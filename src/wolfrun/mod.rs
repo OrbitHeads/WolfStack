@@ -306,6 +306,7 @@ impl WolfRunState {
         let mut svcs = self.services.write().unwrap();
         if let Some(svc) = svcs.iter_mut().find(|s| s.id == id) {
             svc.instances = instances;
+            svc.updated_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         }
         drop(svcs);
         self.save();

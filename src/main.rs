@@ -705,6 +705,8 @@ async fn main() -> std::io::Result<()> {
                 // duplicate container creation and IP address conflicts
                 if wolfrun::is_leader(&wolfrun_cluster) {
                     wolfrun::reconcile(&wolfrun_bg, &wolfrun_cluster, &wolfrun_secret).await;
+                    // Broadcast updated instance status to cluster peers
+                    wolfrun::broadcast_to_cluster(&wolfrun_bg, &wolfrun_cluster, &wolfrun_secret).await;
                 }
                 tokio::time::sleep(Duration::from_secs(15)).await;
             }
