@@ -404,31 +404,28 @@ impl WolfRunState {
 
 
     /// Merge services received from a cluster peer.
-    /// For each incoming service: if we don't have it, add it.
-    /// If we have it and the peer's version is newer (updated_at), replace ours.
-    /// Services we have that the peer doesn't send are kept (peer may not know about them yet).
+    /// Strategy: for each cluster represented in the incoming data, REPLACE all
+    /// local services for that cluster with the peer's versions. Services for
+    /// clusters NOT in the incoming data are preserved unchanged.
+    /// This ensures stale/junk entries don't accumulate.
     pub fn merge_from_peer(&self, peer_services: Vec<WolfRunService>) {
-        let mut svcs = self.services.write().unwrap();
-        let mut changed = false;
+        if peer_services.is_empty() { return; }
 
-        for peer_svc in peer_services {
-            if let Some(local) = svcs.iter_mut().find(|s| s.id == peer_svc.id) {
-                // Update if peer has a newer version
-                if peer_svc.updated_at > local.updated_at {
-                    *local = peer_svc;
-                    changed = true;
-                }
-            } else {
-                // New service we don't have yet
-                svcs.push(peer_svc);
-                changed = true;
-            }
-        }
+        // Identify which clusters the peer is sending data for
+        let peer_clusters: std::collections::HashSet<String> = peer_services.iter()
+            .map(|s| s.cluster_name.clone())
+            .collect();
+
+        let mut svcs = self.services.write().unwrap();
+
+        // Remove all local services for the incoming clusters
+        svcs.retain(|s| !peer_clusters.contains(&s.cluster_name));
+
+        // Add all peer services
+        svcs.extend(peer_services);
 
         drop(svcs);
-        if changed {
-            self.save();
-        }
+        self.save();
     }
 
     /// Mark a service as deleted by removing it from our list (called when peer broadcasts a deletion).
