@@ -13779,10 +13779,16 @@ function renderWolfRunServices(services) {
         const desired = svc.replicas;
 
         // Status badge
+        const offline = svc.instances.filter(i => i.status === 'offline').length;
         let statusBadge;
         if (running === desired && desired > 0) {
             statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(16,185,129,0.15);color:#10b981;border:1px solid rgba(16,185,129,0.3);">
                 <span style="width:6px;height:6px;border-radius:50%;background:#10b981;display:inline-block;animation:pulse 2s infinite;"></span> Healthy
+            </span>`;
+        } else if (running > 0 && running < desired && total >= desired) {
+            // All instances exist but some are on offline nodes — not actively scaling
+            statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(249,115,22,0.15);color:#f97316;border:1px solid rgba(249,115,22,0.3);">
+                <span style="width:6px;height:6px;border-radius:50%;background:#f97316;display:inline-block;"></span> Degraded (${offline} offline)
             </span>`;
         } else if (running > 0 && running < desired) {
             statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(234,179,8,0.15);color:#eab308;border:1px solid rgba(234,179,8,0.3);">
