@@ -8141,6 +8141,21 @@ pub async fn wolfrun_sync(req: HttpRequest, state: web::Data<AppState>, body: we
     HttpResponse::Ok().json(serde_json::json!({ "synced": true }))
 }
 
+/// POST /api/wolfrun/reconcile — trigger an immediate reconcile + broadcast
+pub async fn wolfrun_reconcile(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    let wolfrun = Arc::clone(&state.wolfrun);
+    let cluster = Arc::clone(&state.cluster);
+    let secret = state.cluster_secret.clone();
+
+    // Run reconcile synchronously so the response has fresh data
+    crate::wolfrun::reconcile(&wolfrun, &cluster, &secret).await;
+    crate::wolfrun::broadcast_to_cluster(&wolfrun, &cluster, &secret).await;
+
+    HttpResponse::Ok().json(serde_json::json!({ "reconciled": true }))
+}
+
 /// Configure all API routes
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg
@@ -8399,6 +8414,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/wolfrun/services", web::post().to(wolfrun_create))
         .route("/api/wolfrun/services/adopt", web::post().to(wolfrun_adopt))
         .route("/api/wolfrun/sync", web::post().to(wolfrun_sync))
+        .route("/api/wolfrun/reconcile", web::post().to(wolfrun_reconcile))
         .route("/api/wolfrun/services/{id}", web::get().to(wolfrun_get))
         .route("/api/wolfrun/services/{id}", web::delete().to(wolfrun_delete))
         .route("/api/wolfrun/services/{id}/scale", web::post().to(wolfrun_scale))

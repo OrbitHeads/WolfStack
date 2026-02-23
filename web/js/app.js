@@ -13709,6 +13709,11 @@ function wolfrunApiUrl(path) {
 
 async function loadWolfRunServices() {
     try {
+        // Trigger an immediate reconcile on the cluster node to get fresh status
+        try {
+            await fetch(wolfrunApiUrl('/api/wolfrun/reconcile'), { method: 'POST' });
+        } catch (e) { /* ignore — older nodes may not have this endpoint */ }
+
         const url = wolfrunApiUrl(`/api/wolfrun/services?cluster=${encodeURIComponent(wolfrunCurrentCluster)}`);
         const resp = await fetch(url);
         if (!resp.ok) throw new Error('Failed to load services');
