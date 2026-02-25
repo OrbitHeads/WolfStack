@@ -110,8 +110,16 @@
         term.loadAddon(fitAddon);
         term.open(document.getElementById('terminal-container'));
 
+        let ws = null;
+
         function doFit() {
-            try { fitAddon.fit(); } catch (e) { }
+            try {
+                fitAddon.fit();
+                // Send new dimensions to server for PTY resize
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+                }
+            } catch (e) { }
         }
         setTimeout(doFit, 100);
         window.addEventListener('resize', doFit);
@@ -134,7 +142,7 @@
         connectWebSocket(wsUrl);
 
         function connectWebSocket(url) {
-            const ws = new WebSocket(url);
+            ws = new WebSocket(url);
             ws.binaryType = 'arraybuffer';
             attachWebSocket(ws);
         }

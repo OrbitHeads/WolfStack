@@ -13714,9 +13714,10 @@ function wolfrunApiUrl(path) {
 
 async function loadWolfRunServices() {
     try {
-        // Trigger an immediate reconcile on the cluster node to get fresh status
+        // Fire-and-forget reconcile — the background loop already runs every 15s,
+        // so we don't need to block the page load waiting for it
         try {
-            await fetch(wolfrunApiUrl('/api/wolfrun/reconcile'), { method: 'POST' });
+            fetch(wolfrunApiUrl('/api/wolfrun/reconcile'), { method: 'POST' }).catch(() => { });
         } catch (e) { /* ignore — older nodes may not have this endpoint */ }
 
         const url = wolfrunApiUrl(`/api/wolfrun/services?cluster=${encodeURIComponent(wolfrunCurrentCluster)}`);

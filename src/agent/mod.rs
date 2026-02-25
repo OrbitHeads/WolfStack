@@ -692,16 +692,16 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
         ];
 
 
-        let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .danger_accept_invalid_certs(true)
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Failed to create HTTP client: {}", e);
-                continue;
-            }
+        let client = {
+            // Reuse a single client across all poll cycles for connection pooling & keep-alive
+            static POLL_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+                reqwest::Client::builder()
+                    .timeout(Duration::from_secs(10))
+                    .danger_accept_invalid_certs(true)
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new())
+            });
+            &*POLL_CLIENT
         };
 
         let mut poll_ok = false;

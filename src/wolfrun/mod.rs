@@ -702,6 +702,23 @@ pub async fn reconcile(
             let node = all_nodes.iter().find(|n| n.id == inst.node_id);
             match node {
                 Some(n) if n.online && n.is_self => {
+                    // Check if the required runtime is actually installed on this node
+                    let runtime_available = match service.runtime {
+                        Runtime::Docker => n.has_docker || std::path::Path::new("/usr/bin/docker").exists(),
+                        Runtime::Lxc => n.has_lxc || std::path::Path::new("/usr/bin/lxc-ls").exists(),
+                    };
+                    if !runtime_available {
+                        // Runtime not installed locally — treat like offline remote node
+                        // so instances aren't marked "lost" and don't trigger replacement clones
+                        if inst.status == "pending" {
+                            live_instances.push(inst.clone());
+                        } else {
+                            let mut offline = inst.clone();
+                            offline.status = "offline".to_string();
+                            live_instances.push(offline);
+                        }
+                        continue;
+                    }
                     // Local node — query containers directly (avoids HTTP self-call issues)
                     let containers = match service.runtime {
                         Runtime::Docker => crate::containers::docker_list_all(),

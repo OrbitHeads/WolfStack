@@ -252,19 +252,28 @@ impl PveClient {
         }).collect();
 
         // For containers with no name, fetch hostname from their individual config
+        // Fetch all unnamed configs concurrently for speed on remote servers
         let unnamed: Vec<usize> = guests.iter().enumerate()
             .filter(|(_, g)| g.name.is_empty())
             .map(|(i, _)| i)
             .collect();
 
-        for idx in unnamed {
-            let vmid = guests[idx].vmid;
-            if let Ok(cfg) = self.get(&format!("/nodes/{}/lxc/{}/config", self.node_name, vmid)).await {
+        let config_paths: Vec<String> = unnamed.iter().map(|idx| {
+            let vmid = guests[*idx].vmid;
+            format!("/nodes/{}/lxc/{}/config", self.node_name, vmid)
+        }).collect();
+        let config_futures: Vec<_> = config_paths.iter().map(|path| {
+            self.get(path)
+        }).collect();
+        let config_results = futures::future::join_all(config_futures).await;
+
+        for (i, result) in unnamed.iter().zip(config_results.into_iter()) {
+            if let Ok(cfg) = result {
                 if let Some(hostname) = cfg.get("hostname").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-                    guests[idx].name = hostname.to_string();
+                    guests[*i].name = hostname.to_string();
                 } else if let Some(desc) = cfg.get("description").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                     // Fall back to first line of description/notes
-                    guests[idx].name = desc.lines().next().unwrap_or("").to_string();
+                    guests[*i].name = desc.lines().next().unwrap_or("").to_string();
                 }
             }
         }
@@ -468,10 +477,16 @@ pub async fn poll_pve_node(
 
     node_name: &str,
 ) -> Result<(PveNodeStatus, u32, u32, Option<String>, Vec<PveGuest>), String> {
-    // Enhanced logging for debugging offline status
+    // Run all PVE API calls concurrently for speed on remote servers
     let client = PveClient::new(address, port, token, fingerprint, node_name);
-    
-    let status = match client.get_node_status().await {
+
+    let (status_res, guests_res, cluster_name_res) = tokio::join!(
+        client.get_node_status(),
+        client.list_all_guests(),
+        client.get_cluster_name(),
+    );
+
+    let status = match status_res {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("Proxmox poll failed for {} ({}): get_node_status error: {}", node_name, address, e);
@@ -479,7 +494,7 @@ pub async fn poll_pve_node(
         }
     };
 
-    let guests = match client.list_all_guests().await {
+    let guests = match guests_res {
         Ok(g) => g,
         Err(e) => {
              tracing::warn!("Proxmox poll warning for {} ({}): list_all_guests failed: {}", node_name, address, e);
@@ -487,7 +502,7 @@ pub async fn poll_pve_node(
         }
     };
 
-    let cluster_name = client.get_cluster_name().await.ok(); 
+    let cluster_name = cluster_name_res.ok();
 
     let lxc_count = guests.iter().filter(|g| g.guest_type == "lxc").count() as u32;
     let vm_count = guests.iter().filter(|g| g.guest_type == "qemu").count() as u32;
