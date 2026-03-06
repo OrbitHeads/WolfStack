@@ -106,10 +106,8 @@ function showAddBookmarkModal() {
                 <button class="btn btn-primary" onclick="addBookmark()">Add Bookmark</button>
             </div>
         </div>`;
-    showModal(html, '🔖 Add Bookmark');
+    showModal(html, '🔖 Add Bookmark', { noOk: true });
     _bookmarkOverlay = document.body.lastElementChild;
-    const okBtn = _bookmarkOverlay.querySelector('div[style*="text-align:right"]');
-    if (okBtn) okBtn.style.display = 'none';
     setTimeout(() => document.getElementById('bookmark-name')?.focus(), 100);
 }
 function selectBookmarkIcon(el, icon) {
@@ -277,7 +275,8 @@ document.addEventListener('click', (e) => {
 });
 
 // ─── Modal Dialog (replaces alert()) ───
-function showModal(message, title) {
+function showModal(message, title, opts) {
+    opts = opts || {};
     title = title || 'WolfStack';
     var overlay = document.createElement('div');
     overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:100000;display:flex;align-items:center;justify-content:center;animation:fadeIn 0.15s ease';
@@ -288,28 +287,32 @@ function showModal(message, title) {
     h.textContent = title;
     var body = document.createElement('div');
     body.style.cssText = 'font-size:13px;line-height:1.6;color:var(--text-secondary,#a1a1aa);white-space:pre-wrap;word-break:break-word;max-height:400px;overflow-y:auto';
-    // Support HTML content (if it starts with <) or plain text
     if (typeof message === 'string' && message.trimStart().startsWith('<')) {
         body.innerHTML = message;
     } else {
         body.textContent = message;
     }
-    var btnWrap = document.createElement('div');
-    btnWrap.style.cssText = 'margin-top:18px;text-align:right';
-    var btn = document.createElement('button');
-    btn.textContent = 'OK';
-    btn.style.cssText = 'background:var(--accent,#3b82f6);color:#fff;border:none;border-radius:6px;padding:8px 24px;cursor:pointer;font-size:13px;font-weight:500;transition:background 0.2s';
-    btn.onmouseenter = function () { btn.style.background = 'var(--accent-light,#60a5fa)'; };
-    btn.onmouseleave = function () { btn.style.background = 'var(--accent,#3b82f6)'; };
-    btn.onclick = function () { overlay.remove(); };
     overlay.onclick = function (e) { if (e.target === overlay) overlay.remove(); };
-    btnWrap.appendChild(btn);
     modal.appendChild(h);
     modal.appendChild(body);
-    modal.appendChild(btnWrap);
-    overlay.appendChild(modal);
-    document.body.appendChild(overlay);
-    btn.focus();
+    if (!opts.noOk) {
+        var btnWrap = document.createElement('div');
+        btnWrap.style.cssText = 'margin-top:18px;text-align:right';
+        var btn = document.createElement('button');
+        btn.textContent = 'OK';
+        btn.style.cssText = 'background:var(--accent,#3b82f6);color:#fff;border:none;border-radius:6px;padding:8px 24px;cursor:pointer;font-size:13px;font-weight:500;transition:background 0.2s';
+        btn.onmouseenter = function () { btn.style.background = 'var(--accent-light,#60a5fa)'; };
+        btn.onmouseleave = function () { btn.style.background = 'var(--accent,#3b82f6)'; };
+        btn.onclick = function () { overlay.remove(); };
+        btnWrap.appendChild(btn);
+        modal.appendChild(btnWrap);
+        overlay.appendChild(modal);
+        document.body.appendChild(overlay);
+        btn.focus();
+    } else {
+        overlay.appendChild(modal);
+        document.body.appendChild(overlay);
+    }
 }
 
 /// Styled confirmation dialog — returns a Promise<boolean>
