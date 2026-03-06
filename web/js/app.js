@@ -56,6 +56,13 @@ function applyMapCollapse() {
 }
 
 // ─── Bookmarks ───
+const BOOKMARK_ICONS = [
+    '🌐','📁','💻','🖥️','📊','📈','🔧','⚙️','🛠️','📝',
+    '📋','📦','🗄️','🔒','🔑','💾','📡','🌍','☁️','🐳',
+    '🐧','🔥','💬','📧','🎯','⭐','❤️','🏠','🚀','📌',
+    '🎮','🎵','📷','🛒','💰','📚','🔬','🧪','🤖','👾',
+];
+
 function loadBookmarks() {
     try { return JSON.parse(localStorage.getItem('wolfstack_bookmarks') || '[]'); }
     catch { return []; }
@@ -73,16 +80,23 @@ function renderBookmarks() {
     }
     el.innerHTML = bookmarks.map((b, i) => `
         <a href="${b.url}" target="_blank" rel="noopener" class="bookmark-item" title="${b.url}">
-            <img src="https://www.google.com/s2/favicons?domain=${new URL(b.url).hostname}&sz=32" alt="" style="width:16px;height:16px;border-radius:2px;">
+            <span style="font-size:16px;line-height:1;">${b.icon || '🌐'}</span>
             <span>${b.name}</span>
             <span class="bookmark-delete" onclick="event.preventDefault();event.stopPropagation();deleteBookmark(${i})">×</span>
         </a>
     `).join('');
 }
 let _bookmarkOverlay = null;
+let _selectedBookmarkIcon = '🌐';
 function showAddBookmarkModal() {
+    _selectedBookmarkIcon = '🌐';
+    const iconGrid = BOOKMARK_ICONS.map(ic =>
+        `<span class="bm-icon-opt${ic === '🌐' ? ' selected' : ''}" onclick="selectBookmarkIcon(this,'${ic}')">${ic}</span>`
+    ).join('');
     const html = `
         <div style="display:flex;flex-direction:column;gap:6px;">
+            <label style="font-size:12px;color:var(--text-muted);">Icon</label>
+            <div id="bookmark-icon-grid" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px;">${iconGrid}</div>
             <label style="font-size:12px;color:var(--text-muted);">Name</label>
             <input type="text" id="bookmark-name" class="form-control" placeholder="e.g. GitHub" style="width:100%;margin-bottom:4px;">
             <label style="font-size:12px;color:var(--text-muted);">URL</label>
@@ -93,12 +107,15 @@ function showAddBookmarkModal() {
             </div>
         </div>`;
     showModal(html, '🔖 Add Bookmark');
-    // Grab the overlay we just created (last child of body)
     _bookmarkOverlay = document.body.lastElementChild;
-    // Hide the default OK button that showModal adds
     const okBtn = _bookmarkOverlay.querySelector('div[style*="text-align:right"]');
     if (okBtn) okBtn.style.display = 'none';
     setTimeout(() => document.getElementById('bookmark-name')?.focus(), 100);
+}
+function selectBookmarkIcon(el, icon) {
+    _selectedBookmarkIcon = icon;
+    document.querySelectorAll('.bm-icon-opt').forEach(e => e.classList.remove('selected'));
+    el.classList.add('selected');
 }
 function dismissBookmarkModal() {
     if (_bookmarkOverlay) { _bookmarkOverlay.remove(); _bookmarkOverlay = null; }
@@ -109,7 +126,7 @@ function addBookmark() {
     if (!name || !url) return;
     if (!url.match(/^https?:\/\//)) url = 'https://' + url;
     const bookmarks = loadBookmarks();
-    bookmarks.push({ name, url });
+    bookmarks.push({ name, url, icon: _selectedBookmarkIcon });
     saveBookmarks(bookmarks);
     renderBookmarks();
     dismissBookmarkModal();
