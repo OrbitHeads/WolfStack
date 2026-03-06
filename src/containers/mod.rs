@@ -24,8 +24,6 @@ pub fn wolfnet_init() {
         return;
     }
 
-
-
     // Enable per-interface forwarding (required for routing between wolfnet0 and lxcbr0)
     let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.wolfnet0.forwarding=1"]).output();
     let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.lxcbr0.forwarding=1"]).output();
@@ -41,16 +39,55 @@ pub fn wolfnet_init() {
     let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.lxcbr0.send_redirects=0"]).output();
     let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.all.send_redirects=0"]).output();
 
+    // On firewalld systems (Fedora/RHEL/Nobara), add WolfNet/bridge interfaces
+    // to the trusted zone. firewalld uses nftables with its own table — our
+    // iptables FORWARD rules go into a separate compat table and firewalld's
+    // REJECT rule fires independently, blocking forwarded container traffic.
+    ensure_firewalld_trusted(&["wolfnet0", "lxcbr0", "docker0"]);
+
     // FORWARD chain: allow traffic between wolfnet0 and lxcbr0 in both directions
+    // (fallback for non-firewalld systems)
     let check = Command::new("iptables")
         .args(["-C", "FORWARD", "-i", "wolfnet0", "-o", "lxcbr0", "-j", "ACCEPT"]).output();
     if check.map(|o| !o.status.success()).unwrap_or(true) {
         let _ = Command::new("iptables").args(["-I", "FORWARD", "-i", "wolfnet0", "-o", "lxcbr0", "-j", "ACCEPT"]).output();
         let _ = Command::new("iptables").args(["-I", "FORWARD", "-i", "lxcbr0", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
+    }
+}
 
+/// Add interfaces to the firewalld trusted zone (if firewalld is running).
+/// This prevents firewalld's nftables REJECT rule from blocking forwarded
+/// traffic between WolfNet, container bridges, and WireGuard interfaces.
+fn ensure_firewalld_trusted(ifaces: &[&str]) {
+    // Quick check: is firewalld running?
+    let running = Command::new("firewall-cmd").args(["--state"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !running { return; }
+
+    for iface in ifaces {
+        // Check if already in trusted zone (avoid unnecessary reloads)
+        let already = Command::new("firewall-cmd")
+            .args(["--permanent", "--zone=trusted", "--query-interface", iface])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if already { continue; }
+
+        // Remove from any other zone first, then add to trusted
+        let _ = Command::new("firewall-cmd")
+            .args(["--permanent", "--zone=trusted", "--add-interface", iface])
+            .output();
     }
 
+    // Enable masquerading in trusted zone so container NAT works
+    let _ = Command::new("firewall-cmd")
+        .args(["--permanent", "--zone=trusted", "--add-masquerade"])
+        .output();
 
+    // Reload to apply permanent changes
+    let _ = Command::new("firewall-cmd").args(["--reload"]).output();
 }
 
 // ─── WolfNet Route Cache ───
