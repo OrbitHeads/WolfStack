@@ -1255,3 +1255,388 @@ pub fn read_system_logs(lines: usize, search: Option<&str>, unit: Option<&str>) 
         Err(e) => vec![format!("Error reading logs: {}", e)],
     }
 }
+
+// ─── Disk Partitioning & Formatting ───
+
+/// Protected device prefixes and mount points that must never be modified
+const PROTECTED_MOUNTS: &[&str] = &["/", "/boot", "/boot/efi", "/home"];
+
+/// Supported filesystem types for formatting
+pub const SUPPORTED_FILESYSTEMS: &[&str] = &[
+    "ext4", "ext3", "ext2", "xfs", "btrfs", "vfat", "fat32", "ntfs", "swap",
+];
+
+/// Validate that a device path is a real block device and not protected
+fn validate_device(device: &str) -> Result<(), String> {
+    // Must be an absolute path starting with /dev/
+    if !device.starts_with("/dev/") {
+        return Err("Device path must start with /dev/".into());
+    }
+    // Reject path traversal
+    if device.contains("..") {
+        return Err("Invalid device path".into());
+    }
+    // Must actually exist as a block device
+    let p = Path::new(device);
+    if !p.exists() {
+        return Err(format!("{} does not exist", device));
+    }
+    // Use lsblk to verify it's a real block device
+    let output = Command::new("lsblk")
+        .args(["-no", "TYPE", device])
+        .output()
+        .map_err(|e| format!("lsblk failed: {}", e))?;
+    if !output.status.success() {
+        return Err(format!("{} is not a block device", device));
+    }
+    Ok(())
+}
+
+/// Check if a device or any of its children are mounted at a protected mount point
+fn is_protected_device(device: &str) -> Result<bool, String> {
+    let output = Command::new("lsblk")
+        .args(["-Jno", "NAME,MOUNTPOINTS,TYPE", device])
+        .output()
+        .map_err(|e| format!("lsblk: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&stdout) {
+        fn check_nodes(nodes: &[serde_json::Value]) -> bool {
+            for node in nodes {
+                if let Some(mounts) = node.get("mountpoints").and_then(|m| m.as_array()) {
+                    for mp in mounts {
+                        if let Some(s) = mp.as_str() {
+                            for protected in PROTECTED_MOUNTS {
+                                if s == *protected {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(children) = node.get("children").and_then(|c| c.as_array()) {
+                    if check_nodes(children) { return true; }
+                }
+            }
+            false
+        }
+        if let Some(devs) = val.get("blockdevices").and_then(|b| b.as_array()) {
+            return Ok(check_nodes(devs));
+        }
+    }
+    Ok(false)
+}
+
+/// Check if a specific device is currently mounted
+fn is_mounted(device: &str) -> bool {
+    Command::new("findmnt")
+        .args(["-n", "-S", device])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Get partition table type for a disk (gpt, dos/mbr, or empty)
+pub fn get_partition_table(disk: &str) -> Result<String, String> {
+    let output = Command::new("blkid")
+        .args(["-p", "-o", "value", "-s", "PTTYPE", disk])
+        .output()
+        .map_err(|e| format!("blkid: {}", e))?;
+    let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(if result.is_empty() { "none".to_string() } else { result })
+}
+
+/// Create a new partition table on a disk (gpt or msdos)
+pub fn create_partition_table(disk: &str, table_type: &str) -> Result<String, String> {
+    validate_device(disk)?;
+
+    // Only allow on whole disks
+    let dev_type = Command::new("lsblk")
+        .args(["-dno", "TYPE", disk])
+        .output()
+        .map_err(|e| format!("lsblk: {}", e))?;
+    let dev_type_str = String::from_utf8_lossy(&dev_type.stdout).trim().to_string();
+    if dev_type_str != "disk" {
+        return Err(format!("{} is not a whole disk (type: {})", disk, dev_type_str));
+    }
+
+    if is_protected_device(disk)? {
+        return Err(format!("{} has partitions mounted at protected locations — refusing", disk));
+    }
+
+    let label = match table_type {
+        "gpt" => "gpt",
+        "msdos" | "mbr" => "msdos",
+        _ => return Err(format!("Unsupported partition table type: {}. Use 'gpt' or 'msdos'.", table_type)),
+    };
+
+    let output = Command::new("parted")
+        .args(["-s", disk, "mklabel", label])
+        .output()
+        .map_err(|e| format!("parted: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("parted mklabel failed: {}", stderr.trim()));
+    }
+    tracing::info!("Created {} partition table on {}", label, disk);
+    Ok(format!("Created {} partition table on {}", label, disk))
+}
+
+/// Create a new partition on a disk
+pub fn create_partition(disk: &str, size_mb: Option<u64>, fs_type_hint: Option<&str>) -> Result<String, String> {
+    validate_device(disk)?;
+
+    let dev_type = Command::new("lsblk")
+        .args(["-dno", "TYPE", disk])
+        .output()
+        .map_err(|e| format!("lsblk: {}", e))?;
+    let dev_type_str = String::from_utf8_lossy(&dev_type.stdout).trim().to_string();
+    if dev_type_str != "disk" {
+        return Err(format!("{} is not a whole disk", disk));
+    }
+
+    if is_protected_device(disk)? {
+        return Err(format!("{} has partitions at protected mount points — refusing", disk));
+    }
+
+    // Check the disk has a partition table
+    let pt = get_partition_table(disk)?;
+    if pt == "none" {
+        return Err(format!("{} has no partition table. Create one first (GPT or MBR).", disk));
+    }
+
+    // Find the end of the last partition to know where to start
+    let output = Command::new("parted")
+        .args(["-s", "-m", disk, "unit", "MiB", "print", "free"])
+        .output()
+        .map_err(|e| format!("parted print: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Find the last free space block
+    let mut free_start: Option<f64> = None;
+    let mut free_end: Option<f64> = None;
+    for line in stdout.lines() {
+        // Machine-parseable lines: "1:1.00MiB:500MiB:499MiB:ext4::;"  or "1:500MiB:1000MiB:500MiB:free;"
+        if line.contains(":free;") || line.contains(":free:") {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() >= 3 {
+                let start = parts[1].trim_end_matches("MiB").parse::<f64>().unwrap_or(0.0);
+                let end = parts[2].trim_end_matches("MiB").parse::<f64>().unwrap_or(0.0);
+                if end - start > 1.0 {
+                    free_start = Some(start);
+                    free_end = Some(end);
+                }
+            }
+        }
+    }
+
+    let start = free_start.ok_or_else(|| "No free space available on the disk".to_string())?;
+    let max_end = free_end.unwrap_or(start);
+
+    let end = if let Some(sz) = size_mb {
+        let proposed = start + sz as f64;
+        if proposed > max_end {
+            return Err(format!("Requested {}MiB but only {:.0}MiB free", sz, max_end - start));
+        }
+        proposed
+    } else {
+        max_end // Use all remaining space
+    };
+
+    let fs_hint = fs_type_hint.unwrap_or("");
+    let part_type = match fs_hint {
+        "swap" => "linux-swap",
+        "vfat" | "fat32" => "fat32",
+        "ntfs" => "ntfs",
+        _ => "ext2", // parted type hint, actual filesystem is created by mkfs later
+    };
+
+    let start_str = format!("{:.2}MiB", start);
+    let end_str = format!("{:.2}MiB", end);
+
+    let output = Command::new("parted")
+        .args(["-s", "-a", "optimal", disk, "mkpart", "primary", part_type, &start_str, &end_str])
+        .output()
+        .map_err(|e| format!("parted mkpart: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("parted mkpart failed: {}", stderr.trim()));
+    }
+
+    // Inform kernel of partition changes
+    let _ = Command::new("partprobe").arg(disk).output();
+    // Small delay for udev to settle
+    let _ = Command::new("udevadm").args(["settle", "--timeout=3"]).output();
+
+    tracing::info!("Created partition on {}: {}-{}", disk, start_str, end_str);
+    Ok(format!("Partition created on {} ({} - {})", disk, start_str, end_str))
+}
+
+/// Delete a partition
+pub fn delete_partition(device: &str) -> Result<String, String> {
+    validate_device(device)?;
+
+    // Must be a partition, not a whole disk
+    let dev_type = Command::new("lsblk")
+        .args(["-dno", "TYPE", device])
+        .output()
+        .map_err(|e| format!("lsblk: {}", e))?;
+    let dev_type_str = String::from_utf8_lossy(&dev_type.stdout).trim().to_string();
+    if dev_type_str != "part" {
+        return Err(format!("{} is not a partition (type: {})", device, dev_type_str));
+    }
+
+    // Check it's not mounted at a protected location
+    if is_protected_device(device)? {
+        return Err(format!("{} is mounted at a protected location — refusing", device));
+    }
+
+    // Unmount if currently mounted
+    if is_mounted(device) {
+        let output = Command::new("umount").arg(device).output()
+            .map_err(|e| format!("umount: {}", e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("Cannot unmount {}: {}", device, stderr.trim()));
+        }
+    }
+
+    // Extract disk and partition number
+    // /dev/sda1 -> disk=/dev/sda, num=1
+    // /dev/nvme0n1p2 -> disk=/dev/nvme0n1, num=2
+    let name = device.trim_start_matches("/dev/");
+    let (disk, part_num) = if name.contains("nvme") || name.contains("mmcblk") || name.contains("loop") {
+        // NVMe style: nvme0n1p2
+        if let Some(idx) = name.rfind('p') {
+            let num = &name[idx+1..];
+            let disk_name = &name[..idx];
+            (format!("/dev/{}", disk_name), num.to_string())
+        } else {
+            return Err(format!("Cannot parse partition number from {}", device));
+        }
+    } else {
+        // SCSI style: sda1
+        let split_pos = name.len() - name.chars().rev().take_while(|c| c.is_ascii_digit()).count();
+        if split_pos == name.len() {
+            return Err(format!("Cannot parse partition number from {}", device));
+        }
+        let disk_name = &name[..split_pos];
+        let num = &name[split_pos..];
+        (format!("/dev/{}", disk_name), num.to_string())
+    };
+
+    let output = Command::new("parted")
+        .args(["-s", &disk, "rm", &part_num])
+        .output()
+        .map_err(|e| format!("parted rm: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("parted rm failed: {}", stderr.trim()));
+    }
+
+    let _ = Command::new("partprobe").arg(&disk).output();
+    let _ = Command::new("udevadm").args(["settle", "--timeout=3"]).output();
+
+    tracing::info!("Deleted partition {}", device);
+    Ok(format!("Partition {} deleted", device))
+}
+
+/// Format a partition with a given filesystem type
+pub fn format_partition(device: &str, fstype: &str, label: Option<&str>) -> Result<String, String> {
+    validate_device(device)?;
+
+    if !SUPPORTED_FILESYSTEMS.contains(&fstype) {
+        return Err(format!("Unsupported filesystem type: {}. Supported: {}", fstype, SUPPORTED_FILESYSTEMS.join(", ")));
+    }
+
+    // Must be a partition or LVM, not a whole disk
+    let dev_type = Command::new("lsblk")
+        .args(["-dno", "TYPE", device])
+        .output()
+        .map_err(|e| format!("lsblk: {}", e))?;
+    let dev_type_str = String::from_utf8_lossy(&dev_type.stdout).trim().to_string();
+    if dev_type_str == "disk" {
+        return Err("Cannot format a whole disk — format individual partitions instead".into());
+    }
+
+    // Check it's not mounted at a protected location
+    if is_protected_device(device)? {
+        return Err(format!("{} is mounted at a protected location — refusing", device));
+    }
+
+    // Unmount if currently mounted
+    if is_mounted(device) {
+        let output = Command::new("umount").arg(device).output()
+            .map_err(|e| format!("umount: {}", e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("Cannot unmount {}: {}", device, stderr.trim()));
+        }
+    }
+
+    // Build mkfs command
+    let cmd;
+    let mut args: Vec<&str> = Vec::new();
+
+    match fstype {
+        "ext4" | "ext3" | "ext2" => {
+            cmd = format!("mkfs.{}", fstype);
+            args.push("-F"); // Force — don't ask for confirmation
+            if let Some(l) = label {
+                if !l.is_empty() { args.push("-L"); args.push(l); }
+            }
+        }
+        "xfs" => {
+            cmd = "mkfs.xfs".to_string();
+            args.push("-f"); // Force overwrite
+            if let Some(l) = label {
+                if !l.is_empty() { args.push("-L"); args.push(l); }
+            }
+        }
+        "btrfs" => {
+            cmd = "mkfs.btrfs".to_string();
+            args.push("-f");
+            if let Some(l) = label {
+                if !l.is_empty() { args.push("-L"); args.push(l); }
+            }
+        }
+        "vfat" | "fat32" => {
+            cmd = "mkfs.vfat".to_string();
+            args.push("-F"); args.push("32");
+            if let Some(l) = label {
+                if !l.is_empty() { args.push("-n"); args.push(l); }
+            }
+        }
+        "ntfs" => {
+            cmd = "mkfs.ntfs".to_string();
+            args.push("-f"); // Quick format
+            if let Some(l) = label {
+                if !l.is_empty() { args.push("-L"); args.push(l); }
+            }
+        }
+        "swap" => {
+            cmd = "mkswap".to_string();
+            if let Some(l) = label {
+                if !l.is_empty() { args.push("-L"); args.push(l); }
+            }
+        }
+        _ => return Err(format!("Unsupported filesystem: {}", fstype)),
+    }
+
+    args.push(device);
+
+    let output = Command::new(&cmd)
+        .args(&args)
+        .output()
+        .map_err(|e| format!("{} failed: {}", cmd, e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("{} failed: {}", cmd, stderr.trim()));
+    }
+
+    tracing::info!("Formatted {} as {} (label: {:?})", device, fstype, label);
+    Ok(format!("{} formatted as {}", device, fstype))
+}

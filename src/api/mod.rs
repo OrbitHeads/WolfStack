@@ -5778,6 +5778,110 @@ pub async fn storage_disk_info(req: HttpRequest, state: web::Data<AppState>) -> 
     HttpResponse::Ok().json(serde_json::json!({ "devices": entries }))
 }
 
+// ─── Disk Partitioning & Formatting ───
+
+#[derive(Deserialize)]
+pub struct CreatePartitionTableRequest {
+    pub disk: String,
+    pub table_type: String, // "gpt" or "msdos"
+}
+
+/// POST /api/storage/disk/partition-table — create a partition table
+pub async fn disk_create_partition_table(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<CreatePartitionTableRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let disk = body.disk.clone();
+    let table_type = body.table_type.clone();
+    match web::block(move || storage::create_partition_table(&disk, &table_type)).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({"ok": true, "message": msg})),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({"ok": false, "error": e})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": format!("{}", e)})),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CreatePartitionRequest {
+    pub disk: String,
+    #[serde(default)]
+    pub size_mb: Option<u64>, // None = use all remaining space
+    #[serde(default)]
+    pub fs_type_hint: Option<String>,
+}
+
+/// POST /api/storage/disk/partition — create a partition
+pub async fn disk_create_partition(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<CreatePartitionRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let disk = body.disk.clone();
+    let size_mb = body.size_mb;
+    let hint = body.fs_type_hint.clone();
+    match web::block(move || storage::create_partition(&disk, size_mb, hint.as_deref())).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({"ok": true, "message": msg})),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({"ok": false, "error": e})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": format!("{}", e)})),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct DeletePartitionRequest {
+    pub device: String,
+}
+
+/// POST /api/storage/disk/partition/delete — delete a partition
+pub async fn disk_delete_partition(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<DeletePartitionRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let device = body.device.clone();
+    match web::block(move || storage::delete_partition(&device)).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({"ok": true, "message": msg})),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({"ok": false, "error": e})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": format!("{}", e)})),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct FormatPartitionRequest {
+    pub device: String,
+    pub fstype: String,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// POST /api/storage/disk/format — format a partition
+pub async fn disk_format_partition(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<FormatPartitionRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let device = body.device.clone();
+    let fstype = body.fstype.clone();
+    let label = body.label.clone();
+    match web::block(move || storage::format_partition(&device, &fstype, label.as_deref())).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({"ok": true, "message": msg})),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({"ok": false, "error": e})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": format!("{}", e)})),
+    }
+}
+
+/// GET /api/storage/disk/filesystems — list supported filesystem types
+pub async fn disk_supported_filesystems(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    HttpResponse::Ok().json(storage::SUPPORTED_FILESYSTEMS)
+}
+
 // ─── ZFS Storage ───
 
 /// GET /api/storage/zfs/status — check if ZFS is available and return overview
@@ -10432,6 +10536,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/system/logs", web::get().to(system_logs))
         // Disk partition info
         .route("/api/storage/disk-info", web::get().to(storage_disk_info))
+        // Disk Partitioning & Formatting
+        .route("/api/storage/disk/partition-table", web::post().to(disk_create_partition_table))
+        .route("/api/storage/disk/partition", web::post().to(disk_create_partition))
+        .route("/api/storage/disk/partition/delete", web::post().to(disk_delete_partition))
+        .route("/api/storage/disk/format", web::post().to(disk_format_partition))
+        .route("/api/storage/disk/filesystems", web::get().to(disk_supported_filesystems))
         // ZFS
         .route("/api/storage/zfs/status", web::get().to(zfs_status))
         .route("/api/storage/zfs/pools", web::get().to(zfs_pools))

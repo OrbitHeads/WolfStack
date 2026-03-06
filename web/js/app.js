@@ -4244,14 +4244,14 @@ async function showZfsPoolIostat(pool) {
 async function loadDiskInfo() {
     const tbody = document.getElementById('disk-info-tbody');
     if (!tbody) return;
-    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:var(--text-muted); padding:20px;">Loading…</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color:var(--text-muted); padding:20px;">Loading…</td></tr>';
     try {
         const resp = await fetch(apiUrl('/api/storage/disk-info'));
         if (!resp.ok) throw new Error(await resp.text());
         const data = await resp.json();
         renderDiskInfo(data.devices || []);
     } catch (e) {
-        tbody.innerHTML = `<tr><td colspan="7" style="text-align:center; color:#ef4444; padding:20px;">Failed to load disk info: ${escapeHtml(e.message)}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="8" style="text-align:center; color:#ef4444; padding:20px;">Failed to load disk info: ${escapeHtml(e.message)}</td></tr>`;
     }
 }
 
@@ -4260,8 +4260,14 @@ function renderDiskInfo(devices) {
     if (!tbody) return;
 
     if (!devices || devices.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:var(--text-muted); padding:20px;">No block devices found</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color:var(--text-muted); padding:20px;">No block devices found</td></tr>';
         return;
+    }
+
+    // Determine which devices are protected (mounted at /, /boot, etc.)
+    const protectedMounts = ['/', '/boot', '/boot/efi', '/home'];
+    function isProtected(d) {
+        return (d.mountpoints || []).some(m => protectedMounts.includes(m));
     }
 
     tbody.innerHTML = devices.map(d => {
@@ -4299,6 +4305,27 @@ function renderDiskInfo(devices) {
         const rotate = d.rotational ? '🔄 HDD' : '⚡ SSD';
         const deviceLabel = `<code style="font-size:12px;">${escapeHtml(d.device)}</code>`;
 
+        // Build action buttons based on device type
+        let actions = '';
+        const prot = isProtected(d);
+        const esc = s => s.replace(/'/g, "\\'");
+
+        if (d.type === 'disk' && !d.device.startsWith('/dev/loop')) {
+            actions = `<div style="display:flex; gap:4px; flex-wrap:wrap;">
+                <button class="btn btn-sm" onclick="showDiskPartitionTableModal('${esc(d.device)}')" style="font-size:10px; padding:1px 6px;" title="Create partition table">Table</button>
+                <button class="btn btn-sm" onclick="showDiskCreatePartitionModal('${esc(d.device)}')" style="font-size:10px; padding:1px 6px;" title="Create partition">+ Part</button>
+            </div>`;
+        } else if (d.type === 'part') {
+            if (prot) {
+                actions = `<span style="font-size:11px; color:var(--text-muted);" title="Protected mount point">🔒</span>`;
+            } else {
+                actions = `<div style="display:flex; gap:4px; flex-wrap:wrap;">
+                    <button class="btn btn-sm" onclick="showDiskFormatModal('${esc(d.device)}')" style="font-size:10px; padding:1px 6px;" title="Format partition">Format</button>
+                    <button class="btn btn-sm" onclick="showDiskDeletePartitionModal('${esc(d.device)}')" style="font-size:10px; padding:1px 6px; color:var(--danger);" title="Delete partition">Delete</button>
+                </div>`;
+            }
+        }
+
         return `<tr>
             <td style="${indent}${d.type !== 'disk' ? 'color:var(--text-secondary);' : ''}">${deviceLabel}</td>
             <td>${typeIcon} <span style="font-size:12px;">${typeLabel}${d.type === 'disk' ? ' · ' + rotate : ''}</span></td>
@@ -4307,8 +4334,178 @@ function renderDiskInfo(devices) {
             <td style="font-size:13px; white-space:nowrap;">${escapeHtml(d.size)}</td>
             <td>${mounts}</td>
             <td>${freeCell}</td>
+            <td>${actions}</td>
         </tr>`;
     }).join('');
+}
+
+// ─── Disk Partitioning & Formatting Modals ───
+
+function showDiskPartitionTableModal(disk) {
+    const html = `<div style="display:flex; flex-direction:column; gap:10px;">
+        <p>Create a new partition table on <b><code>${escapeHtml(disk)}</code></b>.</p>
+        <div style="padding:10px; background:rgba(239,68,68,0.1); border:1px solid var(--danger); border-radius:6px; font-size:13px; color:var(--danger);">
+            <b>Warning:</b> This will erase ALL existing partitions and data on this disk.
+        </div>
+        <label style="font-size:12px; color:var(--text-muted);">Partition Table Type</label>
+        <select id="disk-pt-type" class="form-control" style="width:100%;">
+            <option value="gpt">GPT (recommended for disks > 2TB and UEFI)</option>
+            <option value="msdos">MBR / DOS (legacy BIOS, max 2TB)</option>
+        </select>
+        <label style="font-size:12px; color:var(--text-muted);">Type the device name to confirm:</label>
+        <input type="text" id="disk-pt-confirm" class="form-control" placeholder="${escapeHtml(disk)}" style="width:100%;">
+        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
+            <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+            <button class="btn" style="background:var(--danger); color:#fff;" onclick="diskCreatePartitionTable('${disk.replace(/'/g, "\\'")}')">Create Table</button>
+        </div>
+    </div>`;
+    showModal(html, 'Create Partition Table', { noOk: true });
+}
+
+async function diskCreatePartitionTable(disk) {
+    const confirm = document.getElementById('disk-pt-confirm')?.value.trim();
+    if (confirm !== disk) {
+        showModal(`<p style="color:var(--danger);">Device name does not match. Type <code>${escapeHtml(disk)}</code> to confirm.</p>`, 'Confirmation Failed');
+        return;
+    }
+    const tableType = document.getElementById('disk-pt-type')?.value || 'gpt';
+    document.querySelector('.modal-overlay')?.remove();
+    try {
+        const resp = await fetch(apiUrl('/api/storage/disk/partition-table'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ disk, table_type: tableType }),
+        });
+        const data = await resp.json();
+        if (data.ok) { showModal(`<p style="color:var(--success);">${data.message}</p>`, 'Success'); loadDiskInfo(); }
+        else { showModal(`<p style="color:var(--danger);">${data.error}</p>`, 'Error'); }
+    } catch (e) { showModal(`<p style="color:var(--danger);">Failed: ${e.message}</p>`, 'Error'); }
+}
+
+function showDiskCreatePartitionModal(disk) {
+    const html = `<div style="display:flex; flex-direction:column; gap:10px;">
+        <p>Create a new partition on <b><code>${escapeHtml(disk)}</code></b>.</p>
+        <label style="font-size:12px; color:var(--text-muted);">Size</label>
+        <div style="display:flex; gap:8px; align-items:center;">
+            <input type="number" id="disk-part-size" class="form-control" placeholder="All remaining" min="1" style="flex:1;">
+            <span style="font-size:13px; color:var(--text-muted);">MiB</span>
+            <label style="font-size:12px; white-space:nowrap; display:flex; align-items:center; gap:4px;">
+                <input type="checkbox" id="disk-part-use-all" checked onchange="document.getElementById('disk-part-size').disabled = this.checked; if(this.checked) document.getElementById('disk-part-size').value='';">
+                Use all free space
+            </label>
+        </div>
+        <label style="font-size:12px; color:var(--text-muted);">Filesystem type hint (optional)</label>
+        <select id="disk-part-fshint" class="form-control" style="width:100%;">
+            <option value="">Default (Linux)</option>
+            <option value="swap">Swap</option>
+            <option value="fat32">FAT32 (EFI/Windows)</option>
+            <option value="ntfs">NTFS</option>
+        </select>
+        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
+            <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+            <button class="btn btn-primary" onclick="diskCreatePartition('${disk.replace(/'/g, "\\'")}')">Create Partition</button>
+        </div>
+    </div>`;
+    showModal(html, 'Create Partition', { noOk: true });
+    document.getElementById('disk-part-size').disabled = true;
+}
+
+async function diskCreatePartition(disk) {
+    const useAll = document.getElementById('disk-part-use-all')?.checked;
+    const sizeMb = useAll ? null : parseInt(document.getElementById('disk-part-size')?.value) || null;
+    const hint = document.getElementById('disk-part-fshint')?.value || null;
+    document.querySelector('.modal-overlay')?.remove();
+    try {
+        const resp = await fetch(apiUrl('/api/storage/disk/partition'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ disk, size_mb: sizeMb, fs_type_hint: hint }),
+        });
+        const data = await resp.json();
+        if (data.ok) { showModal(`<p style="color:var(--success);">${data.message}</p>`, 'Partition Created'); loadDiskInfo(); }
+        else { showModal(`<p style="color:var(--danger);">${data.error}</p>`, 'Error'); }
+    } catch (e) { showModal(`<p style="color:var(--danger);">Failed: ${e.message}</p>`, 'Error'); }
+}
+
+function showDiskFormatModal(device) {
+    const html = `<div style="display:flex; flex-direction:column; gap:10px;">
+        <p>Format partition <b><code>${escapeHtml(device)}</code></b>.</p>
+        <div style="padding:10px; background:rgba(239,68,68,0.1); border:1px solid var(--danger); border-radius:6px; font-size:13px; color:var(--danger);">
+            <b>Warning:</b> This will erase ALL data on this partition.
+        </div>
+        <label style="font-size:12px; color:var(--text-muted);">Filesystem Type</label>
+        <select id="disk-fmt-type" class="form-control" style="width:100%;">
+            <option value="ext4">ext4 (recommended for Linux)</option>
+            <option value="xfs">XFS (high performance)</option>
+            <option value="btrfs">Btrfs (copy-on-write, snapshots)</option>
+            <option value="ext3">ext3</option>
+            <option value="ext2">ext2 (no journal)</option>
+            <option value="vfat">FAT32 / VFAT (EFI, USB drives)</option>
+            <option value="ntfs">NTFS (Windows compatible)</option>
+            <option value="swap">Swap</option>
+        </select>
+        <label style="font-size:12px; color:var(--text-muted);">Label (optional)</label>
+        <input type="text" id="disk-fmt-label" class="form-control" placeholder="e.g. data" style="width:100%;">
+        <label style="font-size:12px; color:var(--text-muted);">Type the device name to confirm:</label>
+        <input type="text" id="disk-fmt-confirm" class="form-control" placeholder="${escapeHtml(device)}" style="width:100%;">
+        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
+            <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+            <button class="btn" style="background:var(--danger); color:#fff;" onclick="diskFormatPartition('${device.replace(/'/g, "\\'")}')">Format</button>
+        </div>
+    </div>`;
+    showModal(html, 'Format Partition', { noOk: true });
+}
+
+async function diskFormatPartition(device) {
+    const confirm = document.getElementById('disk-fmt-confirm')?.value.trim();
+    if (confirm !== device) {
+        showModal(`<p style="color:var(--danger);">Device name does not match. Type <code>${escapeHtml(device)}</code> to confirm.</p>`, 'Confirmation Failed');
+        return;
+    }
+    const fstype = document.getElementById('disk-fmt-type')?.value || 'ext4';
+    const label = document.getElementById('disk-fmt-label')?.value.trim() || null;
+    document.querySelector('.modal-overlay')?.remove();
+    try {
+        const resp = await fetch(apiUrl('/api/storage/disk/format'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ device, fstype, label }),
+        });
+        const data = await resp.json();
+        if (data.ok) { showModal(`<p style="color:var(--success);">${data.message}</p>`, 'Formatted'); loadDiskInfo(); }
+        else { showModal(`<p style="color:var(--danger);">${data.error}</p>`, 'Error'); }
+    } catch (e) { showModal(`<p style="color:var(--danger);">Failed: ${e.message}</p>`, 'Error'); }
+}
+
+function showDiskDeletePartitionModal(device) {
+    const html = `<div style="display:flex; flex-direction:column; gap:10px;">
+        <p>Delete partition <b><code>${escapeHtml(device)}</code></b>?</p>
+        <div style="padding:10px; background:rgba(239,68,68,0.1); border:1px solid var(--danger); border-radius:6px; font-size:13px; color:var(--danger);">
+            <b>Warning:</b> This will permanently destroy the partition and all data on it. If it is mounted, it will be unmounted first.
+        </div>
+        <label style="font-size:12px; color:var(--text-muted);">Type the device name to confirm:</label>
+        <input type="text" id="disk-del-confirm" class="form-control" placeholder="${escapeHtml(device)}" style="width:100%;">
+        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
+            <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+            <button class="btn" style="background:var(--danger); color:#fff;" onclick="diskDeletePartition('${device.replace(/'/g, "\\'")}')">Delete Partition</button>
+        </div>
+    </div>`;
+    showModal(html, 'Delete Partition', { noOk: true });
+}
+
+async function diskDeletePartition(device) {
+    const confirm = document.getElementById('disk-del-confirm')?.value.trim();
+    if (confirm !== device) {
+        showModal(`<p style="color:var(--danger);">Device name does not match. Type <code>${escapeHtml(device)}</code> to confirm.</p>`, 'Confirmation Failed');
+        return;
+    }
+    document.querySelector('.modal-overlay')?.remove();
+    try {
+        const resp = await fetch(apiUrl('/api/storage/disk/partition/delete'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ device }),
+        });
+        const data = await resp.json();
+        if (data.ok) { showModal(`<p style="color:var(--success);">${data.message}</p>`, 'Deleted'); loadDiskInfo(); }
+        else { showModal(`<p style="color:var(--danger);">${data.error}</p>`, 'Error'); }
+    } catch (e) { showModal(`<p style="color:var(--danger);">Failed: ${e.message}</p>`, 'Error'); }
 }
 
 function formatStorageBytes(bytes) {
