@@ -2853,13 +2853,28 @@ async function cephCreatePool() {
 }
 
 async function cephDeletePool(name) {
-    const html = `<p>Are you sure you want to delete pool <b>${name}</b>?</p>
-        <p style="color:var(--danger); font-size:13px;">This will permanently destroy all data in this pool.</p>
-        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:12px;">
+    const html = `<div style="display:flex; flex-direction:column; gap:10px;">
+        <p>You are about to delete pool <b>${escapeHtml(name)}</b>.</p>
+        <div style="padding:10px; background:rgba(239,68,68,0.1); border:1px solid var(--danger); border-radius:6px; font-size:13px; color:var(--danger);">
+            <b>Warning:</b> This will permanently destroy ALL data stored in this pool. This action cannot be undone.
+        </div>
+        <label style="font-size:12px; color:var(--text-muted);">Type <b>YES</b> to confirm:</label>
+        <input type="text" id="ceph-del-pool-confirm" class="form-control" placeholder="YES" style="width:100%;" autocomplete="off">
+        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
             <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
-            <button class="btn" style="background:var(--danger); color:#fff;" onclick="this.closest('.modal-overlay').remove(); _doCephDeletePool('${name}')">Delete Pool</button>
-        </div>`;
+            <button class="btn" style="background:var(--danger); color:#fff;" onclick="_confirmCephDeletePool('${escapeHtml(name)}')">Delete Pool</button>
+        </div>
+    </div>`;
     showModal(html, 'Delete Pool', { noOk: true });
+    setTimeout(() => document.getElementById('ceph-del-pool-confirm')?.focus(), 100);
+}
+function _confirmCephDeletePool(name) {
+    if (document.getElementById('ceph-del-pool-confirm')?.value.trim() !== 'YES') {
+        showModal('<p style="color:var(--danger);">You must type <b>YES</b> to confirm deletion.</p>', 'Confirmation Required');
+        return;
+    }
+    document.querySelector('.modal-overlay')?.remove();
+    _doCephDeletePool(name);
 }
 
 async function _doCephDeletePool(name) {
@@ -2941,12 +2956,28 @@ async function cephOsdAction(osdId, action) {
 }
 
 async function cephRemoveOsd(osdId) {
-    const html = `<p>Remove <b>osd.${osdId}</b>? This will mark it out, stop the daemon, and purge it.</p>
-        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:12px;">
+    const html = `<div style="display:flex; flex-direction:column; gap:10px;">
+        <p>You are about to remove <b>osd.${osdId}</b>.</p>
+        <div style="padding:10px; background:rgba(239,68,68,0.1); border:1px solid var(--danger); border-radius:6px; font-size:13px; color:var(--danger);">
+            <b>Warning:</b> This will mark the OSD out, stop the daemon, and purge it from the cluster. Data will be rebalanced to remaining OSDs.
+        </div>
+        <label style="font-size:12px; color:var(--text-muted);">Type <b>YES</b> to confirm:</label>
+        <input type="text" id="ceph-del-osd-confirm" class="form-control" placeholder="YES" style="width:100%;" autocomplete="off">
+        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
             <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
-            <button class="btn" style="background:var(--danger); color:#fff;" onclick="this.closest('.modal-overlay').remove(); _doCephRemoveOsd(${osdId})">Remove OSD</button>
-        </div>`;
+            <button class="btn" style="background:var(--danger); color:#fff;" onclick="_confirmCephRemoveOsd(${osdId})">Remove OSD</button>
+        </div>
+    </div>`;
     showModal(html, 'Remove OSD', { noOk: true });
+    setTimeout(() => document.getElementById('ceph-del-osd-confirm')?.focus(), 100);
+}
+function _confirmCephRemoveOsd(osdId) {
+    if (document.getElementById('ceph-del-osd-confirm')?.value.trim() !== 'YES') {
+        showModal('<p style="color:var(--danger);">You must type <b>YES</b> to confirm removal.</p>', 'Confirmation Required');
+        return;
+    }
+    document.querySelector('.modal-overlay')?.remove();
+    _doCephRemoveOsd(osdId);
 }
 
 async function _doCephRemoveOsd(osdId) {
@@ -2997,12 +3028,28 @@ async function cephCreateFs() {
 }
 
 async function cephDeleteFs(name) {
-    const html = `<p>Delete CephFS filesystem <b>${name}</b>?</p>
-        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:12px;">
+    const html = `<div style="display:flex; flex-direction:column; gap:10px;">
+        <p>You are about to delete CephFS filesystem <b>${escapeHtml(name)}</b>.</p>
+        <div style="padding:10px; background:rgba(239,68,68,0.1); border:1px solid var(--danger); border-radius:6px; font-size:13px; color:var(--danger);">
+            <b>Warning:</b> This will destroy the filesystem and all files within it. This action cannot be undone.
+        </div>
+        <label style="font-size:12px; color:var(--text-muted);">Type <b>YES</b> to confirm:</label>
+        <input type="text" id="ceph-del-fs-confirm" class="form-control" placeholder="YES" style="width:100%;" autocomplete="off">
+        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
             <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
-            <button class="btn" style="background:var(--danger); color:#fff;" onclick="this.closest('.modal-overlay').remove(); _doCephDeleteFs('${name}')">Delete</button>
-        </div>`;
+            <button class="btn" style="background:var(--danger); color:#fff;" onclick="_confirmCephDeleteFs('${escapeHtml(name)}')">Delete Filesystem</button>
+        </div>
+    </div>`;
     showModal(html, 'Delete CephFS', { noOk: true });
+    setTimeout(() => document.getElementById('ceph-del-fs-confirm')?.focus(), 100);
+}
+function _confirmCephDeleteFs(name) {
+    if (document.getElementById('ceph-del-fs-confirm')?.value.trim() !== 'YES') {
+        showModal('<p style="color:var(--danger);">You must type <b>YES</b> to confirm deletion.</p>', 'Confirmation Required');
+        return;
+    }
+    document.querySelector('.modal-overlay')?.remove();
+    _doCephDeleteFs(name);
 }
 
 async function _doCephDeleteFs(name) {
@@ -4346,27 +4393,27 @@ function showDiskPartitionTableModal(disk) {
     const html = `<div style="display:flex; flex-direction:column; gap:10px;">
         <p>Create a new partition table on <b><code>${escapeHtml(disk)}</code></b>.</p>
         <div style="padding:10px; background:rgba(239,68,68,0.1); border:1px solid var(--danger); border-radius:6px; font-size:13px; color:var(--danger);">
-            <b>Warning:</b> This will erase ALL existing partitions and data on this disk.
+            <b>Warning:</b> This will erase ALL existing partitions and data on this disk. This action cannot be undone.
         </div>
         <label style="font-size:12px; color:var(--text-muted);">Partition Table Type</label>
         <select id="disk-pt-type" class="form-control" style="width:100%;">
             <option value="gpt">GPT (recommended for disks > 2TB and UEFI)</option>
             <option value="msdos">MBR / DOS (legacy BIOS, max 2TB)</option>
         </select>
-        <label style="font-size:12px; color:var(--text-muted);">Type the device name to confirm:</label>
-        <input type="text" id="disk-pt-confirm" class="form-control" placeholder="${escapeHtml(disk)}" style="width:100%;">
+        <label style="font-size:12px; color:var(--text-muted);">Type <b>YES</b> to confirm:</label>
+        <input type="text" id="disk-pt-confirm" class="form-control" placeholder="YES" style="width:100%;" autocomplete="off">
         <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
             <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
             <button class="btn" style="background:var(--danger); color:#fff;" onclick="diskCreatePartitionTable('${disk.replace(/'/g, "\\'")}')">Create Table</button>
         </div>
     </div>`;
     showModal(html, 'Create Partition Table', { noOk: true });
+    setTimeout(() => document.getElementById('disk-pt-confirm')?.focus(), 100);
 }
 
 async function diskCreatePartitionTable(disk) {
-    const confirm = document.getElementById('disk-pt-confirm')?.value.trim();
-    if (confirm !== disk) {
-        showModal(`<p style="color:var(--danger);">Device name does not match. Type <code>${escapeHtml(disk)}</code> to confirm.</p>`, 'Confirmation Failed');
+    if (document.getElementById('disk-pt-confirm')?.value.trim() !== 'YES') {
+        showModal('<p style="color:var(--danger);">You must type <b>YES</b> to confirm.</p>', 'Confirmation Required');
         return;
     }
     const tableType = document.getElementById('disk-pt-type')?.value || 'gpt';
@@ -4474,7 +4521,7 @@ function showDiskFormatModal(device) {
     const html = `<div style="display:flex; flex-direction:column; gap:10px;">
         <p>Format partition <b><code>${escapeHtml(device)}</code></b>.</p>
         <div style="padding:10px; background:rgba(239,68,68,0.1); border:1px solid var(--danger); border-radius:6px; font-size:13px; color:var(--danger);">
-            <b>Warning:</b> This will erase ALL data on this partition.
+            <b>Warning:</b> This will erase ALL data on this partition. This action cannot be undone.
         </div>
         <label style="font-size:12px; color:var(--text-muted);">Filesystem Type</label>
         <select id="disk-fmt-type" class="form-control" style="width:100%;">
@@ -4489,20 +4536,20 @@ function showDiskFormatModal(device) {
         </select>
         <label style="font-size:12px; color:var(--text-muted);">Label (optional)</label>
         <input type="text" id="disk-fmt-label" class="form-control" placeholder="e.g. data" style="width:100%;">
-        <label style="font-size:12px; color:var(--text-muted);">Type the device name to confirm:</label>
-        <input type="text" id="disk-fmt-confirm" class="form-control" placeholder="${escapeHtml(device)}" style="width:100%;">
+        <label style="font-size:12px; color:var(--text-muted);">Type <b>YES</b> to confirm:</label>
+        <input type="text" id="disk-fmt-confirm" class="form-control" placeholder="YES" style="width:100%;" autocomplete="off">
         <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
             <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
             <button class="btn" style="background:var(--danger); color:#fff;" onclick="diskFormatPartition('${device.replace(/'/g, "\\'")}')">Format</button>
         </div>
     </div>`;
     showModal(html, 'Format Partition', { noOk: true });
+    setTimeout(() => document.getElementById('disk-fmt-confirm')?.focus(), 100);
 }
 
 async function diskFormatPartition(device) {
-    const confirm = document.getElementById('disk-fmt-confirm')?.value.trim();
-    if (confirm !== device) {
-        showModal(`<p style="color:var(--danger);">Device name does not match. Type <code>${escapeHtml(device)}</code> to confirm.</p>`, 'Confirmation Failed');
+    if (document.getElementById('disk-fmt-confirm')?.value.trim() !== 'YES') {
+        showModal('<p style="color:var(--danger);">You must type <b>YES</b> to confirm.</p>', 'Confirmation Required');
         return;
     }
     const fstype = document.getElementById('disk-fmt-type')?.value || 'ext4';
@@ -4521,24 +4568,24 @@ async function diskFormatPartition(device) {
 
 function showDiskDeletePartitionModal(device) {
     const html = `<div style="display:flex; flex-direction:column; gap:10px;">
-        <p>Delete partition <b><code>${escapeHtml(device)}</code></b>?</p>
+        <p>You are about to delete partition <b><code>${escapeHtml(device)}</code></b>.</p>
         <div style="padding:10px; background:rgba(239,68,68,0.1); border:1px solid var(--danger); border-radius:6px; font-size:13px; color:var(--danger);">
-            <b>Warning:</b> This will permanently destroy the partition and all data on it. If it is mounted, it will be unmounted first.
+            <b>Warning:</b> This will permanently destroy the partition and all data on it. If it is mounted, it will be unmounted first. This action cannot be undone.
         </div>
-        <label style="font-size:12px; color:var(--text-muted);">Type the device name to confirm:</label>
-        <input type="text" id="disk-del-confirm" class="form-control" placeholder="${escapeHtml(device)}" style="width:100%;">
+        <label style="font-size:12px; color:var(--text-muted);">Type <b>YES</b> to confirm:</label>
+        <input type="text" id="disk-del-confirm" class="form-control" placeholder="YES" style="width:100%;" autocomplete="off">
         <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
             <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
             <button class="btn" style="background:var(--danger); color:#fff;" onclick="diskDeletePartition('${device.replace(/'/g, "\\'")}')">Delete Partition</button>
         </div>
     </div>`;
     showModal(html, 'Delete Partition', { noOk: true });
+    setTimeout(() => document.getElementById('disk-del-confirm')?.focus(), 100);
 }
 
 async function diskDeletePartition(device) {
-    const confirm = document.getElementById('disk-del-confirm')?.value.trim();
-    if (confirm !== device) {
-        showModal(`<p style="color:var(--danger);">Device name does not match. Type <code>${escapeHtml(device)}</code> to confirm.</p>`, 'Confirmation Failed');
+    if (document.getElementById('disk-del-confirm')?.value.trim() !== 'YES') {
+        showModal('<p style="color:var(--danger);">You must type <b>YES</b> to confirm.</p>', 'Confirmation Required');
         return;
     }
     document.querySelector('.modal-overlay')?.remove();
