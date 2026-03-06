@@ -1086,6 +1086,10 @@ impl VmManager {
             }
         }
 
+        // On firewalld systems, add TAP + WolfNet to trusted zone so firewalld's
+        // nftables REJECT rule doesn't block forwarded VM traffic
+        crate::containers::ensure_firewalld_trusted(&[tap, &wn_iface]);
+
         // iptables FORWARD: allow all traffic to/from the TAP (not just wolfnet0,
         // so the VM can also reach the internet when FORWARD chain default is DROP)
         let check_in = Command::new("iptables")

@@ -2720,6 +2720,9 @@ fn setup_bridge_nat(bridge: &WireGuardBridge) -> Result<(), String> {
     let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.send_redirects=0", iface)]).output();
     let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.send_redirects=0", wn_iface)]).output();
 
+    // On firewalld systems, add WG + WolfNet to trusted zone
+    crate::containers::ensure_firewalld_trusted(&[&iface, &wn_iface]);
+
     // Clean up any existing rules for this bridge first
     cleanup_bridge_nat(bridge);
 

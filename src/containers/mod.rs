@@ -58,7 +58,7 @@ pub fn wolfnet_init() {
 /// Add interfaces to the firewalld trusted zone (if firewalld is running).
 /// This prevents firewalld's nftables REJECT rule from blocking forwarded
 /// traffic between WolfNet, container bridges, and WireGuard interfaces.
-fn ensure_firewalld_trusted(ifaces: &[&str]) {
+pub fn ensure_firewalld_trusted(ifaces: &[&str]) {
     // Quick check: is firewalld running?
     let running = Command::new("firewall-cmd").args(["--state"])
         .output()
@@ -1358,7 +1358,19 @@ fn lxc_apply_wolfnet(container: &str) {
             let _ = Command::new("iptables").args(["-I", "FORWARD", "-i", "lxcbr0", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
         }
 
-
+        // On Fedora/RHEL/AlmaLinux containers, firewalld blocks inbound WolfNet
+        // traffic by default. Add the WolfNet interface to the trusted zone inside
+        // the container so other nodes can reach services running here.
+        let wn_iface = if is_pve { "wn0" } else { "eth0" };
+        let fw_cmd = format!(
+            "if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then \
+                 firewall-cmd --permanent --zone=trusted --add-interface={} 2>/dev/null; \
+                 firewall-cmd --reload 2>/dev/null; \
+             fi; true", wn_iface
+        );
+        let mut fw_args: Vec<String> = attach_prefix.clone();
+        fw_args.extend(["sh", "-c", &fw_cmd].iter().map(|s| s.to_string()));
+        let _ = Command::new("lxc-attach").args(&fw_args).output();
     }
 }
 
