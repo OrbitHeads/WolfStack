@@ -55,6 +55,73 @@ function applyMapCollapse() {
     }
 }
 
+// ─── Bookmarks ───
+function loadBookmarks() {
+    try { return JSON.parse(localStorage.getItem('wolfstack_bookmarks') || '[]'); }
+    catch { return []; }
+}
+function saveBookmarks(bookmarks) {
+    localStorage.setItem('wolfstack_bookmarks', JSON.stringify(bookmarks));
+}
+function renderBookmarks() {
+    const el = document.getElementById('bookmarks-list');
+    if (!el) return;
+    const bookmarks = loadBookmarks();
+    if (bookmarks.length === 0) {
+        el.innerHTML = '<div style="color:var(--text-muted); font-size:13px; padding:20px; text-align:center; width:100%;">No bookmarks yet. Click <b>+ Add</b> to save your favourite links.</div>';
+        return;
+    }
+    el.innerHTML = bookmarks.map((b, i) => `
+        <a href="${b.url}" target="_blank" rel="noopener" class="bookmark-item" title="${b.url}">
+            <img src="https://www.google.com/s2/favicons?domain=${new URL(b.url).hostname}&sz=32" alt="" style="width:16px;height:16px;border-radius:2px;">
+            <span>${b.name}</span>
+            <span class="bookmark-delete" onclick="event.preventDefault();event.stopPropagation();deleteBookmark(${i})">×</span>
+        </a>
+    `).join('');
+}
+let _bookmarkOverlay = null;
+function showAddBookmarkModal() {
+    const html = `
+        <div style="display:flex;flex-direction:column;gap:12px;">
+            <div>
+                <label style="font-size:13px;color:var(--text-muted);margin-bottom:4px;display:block;">Name</label>
+                <input type="text" id="bookmark-name" class="form-control" placeholder="e.g. GitHub" style="width:100%;">
+            </div>
+            <div>
+                <label style="font-size:13px;color:var(--text-muted);margin-bottom:4px;display:block;">URL</label>
+                <input type="url" id="bookmark-url" class="form-control" placeholder="https://github.com" style="width:100%;">
+            </div>
+            <div style="display:flex;gap:8px;justify-content:flex-end;">
+                <button class="btn btn-secondary" onclick="dismissBookmarkModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="addBookmark()">Add Bookmark</button>
+            </div>
+        </div>`;
+    showModal(html, '🔖 Add Bookmark');
+    // Grab the overlay we just created (last child of body)
+    _bookmarkOverlay = document.body.lastElementChild;
+    setTimeout(() => document.getElementById('bookmark-name')?.focus(), 100);
+}
+function dismissBookmarkModal() {
+    if (_bookmarkOverlay) { _bookmarkOverlay.remove(); _bookmarkOverlay = null; }
+}
+function addBookmark() {
+    const name = document.getElementById('bookmark-name')?.value.trim();
+    let url = document.getElementById('bookmark-url')?.value.trim();
+    if (!name || !url) return;
+    if (!url.match(/^https?:\/\//)) url = 'https://' + url;
+    const bookmarks = loadBookmarks();
+    bookmarks.push({ name, url });
+    saveBookmarks(bookmarks);
+    renderBookmarks();
+    dismissBookmarkModal();
+}
+function deleteBookmark(index) {
+    const bookmarks = loadBookmarks();
+    bookmarks.splice(index, 1);
+    saveBookmarks(bookmarks);
+    renderBookmarks();
+}
+
 // ─── Dashboard Layout Preferences ───
 let dcLayout = localStorage.getItem('wolfstack_dc_layout') || 'grid';
 let dcCompact = localStorage.getItem('wolfstack_dc_compact') === '1';
@@ -982,8 +1049,8 @@ function renderDatacenterOverview() {
         container.innerHTML = html;
     }
 
-    // Initialize Map
-    setTimeout(() => { updateMap(nodes); applyMapCollapse(); }, 100);
+    // Initialize Map + Bookmarks
+    setTimeout(() => { updateMap(nodes); applyMapCollapse(); renderBookmarks(); }, 100);
 }
 
 // ─── Sparkline mini-charts for datacenter cards ───

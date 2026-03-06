@@ -47,6 +47,37 @@
         .leaflet-popup-close-button {
             color: var(--text-muted) !important;
         }
+
+        /* Bookmark Styles */
+        .bookmark-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 10px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text-primary);
+            text-decoration: none;
+            font-size: 13px;
+            transition: background 0.15s, border-color 0.15s;
+            position: relative;
+        }
+        .bookmark-item:hover {
+            background: var(--bg-hover);
+            border-color: var(--accent);
+        }
+        .bookmark-delete {
+            display: none;
+            color: var(--text-muted);
+            font-size: 16px;
+            line-height: 1;
+            cursor: pointer;
+            margin-left: auto;
+            padding: 0 2px;
+        }
+        .bookmark-delete:hover { color: var(--danger); }
+        .bookmark-item:hover .bookmark-delete { display: block; }
     </style>
 </head>
 
@@ -169,17 +200,27 @@
             <!-- ═══ Datacenter Overview ═══ -->
             <div id="page-datacenter" class="page-view">
 
-                <!-- World Map -->
-                <div class="card" id="map-card" style="margin-bottom: 12px; overflow: hidden;">
-                    <div class="card-header" style="cursor:pointer;" onclick="toggleMapCollapse()">
-                        <h3>🌍 Global Infrastructure</h3>
-                        <div style="display:flex; align-items:center; gap:10px;">
-                            <span style="font-size: 12px; color: var(--text-muted);">Live Server Locations</span>
+                <!-- Map + Bookmarks Row -->
+                <div style="display: grid; grid-template-columns: 1fr 2fr; gap: 12px; margin-bottom: 12px;">
+                    <!-- World Map -->
+                    <div class="card" id="map-card" style="overflow: hidden;">
+                        <div class="card-header" style="cursor:pointer;" onclick="toggleMapCollapse()">
+                            <h3>🌍 Infrastructure</h3>
                             <span id="map-toggle-icon" style="font-size:12px; color:var(--text-muted); transition:transform 0.3s ease;">▼</span>
                         </div>
+                        <div id="world-map-wrap" style="height:0; overflow:hidden; transition:height 0.3s ease;">
+                            <div id="world-map" style="height: 220px; width: 100%; border: none; border-radius: 0;"></div>
+                        </div>
                     </div>
-                    <div id="world-map-wrap" style="height:0; overflow:hidden; transition:height 0.3s ease;">
-                        <div id="world-map" style="height: 220px; width: 100%; border: none; border-radius: 0;"></div>
+
+                    <!-- Bookmarks -->
+                    <div class="card" id="bookmarks-card" style="overflow: hidden;">
+                        <div class="card-header">
+                            <h3>🔖 Bookmarks</h3>
+                            <button class="btn btn-sm" onclick="showAddBookmarkModal()" style="padding: 2px 10px; font-size: 12px;">+ Add</button>
+                        </div>
+                        <div id="bookmarks-list" style="padding: 10px; display: flex; flex-wrap: wrap; gap: 8px; max-height: 220px; overflow-y: auto;">
+                        </div>
                     </div>
                 </div>
 
