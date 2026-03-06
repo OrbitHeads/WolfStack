@@ -5061,6 +5061,19 @@ pub async fn ceph_devices(
     }
 }
 
+/// POST /api/ceph/install — install ceph packages
+pub async fn ceph_install(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    match web::block(|| crate::ceph::install_ceph()).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({"ok": true, "message": msg})),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": e})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": format!("{}", e)})),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct CephBootstrapRequest {
     #[serde(default)]
@@ -10385,6 +10398,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // Ceph Cluster
         .route("/api/ceph/status", web::get().to(ceph_status))
         .route("/api/ceph/install-status", web::get().to(ceph_install_status))
+        .route("/api/ceph/install", web::post().to(ceph_install))
         .route("/api/ceph/devices", web::get().to(ceph_devices))
         .route("/api/ceph/bootstrap", web::post().to(ceph_bootstrap))
         .route("/api/ceph/pools", web::post().to(ceph_create_pool))

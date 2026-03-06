@@ -752,6 +752,54 @@ pub fn get_install_status() -> serde_json::Value {
     })
 }
 
+/// Install Ceph packages using the system package manager
+pub fn install_ceph() -> Result<String, String> {
+    let distro = crate::installer::detect_distro();
+    info!("Installing Ceph packages (distro: {:?})", distro);
+
+    match distro {
+        crate::installer::DistroFamily::Debian => {
+            // apt-get install
+            let output = Command::new("apt-get")
+                .args(["install", "-y", "ceph", "ceph-common", "ceph-mon", "ceph-osd", "ceph-mgr", "ceph-mds", "ceph-volume", "ceph-fuse", "radosgw"])
+                .output()
+                .map_err(|e| format!("Failed to run apt-get: {}", e))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("apt-get install failed: {}", stderr.trim()));
+            }
+            Ok("Ceph packages installed successfully via apt".to_string())
+        }
+        crate::installer::DistroFamily::RedHat => {
+            // Enable EPEL if needed, then dnf install
+            let _ = Command::new("dnf").args(["install", "-y", "epel-release"]).output();
+            let output = Command::new("dnf")
+                .args(["install", "-y", "ceph", "ceph-common", "ceph-mon", "ceph-osd", "ceph-mgr", "ceph-mds", "ceph-volume", "ceph-fuse", "ceph-radosgw"])
+                .output()
+                .map_err(|e| format!("Failed to run dnf: {}", e))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("dnf install failed: {}", stderr.trim()));
+            }
+            Ok("Ceph packages installed successfully via dnf".to_string())
+        }
+        crate::installer::DistroFamily::Suse => {
+            let output = Command::new("zypper")
+                .args(["install", "-y", "ceph", "ceph-common", "ceph-mon", "ceph-osd", "ceph-mgr", "ceph-mds", "ceph-volume", "ceph-fuse", "ceph-radosgw"])
+                .output()
+                .map_err(|e| format!("Failed to run zypper: {}", e))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("zypper install failed: {}", stderr.trim()));
+            }
+            Ok("Ceph packages installed successfully via zypper".to_string())
+        }
+        crate::installer::DistroFamily::Unknown => {
+            Err("Unsupported distro — cannot auto-install. Please install Ceph packages manually.".to_string())
+        }
+    }
+}
+
 /// Bootstrap a new Ceph cluster (mon + mgr on this node)
 pub fn bootstrap_cluster(cluster_name: &str, public_network: &str, mon_ip: &str) -> Result<String, String> {
     if public_network.is_empty() || mon_ip.is_empty() {

@@ -2552,16 +2552,13 @@ async function loadCephStatus() {
             setupBanner.style.display = 'block';
             clusterView.style.display = 'none';
             document.getElementById('ceph-install-status').innerHTML = `
-                <div style="display:flex; align-items:center; gap:12px; padding:16px; background:var(--bg-secondary); border-radius:8px; border:1px solid var(--border);">
+                <div style="display:flex; align-items:center; gap:16px; padding:16px; background:var(--bg-secondary); border-radius:8px; border:1px solid var(--border);">
                     <span style="font-size:32px;">📦</span>
-                    <div>
+                    <div style="flex:1;">
                         <div style="font-weight:600; margin-bottom:4px;">Ceph is not installed</div>
-                        <div style="font-size:13px; color:var(--text-muted);">Install Ceph packages to manage a distributed storage cluster.</div>
-                        <div style="margin-top:8px; font-size:12px; color:var(--text-muted);">
-                            Run: <code>apt install ceph ceph-common ceph-mon ceph-osd ceph-mgr ceph-mds ceph-volume</code> (Debian/Ubuntu)<br>
-                            or: <code>dnf install ceph ceph-common ceph-mon ceph-osd ceph-mgr ceph-mds ceph-volume</code> (Fedora/RHEL)
-                        </div>
+                        <div style="font-size:13px; color:var(--text-muted);">Install Ceph packages to set up a distributed storage cluster on this node.</div>
                     </div>
+                    <button class="btn btn-primary" onclick="cephInstallPackages()" id="ceph-install-btn">Install Ceph</button>
                 </div>`;
             document.getElementById('ceph-bootstrap-form').style.display = 'none';
             return;
@@ -2723,6 +2720,38 @@ function renderCephStatus(s) {
 }
 
 // ── Bootstrap ──
+async function cephInstallPackages() {
+    const html = `<p>This will install the Ceph storage packages on this node using the system package manager.</p>
+        <p style="font-size:13px; color:var(--text-muted);">Packages: ceph, ceph-common, ceph-mon, ceph-osd, ceph-mgr, ceph-mds, ceph-volume, ceph-fuse, radosgw</p>
+        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:12px;">
+            <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+            <button class="btn btn-primary" onclick="this.closest('.modal-overlay').remove(); _doCephInstall()">Install</button>
+        </div>`;
+    showModal(html, 'Install Ceph', { noOk: true });
+}
+
+async function _doCephInstall() {
+    const btn = document.getElementById('ceph-install-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Installing...'; }
+    showModal('<p>Installing Ceph packages... This may take several minutes.</p><div style="margin-top:12px; text-align:center;"><div class="spinner" style="border:3px solid var(--border); border-top:3px solid var(--accent); border-radius:50%; width:24px; height:24px; animation:spin 1s linear infinite; display:inline-block;"></div></div>', 'Installing Ceph', { noOk: true });
+    try {
+        const resp = await fetch(apiUrl('/api/ceph/install'), { method: 'POST' });
+        const data = await resp.json();
+        document.querySelector('.modal-overlay')?.remove();
+        if (data.ok) {
+            showModal(`<p style="color:var(--success);">${data.message}</p><p style="font-size:13px; color:var(--text-muted); margin-top:8px;">You can now bootstrap a new cluster or join an existing one.</p>`, 'Ceph Installed');
+            loadCephStatus();
+        } else {
+            showModal(`<p style="color:var(--danger);">${data.error || 'Installation failed'}</p>`, 'Installation Error');
+            if (btn) { btn.disabled = false; btn.textContent = 'Install Ceph'; }
+        }
+    } catch (e) {
+        document.querySelector('.modal-overlay')?.remove();
+        showModal(`<p style="color:var(--danger);">Request failed: ${e.message}</p>`, 'Error');
+        if (btn) { btn.disabled = false; btn.textContent = 'Install Ceph'; }
+    }
+}
+
 async function cephBootstrapCluster() {
     const clusterName = document.getElementById('ceph-cluster-name')?.value.trim() || 'ceph';
     const monIp = document.getElementById('ceph-mon-ip')?.value.trim();
