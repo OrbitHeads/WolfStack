@@ -67,16 +67,18 @@
             background: var(--bg-hover);
             border-color: var(--accent);
         }
-        .bookmark-delete {
+        .bookmark-edit, .bookmark-delete {
             display: none;
             color: var(--text-muted);
-            font-size: 16px;
+            font-size: 14px;
             line-height: 1;
             cursor: pointer;
-            margin-left: auto;
             padding: 0 2px;
         }
+        .bookmark-edit { margin-left: auto; }
+        .bookmark-edit:hover { color: var(--accent); }
         .bookmark-delete:hover { color: var(--danger); }
+        .bookmark-item:hover .bookmark-edit,
         .bookmark-item:hover .bookmark-delete { display: block; }
         .bm-icon-opt {
             width: 30px; height: 30px;

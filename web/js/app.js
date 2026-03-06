@@ -61,6 +61,9 @@ const BOOKMARK_ICONS = [
     '📋','📦','🗄️','🔒','🔑','💾','📡','🌍','☁️','🐳',
     '🐧','🔥','💬','📧','🎯','⭐','❤️','🏠','🚀','📌',
     '🎮','🎵','📷','🛒','💰','📚','🔬','🧪','🤖','👾',
+    '🗂️','📎','🔗','🧭','🗺️','📱','🖨️','🎨','🔍','💡',
+    '🏢','🏗️','📡','🛡️','🧩','📐','🗃️','💳','🔔','📢',
+    '🎓','🏆','🌟','💎','🔮','🧲','⚡','🌈','🍀','🐾',
 ];
 
 function loadBookmarks() {
@@ -78,35 +81,58 @@ function renderBookmarks() {
         el.innerHTML = '<div style="color:var(--text-muted); font-size:13px; padding:20px; text-align:center; width:100%;">No bookmarks yet. Click <b>+ Add</b> to save your favourite links.</div>';
         return;
     }
-    el.innerHTML = bookmarks.map((b, i) => `
-        <a href="${b.url}" target="_blank" rel="noopener" class="bookmark-item" title="${b.url}">
-            <span style="font-size:16px;line-height:1;">${b.icon || '🌐'}</span>
-            <span>${b.name}</span>
+    el.innerHTML = bookmarks.map((b, i) => {
+        const esc = (s) => s.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        const iconHtml = b.imageUrl
+            ? `<img src="${esc(b.imageUrl)}" style="width:18px;height:18px;border-radius:3px;object-fit:contain;" onerror="this.style.display='none';this.nextElementSibling.style.display=''">`
+              + `<span style="font-size:16px;line-height:1;display:none;">${b.icon || '🌐'}</span>`
+            : `<span style="font-size:16px;line-height:1;">${b.icon || '🌐'}</span>`;
+        return `<a href="${esc(b.url)}" target="_blank" rel="noopener" class="bookmark-item" title="${esc(b.url)}">
+            ${iconHtml}
+            <span>${esc(b.name)}</span>
+            <span class="bookmark-edit" onclick="event.preventDefault();event.stopPropagation();showEditBookmarkModal(${i})">✎</span>
             <span class="bookmark-delete" onclick="event.preventDefault();event.stopPropagation();deleteBookmark(${i})">×</span>
-        </a>
-    `).join('');
+        </a>`;
+    }).join('');
 }
 let _bookmarkOverlay = null;
 let _selectedBookmarkIcon = '🌐';
-function showAddBookmarkModal() {
-    _selectedBookmarkIcon = '🌐';
+let _editingBookmarkIndex = -1;
+function _bookmarkModalHtml(icon, name, url, imageUrl, isEdit) {
     const iconGrid = BOOKMARK_ICONS.map(ic =>
-        `<span class="bm-icon-opt${ic === '🌐' ? ' selected' : ''}" onclick="selectBookmarkIcon(this,'${ic}')">${ic}</span>`
+        `<span class="bm-icon-opt${ic === icon ? ' selected' : ''}" onclick="selectBookmarkIcon(this,'${ic}')">${ic}</span>`
     ).join('');
-    const html = `
+    const esc = (s) => (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;');
+    return `
         <div style="display:flex;flex-direction:column;gap:6px;">
             <label style="font-size:12px;color:var(--text-muted);">Icon</label>
             <div id="bookmark-icon-grid" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px;">${iconGrid}</div>
+            <label style="font-size:12px;color:var(--text-muted);">Custom Image URL <span style="font-size:11px;opacity:0.6;">(optional — overrides icon)</span></label>
+            <input type="url" id="bookmark-image-url" class="form-control" placeholder="https://example.com/logo.png" value="${esc(imageUrl)}" style="width:100%;margin-bottom:4px;">
             <label style="font-size:12px;color:var(--text-muted);">Name</label>
-            <input type="text" id="bookmark-name" class="form-control" placeholder="e.g. GitHub" style="width:100%;margin-bottom:4px;">
+            <input type="text" id="bookmark-name" class="form-control" placeholder="e.g. GitHub" value="${esc(name)}" style="width:100%;margin-bottom:4px;">
             <label style="font-size:12px;color:var(--text-muted);">URL</label>
-            <input type="url" id="bookmark-url" class="form-control" placeholder="https://github.com" style="width:100%;margin-bottom:6px;">
+            <input type="url" id="bookmark-url" class="form-control" placeholder="https://github.com" value="${esc(url)}" style="width:100%;margin-bottom:6px;">
             <div style="display:flex;gap:8px;justify-content:flex-end;">
                 <button class="btn btn-secondary" onclick="dismissBookmarkModal()">Cancel</button>
-                <button class="btn btn-primary" onclick="addBookmark()">Add Bookmark</button>
+                <button class="btn btn-primary" onclick="${isEdit ? 'saveEditedBookmark()' : 'addBookmark()'}">${isEdit ? 'Save Changes' : 'Add Bookmark'}</button>
             </div>
         </div>`;
-    showModal(html, '🔖 Add Bookmark', { noOk: true });
+}
+function showAddBookmarkModal() {
+    _selectedBookmarkIcon = '🌐';
+    _editingBookmarkIndex = -1;
+    showModal(_bookmarkModalHtml('🌐', '', '', '', false), '🔖 Add Bookmark', { noOk: true });
+    _bookmarkOverlay = document.body.lastElementChild;
+    setTimeout(() => document.getElementById('bookmark-name')?.focus(), 100);
+}
+function showEditBookmarkModal(index) {
+    const bookmarks = loadBookmarks();
+    const b = bookmarks[index];
+    if (!b) return;
+    _editingBookmarkIndex = index;
+    _selectedBookmarkIcon = b.icon || '🌐';
+    showModal(_bookmarkModalHtml(b.icon || '🌐', b.name, b.url, b.imageUrl || '', true), '✎ Edit Bookmark', { noOk: true });
     _bookmarkOverlay = document.body.lastElementChild;
     setTimeout(() => document.getElementById('bookmark-name')?.focus(), 100);
 }
@@ -117,14 +143,31 @@ function selectBookmarkIcon(el, icon) {
 }
 function dismissBookmarkModal() {
     if (_bookmarkOverlay) { _bookmarkOverlay.remove(); _bookmarkOverlay = null; }
+    _editingBookmarkIndex = -1;
 }
-function addBookmark() {
+function _getBookmarkFormValues() {
     const name = document.getElementById('bookmark-name')?.value.trim();
     let url = document.getElementById('bookmark-url')?.value.trim();
-    if (!name || !url) return;
+    const imageUrl = document.getElementById('bookmark-image-url')?.value.trim() || '';
+    if (!name || !url) return null;
     if (!url.match(/^https?:\/\//)) url = 'https://' + url;
+    return { name, url, icon: _selectedBookmarkIcon, imageUrl };
+}
+function addBookmark() {
+    const vals = _getBookmarkFormValues();
+    if (!vals) return;
     const bookmarks = loadBookmarks();
-    bookmarks.push({ name, url, icon: _selectedBookmarkIcon });
+    bookmarks.push(vals);
+    saveBookmarks(bookmarks);
+    renderBookmarks();
+    dismissBookmarkModal();
+}
+function saveEditedBookmark() {
+    const vals = _getBookmarkFormValues();
+    if (!vals || _editingBookmarkIndex < 0) return;
+    const bookmarks = loadBookmarks();
+    if (_editingBookmarkIndex >= bookmarks.length) return;
+    bookmarks[_editingBookmarkIndex] = vals;
     saveBookmarks(bookmarks);
     renderBookmarks();
     dismissBookmarkModal();
