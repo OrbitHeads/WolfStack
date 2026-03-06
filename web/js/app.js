@@ -4619,13 +4619,18 @@ function showDiskCreatePartitionModal(disk) {
                 Use all free space
             </label>
         </div>
-        <label style="font-size:12px; color:var(--text-muted);">Filesystem type hint (optional)</label>
+        <label style="font-size:12px; color:var(--text-muted);">Partition type hint</label>
         <select id="disk-part-fshint" class="form-control" style="width:100%;">
-            <option value="">Default (Linux)</option>
-            <option value="swap">Swap</option>
-            <option value="fat32">FAT32 (EFI/Windows)</option>
-            <option value="ntfs">NTFS</option>
+            <option value="">Linux (ext4, XFS, Btrfs, F2FS, JFS, etc.)</option>
+            <option value="swap">Linux Swap</option>
+            <option value="fat32">FAT32 / exFAT (EFI, USB drives)</option>
+            <option value="linux-lvm">Linux LVM</option>
+            <option value="linux-raid">Linux RAID</option>
+            <option value="zfs">ZFS</option>
         </select>
+        <div style="font-size:11px; color:var(--text-muted); margin-top:-6px;">
+            This sets the partition type flag only. Use <b>Format</b> afterwards to create the actual filesystem.
+        </div>
         <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
             <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
             <button class="btn btn-primary" onclick="diskCreatePartition('${disk.replace(/'/g, "\\'")}')">Create Partition</button>
@@ -4704,12 +4709,16 @@ function showDiskFormatModal(device) {
         <label style="font-size:12px; color:var(--text-muted);">Filesystem Type</label>
         <select id="disk-fmt-type" class="form-control" style="width:100%;">
             <option value="ext4">ext4 (recommended for Linux)</option>
-            <option value="xfs">XFS (high performance)</option>
-            <option value="btrfs">Btrfs (copy-on-write, snapshots)</option>
-            <option value="ext3">ext3</option>
+            <option value="xfs">XFS (high performance, data servers)</option>
+            <option value="btrfs">Btrfs (copy-on-write, snapshots, compression)</option>
+            <option value="f2fs">F2FS (flash-friendly, SSDs/NVMe)</option>
+            <option value="ext3">ext3 (journaled, legacy)</option>
             <option value="ext2">ext2 (no journal)</option>
-            <option value="vfat">FAT32 / VFAT (EFI, USB drives)</option>
-            <option value="ntfs">NTFS (Windows compatible)</option>
+            <option value="jfs">JFS (IBM journaled filesystem)</option>
+            <option value="reiserfs">ReiserFS (small files, legacy)</option>
+            <option value="nilfs2">NILFS2 (log-structured, continuous snapshots)</option>
+            <option value="exfat">exFAT (USB drives, cross-platform)</option>
+            <option value="vfat">FAT32 / VFAT (EFI, small USB drives)</option>
             <option value="swap">Swap</option>
         </select>
         <label style="font-size:12px; color:var(--text-muted);">Label (optional)</label>

@@ -1263,7 +1263,8 @@ const PROTECTED_MOUNTS: &[&str] = &["/", "/boot", "/boot/efi", "/home"];
 
 /// Supported filesystem types for formatting
 pub const SUPPORTED_FILESYSTEMS: &[&str] = &[
-    "ext4", "ext3", "ext2", "xfs", "btrfs", "vfat", "fat32", "ntfs", "swap",
+    "ext4", "ext3", "ext2", "xfs", "btrfs", "f2fs", "jfs", "reiserfs",
+    "nilfs2", "exfat", "vfat", "fat32", "swap",
 ];
 
 /// Validate that a device path is a real block device and not protected
@@ -1447,7 +1448,9 @@ pub fn create_partition(disk: &str, size_mb: Option<u64>, fs_type_hint: Option<&
     let part_type = match fs_hint {
         "swap" => "linux-swap",
         "vfat" | "fat32" => "fat32",
-        "ntfs" => "ntfs",
+        "linux-lvm" => "ext2", // parted will set LVM flag separately
+        "linux-raid" => "ext2", // parted will set raid flag separately
+        "zfs" => "zfs",
         _ => "ext2", // parted type hint, actual filesystem is created by mkfs later
     };
 
@@ -1462,6 +1465,27 @@ pub fn create_partition(disk: &str, size_mb: Option<u64>, fs_type_hint: Option<&
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("parted mkpart failed: {}", stderr.trim()));
+    }
+
+    // Set LVM or RAID flag if requested — find the newest partition number
+    if fs_hint == "linux-lvm" || fs_hint == "linux-raid" {
+        let list_out = Command::new("parted")
+            .args(["-s", "-m", disk, "print"])
+            .output()
+            .ok();
+        if let Some(lo) = list_out {
+            let text = String::from_utf8_lossy(&lo.stdout);
+            // Lines like "1:1049kB:500MB:499MB:ext2:primary:;" — last numbered line is newest
+            let last_num = text.lines()
+                .filter_map(|l| l.split(':').next()?.parse::<u32>().ok())
+                .last();
+            if let Some(num) = last_num {
+                let flag = if fs_hint == "linux-lvm" { "lvm" } else { "raid" };
+                let _ = Command::new("parted")
+                    .args(["-s", disk, "set", &num.to_string(), flag, "on"])
+                    .output();
+            }
+        }
     }
 
     // Inform kernel of partition changes
@@ -1602,18 +1626,46 @@ pub fn format_partition(device: &str, fstype: &str, label: Option<&str>) -> Resu
                 if !l.is_empty() { args.push("-L"); args.push(l); }
             }
         }
+        "f2fs" => {
+            cmd = "mkfs.f2fs".to_string();
+            args.push("-f");
+            if let Some(l) = label {
+                if !l.is_empty() { args.push("-l"); args.push(l); }
+            }
+        }
+        "jfs" => {
+            cmd = "mkfs.jfs".to_string();
+            args.push("-q"); // Don't prompt
+            if let Some(l) = label {
+                if !l.is_empty() { args.push("-L"); args.push(l); }
+            }
+        }
+        "reiserfs" => {
+            cmd = "mkfs.reiserfs".to_string();
+            args.push("-f");
+            args.push("-q");
+            if let Some(l) = label {
+                if !l.is_empty() { args.push("-l"); args.push(l); }
+            }
+        }
+        "nilfs2" => {
+            cmd = "mkfs.nilfs2".to_string();
+            args.push("-f");
+            if let Some(l) = label {
+                if !l.is_empty() { args.push("-L"); args.push(l); }
+            }
+        }
+        "exfat" => {
+            cmd = "mkfs.exfat".to_string();
+            if let Some(l) = label {
+                if !l.is_empty() { args.push("-n"); args.push(l); }
+            }
+        }
         "vfat" | "fat32" => {
             cmd = "mkfs.vfat".to_string();
             args.push("-F"); args.push("32");
             if let Some(l) = label {
                 if !l.is_empty() { args.push("-n"); args.push(l); }
-            }
-        }
-        "ntfs" => {
-            cmd = "mkfs.ntfs".to_string();
-            args.push("-f"); // Quick format
-            if let Some(l) = label {
-                if !l.is_empty() { args.push("-L"); args.push(l); }
             }
         }
         "swap" => {
