@@ -2853,14 +2853,16 @@ async function cephCreatePool() {
 }
 
 async function cephDeletePool(name) {
-    const html = `<div style="display:flex; flex-direction:column; gap:10px;">
-        <p>You are about to delete pool <b>${escapeHtml(name)}</b>.</p>
-        <div style="padding:10px; background:rgba(239,68,68,0.1); border:1px solid var(--danger); border-radius:6px; font-size:13px; color:var(--danger);">
-            <b>Warning:</b> This will permanently destroy ALL data stored in this pool. This action cannot be undone.
+    const html = `<div style="display:flex; flex-direction:column; gap:8px;">
+        <p style="margin:0;">Delete pool <b>${escapeHtml(name)}</b></p>
+        <div style="padding:6px 8px; background:rgba(239,68,68,0.1); border:1px solid var(--danger); border-radius:6px; font-size:12px; color:var(--danger);">
+            <b>Warning:</b> Permanently destroys ALL data in this pool. Cannot be undone.
         </div>
-        <label style="font-size:12px; color:var(--text-muted);">Type <b>YES</b> to confirm:</label>
-        <input type="text" id="ceph-del-pool-confirm" class="form-control" placeholder="YES" style="width:100%;" autocomplete="off">
-        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
+        <div style="display:flex; align-items:center; gap:8px;">
+            <span style="font-size:12px; color:var(--text-muted); white-space:nowrap;">Type <b>YES</b>:</span>
+            <input type="text" id="ceph-del-pool-confirm" class="form-control" placeholder="YES" style="flex:1;" autocomplete="off">
+        </div>
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
             <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
             <button class="btn" style="background:var(--danger); color:#fff;" onclick="_confirmCephDeletePool('${escapeHtml(name)}')">Delete Pool</button>
         </div>
@@ -2956,14 +2958,16 @@ async function cephOsdAction(osdId, action) {
 }
 
 async function cephRemoveOsd(osdId) {
-    const html = `<div style="display:flex; flex-direction:column; gap:10px;">
-        <p>You are about to remove <b>osd.${osdId}</b>.</p>
-        <div style="padding:10px; background:rgba(239,68,68,0.1); border:1px solid var(--danger); border-radius:6px; font-size:13px; color:var(--danger);">
-            <b>Warning:</b> This will mark the OSD out, stop the daemon, and purge it from the cluster. Data will be rebalanced to remaining OSDs.
+    const html = `<div style="display:flex; flex-direction:column; gap:8px;">
+        <p style="margin:0;">Remove <b>osd.${osdId}</b></p>
+        <div style="padding:6px 8px; background:rgba(239,68,68,0.1); border:1px solid var(--danger); border-radius:6px; font-size:12px; color:var(--danger);">
+            <b>Warning:</b> Marks OSD out, stops daemon, and purges from cluster. Data rebalances to remaining OSDs.
         </div>
-        <label style="font-size:12px; color:var(--text-muted);">Type <b>YES</b> to confirm:</label>
-        <input type="text" id="ceph-del-osd-confirm" class="form-control" placeholder="YES" style="width:100%;" autocomplete="off">
-        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
+        <div style="display:flex; align-items:center; gap:8px;">
+            <span style="font-size:12px; color:var(--text-muted); white-space:nowrap;">Type <b>YES</b>:</span>
+            <input type="text" id="ceph-del-osd-confirm" class="form-control" placeholder="YES" style="flex:1;" autocomplete="off">
+        </div>
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
             <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
             <button class="btn" style="background:var(--danger); color:#fff;" onclick="_confirmCephRemoveOsd(${osdId})">Remove OSD</button>
         </div>
@@ -3028,14 +3032,16 @@ async function cephCreateFs() {
 }
 
 async function cephDeleteFs(name) {
-    const html = `<div style="display:flex; flex-direction:column; gap:10px;">
-        <p>You are about to delete CephFS filesystem <b>${escapeHtml(name)}</b>.</p>
-        <div style="padding:10px; background:rgba(239,68,68,0.1); border:1px solid var(--danger); border-radius:6px; font-size:13px; color:var(--danger);">
-            <b>Warning:</b> This will destroy the filesystem and all files within it. This action cannot be undone.
+    const html = `<div style="display:flex; flex-direction:column; gap:8px;">
+        <p style="margin:0;">Delete CephFS <b>${escapeHtml(name)}</b></p>
+        <div style="padding:6px 8px; background:rgba(239,68,68,0.1); border:1px solid var(--danger); border-radius:6px; font-size:12px; color:var(--danger);">
+            <b>Warning:</b> Destroys the filesystem and all files within it. Cannot be undone.
         </div>
-        <label style="font-size:12px; color:var(--text-muted);">Type <b>YES</b> to confirm:</label>
-        <input type="text" id="ceph-del-fs-confirm" class="form-control" placeholder="YES" style="width:100%;" autocomplete="off">
-        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
+        <div style="display:flex; align-items:center; gap:8px;">
+            <span style="font-size:12px; color:var(--text-muted); white-space:nowrap;">Type <b>YES</b>:</span>
+            <input type="text" id="ceph-del-fs-confirm" class="form-control" placeholder="YES" style="flex:1;" autocomplete="off">
+        </div>
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
             <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
             <button class="btn" style="background:var(--danger); color:#fff;" onclick="_confirmCephDeleteFs('${escapeHtml(name)}')">Delete Filesystem</button>
         </div>
@@ -4580,19 +4586,20 @@ function renderDiskInfo(devices) {
 // ─── Disk Partitioning & Formatting Modals ───
 
 function showDiskPartitionTableModal(disk) {
-    const html = `<div style="display:flex; flex-direction:column; gap:10px;">
-        <p>Create a new partition table on <b><code>${escapeHtml(disk)}</code></b>.</p>
-        <div style="padding:10px; background:rgba(239,68,68,0.1); border:1px solid var(--danger); border-radius:6px; font-size:13px; color:var(--danger);">
-            <b>Warning:</b> This will erase ALL existing partitions and data on this disk. This action cannot be undone.
+    const html = `<div style="display:flex; flex-direction:column; gap:8px;">
+        <p style="margin:0;">Create partition table on <code>${escapeHtml(disk)}</code></p>
+        <div style="padding:8px; background:rgba(239,68,68,0.1); border:1px solid var(--danger); border-radius:6px; font-size:12px; color:var(--danger);">
+            <b>Warning:</b> Erases ALL partitions and data. Cannot be undone.
         </div>
-        <label style="font-size:12px; color:var(--text-muted);">Partition Table Type</label>
         <select id="disk-pt-type" class="form-control" style="width:100%;">
-            <option value="gpt">GPT (recommended for disks > 2TB and UEFI)</option>
+            <option value="gpt">GPT (recommended, UEFI, >2TB)</option>
             <option value="msdos">MBR / DOS (legacy BIOS, max 2TB)</option>
         </select>
-        <label style="font-size:12px; color:var(--text-muted);">Type <b>YES</b> to confirm:</label>
-        <input type="text" id="disk-pt-confirm" class="form-control" placeholder="YES" style="width:100%;" autocomplete="off">
-        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
+        <div style="display:flex; align-items:center; gap:8px;">
+            <span style="font-size:12px; color:var(--text-muted); white-space:nowrap;">Type <b>YES</b>:</span>
+            <input type="text" id="disk-pt-confirm" class="form-control" placeholder="YES" style="flex:1;" autocomplete="off">
+        </div>
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
             <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
             <button class="btn" style="background:var(--danger); color:#fff;" onclick="diskCreatePartitionTable('${disk.replace(/'/g, "\\'")}')">Create Table</button>
         </div>
@@ -4620,30 +4627,26 @@ async function diskCreatePartitionTable(disk) {
 }
 
 function showDiskCreatePartitionModal(disk) {
-    const html = `<div style="display:flex; flex-direction:column; gap:10px;">
-        <p>Create a new partition on <b><code>${escapeHtml(disk)}</code></b>.</p>
-        <label style="font-size:12px; color:var(--text-muted);">Size</label>
+    const html = `<div style="display:flex; flex-direction:column; gap:8px;">
+        <p style="margin:0;">Create partition on <code>${escapeHtml(disk)}</code></p>
         <div style="display:flex; gap:8px; align-items:center;">
             <input type="number" id="disk-part-size" class="form-control" placeholder="All remaining" min="1" style="flex:1;">
-            <span style="font-size:13px; color:var(--text-muted);">MiB</span>
+            <span style="font-size:12px; color:var(--text-muted);">MiB</span>
             <label style="font-size:12px; white-space:nowrap; display:flex; align-items:center; gap:4px;">
                 <input type="checkbox" id="disk-part-use-all" checked onchange="document.getElementById('disk-part-size').disabled = this.checked; if(this.checked) document.getElementById('disk-part-size').value='';">
-                Use all free space
+                Use all
             </label>
         </div>
-        <label style="font-size:12px; color:var(--text-muted);">Partition type hint</label>
         <select id="disk-part-fshint" class="form-control" style="width:100%;">
             <option value="">Linux (ext4, XFS, Btrfs, F2FS, JFS, etc.)</option>
             <option value="swap">Linux Swap</option>
-            <option value="fat32">FAT32 / exFAT (EFI, USB drives)</option>
+            <option value="fat32">FAT32 / exFAT (EFI, USB)</option>
             <option value="linux-lvm">Linux LVM</option>
             <option value="linux-raid">Linux RAID</option>
             <option value="zfs">ZFS</option>
         </select>
-        <div style="font-size:11px; color:var(--text-muted); margin-top:-6px;">
-            This sets the partition type flag only. Use <b>Format</b> afterwards to create the actual filesystem.
-        </div>
-        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
+        <div style="font-size:11px; color:var(--text-muted);">Sets partition type flag only. Use <b>Format</b> to create the filesystem.</div>
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
             <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
             <button class="btn btn-primary" onclick="diskCreatePartition('${disk.replace(/'/g, "\\'")}')">Create Partition</button>
         </div>
@@ -4669,25 +4672,17 @@ async function diskCreatePartition(disk) {
 }
 
 function showDiskResizeModal(device) {
-    const html = `<div style="display:flex; flex-direction:column; gap:10px;">
-        <p>Grow partition <b><code>${escapeHtml(device)}</code></b> and its filesystem to fill all available space.</p>
-        <div style="padding:10px; background:rgba(59,130,246,0.1); border:1px solid var(--accent); border-radius:6px; font-size:13px;">
-            <b>What this does:</b>
-            <ol style="margin:6px 0 0 18px; padding:0; font-size:12px; color:var(--text-secondary);">
-                <li>Extends the partition to use all unallocated space after it</li>
-                <li>Detects the filesystem type (ext4, XFS, Btrfs, swap)</li>
-                <li>Grows the filesystem to match the new partition size</li>
-            </ol>
+    const html = `<div style="display:flex; flex-direction:column; gap:8px;">
+        <p style="margin:0;">Grow <code>${escapeHtml(device)}</code> and its filesystem to fill available space.</p>
+        <div style="padding:8px; background:rgba(59,130,246,0.1); border:1px solid var(--accent); border-radius:6px; font-size:12px; color:var(--text-secondary);">
+            Extends partition, detects fstype (ext4/XFS/Btrfs/swap), and grows the filesystem. Safe for online filesystems. No changes if already at max size.
         </div>
-        <div style="padding:8px 10px; background:var(--bg-secondary); border-radius:6px; font-size:12px; color:var(--text-muted);">
-            This is safe for online ext4/Btrfs/XFS filesystems. XFS and Btrfs must be mounted. If the partition is already at maximum size, no changes will be made.
-        </div>
-        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
             <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
             <button class="btn btn-primary" onclick="diskResizePartition('${device.replace(/'/g, "\\'")}')">Resize</button>
         </div>
     </div>`;
-    showModal(html, 'Resize Partition & Filesystem', { noOk: true });
+    showModal(html, 'Resize Partition', { noOk: true });
 }
 
 async function diskResizePartition(device) {
@@ -4713,31 +4708,31 @@ async function diskResizePartition(device) {
 }
 
 function showDiskFormatModal(device) {
-    const html = `<div style="display:flex; flex-direction:column; gap:10px;">
-        <p>Format partition <b><code>${escapeHtml(device)}</code></b>.</p>
-        <div style="padding:10px; background:rgba(239,68,68,0.1); border:1px solid var(--danger); border-radius:6px; font-size:13px; color:var(--danger);">
-            <b>Warning:</b> This will erase ALL data on this partition. This action cannot be undone.
+    const html = `<div style="display:flex; flex-direction:column; gap:8px;">
+        <p style="margin:0;">Format <code>${escapeHtml(device)}</code></p>
+        <div style="padding:6px 8px; background:rgba(239,68,68,0.1); border:1px solid var(--danger); border-radius:6px; font-size:12px; color:var(--danger);">
+            <b>Warning:</b> Erases ALL data on this partition. Cannot be undone.
         </div>
-        <label style="font-size:12px; color:var(--text-muted);">Filesystem Type</label>
         <select id="disk-fmt-type" class="form-control" style="width:100%;">
-            <option value="ext4">ext4 (recommended for Linux)</option>
-            <option value="xfs">XFS (high performance, data servers)</option>
-            <option value="btrfs">Btrfs (copy-on-write, snapshots, compression)</option>
-            <option value="f2fs">F2FS (flash-friendly, SSDs/NVMe)</option>
-            <option value="ext3">ext3 (journaled, legacy)</option>
+            <option value="ext4">ext4 (recommended)</option>
+            <option value="xfs">XFS (high performance)</option>
+            <option value="btrfs">Btrfs (snapshots, compression)</option>
+            <option value="f2fs">F2FS (flash/SSD)</option>
+            <option value="ext3">ext3 (legacy)</option>
             <option value="ext2">ext2 (no journal)</option>
-            <option value="jfs">JFS (IBM journaled filesystem)</option>
-            <option value="reiserfs">ReiserFS (small files, legacy)</option>
-            <option value="nilfs2">NILFS2 (log-structured, continuous snapshots)</option>
-            <option value="exfat">exFAT (USB drives, cross-platform)</option>
-            <option value="vfat">FAT32 / VFAT (EFI, small USB drives)</option>
+            <option value="jfs">JFS</option>
+            <option value="reiserfs">ReiserFS</option>
+            <option value="nilfs2">NILFS2 (continuous snapshots)</option>
+            <option value="exfat">exFAT (cross-platform)</option>
+            <option value="vfat">FAT32 / VFAT (EFI)</option>
             <option value="swap">Swap</option>
         </select>
-        <label style="font-size:12px; color:var(--text-muted);">Label (optional)</label>
-        <input type="text" id="disk-fmt-label" class="form-control" placeholder="e.g. data" style="width:100%;">
-        <label style="font-size:12px; color:var(--text-muted);">Type <b>YES</b> to confirm:</label>
-        <input type="text" id="disk-fmt-confirm" class="form-control" placeholder="YES" style="width:100%;" autocomplete="off">
-        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
+        <input type="text" id="disk-fmt-label" class="form-control" placeholder="Label (optional)" style="width:100%;">
+        <div style="display:flex; align-items:center; gap:8px;">
+            <span style="font-size:12px; color:var(--text-muted); white-space:nowrap;">Type <b>YES</b>:</span>
+            <input type="text" id="disk-fmt-confirm" class="form-control" placeholder="YES" style="flex:1;" autocomplete="off">
+        </div>
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
             <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
             <button class="btn" style="background:var(--danger); color:#fff;" onclick="diskFormatPartition('${device.replace(/'/g, "\\'")}')">Format</button>
         </div>
@@ -4766,14 +4761,16 @@ async function diskFormatPartition(device) {
 }
 
 function showDiskDeletePartitionModal(device) {
-    const html = `<div style="display:flex; flex-direction:column; gap:10px;">
-        <p>You are about to delete partition <b><code>${escapeHtml(device)}</code></b>.</p>
-        <div style="padding:10px; background:rgba(239,68,68,0.1); border:1px solid var(--danger); border-radius:6px; font-size:13px; color:var(--danger);">
-            <b>Warning:</b> This will permanently destroy the partition and all data on it. If it is mounted, it will be unmounted first. This action cannot be undone.
+    const html = `<div style="display:flex; flex-direction:column; gap:8px;">
+        <p style="margin:0;">Delete partition <code>${escapeHtml(device)}</code></p>
+        <div style="padding:6px 8px; background:rgba(239,68,68,0.1); border:1px solid var(--danger); border-radius:6px; font-size:12px; color:var(--danger);">
+            <b>Warning:</b> Permanently destroys the partition and all data. Will unmount if mounted. Cannot be undone.
         </div>
-        <label style="font-size:12px; color:var(--text-muted);">Type <b>YES</b> to confirm:</label>
-        <input type="text" id="disk-del-confirm" class="form-control" placeholder="YES" style="width:100%;" autocomplete="off">
-        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
+        <div style="display:flex; align-items:center; gap:8px;">
+            <span style="font-size:12px; color:var(--text-muted); white-space:nowrap;">Type <b>YES</b>:</span>
+            <input type="text" id="disk-del-confirm" class="form-control" placeholder="YES" style="flex:1;" autocomplete="off">
+        </div>
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
             <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
             <button class="btn" style="background:var(--danger); color:#fff;" onclick="diskDeletePartition('${device.replace(/'/g, "\\'")}')">Delete Partition</button>
         </div>
