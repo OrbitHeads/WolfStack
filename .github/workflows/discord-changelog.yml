@@ -1,0 +1,63 @@
+name: Discord Changelog
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Post changelog to Discord
+        env:
+          WEBHOOK_URL: ${{ secrets.DISCORD_CHANGELOG_WEBHOOK }}
+        run: |
+          # Get version from Cargo.toml
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+
+          # Gather commits from this push
+          if [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+            COMMITS=$(git log --pretty=format:'- **%s**%n  %b' -5 | sed '/^$/d')
+          else
+            COMMITS=$(git log --pretty=format:'- **%s**%n  %b' ${{ github.event.before }}..${{ github.event.after }} | sed '/^$/d')
+          fi
+
+          # Count files changed
+          if [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            FILES_CHANGED=$(git diff --stat ${{ github.event.before }}..${{ github.event.after }} | tail -1)
+          else
+            FILES_CHANGED=$(git diff --stat HEAD~1 | tail -1)
+          fi
+
+          # Build a rich Discord embed
+          DESCRIPTION=$(printf '%s\n\n📊 %s' "$COMMITS" "$FILES_CHANGED" | head -c 4000 | jq -Rs .)
+          COMPARE_URL="${{ github.event.compare }}"
+          AUTHOR="${{ github.event.pusher.name }}"
+          REPO="${{ github.repository }}"
+          SHA_SHORT=$(echo "${{ github.event.after }}" | cut -c1-7)
+
+          jq -n \
+            --arg title "🚀 WolfStack v${VERSION}" \
+            --argjson desc "$DESCRIPTION" \
+            --arg url "$COMPARE_URL" \
+            --arg author "$AUTHOR" \
+            --arg footer "Pushed to ${REPO} • ${SHA_SHORT}" \
+            '{
+              embeds: [{
+                title: $title,
+                description: $desc,
+                url: $url,
+                color: 3066993,
+                author: { name: ("📦 " + $author) },
+                footer: { text: $footer },
+                timestamp: (now | todate)
+              }]
+            }' > payload.json
+
+          curl -sf -H "Content-Type: application/json" \
+            -d @payload.json \
+            "$WEBHOOK_URL"
