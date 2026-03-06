@@ -9179,12 +9179,17 @@ async function applyContainerUpdates(runtime, container) {
         const resp = await fetch(apiUrl(`/api/containers/${runtime}/${encodeURIComponent(container)}/updates/apply`), { method: 'POST' });
         const data = await resp.json();
         if (data.ok) {
+            const rawOutput = data.output || '';
+            const lines = rawOutput.split('\n').filter(l => l.trim());
+            const lineCount = lines.length;
+            const preview = lines.slice(-20).join('\n');
             body.innerHTML = `
                 <div style="margin-bottom:16px;">
                     <span style="display:inline-block;padding:4px 12px;border-radius:8px;font-size:14px;font-weight:600;background:rgba(16,185,129,0.15);color:#10b981;">Updates applied successfully</span>
                     <button class="btn btn-sm" style="margin-left:12px;" onclick="openContainerUpdates('${runtime}', '${container.replace(/'/g, "\\'")}')">🔄 Check Again</button>
                 </div>
-                <pre style="background:var(--bg-primary);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:var(--font-mono);font-size:12px;max-height:400px;overflow-y:auto;color:var(--text);white-space:pre-wrap;word-break:break-all;">${escapeHtml(data.output || '')}</pre>`;
+                <p style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">${lineCount} lines of output (showing last 20)</p>
+                <pre style="background:var(--bg-primary);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:var(--font-mono);font-size:12px;max-height:300px;overflow-y:auto;color:var(--text);white-space:pre-wrap;word-break:break-all;">${escapeHtml(preview)}</pre>`;
             showToast('Updates applied to ' + container, 'success');
         } else {
             body.innerHTML = `<p style="color:#ef4444;">Failed to apply updates: ${escapeHtml(data.error || 'Unknown error')}</p>
