@@ -4302,16 +4302,109 @@ async function loadDiskInfo() {
     }
 }
 
+const _PART_COLORS = [
+    '#3b82f6','#10b981','#f59e0b','#8b5cf6','#ec4899','#06b6d4','#84cc16','#f97316',
+    '#6366f1','#14b8a6','#eab308','#d946ef','#0ea5e9','#22c55e','#e11d48','#a855f7',
+];
+
 function renderDiskInfo(devices) {
     const tbody = document.getElementById('disk-info-tbody');
+    const vizEl = document.getElementById('disk-visual-map');
     if (!tbody) return;
 
     if (!devices || devices.length === 0) {
         tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color:var(--text-muted); padding:20px;">No block devices found</td></tr>';
+        if (vizEl) vizEl.innerHTML = '';
         return;
     }
 
-    // Determine which devices are protected (mounted at /, /boot, etc.)
+    // Group devices by parent disk
+    const disks = [];
+    const partsByDisk = {};
+    let colorIdx = 0;
+    const partColorMap = {};
+
+    for (const d of devices) {
+        if (d.type === 'disk') {
+            disks.push(d);
+            partsByDisk[d.device] = [];
+        }
+    }
+    for (const d of devices) {
+        if (d.type === 'part' && partsByDisk[d.disk]) {
+            partsByDisk[d.disk].push(d);
+            partColorMap[d.device] = _PART_COLORS[colorIdx % _PART_COLORS.length];
+            colorIdx++;
+        }
+    }
+
+    // ── Graphical partition map ──
+    if (vizEl) {
+        vizEl.innerHTML = disks.filter(dk => !dk.device.startsWith('/dev/loop')).map(dk => {
+            const parts = partsByDisk[dk.device] || [];
+            const diskBytes = dk.size_bytes || 1;
+            const model = dk.model ? escapeHtml(dk.model) : '';
+            const rotate = dk.rotational ? 'HDD' : 'SSD';
+
+            let allocatedBytes = 0;
+            const segments = parts.map(p => {
+                const pct = Math.max((p.size_bytes / diskBytes) * 100, 1.5);
+                allocatedBytes += p.size_bytes || 0;
+                const col = partColorMap[p.device] || '#666';
+                const name = p.device.replace('/dev/','');
+                const fs = p.fstype || 'unformatted';
+                const mp = (p.mountpoints || []).filter(m => m).join(', ') || '';
+                const tooltip = `${p.device}  ${escapeHtml(p.size)}  ${fs}${mp ? '  mounted: ' + escapeHtml(mp) : ''}`;
+                const usePct = (p.df && p.df.total_bytes > 0) ? p.df.use_pct : null;
+                // Inner fill bar showing used space within the partition
+                const innerBar = usePct !== null
+                    ? `<div style="position:absolute;bottom:0;left:0;width:100%;height:4px;background:rgba(0,0,0,0.2);border-radius:0 0 3px 3px;">
+                         <div style="width:${usePct}%;height:100%;background:rgba(255,255,255,0.35);border-radius:0 0 3px 3px;"></div>
+                       </div>`
+                    : '';
+                return `<div title="${tooltip}" style="flex:0 0 ${pct.toFixed(2)}%;min-width:30px;background:${col};border-radius:4px;padding:4px 6px;
+                    color:#fff;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;position:relative;cursor:default;
+                    border:1px solid rgba(255,255,255,0.15);text-shadow:0 1px 2px rgba(0,0,0,0.4);">
+                    <div style="font-weight:600;">${name}</div>
+                    <div style="opacity:0.85;font-size:10px;">${escapeHtml(p.size)} ${fs}</div>
+                    ${innerBar}
+                </div>`;
+            });
+
+            // Unallocated space
+            const freeBytes = diskBytes - allocatedBytes;
+            if (freeBytes > diskBytes * 0.01 && parts.length > 0) {
+                const freePct = Math.max((freeBytes / diskBytes) * 100, 1.5);
+                segments.push(`<div title="Unallocated  ${formatStorageBytes(freeBytes)}" style="flex:0 0 ${freePct.toFixed(2)}%;min-width:30px;
+                    background:var(--bg-tertiary);border:1px dashed var(--border);border-radius:4px;padding:4px 6px;
+                    color:var(--text-muted);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:default;">
+                    <div style="font-weight:600;">free</div>
+                    <div style="font-size:10px;">${formatStorageBytes(freeBytes)}</div>
+                </div>`);
+            }
+            // Empty disk with no partitions
+            if (parts.length === 0) {
+                segments.push(`<div title="Unallocated  ${escapeHtml(dk.size)}" style="flex:1;min-width:30px;
+                    background:var(--bg-tertiary);border:1px dashed var(--border);border-radius:4px;padding:4px 6px;
+                    color:var(--text-muted);font-size:11px;cursor:default;">
+                    <div style="font-weight:600;">Unallocated</div>
+                    <div style="font-size:10px;">${escapeHtml(dk.size)}</div>
+                </div>`);
+            }
+
+            return `<div style="margin-bottom:14px;">
+                <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:6px;">
+                    <span style="font-weight:700;font-size:13px;color:var(--text-primary);">${escapeHtml(dk.device)}</span>
+                    <span style="font-size:12px;color:var(--text-muted);">${escapeHtml(dk.size)} ${rotate}${model ? ' — ' + model : ''}</span>
+                </div>
+                <div style="display:flex;gap:3px;height:46px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:3px;overflow:hidden;">
+                    ${segments.join('')}
+                </div>
+            </div>`;
+        }).join('');
+    }
+
+    // ── Table rows ──
     const protectedMounts = ['/', '/boot', '/boot/efi', '/home'];
     function isProtected(d) {
         return (d.mountpoints || []).some(m => protectedMounts.includes(m));
@@ -4352,6 +4445,11 @@ function renderDiskInfo(devices) {
         const rotate = d.rotational ? '🔄 HDD' : '⚡ SSD';
         const deviceLabel = `<code style="font-size:12px;">${escapeHtml(d.device)}</code>`;
 
+        // Color swatch for partitions matching the visual map
+        const colorDot = (d.type === 'part' && partColorMap[d.device])
+            ? `<span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${partColorMap[d.device]};margin-right:4px;vertical-align:middle;"></span>`
+            : '';
+
         // Build action buttons based on device type
         let actions = '';
         const prot = isProtected(d);
@@ -4375,7 +4473,7 @@ function renderDiskInfo(devices) {
         }
 
         return `<tr>
-            <td style="${indent}${d.type !== 'disk' ? 'color:var(--text-secondary);' : ''}">${deviceLabel}</td>
+            <td style="${indent}${d.type !== 'disk' ? 'color:var(--text-secondary);' : ''}">${colorDot}${deviceLabel}</td>
             <td>${typeIcon} <span style="font-size:12px;">${typeLabel}${d.type === 'disk' ? ' · ' + rotate : ''}</span></td>
             <td style="font-size:12px;">${modelInfo}</td>
             <td style="font-family:var(--font-mono); font-size:12px;">${fstype}</td>

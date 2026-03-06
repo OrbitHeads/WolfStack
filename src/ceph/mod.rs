@@ -196,6 +196,7 @@ pub struct CephConfig {
 
 // ─── Config Persistence ───
 
+#[allow(dead_code)]
 pub fn load_config() -> CephConfig {
     match std::fs::read_to_string(CONFIG_PATH) {
         Ok(content) => serde_json::from_str(&content).unwrap_or_else(|e| {
