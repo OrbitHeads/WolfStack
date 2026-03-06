@@ -4024,7 +4024,7 @@ function renderZfsPools(pools) {
     if (!table) return;
 
     if (pools.length === 0) {
-        table.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-muted);">No ZFS pools found</td></tr>';
+        table.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--text-muted);">No ZFS pools found</td></tr>';
         return;
     }
 
@@ -4055,7 +4055,7 @@ function renderZfsPools(pools) {
             </td>
         </tr>
         <tr class="storage-sub-row" style="background:var(--bg-secondary);">
-            <td colspan="8" style="padding:4px 16px 6px 24px;border-top:none;">
+            <td colspan="9" style="padding:4px 16px 6px 24px;border-top:none;">
                 <div style="display:flex;align-items:center;gap:16px;font-size:11px;flex-wrap:wrap;">
                     <span>🔄 <strong>Scan:</strong> ${escapeHtml(scanInfo.length > 80 ? scanInfo.substring(0, 80) + '…' : scanInfo)}</span>
                     <span style="color:${errorsColor};">⚠️ <strong>Errors:</strong> ${escapeHtml(errorsInfo)}</span>
@@ -4291,14 +4291,14 @@ async function showZfsPoolIostat(pool) {
 async function loadDiskInfo() {
     const tbody = document.getElementById('disk-info-tbody');
     if (!tbody) return;
-    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color:var(--text-muted); padding:20px;">Loading…</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center; color:var(--text-muted); padding:20px;">Loading…</td></tr>';
     try {
         const resp = await fetch(apiUrl('/api/storage/disk-info'));
         if (!resp.ok) throw new Error(await resp.text());
         const data = await resp.json();
         renderDiskInfo(data.devices || []);
     } catch (e) {
-        tbody.innerHTML = `<tr><td colspan="8" style="text-align:center; color:#ef4444; padding:20px;">Failed to load disk info: ${escapeHtml(e.message)}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="9" style="text-align:center; color:#ef4444; padding:20px;">Failed to load disk info: ${escapeHtml(e.message)}</td></tr>`;
     }
 }
 
@@ -4313,7 +4313,7 @@ function renderDiskInfo(devices) {
     if (!tbody) return;
 
     if (!devices || devices.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color:var(--text-muted); padding:20px;">No block devices found</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="9" style="text-align:center; color:var(--text-muted); padding:20px;">No block devices found</td></tr>';
         if (vizEl) vizEl.innerHTML = '';
         return;
     }
@@ -4384,18 +4384,68 @@ function renderDiskInfo(devices) {
             }
             // Empty disk with no partitions
             if (parts.length === 0) {
-                segments.push(`<div title="Unallocated  ${escapeHtml(dk.size)}" style="flex:1;min-width:30px;
-                    background:var(--bg-tertiary);border:1px dashed var(--border);border-radius:4px;padding:4px 6px;
-                    color:var(--text-muted);font-size:11px;cursor:default;">
-                    <div style="font-weight:600;">Unallocated</div>
-                    <div style="font-size:10px;">${escapeHtml(dk.size)}</div>
-                </div>`);
+                if (dk.fstype) {
+                    // Whole-disk filesystem (e.g. XFS/ext4 directly on /dev/sda with no partition table)
+                    const col = _PART_COLORS[colorIdx % _PART_COLORS.length];
+                    partColorMap[dk.device] = col;
+                    colorIdx++;
+                    const mp = (dk.mountpoints || []).filter(m => m).join(', ') || '';
+                    const tooltip = `${dk.device}  ${escapeHtml(dk.size)}  ${dk.fstype}${mp ? '  mounted: ' + escapeHtml(mp) : ''}`;
+                    const usePct = (dk.df && dk.df.total_bytes > 0) ? dk.df.use_pct : null;
+                    const innerBar = usePct !== null
+                        ? `<div style="position:absolute;bottom:0;left:0;width:100%;height:4px;background:rgba(0,0,0,0.2);border-radius:0 0 3px 3px;">
+                             <div style="width:${usePct}%;height:100%;background:rgba(255,255,255,0.35);border-radius:0 0 3px 3px;"></div>
+                           </div>`
+                        : '';
+                    segments.push(`<div title="${tooltip}" style="flex:1;min-width:30px;background:${col};border-radius:4px;padding:4px 6px;
+                        color:#fff;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;position:relative;cursor:default;
+                        border:1px solid rgba(255,255,255,0.15);text-shadow:0 1px 2px rgba(0,0,0,0.4);">
+                        <div style="font-weight:600;">${dk.device.replace('/dev/','')}</div>
+                        <div style="opacity:0.85;font-size:10px;">${escapeHtml(dk.size)} ${dk.fstype} (whole disk)</div>
+                        ${innerBar}
+                    </div>`);
+                } else {
+                    segments.push(`<div title="Unallocated  ${escapeHtml(dk.size)}" style="flex:1;min-width:30px;
+                        background:var(--bg-tertiary);border:1px dashed var(--border);border-radius:4px;padding:4px 6px;
+                        color:var(--text-muted);font-size:11px;cursor:default;">
+                        <div style="font-weight:600;">Unallocated</div>
+                        <div style="font-size:10px;">${escapeHtml(dk.size)}</div>
+                    </div>`);
+                }
+            }
+
+            // SMART health badge
+            let smartBadge = '';
+            if (dk.smart) {
+                const passed = dk.smart.passed;
+                const temp = dk.smart.temperature_c;
+                const hrs = dk.smart.power_on_hours;
+                const realloc = dk.smart.reallocated_sectors;
+                if (passed === true) {
+                    smartBadge += `<span style="font-size:11px;padding:1px 6px;border-radius:3px;background:#10b981;color:#fff;font-weight:600;">HEALTHY</span>`;
+                } else if (passed === false) {
+                    smartBadge += `<span style="font-size:11px;padding:1px 6px;border-radius:3px;background:#ef4444;color:#fff;font-weight:600;">FAILING</span>`;
+                }
+                const details = [];
+                if (temp != null) details.push(`${temp}°C`);
+                if (hrs != null) details.push(`${Number(hrs).toLocaleString()}h`);
+                if (realloc != null && realloc > 0) details.push(`${realloc} realloc`);
+                if (details.length > 0) {
+                    const tempColor = (temp != null && temp >= 50) ? '#ef4444' : (temp != null && temp >= 40) ? '#f59e0b' : 'var(--text-muted)';
+                    const reallocColor = (realloc != null && realloc > 0) ? '#ef4444' : 'var(--text-muted)';
+                    smartBadge += `<span style="font-size:11px;color:var(--text-muted);margin-left:4px;">`;
+                    if (temp != null) smartBadge += `<span style="color:${tempColor};">${temp}°C</span> `;
+                    if (hrs != null) smartBadge += `${Number(hrs).toLocaleString()}h `;
+                    if (realloc != null && realloc > 0) smartBadge += `<span style="color:${reallocColor};">${realloc} realloc!</span>`;
+                    smartBadge += `</span>`;
+                }
             }
 
             return `<div style="margin-bottom:14px;">
                 <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:6px;">
                     <span style="font-weight:700;font-size:13px;color:var(--text-primary);">${escapeHtml(dk.device)}</span>
                     <span style="font-size:12px;color:var(--text-muted);">${escapeHtml(dk.size)} ${rotate}${model ? ' — ' + model : ''}</span>
+                    ${smartBadge}
                 </div>
                 <div style="display:flex;gap:3px;height:46px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:3px;overflow:hidden;">
                     ${segments.join('')}
@@ -4456,10 +4506,15 @@ function renderDiskInfo(devices) {
         const esc = s => s.replace(/'/g, "\\'");
 
         if (d.type === 'disk' && !d.device.startsWith('/dev/loop')) {
-            actions = `<div style="display:flex; gap:4px; flex-wrap:wrap;">
-                <button class="btn btn-sm" onclick="showDiskPartitionTableModal('${esc(d.device)}')" style="font-size:10px; padding:1px 6px;" title="Create partition table">Table</button>
-                <button class="btn btn-sm" onclick="showDiskCreatePartitionModal('${esc(d.device)}')" style="font-size:10px; padding:1px 6px;" title="Create partition">+ Part</button>
-            </div>`;
+            if (d.fstype || (d.mountpoints && d.mountpoints.length > 0)) {
+                // Whole-disk filesystem — protect it
+                actions = `<span style="font-size:11px; color:var(--text-muted);" title="Whole-disk filesystem — creating a partition table will erase data">🔒 ${escapeHtml(d.fstype || 'in use')}</span>`;
+            } else {
+                actions = `<div style="display:flex; gap:4px; flex-wrap:wrap;">
+                    <button class="btn btn-sm" onclick="showDiskPartitionTableModal('${esc(d.device)}')" style="font-size:10px; padding:1px 6px;" title="Create partition table">Table</button>
+                    <button class="btn btn-sm" onclick="showDiskCreatePartitionModal('${esc(d.device)}')" style="font-size:10px; padding:1px 6px;" title="Create partition">+ Part</button>
+                </div>`;
+            }
         } else if (d.type === 'part') {
             if (prot) {
                 actions = `<span style="font-size:11px; color:var(--text-muted);" title="Protected mount point">🔒</span>`;
@@ -4472,6 +4527,30 @@ function renderDiskInfo(devices) {
             }
         }
 
+        // SMART health cell (only for disk rows)
+        let healthCell = '<span style="color:var(--text-muted)">—</span>';
+        if (d.type === 'disk' && d.smart) {
+            const s = d.smart;
+            if (s.passed === true) {
+                healthCell = `<span style="color:#10b981;font-weight:600;font-size:12px;">✓ OK</span>`;
+            } else if (s.passed === false) {
+                healthCell = `<span style="color:#ef4444;font-weight:600;font-size:12px;">✗ FAIL</span>`;
+            } else {
+                healthCell = `<span style="color:var(--text-muted);font-size:12px;">?</span>`;
+            }
+            const extras = [];
+            if (s.temperature_c != null) {
+                const tc = s.temperature_c;
+                const tcCol = tc >= 50 ? '#ef4444' : tc >= 40 ? '#f59e0b' : 'var(--text-muted)';
+                extras.push(`<span style="color:${tcCol};">${tc}°C</span>`);
+            }
+            if (s.power_on_hours != null) extras.push(`${Number(s.power_on_hours).toLocaleString()}h`);
+            if (s.reallocated_sectors != null && s.reallocated_sectors > 0) {
+                extras.push(`<span style="color:#ef4444;">${s.reallocated_sectors} realloc</span>`);
+            }
+            if (extras.length > 0) healthCell += `<div style="font-size:10px;color:var(--text-muted);margin-top:1px;">${extras.join(' · ')}</div>`;
+        }
+
         return `<tr>
             <td style="${indent}${d.type !== 'disk' ? 'color:var(--text-secondary);' : ''}">${colorDot}${deviceLabel}</td>
             <td>${typeIcon} <span style="font-size:12px;">${typeLabel}${d.type === 'disk' ? ' · ' + rotate : ''}</span></td>
@@ -4480,6 +4559,7 @@ function renderDiskInfo(devices) {
             <td style="font-size:13px; white-space:nowrap;">${escapeHtml(d.size)}</td>
             <td>${mounts}</td>
             <td>${freeCell}</td>
+            <td>${healthCell}</td>
             <td>${actions}</td>
         </tr>`;
     }).join('');
@@ -7960,7 +8040,7 @@ function renderNetInterfaces(interfaces) {
     if (!tbody) return;
 
     if (interfaces.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color:var(--text-muted); padding:20px;">No interfaces found</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="9" style="text-align:center; color:var(--text-muted); padding:20px;">No interfaces found</td></tr>';
         return;
     }
 

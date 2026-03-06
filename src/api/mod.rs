@@ -5775,6 +5775,58 @@ pub async fn storage_disk_info(req: HttpRequest, state: web::Data<AppState>) -> 
         walk_devices(devs, &df_map, "", "", &mut entries);
     }
 
+    // Collect SMART health for physical disks (best-effort, smartctl may not be installed)
+    let has_smartctl = std::process::Command::new("which")
+        .arg("smartctl")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if has_smartctl {
+        let mut smart_map: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
+        for entry in &entries {
+            if entry.get("type").and_then(|v| v.as_str()) == Some("disk") {
+                if let Some(dev) = entry.get("device").and_then(|v| v.as_str()) {
+                    if dev.starts_with("/dev/loop") { continue; }
+                    if let Ok(out) = std::process::Command::new("smartctl")
+                        .args(["--json=c", "-H", "-A", dev])
+                        .output()
+                    {
+                        let text = String::from_utf8_lossy(&out.stdout);
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                            let passed = json.pointer("/smart_status/passed");
+                            let temp = json.pointer("/temperature/current")
+                                .and_then(|v| v.as_i64());
+                            let power_on = json.pointer("/power_on_time/hours")
+                                .and_then(|v| v.as_u64());
+                            let reallocated = json.get("ata_smart_attributes")
+                                .and_then(|a| a.get("table"))
+                                .and_then(|t| t.as_array())
+                                .and_then(|attrs| attrs.iter().find(|a|
+                                    a.get("id").and_then(|v| v.as_u64()) == Some(5)
+                                ))
+                                .and_then(|a| a.get("raw").and_then(|r| r.get("value")).and_then(|v| v.as_u64()));
+                            smart_map.insert(dev.to_string(), serde_json::json!({
+                                "passed": passed,
+                                "temperature_c": temp,
+                                "power_on_hours": power_on,
+                                "reallocated_sectors": reallocated,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        // Attach SMART data to disk entries
+        for entry in &mut entries {
+            if let Some(dev) = entry.get("device").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+                if let Some(smart) = smart_map.get(&dev) {
+                    entry.as_object_mut().map(|m| m.insert("smart".to_string(), smart.clone()));
+                }
+            }
+        }
+    }
+
     HttpResponse::Ok().json(serde_json::json!({ "devices": entries }))
 }
 
