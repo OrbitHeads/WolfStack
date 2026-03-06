@@ -541,6 +541,13 @@ function selectServerView(nodeId, view) {
         // Show blur overlay over the page content
         showPageLoadingOverlay(el);
     }
+    // Clear stale update badges and cancel timers when switching views
+    if (view === 'containers' || view === 'lxc') {
+        containerUpdateCounts = {};
+        _updateSummaryLoading = false;
+    }
+    if (lxcPollTimer) { clearInterval(lxcPollTimer); lxcPollTimer = null; }
+    if (containerPollTimer) { clearInterval(containerPollTimer); containerPollTimer = null; }
     if (view === 'dashboard') {
         // Clear history for new server view to show fresh data
         cpuHistory = [];
@@ -6831,12 +6838,16 @@ let dockerStats = {};
 let containerPollTimer = null;
 let containerUpdateCounts = {};
 let _updateSummaryLoading = false;
+let _dockerLoadGeneration = 0;
 
 async function fetchContainerUpdateSummary() {
     if (_updateSummaryLoading) return;
     _updateSummaryLoading = true;
+    const loadNodeId = currentNodeId;
     try {
         const resp = await fetch(apiUrl('/api/containers/updates/summary'), { method: 'POST' });
+        // Discard if user switched servers
+        if (currentNodeId !== loadNodeId) { _updateSummaryLoading = false; return; }
         const data = await resp.json();
         if (data.ok && data.containers) {
             containerUpdateCounts = data.containers;
@@ -8332,6 +8343,13 @@ async function wolfnetServiceAction(action) {
 // ─── Docker ───
 
 async function loadDockerContainers() {
+    // Cancel any existing poll timer immediately
+    if (containerPollTimer) { clearInterval(containerPollTimer); containerPollTimer = null; }
+
+    // Capture generation and node to detect stale responses
+    const gen = ++_dockerLoadGeneration;
+    const loadNodeId = currentNodeId;
+
     // Fetch runtime status first
     fetchContainerStatus();
 
@@ -8342,6 +8360,9 @@ async function loadDockerContainers() {
             fetch(apiUrl('/api/containers/docker/stats')),
             fetch(apiUrl('/api/containers/docker/images')),
         ]);
+
+        // Discard response if user switched to a different server/page
+        if (gen !== _dockerLoadGeneration || currentNodeId !== loadNodeId) return;
 
         const containers = await containersResp.json();
         const stats = await statsResp.json();
@@ -8360,9 +8381,10 @@ async function loadDockerContainers() {
         console.error('Failed to load Docker containers:', e);
     }
 
-    // Start polling for container stats
-    if (containerPollTimer) clearInterval(containerPollTimer);
-    containerPollTimer = setInterval(refreshDockerStats, 5000);
+    // Only set poll timer if we're still on this view/node
+    if (gen === _dockerLoadGeneration && currentPage === 'containers') {
+        containerPollTimer = setInterval(refreshDockerStats, 5000);
+    }
 }
 
 async function refreshDockerStats() {
@@ -8915,8 +8937,16 @@ async function saveDockerSettings(name) {
 // ─── LXC ───
 
 let lxcPollTimer = null;
+let _lxcLoadGeneration = 0;
 
 async function loadLxcContainers() {
+    // Cancel any existing poll timer immediately
+    if (lxcPollTimer) { clearInterval(lxcPollTimer); lxcPollTimer = null; }
+
+    // Capture generation and node to detect stale responses
+    const gen = ++_lxcLoadGeneration;
+    const loadNodeId = currentNodeId;
+
     fetchContainerStatus();
 
     try {
@@ -8924,6 +8954,9 @@ async function loadLxcContainers() {
             fetch(apiUrl('/api/containers/lxc')),
             fetch(apiUrl('/api/containers/lxc/stats')),
         ]);
+
+        // Discard response if user switched to a different server/page
+        if (gen !== _lxcLoadGeneration || currentNodeId !== loadNodeId) return;
 
         const containersData = containersResp.ok ? await containersResp.json() : [];
         const statsData = statsResp.ok ? await statsResp.json() : [];
@@ -8936,16 +8969,19 @@ async function loadLxcContainers() {
 
         renderLxcContainers(containers, lxcStats);
         applyUpdateBadges();
+        // Fire update summary check in background — don't block page render
         fetchContainerUpdateSummary();
     } catch (e) {
         console.error('Failed to load LXC containers:', e);
     }
 
-    if (lxcPollTimer) clearInterval(lxcPollTimer);
-    lxcPollTimer = setInterval(async () => {
-        if (currentPage !== 'lxc') { clearInterval(lxcPollTimer); lxcPollTimer = null; return; }
-        loadLxcContainers();
-    }, 10000);
+    // Only set poll timer if we're still on this view/node
+    if (gen === _lxcLoadGeneration && currentPage === 'lxc') {
+        lxcPollTimer = setInterval(async () => {
+            if (currentPage !== 'lxc') { clearInterval(lxcPollTimer); lxcPollTimer = null; return; }
+            loadLxcContainers();
+        }, 10000);
+    }
 }
 
 function renderLxcContainers(containers, stats) {

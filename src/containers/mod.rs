@@ -2329,7 +2329,8 @@ fn pct_list_all() -> Vec<ContainerInfo> {
         _ => return vec![],
     };
 
-    output.lines()
+    // Parse listing into (vmid, state, pct_name) tuples first
+    let entries: Vec<(String, String, String)> = output.lines()
         .skip(1) // Skip header: VMID       Status     Lock         Name
         .filter(|l| !l.trim().is_empty())
         .filter_map(|line| {
@@ -2337,43 +2338,64 @@ fn pct_list_all() -> Vec<ContainerInfo> {
             let vmid = parts.first()?.to_string();
             let state = parts.get(1).unwrap_or(&"stopped").to_lowercase();
             let pct_name = parts.get(2..).map(|p| p.join(" ")).unwrap_or_default();
+            Some((vmid, state, pct_name))
+        })
+        .collect();
 
-            let status = if state == "running" {
-                // Get PID from lxc-info
-                let pid = Command::new("lxc-info")
-                    .args(["-n", &vmid, "-pH"])
-                    .output().ok()
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    .unwrap_or("-".to_string());
-                format!("Running (PID {})", pid)
-            } else {
-                "Stopped".to_string()
-            };
+    // Fetch all pct configs in parallel (one `pct config` per container)
+    let configs: Vec<String> = std::thread::scope(|s| {
+        let handles: Vec<_> = entries.iter().map(|(vmid, _, _)| {
+            let vmid = vmid.clone();
+            s.spawn(move || {
+                Command::new("pct").args(["config", &vmid]).output().ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                    .unwrap_or_default()
+            })
+        }).collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+    });
 
-            // Get IP addresses for running containers
-            let mut ip = String::new();
-            if state == "running" {
-                if let Ok(info_out) = Command::new("lxc-info")
-                    .args(["-n", &vmid, "-iH"])
-                    .output()
-                {
-                    let info_ip = String::from_utf8_lossy(&info_out.stdout)
-                        .lines()
-                        .filter(|l| !l.contains(':'))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    if !info_ip.is_empty() && info_ip != "-" {
-                        ip = info_ip;
+    // Now process each container in parallel for remaining details
+    std::thread::scope(|s| {
+        let handles: Vec<_> = entries.iter().zip(configs.iter()).map(|((vmid, state, pct_name), cfg_text)| {
+            let vmid = vmid.clone();
+            let state = state.clone();
+            let pct_name = pct_name.clone();
+            let cfg_text = cfg_text.clone();
+            s.spawn(move || {
+                let status = if state == "running" {
+                    let pid = Command::new("lxc-info")
+                        .args(["-n", &vmid, "-pH"])
+                        .output().ok()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .unwrap_or("-".to_string());
+                    format!("Running (PID {})", pid)
+                } else {
+                    "Stopped".to_string()
+                };
+
+                // Get IP addresses for running containers
+                let mut ip = String::new();
+                if state == "running" {
+                    if let Ok(info_out) = Command::new("lxc-info")
+                        .args(["-n", &vmid, "-iH"])
+                        .output()
+                    {
+                        let info_ip = String::from_utf8_lossy(&info_out.stdout)
+                            .lines()
+                            .filter(|l| !l.contains(':'))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        if !info_ip.is_empty() && info_ip != "-" {
+                            ip = info_ip;
+                        }
                     }
                 }
-            }
 
-            // Read hostname, autostart, and rootfs from pct config (Proxmox format)
-            let mut hostname = pct_name.clone();
-            let mut autostart = false;
-            let mut rootfs_storage = String::new();
-            if let Ok(cfg_out) = Command::new("pct").args(["config", &vmid]).output() {
-                let cfg_text = String::from_utf8_lossy(&cfg_out.stdout);
+                // Parse config for hostname, autostart, rootfs
+                let mut hostname = pct_name.clone();
+                let mut autostart = false;
+                let mut rootfs_storage = String::new();
                 for cline in cfg_text.lines() {
                     let cline = cline.trim();
                     if cline.starts_with("hostname:") {
@@ -2383,7 +2405,6 @@ fn pct_list_all() -> Vec<ContainerInfo> {
                     } else if cline.starts_with("rootfs:") {
                         rootfs_storage = cline.splitn(2, ':').nth(1).unwrap_or("").trim().to_string();
                     }
-                    // Also extract IPs from net* lines for stopped containers
                     if ip.is_empty() && cline.starts_with("net") && cline.contains("ip=") {
                         if let Some(ip_part) = cline.split(',').find(|p| p.trim().starts_with("ip=")) {
                             let configured_ip = ip_part.trim().trim_start_matches("ip=");
@@ -2393,89 +2414,82 @@ fn pct_list_all() -> Vec<ContainerInfo> {
                         }
                     }
                 }
-            }
 
-            // WolfNet IP
-            let wolfnet_ip_file = format!("/var/lib/lxc/{}/.wolfnet/ip", vmid);
-            let wolfnet_ip = std::fs::read_to_string(&wolfnet_ip_file)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
-            if !wolfnet_ip.is_empty() {
-                if ip.is_empty() {
-                    ip = format!("{} (wolfnet)", wolfnet_ip);
-                } else if !ip.contains(&wolfnet_ip) {
-                    ip = format!("{}, {} (wolfnet)", ip, wolfnet_ip);
-                }
-            }
-
-            let rootfs_path = format!("/var/lib/lxc/{}/rootfs", vmid);
-            // Extract Proxmox storage name from rootfs config
-            // e.g. "local-lvm:vm-101-disk-0,size=32G" → "local-lvm"
-            let storage_path = if !rootfs_storage.is_empty() {
-                let storage_name = rootfs_storage.split(':').next().unwrap_or("").to_string();
-                if storage_name.is_empty() { None } else { Some(storage_name) }
-            } else if std::path::Path::new(&rootfs_path).exists() {
-                Some(rootfs_path.clone())
-            } else { None };
-
-            // For Proxmox containers, get per-container disk usage instead of pool-level stats.
-            // Running: use `pct exec {vmid} -- df -T --block-size=1 /` to get rootfs usage inside the CT.
-            // Stopped: parse the allocated size from rootfs config (e.g. "size=32G").
-            let (du, dt, ft) = if state == "running" {
-                // Try to get actual disk usage from inside the container
-                match Command::new("pct").args(["exec", &vmid, "--", "df", "-T", "--block-size=1", "/"]).output() {
-                    Ok(out) if out.status.success() => {
-                        let text = String::from_utf8_lossy(&out.stdout);
-                        if let Some(line) = text.lines().nth(1) {
-                            let p: Vec<&str> = line.split_whitespace().collect();
-                            let fs = p.get(1).map(|s| s.to_string());
-                            let total = p.get(2).and_then(|s| s.parse::<u64>().ok());
-                            let used  = p.get(3).and_then(|s| s.parse::<u64>().ok());
-                            (used, total, fs)
-                        } else {
-                            (None, None, None)
-                        }
+                // WolfNet IP
+                let wolfnet_ip_file = format!("/var/lib/lxc/{}/.wolfnet/ip", vmid);
+                let wolfnet_ip = std::fs::read_to_string(&wolfnet_ip_file)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                if !wolfnet_ip.is_empty() {
+                    if ip.is_empty() {
+                        ip = format!("{} (wolfnet)", wolfnet_ip);
+                    } else if !ip.contains(&wolfnet_ip) {
+                        ip = format!("{}, {} (wolfnet)", ip, wolfnet_ip);
                     }
-                    _ => (None, None, None),
                 }
-            } else {
-                // Stopped container — parse allocated size from rootfs config
-                let alloc_bytes = parse_pct_rootfs_size(&rootfs_storage);
-                (Some(0), alloc_bytes, None)
-            };
 
-            let pve_rootfs_path = format!("/var/lib/lxc/{}/rootfs", vmid);
-            let version = lxc_read_os_version(&pve_rootfs_path);
+                let rootfs_path = format!("/var/lib/lxc/{}/rootfs", vmid);
+                let storage_path = if !rootfs_storage.is_empty() {
+                    let storage_name = rootfs_storage.split(':').next().unwrap_or("").to_string();
+                    if storage_name.is_empty() { None } else { Some(storage_name) }
+                } else if std::path::Path::new(&rootfs_path).exists() {
+                    Some(rootfs_path.clone())
+                } else { None };
 
-            // Detect Wolf services inside running containers
-            let services = if state == "running" {
-                detect_container_services("lxc", &vmid)
-            } else {
-                vec![]
-            };
+                let (du, dt, ft) = if state == "running" {
+                    match Command::new("pct").args(["exec", &vmid, "--", "df", "-T", "--block-size=1", "/"]).output() {
+                        Ok(out) if out.status.success() => {
+                            let text = String::from_utf8_lossy(&out.stdout);
+                            if let Some(line) = text.lines().nth(1) {
+                                let p: Vec<&str> = line.split_whitespace().collect();
+                                let fs = p.get(1).map(|s| s.to_string());
+                                let total = p.get(2).and_then(|s| s.parse::<u64>().ok());
+                                let used  = p.get(3).and_then(|s| s.parse::<u64>().ok());
+                                (used, total, fs)
+                            } else {
+                                (None, None, None)
+                            }
+                        }
+                        _ => (None, None, None),
+                    }
+                } else {
+                    let alloc_bytes = parse_pct_rootfs_size(&rootfs_storage);
+                    (Some(0), alloc_bytes, None)
+                };
 
-            Some(ContainerInfo {
-                id: vmid.clone(),
-                name: vmid,
-                image: "lxc".to_string(),
-                status,
-                state,
-                created: String::new(),
-                ports: vec![],
-                runtime: "lxc".to_string(),
-                ip_address: ip,
-                autostart,
-                hostname,
-                storage_path,
-                disk_usage: du,
-                disk_total: dt,
-                fs_type: ft,
-                version,
-                services,
+                let pve_rootfs_path = format!("/var/lib/lxc/{}/rootfs", vmid);
+                let version = lxc_read_os_version(&pve_rootfs_path);
+
+                let services = if state == "running" {
+                    detect_container_services("lxc", &vmid)
+                } else {
+                    vec![]
+                };
+
+                ContainerInfo {
+                    id: vmid.clone(),
+                    name: vmid,
+                    image: "lxc".to_string(),
+                    status,
+                    state,
+                    created: String::new(),
+                    ports: vec![],
+                    runtime: "lxc".to_string(),
+                    ip_address: ip,
+                    autostart,
+                    hostname,
+                    storage_path,
+                    disk_usage: du,
+                    disk_total: dt,
+                    fs_type: ft,
+                    version,
+                    services,
+                }
             })
-        })
-        .collect()
+        }).collect();
+        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+    })
 }
 
 /// Read OS version from an LXC container's rootfs (e.g. "Ubuntu 22.04.3 LTS")

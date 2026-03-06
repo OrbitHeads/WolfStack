@@ -1943,12 +1943,28 @@ pub async fn container_updates_summary(req: HttpRequest, state: web::Data<AppSta
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let docker = containers::docker_list_all();
     let lxc = containers::lxc_list_all();
-    let mut results = serde_json::Map::new();
 
-    for c in docker.iter().chain(lxc.iter()) {
-        if c.state != "running" { continue; }
-        let key = format!("{}:{}", c.runtime, c.name);
-        let (pm, count) = quick_container_update_count(&c.runtime, &c.name);
+    // Collect running containers to check
+    let running: Vec<(String, String)> = docker.iter().chain(lxc.iter())
+        .filter(|c| c.state == "running")
+        .map(|c| (c.runtime.clone(), c.name.clone()))
+        .collect();
+
+    // Check all containers in parallel using thread::scope
+    let results_vec: Vec<(String, String, usize)> = std::thread::scope(|s| {
+        let handles: Vec<_> = running.iter().map(|(runtime, name)| {
+            let runtime = runtime.clone();
+            let name = name.clone();
+            s.spawn(move || {
+                let (pm, count) = quick_container_update_count(&runtime, &name);
+                (format!("{}:{}", runtime, name), pm, count)
+            })
+        }).collect();
+        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
+
+    let mut results = serde_json::Map::new();
+    for (key, pm, count) in results_vec {
         results.insert(key, serde_json::json!({ "package_manager": pm, "count": count }));
     }
 
