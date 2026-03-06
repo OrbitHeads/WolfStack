@@ -5873,6 +5873,26 @@ pub async fn disk_format_partition(
     }
 }
 
+#[derive(Deserialize)]
+pub struct ResizePartitionRequest {
+    pub device: String,
+}
+
+/// POST /api/storage/disk/resize — grow a partition and its filesystem
+pub async fn disk_resize_partition(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<ResizePartitionRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let device = body.device.clone();
+    match web::block(move || storage::resize_partition(&device)).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({"ok": true, "message": msg})),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({"ok": false, "error": e})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": format!("{}", e)})),
+    }
+}
+
 /// GET /api/storage/disk/filesystems — list supported filesystem types
 pub async fn disk_supported_filesystems(
     req: HttpRequest,
@@ -10541,6 +10561,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/storage/disk/partition", web::post().to(disk_create_partition))
         .route("/api/storage/disk/partition/delete", web::post().to(disk_delete_partition))
         .route("/api/storage/disk/format", web::post().to(disk_format_partition))
+        .route("/api/storage/disk/resize", web::post().to(disk_resize_partition))
         .route("/api/storage/disk/filesystems", web::get().to(disk_supported_filesystems))
         // ZFS
         .route("/api/storage/zfs/status", web::get().to(zfs_status))

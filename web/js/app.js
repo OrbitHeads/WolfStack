@@ -4320,6 +4320,7 @@ function renderDiskInfo(devices) {
                 actions = `<span style="font-size:11px; color:var(--text-muted);" title="Protected mount point">🔒</span>`;
             } else {
                 actions = `<div style="display:flex; gap:4px; flex-wrap:wrap;">
+                    <button class="btn btn-sm" onclick="showDiskResizeModal('${esc(d.device)}')" style="font-size:10px; padding:1px 6px;" title="Grow partition + filesystem to fill available space">Resize</button>
                     <button class="btn btn-sm" onclick="showDiskFormatModal('${esc(d.device)}')" style="font-size:10px; padding:1px 6px;" title="Format partition">Format</button>
                     <button class="btn btn-sm" onclick="showDiskDeletePartitionModal('${esc(d.device)}')" style="font-size:10px; padding:1px 6px; color:var(--danger);" title="Delete partition">Delete</button>
                 </div>`;
@@ -4423,6 +4424,50 @@ async function diskCreatePartition(disk) {
         if (data.ok) { showModal(`<p style="color:var(--success);">${data.message}</p>`, 'Partition Created'); loadDiskInfo(); }
         else { showModal(`<p style="color:var(--danger);">${data.error}</p>`, 'Error'); }
     } catch (e) { showModal(`<p style="color:var(--danger);">Failed: ${e.message}</p>`, 'Error'); }
+}
+
+function showDiskResizeModal(device) {
+    const html = `<div style="display:flex; flex-direction:column; gap:10px;">
+        <p>Grow partition <b><code>${escapeHtml(device)}</code></b> and its filesystem to fill all available space.</p>
+        <div style="padding:10px; background:rgba(59,130,246,0.1); border:1px solid var(--accent); border-radius:6px; font-size:13px;">
+            <b>What this does:</b>
+            <ol style="margin:6px 0 0 18px; padding:0; font-size:12px; color:var(--text-secondary);">
+                <li>Extends the partition to use all unallocated space after it</li>
+                <li>Detects the filesystem type (ext4, XFS, Btrfs, swap)</li>
+                <li>Grows the filesystem to match the new partition size</li>
+            </ol>
+        </div>
+        <div style="padding:8px 10px; background:var(--bg-secondary); border-radius:6px; font-size:12px; color:var(--text-muted);">
+            This is safe for online ext4/Btrfs/XFS filesystems. XFS and Btrfs must be mounted. If the partition is already at maximum size, no changes will be made.
+        </div>
+        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
+            <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+            <button class="btn btn-primary" onclick="diskResizePartition('${device.replace(/'/g, "\\'")}')">Resize</button>
+        </div>
+    </div>`;
+    showModal(html, 'Resize Partition & Filesystem', { noOk: true });
+}
+
+async function diskResizePartition(device) {
+    document.querySelector('.modal-overlay')?.remove();
+    showModal('<p>Resizing partition and filesystem...</p>', 'Resizing...', { noOk: true });
+    try {
+        const resp = await fetch(apiUrl('/api/storage/disk/resize'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ device }),
+        });
+        const data = await resp.json();
+        document.querySelector('.modal-overlay')?.remove();
+        if (data.ok) {
+            showModal(`<p style="color:var(--success);">${escapeHtml(data.message)}</p>`, 'Resize Complete');
+            loadDiskInfo();
+        } else {
+            showModal(`<p style="color:var(--danger);">${escapeHtml(data.error)}</p>`, 'Resize Failed');
+        }
+    } catch (e) {
+        document.querySelector('.modal-overlay')?.remove();
+        showModal(`<p style="color:var(--danger);">Failed: ${escapeHtml(e.message)}</p>`, 'Error');
+    }
 }
 
 function showDiskFormatModal(device) {

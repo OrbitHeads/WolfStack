@@ -1640,3 +1640,192 @@ pub fn format_partition(device: &str, fstype: &str, label: Option<&str>) -> Resu
     tracing::info!("Formatted {} as {} (label: {:?})", device, fstype, label);
     Ok(format!("{} formatted as {}", device, fstype))
 }
+
+/// Resize a partition to fill its available space, then grow the filesystem.
+///
+/// This handles the common case where a virtual disk has been extended
+/// (e.g. in a VM or cloud) and the partition + filesystem need to be grown
+/// to use the new space.
+///
+/// Steps:
+///  1. Use `growpart` (if available) or `parted resizepart` to extend the partition
+///  2. Detect the filesystem type
+///  3. Run the appropriate filesystem resize tool (resize2fs, xfs_growfs, btrfs resize)
+pub fn resize_partition(device: &str) -> Result<String, String> {
+    validate_device(device)?;
+
+    // Must be a partition, not a whole disk
+    let dev_type = Command::new("lsblk")
+        .args(["-dno", "TYPE", device])
+        .output()
+        .map_err(|e| format!("lsblk: {}", e))?;
+    let dev_type_str = String::from_utf8_lossy(&dev_type.stdout).trim().to_string();
+    if dev_type_str != "part" && dev_type_str != "lvm" {
+        return Err(format!("{} is not a partition (type: {}). Resize individual partitions, not whole disks.", device, dev_type_str));
+    }
+
+    // Extract parent disk and partition number
+    let name = device.trim_start_matches("/dev/");
+    let (disk, part_num) = if name.contains("nvme") || name.contains("mmcblk") || name.contains("loop") {
+        if let Some(idx) = name.rfind('p') {
+            (format!("/dev/{}", &name[..idx]), name[idx+1..].to_string())
+        } else {
+            return Err(format!("Cannot parse partition number from {}", device));
+        }
+    } else {
+        let split_pos = name.len() - name.chars().rev().take_while(|c| c.is_ascii_digit()).count();
+        if split_pos == name.len() {
+            return Err(format!("Cannot parse partition number from {}", device));
+        }
+        (format!("/dev/{}", &name[..split_pos]), name[split_pos..].to_string())
+    };
+
+    let mut messages: Vec<String> = Vec::new();
+
+    // Step 1: Grow the partition to fill available space
+    // Try growpart first (cloud-utils), then fall back to parted
+    let part_grown = if Command::new("which").arg("growpart").output().map(|o| o.status.success()).unwrap_or(false) {
+        let output = Command::new("growpart")
+            .args([&disk, &part_num])
+            .output()
+            .map_err(|e| format!("growpart: {}", e))?;
+        if output.status.success() {
+            messages.push("Partition extended with growpart".into());
+            true
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // growpart returns exit code 1 with "NOCHANGE" if already at max size
+            if stderr.contains("NOCHANGE") || String::from_utf8_lossy(&output.stdout).contains("NOCHANGE") {
+                messages.push("Partition already at maximum size".into());
+                true
+            } else {
+                // Fall back to parted
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    if !part_grown {
+        // Try parted resizepart — grow to 100%
+        let output = Command::new("parted")
+            .args(["-s", &disk, "resizepart", &part_num, "100%"])
+            .output()
+            .map_err(|e| format!("parted resizepart: {}", e))?;
+        if output.status.success() {
+            messages.push("Partition extended with parted".into());
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Not fatal — the partition may already be at max, or this may be LVM
+            messages.push(format!("Partition resize skipped: {}", stderr.trim()));
+        }
+    }
+
+    // Inform kernel of changes
+    let _ = Command::new("partprobe").arg(&disk).output();
+    let _ = Command::new("udevadm").args(["settle", "--timeout=3"]).output();
+
+    // Step 2: Detect filesystem type
+    let fstype_out = Command::new("blkid")
+        .args(["-o", "value", "-s", "TYPE", device])
+        .output()
+        .map_err(|e| format!("blkid: {}", e))?;
+    let fstype = String::from_utf8_lossy(&fstype_out.stdout).trim().to_string();
+
+    if fstype.is_empty() {
+        // No filesystem — partition resize is all we can do
+        messages.push("No filesystem detected — only partition was resized".into());
+        tracing::info!("Resized partition {} (no filesystem): {:?}", device, messages);
+        return Ok(messages.join(". "));
+    }
+
+    // Step 3: Resize the filesystem
+    match fstype.as_str() {
+        "ext4" | "ext3" | "ext2" => {
+            // resize2fs works on mounted or unmounted ext filesystems
+            let output = Command::new("resize2fs")
+                .arg(device)
+                .output()
+                .map_err(|e| format!("resize2fs: {}", e))?;
+            if output.status.success() {
+                messages.push(format!("{} filesystem resized with resize2fs", fstype));
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("resize2fs failed: {}", stderr.trim()));
+            }
+        }
+        "xfs" => {
+            // xfs_growfs requires the filesystem to be mounted
+            let mountpoint = get_mountpoint(device);
+            if let Some(mp) = mountpoint {
+                let output = Command::new("xfs_growfs")
+                    .arg(&mp)
+                    .output()
+                    .map_err(|e| format!("xfs_growfs: {}", e))?;
+                if output.status.success() {
+                    messages.push("XFS filesystem resized with xfs_growfs".into());
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(format!("xfs_growfs failed: {}", stderr.trim()));
+                }
+            } else {
+                return Err("XFS filesystem must be mounted to resize. Mount it first, then retry.".into());
+            }
+        }
+        "btrfs" => {
+            // btrfs filesystem resize requires the filesystem to be mounted
+            let mountpoint = get_mountpoint(device);
+            if let Some(mp) = mountpoint {
+                let output = Command::new("btrfs")
+                    .args(["filesystem", "resize", "max", &mp])
+                    .output()
+                    .map_err(|e| format!("btrfs resize: {}", e))?;
+                if output.status.success() {
+                    messages.push("Btrfs filesystem resized".into());
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(format!("btrfs resize failed: {}", stderr.trim()));
+                }
+            } else {
+                return Err("Btrfs filesystem must be mounted to resize. Mount it first, then retry.".into());
+            }
+        }
+        "swap" => {
+            // Recreate swap to match new partition size
+            let was_on = Command::new("swapon").args(["--show=NAME", "--noheadings"])
+                .output().map(|o| String::from_utf8_lossy(&o.stdout).contains(device)).unwrap_or(false);
+            if was_on {
+                let _ = Command::new("swapoff").arg(device).output();
+            }
+            let output = Command::new("mkswap").arg(device).output()
+                .map_err(|e| format!("mkswap: {}", e))?;
+            if output.status.success() {
+                messages.push("Swap recreated at new size".into());
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("mkswap failed: {}", stderr.trim()));
+            }
+            if was_on {
+                let _ = Command::new("swapon").arg(device).output();
+                messages.push("Swap re-enabled".into());
+            }
+        }
+        other => {
+            messages.push(format!("Filesystem '{}' does not support online resize — partition was extended but filesystem was not grown", other));
+        }
+    }
+
+    tracing::info!("Resized {}: {:?}", device, messages);
+    Ok(messages.join(". "))
+}
+
+/// Get the mount point for a device, if mounted
+fn get_mountpoint(device: &str) -> Option<String> {
+    let output = Command::new("findmnt")
+        .args(["-n", "-o", "TARGET", "-S", device])
+        .output()
+        .ok()?;
+    let mp = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if mp.is_empty() { None } else { Some(mp) }
+}
