@@ -2467,6 +2467,7 @@ body.sidebar-collapsed .main-content {
         width: 280px;
         transform: translateX(-100%) !important;
         box-shadow: none;
+        transition: transform 0.25s ease !important;
     }
 
     /* sidebar-open overrides everything on mobile */
@@ -2478,6 +2479,10 @@ body.sidebar-collapsed .main-content {
     body.sidebar-open .sidebar-backdrop {
         display: block;
         opacity: 1;
+    }
+
+    .sidebar-backdrop {
+        backdrop-filter: none;
     }
 
     .main-content {
