@@ -25,7 +25,7 @@ function isMobileView() {
 
 function toggleSidebar() {
     if (isMobileView()) {
-        // Mobile: toggle overlay sidebar
+        // Mobile: toggle overlay sidebar (ignore collapsed state)
         const isOpen = document.body.classList.toggle('sidebar-open');
         const backdrop = document.querySelector('.sidebar-backdrop');
         if (backdrop) backdrop.style.display = isOpen ? 'block' : 'none';
@@ -36,7 +36,7 @@ function toggleSidebar() {
         localStorage.setItem('wolfstack_sidebar_collapsed', collapsed ? '1' : '0');
     }
     // Invalidate map size after transition
-    setTimeout(() => { if (worldMap) worldMap.invalidateSize(); }, 350);
+    setTimeout(() => { if (typeof worldMap !== 'undefined' && worldMap) worldMap.invalidateSize(); }, 350);
 }
 
 function closeSidebarMobile() {

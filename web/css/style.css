@@ -2465,27 +2465,19 @@ body.sidebar-collapsed .main-content {
     /* Sidebar becomes a slide-over overlay */
     .sidebar {
         width: 280px;
-        transform: translateX(-100%);
+        transform: translateX(-100%) !important;
         box-shadow: none;
     }
 
+    /* sidebar-open overrides everything on mobile */
     body.sidebar-open .sidebar {
-        transform: translateX(0);
+        transform: translateX(0) !important;
         box-shadow: var(--shadow-lg);
     }
 
     body.sidebar-open .sidebar-backdrop {
         display: block;
         opacity: 1;
-    }
-
-    /* Collapsed state has no effect on mobile — sidebar-open controls it */
-    body.sidebar-collapsed .sidebar {
-        transform: translateX(-100%);
-    }
-
-    body.sidebar-collapsed.sidebar-open .sidebar {
-        transform: translateX(0);
     }
 
     .main-content {
