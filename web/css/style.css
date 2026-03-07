@@ -2468,17 +2468,20 @@ body.sidebar-collapsed .main-content {
         animation: none !important;
     }
 
-    /* Sidebar: hidden by default, shown instantly on toggle */
-    .sidebar {
+    /* Sidebar: always rendered but parked off-screen for instant toggle */
+    .sidebar,
+    body.sidebar-collapsed .sidebar {
         width: 280px;
-        display: none !important;
-        transform: none !important;
-        box-shadow: none;
+        left: -280px;
+        transform: none;
         z-index: 10001;
+        box-shadow: none;
     }
 
-    body.sidebar-open .sidebar {
-        display: flex !important;
+    body.sidebar-open .sidebar,
+    body.sidebar-collapsed.sidebar-open .sidebar {
+        left: 0;
+        transform: none;
         box-shadow: var(--shadow-lg);
     }
 
