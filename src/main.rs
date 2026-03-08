@@ -996,8 +996,8 @@ a{color:#eab308;text-decoration:none;}a:hover{text-decoration:underline;}
                             let mem_pct = metrics.memory_percent;
                             let disk_pct = metrics.disks.iter()
                                 .filter(|d| {
-                                    // Skip /boot/ mounts unless >99% — the OS manages /boot/ automatically
-                                    if d.mount_point.starts_with("/boot") {
+                                    // Skip /boot/ and /etc/pve mounts unless >99% — managed by the OS/Proxmox
+                                    if d.mount_point.starts_with("/boot") || d.mount_point == "/etc/pve" {
                                         d.usage_percent > 99.0
                                     } else {
                                         true

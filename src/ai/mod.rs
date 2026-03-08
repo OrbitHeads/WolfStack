@@ -399,8 +399,8 @@ impl AiAgent {
             "You are a server monitoring AI for WolfStack. Analyze these metrics and report ONLY if there are concerns. \
              If everything looks healthy, respond with exactly 'ALL_OK'. \
              If there are issues, list them concisely with severity (INFO/WARNING/CRITICAL).\n\
-             IMPORTANT: Ignore /boot and /boot/efi partition usage — the OS manages these automatically. \
-             Only flag /boot if it is over 99% full.\n\n\
+             IMPORTANT: Ignore /boot, /boot/efi, and /etc/pve partition usage — these are managed automatically \
+             by the OS or Proxmox. Only flag them if over 99% full.\n\n\
              Current server metrics:\n{}",
             metrics_summary
         );

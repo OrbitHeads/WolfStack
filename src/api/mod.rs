@@ -8795,8 +8795,8 @@ pub fn collect_issues(metrics: &crate::monitoring::SystemMetrics) -> Vec<Issue> 
 
     // ── Disk checks (free space, not just %) ──
     for disk in &metrics.disks {
-        // Skip /boot/ mounts unless >99% — the OS manages /boot/ automatically
-        if disk.mount_point.starts_with("/boot") && disk.usage_percent <= 99.0 {
+        // Skip /boot/ and /etc/pve mounts unless >99% — managed by the OS/Proxmox
+        if (disk.mount_point.starts_with("/boot") || disk.mount_point == "/etc/pve") && disk.usage_percent <= 99.0 {
             continue;
         }
 
