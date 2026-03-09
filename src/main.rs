@@ -31,6 +31,7 @@ mod wolfrun;
 mod statuspage;
 mod ceph;
 mod configurator;
+mod patreon;
 
 use actix_web::{web, App, HttpServer, HttpRequest, HttpResponse};
 use actix_files;
@@ -263,6 +264,7 @@ async fn main() -> std::io::Result<()> {
             tls_enabled,
             login_limiter: Arc::new(auth::LoginRateLimiter::new()),
             wireguard_bridges: Arc::new(std::sync::RwLock::new(networking::load_wireguard_bridges())),
+            patreon: Arc::new(patreon::PatreonState::new()),
         });
 
         // Background: periodic self-monitoring update
@@ -352,6 +354,22 @@ async fn main() -> std::io::Result<()> {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 backup::check_schedules();
+            }
+        });
+
+        // Background: Patreon membership sync (every 24h)
+        let patreon_state = app_state.patreon.clone();
+        tokio::spawn(async move {
+            // Initial delay — let the server settle before first check
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            loop {
+                if patreon_state.config.read().map(|c| c.linked).unwrap_or(false) {
+                    match patreon_state.sync_membership().await {
+                        Ok(tier) => info!("Patreon tier synced: {:?}", tier),
+                        Err(e) => warn!("Patreon sync failed: {}", e),
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(86400)).await; // 24 hours
             }
         });
 

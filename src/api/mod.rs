@@ -71,6 +71,8 @@ pub struct AppState {
     pub login_limiter: Arc<crate::auth::LoginRateLimiter>,
     /// WireGuard bridge configs (cluster → bridge)
     pub wireguard_bridges: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::networking::WireGuardBridge>>>,
+    /// Patreon integration state
+    pub patreon: Arc<crate::patreon::PatreonState>,
 }
 
 /// Load or generate the join token from /etc/wolfstack/join-token
@@ -10494,6 +10496,129 @@ pub async fn toml_bootstrap(req: HttpRequest, state: web::Data<AppState>, path: 
     }
 }
 
+// ─── Patreon Integration ─────────────────────────────────────────────────────
+
+/// GET /api/patreon/connect — start OAuth flow, redirect to Patreon
+async fn patreon_connect(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) {
+        return resp;
+    }
+    // Build the callback URL for this WolfStack instance
+    let conn = req.connection_info();
+    let scheme = conn.scheme();
+    let host = conn.host();
+    let callback_url = format!("{}://{}/api/patreon/callback", scheme, host);
+    let auth_url = state.patreon.authorize_url(&callback_url);
+    HttpResponse::Found()
+        .append_header(("Location", auth_url))
+        .finish()
+}
+
+/// GET /api/patreon/callback — receive tokens from wolfscale.org proxy
+/// The proxy already exchanged the code for tokens using the client secret.
+/// We receive: ?access_token=...&refresh_token=... (or ?error=...)
+async fn patreon_callback(_req: HttpRequest, state: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> HttpResponse {
+    // Check for error from proxy
+    if let Some(error) = query.get("error") {
+        return HttpResponse::Ok().content_type("text/html").body(format!(
+            r#"<!DOCTYPE html><html><head><title>Patreon Link Failed</title></head>
+            <body style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;background:#0f172a;color:#fff;">
+            <div style="text-align:center"><h2>Patreon Link Failed</h2><p>Error: {}</p>
+            <p><a href="/" style="color:#22c55e;">Return to dashboard</a></p></div></body></html>"#,
+            error
+        ));
+    }
+
+    // Receive tokens from proxy
+    let access_token = match query.get("access_token") {
+        Some(t) => t.clone(),
+        None => {
+            return HttpResponse::Ok().content_type("text/html").body(
+                r#"<!DOCTYPE html><html><head><title>Patreon Link Failed</title></head>
+                <body style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;background:#0f172a;color:#fff;">
+                <div style="text-align:center"><h2>Patreon Link Failed</h2><p>No access token received</p>
+                <p><a href="/" style="color:#22c55e;">Return to dashboard</a></p></div></body></html>"#
+            );
+        }
+    };
+    let refresh_token = query.get("refresh_token").cloned().unwrap_or_default();
+
+    // Save tokens
+    {
+        let mut config = state.patreon.config.write().unwrap();
+        config.access_token = Some(access_token);
+        config.refresh_token = Some(refresh_token);
+        config.linked = true;
+        let _ = config.save();
+    }
+
+    // Immediately sync membership info
+    match state.patreon.sync_membership().await {
+        Ok(tier) => {
+            tracing::info!("Patreon linked successfully, tier: {:?}", tier);
+        }
+        Err(e) => {
+            tracing::warn!("Patreon linked but membership sync failed: {}", e);
+        }
+    }
+
+    HttpResponse::Ok().content_type("text/html").body(
+        r#"<!DOCTYPE html><html><head><title>Patreon Linked</title></head>
+        <body style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;background:#0f172a;color:#fff;">
+        <div style="text-align:center"><h2 style="color:#22c55e;">Patreon Linked Successfully!</h2>
+        <p>Your support tier has been detected. You can close this window.</p>
+        <p><a href="/" style="color:#22c55e;">Return to dashboard</a></p></div></body></html>"#
+    )
+}
+
+/// GET /api/patreon/status — return current Patreon link status and tier
+async fn patreon_status(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) {
+        return resp;
+    }
+    let config = state.patreon.config.read().unwrap();
+    HttpResponse::Ok().json(serde_json::json!({
+        "linked": config.linked,
+        "user_name": config.patreon_user_name,
+        "email": config.patreon_email,
+        "tier": config.tier,
+        "pledge_amount_cents": config.pledge_amount_cents,
+        "has_beta_access": config.tier.has_beta_access(),
+        "last_checked": config.last_checked,
+    }))
+}
+
+/// POST /api/patreon/sync — manually refresh membership status
+async fn patreon_sync(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) {
+        return resp;
+    }
+    match state.patreon.sync_membership().await {
+        Ok(tier) => {
+            let config = state.patreon.config.read().unwrap();
+            HttpResponse::Ok().json(serde_json::json!({
+                "ok": true,
+                "tier": tier,
+                "has_beta_access": tier.has_beta_access(),
+                "user_name": config.patreon_user_name,
+                "last_checked": config.last_checked,
+            }))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// POST /api/patreon/disconnect — unlink Patreon account
+async fn patreon_disconnect(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) {
+        return resp;
+    }
+    let mut config = state.patreon.config.write().unwrap();
+    *config = crate::patreon::PatreonConfig::default();
+    let _ = config.save();
+    HttpResponse::Ok().json(serde_json::json!({ "ok": true }))
+}
+
 /// Configure all API routes
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg
@@ -10872,6 +10997,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/statuspage/incidents", web::post().to(statuspage_incident_save))
         .route("/api/statuspage/incidents/{id}", web::delete().to(statuspage_incident_delete))
         .route("/api/statuspage/sync", web::post().to(statuspage_sync))
+        // Patreon integration
+        .route("/api/patreon/connect", web::get().to(patreon_connect))
+        .route("/api/patreon/callback", web::get().to(patreon_callback))
+        .route("/api/patreon/status", web::get().to(patreon_status))
+        .route("/api/patreon/sync", web::post().to(patreon_sync))
+        .route("/api/patreon/disconnect", web::post().to(patreon_disconnect))
         // Status Page (public — NO auth)
         .route("/status", web::get().to(statuspage_public_index))
         .route("/status/{slug}", web::get().to(statuspage_public_page));

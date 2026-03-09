@@ -545,6 +545,7 @@ function selectView(page) {
         loadAppStoreApps();
     } else if (page === 'issues') {
         checkIssuesAiBadge();
+        checkBetaAccess();
         loadIssueSchedule();
     }
 }
@@ -15930,6 +15931,29 @@ function escapeHtml(str) {
 var issuesScanResults = []; // cached for upgrade-all
 var issuesLatestVersion = '0.0.0'; // GitHub-resolved latest, cached after each scan
 
+// Gate the beta channel dropdown based on Patreon tier
+async function checkBetaAccess() {
+    var sel = document.getElementById('issues-channel-select');
+    if (!sel) return;
+    try {
+        var resp = await fetch('/api/patreon/status');
+        var data = await resp.json();
+        var betaOpt = sel.querySelector('option[value="beta"]');
+        if (betaOpt) {
+            if (data.has_beta_access) {
+                betaOpt.disabled = false;
+                betaOpt.textContent = 'Beta';
+            } else {
+                betaOpt.disabled = true;
+                betaOpt.textContent = 'Beta (Patreon Advanced+ required)';
+                if (sel.value === 'beta') sel.value = 'master';
+            }
+        }
+    } catch (e) {
+        // If we can't check, leave it as-is
+    }
+}
+
 async function checkIssuesAiBadge() {
     try {
         var resp = await fetch('/api/ai/status');
@@ -17800,7 +17824,7 @@ function switchSettingsTab(tabName) {
     // Highlight the correct button
     document.querySelectorAll('.settings-tab-btn').forEach(btn => {
         const btnText = btn.textContent.trim().toLowerCase();
-        const tabMap = { 'appearance': '\ud83c\udfa8 appearance', 'alerting': '\ud83d\udd14 alerting', 'ai': '\ud83e\udd16 ai agent', 'backup': '\ud83d\udce6 config backup', 'security': '\ud83d\udd10 security' };
+        const tabMap = { 'appearance': '\ud83c\udfa8 appearance', 'alerting': '\ud83d\udd14 alerting', 'ai': '\ud83e\udd16 ai agent', 'backup': '\ud83d\udce6 config backup', 'security': '\ud83d\udd10 security', 'patreon': '\u2764 patreon' };
         if (btnText === (tabMap[tabName] || '').trim()) {
             btn.classList.add('active');
         }
@@ -17815,6 +17839,80 @@ function switchSettingsTab(tabName) {
         loadAlertingConfig();
     } else if (tabName === 'security') {
         loadClusterSecretStatus();
+    } else if (tabName === 'patreon') {
+        loadPatreonStatus();
+    }
+}
+
+// ─── Patreon Integration ───
+
+async function loadPatreonStatus() {
+    var statusEl = document.getElementById('patreon-link-status');
+    var infoEl = document.getElementById('patreon-linked-info');
+    var connectBtn = document.getElementById('btn-patreon-connect');
+    var syncBtn = document.getElementById('btn-patreon-sync');
+    var disconnectBtn = document.getElementById('btn-patreon-disconnect');
+    if (!statusEl) return;
+    try {
+        var resp = await fetch('/api/patreon/status');
+        var data = await resp.json();
+        if (data.linked) {
+            var tierNames = { none: 'None', free: 'Free', basic: 'Basic', advanced: 'Advanced', platinum: 'Platinum', enterprise: 'Enterprise' };
+            var tierColors = { none: 'var(--text-muted)', free: 'var(--text-muted)', basic: '#22c55e', advanced: '#3b82f6', platinum: '#a855f7', enterprise: '#ef4444' };
+            var tier = data.tier || 'none';
+            statusEl.innerHTML = '<span style="color:#22c55e;">Linked</span>';
+            statusEl.style.borderColor = 'rgba(34,197,94,0.3)';
+            infoEl.style.display = 'block';
+            document.getElementById('patreon-user-name').textContent = data.user_name || 'Unknown';
+            var tierEl = document.getElementById('patreon-tier');
+            tierEl.textContent = tierNames[tier] || tier;
+            tierEl.style.color = tierColors[tier] || 'inherit';
+            var betaEl = document.getElementById('patreon-beta-access');
+            betaEl.innerHTML = data.has_beta_access ? '<span style="color:#22c55e;">Yes</span>' : '<span style="color:var(--text-muted);">No (Advanced+ required)</span>';
+            document.getElementById('patreon-last-checked').textContent = data.last_checked ? new Date(data.last_checked).toLocaleString() : 'Never';
+            connectBtn.style.display = 'none';
+            syncBtn.style.display = '';
+            disconnectBtn.style.display = '';
+        } else {
+            statusEl.innerHTML = '<span style="color:var(--text-muted);">Not linked</span>';
+            infoEl.style.display = 'none';
+            connectBtn.style.display = '';
+            syncBtn.style.display = 'none';
+            disconnectBtn.style.display = 'none';
+        }
+    } catch (e) {
+        statusEl.textContent = 'Error loading status';
+    }
+}
+
+function connectPatreon() {
+    window.open('/api/patreon/connect', '_blank');
+}
+
+async function syncPatreon() {
+    var syncBtn = document.getElementById('btn-patreon-sync');
+    if (syncBtn) { syncBtn.textContent = 'Refreshing...'; syncBtn.disabled = true; }
+    try {
+        var resp = await fetch('/api/patreon/sync', { method: 'POST' });
+        var data = await resp.json();
+        if (data.ok) {
+            loadPatreonStatus();
+        } else {
+            alert('Sync failed: ' + (data.error || 'Unknown error'));
+        }
+    } catch (e) {
+        alert('Sync failed: ' + e.message);
+    }
+    if (syncBtn) { syncBtn.textContent = 'Refresh Tier'; syncBtn.disabled = false; }
+}
+
+async function disconnectPatreon() {
+    if (!confirm('Disconnect your Patreon account? You will lose beta access if your tier granted it.')) return;
+    try {
+        await fetch('/api/patreon/disconnect', { method: 'POST' });
+        loadPatreonStatus();
+    } catch (e) {
+        alert('Failed to disconnect: ' + e.message);
     }
 }
 
