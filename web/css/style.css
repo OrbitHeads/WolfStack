@@ -628,6 +628,7 @@
 /* ─── Settings Page Tabs ─── */
 .settings-tabs {
     display: flex;
+    flex-wrap: wrap;
     gap: 0;
     border-bottom: 2px solid var(--border);
     margin-bottom: 24px;
