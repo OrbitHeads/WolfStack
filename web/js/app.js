@@ -17821,11 +17821,10 @@ function switchSettingsTab(tabName) {
     const panel = document.getElementById(`settings-tab-${tabName}`);
     if (panel) panel.classList.add('active');
 
-    // Highlight the correct button
+    // Highlight the correct button — match by onclick attribute for reliability
     document.querySelectorAll('.settings-tab-btn').forEach(btn => {
-        const btnText = btn.textContent.trim().toLowerCase();
-        const tabMap = { 'appearance': '\ud83c\udfa8 appearance', 'alerting': '\ud83d\udd14 alerting', 'ai': '\ud83e\udd16 ai agent', 'backup': '\ud83d\udce6 config backup', 'security': '\ud83d\udd10 security', 'patreon': '\u2764 patreon' };
-        if (btnText === (tabMap[tabName] || '').trim()) {
+        const onclick = btn.getAttribute('onclick') || '';
+        if (onclick.includes("'" + tabName + "'") || onclick.includes('"' + tabName + '"')) {
             btn.classList.add('active');
         }
     });
@@ -17853,8 +17852,10 @@ async function loadPatreonStatus() {
     var syncBtn = document.getElementById('btn-patreon-sync');
     var disconnectBtn = document.getElementById('btn-patreon-disconnect');
     if (!statusEl) return;
+    statusEl.textContent = 'Loading...';
     try {
         var resp = await fetch('/api/patreon/status');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
         var data = await resp.json();
         if (data.linked) {
             var tierNames = { none: 'None', free: 'Free', basic: 'Basic', advanced: 'Advanced', platinum: 'Platinum', enterprise: 'Enterprise' };
