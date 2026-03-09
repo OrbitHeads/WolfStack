@@ -586,6 +586,195 @@
     color: #e8a0a0;
 }
 
+/* ─── Obsidian Theme ─── */
+[data-theme="obsidian"] {
+    --bg-primary: #0f0f0f;
+    --bg-secondary: #1a1a1a;
+    --bg-card: #222222;
+    --bg-card-hover: #2a2a2a;
+    --bg-input: #0c0c0c;
+    --border: #2e2e2e;
+    --border-light: #3a3a3a;
+    --text-primary: #f5f5f5;
+    --text-secondary: #a0a0a0;
+    --text-muted: #666666;
+    --accent: #00d4aa;
+    --accent-light: #33e8c0;
+    --accent-glow: rgba(0, 212, 170, 0.12);
+    --success: #00d4aa;
+    --success-bg: rgba(0, 212, 170, 0.1);
+    --warning: #f0a000;
+    --warning-bg: rgba(240, 160, 0, 0.1);
+    --danger: #ff6b9d;
+    --danger-bg: rgba(255, 107, 157, 0.1);
+    --info: #00a3cc;
+    --info-bg: rgba(0, 163, 204, 0.1);
+    --gradient-main: linear-gradient(135deg, #00d4aa 0%, #00a3cc 100%);
+    --gradient-success: linear-gradient(135deg, #00d4aa 0%, #33e8c0 100%);
+    --gradient-danger: linear-gradient(135deg, #ff6b9d 0%, #ff8fb3 100%);
+    --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.5);
+    --shadow-md: 0 4px 20px rgba(0, 0, 0, 0.6);
+    --shadow-lg: 0 10px 40px rgba(0, 0, 0, 0.7);
+    --shadow-glow: 0 0 30px rgba(0, 212, 170, 0.1);
+}
+
+[data-theme="obsidian"] .log-viewer {
+    background: #0a0a0a;
+    color: #c0c0c0;
+}
+
+/* ─── Carbon Theme ─── */
+[data-theme="carbon"] {
+    --bg-primary: #121212;
+    --bg-secondary: #1e1e1e;
+    --bg-card: #262626;
+    --bg-card-hover: #2e2e2e;
+    --bg-input: #0e0e0e;
+    --border: #333333;
+    --border-light: #404040;
+    --text-primary: #e1e1e1;
+    --text-secondary: #999999;
+    --text-muted: #606060;
+    --accent: #bb86fc;
+    --accent-light: #d0a8ff;
+    --accent-glow: rgba(187, 134, 252, 0.12);
+    --success: #03dac6;
+    --success-bg: rgba(3, 218, 198, 0.1);
+    --warning: #f0a000;
+    --warning-bg: rgba(240, 160, 0, 0.1);
+    --danger: #cf6679;
+    --danger-bg: rgba(207, 102, 121, 0.1);
+    --info: #bb86fc;
+    --info-bg: rgba(187, 134, 252, 0.1);
+    --gradient-main: linear-gradient(135deg, #bb86fc 0%, #d0a8ff 100%);
+    --gradient-success: linear-gradient(135deg, #03dac6 0%, #64ffda 100%);
+    --gradient-danger: linear-gradient(135deg, #cf6679 0%, #e08090 100%);
+    --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.5);
+    --shadow-md: 0 4px 20px rgba(0, 0, 0, 0.6);
+    --shadow-lg: 0 10px 40px rgba(0, 0, 0, 0.7);
+    --shadow-glow: 0 0 30px rgba(187, 134, 252, 0.1);
+}
+
+[data-theme="carbon"] .log-viewer {
+    background: #0a0a0a;
+    color: #b0b0b0;
+}
+
+/* ─── Void Theme ─── */
+[data-theme="void"] {
+    --bg-primary: #0d1117;
+    --bg-secondary: #161b22;
+    --bg-card: #1c2128;
+    --bg-card-hover: #242a32;
+    --bg-input: #090d12;
+    --border: #30363d;
+    --border-light: #484f58;
+    --text-primary: #c9d1d9;
+    --text-secondary: #8b949e;
+    --text-muted: #545d68;
+    --accent: #58a6ff;
+    --accent-light: #79c0ff;
+    --accent-glow: rgba(88, 166, 255, 0.12);
+    --success: #3fb950;
+    --success-bg: rgba(63, 185, 80, 0.1);
+    --warning: #d29922;
+    --warning-bg: rgba(210, 153, 34, 0.1);
+    --danger: #f85149;
+    --danger-bg: rgba(248, 81, 73, 0.1);
+    --info: #58a6ff;
+    --info-bg: rgba(88, 166, 255, 0.1);
+    --gradient-main: linear-gradient(135deg, #58a6ff 0%, #79c0ff 100%);
+    --gradient-success: linear-gradient(135deg, #3fb950 0%, #56d364 100%);
+    --gradient-danger: linear-gradient(135deg, #f85149 0%, #ff7b72 100%);
+    --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 4px 20px rgba(0, 0, 0, 0.5);
+    --shadow-lg: 0 10px 40px rgba(0, 0, 0, 0.6);
+    --shadow-glow: 0 0 30px rgba(88, 166, 255, 0.1);
+}
+
+[data-theme="void"] .log-viewer {
+    background: #080c10;
+    color: #a0b0c0;
+}
+
+/* ─── Twilight Theme ─── */
+[data-theme="twilight"] {
+    --bg-primary: #1a1625;
+    --bg-secondary: #2d2438;
+    --bg-card: #352c42;
+    --bg-card-hover: #3e344c;
+    --bg-input: #14111c;
+    --border: #443a55;
+    --border-light: #574c68;
+    --text-primary: #dcd7e8;
+    --text-secondary: #9d94b0;
+    --text-muted: #6a6080;
+    --accent: #9d7cd8;
+    --accent-light: #b99aee;
+    --accent-glow: rgba(157, 124, 216, 0.12);
+    --success: #7aa2f7;
+    --success-bg: rgba(122, 162, 247, 0.1);
+    --warning: #ff9e64;
+    --warning-bg: rgba(255, 158, 100, 0.1);
+    --danger: #f7768e;
+    --danger-bg: rgba(247, 118, 142, 0.1);
+    --info: #7aa2f7;
+    --info-bg: rgba(122, 162, 247, 0.1);
+    --gradient-main: linear-gradient(135deg, #9d7cd8 0%, #b99aee 100%);
+    --gradient-success: linear-gradient(135deg, #7aa2f7 0%, #95b8ff 100%);
+    --gradient-danger: linear-gradient(135deg, #f7768e 0%, #ff9eac 100%);
+    --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 4px 20px rgba(0, 0, 0, 0.5);
+    --shadow-lg: 0 10px 40px rgba(0, 0, 0, 0.6);
+    --shadow-glow: 0 0 30px rgba(157, 124, 216, 0.1);
+}
+
+[data-theme="twilight"] .log-viewer {
+    background: #110e18;
+    color: #b8b0cc;
+}
+
+/* ─── Arctic Theme ─── */
+[data-theme="arctic"] {
+    --bg-primary: #f0f9ff;
+    --bg-secondary: #f8fafc;
+    --bg-card: #ffffff;
+    --bg-card-hover: #e8f4fd;
+    --bg-input: #e2eef8;
+    --border: #c8dce8;
+    --border-light: #a8c4d8;
+    --text-primary: #0c4a6e;
+    --text-secondary: #3a6e8a;
+    --text-muted: #7498b0;
+    --accent: #0284c7;
+    --accent-light: #0369a1;
+    --accent-glow: rgba(2, 132, 199, 0.1);
+    --success: #059669;
+    --success-bg: rgba(5, 150, 105, 0.08);
+    --warning: #d97706;
+    --warning-bg: rgba(217, 119, 6, 0.08);
+    --danger: #e11d48;
+    --danger-bg: rgba(225, 29, 72, 0.06);
+    --info: #0ea5e9;
+    --info-bg: rgba(14, 165, 233, 0.08);
+    --gradient-main: linear-gradient(135deg, #0284c7 0%, #0ea5e9 100%);
+    --gradient-success: linear-gradient(135deg, #059669 0%, #10b981 100%);
+    --gradient-danger: linear-gradient(135deg, #e11d48 0%, #f43f5e 100%);
+    --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.06);
+    --shadow-md: 0 4px 20px rgba(0, 0, 0, 0.06);
+    --shadow-lg: 0 10px 40px rgba(0, 0, 0, 0.08);
+    --shadow-glow: 0 0 30px rgba(2, 132, 199, 0.08);
+}
+
+[data-theme="arctic"] .top-bar {
+    background: rgba(240, 249, 255, 0.9);
+}
+
+[data-theme="arctic"] .log-viewer {
+    background: #f0f7fc;
+    color: #1e4a6e;
+}
+
 /* ─── No Icons Mode ─── */
 [data-no-icons] .icon {
     display: none !important;
