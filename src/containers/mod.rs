@@ -3160,7 +3160,29 @@ fn parse_proxmox_config(mut cfg: LxcParsedConfig, content: &str, container: &str
                     }
                 }
             }
-            _ => {}
+            _ => {
+                // Proxmox configs can contain raw LXC directives (lxc.mount.entry, lxc.cgroup2, etc.)
+                // using the same "key: value" colon format, e.g.:
+                //   lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file 0 0
+                if key == "lxc.mount.entry" && val.contains("/dev/net/tun") {
+                    cfg.tun_enabled = true;
+                }
+                if key == "lxc.mount.entry" && val.contains("/dev/fuse") {
+                    cfg.fuse_enabled = true;
+                }
+                if key == "lxc.mount.entry" && val.contains("nfsd") {
+                    cfg.nfs_enabled = true;
+                }
+                if key == "lxc.include" && val.contains("nesting.conf") {
+                    cfg.nesting_enabled = true;
+                }
+                if key == "lxc.mount.auto" && val.contains("cgroup") {
+                    cfg.nesting_enabled = true;
+                }
+                if key == "lxc.mount.auto" && val.contains("proc:rw") {
+                    cfg.keyctl_enabled = true;
+                }
+            }
         }
     }
 
@@ -3490,6 +3512,36 @@ fn pct_update_settings(container: &str, settings: &LxcSettingsUpdate) -> Result<
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("pct set failed: {}", stderr));
+    }
+
+    // Handle raw LXC directives (TUN, NFS) that pct set doesn't manage.
+    // These are lxc.mount.entry / lxc.cgroup2.devices.allow lines in the PVE config.
+    {
+        let pve_conf = format!("/etc/pve/lxc/{}.conf", container);
+        if let Ok(conf_content) = std::fs::read_to_string(&pve_conf) {
+            let feature_markers = ["/dev/net/tun", "nfsd", "10:200"];
+            // Strip existing managed lines
+            let mut lines: Vec<&str> = conf_content.lines().filter(|line| {
+                let trimmed = line.trim();
+                !feature_markers.iter().any(|m| trimmed.contains(m))
+            }).collect();
+
+            // Re-add based on desired state
+            let tun = settings.tun_enabled.unwrap_or(current.tun_enabled);
+            if tun {
+                lines.push("lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file 0 0");
+                lines.push("lxc.cgroup2.devices.allow: c 10:200 rwm");
+            }
+            let nfs = settings.nfs_enabled.unwrap_or(current.nfs_enabled);
+            if nfs {
+                lines.push("lxc.mount.entry: nfsd nfsd nfsd defaults 0 0");
+            }
+
+            let new_content = lines.join("\n") + "\n";
+            if let Err(e) = std::fs::write(&pve_conf, new_content) {
+                error!("Failed to update raw LXC directives in {}: {}", pve_conf, e);
+            }
+        }
     }
 
     // Handle WolfNet IP separately
