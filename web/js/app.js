@@ -17853,6 +17853,7 @@ async function loadPatreonHeaderBadge() {
         var data = await resp.json();
         var textEl = document.getElementById('patreon-header-text');
         var badgeEl = document.getElementById('patreon-header-badge');
+        var linkEl = document.getElementById('patreon-header-link');
         if (!badgeEl) return;
         if (data.linked && data.tier && data.tier !== 'none') {
             var tierNames = { free: 'Free', basic: 'Basic', advanced: 'Advanced', platinum: 'Platinum', enterprise: 'Enterprise' };
@@ -17866,6 +17867,15 @@ async function loadPatreonHeaderBadge() {
             badgeEl.style.background = tierColors[data.tier] || tierColors.basic;
             badgeEl.textContent = tierNames[data.tier] || data.tier;
             if (textEl) textEl.textContent = 'Patron \u2014 ' + (data.user_name || 'Linked');
+        } else if (!data.linked) {
+            // Not linked — point to settings page instead of Patreon
+            if (linkEl) {
+                linkEl.href = '#';
+                linkEl.removeAttribute('target');
+                linkEl.onclick = function(e) { e.preventDefault(); selectView('settings'); setTimeout(function(){ switchSettingsTab('patreon'); }, 100); };
+            }
+            if (textEl) textEl.textContent = 'Link your Patreon for beta access';
+            badgeEl.textContent = 'Connect';
         }
     } catch (e) { /* silent */ }
 }
