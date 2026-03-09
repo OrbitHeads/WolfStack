@@ -18,8 +18,6 @@ const CONFIG_PATH: &str = "/etc/wolfstack/patreon.json";
 const PATREON_CLIENT_ID: &str = "NawRwaiiX2WMqOuin7Tp0t8KTsarYTbi4g4e-C2Ab75QrdXjbN_6nx5JN73i6JVN";
 
 const PATREON_AUTH_URL: &str = "https://www.patreon.com/oauth2/authorize";
-const PATREON_IDENTITY_URL: &str = "https://www.patreon.com/api/oauth2/v2/identity";
-
 /// The wolfscale.org proxy handles OAuth callbacks and token operations.
 /// The client secret lives ONLY on wolfscale.org, never in the binary or config.
 const OAUTH_PROXY_BASE: &str = "https://wolfscale.org/patreon-proxy.php";
@@ -180,21 +178,19 @@ impl PatreonState {
         Ok((access_token, new_refresh))
     }
 
-    /// Fetch the user's identity and membership info from Patreon API v2.
+    /// Fetch the user's identity and membership info via the wolfscale.org proxy.
+    /// The proxy calls Patreon API v2, applies any overrides, and returns a clean JSON response.
     pub async fn fetch_identity(access_token: &str) -> Result<PatreonIdentity, String> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .map_err(|e| e.to_string())?;
 
-        let url = format!(
-            "{}?include=memberships,memberships.currently_entitled_tiers&fields[user]=full_name,email&fields[member]=currently_entitled_amount_cents,patron_status,campaign_lifetime_support_cents&fields[tier]=title,amount_cents",
-            PATREON_IDENTITY_URL
-        );
+        let url = format!("{}?action=identity", OAUTH_PROXY_BASE);
 
         let resp = client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", access_token))
+            .post(&url)
+            .form(&[("access_token", access_token)])
             .send()
             .await
             .map_err(|e| format!("Identity fetch failed: {}", e))?;
@@ -210,34 +206,30 @@ impl PatreonState {
             .await
             .map_err(|e| format!("Failed to parse identity: {}", e))?;
 
-        let user_data = &body["data"];
-        let user_id = user_data["id"].as_str().unwrap_or("").to_string();
-        let attrs = &user_data["attributes"];
-        let full_name = attrs["full_name"].as_str().unwrap_or("").to_string();
-        let email = attrs["email"].as_str().unwrap_or("").to_string();
-
-        // Find the membership for the WolfStack campaign
-        let mut pledge_cents: i64 = 0;
-
-        if let Some(included) = body["included"].as_array() {
-            for item in included {
-                if item["type"].as_str() == Some("member") {
-                    let member_attrs = &item["attributes"];
-                    let status = member_attrs["patron_status"].as_str().unwrap_or("");
-                    let cents = member_attrs["currently_entitled_amount_cents"].as_i64().unwrap_or(0);
-                    if status == "active_patron" && cents > pledge_cents {
-                        pledge_cents = cents;
-                    }
-                }
-            }
+        if let Some(error) = body["error"].as_str() {
+            return Err(format!("Identity error: {}", error));
         }
+
+        let user_id = body["user_id"].as_str().unwrap_or("").to_string();
+        let full_name = body["full_name"].as_str().unwrap_or("").to_string();
+        let email = body["email"].as_str().unwrap_or("").to_string();
+        let pledge_cents = body["pledge_amount_cents"].as_i64().unwrap_or(0);
+        let tier = body["tier"].as_str().unwrap_or("none");
+
+        let tier = match tier {
+            "platinum" => PatreonTier::Platinum,
+            "advanced" => PatreonTier::Advanced,
+            "basic" => PatreonTier::Basic,
+            "free" => PatreonTier::Free,
+            _ => PatreonTier::from_cents(pledge_cents),
+        };
 
         Ok(PatreonIdentity {
             user_id,
             full_name,
             email,
             pledge_amount_cents: pledge_cents,
-            tier: PatreonTier::from_cents(pledge_cents),
+            tier,
         })
     }
 
@@ -272,10 +264,7 @@ impl PatreonState {
             Err(e) => return Err(e),
         };
 
-        // Owner override
-        let is_owner = identity.email.to_lowercase() == "paul@wolf.uk.com"
-            || identity.full_name.to_lowercase() == "paul clevett";
-        let tier = if is_owner { PatreonTier::Platinum } else { identity.tier.clone() };
+        let tier = identity.tier.clone();
 
         // Update config
         {
@@ -283,7 +272,7 @@ impl PatreonState {
             config.patreon_user_id = Some(identity.user_id);
             config.patreon_user_name = Some(identity.full_name);
             config.patreon_email = Some(identity.email);
-            config.tier = tier.clone();
+            config.tier = identity.tier;
             config.pledge_amount_cents = identity.pledge_amount_cents;
             config.last_checked = Some(chrono::Utc::now().to_rfc3339());
             let _ = config.save();
