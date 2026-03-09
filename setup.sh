@@ -854,9 +854,11 @@ else
     echo ""
     echo "✓ Config already exists at /etc/wolfstack/config.toml"
     echo "  (Upgrade mode - skipping configuration prompts)"
-    # Read port from existing config
+    # Read port and bind from existing config
     WS_PORT=$(grep "^port" /etc/wolfstack/config.toml 2>/dev/null | head -1 | awk '{print $3}' | tr -d '[:space:][:cntrl:]' || echo "8553")
     WS_PORT=${WS_PORT:-8553}
+    WS_BIND=$(grep "^bind" /etc/wolfstack/config.toml 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/' | tr -d '[:space:][:cntrl:]' || echo "0.0.0.0")
+    WS_BIND=${WS_BIND:-0.0.0.0}
 fi
 
 # ─── Create systemd service ─────────────────────────────────────────────────
