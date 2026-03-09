@@ -116,6 +116,22 @@ else
     exit 1
 fi
 
+# ─── Update system packages first ─────────────────────────────────────────
+# Ensures package index is in sync and avoids dependency mismatches
+# (e.g. libssl-dev requiring an older libssl3t64 than what's installed)
+echo ""
+echo "Updating system packages..."
+if [ "$PKG_MANAGER" = "apt" ]; then
+    apt update -qq && apt upgrade -y -qq
+elif [ "$PKG_MANAGER" = "dnf" ]; then
+    dnf upgrade -y --quiet
+elif [ "$PKG_MANAGER" = "yum" ]; then
+    yum update -y -q
+elif [ "$PKG_MANAGER" = "zypper" ]; then
+    zypper refresh -q && zypper update -y
+fi
+echo "✓ System packages up to date"
+
 # ─── Detect Proxmox VE host ─────────────────────────────────────────────────
 IS_PROXMOX=false
 if command -v pveversion &> /dev/null || [ -f /etc/pve/.version ] || dpkg -l proxmox-ve &> /dev/null 2>&1; then
