@@ -10882,9 +10882,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/backups/pbs/snapshots", web::get().to(pbs_snapshots))
         .route("/api/backups/pbs/restore", web::post().to(pbs_restore))
         .route("/api/backups/pbs/restore/progress", web::get().to(pbs_restore_progress))
+        .route("/api/backups/pbs/config/full", web::get().to(pbs_config_get_full))
         .route("/api/backups/pbs/config", web::get().to(pbs_config_get))
         .route("/api/backups/pbs/config", web::post().to(pbs_config_save))
-        .route("/api/backups/pbs/config/full", web::get().to(pbs_config_get_full))
         // Generic backup {id} routes — after specific routes
         .route("/api/backups/{id}", web::delete().to(backup_delete))
         .route("/api/backups/{id}/restore", web::post().to(backup_restore))
