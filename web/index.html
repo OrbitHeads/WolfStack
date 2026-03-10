@@ -1802,6 +1802,189 @@
             </div>
         </div>
 
+        <!-- ═══ Cluster Backups Page ═══ -->
+        <div id="page-cluster-backups" class="page-view" style="display:none;">
+            <!-- Header -->
+            <div class="card"
+                style="margin-bottom:20px; background:linear-gradient(135deg, rgba(99,102,241,0.12), rgba(16,185,129,0.08)); border-color:rgba(99,102,241,0.25);">
+                <div class="card-body"
+                    style="display:flex; align-items:center; justify-content:space-between; padding:28px 32px; flex-wrap:wrap; gap:16px;">
+                    <div style="display:flex; align-items:center; gap:20px;">
+                        <div
+                            style="width:64px; height:64px; background:linear-gradient(135deg,#6366f1,#10b981); border-radius:16px; display:flex; align-items:center; justify-content:center; font-size:32px; box-shadow:0 4px 20px rgba(99,102,241,0.3);">
+                            🛡️</div>
+                        <div>
+                            <h2 style="font-size:24px; margin-bottom:4px; color:var(--text-primary); font-weight:700;">
+                                Cluster Backups <span id="cluster-backups-label"
+                                    style="font-size:14px; font-weight:400; color:var(--text-secondary);"></span></h2>
+                            <p style="color:var(--text-secondary); font-size:13px; margin:0;">Aggregated backup overview across all nodes in this cluster. Configure PBS once and push to every node.</p>
+                        </div>
+                    </div>
+                    <div style="display:flex; gap:10px; align-items:center;">
+                        <button class="btn btn-primary" onclick="loadClusterBackups()" style="font-weight:600;">
+                            🔄 Refresh
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Summary Stats -->
+            <div class="stats-grid" style="margin-bottom:20px;">
+                <div class="stat-card">
+                    <div class="stat-header">
+                        <span class="stat-label">Total Backups</span>
+                        <div class="stat-icon" style="background:rgba(99,102,241,0.15); color:#6366f1;">🛡️</div>
+                    </div>
+                    <div class="stat-value" id="cb-stat-backups">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-header">
+                        <span class="stat-label">Schedules</span>
+                        <div class="stat-icon" style="background:rgba(16,185,129,0.15); color:#10b981;">📅</div>
+                    </div>
+                    <div class="stat-value" id="cb-stat-schedules" style="color:#10b981;">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-header">
+                        <span class="stat-label">Nodes</span>
+                        <div class="stat-icon" style="background:rgba(59,130,246,0.15); color:#3b82f6;">🖥️</div>
+                    </div>
+                    <div class="stat-value" id="cb-stat-nodes">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-header">
+                        <span class="stat-label">PBS Connected</span>
+                        <div class="stat-icon" style="background:rgba(234,179,8,0.15); color:#eab308;">📦</div>
+                    </div>
+                    <div class="stat-value" id="cb-stat-pbs" style="color:#eab308;">0</div>
+                </div>
+            </div>
+
+            <!-- Aggregated Backup History -->
+            <div class="card" style="margin-bottom:16px;">
+                <div class="card-header">
+                    <h3>📋 Backup History (All Nodes)</h3>
+                </div>
+                <div class="card-body" style="overflow-x:auto;">
+                    <table class="data-table" style="width:100%;">
+                        <thead>
+                            <tr>
+                                <th>Node</th>
+                                <th>Target</th>
+                                <th>Type</th>
+                                <th>Storage</th>
+                                <th>Size</th>
+                                <th>Date</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="cb-backups-table"></tbody>
+                    </table>
+                    <p id="cb-backups-empty"
+                        style="display:none; text-align:center; padding:20px; color: var(--text-muted);">
+                        No backups found across cluster nodes.
+                    </p>
+                </div>
+            </div>
+
+            <!-- Aggregated Schedules -->
+            <div class="card" style="margin-bottom:16px;">
+                <div class="card-header">
+                    <h3>📅 Schedules (All Nodes)</h3>
+                </div>
+                <div class="card-body" style="overflow-x:auto;">
+                    <table class="data-table" style="width:100%;">
+                        <thead>
+                            <tr>
+                                <th>Node</th>
+                                <th>Name</th>
+                                <th>Frequency</th>
+                                <th>Time (UTC)</th>
+                                <th>Targets</th>
+                                <th>Storage</th>
+                                <th>Retention</th>
+                                <th>Enabled</th>
+                            </tr>
+                        </thead>
+                        <tbody id="cb-schedules-table"></tbody>
+                    </table>
+                    <p id="cb-schedules-empty"
+                        style="display:none; text-align:center; padding:20px; color: var(--text-muted);">
+                        No schedules configured on any node.
+                    </p>
+                </div>
+            </div>
+
+            <!-- PBS Configuration — Copy to All Nodes -->
+            <div class="card" style="margin-bottom:16px;">
+                <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
+                    <h3>📦 Proxmox Backup Server — Push Config</h3>
+                </div>
+                <div class="card-body">
+                    <p style="font-size:13px; color:var(--text-secondary); margin-bottom:16px;">
+                        Enter your PBS details below and push the configuration to all WolfStack nodes at once — even across different clusters.
+                    </p>
+                    <!-- Per-node PBS status -->
+                    <div id="cb-pbs-node-status" style="margin-bottom:16px;"></div>
+                    <!-- PBS Config Form -->
+                    <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(280px, 1fr)); gap:12px; margin-bottom:16px;">
+                        <div class="form-group">
+                            <label style="font-size:12px; color:var(--text-secondary);">Server</label>
+                            <input type="text" id="cb-pbs-server" class="form-control" placeholder="pbs.example.com:8007">
+                        </div>
+                        <div class="form-group">
+                            <label style="font-size:12px; color:var(--text-secondary);">Datastore</label>
+                            <input type="text" id="cb-pbs-datastore" class="form-control" placeholder="backups">
+                        </div>
+                        <div class="form-group">
+                            <label style="font-size:12px; color:var(--text-secondary);">Username</label>
+                            <input type="text" id="cb-pbs-user" class="form-control" placeholder="backup@pbs">
+                        </div>
+                        <div class="form-group">
+                            <label style="font-size:12px; color:var(--text-secondary);">Password <span
+                                    style="color:var(--text-muted);">(or use API token below)</span></label>
+                            <input type="password" id="cb-pbs-password" class="form-control" placeholder="password">
+                        </div>
+                        <div class="form-group">
+                            <label style="font-size:12px; color:var(--text-secondary);">API Token Name <span
+                                    style="color:var(--text-muted);">(optional)</span></label>
+                            <input type="text" id="cb-pbs-token-name" class="form-control" placeholder="wolfstack">
+                        </div>
+                        <div class="form-group">
+                            <label style="font-size:12px; color:var(--text-secondary);">API Token Secret <span
+                                    style="color:var(--text-muted);">(optional)</span></label>
+                            <input type="password" id="cb-pbs-token-secret" class="form-control"
+                                placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
+                        </div>
+                        <div class="form-group">
+                            <label style="font-size:12px; color:var(--text-secondary);">Namespace <span
+                                    style="color:var(--text-muted);">(optional)</span></label>
+                            <input type="text" id="cb-pbs-namespace" class="form-control" placeholder="">
+                        </div>
+                        <div class="form-group">
+                            <label style="font-size:12px; color:var(--text-secondary);">Fingerprint <span
+                                    style="color:var(--text-muted);">(optional, for self-signed certs)</span></label>
+                            <input type="text" id="cb-pbs-fingerprint" class="form-control" placeholder="SHA-256 fingerprint">
+                        </div>
+                    </div>
+                    <!-- Node selection -->
+                    <div style="margin-bottom:16px;">
+                        <label style="font-size:13px; font-weight:600; color:var(--text-primary); display:block; margin-bottom:8px;">Target Nodes</label>
+                        <div id="cb-pbs-node-checkboxes" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(260px, 1fr)); gap:8px;"></div>
+                    </div>
+                    <div style="display:flex; gap:10px;">
+                        <button class="btn btn-primary" onclick="copyPbsConfigToNodes()" style="font-weight:600;">
+                            📤 Push PBS Config to Selected Nodes
+                        </button>
+                        <button class="btn" onclick="loadPbsConfigFromNode()"
+                            style="background:var(--bg-secondary); border:1px solid var(--border);">
+                            📥 Pull Config from a Node
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- Schedule Modal (only needs name, frequency, time, retention — targets come from checked items) -->
         <div id="create-schedule-modal" class="modal-overlay">
             <div class="modal" style="max-width:480px;">

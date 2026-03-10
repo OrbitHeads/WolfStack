@@ -749,6 +749,9 @@ function buildServerTree(nodes) {
                 <a class="nav-item server-child-item wolfrun-cluster-item" data-cluster="${escapedName}" data-view="wolfrun" onclick="showWolfRunPage('${escapedName}')" style="margin-left: 8px; padding: 6px 10px; display:flex; align-items:center; gap:6px;">
                     <span class="icon" style="font-size:15px;">🏃</span> <span style="font-weight:600;">WolfRun</span>
                     <span class="wolfrun-svc-count" id="wolfrun-count-${clusterId}" style="margin-left:auto; font-size:10px; padding:1px 6px; background:var(--primary-color,#6366f1); color:#fff; border-radius:10px; display:none;"></span>
+                </a>
+                <a class="nav-item server-child-item cluster-backups-item" data-cluster="${escapedName}" data-view="cluster-backups" onclick="showClusterBackupsPage('${escapedName}')" style="margin-left: 8px; padding: 6px 10px; display:flex; align-items:center; gap:6px;">
+                    <span class="icon" style="font-size:15px;">🛡️</span> <span style="font-weight:600;">Backups</span>
                 </a>`;
 
         // Each node within the cluster
@@ -6549,18 +6552,21 @@ function activityStop() {
 }
 
 // ─── Toast Notifications ───
-function showToast(message, type = 'info', duration = 4000, id = null) {
+function showToast(message, type = 'info', duration = 5000, id = null) {
     const container = document.getElementById('toast-container');
+    if (!container) return;
     const toast = document.createElement('div');
     toast.className = `toast ${type}`;
     if (id) toast.id = id;
-    const icons = { success: '✓', error: '✗', info: 'ℹ' };
-    toast.innerHTML = `<span style="font-size: 16px;">${icons[type] || 'ℹ'}</span> <span class="toast-message">${message}</span>`;
+    const icons = { success: '✅', error: '❌', info: 'ℹ️' };
+    toast.innerHTML = `<span style="font-size:18px; flex-shrink:0;">${icons[type] || 'ℹ️'}</span>
+        <span class="toast-message" style="flex:1;">${message}</span>
+        <span onclick="this.parentElement.remove()" style="cursor:pointer; opacity:0.6; font-size:16px; flex-shrink:0; margin-left:8px;" title="Dismiss">&times;</span>`;
     container.appendChild(toast);
     if (duration > 0) {
         setTimeout(() => {
             toast.style.opacity = '0';
-            toast.style.transform = 'translateX(100%)';
+            toast.style.transform = 'translateX(120%)';
             setTimeout(() => toast.remove(), 300);
         }, duration);
     }
@@ -13981,6 +13987,345 @@ async function restorePbsSnapshot(snapshot, backupType) {
         showToast('PBS restore error: ' + e.message, 'error');
         if (btn) { btn.disabled = false; btn.innerHTML = origText; }
     }
+}
+
+// ═══════════════════════════════════════════════════
+// Cluster Backups
+// ═══════════════════════════════════════════════════
+
+let clusterBackupsCurrentCluster = '';
+let clusterBackupsRefreshTimer = null;
+
+function nodeApiUrl(nodeId, path) {
+    const node = allNodes.find(n => n.id === nodeId);
+    if (!node) return path;
+    if (node.is_self) return path;
+    const cleanPath = path.replace(/^\/api\//, '');
+    return `/api/nodes/${nodeId}/proxy/${cleanPath}`;
+}
+
+function getClusterNodes(clusterName) {
+    return allNodes.filter(n =>
+        n.node_type !== 'proxmox' &&
+        (n.cluster_name || 'WolfStack') === clusterName
+    );
+}
+
+function getAllWolfStackNodes() {
+    return allNodes.filter(n => n.node_type !== 'proxmox');
+}
+
+function showClusterBackupsPage(clusterName) {
+    closeSidebarMobile();
+    clusterBackupsCurrentCluster = clusterName;
+    currentPage = 'cluster-backups';
+    currentNodeId = null;
+    currentComponent = null;
+
+    document.querySelectorAll('.page-view').forEach(p => p.style.display = 'none');
+    const el = document.getElementById('page-cluster-backups');
+    if (el) el.style.display = 'block';
+
+    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+    const item = document.querySelector(`.cluster-backups-item[data-cluster="${clusterName}"]`);
+    if (item) item.classList.add('active');
+
+    document.getElementById('page-title').textContent = `Backups — ${clusterName}`;
+    document.getElementById('cluster-backups-label').textContent = `— ${clusterName}`;
+
+    loadClusterBackups();
+
+    if (clusterBackupsRefreshTimer) clearInterval(clusterBackupsRefreshTimer);
+    clusterBackupsRefreshTimer = setInterval(() => {
+        if (currentPage === 'cluster-backups') loadClusterBackups();
+        else clearInterval(clusterBackupsRefreshTimer);
+    }, 30000);
+}
+
+async function loadClusterBackups() {
+    const clusterNodes = getClusterNodes(clusterBackupsCurrentCluster);
+    const allWsNodes = getAllWolfStackNodes();
+
+    // Update stats: nodes count
+    const statNodes = document.getElementById('cb-stat-nodes');
+    if (statNodes) statNodes.textContent = clusterNodes.length;
+
+    // Fetch backups, schedules, and PBS status from each cluster node in parallel
+    const results = await Promise.allSettled(clusterNodes.filter(n => n.online).map(async (node) => {
+        try {
+            const [backupsRes, schedulesRes, pbsRes] = await Promise.all([
+                fetch(nodeApiUrl(node.id, '/api/backups')),
+                fetch(nodeApiUrl(node.id, '/api/backups/schedules')),
+                fetch(nodeApiUrl(node.id, '/api/backups/pbs/status')).catch(() => null),
+            ]);
+            const backups = backupsRes.ok ? await backupsRes.json() : [];
+            const schedules = schedulesRes.ok ? await schedulesRes.json() : [];
+            const pbs = pbsRes && pbsRes.ok ? await pbsRes.json() : null;
+            return { node, backups, schedules, pbs };
+        } catch (e) {
+            return { node, backups: [], schedules: [], pbs: null };
+        }
+    }));
+
+    const nodeResults = results.map(r => r.status === 'fulfilled' ? r.value : r.reason);
+
+    // Aggregate stats
+    let totalBackups = 0, totalSchedules = 0, pbsConnected = 0;
+    const allBackups = [];
+    const allSchedules = [];
+
+    for (const nr of nodeResults) {
+        if (!nr || !nr.node) continue;
+        const backups = Array.isArray(nr.backups) ? nr.backups : [];
+        const schedules = Array.isArray(nr.schedules) ? nr.schedules : [];
+        totalBackups += backups.length;
+        totalSchedules += schedules.length;
+        if (nr.pbs && nr.pbs.connected) pbsConnected++;
+        backups.forEach(b => allBackups.push({ ...b, _node: nr.node }));
+        schedules.forEach(s => allSchedules.push({ ...s, _node: nr.node }));
+    }
+
+    const statBackups = document.getElementById('cb-stat-backups');
+    const statSchedules = document.getElementById('cb-stat-schedules');
+    const statPbs = document.getElementById('cb-stat-pbs');
+    if (statBackups) statBackups.textContent = totalBackups;
+    if (statSchedules) statSchedules.textContent = totalSchedules;
+    if (statPbs) statPbs.textContent = `${pbsConnected}/${clusterNodes.filter(n => n.online).length}`;
+
+    renderClusterBackupHistory(allBackups);
+    renderClusterSchedules(allSchedules);
+    renderClusterPbsNodeStatus(nodeResults);
+    renderPbsNodeCheckboxes(allWsNodes);
+}
+
+function renderClusterBackupHistory(backups) {
+    const tbody = document.getElementById('cb-backups-table');
+    const empty = document.getElementById('cb-backups-empty');
+    if (!tbody) return;
+
+    if (!backups || backups.length === 0) {
+        tbody.innerHTML = '';
+        if (empty) empty.style.display = 'block';
+        return;
+    }
+    if (empty) empty.style.display = 'none';
+
+    backups.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+
+    tbody.innerHTML = backups.slice(0, 100).map(b => {
+        const typeEmoji = { docker: '🐳', lxc: '📦', vm: '🖥️', config: '⚙️' }[b.target?.type] || '📄';
+        const typeName = (b.target?.type || 'unknown').toUpperCase();
+        const targetName = b.target?.name || (b.target?.type === 'config' ? 'WolfStack Config' : 'Unknown');
+        const storageLabel = formatStorageLabel(b.storage);
+        const size = formatBytes(b.size_bytes || 0);
+        const date = b.created_at ? new Date(b.created_at).toLocaleString() : '—';
+        const statusBadge = b.status === 'completed'
+            ? '<span class="badge" style="background:#22c55e; color:#fff;">Completed</span>'
+            : b.status === 'failed'
+                ? '<span class="badge" style="background:#ef4444; color:#fff;">Failed</span>'
+                : '<span class="badge" style="background:#f59e0b; color:#000;">In Progress</span>';
+        const nodeName = b._node ? escapeHtml(b._node.hostname) : '—';
+
+        return `<tr>
+            <td><span class="server-dot ${b._node?.online ? 'online' : 'offline'}" style="display:inline-block; margin-right:4px;"></span>${nodeName}</td>
+            <td>${typeEmoji} ${escapeHtml(targetName)}</td>
+            <td>${typeName}</td>
+            <td>${escapeHtml(storageLabel)}</td>
+            <td>${size}</td>
+            <td>${date}</td>
+            <td>${statusBadge}</td>
+        </tr>`;
+    }).join('');
+}
+
+function renderClusterSchedules(schedules) {
+    const tbody = document.getElementById('cb-schedules-table');
+    const empty = document.getElementById('cb-schedules-empty');
+    if (!tbody) return;
+
+    if (!schedules || schedules.length === 0) {
+        tbody.innerHTML = '';
+        if (empty) empty.style.display = 'block';
+        return;
+    }
+    if (empty) empty.style.display = 'none';
+
+    tbody.innerHTML = schedules.map(s => {
+        const targets = s.backup_all ? 'All' : (s.targets || []).map(t => `${t.type}:${t.name}`).join(', ');
+        const storageLabel = formatStorageLabel(s.storage);
+        const retention = s.retention > 0 ? `Keep ${s.retention}` : 'Unlimited';
+        const enabled = s.enabled
+            ? '<span class="badge" style="background:#22c55e; color:#fff;">Active</span>'
+            : '<span class="badge" style="background:#6b7280; color:#fff;">Disabled</span>';
+        const nodeName = s._node ? escapeHtml(s._node.hostname) : '—';
+
+        return `<tr>
+            <td><span class="server-dot ${s._node?.online ? 'online' : 'offline'}" style="display:inline-block; margin-right:4px;"></span>${nodeName}</td>
+            <td>${escapeHtml(s.name)}</td>
+            <td style="text-transform:capitalize;">${s.frequency}</td>
+            <td>${s.time}</td>
+            <td>${escapeHtml(targets)}</td>
+            <td>${escapeHtml(storageLabel)}</td>
+            <td>${retention}</td>
+            <td>${enabled}</td>
+        </tr>`;
+    }).join('');
+}
+
+function renderClusterPbsNodeStatus(nodeResults) {
+    const container = document.getElementById('cb-pbs-node-status');
+    if (!container) return;
+
+    const rows = nodeResults.filter(nr => nr && nr.node).map(nr => {
+        const pbs = nr.pbs;
+        let statusHtml;
+        if (!pbs) {
+            statusHtml = '<span style="color:var(--text-muted);">Offline / Unreachable</span>';
+        } else if (!pbs.installed) {
+            statusHtml = '<span style="color:#ef4444;">Client not installed</span>';
+        } else if (pbs.connected) {
+            statusHtml = `<span style="color:#22c55e;">Connected (${pbs.snapshot_count || 0} snapshots)</span>`;
+        } else {
+            statusHtml = `<span style="color:#f59e0b;">Disconnected${pbs.error ? ': ' + escapeHtml(pbs.error) : ''}</span>`;
+        }
+        return `<div style="display:flex; align-items:center; gap:10px; padding:8px 12px; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-sm); font-size:13px;">
+            <span class="server-dot ${nr.node.online ? 'online' : 'offline'}" style="display:inline-block;"></span>
+            <strong style="min-width:120px;">${escapeHtml(nr.node.hostname)}</strong>
+            <span style="flex:1;">${statusHtml}</span>
+        </div>`;
+    });
+
+    container.innerHTML = rows.length > 0
+        ? `<div style="display:grid; gap:6px; margin-bottom:12px;">${rows.join('')}</div>`
+        : '<p style="color:var(--text-muted); font-size:13px;">No nodes available to check.</p>';
+}
+
+function renderPbsNodeCheckboxes(wsNodes) {
+    const container = document.getElementById('cb-pbs-node-checkboxes');
+    if (!container) return;
+
+    container.innerHTML = `<label style="display:flex; align-items:center; gap:8px; padding:8px 12px; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-sm); cursor:pointer; font-size:13px; font-weight:600;">
+        <input type="checkbox" id="cb-pbs-select-all" checked onchange="toggleClusterPbsNodes(this.checked)"> Select All (${wsNodes.length} nodes)
+    </label>` + wsNodes.map(n => {
+        const cluster = n.cluster_name || 'WolfStack';
+        return `<label style="display:flex; align-items:center; gap:8px; padding:8px 12px; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-sm); cursor:pointer; font-size:13px;"
+            onmouseover="this.style.borderColor='var(--border-light)'" onmouseout="this.style.borderColor='var(--border)'">
+            <input type="checkbox" class="cb-pbs-node-cb" value="${n.id}" checked ${!n.online ? 'disabled' : ''}>
+            <span class="server-dot ${n.online ? 'online' : 'offline'}" style="display:inline-block;"></span>
+            <span style="flex:1;">${escapeHtml(n.hostname)}</span>
+            <span style="font-size:11px; color:var(--text-muted);">${escapeHtml(cluster)}</span>
+        </label>`;
+    }).join('');
+}
+
+function toggleClusterPbsNodes(checked) {
+    document.querySelectorAll('.cb-pbs-node-cb:not(:disabled)').forEach(cb => cb.checked = checked);
+}
+
+async function copyPbsConfigToNodes() {
+    const getVal = id => (document.getElementById(id) || {}).value || '';
+    const body = {
+        pbs_server: getVal('cb-pbs-server'),
+        pbs_datastore: getVal('cb-pbs-datastore'),
+        pbs_user: getVal('cb-pbs-user'),
+        pbs_password: getVal('cb-pbs-password'),
+        pbs_token_name: getVal('cb-pbs-token-name'),
+        pbs_token_secret: getVal('cb-pbs-token-secret'),
+        pbs_fingerprint: getVal('cb-pbs-fingerprint'),
+        pbs_namespace: getVal('cb-pbs-namespace'),
+    };
+
+    if (!body.pbs_server || !body.pbs_datastore || !body.pbs_user) {
+        showToast('Server, datastore, and user are required', 'error');
+        return;
+    }
+
+    const selectedIds = [...document.querySelectorAll('.cb-pbs-node-cb:checked')].map(cb => cb.value);
+    if (selectedIds.length === 0) {
+        showToast('No nodes selected', 'error');
+        return;
+    }
+
+    const nodes = allNodes.filter(n => selectedIds.includes(n.id));
+    if (!await showConfirm(`Push PBS configuration to ${nodes.length} node(s)?\n\n${nodes.map(n => n.hostname).join(', ')}\n\nServer: ${body.pbs_server}\nDatastore: ${body.pbs_datastore}`)) return;
+
+    let success = 0, failed = 0;
+    const results = await Promise.allSettled(nodes.map(async (node) => {
+        try {
+            const url = nodeApiUrl(node.id, '/api/backups/pbs/config');
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            if (data.error) throw new Error(data.error);
+            return { node, ok: true };
+        } catch (e) {
+            return { node, ok: false, error: e.message };
+        }
+    }));
+
+    for (const r of results) {
+        const res = r.status === 'fulfilled' ? r.value : { ok: false };
+        if (res.ok) success++;
+        else failed++;
+    }
+
+    if (failed === 0) {
+        showToast(`PBS config pushed to all ${success} node(s) successfully`, 'success');
+    } else {
+        showToast(`PBS config: ${success} succeeded, ${failed} failed`, failed > 0 ? 'error' : 'success');
+    }
+
+    loadClusterBackups();
+}
+
+async function loadPbsConfigFromNode() {
+    // Find the first online WolfStack node that has PBS configured
+    const wsNodes = getAllWolfStackNodes().filter(n => n.online);
+    if (wsNodes.length === 0) {
+        showToast('No online nodes available', 'error');
+        return;
+    }
+
+    let foundCfg = null;
+    let fromNode = null;
+    for (const node of wsNodes) {
+        try {
+            const res = await fetch(nodeApiUrl(node.id, '/api/backups/pbs/config'));
+            if (res.ok) {
+                const cfg = await res.json();
+                if (cfg.pbs_server) {
+                    foundCfg = cfg;
+                    fromNode = node;
+                    break;
+                }
+            }
+        } catch (e) { /* skip */ }
+    }
+
+    if (!foundCfg) {
+        showToast('No PBS configuration found on any node', 'error');
+        return;
+    }
+
+    // Populate the form fields
+    const setVal = (id, val) => { const el = document.getElementById(id); if (el) el.value = val || ''; };
+    setVal('cb-pbs-server', foundCfg.pbs_server);
+    setVal('cb-pbs-datastore', foundCfg.pbs_datastore);
+    setVal('cb-pbs-user', foundCfg.pbs_user);
+    setVal('cb-pbs-token-name', foundCfg.pbs_token_name);
+    setVal('cb-pbs-fingerprint', foundCfg.pbs_fingerprint);
+    setVal('cb-pbs-namespace', foundCfg.pbs_namespace);
+    // Don't populate secrets — they aren't returned by the API
+    const secEl = document.getElementById('cb-pbs-token-secret');
+    if (secEl && foundCfg.has_token_secret) secEl.placeholder = '(saved on node — re-enter to push)';
+    const pwEl = document.getElementById('cb-pbs-password');
+    if (pwEl && foundCfg.has_password) pwEl.placeholder = '(saved on node — re-enter to push)';
+
+    showToast(`Pulled PBS config from ${fromNode.hostname}. Re-enter password/token secret to push to other nodes.`, 'success');
 }
 
 // ═══════════════════════════════════════════════════
