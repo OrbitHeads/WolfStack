@@ -18739,16 +18739,18 @@ async function loadPatreonHeaderBadge() {
             badgeEl.style.background = tierColors[data.tier] || tierColors.basic;
             badgeEl.textContent = tierNames[data.tier] || data.tier;
             if (textEl) textEl.textContent = 'Patron \u2014 ' + (data.user_name || 'Linked');
-        } else if (!data.linked) {
-            // Not linked — point to settings page instead of Patreon
-            if (linkEl) {
-                linkEl.href = '#';
-                linkEl.removeAttribute('target');
-                linkEl.onclick = function(e) { e.preventDefault(); selectView('settings'); setTimeout(function(){ switchSettingsTab('patreon'); }, 100); };
+        } else {
+            // Not linked or no paid tier — encourage support
+            if (!data.linked) {
+                if (linkEl) {
+                    linkEl.href = '#';
+                    linkEl.removeAttribute('target');
+                    linkEl.onclick = function(e) { e.preventDefault(); selectView('settings'); setTimeout(function(){ switchSettingsTab('patreon'); }, 100); };
+                }
+                if (textEl) textEl.textContent = 'Link your Patreon account';
+                badgeEl.textContent = 'Connect';
             }
-            if (textEl) textEl.textContent = 'Link your Patreon account';
-            badgeEl.textContent = 'Connect';
-            // Show support toast once per session for non-patrons
+            // Show support toast once per session
             if (!sessionStorage.getItem('ws_patreon_toast')) {
                 sessionStorage.setItem('ws_patreon_toast', '1');
                 setTimeout(() => {
