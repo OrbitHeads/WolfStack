@@ -6609,9 +6609,9 @@ function showToast(message, type = 'info', duration = 5000, id = null) {
     const toast = document.createElement('div');
     toast.className = `toast ${type}`;
     if (id) toast.id = id;
-    const icons = { success: '✅', error: '❌', warning: '⚠️', info: 'ℹ️' };
-    const bgColors = { success: 'linear-gradient(135deg, #166534, #14532d)', error: 'linear-gradient(135deg, #991b1b, #7f1d1d)', warning: 'linear-gradient(135deg, #854d0e, #713f12)', info: 'linear-gradient(135deg, #1e3a5f, #172554)' };
-    const borderColors = { success: '#4ade80', error: '#f87171', warning: '#facc15', info: '#60a5fa' };
+    const icons = { success: '✓', error: '✗', warning: '⚠', info: 'ℹ' };
+    const bgColors = { success: 'linear-gradient(135deg, #1a3a2a, #162b22)', error: 'linear-gradient(135deg, #3b1111, #2d0e0e)', warning: 'linear-gradient(135deg, #3b2e0e, #2d2408)', info: 'linear-gradient(135deg, #1a2a3f, #141f30)' };
+    const borderColors = { success: '#34d399', error: '#f87171', warning: '#fbbf24', info: '#60a5fa' };
     Object.assign(toast.style, {
         padding: '14px 20px', background: bgColors[type] || bgColors.info,
         borderLeft: '4px solid ' + (borderColors[type] || borderColors.info),
@@ -7968,11 +7968,7 @@ function tomlToggleRaw(component, displayName) {
 
 // ─── Polling Loop ───
 const POLL_INTERVAL = isMobileView() ? 30000 : 10000;
-fetchNodes().then(() => {
-    const count = allNodes.length;
-    const nodeWord = count === 1 ? 'node' : 'nodes';
-    showToast(`Connected — ${count} ${nodeWord} online`, 'success', 3000);
-});
+fetchNodes();
 fetchMetricsHistory(); // Initial history load
 setInterval(fetchNodes, POLL_INTERVAL);
 

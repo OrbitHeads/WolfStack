@@ -2034,22 +2034,22 @@ body.sidebar-collapsed .main-content {
 }
 
 .toast.success {
-    background: linear-gradient(135deg, #166534, #14532d);
-    border-left-color: #4ade80;
+    background: linear-gradient(135deg, #1a3a2a, #162b22);
+    border-left-color: #34d399;
 }
 
 .toast.error {
-    background: linear-gradient(135deg, #991b1b, #7f1d1d);
+    background: linear-gradient(135deg, #3b1111, #2d0e0e);
     border-left-color: #f87171;
 }
 
 .toast.warning {
-    background: linear-gradient(135deg, #854d0e, #713f12);
-    border-left-color: #facc15;
+    background: linear-gradient(135deg, #3b2e0e, #2d2408);
+    border-left-color: #fbbf24;
 }
 
 .toast.info {
-    background: linear-gradient(135deg, #1e3a5f, #172554);
+    background: linear-gradient(135deg, #1a2a3f, #141f30);
     border-left-color: #60a5fa;
 }
 
