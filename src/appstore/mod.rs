@@ -515,6 +515,26 @@ fn merge_pending_installs(installed: &mut Vec<InstalledApp>) {
 
 // ─── Live terminal install: script generation ───
 
+/// Remap a Docker volume spec to use a custom storage path.
+/// Named volumes like `vol_name:/path` become bind mounts at `<base>/vol_name:/path`.
+/// Absolute host paths like `/host/path:/container` are left unchanged.
+fn remap_volume(vol: &str, storage_base: &str) -> String {
+    if let Some(colon_pos) = vol.find(':') {
+        let host_part = &vol[..colon_pos];
+        let rest = &vol[colon_pos..];  // includes the colon
+        if host_part.starts_with('/') || host_part.starts_with('.') {
+            // Already an absolute or relative path — leave as-is
+            vol.to_string()
+        } else {
+            // Named volume — convert to bind mount at storage path
+            format!("{}/{}{}", storage_base.trim_end_matches('/'), host_part, rest)
+        }
+    } else {
+        // No colon — anonymous volume, leave as-is
+        vol.to_string()
+    }
+}
+
 /// Prepare an install script for live terminal execution.
 /// Returns (session_id, script_path) on success.
 pub fn prepare_install(
@@ -522,6 +542,7 @@ pub fn prepare_install(
     target: &str,
     container_name: &str,
     user_inputs: &HashMap<String, String>,
+    storage_path: Option<&str>,
 ) -> Result<(String, String), String> {
     let app = get_app(app_id).ok_or_else(|| format!("App '{}' not found", app_id))?;
 
@@ -539,10 +560,22 @@ pub fn prepare_install(
 
             let wolfnet_ip = crate::containers::next_available_wolfnet_ip();
 
+            // Compute storage base for volume remapping
+            let vol_base = storage_path.map(|sp| format!("{}/appstore/{}", sp.trim_end_matches('/'), container_name));
+
             script.push_str(&format!(
                 "echo -e '\\033[1;36m━━━ Installing {} via Docker ━━━\\033[0m'\n\n",
                 app.name
             ));
+
+            // Create storage directory if using custom storage
+            if let Some(ref base) = vol_base {
+                script.push_str(&format!("mkdir -p {}\n", shell_escape(base)));
+                script.push_str(&format!(
+                    "echo -e '\\033[0;36m  Storage: {}\\033[0m'\n\n",
+                    base
+                ));
+            }
 
             // Sidecars first
             for sidecar in &docker.sidecars {
@@ -568,7 +601,8 @@ pub fn prepare_install(
                     create_args.push_str(&format!(" -e {}", shell_escape(e)));
                 }
                 for v in &sidecar.volumes {
-                    create_args.push_str(&format!(" -v {}", shell_escape(v)));
+                    let vol = if let Some(ref base) = vol_base { remap_volume(v, base) } else { v.clone() };
+                    create_args.push_str(&format!(" -v {}", shell_escape(&vol)));
                 }
                 create_args.push_str(&format!(" {}", shell_escape(&sidecar.image)));
                 script.push_str(&format!("{}\n\n", create_args));
@@ -598,7 +632,8 @@ pub fn prepare_install(
                 create_args.push_str(&format!(" -e {}", shell_escape(e)));
             }
             for v in &docker.volumes {
-                create_args.push_str(&format!(" -v {}", shell_escape(v)));
+                let vol = if let Some(ref base) = vol_base { remap_volume(v, base) } else { v.clone() };
+                create_args.push_str(&format!(" -v {}", shell_escape(&vol)));
             }
             if let Some(ref ip) = wolfnet_ip {
                 create_args.push_str(&format!(" --label wolfnet.ip={}", ip));
@@ -629,9 +664,11 @@ pub fn prepare_install(
                 "echo -e '\\033[1;33m▸ Creating LXC container: {}\\033[0m'\n",
                 container_name
             ));
+            let lxc_path_flag = storage_path.map(|sp| format!(" -P {}", shell_escape(sp))).unwrap_or_default();
             script.push_str(&format!(
-                "lxc-create -t download -n {} -- -d {} -r {} -a {}\n\n",
+                "lxc-create -t download -n {}{} -- -d {} -r {} -a {}\n\n",
                 shell_escape(container_name),
+                lxc_path_flag,
                 shell_escape(&lxc.distribution),
                 shell_escape(&lxc.release),
                 shell_escape(&lxc.architecture),
@@ -3097,6 +3134,361 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
                     "systemctl enable picoclaw".into(),
                 ],
             }),
+            bare_metal: None,
+            user_inputs: vec![],
+        },
+
+
+        // ─── Gaming Servers ───
+
+        AppManifest {
+            id: "minecraft-java".into(),
+            name: "Minecraft: Java Edition".into(),
+            icon: "⛏️".into(),
+            category: "Gaming".into(),
+            description: "Minecraft Java Edition server — supports Vanilla, Paper, Forge, Fabric and more".into(),
+            website: Some("https://docker-minecraft-server.readthedocs.io".into()),
+            docker: Some(DockerTarget {
+                image: "itzg/minecraft-server:latest".into(),
+                ports: vec!["25565:25565".into()],
+                env: vec![
+                    "EULA=TRUE".into(),
+                    "TYPE=${SERVER_TYPE}".into(),
+                    "VERSION=LATEST".into(),
+                    "MEMORY=2G".into(),
+                    "DIFFICULTY=normal".into(),
+                    "MAX_PLAYERS=20".into(),
+                    "MOTD=${MOTD}".into(),
+                    "MODE=survival".into(),
+                    "ENABLE_RCON=true".into(),
+                    "RCON_PASSWORD=${RCON_PASSWORD}".into(),
+                    "ONLINE_MODE=true".into(),
+                ],
+                volumes: vec!["minecraft_data:/data".into()],
+                sidecars: vec![],
+            }),
+            lxc: None,
+            bare_metal: None,
+            user_inputs: vec![
+                UserInput { id: "SERVER_TYPE".into(), label: "Server Type".into(), input_type: "select".into(), default: Some("VANILLA".into()), required: false, placeholder: None, options: vec!["VANILLA".into(), "PAPER".into(), "FABRIC".into(), "FORGE".into(), "SPIGOT".into()] },
+                UserInput { id: "MOTD".into(), label: "Server Message (MOTD)".into(), input_type: "text".into(), default: Some("A Minecraft Server".into()), required: false, placeholder: Some("Message of the Day".into()), options: vec![] },
+                UserInput { id: "RCON_PASSWORD".into(), label: "RCON Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Remote console password".into()), options: vec![] },
+            ],
+        },
+
+        AppManifest {
+            id: "minecraft-bedrock".into(),
+            name: "Minecraft: Bedrock Edition".into(),
+            icon: "🧱".into(),
+            category: "Gaming".into(),
+            description: "Minecraft Bedrock server for Xbox, PlayStation, Switch, and mobile clients".into(),
+            website: Some("https://github.com/itzg/docker-minecraft-bedrock-server".into()),
+            docker: Some(DockerTarget {
+                image: "itzg/minecraft-bedrock-server:latest".into(),
+                ports: vec!["19132:19132/udp".into()],
+                env: vec![
+                    "EULA=TRUE".into(),
+                    "SERVER_NAME=${SERVER_NAME}".into(),
+                    "GAMEMODE=survival".into(),
+                    "DIFFICULTY=easy".into(),
+                    "MAX_PLAYERS=10".into(),
+                    "ONLINE_MODE=true".into(),
+                ],
+                volumes: vec!["bedrock_data:/data".into()],
+                sidecars: vec![],
+            }),
+            lxc: None,
+            bare_metal: None,
+            user_inputs: vec![
+                UserInput { id: "SERVER_NAME".into(), label: "Server Name".into(), input_type: "text".into(), default: Some("Bedrock Server".into()), required: false, placeholder: None, options: vec![] },
+            ],
+        },
+
+        AppManifest {
+            id: "valheim".into(),
+            name: "Valheim".into(),
+            icon: "⚔️".into(),
+            category: "Gaming".into(),
+            description: "Valheim dedicated server with automatic updates, backups, and mod support".into(),
+            website: Some("https://github.com/lloesche/valheim-server-docker".into()),
+            docker: Some(DockerTarget {
+                image: "lloesche/valheim-server:latest".into(),
+                ports: vec!["2456-2458:2456-2458/udp".into()],
+                env: vec![
+                    "SERVER_NAME=${SERVER_NAME}".into(),
+                    "WORLD_NAME=Dedicated".into(),
+                    "SERVER_PASS=${SERVER_PASS}".into(),
+                    "SERVER_PUBLIC=true".into(),
+                    "BACKUPS=true".into(),
+                    "TZ=Etc/UTC".into(),
+                ],
+                volumes: vec!["valheim_config:/config".into(), "valheim_data:/opt/valheim".into()],
+                sidecars: vec![],
+            }),
+            lxc: None,
+            bare_metal: None,
+            user_inputs: vec![
+                UserInput { id: "SERVER_NAME".into(), label: "Server Name".into(), input_type: "text".into(), default: Some("My Valheim Server".into()), required: false, placeholder: None, options: vec![] },
+                UserInput { id: "SERVER_PASS".into(), label: "Server Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Min 5 characters".into()), options: vec![] },
+            ],
+        },
+
+        AppManifest {
+            id: "terraria".into(),
+            name: "Terraria (TShock)".into(),
+            icon: "🌳".into(),
+            category: "Gaming".into(),
+            description: "Terraria server with TShock mod support and REST API".into(),
+            website: Some("https://github.com/ryshe/terraria".into()),
+            docker: Some(DockerTarget {
+                image: "ryshe/terraria:latest".into(),
+                ports: vec!["7777:7777".into()],
+                env: vec![],
+                volumes: vec!["terraria_worlds:/root/.local/share/Terraria/Worlds".into()],
+                sidecars: vec![],
+            }),
+            lxc: None,
+            bare_metal: None,
+            user_inputs: vec![],
+        },
+
+        AppManifest {
+            id: "palworld".into(),
+            name: "Palworld".into(),
+            icon: "🦎".into(),
+            category: "Gaming".into(),
+            description: "Palworld dedicated server with RCON, REST API, and automatic backups".into(),
+            website: Some("https://github.com/thijsvanloef/palworld-server-docker".into()),
+            docker: Some(DockerTarget {
+                image: "thijsvanloef/palworld-server-docker:latest".into(),
+                ports: vec!["8211:8211/udp".into(), "27015:27015/udp".into(), "25575:25575".into()],
+                env: vec![
+                    "PUID=1000".into(),
+                    "PGID=1000".into(),
+                    "PLAYERS=16".into(),
+                    "MULTITHREADING=true".into(),
+                    "SERVER_NAME=${SERVER_NAME}".into(),
+                    "SERVER_PASSWORD=${SERVER_PASS}".into(),
+                    "ADMIN_PASSWORD=${ADMIN_PASS}".into(),
+                    "COMMUNITY=false".into(),
+                    "RCON_ENABLED=true".into(),
+                    "RCON_PORT=25575".into(),
+                ],
+                volumes: vec!["palworld_data:/palworld".into()],
+                sidecars: vec![],
+            }),
+            lxc: None,
+            bare_metal: None,
+            user_inputs: vec![
+                UserInput { id: "SERVER_NAME".into(), label: "Server Name".into(), input_type: "text".into(), default: Some("Palworld Server".into()), required: false, placeholder: None, options: vec![] },
+                UserInput { id: "SERVER_PASS".into(), label: "Server Password".into(), input_type: "password".into(), default: None, required: false, placeholder: Some("Leave blank for no password".into()), options: vec![] },
+                UserInput { id: "ADMIN_PASS".into(), label: "Admin Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("RCON/admin password".into()), options: vec![] },
+            ],
+        },
+
+        AppManifest {
+            id: "factorio".into(),
+            name: "Factorio".into(),
+            icon: "🏭".into(),
+            category: "Gaming".into(),
+            description: "Factorio headless dedicated server with mod and save management".into(),
+            website: Some("https://github.com/factoriotools/factorio-docker".into()),
+            docker: Some(DockerTarget {
+                image: "factoriotools/factorio:stable".into(),
+                ports: vec!["34197:34197/udp".into(), "27015:27015".into()],
+                env: vec![
+                    "LOAD_LATEST_SAVE=true".into(),
+                    "GENERATE_NEW_SAVE=true".into(),
+                    "UPDATE_MODS_ON_START=false".into(),
+                ],
+                volumes: vec!["factorio_data:/factorio".into()],
+                sidecars: vec![],
+            }),
+            lxc: None,
+            bare_metal: None,
+            user_inputs: vec![],
+        },
+
+        AppManifest {
+            id: "cs2".into(),
+            name: "Counter-Strike 2".into(),
+            icon: "🔫".into(),
+            category: "Gaming".into(),
+            description: "Counter-Strike 2 dedicated server — requires a Steam Game Server Login Token".into(),
+            website: Some("https://github.com/CM2Walki/CS2".into()),
+            docker: Some(DockerTarget {
+                image: "cm2network/cs2:latest".into(),
+                ports: vec!["27015:27015/tcp".into(), "27015:27015/udp".into()],
+                env: vec![
+                    "SRCDS_TOKEN=${SRCDS_TOKEN}".into(),
+                    "CS2_SERVERNAME=${SERVER_NAME}".into(),
+                    "CS2_PORT=27015".into(),
+                    "CS2_RCONPW=${RCON_PASS}".into(),
+                    "CS2_PW=${SERVER_PASS}".into(),
+                    "CS2_MAXPLAYERS=10".into(),
+                    "CS2_GAMETYPE=0".into(),
+                    "CS2_GAMEMODE=1".into(),
+                    "CS2_STARTMAP=de_inferno".into(),
+                ],
+                volumes: vec!["cs2_data:/home/steam/cs2-dedicated".into()],
+                sidecars: vec![],
+            }),
+            lxc: None,
+            bare_metal: None,
+            user_inputs: vec![
+                UserInput { id: "SRCDS_TOKEN".into(), label: "Steam GSLT Token".into(), input_type: "text".into(), default: None, required: true, placeholder: Some("From steamcommunity.com/dev/managegameservers".into()), options: vec![] },
+                UserInput { id: "SERVER_NAME".into(), label: "Server Name".into(), input_type: "text".into(), default: Some("CS2 Server".into()), required: false, placeholder: None, options: vec![] },
+                UserInput { id: "RCON_PASS".into(), label: "RCON Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Remote console password".into()), options: vec![] },
+                UserInput { id: "SERVER_PASS".into(), label: "Server Password".into(), input_type: "password".into(), default: None, required: false, placeholder: Some("Leave blank for public".into()), options: vec![] },
+            ],
+        },
+
+        AppManifest {
+            id: "rust-game".into(),
+            name: "Rust".into(),
+            icon: "🪓".into(),
+            category: "Gaming".into(),
+            description: "Rust dedicated server with web RCON, Oxide mod support, and Rust+ companion app".into(),
+            website: Some("https://github.com/Didstopia/rust-server".into()),
+            docker: Some(DockerTarget {
+                image: "didstopia/rust-server:latest".into(),
+                ports: vec!["28015:28015/tcp".into(), "28015:28015/udp".into(), "28016:28016".into(), "8080:8080".into()],
+                env: vec![
+                    "RUST_SERVER_NAME=${SERVER_NAME}".into(),
+                    "RUST_SERVER_SEED=12345".into(),
+                    "RUST_SERVER_WORLDSIZE=3500".into(),
+                    "RUST_SERVER_MAXPLAYERS=50".into(),
+                    "RUST_RCON_WEB=1".into(),
+                    "RUST_RCON_PORT=28016".into(),
+                    "RUST_RCON_PASSWORD=${RCON_PASS}".into(),
+                    "RUST_SERVER_SAVE_INTERVAL=600".into(),
+                ],
+                volumes: vec!["rust_data:/steamcmd/rust".into()],
+                sidecars: vec![],
+            }),
+            lxc: None,
+            bare_metal: None,
+            user_inputs: vec![
+                UserInput { id: "SERVER_NAME".into(), label: "Server Name".into(), input_type: "text".into(), default: Some("Rust Server".into()), required: false, placeholder: None, options: vec![] },
+                UserInput { id: "RCON_PASS".into(), label: "RCON Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Web RCON password".into()), options: vec![] },
+            ],
+        },
+
+        AppManifest {
+            id: "ark-survival".into(),
+            name: "ARK: Survival Evolved".into(),
+            icon: "🦖".into(),
+            category: "Gaming".into(),
+            description: "ARK dedicated server with automatic updates and backups".into(),
+            website: Some("https://github.com/hermsi1337/docker-ark-server".into()),
+            docker: Some(DockerTarget {
+                image: "hermsi/ark-server:latest".into(),
+                ports: vec!["7777:7777/udp".into(), "7778:7778/udp".into(), "27015:27015/udp".into(), "27020:27020".into()],
+                env: vec![
+                    "SESSION_NAME=${SERVER_NAME}".into(),
+                    "SERVER_MAP=TheIsland".into(),
+                    "SERVER_PASSWORD=${SERVER_PASS}".into(),
+                    "ADMIN_PASSWORD=${ADMIN_PASS}".into(),
+                    "MAX_PLAYERS=20".into(),
+                    "UPDATE_ON_START=true".into(),
+                    "BACKUP_ON_STOP=true".into(),
+                ],
+                volumes: vec!["ark_data:/app".into()],
+                sidecars: vec![],
+            }),
+            lxc: None,
+            bare_metal: None,
+            user_inputs: vec![
+                UserInput { id: "SERVER_NAME".into(), label: "Session Name".into(), input_type: "text".into(), default: Some("ARK Docker Server".into()), required: false, placeholder: None, options: vec![] },
+                UserInput { id: "SERVER_PASS".into(), label: "Server Password".into(), input_type: "password".into(), default: None, required: false, placeholder: Some("Leave blank for no password".into()), options: vec![] },
+                UserInput { id: "ADMIN_PASS".into(), label: "Admin Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Admin/RCON password".into()), options: vec![] },
+            ],
+        },
+
+        AppManifest {
+            id: "satisfactory".into(),
+            name: "Satisfactory".into(),
+            icon: "🔧".into(),
+            category: "Gaming".into(),
+            description: "Satisfactory dedicated server with automatic updates and autosave".into(),
+            website: Some("https://github.com/wolveix/satisfactory-server".into()),
+            docker: Some(DockerTarget {
+                image: "wolveix/satisfactory-server:latest".into(),
+                ports: vec!["7777:7777/tcp".into(), "7777:7777/udp".into()],
+                env: vec![
+                    "MAXPLAYERS=4".into(),
+                    "PGID=1000".into(),
+                    "PUID=1000".into(),
+                    "AUTOPAUSE=true".into(),
+                    "AUTOSAVEINTERVAL=300".into(),
+                    "AUTOSAVENUM=5".into(),
+                ],
+                volumes: vec!["satisfactory_data:/config".into()],
+                sidecars: vec![],
+            }),
+            lxc: None,
+            bare_metal: None,
+            user_inputs: vec![],
+        },
+
+        AppManifest {
+            id: "project-zomboid".into(),
+            name: "Project Zomboid".into(),
+            icon: "🧟".into(),
+            category: "Gaming".into(),
+            description: "Project Zomboid dedicated server with mod support and Steam Workshop integration".into(),
+            website: Some("https://github.com/Renegade-Master/zomboid-dedicated-server".into()),
+            docker: Some(DockerTarget {
+                image: "renegademaster/zomboid-dedicated-server:latest".into(),
+                ports: vec!["16261:16261/udp".into(), "16262:16262/udp".into()],
+                env: vec![
+                    "ADMIN_USERNAME=admin".into(),
+                    "ADMIN_PASSWORD=${ADMIN_PASS}".into(),
+                    "SERVER_NAME=${SERVER_NAME}".into(),
+                    "SERVER_PASSWORD=${SERVER_PASS}".into(),
+                    "MAX_PLAYERS=16".into(),
+                    "MAX_RAM=4096m".into(),
+                    "PAUSE_ON_EMPTY=true".into(),
+                ],
+                volumes: vec!["zomboid_server:/home/steam/ZomboidDedicatedServer".into(), "zomboid_data:/home/steam/Zomboid".into()],
+                sidecars: vec![],
+            }),
+            lxc: None,
+            bare_metal: None,
+            user_inputs: vec![
+                UserInput { id: "SERVER_NAME".into(), label: "Server Name".into(), input_type: "text".into(), default: Some("Zomboid Server".into()), required: false, placeholder: None, options: vec![] },
+                UserInput { id: "ADMIN_PASS".into(), label: "Admin Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Admin password".into()), options: vec![] },
+                UserInput { id: "SERVER_PASS".into(), label: "Server Password".into(), input_type: "password".into(), default: None, required: false, placeholder: Some("Leave blank for no password".into()), options: vec![] },
+            ],
+        },
+
+        AppManifest {
+            id: "7dtd".into(),
+            name: "7 Days to Die".into(),
+            icon: "💀".into(),
+            category: "Gaming".into(),
+            description: "7 Days to Die dedicated server with web admin panel and mod support".into(),
+            website: Some("https://github.com/vinanrra/Docker-7DaysToDie".into()),
+            docker: Some(DockerTarget {
+                image: "vinanrra/7dtd-server:latest".into(),
+                ports: vec!["26900:26900/tcp".into(), "26900-26902:26900-26902/udp".into(), "8080:8080".into(), "8081:8081".into()],
+                env: vec![
+                    "START_MODE=1".into(),
+                    "VERSION=stable".into(),
+                    "PUID=1000".into(),
+                    "PGID=1000".into(),
+                    "TimeZone=Etc/UTC".into(),
+                    "BACKUP=YES".into(),
+                ],
+                volumes: vec![
+                    "7dtd_server:/home/sdtdserver/serverfiles".into(),
+                    "7dtd_saves:/home/sdtdserver/.local/share/7DaysToDie".into(),
+                    "7dtd_logs:/home/sdtdserver/log".into(),
+                    "7dtd_backups:/home/sdtdserver/lgsm/backup".into(),
+                ],
+                sidecars: vec![],
+            }),
+            lxc: None,
             bare_metal: None,
             user_inputs: vec![],
         },

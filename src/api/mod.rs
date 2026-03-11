@@ -8226,6 +8226,8 @@ pub struct AppInstallRequest {
     pub container_name: String,                      // name for the container
     #[serde(default)]
     pub inputs: std::collections::HashMap<String, String>,  // user input values
+    #[serde(default)]
+    pub storage_path: Option<String>,                // optional storage location
 }
 
 /// POST /api/appstore/apps/{id}/install — install an app
@@ -8261,9 +8263,10 @@ pub async fn appstore_prepare_install(
 
     let target = body.target.clone();
     let container_name = body.container_name.clone();
+    let storage_path = body.storage_path.clone();
 
     match web::block(move || {
-        appstore::prepare_install(&id, &target, &container_name, &inputs)
+        appstore::prepare_install(&id, &target, &container_name, &inputs, storage_path.as_deref())
     }).await {
         Ok(Ok((session_id, _script_path))) => HttpResponse::Ok().json(serde_json::json!({
             "session_id": session_id,

@@ -17860,7 +17860,13 @@ const APP_ICONS = {
     'prometheus': '🔥', 'postgresql': '🐘', 'mariadb': '🗄️', 'redis': '⚡',
     'nginx': '🌐', 'traefik': '🔀', 'pihole': '🛡️', 'jellyfin': '🎬',
     'portainer': '🐳', 'minio': '💾', 'code-server': '💻', 'homeassistant': '🏠',
+    'minecraft-java': '⛏️', 'minecraft-bedrock': '🧱', 'valheim': '⚔️',
+    'terraria': '🌳', 'palworld': '🦎', 'factorio': '🏭', 'cs2': '🔫',
+    'rust-game': '🪓', 'ark-survival': '🦖', 'satisfactory': '🔧',
+    'project-zomboid': '🧟', '7dtd': '💀',
 };
+
+let appStoreViewMode = 'grid';
 
 async function loadAppStoreApps() {
     try {
@@ -17868,7 +17874,7 @@ async function loadAppStoreApps() {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         appStoreApps = data.apps || [];
-        renderAppStoreGrid();
+        renderAppStoreView();
     } catch (e) {
         const grid = document.getElementById('appstore-grid');
         if (grid) grid.innerHTML = `<div style="padding:40px; text-align:center; color:var(--text-muted); grid-column:1/-1;">Failed to load apps: ${escapeHtml(e.message)}</div>`;
@@ -17878,6 +17884,7 @@ async function loadAppStoreApps() {
 function renderAppStoreGrid() {
     const grid = document.getElementById('appstore-grid');
     if (!grid) return;
+    grid.className = 'appstore-grid';
 
     const query = (document.getElementById('appstore-search')?.value || '').toLowerCase();
     const filtered = appStoreApps.filter(app => {
@@ -17925,15 +17932,77 @@ function renderAppStoreGrid() {
 }
 
 function filterAppStore() {
-    renderAppStoreGrid();
+    renderAppStoreView();
 }
 
 function filterAppStoreCategory(cat) {
     appStoreCategory = cat;
     document.querySelectorAll('.appstore-cat-btn').forEach(b => b.classList.remove('active'));
     event.target.classList.add('active');
-    renderAppStoreGrid();
+    renderAppStoreView();
 }
+
+function setAppStoreView(mode) {
+    appStoreViewMode = mode;
+    const gridBtn = document.getElementById('appstore-view-grid');
+    const tableBtn = document.getElementById('appstore-view-table');
+    if (gridBtn) { gridBtn.style.background = mode === 'grid' ? 'var(--accent)' : 'var(--bg-tertiary)'; gridBtn.style.color = mode === 'grid' ? '#fff' : 'var(--text-primary)'; gridBtn.style.border = mode === 'grid' ? 'none' : '1px solid var(--border)'; }
+    if (tableBtn) { tableBtn.style.background = mode === 'table' ? 'var(--accent)' : 'var(--bg-tertiary)'; tableBtn.style.color = mode === 'table' ? '#fff' : 'var(--text-primary)'; tableBtn.style.border = mode === 'table' ? 'none' : '1px solid var(--border)'; }
+    renderAppStoreView();
+}
+
+function renderAppStoreView() {
+    if (appStoreViewMode === 'table') {
+        renderAppStoreTable();
+    } else {
+        renderAppStoreGrid();
+    }
+}
+
+function renderAppStoreTable() {
+    const grid = document.getElementById('appstore-grid');
+    if (!grid) return;
+
+    const query = (document.getElementById('appstore-search')?.value || '').toLowerCase();
+    const filtered = appStoreApps.filter(app => {
+        if (appStoreCategory !== 'All' && app.category !== appStoreCategory) return false;
+        if (query && !app.name.toLowerCase().includes(query) && !app.description.toLowerCase().includes(query)) return false;
+        return true;
+    });
+
+    if (filtered.length === 0) {
+        grid.innerHTML = '<div style="padding:40px; text-align:center; color:var(--text-muted);">No apps match your search.</div>';
+        return;
+    }
+
+    filtered.sort((a, b) => a.name.localeCompare(b.name));
+
+    let html = '<div style="overflow-x:auto;"><table class="data-table" style="width:100%;"><thead><tr>';
+    html += '<th>App</th><th>Category</th><th>Description</th><th>Targets</th><th style="text-align:right;">Actions</th>';
+    html += '</tr></thead><tbody>';
+
+    html += filtered.map(app => {
+        const icon = APP_ICONS[app.id] || '📦';
+        const targets = [];
+        if (app.docker) targets.push('<span class="appstore-target-badge">Docker</span>');
+        if (app.lxc) targets.push('<span class="appstore-target-badge">LXC</span>');
+        if (app.bare_metal) targets.push('<span class="appstore-target-badge">Host</span>');
+        const docsLink = app.website ? `<a href="${escapeHtml(app.website)}" target="_blank" rel="noopener" title="Docs" style="color:var(--text-muted); font-size:14px; text-decoration:none; margin-right:6px;">🔗</a>` : '';
+
+        return `<tr>
+            <td style="white-space:nowrap;"><span style="font-size:18px; margin-right:8px;">${icon}</span><strong>${escapeHtml(app.name)}</strong></td>
+            <td><span class="appstore-card-category">${escapeHtml(app.category)}</span></td>
+            <td style="font-size:12px; color:var(--text-secondary); max-width:400px;">${escapeHtml(app.description)}</td>
+            <td style="white-space:nowrap;">${targets.join(' ')}</td>
+            <td style="text-align:right; white-space:nowrap;">${docsLink}<button class="appstore-install-btn" onclick="openAppStoreInstallModal('${app.id}')" style="font-size:12px; padding:5px 14px;">Install</button></td>
+        </tr>`;
+    }).join('');
+
+    html += '</tbody></table></div>';
+    grid.innerHTML = html;
+    grid.className = ''; // Remove grid class when in table mode
+}
+
 
 function switchAppStoreTab(tab) {
     document.querySelectorAll('.appstore-tab-btn').forEach(b => b.classList.remove('active'));
@@ -17970,6 +18039,10 @@ function openAppStoreInstallModal(appId) {
     if (allNodes.length === 0) {
         hostSelect.innerHTML = '<option value="">No servers found</option>';
     }
+
+    // Populate storage when host changes
+    hostSelect.onchange = () => populateAppStoreStorage();
+    populateAppStoreStorage();
 
     // Build target buttons
     const targetsEl = document.getElementById('appstore-install-targets');
@@ -18011,6 +18084,60 @@ function selectInstallTarget(target) {
     event.target.classList.add('active');
 }
 
+async function populateAppStoreStorage() {
+    const sel = document.getElementById('appstore-install-storage');
+    const info = document.getElementById('appstore-install-storage-info');
+    if (!sel) return;
+    sel.innerHTML = '<option value="">Default (system storage)</option>';
+    info.textContent = '';
+
+    const nodeId = document.getElementById('appstore-install-host').value;
+    const node = allNodes.find(n => n.id === nodeId);
+    const isSelf = !node || node.is_self;
+
+    try {
+        const url = isSelf ? '/api/storage/list' : `/api/nodes/${nodeId}/proxy/storage/list`;
+        const resp = await fetch(url);
+        if (!resp.ok) return;
+        const data = await resp.json();
+
+        if (data.proxmox) {
+            data.storages.filter(s => s.status === 'active').forEach(s => {
+                const free = formatBytes(s.available_bytes);
+                sel.innerHTML += `<option value="${escapeHtml(s.id)}">${escapeHtml(s.id)} (${s.type}, ${free} free)</option>`;
+            });
+        } else {
+            data.storages.forEach(s => {
+                if (s.id !== '/') {
+                    const free = formatBytes(s.available_bytes);
+                    sel.innerHTML += `<option value="${escapeHtml(s.id)}">${escapeHtml(s.id)} (${free} free)</option>`;
+                }
+            });
+        }
+
+        // Also add WolfStack storage mounts
+        const mountUrl = isSelf ? '/api/storage/mounts' : `/api/nodes/${nodeId}/proxy/storage/mounts`;
+        const mountResp = await fetch(mountUrl);
+        if (mountResp.ok) {
+            const mounts = await mountResp.json();
+            const ICONS = { s3: '☁️', nfs: '📂', directory: '📁', wolfdisk: '💾', smb: '🖧' };
+            mounts.filter(m => m.status === 'mounted' && m.mount_point).forEach(m => {
+                const icon = ICONS[m.type] || '📦';
+                sel.innerHTML += `<option value="${escapeHtml(m.mount_point)}">${icon} ${escapeHtml(m.name)} — ${escapeHtml(m.mount_point)}</option>`;
+            });
+        }
+
+        sel.onchange = () => {
+            const val = sel.value;
+            if (!val) { info.textContent = ''; return; }
+            const match = data.storages.find(s => s.id === val);
+            info.textContent = match ? `${formatBytes(match.available_bytes)} free` : '';
+        };
+    } catch (e) {
+        console.error('Failed to populate app store storage:', e);
+    }
+}
+
 function closeAppStoreInstallModal() {
     const modal = document.getElementById('appstore-install-modal');
     modal.classList.remove('active');
@@ -18026,6 +18153,9 @@ async function executeAppStoreInstall() {
     document.querySelectorAll('.appstore-user-input').forEach(el => {
         userInputs[el.dataset.key] = el.value;
     });
+
+    // Get storage selection
+    const storagePath = document.getElementById('appstore-install-storage').value || null;
 
     // Determine the install URL based on selected host
     const selectedNodeId = document.getElementById('appstore-install-host').value;
@@ -18050,6 +18180,7 @@ async function executeAppStoreInstall() {
                 container_name: name,
                 target: appStoreInstallTarget,
                 inputs: userInputs,
+                storage_path: storagePath,
             }),
         });
         const data = await res.json().catch(() => ({}));

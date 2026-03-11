@@ -674,12 +674,17 @@
                         <button class="appstore-cat-btn" onclick="filterAppStoreCategory('Monitoring')">📊
                             Monitoring</button>
                         <button class="appstore-cat-btn" onclick="filterAppStoreCategory('Media')">🎬 Media</button>
+                        <button class="appstore-cat-btn" onclick="filterAppStoreCategory('Gaming')">🎮 Gaming</button>
                         <button class="appstore-cat-btn" onclick="filterAppStoreCategory('Dev Tools')">💻 Dev
                             Tools</button>
                         <button class="appstore-cat-btn" onclick="filterAppStoreCategory('Networking')">🔀
                             Networking</button>
                         <button class="appstore-cat-btn" onclick="filterAppStoreCategory('Other')">📦 Other</button>
                         <button class="appstore-cat-btn" onclick="filterAppStoreCategory('Wolf')">🐺 Wolf</button>
+                    </div>
+                    <div style="display:flex; gap:4px; margin-left:auto;">
+                        <button id="appstore-view-grid" class="btn btn-sm" onclick="setAppStoreView('grid')" title="Grid view" style="font-size:16px; padding:6px 10px; background:var(--accent); color:#fff; border:none;">▦</button>
+                        <button id="appstore-view-table" class="btn btn-sm" onclick="setAppStoreView('table')" title="Table view" style="font-size:16px; padding:6px 10px; background:var(--bg-tertiary); color:var(--text-primary); border:1px solid var(--border);">☰</button>
                     </div>
                 </div>
                 <!-- App Grid -->
@@ -710,6 +715,13 @@
                             <label style="font-size:13px; font-weight:600; display:block; margin-bottom:6px;">Container
                                 Name</label>
                             <input type="text" id="appstore-install-name" class="form-control" placeholder="my-app">
+                        </div>
+                        <div style="margin-bottom:16px;">
+                            <label style="font-size:13px; font-weight:600; display:block; margin-bottom:6px;">💾 Storage</label>
+                            <select id="appstore-install-storage" class="form-control" style="width:100%;">
+                                <option value="">Default</option>
+                            </select>
+                            <small id="appstore-install-storage-info" style="color:var(--text-muted); font-size:11px;"></small>
                         </div>
                         <div style="margin-bottom:16px;">
                             <label style="font-size:13px; font-weight:600; display:block; margin-bottom:6px;">Install
