@@ -18750,9 +18750,9 @@ async function loadPatreonHeaderBadge() {
                 if (textEl) textEl.textContent = 'Link your Patreon account';
                 badgeEl.textContent = 'Connect';
             }
-            // Show support toast once per session
-            if (!sessionStorage.getItem('ws_patreon_toast')) {
-                sessionStorage.setItem('ws_patreon_toast', '1');
+            // Show support toast once per page load
+            if (!window._wsPatreonToastShown) {
+                window._wsPatreonToastShown = true;
                 setTimeout(() => {
                     showToast('Enjoying WolfStack? <a href="#" onclick="event.preventDefault();selectView(\'settings\');setTimeout(function(){switchSettingsTab(\'patreon\');},100);this.closest(\'.toast\')?.remove();" style="color:#facc15;text-decoration:underline;">Support us on Patreon</a> to unlock extra features and remove this message.', 'info', 10000);
                 }, 4000);
