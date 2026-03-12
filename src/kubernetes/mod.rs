@@ -2365,10 +2365,7 @@ pub fn get_storage_classes(kubeconfig: &str) -> Vec<serde_json::Value> {
             .as_str().unwrap_or("false") == "true";
         serde_json::json!({
             "name": sc["metadata"]["name"].as_str().unwrap_or(""),
-            "provisioner": sc["metadata"]["annotations"]["storageclass.kubernetes.io/provisioner"]
-                .as_str()
-                .or_else(|| sc["provisioner"].as_str())
-                .unwrap_or("unknown"),
+            "provisioner": sc["provisioner"].as_str().unwrap_or("unknown"),
             "reclaim_policy": sc["reclaimPolicy"].as_str().unwrap_or("Delete"),
             "volume_binding_mode": sc["volumeBindingMode"].as_str().unwrap_or("Immediate"),
             "is_default": is_default,

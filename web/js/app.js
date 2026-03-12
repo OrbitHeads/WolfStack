@@ -22045,7 +22045,7 @@ async function showK8sPodLogs(pod, namespace) {
         </div>`;
     document.body.appendChild(overlay);
     try {
-        const resp = await fetch(`/api/kubernetes/clusters/${k8sCurrentCluster}/logs/${pod}?namespace=${encodeURIComponent(namespace)}&tail=200`);
+        const resp = await fetch(`/api/kubernetes/clusters/${k8sCurrentCluster}/logs/${encodeURIComponent(pod)}?namespace=${encodeURIComponent(namespace)}&tail=200`);
         const el = document.getElementById('k8s-log-content');
         if (!resp.ok) { el.textContent = 'Failed to load logs'; return; }
         const data = await resp.json();
@@ -24166,7 +24166,7 @@ async function showK8sDeploymentDetail(name, namespace) {
                     <div style="font-size:11px; color:var(--text-muted); text-transform:uppercase; letter-spacing:1px; margin-bottom:6px;">Ports</div>
                     <div style="display:flex; gap:8px; flex-wrap:wrap;">`;
                 c.ports.forEach(p => {
-                    html += `<span style="padding:3px 10px; border-radius:6px; font-size:12px; background:rgba(50,108,229,0.1); color:#326ce5; border:1px solid rgba(50,108,229,0.2);">${p.container_port}/${p.protocol}</span>`;
+                    html += `<span style="padding:3px 10px; border-radius:6px; font-size:12px; background:rgba(50,108,229,0.1); color:#326ce5; border:1px solid rgba(50,108,229,0.2);">${escapeHtml(String(p.container_port || ''))}/${escapeHtml(p.protocol || 'TCP')}</span>`;
                 });
                 html += `</div></div>`;
             }
