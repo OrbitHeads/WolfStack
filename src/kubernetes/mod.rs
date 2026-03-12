@@ -413,8 +413,8 @@ if ! command -v curl &>/dev/null; then
     fi
 fi
 
-# Install k3s server
-curl -sfL https://get.k3s.io | sh -s - server
+# Install k3s server (--tls-san allows remote kubectl access via hostname/IP)
+curl -sfL https://get.k3s.io | sh -s - server --tls-san {node_address}
 
 # Wait for k3s to be ready
 echo "Waiting for k3s to be ready..."
@@ -951,12 +951,16 @@ fi
 # Install k0s
 curl -sSLf https://get.k0s.sh | sh
 
-# Create default config
-k0s config create > /etc/k0s/k0s.yaml 2>/dev/null || true
+# Create config with TLS SAN for remote access
 mkdir -p /etc/k0s
+k0s config create > /etc/k0s/k0s.yaml 2>/dev/null || true
+# Add SAN to config so remote kubectl works
+if command -v sed &>/dev/null; then
+    sed -i '/spec:/a\  api:\n    sans:\n      - {node_address}' /etc/k0s/k0s.yaml 2>/dev/null || true
+fi
 
 # Install and start as controller with worker capabilities
-k0s install controller --single
+k0s install controller --single --config /etc/k0s/k0s.yaml
 
 # Start the service
 k0s start
@@ -1089,6 +1093,13 @@ fi
 
 # Install RKE2 server
 curl -sfL https://get.rke2.io | sh -
+
+# Configure TLS SAN for remote access
+mkdir -p /etc/rancher/rke2
+cat > /etc/rancher/rke2/config.yaml << EOF
+tls-san:
+  - {node_address}
+EOF
 
 # Enable and start RKE2
 systemctl enable rke2-server.service
@@ -1794,33 +1805,50 @@ pub fn get_nodes(kubeconfig: &str) -> Vec<K8sNode> {
 }
 
 pub fn get_cluster_status(kubeconfig: &str) -> K8sClusterStatus {
+    // Try normal kubectl first, fall back to --insecure-skip-tls-verify for
+    // clusters whose TLS cert doesn't include the remote hostname/IP
+    let nodes = get_nodes(kubeconfig);
+    let (kubeconfig_to_use, insecure) = if nodes.is_empty() {
+        // Check if the issue is TLS by retrying with skip-verify
+        let test = kubectl_insecure(kubeconfig, &["get", "nodes", "-o", "json"]);
+        if test.is_ok() {
+            (kubeconfig.to_string(), true)
+        } else {
+            (kubeconfig.to_string(), false)
+        }
+    } else {
+        (kubeconfig.to_string(), false)
+    };
+    let kc = kubeconfig_to_use.as_str();
+
+    let kctl = if insecure { kubectl_insecure } else { kubectl };
+
     // Get API version
-    let api_version = kubectl(kubeconfig, &["version", "--short", "-o", "json"])
+    let api_version = kctl(kc, &["version", "-o", "json"])
         .ok()
         .and_then(|o| serde_json::from_str::<serde_json::Value>(&o).ok())
         .and_then(|v| v["serverVersion"]["gitVersion"].as_str().map(String::from))
-        .unwrap_or_else(|| {
-            // Fallback: try plain version output
-            kubectl(kubeconfig, &["version", "--short"])
-                .unwrap_or_else(|_| "unknown".to_string())
-                .lines()
-                .find(|l| l.contains("Server"))
-                .unwrap_or("unknown")
-                .to_string()
-        });
+        .unwrap_or_else(|| "unknown".to_string());
 
     // Get nodes
-    let nodes = get_nodes(kubeconfig);
+    let nodes = if insecure { get_nodes_insecure(kc) } else { get_nodes(kc) };
     let nodes_total = nodes.len() as u32;
     let nodes_ready = nodes.iter().filter(|n| n.status == "Ready").count() as u32;
 
     // Get pods
-    let pods = get_pods(kubeconfig, None);
+    let pods = if insecure { get_pods_insecure(kc, None) } else { get_pods(kc, None) };
     let pods_total = pods.len() as u32;
     let pods_running = pods.iter().filter(|p| p.status == "Running").count() as u32;
 
     // Get namespaces
-    let namespaces = get_namespaces(kubeconfig).len() as u32;
+    let namespaces = if insecure {
+        kctl(kc, &["get", "namespaces", "-o", "json"]).ok()
+            .and_then(|o| serde_json::from_str::<serde_json::Value>(&o).ok())
+            .and_then(|v| v["items"].as_array().map(|a| a.len()))
+            .unwrap_or(0) as u32
+    } else {
+        get_namespaces(kc).len() as u32
+    };
 
     let healthy = nodes_total > 0 && nodes_ready == nodes_total;
 
@@ -1833,6 +1861,70 @@ pub fn get_cluster_status(kubeconfig: &str) -> K8sClusterStatus {
         namespaces,
         api_version,
     }
+}
+
+/// kubectl with --insecure-skip-tls-verify for clusters with mismatched certs
+fn kubectl_insecure(kubeconfig: &str, args: &[&str]) -> Result<String, String> {
+    let (binary, prefix_args) = find_kubectl();
+    let mut cmd = Command::new(binary);
+    cmd.args(prefix_args);
+    cmd.arg("--kubeconfig").arg(kubeconfig);
+    cmd.arg("--insecure-skip-tls-verify");
+    cmd.args(args);
+    let output = cmd.output()
+        .map_err(|e| format!("kubectl error: {}", e))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+fn get_nodes_insecure(kubeconfig: &str) -> Vec<K8sNode> {
+    kubectl_insecure(kubeconfig, &["get", "nodes", "-o", "json"])
+        .ok()
+        .and_then(|o| serde_json::from_str::<serde_json::Value>(&o).ok())
+        .and_then(|v| v["items"].as_array().map(|items| {
+            items.iter().map(|n| {
+                let name = n["metadata"]["name"].as_str().unwrap_or("").to_string();
+                let status = n["status"]["conditions"].as_array()
+                    .and_then(|c| c.iter().find(|cond| cond["type"] == "Ready"))
+                    .and_then(|c| c["status"].as_str())
+                    .map(|s| if s == "True" { "Ready" } else { "NotReady" })
+                    .unwrap_or("Unknown").to_string();
+                let roles = n["metadata"]["labels"].as_object()
+                    .map(|l| l.keys().filter(|k| k.starts_with("node-role.kubernetes.io/"))
+                        .map(|k| k.trim_start_matches("node-role.kubernetes.io/").to_string())
+                        .collect::<Vec<_>>().join(","))
+                    .unwrap_or_default();
+                K8sNode { name, status, roles, age: String::new(), version: String::new(),
+                    cpu_capacity: String::new(), memory_capacity: String::new(),
+                    cpu_usage: String::new(), memory_usage: String::new() }
+            }).collect()
+        }))
+        .unwrap_or_default()
+}
+
+fn get_pods_insecure(kubeconfig: &str, namespace: Option<&str>) -> Vec<K8sPod> {
+    let mut args = vec!["get", "pods", "-o", "json"];
+    if let Some(ns) = namespace { args.extend(["-n", ns]); } else { args.push("--all-namespaces"); }
+    kubectl_insecure(kubeconfig, &args)
+        .ok()
+        .and_then(|o| serde_json::from_str::<serde_json::Value>(&o).ok())
+        .and_then(|v| v["items"].as_array().map(|items| {
+            items.iter().map(|p| {
+                K8sPod {
+                    name: p["metadata"]["name"].as_str().unwrap_or("").to_string(),
+                    namespace: p["metadata"]["namespace"].as_str().unwrap_or("").to_string(),
+                    status: p["status"]["phase"].as_str().unwrap_or("Unknown").to_string(),
+                    node: p["spec"]["nodeName"].as_str().unwrap_or("").to_string(),
+                    ip: p["status"]["podIP"].as_str().unwrap_or("").to_string(),
+                    ready: String::new(),
+                    restarts: 0, age: String::new(),
+                }
+            }).collect()
+        }))
+        .unwrap_or_default()
 }
 
 // ═══════════════════════════════════════════════

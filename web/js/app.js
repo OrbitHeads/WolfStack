@@ -22456,7 +22456,7 @@ async function loadNodeWolfKube() {
                     <thead><tr><th>Name</th><th>Type</th><th>Kubeconfig</th><th>Status</th><th>Actions</th></tr></thead>
                     <tbody>`;
         for (const d of detected) {
-            const alreadyImported = clusters.some(c => c.kubeconfig_path === d.kubeconfig_path);
+            const alreadyImported = clusters.some(c => c.kubeconfig_path === d.kubeconfig_path || c.cluster_type === d.cluster_type);
             html += `<tr>
                 <td style="font-weight:600;">${escapeHtml(d.name)}</td>
                 <td><span style="padding:2px 8px;border-radius:6px;font-size:11px;background:rgba(50,108,229,0.12);color:#326ce5;border:1px solid rgba(50,108,229,0.3);">${escapeHtml(d.cluster_type)}</span></td>
