@@ -82,7 +82,7 @@ impl SystemMonitor {
     /// Collect current system metrics
     pub fn collect(&mut self) -> SystemMetrics {
         self.sys.refresh_all();
-        self.disks.refresh();
+        self.disks.refresh_list();
         self.networks.refresh();
 
         let cpu_model = self.sys.cpus().first()
