@@ -8960,15 +8960,15 @@ pub async fn k8s_prepare_provision(req: HttpRequest, state: web::Data<AppState>,
 
     let server_script = format!(
         "#!/bin/bash\nset -e\n\n\
-         echo -e '\\033[1;36m━━━ WolfKube — Installing {dist} server on {addr} ━━━\\033[0m'\n\
-         echo -e '\\033[0;90mCluster: {name}\\033[0m'\n\
+         printf '\\033[1;36m━━━ WolfKube — Installing {dist} server on {addr} ━━━\\033[0m\\n'\n\
+         printf '\\033[0;90mCluster: {name}\\033[0m\\n'\n\
          echo ''\n\n\
          {install}\n\n\
          echo ''\n\
-         echo -e '\\033[1;32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\033[0m'\n\
-         echo -e '\\033[1;32m  ✅ {dist} server installed successfully!\\033[0m'\n\
-         echo -e '\\033[1;32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\033[0m'\n\
-         echo -e '\\033[0;36m  Kubeconfig: {kubeconfig}\\033[0m'\n",
+         printf '\\033[1;32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\033[0m\\n'\n\
+         printf '\\033[1;32m  {dist} server installed successfully!\\033[0m\\n'\n\
+         printf '\\033[1;32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\033[0m\\n'\n\
+         printf '\\033[0;36m  Kubeconfig: {kubeconfig}\\033[0m\\n'\n",
         dist = dist, addr = server_address, name = cluster_name,
         install = server_install, kubeconfig = kubeconfig_path,
     );
@@ -9097,13 +9097,13 @@ pub async fn k8s_prepare_provision_agents(req: HttpRequest, state: web::Data<App
         let session_id = format!("{}-agent{}-{}", dist, i, ts);
         let script = format!(
             "#!/bin/bash\nset -e\n\n\
-             echo -e '\\033[1;36m━━━ WolfKube — Joining {hostname} as {dist} worker ━━━\\033[0m'\n\
+             printf '\\033[1;36m━━━ WolfKube — Joining {hostname} as {dist} worker ━━━\\033[0m\\n'\n\
              echo ''\n\n\
              {install}\n\n\
              echo ''\n\
-             echo -e '\\033[1;32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\033[0m'\n\
-             echo -e '\\033[1;32m  ✅ {hostname} joined the cluster!\\033[0m'\n\
-             echo -e '\\033[1;32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\033[0m'\n",
+             printf '\\033[1;32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\033[0m\\n'\n\
+             printf '\\033[1;32m  {hostname} joined the cluster!\\033[0m\\n'\n\
+             printf '\\033[1;32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\033[0m\\n'\n",
             hostname = agent_node.hostname, dist = dist, install = agent_install,
         );
 

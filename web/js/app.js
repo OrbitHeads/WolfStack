@@ -21935,6 +21935,12 @@ function showK8sProvisionModal() {
     const clusterName = k8sWolfStackCluster || 'WolfStack';
     const clusterFilteredNodes = allNodes.filter(n => (n.cluster_name || 'WolfStack') === clusterName);
     const sortedNodes = [...clusterFilteredNodes].sort((a, b) => a.hostname.localeCompare(b.hostname));
+
+    if (sortedNodes.length < 2) {
+        showToast('You need at least 2 nodes in this cluster to provision Kubernetes (1 server + 1 worker). Add more nodes first.', 'error');
+        return;
+    }
+
     const nodeOpts = sortedNodes.map(n => {
         const self = n.is_self ? ' (this server)' : '';
         return `<option value="${n.id}">${escapeHtml(n.hostname)} (${n.address})${self}</option>`;
@@ -22006,9 +22012,12 @@ function showK8sProvisionModal() {
                     <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">The Kubernetes control plane will be installed on this node.</div>
                 </div>
                 <div class="form-group">
-                    <label style="font-weight:600; font-size:13px; margin-bottom:6px; display:block;">Worker Nodes <span style="font-weight:400; color:var(--text-muted);">(optional)</span></label>
+                    <label style="font-weight:600; font-size:13px; margin-bottom:6px; display:block;">Worker Nodes <span style="font-weight:400; color:#ef4444;">(required — select at least 1)</span></label>
                     <select id="k8s-provision-agents" class="form-control" multiple style="height:100px; font-size:14px; padding:8px;">${nodeOpts}</select>
-                    <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">Hold Ctrl/Cmd to select multiple. These will join as worker nodes.</div>
+                    <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">Hold Ctrl/Cmd to select multiple. The server node is excluded automatically. You need at least 1 server + 1 worker.</div>
+                </div>
+                <div style="background:rgba(50,108,229,0.06); border:1px solid rgba(50,108,229,0.2); border-radius:8px; padding:12px 16px; margin-top:12px;">
+                    <p style="margin:0; font-size:12px; color:var(--text-secondary);"><strong>Minimum:</strong> 2 nodes &mdash; 1 server (control plane) + 1 worker. Select different nodes for server and workers.</p>
                 </div>
             </div>
             <div class="modal-footer">
@@ -22047,6 +22056,10 @@ async function k8sProvision() {
 
     if (!name) { showToast('Please enter a cluster name', 'error'); return; }
     if (!serverNodeId) { showToast('Please select a server node', 'error'); return; }
+    if (agentNodeIds.length === 0) {
+        showToast('Select at least 1 worker node (different from the server node)', 'error');
+        return;
+    }
 
     closeModal();
 
