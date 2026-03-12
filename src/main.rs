@@ -835,6 +835,62 @@ a{color:#eab308;text-decoration:none;}a:hover{text-decoration:underline;}
                                 }
                             }
 
+                            // ─── Kubernetes Clusters Table ───
+                            {
+                                let k8s_clusters = crate::kubernetes::list_clusters();
+                                if !k8s_clusters.is_empty() {
+                                    html.push_str(r#"<h2>Kubernetes Clusters</h2>"#);
+                                    for cluster in &k8s_clusters {
+                                        let status = tokio::task::spawn_blocking({
+                                            let kc = cluster.kubeconfig_path.clone();
+                                            move || crate::kubernetes::get_cluster_status(&kc)
+                                        }).await.unwrap_or(crate::kubernetes::K8sClusterStatus {
+                                            healthy: false, nodes_ready: 0, nodes_total: 0,
+                                            pods_running: 0, pods_total: 0, namespaces: 0,
+                                            api_version: "unknown".to_string(),
+                                        });
+
+                                        let health_class = if status.healthy { "online" } else { "critical" };
+                                        let health_text = if status.healthy { "Healthy" } else { "Unhealthy" };
+                                        html.push_str(&format!(
+                                            r#"<p style="margin:12px 0 6px;"><strong>{}</strong> <span class="badge info">{}</span> <span class="badge {}">{}</span> &bull; <span class="meta">{}/{} nodes, {}/{} pods, {} namespaces, API {}</span></p>"#,
+                                            cluster.name, cluster.cluster_type, health_class, health_text,
+                                            status.nodes_ready, status.nodes_total,
+                                            status.pods_running, status.pods_total,
+                                            status.namespaces, status.api_version,
+                                        ));
+
+                                        // Get pods for this cluster
+                                        let pods = tokio::task::spawn_blocking({
+                                            let kc = cluster.kubeconfig_path.clone();
+                                            move || {
+                                                let pods = crate::kubernetes::get_pods(&kc, None);
+                                                if pods.is_empty() {
+                                                    crate::kubernetes::get_pods_insecure_pub(&kc, None)
+                                                } else {
+                                                    pods
+                                                }
+                                            }
+                                        }).await.unwrap_or_default();
+
+                                        if !pods.is_empty() {
+                                            html.push_str(r#"<table><thead><tr><th>Pod</th><th>Namespace</th><th>Status</th><th>Ready</th><th>Restarts</th><th>Node</th><th>Age</th></tr></thead><tbody>"#);
+                                            for p in &pods {
+                                                let state_class = match p.status.as_str() { "Running" => "running", "Failed" | "Unknown" => "critical", "Pending" => "warning", "Succeeded" => "info", _ => "stopped" };
+                                                html.push_str(&format!(
+                                                    r#"<tr><td><strong>{}</strong></td><td class="meta">{}</td><td><span class="badge {}">{}</span></td><td>{}</td><td>{}{}</td><td class="meta">{}</td><td class="meta">{}</td></tr>"#,
+                                                    p.name, p.namespace, state_class, p.status,
+                                                    p.ready, p.restarts,
+                                                    if p.restarts >= 10 { " ⚠" } else { "" },
+                                                    p.node, p.age,
+                                                ));
+                                            }
+                                            html.push_str("</tbody></table>");
+                                        }
+                                    }
+                                }
+                            }
+
                             // ─── Proxmox VE Guests Table ───
                             {
                                 let mut pve_guests: Vec<(String, crate::proxmox::PveGuest)> = Vec::new();
@@ -997,6 +1053,11 @@ a{color:#eab308;text-decoration:none;}a:hover{text-decoration:underline;}
                         .map(|(node, gtype, vmid, name, cpu)| (node.as_str(), gtype.as_str(), *vmid, name.as_str(), *cpu))
                         .collect();
 
+                    // Gather Kubernetes cluster health (blocking kubectl calls)
+                    let k8s_health = tokio::task::spawn_blocking(|| {
+                        crate::kubernetes::health_summary()
+                    }).await.unwrap_or(None);
+
                     let summary = ai::build_metrics_summary(
                         &hostname,
                         cpu_pct,
@@ -1005,6 +1066,7 @@ a{color:#eab308;text-decoration:none;}a:hover{text-decoration:underline;}
                         docker_count, lxc_count, vm_count,
                         uptime_secs,
                         if guest_stats_refs.is_empty() { None } else { Some(&guest_stats_refs) },
+                        k8s_health.as_deref(),
                     );
                     let _ = ai_agent_bg.health_check(&summary).await;
                 }

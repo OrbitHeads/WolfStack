@@ -9933,6 +9933,69 @@ pub fn collect_issues(metrics: &crate::monitoring::SystemMetrics) -> Vec<Issue> 
         }
     }
 
+    // ── Kubernetes cluster issues ──
+    let k8s_clusters = crate::kubernetes::list_clusters();
+    for cluster in &k8s_clusters {
+        let status = crate::kubernetes::get_cluster_status(&cluster.kubeconfig_path);
+        if !status.healthy {
+            issues.push(Issue {
+                severity: "warning".into(),
+                category: "kubernetes".into(),
+                title: format!("K8s cluster '{}' unhealthy", cluster.name),
+                detail: format!("{}/{} nodes ready, {}/{} pods running",
+                    status.nodes_ready, status.nodes_total,
+                    status.pods_running, status.pods_total),
+            });
+        }
+
+        // Check for NotReady nodes
+        let nodes = crate::kubernetes::get_nodes(&cluster.kubeconfig_path);
+        for n in &nodes {
+            if n.status != "Ready" {
+                issues.push(Issue {
+                    severity: "critical".into(),
+                    category: "kubernetes".into(),
+                    title: format!("K8s node '{}' not ready", n.name),
+                    detail: format!("Cluster '{}', status: {}, role: {}", cluster.name, n.status, n.roles),
+                });
+            }
+        }
+
+        // Check for problem pods
+        let pods = crate::kubernetes::get_pods(&cluster.kubeconfig_path, None);
+        let failed = pods.iter().filter(|p| p.status == "Failed" || p.status == "Unknown").count();
+        let pending = pods.iter().filter(|p| p.status == "Pending").count();
+        let high_restarts = pods.iter().filter(|p| p.restarts >= 10).count();
+
+        if failed > 0 {
+            issues.push(Issue {
+                severity: "critical".into(),
+                category: "kubernetes".into(),
+                title: format!("{} failed pod(s) in cluster '{}'", failed, cluster.name),
+                detail: pods.iter().filter(|p| p.status == "Failed" || p.status == "Unknown")
+                    .take(5).map(|p| format!("{}/{}", p.namespace, p.name)).collect::<Vec<_>>().join(", "),
+            });
+        }
+        if pending > 0 {
+            issues.push(Issue {
+                severity: "warning".into(),
+                category: "kubernetes".into(),
+                title: format!("{} pending pod(s) in cluster '{}'", pending, cluster.name),
+                detail: pods.iter().filter(|p| p.status == "Pending")
+                    .take(5).map(|p| format!("{}/{}", p.namespace, p.name)).collect::<Vec<_>>().join(", "),
+            });
+        }
+        if high_restarts > 0 {
+            issues.push(Issue {
+                severity: "warning".into(),
+                category: "kubernetes".into(),
+                title: format!("{} pod(s) with high restarts in cluster '{}'", high_restarts, cluster.name),
+                detail: pods.iter().filter(|p| p.restarts >= 10)
+                    .take(5).map(|p| format!("{}/{} ({}x)", p.namespace, p.name, p.restarts)).collect::<Vec<_>>().join(", "),
+            });
+        }
+    }
+
     // ── Clearable disk space ──
 
     // Journal logs

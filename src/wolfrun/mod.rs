@@ -792,13 +792,19 @@ pub async fn reconcile(
                         container_list_path(&service.runtime),
                     );
                     let mut found = false;
+                    let mut got_container_list = false; // true if we successfully fetched & parsed the list
                     for url in &urls {
                         match client.get(url)
                             .header("X-WolfStack-Secret", cluster_secret)
                             .send().await
                         {
                             Ok(resp) => {
+                                if !resp.status().is_success() {
+                                    // HTTP error (401, 403, 500, etc.) — can't verify container state
+                                    break;
+                                }
                                 if let Ok(containers) = resp.json::<Vec<serde_json::Value>>().await {
+                                    got_container_list = true;
                                     for c in &containers {
                                         let name = c["name"].as_str().unwrap_or("");
                                         if name == inst.container_name {
@@ -834,16 +840,27 @@ pub async fn reconcile(
                         }
                     }
                     if !found {
-                        // Container not found on remote node.
-                        // If it was "pending" (clone in progress), keep it pending — don't mark lost.
                         if inst.status == "pending" {
                             live_instances.push(inst.clone());
-                        } else {
+                        } else if got_container_list {
+                            // We successfully fetched the container list but the container
+                            // wasn't in it — it's genuinely gone. Mark as "lost".
                             live_instances.push(ServiceInstance {
                                 node_id: inst.node_id.clone(),
                                 container_name: inst.container_name.clone(),
                                 wolfnet_ip: None,
                                 status: "lost".to_string(),
+                                last_seen: inst.last_seen,
+                            });
+                        } else {
+                            // Couldn't reach the node or got HTTP/auth error — container
+                            // may still be running fine. Keep as "offline" to preserve it
+                            // and avoid triggering replacement clones.
+                            live_instances.push(ServiceInstance {
+                                node_id: inst.node_id.clone(),
+                                container_name: inst.container_name.clone(),
+                                wolfnet_ip: inst.wolfnet_ip.clone(),
+                                status: "offline".to_string(),
                                 last_seen: inst.last_seen,
                             });
                         }

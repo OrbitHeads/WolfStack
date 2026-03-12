@@ -793,6 +793,10 @@ function buildServerTree(nodes) {
                             <span class="icon">📦</span> LXC
                             ${node.lxc_count ? `<span class="badge" style="font-size:10px; padding:1px 6px;">${node.lxc_count}</span>` : ''}
                         </a>
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="wolfkube" onclick="selectServerView('${node.id}', 'wolfkube')">
+                            <span class="icon">&#9784;</span> WolfKube
+                            <span class="badge k8s-pod-badge" data-node="${node.id}" style="font-size:10px; padding:1px 6px; display:none;"></span>
+                        </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="vms" onclick="selectServerView('${node.id}', 'vms')">
                             <span class="icon">🖥️</span> Virtual Machines
                             ${node.vm_count ? `<span class="badge" style="font-size:10px; padding:1px 6px;">${node.vm_count}</span>` : ''}
@@ -832,9 +836,6 @@ function buildServerTree(nodes) {
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="mysql-editor" onclick="selectServerView('${node.id}', 'mysql-editor')">
                             <span class="icon">🗄️</span> MariaDB/MySQL
-                        </a>
-                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="wolfkube" onclick="selectServerView('${node.id}', 'wolfkube')">
-                            <span class="icon">&#9784;</span> WolfKube
                         </a>
                     </div>
                 </div>`;
@@ -2247,6 +2248,8 @@ async function fetchNodes() {
                     }
                 });
             });
+            // Update WolfKube pod badges from k8sClusters data
+            updateK8sPodBadges();
             // Update cluster-level dots (any online = green)
             document.querySelectorAll('.server-node-header[data-cluster-id]').forEach(function (header) {
                 var dot = header.querySelector('.server-dot');
@@ -7982,6 +7985,16 @@ const POLL_INTERVAL = isMobileView() ? 30000 : 10000;
 fetchNodes();
 fetchMetricsHistory(); // Initial history load
 setInterval(fetchNodes, POLL_INTERVAL);
+// Load k8s cluster data for sidebar badges (non-blocking)
+(async () => {
+    try {
+        const resp = await fetch('/api/kubernetes/clusters');
+        if (resp.ok) k8sClusters = await resp.json();
+    } catch(e) {}
+    refreshK8sPodBadgeCounts();
+})();
+// Refresh k8s badge counts every 60 seconds
+setInterval(() => refreshK8sPodBadgeCounts(), 60000);
 
 // ─── Container Management ───
 
@@ -19289,7 +19302,7 @@ function renderWolfRunServices(services) {
         const desired = svc.replicas;
 
         // Status badge
-        const offline = svc.instances.filter(i => i.status === 'offline').length;
+        const offline = svc.instances.filter(i => i.status === 'offline' || i.status === 'lost').length;
         let statusBadge;
         if (running === desired && desired > 0) {
             statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(16,185,129,0.15);color:#10b981;border:1px solid rgba(16,185,129,0.3);">
@@ -21328,11 +21341,82 @@ function renderWolfrunServicePicker(existingCheck) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 let k8sClusters = [];
+let k8sPodCountsByNode = {};   // { nodeId: podCount } for sidebar badges
 let k8sCurrentCluster = null;  // selected K8sCluster id
 let k8sCurrentView = 'overview'; // overview, pods, deployments, services, namespaces, nodes
 let k8sCurrentNamespace = '';    // '' = all namespaces
 let k8sRefreshTimer = null;
 let k8sWolfStackCluster = '';    // WolfStack cluster name context
+
+function updateK8sPodBadges() {
+    // Count pods per node from cluster status data
+    const counts = {};
+    for (const c of k8sClusters) {
+        if (c.status && c.status.nodes) {
+            for (const kn of c.status.nodes) {
+                // Match k8s node name to WolfStack node by hostname or address
+                const nodeName = (kn.name || '').toLowerCase();
+                for (const n of allNodes) {
+                    const hn = (n.hostname || '').toLowerCase();
+                    const addr = (n.address || '').toLowerCase();
+                    if (nodeName === hn || nodeName === hn.split('.')[0] || nodeName === addr) {
+                        counts[n.id] = (counts[n.id] || 0);
+                        // Mark this node as having k8s — actual pod count will come from status totals
+                        counts[n.id] = -1; // placeholder, replaced below
+                    }
+                }
+            }
+        }
+    }
+
+    // Get actual pod counts per node from status pods data
+    // For now, use the total pods from cluster status divided across nodes,
+    // or if we have the per-node data from loadNodeK8sPods, use k8sPodCountsByNode
+    // The k8sPodCountsByNode is populated asynchronously by loadNodeK8sPods
+
+    // Update all WolfKube badges
+    document.querySelectorAll('.k8s-pod-badge').forEach(badge => {
+        const nodeId = badge.getAttribute('data-node');
+        const count = k8sPodCountsByNode[nodeId];
+        if (count && count > 0) {
+            badge.textContent = count;
+            badge.style.display = '';
+        } else if (counts[nodeId] !== undefined) {
+            // Node is part of a k8s cluster but no pod count yet — show cluster indicator
+            badge.textContent = '⎈';
+            badge.style.display = '';
+        } else {
+            badge.style.display = 'none';
+        }
+    });
+}
+
+// Fetch pod counts for all k8s nodes to populate sidebar badges
+async function refreshK8sPodBadgeCounts() {
+    if (k8sClusters.length === 0) return;
+    const nodeCounts = {};
+    const fetches = k8sClusters.map(async (c) => {
+        try {
+            const resp = await fetch(`/api/kubernetes/clusters/${encodeURIComponent(c.id)}/pods`);
+            if (!resp.ok) return;
+            const pods = await resp.json();
+            for (const p of pods) {
+                if (!p.node) continue;
+                const podNode = p.node.toLowerCase();
+                for (const n of allNodes) {
+                    const hn = (n.hostname || '').toLowerCase();
+                    const addr = (n.address || '').toLowerCase();
+                    if (podNode === hn || podNode === hn.split('.')[0] || podNode === addr) {
+                        nodeCounts[n.id] = (nodeCounts[n.id] || 0) + 1;
+                    }
+                }
+            }
+        } catch (e) {}
+    });
+    await Promise.all(fetches);
+    k8sPodCountsByNode = nodeCounts;
+    updateK8sPodBadges();
+}
 
 function showK8sClusterPage(clusterName) {
     k8sWolfStackCluster = clusterName;
@@ -21352,6 +21436,7 @@ async function loadKubernetesClusters() {
     }
 
     renderKubernetesPage();
+    refreshK8sPodBadgeCounts();
 }
 
 function renderKubernetesPage() {
@@ -22547,7 +22632,127 @@ async function loadNodeWolfKube() {
         </div>`;
     }
 
+    // Pods running on this node — fetch from all registered clusters
+    if (clusters.length > 0) {
+        html += `<div id="node-k8s-pods-section"></div>`;
+    }
+
     el.innerHTML = html;
+
+    // Async: load pods from each cluster, filter by this node
+    if (clusters.length > 0) {
+        loadNodeK8sPods(clusters, node);
+    }
+}
+
+async function loadNodeK8sPods(clusters, node) {
+    const section = document.getElementById('node-k8s-pods-section');
+    if (!section) return;
+
+    const hostname = node ? node.hostname : '';
+    const address = node ? (node.address || '') : '';
+    // Build set of names this node might appear as in k8s
+    const nodeNames = new Set();
+    if (hostname) { nodeNames.add(hostname.toLowerCase()); nodeNames.add(hostname.split('.')[0].toLowerCase()); }
+    if (address) nodeNames.add(address.toLowerCase());
+
+    let allPods = [];
+    const fetches = clusters.map(async (c) => {
+        try {
+            const resp = await fetch(`/api/kubernetes/clusters/${encodeURIComponent(c.id)}/pods`);
+            if (!resp.ok) return;
+            const pods = await resp.json();
+            for (const p of pods) {
+                if (p.node && nodeNames.has(p.node.toLowerCase())) {
+                    p._clusterId = c.id;
+                    p._clusterName = c.name;
+                    allPods.push(p);
+                }
+            }
+        } catch (e) {}
+    });
+    await Promise.all(fetches);
+
+    if (allPods.length === 0) {
+        section.innerHTML = `<div class="card">
+            <div class="card-header"><h3>Pods on this Node</h3></div>
+            <div class="card-body" style="padding:20px; text-align:center; color:var(--text-muted);">No pods found running on this node.</div>
+        </div>`;
+        return;
+    }
+
+    const statusColors = { Running: '#10b981', Pending: '#eab308', Succeeded: '#6366f1', Failed: '#ef4444', Unknown: '#9ca3af' };
+    let rows = '';
+    for (const p of allPods) {
+        const color = statusColors[p.status] || '#9ca3af';
+        rows += `<tr>
+            <td><strong style="font-size:12px;">${escapeHtml(p.name)}</strong></td>
+            <td><code style="font-size:11px;">${escapeHtml(p.namespace || '')}</code></td>
+            <td><span style="color:${color}; font-weight:600; font-size:12px;">${escapeHtml(p.status || '')}</span></td>
+            <td>${escapeHtml(p.ready || '')}</td>
+            <td>${p.restarts || 0}</td>
+            <td><code style="font-size:11px;">${escapeHtml(p.ip || '')}</code></td>
+            <td>${escapeHtml(p.age || '')}</td>
+            <td style="font-size:11px;">${escapeHtml(p._clusterName || '')}</td>
+            <td style="text-align:right; white-space:nowrap;">
+                <button class="btn btn-sm btn-secondary" onclick="showNodeK8sPodLogs('${escapeHtml(p._clusterId)}', '${escapeHtml(p.name)}', '${escapeHtml(p.namespace || 'default')}')" style="font-size:11px;">Logs</button>
+                <button class="btn btn-sm btn-danger" onclick="nodeK8sDeletePod('${escapeHtml(p._clusterId)}', '${escapeHtml(p.name)}', '${escapeHtml(p.namespace || 'default')}')" style="font-size:11px;">Delete</button>
+            </td>
+        </tr>`;
+    }
+
+    section.innerHTML = `<div class="card" style="margin-top:16px;">
+        <div class="card-header" style="display:flex; align-items:center; justify-content:space-between;">
+            <h3>Pods on this Node <span style="font-size:12px; font-weight:400; color:var(--text-muted);">(${allPods.length})</span></h3>
+            <button class="btn btn-sm btn-secondary" onclick="loadNodeWolfKube()" style="font-size:11px;">Refresh</button>
+        </div>
+        <div class="card-body" style="padding:0;">
+            <table class="data-table" style="width:100%;">
+                <thead><tr><th>Name</th><th>Namespace</th><th>Status</th><th>Ready</th><th>Restarts</th><th>IP</th><th>Age</th><th>Cluster</th><th style="text-align:right;">Actions</th></tr></thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>
+    </div>`;
+}
+
+async function showNodeK8sPodLogs(clusterId, pod, namespace) {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay active';
+    overlay.onclick = e => { if (e.target === overlay) closeModal(); };
+    overlay.innerHTML = `
+        <div class="modal" style="max-width:700px;">
+            <div class="modal-header">
+                <h3>Logs: ${escapeHtml(pod)}</h3>
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <pre id="k8s-node-log-content" style="max-height:500px; overflow:auto; background:var(--bg-secondary); padding:12px; border-radius:8px; font-size:12px; white-space:pre-wrap;">Loading...</pre>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModal()">Close</button>
+            </div>
+        </div>`;
+    document.body.appendChild(overlay);
+    try {
+        const resp = await fetch(`/api/kubernetes/clusters/${encodeURIComponent(clusterId)}/logs/${encodeURIComponent(pod)}?namespace=${encodeURIComponent(namespace)}&tail=200`);
+        const el = document.getElementById('k8s-node-log-content');
+        if (!resp.ok) { el.textContent = 'Failed to load logs'; return; }
+        const data = await resp.json();
+        el.textContent = data.logs || '(no logs)';
+        el.scrollTop = el.scrollHeight;
+    } catch (e) {
+        document.getElementById('k8s-node-log-content').textContent = 'Error: ' + e.message;
+    }
+}
+
+async function nodeK8sDeletePod(clusterId, pod, namespace) {
+    if (!(await showConfirm(`Delete pod "${pod}" in ${namespace}?`))) return;
+    try {
+        const resp = await fetch(`/api/kubernetes/clusters/${encodeURIComponent(clusterId)}/pods/${encodeURIComponent(pod)}?namespace=${encodeURIComponent(namespace)}`, { method: 'DELETE' });
+        if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Failed');
+        showToast(`Pod "${pod}" deleted`, 'success');
+        loadNodeWolfKube();
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
 }
 
 function showK8sUninstallModal(clusterType, name) {

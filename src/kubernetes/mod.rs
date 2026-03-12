@@ -1942,6 +1942,11 @@ fn get_pods_insecure(kubeconfig: &str, namespace: Option<&str>) -> Vec<K8sPod> {
         .unwrap_or_default()
 }
 
+/// Public wrapper for insecure pod fetching (used by daily report when normal TLS fails)
+pub fn get_pods_insecure_pub(kubeconfig: &str, namespace: Option<&str>) -> Vec<K8sPod> {
+    get_pods_insecure(kubeconfig, namespace)
+}
+
 // ═══════════════════════════════════════════════
 // ─── Resource Management ───
 // ═══════════════════════════════════════════════
@@ -2332,4 +2337,85 @@ echo 'RKE2 uninstalled.'
         _ => return Err(format!("Unknown distribution: {}", cluster_type)),
     };
     Ok(script.to_string())
+}
+
+// ─── AI Health Summary ───
+
+/// Build a text summary of all Kubernetes clusters for the AI health monitor.
+/// Returns None if no clusters are registered.
+pub fn health_summary() -> Option<String> {
+    let clusters = list_clusters();
+    if clusters.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    lines.push("Kubernetes Clusters:".to_string());
+
+    for cluster in &clusters {
+        let status = get_cluster_status(&cluster.kubeconfig_path);
+        let health = if status.healthy { "Healthy" } else { "UNHEALTHY" };
+        lines.push(format!(
+            "  Cluster '{}' ({}): {} — {}/{} nodes ready, {}/{} pods running, {} namespaces, API {}",
+            cluster.name,
+            cluster.cluster_type.to_string(),
+            health,
+            status.nodes_ready, status.nodes_total,
+            status.pods_running, status.pods_total,
+            status.namespaces,
+            status.api_version,
+        ));
+
+        // Get nodes and flag any NotReady
+        let nodes = get_nodes(&cluster.kubeconfig_path);
+        if nodes.is_empty() {
+            // Try insecure fallback
+            let nodes = get_nodes_insecure(&cluster.kubeconfig_path);
+            for n in &nodes {
+                if n.status != "Ready" {
+                    lines.push(format!("    WARNING: Node '{}' status: {} (role: {})", n.name, n.status, n.roles));
+                }
+            }
+        } else {
+            for n in &nodes {
+                if n.status != "Ready" {
+                    lines.push(format!("    WARNING: Node '{}' status: {} (role: {})", n.name, n.status, n.roles));
+                }
+            }
+        }
+
+        // Get pods and flag problematic ones
+        let pods = get_pods(&cluster.kubeconfig_path, None);
+        let pods = if pods.is_empty() {
+            get_pods_insecure(&cluster.kubeconfig_path, None)
+        } else {
+            pods
+        };
+        let mut problems: Vec<String> = Vec::new();
+        for p in &pods {
+            let is_problem = match p.status.as_str() {
+                "Failed" | "Unknown" => true,
+                "Pending" => true,
+                _ => p.restarts >= 10,
+            };
+            if is_problem {
+                problems.push(format!(
+                    "    {} Pod '{}' in {}: status={}, restarts={}, ready={}",
+                    if p.status == "Failed" || p.status == "Unknown" { "CRITICAL:" } else { "WARNING:" },
+                    p.name, p.namespace, p.status, p.restarts, p.ready,
+                ));
+            }
+        }
+        if !problems.is_empty() {
+            // Cap at 15 to avoid overwhelming the AI
+            for line in problems.iter().take(15) {
+                lines.push(line.clone());
+            }
+            if problems.len() > 15 {
+                lines.push(format!("    ... and {} more problem pods", problems.len() - 15));
+            }
+        }
+    }
+
+    Some(lines.join("\n"))
 }

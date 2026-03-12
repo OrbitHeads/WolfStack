@@ -400,7 +400,9 @@ impl AiAgent {
              If everything looks healthy, respond with exactly 'ALL_OK'. \
              If there are issues, list them concisely with severity (INFO/WARNING/CRITICAL).\n\
              IMPORTANT: Ignore /boot, /boot/efi, and /etc/pve partition usage — these are managed automatically \
-             by the OS or Proxmox. Only flag them if over 99% full.\n\n\
+             by the OS or Proxmox. Only flag them if over 99% full.\n\
+             For Kubernetes clusters: flag unhealthy/NotReady nodes, failed or pending pods, pods with high restart counts \
+             (10+), and any cluster that reports as UNHEALTHY. Include the cluster name and affected pod/node names.\n\n\
              Current server metrics:\n{}",
             metrics_summary
         );
@@ -1073,6 +1075,7 @@ pub fn build_metrics_summary(
     vm_count: u32,
     uptime_secs: u64,
     guest_cpu_stats: Option<&[(&str, &str, u64, &str, f32)]>, // (pve_node, guest_type, vmid, name, cpu_percent)
+    k8s_summary: Option<&str>,
 ) -> String {
     let mem_percent = if memory_total_gb > 0.0 { (memory_used_gb / memory_total_gb * 100.0) as u32 } else { 0 };
     let disk_percent = if disk_total_gb > 0.0 { (disk_used_gb / disk_total_gb * 100.0) as u32 } else { 0 };
@@ -1114,6 +1117,12 @@ pub fn build_metrics_summary(
                 ));
             }
         }
+    }
+
+    // Append Kubernetes cluster health if available
+    if let Some(k8s) = k8s_summary {
+        summary.push_str("\n\n");
+        summary.push_str(k8s);
     }
 
     summary
