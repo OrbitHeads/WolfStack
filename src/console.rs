@@ -266,10 +266,10 @@ async fn console_session(
             cmd.arg(format!(
                 "bash {} ; EXIT_CODE=$?; rm -f {} ; \
                  if [ $EXIT_CODE -ne 0 ]; then \
-                   echo '' ; echo -e '\\x1b[1;31m━━━ Installation failed (exit code '$EXIT_CODE') ━━━\\x1b[0m' ; \
-                   echo -e '\\x1b[0;90mScroll up to see the error details.\\x1b[0m' ; \
+                   echo '' ; printf '\\033[1;31m━━━ Installation failed (exit code %s) ━━━\\033[0m\\n' $EXIT_CODE ; \
+                   printf '\\033[0;90mScroll up to see the error details.\\033[0m\\n' ; \
                  fi ; \
-                 echo '' ; echo -e '\\x1b[0;90mDone.\\x1b[0m'",
+                 echo '' ; printf '\\033[0;90mDone.\\033[0m\\n'",
                 script_path, script_path
             ));
         }

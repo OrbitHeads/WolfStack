@@ -22190,7 +22190,12 @@ function k8sStartProvisionTerminal(index, session, agentNodeIds) {
 
         if (session.role === 'server' && agentNodeIds && agentNodeIds.length > 0) {
             // Server done — register cluster, then start agent phase
-            k8sRegisterAndStartAgents(agentNodeIds);
+            k8sRegisterAndStartAgents(agentNodeIds).catch(e => {
+                console.error('k8sRegisterAndStartAgents failed:', e);
+                showToast('Agent provisioning failed: ' + e.message, 'error');
+                const statusEl = document.getElementById('k8s-provision-status');
+                if (statusEl) { statusEl.textContent = 'Agent setup failed'; statusEl.style.color = '#ef4444'; }
+            });
         } else if (session.role === 'agent') {
             // Check if all agents are done
             k8sCheckAllAgentsDone();
@@ -22217,6 +22222,7 @@ async function k8sRegisterAndStartAgents(agentNodeIds) {
         if (serverSession.is_remote) {
             // Fetch kubeconfig from the remote server node
             try {
+                console.log('Fetching kubeconfig from remote node:', serverSession.node_id);
                 const kcResp = await fetch(`/api/nodes/${serverSession.node_id}/proxy/kubernetes/kubeconfig`);
                 if (kcResp.ok) {
                     const kcData = await kcResp.json();
@@ -22226,28 +22232,39 @@ async function k8sRegisterAndStartAgents(agentNodeIds) {
                     kubeconfig = kubeconfig.replace(/localhost/g, meta.server_address);
                     registrationBody = { name: meta.cluster_name, kubeconfig, cluster_type: meta.cluster_type };
                 } else {
+                    console.warn('Failed to fetch remote kubeconfig:', kcResp.status, await kcResp.text().catch(() => ''));
                     registrationBody = { name: meta.cluster_name, kubeconfig_path: meta.kubeconfig_path, cluster_type: meta.cluster_type };
                 }
             } catch (e) {
+                console.warn('Error fetching remote kubeconfig:', e);
                 registrationBody = { name: meta.cluster_name, kubeconfig_path: meta.kubeconfig_path, cluster_type: meta.cluster_type };
             }
         } else {
             registrationBody = { name: meta.cluster_name, kubeconfig_path: meta.kubeconfig_path, cluster_type: meta.cluster_type };
         }
 
+        console.log('Registering cluster:', registrationBody);
         const regResp = await fetch('/api/kubernetes/clusters', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(registrationBody),
         });
+        const regText = await regResp.text();
+        console.log('Registration response:', regResp.status, regText);
         if (regResp.ok) {
-            const regData = await regResp.json();
+            const regData = JSON.parse(regText);
             // Update kubeconfig_path to the locally-saved path for agent provisioning
             if (regData.cluster?.kubeconfig_path) {
                 meta.kubeconfig_path = regData.cluster.kubeconfig_path;
             }
+        } else {
+            console.error('Cluster registration failed:', regText);
+            showToast('Cluster registration failed — agents may still proceed', 'error');
         }
-    } catch (e) { /* will register on refresh anyway */ }
+    } catch (e) {
+        console.error('Registration error:', e);
+        showToast('Cluster registration error: ' + e.message, 'error');
+    }
 
     if (agentNodeIds.length === 0) {
         if (statusEl) statusEl.textContent = 'Complete!';
@@ -22260,31 +22277,45 @@ async function k8sRegisterAndStartAgents(agentNodeIds) {
     if (statusEl) statusEl.textContent = 'Starting worker nodes...';
 
     try {
+        const agentBody = {
+            distribution: meta.distribution,
+            cluster_name: meta.cluster_name,
+            kubeconfig_path: meta.kubeconfig_path,
+            api_url: meta.api_url,
+            server_address: meta.server_address,
+            server_node_id: meta.server_node_id || '',
+            agent_node_ids: agentNodeIds,
+        };
+        console.log('Preparing agent provisioning:', agentBody);
         const resp = await fetch('/api/kubernetes/clusters/prepare-provision-agents', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                distribution: meta.distribution,
-                cluster_name: meta.cluster_name,
-                kubeconfig_path: meta.kubeconfig_path,
-                api_url: meta.api_url,
-                server_address: meta.server_address,
-                server_node_id: meta.server_node_id || '',
-                agent_node_ids: agentNodeIds,
-            }),
+            body: JSON.stringify(agentBody),
         });
         const data = await resp.json().catch(() => ({}));
+        console.log('Agent preparation response:', resp.status, data);
         if (!resp.ok) {
-            showToast('Agent provisioning failed: ' + (data.error || 'Unknown error'), 'error');
+            const errMsg = data.error || 'Unknown error';
+            console.error('Agent provisioning failed:', errMsg);
+            showToast('Agent provisioning failed: ' + errMsg, 'error');
+            if (statusEl) { statusEl.textContent = 'Agent setup failed'; statusEl.style.color = '#ef4444'; }
             return;
         }
 
+        if (data.errors && data.errors.length > 0) {
+            console.warn('Agent provisioning warnings:', data.errors);
+            showToast('Some agents had issues: ' + data.errors.join(', '), 'error');
+        }
+
         // Start agent terminals
+        console.log('Starting', data.sessions.length, 'agent terminals');
         data.sessions.forEach((session, i) => {
             setTimeout(() => k8sStartProvisionTerminal(i + 1, session, null), i * 500);
         });
     } catch (e) {
+        console.error('Agent provisioning error:', e);
         showToast('Agent provisioning failed: ' + e.message, 'error');
+        if (statusEl) { statusEl.textContent = 'Agent setup failed'; statusEl.style.color = '#ef4444'; }
     }
 }
 
