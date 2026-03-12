@@ -9226,6 +9226,62 @@ pub async fn k8s_join_token(req: HttpRequest, state: web::Data<AppState>) -> Htt
     HttpResponse::NotFound().json(serde_json::json!({ "error": "No join token available on this node" }))
 }
 
+/// POST /api/kubernetes/uninstall — uninstall a k8s distribution from this node
+#[derive(Deserialize)]
+pub struct K8sUninstallRequest {
+    pub cluster_type: String,
+}
+
+pub async fn k8s_uninstall(req: HttpRequest, state: web::Data<AppState>, body: web::Json<K8sUninstallRequest>) -> HttpResponse {
+    // Accept either session auth or cluster-secret auth (for proxied calls)
+    let secret = req.headers().get("X-WolfStack-Secret").and_then(|v| v.to_str().ok()).unwrap_or("");
+    if secret != state.cluster_secret {
+        if let Err(resp) = require_auth(&req, &state) { return resp; }
+    }
+
+    let script = match crate::kubernetes::uninstall_script(&body.cluster_type) {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    };
+
+    let full_script = format!(
+        "#!/bin/bash\nset -e\n\
+         echo -e '\\033[1;31m━━━ WolfKube — Uninstalling {} ━━━\\033[0m'\n\
+         echo ''\n\
+         {}\n\
+         echo ''\n\
+         echo -e '\\033[1;32m━━━ Uninstall complete ━━━\\033[0m'\n",
+        body.cluster_type, script
+    );
+
+    // Run the uninstall script
+    match std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&full_script)
+        .output()
+    {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            if output.status.success() {
+                HttpResponse::Ok().json(serde_json::json!({
+                    "message": format!("{} uninstalled successfully", body.cluster_type),
+                    "output": stdout,
+                }))
+            } else {
+                HttpResponse::Ok().json(serde_json::json!({
+                    "message": format!("{} uninstall completed with warnings", body.cluster_type),
+                    "output": stdout,
+                    "stderr": stderr,
+                }))
+            }
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("Failed to run uninstall: {}", e)
+        })),
+    }
+}
+
 /// POST /api/kubernetes/clusters/{id}/wolfnet — deploy WolfNet to a k8s cluster
 #[derive(Deserialize)]
 pub struct K8sWolfNetRequest {
@@ -11899,6 +11955,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/kubernetes/run-script", web::post().to(k8s_run_script))
         .route("/api/kubernetes/kubeconfig", web::get().to(k8s_kubeconfig))
         .route("/api/kubernetes/join-token", web::get().to(k8s_join_token))
+        .route("/api/kubernetes/uninstall", web::post().to(k8s_uninstall))
         .route("/api/kubernetes/clusters", web::get().to(k8s_list_clusters))
         .route("/api/kubernetes/clusters", web::post().to(k8s_create_cluster))
         .route("/api/kubernetes/clusters/provision", web::post().to(k8s_provision))

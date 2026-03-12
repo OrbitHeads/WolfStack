@@ -22408,7 +22408,7 @@ async function loadNodeWolfKube() {
             <div class="card-header"><h3>Detected Installations</h3></div>
             <div class="card-body" style="padding:0;">
                 <table class="data-table">
-                    <thead><tr><th>Name</th><th>Type</th><th>Kubeconfig</th><th>Status</th></tr></thead>
+                    <thead><tr><th>Name</th><th>Type</th><th>Kubeconfig</th><th>Status</th><th>Actions</th></tr></thead>
                     <tbody>`;
         for (const d of detected) {
             const alreadyImported = clusters.some(c => c.kubeconfig_path === d.kubeconfig_path);
@@ -22420,6 +22420,7 @@ async function loadNodeWolfKube() {
                     ? '<span style="color:#10b981; font-size:12px; font-weight:600;">Registered</span>'
                     : '<span style="color:var(--text-muted); font-size:12px;">Not registered</span>'
                 }</td>
+                <td><button class="btn btn-sm btn-danger" onclick="showK8sUninstallModal('${escapeHtml(d.cluster_type)}', '${escapeHtml(d.name)}')" style="font-size:11px;">Uninstall</button></td>
             </tr>`;
         }
         html += `</tbody></table></div></div>`;
@@ -22463,6 +22464,73 @@ async function loadNodeWolfKube() {
     }
 
     el.innerHTML = html;
+}
+
+function showK8sUninstallModal(clusterType, name) {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay active';
+    overlay.onclick = e => { if (e.target === overlay) closeModal(); };
+    overlay.innerHTML = `
+        <div class="modal" style="max-width:480px;">
+            <div class="modal-header" style="background:linear-gradient(135deg, rgba(239,68,68,0.12), rgba(239,68,68,0.04));">
+                <div style="display:flex; align-items:center; gap:12px;">
+                    <div style="width:40px; height:40px; background:linear-gradient(135deg,#ef4444,#f87171); border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:20px; color:#fff;">&#9888;</div>
+                    <div>
+                        <h3 style="margin:0; font-size:17px; font-weight:700; color:#ef4444;">Uninstall ${escapeHtml(name)}</h3>
+                        <p style="margin:2px 0 0 0; font-size:12px; color:var(--text-muted);">This action cannot be undone</p>
+                    </div>
+                </div>
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-body" style="padding:24px;">
+                <div style="background:rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.25); border-radius:8px; padding:16px; margin-bottom:20px;">
+                    <p style="margin:0 0 8px 0; font-size:13px; color:var(--text-primary); font-weight:600;">This will completely remove <strong>${escapeHtml(clusterType)}</strong> from this node:</p>
+                    <ul style="margin:0; padding-left:20px; font-size:12px; color:var(--text-secondary); line-height:1.8;">
+                        <li>Stop and disable all ${escapeHtml(clusterType)} services</li>
+                        <li>Remove binaries, configuration, and data</li>
+                        <li>Remove kubeconfig files</li>
+                    </ul>
+                </div>
+                <label style="display:block; font-size:13px; color:var(--text-secondary); margin-bottom:8px;">Type <strong>YES</strong> to confirm:</label>
+                <input type="text" id="k8s-uninstall-confirm" autocomplete="off" spellcheck="false"
+                    style="width:100%; padding:10px 12px; border-radius:8px; border:1px solid var(--border-color); background:var(--bg-secondary); color:var(--text-primary); font-size:14px; font-family:monospace; letter-spacing:2px; text-align:center;"
+                    placeholder="YES" />
+            </div>
+            <div class="modal-footer" style="display:flex; justify-content:flex-end; gap:10px; padding:16px 24px;">
+                <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                <button class="btn btn-danger" id="k8s-uninstall-btn" onclick="k8sDoUninstall('${escapeHtml(clusterType)}', '${escapeHtml(name)}')" disabled style="opacity:0.5;">Uninstall</button>
+            </div>
+        </div>`;
+    document.body.appendChild(overlay);
+    const input = document.getElementById('k8s-uninstall-confirm');
+    const btn = document.getElementById('k8s-uninstall-btn');
+    input.addEventListener('input', () => {
+        const match = input.value.trim() === 'YES';
+        btn.disabled = !match;
+        btn.style.opacity = match ? '1' : '0.5';
+    });
+    input.focus();
+}
+
+async function k8sDoUninstall(clusterType, name) {
+    const btn = document.getElementById('k8s-uninstall-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Uninstalling...'; }
+
+    try {
+        const resp = await fetch(apiUrl('/api/kubernetes/uninstall'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cluster_type: clusterType }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || 'Uninstall failed');
+        closeModal();
+        showToast(data.message || `${name} uninstalled successfully`, 'success');
+        loadNodeWolfKube();
+    } catch (e) {
+        closeModal();
+        showToast('Uninstall failed: ' + e.message, 'error');
+    }
 }
 
 // ─── WolfNet Integration ───

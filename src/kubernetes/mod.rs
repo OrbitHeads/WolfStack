@@ -2146,3 +2146,83 @@ spec:
 
     apply_yaml(kubeconfig, &yaml)
 }
+
+/// Generate a shell script to uninstall a Kubernetes distribution from this node
+pub fn uninstall_script(cluster_type: &str) -> Result<String, String> {
+    let script = match cluster_type {
+        "k3s" => r#"
+echo 'Stopping k3s services...'
+systemctl stop k3s 2>/dev/null || true
+systemctl stop k3s-agent 2>/dev/null || true
+
+if [ -f /usr/local/bin/k3s-uninstall.sh ]; then
+    echo 'Running k3s server uninstall script...'
+    /usr/local/bin/k3s-uninstall.sh
+elif [ -f /usr/local/bin/k3s-agent-uninstall.sh ]; then
+    echo 'Running k3s agent uninstall script...'
+    /usr/local/bin/k3s-agent-uninstall.sh
+else
+    echo 'No k3s uninstall script found, cleaning up manually...'
+    systemctl disable k3s k3s-agent 2>/dev/null || true
+    rm -f /usr/local/bin/k3s /usr/local/bin/kubectl /usr/local/bin/crictl /usr/local/bin/ctr
+    rm -rf /etc/rancher/k3s /var/lib/rancher/k3s /run/k3s
+    rm -f /etc/systemd/system/k3s.service /etc/systemd/system/k3s-agent.service
+    systemctl daemon-reload
+fi
+echo 'k3s uninstalled.'
+"#,
+        "microk8s" | "micro_k8s" => r#"
+echo 'Removing MicroK8s...'
+microk8s stop 2>/dev/null || true
+snap remove microk8s --purge 2>/dev/null || true
+echo 'MicroK8s uninstalled.'
+"#,
+        "kubeadm" | "k8s" => r#"
+echo 'Resetting kubeadm...'
+kubeadm reset -f 2>/dev/null || true
+echo 'Removing kubernetes packages...'
+if command -v apt-get &>/dev/null; then
+    apt-get purge -y kubeadm kubelet kubectl 2>/dev/null || true
+    apt-get autoremove -y 2>/dev/null || true
+elif command -v dnf &>/dev/null; then
+    dnf remove -y kubeadm kubelet kubectl 2>/dev/null || true
+elif command -v yum &>/dev/null; then
+    yum remove -y kubeadm kubelet kubectl 2>/dev/null || true
+elif command -v zypper &>/dev/null; then
+    zypper remove -y kubeadm kubelet kubectl 2>/dev/null || true
+fi
+rm -rf /etc/kubernetes /var/lib/kubelet /var/lib/etcd /root/.kube
+echo 'kubeadm uninstalled.'
+"#,
+        "k0s" => r#"
+echo 'Stopping k0s...'
+k0s stop 2>/dev/null || true
+echo 'Resetting k0s...'
+k0s reset --cri-socket docker:unix:///var/run/docker.sock 2>/dev/null || k0s reset 2>/dev/null || true
+rm -rf /var/lib/k0s /etc/k0s /usr/local/bin/k0s
+echo 'k0s uninstalled.'
+"#,
+        "rke2" => r#"
+echo 'Stopping RKE2 services...'
+systemctl stop rke2-server 2>/dev/null || true
+systemctl stop rke2-agent 2>/dev/null || true
+
+if [ -f /usr/local/bin/rke2-uninstall.sh ]; then
+    echo 'Running RKE2 server uninstall script...'
+    /usr/local/bin/rke2-uninstall.sh
+elif [ -f /usr/local/bin/rke2-agent-uninstall.sh ]; then
+    echo 'Running RKE2 agent uninstall script...'
+    /usr/local/bin/rke2-agent-uninstall.sh
+else
+    echo 'No RKE2 uninstall script found, cleaning up manually...'
+    systemctl disable rke2-server rke2-agent 2>/dev/null || true
+    rm -rf /etc/rancher/rke2 /var/lib/rancher/rke2 /usr/local/bin/rke2
+    rm -f /etc/systemd/system/rke2-server.service /etc/systemd/system/rke2-agent.service
+    systemctl daemon-reload
+fi
+echo 'RKE2 uninstalled.'
+"#,
+        _ => return Err(format!("Unknown distribution: {}", cluster_type)),
+    };
+    Ok(script.to_string())
+}
