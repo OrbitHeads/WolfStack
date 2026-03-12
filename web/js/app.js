@@ -22269,6 +22269,7 @@ async function k8sRegisterAndStartAgents(agentNodeIds) {
                 kubeconfig_path: meta.kubeconfig_path,
                 api_url: meta.api_url,
                 server_address: meta.server_address,
+                server_node_id: meta.server_node_id || '',
                 agent_node_ids: agentNodeIds,
             }),
         });
@@ -22407,7 +22408,7 @@ async function loadNodeWolfKube() {
             <div class="card-header"><h3>Detected Installations</h3></div>
             <div class="card-body" style="padding:0;">
                 <table class="data-table">
-                    <thead><tr><th>Name</th><th>Type</th><th>Kubeconfig</th><th>Actions</th></tr></thead>
+                    <thead><tr><th>Name</th><th>Type</th><th>Kubeconfig</th><th>Status</th></tr></thead>
                     <tbody>`;
         for (const d of detected) {
             const alreadyImported = clusters.some(c => c.kubeconfig_path === d.kubeconfig_path);
@@ -22416,8 +22417,8 @@ async function loadNodeWolfKube() {
                 <td><span style="padding:2px 8px;border-radius:6px;font-size:11px;background:rgba(50,108,229,0.12);color:#326ce5;border:1px solid rgba(50,108,229,0.3);">${escapeHtml(d.cluster_type)}</span></td>
                 <td style="font-family:monospace; font-size:12px;">${escapeHtml(d.kubeconfig_path)}</td>
                 <td>${alreadyImported
-                    ? '<span style="color:var(--text-muted); font-size:12px;">Already imported</span>'
-                    : `<button class="btn btn-sm btn-primary" onclick="k8sImportDetected('${escapeHtml(d.name)}', '${escapeHtml(d.kubeconfig_path)}', '${escapeHtml(d.cluster_type)}')" style="background:#326ce5; border-color:#326ce5; font-size:11px;">Import</button>`
+                    ? '<span style="color:#10b981; font-size:12px; font-weight:600;">Registered</span>'
+                    : '<span style="color:var(--text-muted); font-size:12px;">Not registered</span>'
                 }</td>
             </tr>`;
         }

@@ -9010,6 +9010,7 @@ pub async fn k8s_prepare_provision(req: HttpRequest, state: web::Data<AppState>,
         "kubeconfig_path": kubeconfig_path,
         "api_url": format!("https://{}:{}", server_address, api_port),
         "server_address": server_address,
+        "server_node_id": body.server_node_id,
         "agent_node_ids": body.agent_node_ids,
     }))
 }
@@ -9023,6 +9024,8 @@ pub struct K8sPrepareAgentsRequest {
     pub kubeconfig_path: String,
     pub api_url: String,
     pub server_address: String,
+    #[serde(default)]
+    pub server_node_id: String,
     pub agent_node_ids: Vec<String>,
 }
 
@@ -9033,14 +9036,34 @@ pub async fn k8s_prepare_provision_agents(req: HttpRequest, state: web::Data<App
     let cluster_secret = state.cluster_secret.clone();
     let ts = chrono::Utc::now().timestamp_millis();
 
-    // Get join token/command from the server
-    let join_info = match dist.as_str() {
-        "k3s" => crate::kubernetes::get_k3s_token(&body.kubeconfig_path),
-        "microk8s" => crate::kubernetes::get_microk8s_join_command(),
-        "kubeadm" | "k8s" => crate::kubernetes::get_kubeadm_join_command(),
-        "k0s" => crate::kubernetes::get_k0s_join_token(),
-        "rke2" => crate::kubernetes::get_rke2_join_token(),
-        _ => Err("Unsupported distribution".to_string()),
+    // Determine if the server node is remote
+    let server_is_self = if body.server_node_id.is_empty() {
+        true // fallback: assume local
+    } else {
+        state.cluster.get_node(&body.server_node_id).map(|n| n.is_self).unwrap_or(true)
+    };
+    let server_address = body.server_address.clone();
+    let server_port = if !body.server_node_id.is_empty() {
+        state.cluster.get_node(&body.server_node_id).map(|n| n.port).unwrap_or(8553)
+    } else {
+        8553
+    };
+
+    // Get join token/command — from local node or remote server
+    let join_info: Result<String, String> = if server_is_self {
+        match dist.as_str() {
+            "k3s" => crate::kubernetes::get_k3s_token(&body.kubeconfig_path),
+            "microk8s" => crate::kubernetes::get_microk8s_join_command(),
+            "kubeadm" | "k8s" => crate::kubernetes::get_kubeadm_join_command(),
+            "k0s" => crate::kubernetes::get_k0s_join_token(),
+            "rke2" => crate::kubernetes::get_rke2_join_token(),
+            _ => Err("Unsupported distribution".to_string()),
+        }
+    } else {
+        // Fetch join token from the remote server node
+        fetch_from_remote(&server_address, server_port, "/api/kubernetes/join-token", &cluster_secret).await
+            .and_then(|body| body["token"].as_str().map(|s| s.to_string())
+                .ok_or_else(|| "No join token in response".to_string()))
     };
     let join_info = match join_info {
         Ok(t) => t,
