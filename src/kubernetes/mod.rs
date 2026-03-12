@@ -249,13 +249,43 @@ pub fn list_clusters() -> Vec<K8sCluster> {
 // ─── kubectl Helper ───
 // ═══════════════════════════════════════════════
 
+/// Find the best kubectl binary on the system.
+/// Tries: kubectl, k3s kubectl, microk8s kubectl, /usr/local/bin/kubectl
+fn find_kubectl() -> (&'static str, &'static [&'static str]) {
+    // Check standalone kubectl first
+    if Command::new("kubectl").arg("version").arg("--client")
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .status().map(|s| s.success()).unwrap_or(false)
+    {
+        return ("kubectl", &[]);
+    }
+    // k3s ships its own kubectl
+    if Command::new("k3s").arg("kubectl").arg("version").arg("--client")
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .status().map(|s| s.success()).unwrap_or(false)
+    {
+        return ("k3s", &["kubectl"]);
+    }
+    // microk8s ships its own kubectl
+    if Command::new("microk8s").arg("kubectl").arg("version").arg("--client")
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .status().map(|s| s.success()).unwrap_or(false)
+    {
+        return ("microk8s", &["kubectl"]);
+    }
+    // Fallback to kubectl (will fail with a clear error if not found)
+    ("kubectl", &[])
+}
+
 pub fn kubectl(kubeconfig: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("kubectl")
-        .arg("--kubeconfig")
-        .arg(kubeconfig)
-        .args(args)
-        .output()
-        .map_err(|e| format!("Failed to execute kubectl: {}", e))?;
+    let (binary, prefix_args) = find_kubectl();
+    let mut cmd = Command::new(binary);
+    cmd.args(prefix_args);
+    cmd.arg("--kubeconfig").arg(kubeconfig);
+    cmd.args(args);
+
+    let output = cmd.output()
+        .map_err(|e| format!("Failed to execute kubectl (tried '{} {}'): {}. Is kubectl, k3s, or microk8s installed?", binary, prefix_args.join(" "), e))?;
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -264,6 +294,52 @@ pub fn kubectl(kubeconfig: &str, args: &[&str]) -> Result<String, String> {
         warn!("kubectl command failed: {}", stderr);
         Err(stderr)
     }
+}
+
+/// Detect existing Kubernetes installations on this node.
+/// Returns a list of detected clusters with their kubeconfig paths and types.
+pub fn detect_existing_clusters() -> Vec<(String, String, K8sClusterType)> {
+    let mut found = Vec::new();
+
+    // k3s: kubeconfig at /etc/rancher/k3s/k3s.yaml
+    if Path::new("/etc/rancher/k3s/k3s.yaml").exists() {
+        found.push((
+            "k3s (local)".to_string(),
+            "/etc/rancher/k3s/k3s.yaml".to_string(),
+            K8sClusterType::K3s,
+        ));
+    }
+
+    // microk8s: config via `microk8s config`
+    let microk8s_config = "/var/snap/microk8s/current/credentials/client.config";
+    if Path::new(microk8s_config).exists() {
+        found.push((
+            "microk8s (local)".to_string(),
+            microk8s_config.to_string(),
+            K8sClusterType::K8s,
+        ));
+    }
+
+    // kubeadm / standard k8s: ~/.kube/config or /etc/kubernetes/admin.conf
+    if Path::new("/etc/kubernetes/admin.conf").exists() {
+        found.push((
+            "kubernetes (local)".to_string(),
+            "/etc/kubernetes/admin.conf".to_string(),
+            K8sClusterType::K8s,
+        ));
+    }
+
+    // User kubeconfig at /root/.kube/config (WolfStack runs as root)
+    let home_kubeconfig = "/root/.kube/config";
+    if Path::new(home_kubeconfig).exists() {
+        found.push((
+            "kubernetes (~/.kube/config)".to_string(),
+            home_kubeconfig.to_string(),
+            K8sClusterType::K8s,
+        ));
+    }
+
+    found
 }
 
 // ═══════════════════════════════════════════════

@@ -8308,27 +8308,58 @@ pub async fn k8s_list_clusters(req: HttpRequest, state: web::Data<AppState>) -> 
     HttpResponse::Ok().json(crate::kubernetes::list_clusters())
 }
 
-/// POST /api/kubernetes/clusters — import a cluster via kubeconfig
+/// GET /api/kubernetes/detect — detect existing k8s installations on this node
+pub async fn k8s_detect(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let detected = crate::kubernetes::detect_existing_clusters();
+    let already_registered = crate::kubernetes::list_clusters();
+    let results: Vec<serde_json::Value> = detected.into_iter()
+        .filter(|(_, path, _)| !already_registered.iter().any(|c| c.kubeconfig_path == *path))
+        .map(|(name, path, cluster_type)| {
+            serde_json::json!({ "name": name, "kubeconfig_path": path, "cluster_type": cluster_type.to_string() })
+        })
+        .collect();
+    HttpResponse::Ok().json(results)
+}
+
+/// POST /api/kubernetes/clusters — import a cluster via kubeconfig content or path
 #[derive(Deserialize)]
 pub struct K8sImportRequest {
     pub name: String,
-    pub kubeconfig: String,  // raw kubeconfig YAML content
+    #[serde(default)]
+    pub kubeconfig: String,       // raw kubeconfig YAML content (for pasted imports)
+    #[serde(default)]
+    pub kubeconfig_path: Option<String>,  // path to existing kubeconfig (for auto-detected imports)
     #[serde(default)]
     pub cluster_type: Option<String>,
 }
 
 pub async fn k8s_create_cluster(req: HttpRequest, state: web::Data<AppState>, body: web::Json<K8sImportRequest>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    // Save kubeconfig to /etc/wolfstack/kubernetes/<id>.yaml
     let id = format!("k8s-{}", body.name.to_lowercase().replace(|c: char| !c.is_alphanumeric(), "-"));
-    let dir = "/etc/wolfstack/kubernetes";
-    let _ = std::fs::create_dir_all(dir);
-    let kubeconfig_path = format!("{}/{}.yaml", dir, id);
-    if let Err(e) = std::fs::write(&kubeconfig_path, &body.kubeconfig) {
-        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Failed to save kubeconfig: {}", e) }));
-    }
+
+    // If a path is provided directly (e.g. auto-detected k3s), use it as-is
+    // Otherwise save the pasted kubeconfig content to a file
+    let (kubeconfig_path, kubeconfig_content) = if let Some(ref path) = body.kubeconfig_path {
+        if !std::path::Path::new(path).exists() {
+            return HttpResponse::BadRequest().json(serde_json::json!({ "error": format!("Kubeconfig file not found: {}", path) }));
+        }
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        (path.clone(), content)
+    } else if !body.kubeconfig.is_empty() {
+        let dir = "/etc/wolfstack/kubernetes";
+        let _ = std::fs::create_dir_all(dir);
+        let path = format!("{}/{}.yaml", dir, id);
+        if let Err(e) = std::fs::write(&path, &body.kubeconfig) {
+            return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Failed to save kubeconfig: {}", e) }));
+        }
+        (path, body.kubeconfig.clone())
+    } else {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Either kubeconfig content or kubeconfig_path is required" }));
+    };
+
     // Try to extract API URL from kubeconfig
-    let api_url = body.kubeconfig.lines()
+    let api_url = kubeconfig_content.lines()
         .find(|l| l.trim().starts_with("server:"))
         .map(|l| l.trim().trim_start_matches("server:").trim().to_string())
         .unwrap_or_default();
@@ -11308,6 +11339,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // Geolocation proxy (ip-api.com is HTTP-only, browsers block mixed content on HTTPS pages)
         .route("/api/geolocate", web::get().to(geolocate))
         // Kubernetes
+        .route("/api/kubernetes/detect", web::get().to(k8s_detect))
         .route("/api/kubernetes/clusters", web::get().to(k8s_list_clusters))
         .route("/api/kubernetes/clusters", web::post().to(k8s_create_cluster))
         .route("/api/kubernetes/clusters/provision", web::post().to(k8s_provision))

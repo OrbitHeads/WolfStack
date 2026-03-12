@@ -21331,6 +21331,9 @@ function renderKubernetesPage() {
         </div>
     </div>`;
 
+    // Auto-detect banner
+    html += `<div id="k8s-detect-banner"></div>`;
+
     if (k8sClusters.length === 0) {
         html += `<div class="card"><div class="card-body" style="padding:60px; text-align:center;">
             <div style="font-size:48px; margin-bottom:16px;">&#9784;</div>
@@ -21371,6 +21374,49 @@ function renderKubernetesPage() {
     html += `<div id="k8s-detail-panel" style="display:none; margin-top:20px;"></div>`;
 
     el.innerHTML = html;
+
+    // Auto-detect existing k8s installations
+    k8sDetectExisting();
+}
+
+async function k8sDetectExisting() {
+    const banner = document.getElementById('k8s-detect-banner');
+    if (!banner) return;
+    try {
+        const resp = await fetch('/api/kubernetes/detect');
+        if (!resp.ok) return;
+        const detected = await resp.json();
+        if (detected.length === 0) { banner.innerHTML = ''; return; }
+        banner.innerHTML = `<div class="card" style="margin-bottom:16px; border-color:rgba(50,108,229,0.4); background:rgba(50,108,229,0.06);">
+            <div class="card-body" style="padding:16px 24px;">
+                <div style="display:flex; align-items:center; gap:12px; margin-bottom:12px;">
+                    <span style="font-size:20px;">&#128269;</span>
+                    <strong style="font-size:14px;">Existing Kubernetes installations detected on this server</strong>
+                </div>
+                ${detected.map(d => `<div style="display:flex; align-items:center; gap:12px; padding:8px 0; border-top:1px solid var(--border);">
+                    <div style="flex:1;">
+                        <strong>${escapeHtml(d.name)}</strong>
+                        <span style="font-size:12px; color:var(--text-muted); margin-left:8px;">${escapeHtml(d.cluster_type)} &mdash; ${escapeHtml(d.kubeconfig_path)}</span>
+                    </div>
+                    <button class="btn btn-sm btn-primary" onclick="k8sImportDetected('${escapeHtml(d.name)}', '${escapeHtml(d.kubeconfig_path)}', '${escapeHtml(d.cluster_type)}')" style="background:#326ce5; border-color:#326ce5; font-size:11px;">Import</button>
+                </div>`).join('')}
+            </div>
+        </div>`;
+    } catch (e) { /* ignore */ }
+}
+
+async function k8sImportDetected(name, kubeconfigPath, clusterType) {
+    try {
+        const resp = await fetch('/api/kubernetes/clusters', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, kubeconfig_path: kubeconfigPath, cluster_type: clusterType }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || 'Import failed');
+        showToast(`Imported "${name}" cluster!`, 'success');
+        loadKubernetesClusters();
+    } catch (e) { showToast('Import failed: ' + e.message, 'error'); }
 }
 
 async function checkK8sClusterStatus(clusterId) {
