@@ -18117,17 +18117,21 @@ function switchAppStoreTab(tab) {
 
 // ─── Install Modal ───
 // Build a set of node addresses/hostnames that are part of a k8s cluster
-function getK8sNodeAddresses() {
-    const addrs = new Set();
+function getK8sNodeIds() {
+    const ids = new Set();
     for (const c of k8sClusters) {
+        // Owner node (the K8s server)
+        if (c.owner_node_id) ids.add(c.owner_node_id);
+        // Also match by API URL hostname against WolfStack node addresses
         if (c.api_url) {
             try {
-                const u = new URL(c.api_url);
-                addrs.add(u.hostname.toLowerCase());
+                const host = new URL(c.api_url).hostname.toLowerCase();
+                const node = allNodes.find(n => n.address.toLowerCase() === host || n.hostname.toLowerCase() === host);
+                if (node) ids.add(node.id);
             } catch (e) {}
         }
     }
-    return addrs;
+    return ids;
 }
 
 function openAppStoreInstallModal(appId) {
@@ -18138,7 +18142,7 @@ function openAppStoreInstallModal(appId) {
     document.getElementById('appstore-install-title').textContent = `Install ${app.name}`;
     document.getElementById('appstore-install-name').value = app.id.replace(/_/g, '-');
 
-    const k8sAddrs = getK8sNodeAddresses();
+    const k8sNodeIds = getK8sNodeIds();
 
     // Populate host selector from allNodes (show all, mark offline + k8s) — sorted alphabetically
     const hostSelect = document.getElementById('appstore-install-host');
@@ -18146,7 +18150,7 @@ function openAppStoreInstallModal(appId) {
     hostSelect.innerHTML = sortedNodes.map(n => {
         const status = n.online ? '' : ' [offline]';
         const self = n.is_self ? ' — this server' : '';
-        const hasK8s = k8sAddrs.has(n.address.toLowerCase()) || k8sAddrs.has(n.hostname.toLowerCase());
+        const hasK8s = k8sNodeIds.has(n.id);
         const k8sBadge = hasK8s ? ' ⎈ k8s' : '';
         const label = `${n.hostname} (${n.address})${self}${k8sBadge}${status}`;
         return `<option value="${n.id}" data-k8s="${hasK8s}" ${n.is_self ? 'selected' : ''}>${escapeHtml(label)}</option>`;
