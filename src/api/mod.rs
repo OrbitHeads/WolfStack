@@ -9100,7 +9100,15 @@ pub async fn k8s_deploy_app(req: HttpRequest, state: web::Data<AppState>, path: 
                     .trim_matches('-')
                     .to_string();
                 match crate::kubernetes::allocate_wolfnet_route(&cluster.id, &svc_name, &body.namespace) {
-                    Ok(route) => wolfnet_ip = Some(route.wolfnet_ip),
+                    Ok(route) => {
+                        // Push route to all cluster nodes immediately
+                        let wn_status = crate::networking::get_wolfnet_status();
+                        if let Some(ref local_ip) = wn_status.ip {
+                            let gateway = local_ip.split('/').next().unwrap_or(local_ip);
+                            push_wolfnet_route_to_cluster(&route.wolfnet_ip, gateway, &state).await;
+                        }
+                        wolfnet_ip = Some(route.wolfnet_ip);
+                    },
                     Err(e) => tracing::warn!("Auto WolfNet route allocation failed: {}", e),
                 }
             }
@@ -9759,6 +9767,45 @@ pub async fn k8s_uninstall(req: HttpRequest, state: web::Data<AppState>, body: w
     }))
 }
 
+/// Push a WolfNet route to all other WolfStack nodes in the cluster.
+/// This ensures K8s WolfNet IPs are immediately reachable from all nodes
+/// without waiting for the next polling cycle.
+async fn push_wolfnet_route_to_cluster(wolfnet_ip: &str, gateway_ip: &str, state: &web::Data<AppState>) {
+    let nodes = state.cluster.get_all_nodes();
+    let secret = state.cluster_secret.clone();
+    let route_body = serde_json::json!({
+        "routes": { wolfnet_ip: gateway_ip }
+    });
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap_or_default();
+
+    for node in &nodes {
+        if node.is_self || node.node_type != "wolfstack" {
+            continue;
+        }
+        let urls = build_node_urls(&node.address, node.port, "/api/agent/wolfnet-routes");
+        let client = client.clone();
+        let secret = secret.clone();
+        let body = route_body.clone();
+        tokio::spawn(async move {
+            for url in &urls {
+                if let Ok(resp) = client.post(url)
+                    .header("X-WolfStack-Secret", &secret)
+                    .json(&body)
+                    .send()
+                    .await
+                {
+                    if resp.status().is_success() { break; }
+                }
+            }
+        });
+    }
+}
+
 /// POST /api/kubernetes/clusters/{id}/wolfnet — allocate a WolfNet IP route for a deployment
 #[derive(Deserialize)]
 pub struct K8sWolfNetRouteRequest {
@@ -9771,10 +9818,18 @@ pub async fn k8s_deploy_wolfnet(req: HttpRequest, state: web::Data<AppState>, pa
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let id = path.into_inner();
     match crate::kubernetes::allocate_wolfnet_route(&id, &body.deployment_name, &body.namespace) {
-        Ok(route) => HttpResponse::Ok().json(serde_json::json!({
-            "message": format!("Allocated WolfNet IP {} for {}", route.wolfnet_ip, route.deployment_name),
-            "route": route,
-        })),
+        Ok(route) => {
+            // Push route to all cluster nodes immediately
+            let wn_status = crate::networking::get_wolfnet_status();
+            if let Some(ref local_ip) = wn_status.ip {
+                let gateway = local_ip.split('/').next().unwrap_or(local_ip);
+                push_wolfnet_route_to_cluster(&route.wolfnet_ip, gateway, &state).await;
+            }
+            HttpResponse::Ok().json(serde_json::json!({
+                "message": format!("Allocated WolfNet IP {} for {}", route.wolfnet_ip, route.deployment_name),
+                "route": route,
+            }))
+        },
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
     }
 }
