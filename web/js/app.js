@@ -22209,7 +22209,8 @@ function k8sStartProvisionTerminal(index, session, agentNodeIds) {
 
 async function k8sRegisterAndStartAgents(agentNodeIds) {
     const meta = k8sProvisionMeta;
-    if (!meta) return;
+    if (!meta) { console.error('k8sRegisterAndStartAgents: no meta!'); return; }
+    console.log('k8sRegisterAndStartAgents called, agents:', agentNodeIds, 'meta:', JSON.stringify(meta, null, 2));
 
     // Register the cluster first
     const statusEl = document.getElementById('k8s-provision-status');
@@ -22502,7 +22503,7 @@ function showK8sUninstallModal(clusterType, name) {
     overlay.className = 'modal-overlay active';
     overlay.onclick = e => { if (e.target === overlay) closeModal(); };
     overlay.innerHTML = `
-        <div class="modal" style="max-width:480px;">
+        <div class="modal" style="max-width:560px;">
             <div class="modal-header" style="background:linear-gradient(135deg, rgba(239,68,68,0.12), rgba(239,68,68,0.04));">
                 <div style="display:flex; align-items:center; gap:12px;">
                     <div style="width:40px; height:40px; background:linear-gradient(135deg,#ef4444,#f87171); border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:20px; color:#fff;">&#9888;</div>
@@ -22513,23 +22514,32 @@ function showK8sUninstallModal(clusterType, name) {
                 </div>
                 <button class="modal-close" onclick="closeModal()">&times;</button>
             </div>
-            <div class="modal-body" style="padding:24px;">
-                <div style="background:rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.25); border-radius:8px; padding:16px; margin-bottom:20px;">
-                    <p style="margin:0 0 8px 0; font-size:13px; color:var(--text-primary); font-weight:600;">This will completely remove <strong>${escapeHtml(clusterType)}</strong> from this node:</p>
-                    <ul style="margin:0; padding-left:20px; font-size:12px; color:var(--text-secondary); line-height:1.8;">
-                        <li>Stop and disable all ${escapeHtml(clusterType)} services</li>
-                        <li>Remove binaries, configuration, and data</li>
-                        <li>Remove kubeconfig files</li>
-                    </ul>
+            <div id="k8s-uninstall-confirm-area">
+                <div class="modal-body" style="padding:24px;">
+                    <div style="background:rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.25); border-radius:8px; padding:16px; margin-bottom:20px;">
+                        <p style="margin:0 0 8px 0; font-size:13px; color:var(--text-primary); font-weight:600;">This will completely remove <strong>${escapeHtml(clusterType)}</strong> from this node:</p>
+                        <ul style="margin:0; padding-left:20px; font-size:12px; color:var(--text-secondary); line-height:1.8;">
+                            <li>Stop and disable all ${escapeHtml(clusterType)} services</li>
+                            <li>Remove binaries, configuration, and data</li>
+                            <li>Remove kubeconfig files</li>
+                        </ul>
+                    </div>
+                    <label style="display:block; font-size:13px; color:var(--text-secondary); margin-bottom:8px;">Type <strong>YES</strong> to confirm:</label>
+                    <input type="text" id="k8s-uninstall-confirm" autocomplete="off" spellcheck="false"
+                        style="width:100%; padding:10px 12px; border-radius:8px; border:1px solid var(--border-color); background:var(--bg-secondary); color:var(--text-primary); font-size:14px; font-family:monospace; letter-spacing:2px; text-align:center;"
+                        placeholder="YES" />
                 </div>
-                <label style="display:block; font-size:13px; color:var(--text-secondary); margin-bottom:8px;">Type <strong>YES</strong> to confirm:</label>
-                <input type="text" id="k8s-uninstall-confirm" autocomplete="off" spellcheck="false"
-                    style="width:100%; padding:10px 12px; border-radius:8px; border:1px solid var(--border-color); background:var(--bg-secondary); color:var(--text-primary); font-size:14px; font-family:monospace; letter-spacing:2px; text-align:center;"
-                    placeholder="YES" />
+                <div class="modal-footer" style="display:flex; justify-content:flex-end; gap:10px; padding:16px 24px;">
+                    <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                    <button class="btn btn-danger" id="k8s-uninstall-btn" onclick="k8sDoUninstall('${escapeHtml(clusterType)}', '${escapeHtml(name)}')" disabled style="opacity:0.5;">Uninstall</button>
+                </div>
             </div>
-            <div class="modal-footer" style="display:flex; justify-content:flex-end; gap:10px; padding:16px 24px;">
-                <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-                <button class="btn btn-danger" id="k8s-uninstall-btn" onclick="k8sDoUninstall('${escapeHtml(clusterType)}', '${escapeHtml(name)}')" disabled style="opacity:0.5;">Uninstall</button>
+            <div id="k8s-uninstall-terminal-area" style="display:none;">
+                <div id="k8s-uninstall-term" style="height:350px; background:#0a0a0a;"></div>
+                <div class="modal-footer" style="display:flex; justify-content:flex-end; gap:10px; padding:12px 24px;">
+                    <span id="k8s-uninstall-status" style="font-size:12px; color:#eab308; font-weight:600; margin-right:auto;">Uninstalling...</span>
+                    <button class="btn btn-secondary" id="k8s-uninstall-close-btn" onclick="k8sUninstallDone()" disabled style="opacity:0.5; font-size:12px;">Close</button>
+                </div>
             </div>
         </div>`;
     document.body.appendChild(overlay);
@@ -22543,9 +22553,11 @@ function showK8sUninstallModal(clusterType, name) {
     input.focus();
 }
 
+let k8sUninstallTerm = null;
+
 async function k8sDoUninstall(clusterType, name) {
     const btn = document.getElementById('k8s-uninstall-btn');
-    if (btn) { btn.disabled = true; btn.textContent = 'Uninstalling...'; }
+    if (btn) { btn.disabled = true; btn.textContent = 'Preparing...'; }
 
     try {
         const resp = await fetch(apiUrl('/api/kubernetes/uninstall'), {
@@ -22555,13 +22567,64 @@ async function k8sDoUninstall(clusterType, name) {
         });
         const data = await resp.json().catch(() => ({}));
         if (!resp.ok) throw new Error(data.error || 'Uninstall failed');
-        closeModal();
-        showToast(data.message || `${name} uninstalled successfully`, 'success');
-        loadNodeWolfKube();
+
+        // Switch to terminal view
+        document.getElementById('k8s-uninstall-confirm-area').style.display = 'none';
+        document.getElementById('k8s-uninstall-terminal-area').style.display = 'block';
+
+        const container = document.getElementById('k8s-uninstall-term');
+        const term = new Terminal({
+            cursorBlink: true, fontSize: 13,
+            fontFamily: '"JetBrains Mono", "Fira Code", "Cascadia Code", "Courier New", monospace',
+            theme: { background: '#0a0a0a', foreground: '#f0f0f0', cursor: '#ef4444', selectionBackground: 'rgba(239, 68, 68, 0.3)' },
+            scrollback: 5000,
+        });
+        const fitAddon = new FitAddon.FitAddon();
+        term.loadAddon(fitAddon);
+        term.open(container);
+        setTimeout(() => { try { fitAddon.fit(); } catch(e) {} }, 100);
+        k8sUninstallTerm = term;
+
+        // Connect WebSocket — the session_id maps to a k8s-provision type console
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const node = allNodes.find(n => n.id === currentNodeId);
+        const isRemote = node && !node.is_self;
+        let wsUrl;
+        if (isRemote) {
+            wsUrl = `${protocol}//${window.location.host}/ws/remote-console/${encodeURIComponent(currentNodeId)}/k8s-provision/${encodeURIComponent(data.session_id)}`;
+        } else {
+            wsUrl = `${protocol}//${window.location.host}/ws/console/k8s-provision/${encodeURIComponent(data.session_id)}`;
+        }
+
+        const ws = new WebSocket(wsUrl);
+        ws.binaryType = 'arraybuffer';
+        ws.onmessage = (event) => {
+            if (typeof event.data === 'string') term.write(event.data);
+            else term.write(new Uint8Array(event.data));
+        };
+        ws.onclose = () => {
+            const statusEl = document.getElementById('k8s-uninstall-status');
+            if (statusEl) { statusEl.textContent = 'Uninstall complete'; statusEl.style.color = '#10b981'; }
+            const closeBtn = document.getElementById('k8s-uninstall-close-btn');
+            if (closeBtn) { closeBtn.disabled = false; closeBtn.style.opacity = '1'; }
+        };
+        ws.onerror = () => {
+            const statusEl = document.getElementById('k8s-uninstall-status');
+            if (statusEl) { statusEl.textContent = 'Connection error'; statusEl.style.color = '#ef4444'; }
+            const closeBtn = document.getElementById('k8s-uninstall-close-btn');
+            if (closeBtn) { closeBtn.disabled = false; closeBtn.style.opacity = '1'; }
+        };
+        term.onData(d => { if (ws.readyState === WebSocket.OPEN) ws.send(d); });
     } catch (e) {
         closeModal();
         showToast('Uninstall failed: ' + e.message, 'error');
     }
+}
+
+function k8sUninstallDone() {
+    if (k8sUninstallTerm) { try { k8sUninstallTerm.dispose(); } catch(e) {} k8sUninstallTerm = null; }
+    closeModal();
+    loadNodeWolfKube();
 }
 
 // ─── WolfNet Integration ───
