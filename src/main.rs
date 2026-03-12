@@ -76,6 +76,9 @@ struct Cli {
 }
 
 /// Serve the login page for unauthenticated requests to /
+/// Version string used as cache-buster for static assets.
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 async fn index_handler(req: HttpRequest, state: web::Data<api::AppState>) -> HttpResponse {
     // Check if authenticated
     let authenticated = req.cookie("wolfstack_session")
@@ -86,7 +89,17 @@ async fn index_handler(req: HttpRequest, state: web::Data<api::AppState>) -> Htt
     if authenticated {
         let path = format!("{}/index.html", web_dir);
         match std::fs::read_to_string(&path) {
-            Ok(content) => HttpResponse::Ok().content_type("text/html").body(content),
+            Ok(content) => {
+                // Inject cache-busting version into asset URLs so browsers
+                // fetch fresh JS/CSS after an upgrade without Ctrl+Shift+R.
+                let content = content
+                    .replace("/css/style.css\"", &format!("/css/style.css?v={}\"", APP_VERSION))
+                    .replace("/js/app.js\"", &format!("/js/app.js?v={}\"", APP_VERSION));
+                HttpResponse::Ok()
+                    .content_type("text/html")
+                    .insert_header(("Cache-Control", "no-cache"))
+                    .body(content)
+            }
             Err(_) => HttpResponse::InternalServerError().body("Web UI not found"),
         }
     } else {

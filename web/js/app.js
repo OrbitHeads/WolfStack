@@ -587,6 +587,7 @@ function selectServerView(nodeId, view) {
         'syslogs': 'System Logs',
         'security': 'Security',
         'ceph': 'Ceph',
+        'wolfkube': 'WolfKube',
     };
     document.getElementById('page-title').textContent = `${hostname} — ${viewTitles[view] || view}`;
     document.getElementById('hostname-display').textContent = `${hostname} (${node?.address}:${node?.port})`;
@@ -607,7 +608,7 @@ function selectServerView(nodeId, view) {
 
     // Load data for the view
     // Show a modern loading overlay for views that fetch data asynchronously
-    const asyncViews = ['components', 'services', 'containers', 'lxc', 'vms', 'storage', 'networking', 'backups', 'wolfnet', 'certificates', 'cron', 'pve-resources', 'mysql-editor', 'security', 'ceph'];
+    const asyncViews = ['components', 'services', 'containers', 'lxc', 'vms', 'storage', 'networking', 'backups', 'wolfnet', 'certificates', 'cron', 'pve-resources', 'mysql-editor', 'security', 'ceph', 'wolfkube'];
     if (asyncViews.includes(view) && el) {
         // Clear table bodies to prevent stale data showing
         el.querySelectorAll('tbody').forEach(tb => { tb.innerHTML = ''; });
@@ -669,6 +670,7 @@ function selectServerView(nodeId, view) {
     if (view === 'mysql-editor') { loadMySQLEditor(); hidePageLoadingOverlay(el); }
     if (view === 'security') loadNodeSecurity().finally(() => hidePageLoadingOverlay(el));
     if (view === 'ceph') loadCephStatus().finally(() => hidePageLoadingOverlay(el));
+    if (view === 'wolfkube') loadNodeWolfKube().finally(() => hidePageLoadingOverlay(el));
 }
 
 // ─── Server Tree ───
@@ -830,6 +832,9 @@ function buildServerTree(nodes) {
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="mysql-editor" onclick="selectServerView('${node.id}', 'mysql-editor')">
                             <span class="icon">🗄️</span> MariaDB/MySQL
+                        </a>
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="wolfkube" onclick="selectServerView('${node.id}', 'wolfkube')">
+                            <span class="icon">&#9784;</span> WolfKube
                         </a>
                     </div>
                 </div>`;
@@ -22065,40 +22070,42 @@ async function k8sProvision() {
 }
 
 function renderK8sProvisionConsole(meta, agentNodeIds) {
-    const el = document.getElementById('kubernetes-content');
-    if (!el) return;
+    // Remove any existing provision overlay
+    document.getElementById('k8s-provision-overlay')?.remove();
 
     const totalNodes = 1 + agentNodeIds.length;
     const gridCols = totalNodes <= 1 ? '1fr' : totalNodes === 2 ? '1fr 1fr' : 'repeat(auto-fit, minmax(400px, 1fr))';
 
+    const overlay = document.createElement('div');
+    overlay.id = 'k8s-provision-overlay';
+    overlay.style.cssText = 'position:fixed; inset:0; z-index:9999; background:var(--bg-primary, #0f1117); display:flex; flex-direction:column;';
+
     let html = `
-    <div class="card" style="margin-bottom:16px; background:linear-gradient(135deg, rgba(50,108,229,0.12), rgba(50,108,229,0.04)); border-color:rgba(50,108,229,0.25);">
-        <div class="card-body" style="display:flex; align-items:center; justify-content:space-between; padding:16px 24px;">
-            <div style="display:flex; align-items:center; gap:12px;">
-                <div style="width:40px; height:40px; background:linear-gradient(135deg,#326ce5,#54a3ff); border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:20px;">&#9784;</div>
-                <div>
-                    <h3 style="margin:0; font-size:16px; font-weight:700;">Provisioning: ${escapeHtml(meta.cluster_name)}</h3>
-                    <p style="color:var(--text-muted); font-size:12px; margin:2px 0 0 0;">${escapeHtml(meta.distribution)} cluster &mdash; ${totalNodes} node${totalNodes > 1 ? 's' : ''}</p>
-                </div>
-            </div>
-            <div style="display:flex; gap:8px; align-items:center;">
-                <span id="k8s-provision-status" style="font-size:12px; color:#eab308; font-weight:600;">Installing server...</span>
-                <button class="btn btn-sm btn-secondary" onclick="k8sProvisionDone()" style="font-size:11px;">Close</button>
+    <div style="padding:12px 24px; background:linear-gradient(135deg, rgba(50,108,229,0.15), rgba(50,108,229,0.05)); border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; flex-shrink:0;">
+        <div style="display:flex; align-items:center; gap:12px;">
+            <div style="width:36px; height:36px; background:linear-gradient(135deg,#326ce5,#54a3ff); border-radius:8px; display:flex; align-items:center; justify-content:center; font-size:18px;">&#9784;</div>
+            <div>
+                <h3 style="margin:0; font-size:15px; font-weight:700;">Provisioning: ${escapeHtml(meta.cluster_name)}</h3>
+                <p style="color:var(--text-muted); font-size:11px; margin:2px 0 0 0;">${escapeHtml(meta.distribution)} cluster &mdash; ${totalNodes} node${totalNodes > 1 ? 's' : ''}</p>
             </div>
         </div>
+        <div style="display:flex; gap:8px; align-items:center;">
+            <span id="k8s-provision-status" style="font-size:12px; color:#eab308; font-weight:600;">Installing server...</span>
+            <button class="btn btn-sm btn-secondary" onclick="k8sProvisionDone()" style="font-size:11px;">Close</button>
+        </div>
     </div>
-    <div style="display:grid; grid-template-columns:${gridCols}; gap:12px; height:calc(100vh - 200px); min-height:400px;">`;
+    <div style="flex:1; padding:12px; display:grid; grid-template-columns:${gridCols}; gap:12px; min-height:0; overflow:hidden;">`;
 
     // Server terminal panel
     const serverSession = meta.sessions[0];
     html += `
-        <div class="card" style="display:flex; flex-direction:column; overflow:hidden;">
-            <div style="padding:8px 12px; background:rgba(50,108,229,0.08); border-bottom:1px solid var(--border); display:flex; align-items:center; gap:8px;">
+        <div class="card" style="display:flex; flex-direction:column; overflow:hidden; margin:0;">
+            <div style="padding:8px 12px; background:rgba(50,108,229,0.08); border-bottom:1px solid var(--border); display:flex; align-items:center; gap:8px; flex-shrink:0;">
                 <span style="width:8px; height:8px; border-radius:50%; background:#eab308;" id="k8s-term-dot-0"></span>
                 <span style="font-weight:600; font-size:12px;">Server: ${escapeHtml(serverSession.hostname)}</span>
                 <span style="font-size:10px; color:var(--text-muted); margin-left:auto;">${escapeHtml(meta.distribution)}</span>
             </div>
-            <div id="k8s-term-0" style="flex:1; background:#0a0a0a;"></div>
+            <div id="k8s-term-0" style="flex:1; background:#0a0a0a; min-height:0;"></div>
         </div>`;
 
     // Agent terminal panels (initially showing "waiting")
@@ -22106,20 +22113,21 @@ function renderK8sProvisionConsole(meta, agentNodeIds) {
         const agentNode = allNodes.find(n => n.id === agentNodeIds[i]);
         const hostname = agentNode ? agentNode.hostname : agentNodeIds[i];
         html += `
-        <div class="card" style="display:flex; flex-direction:column; overflow:hidden;">
-            <div style="padding:8px 12px; background:rgba(50,108,229,0.08); border-bottom:1px solid var(--border); display:flex; align-items:center; gap:8px;">
+        <div class="card" style="display:flex; flex-direction:column; overflow:hidden; margin:0;">
+            <div style="padding:8px 12px; background:rgba(50,108,229,0.08); border-bottom:1px solid var(--border); display:flex; align-items:center; gap:8px; flex-shrink:0;">
                 <span style="width:8px; height:8px; border-radius:50%; background:#6b7280;" id="k8s-term-dot-${i + 1}"></span>
                 <span style="font-weight:600; font-size:12px;">Worker: ${escapeHtml(hostname)}</span>
                 <span style="font-size:10px; color:var(--text-muted); margin-left:auto;">agent ${i + 1}</span>
             </div>
-            <div id="k8s-term-${i + 1}" style="flex:1; background:#0a0a0a; display:flex; align-items:center; justify-content:center;">
+            <div id="k8s-term-${i + 1}" style="flex:1; background:#0a0a0a; min-height:0; display:flex; align-items:center; justify-content:center;">
                 <span style="color:#6b7280; font-size:13px;" id="k8s-term-waiting-${i + 1}">Waiting for server to finish...</span>
             </div>
         </div>`;
     }
 
     html += `</div>`;
-    el.innerHTML = html;
+    overlay.innerHTML = html;
+    document.body.appendChild(overlay);
 
     // Start server terminal
     k8sProvisionTerminals = [];
@@ -22203,15 +22211,42 @@ async function k8sRegisterAndStartAgents(agentNodeIds) {
     if (statusEl) statusEl.textContent = 'Registering cluster...';
 
     try {
-        await fetch('/api/kubernetes/clusters', {
+        let registrationBody;
+        const serverSession = meta.sessions[0];
+
+        if (serverSession.is_remote) {
+            // Fetch kubeconfig from the remote server node
+            try {
+                const kcResp = await fetch(`/api/nodes/${serverSession.node_id}/proxy/kubernetes/kubeconfig`);
+                if (kcResp.ok) {
+                    const kcData = await kcResp.json();
+                    let kubeconfig = kcData.kubeconfig || '';
+                    // Fix localhost references to actual server address
+                    kubeconfig = kubeconfig.replace(/127\.0\.0\.1/g, meta.server_address);
+                    kubeconfig = kubeconfig.replace(/localhost/g, meta.server_address);
+                    registrationBody = { name: meta.cluster_name, kubeconfig, cluster_type: meta.cluster_type };
+                } else {
+                    registrationBody = { name: meta.cluster_name, kubeconfig_path: meta.kubeconfig_path, cluster_type: meta.cluster_type };
+                }
+            } catch (e) {
+                registrationBody = { name: meta.cluster_name, kubeconfig_path: meta.kubeconfig_path, cluster_type: meta.cluster_type };
+            }
+        } else {
+            registrationBody = { name: meta.cluster_name, kubeconfig_path: meta.kubeconfig_path, cluster_type: meta.cluster_type };
+        }
+
+        const regResp = await fetch('/api/kubernetes/clusters', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                name: meta.cluster_name,
-                kubeconfig_path: meta.kubeconfig_path,
-                cluster_type: meta.cluster_type,
-            }),
+            body: JSON.stringify(registrationBody),
         });
+        if (regResp.ok) {
+            const regData = await regResp.json();
+            // Update kubeconfig_path to the locally-saved path for agent provisioning
+            if (regData.cluster?.kubeconfig_path) {
+                meta.kubeconfig_path = regData.cluster.kubeconfig_path;
+            }
+        }
     } catch (e) { /* will register on refresh anyway */ }
 
     if (agentNodeIds.length === 0) {
@@ -22274,6 +22309,7 @@ function k8sProvisionDone() {
     k8sProvisionTerminals = [];
     k8sProvisionMeta = null;
     k8sAgentsDoneCount = 0;
+    document.getElementById('k8s-provision-overlay')?.remove();
     loadKubernetesClusters();
 }
 
@@ -22329,6 +22365,103 @@ async function k8sImportCluster() {
         showToast(data.message || 'Cluster imported!', 'success');
         loadKubernetesClusters();
     } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+}
+
+// ─── Per-Node WolfKube Page ───
+
+async function loadNodeWolfKube() {
+    const el = document.getElementById('wolfkube-node-content');
+    if (!el) return;
+
+    const node = allNodes.find(n => n.id === currentNodeId);
+    const hostname = node ? node.hostname : currentNodeId;
+
+    let detected = [];
+    let clusters = [];
+
+    try {
+        const [detectResp, clustersResp] = await Promise.all([
+            fetch(apiUrl('/api/kubernetes/detect')),
+            fetch('/api/kubernetes/clusters'),
+        ]);
+        if (detectResp.ok) detected = await detectResp.json();
+        if (clustersResp.ok) clusters = await clustersResp.json();
+    } catch (e) {}
+
+    let html = `
+    <div class="card" style="margin-bottom:20px; background:linear-gradient(135deg, rgba(50,108,229,0.12), rgba(50,108,229,0.04)); border-color:rgba(50,108,229,0.25);">
+        <div class="card-body" style="display:flex; align-items:center; justify-content:space-between; padding:20px 24px;">
+            <div style="display:flex; align-items:center; gap:16px;">
+                <div style="width:48px; height:48px; background:linear-gradient(135deg,#326ce5,#54a3ff); border-radius:12px; display:flex; align-items:center; justify-content:center; font-size:24px;">&#9784;</div>
+                <div>
+                    <h3 style="margin:0; font-size:18px; font-weight:700;">WolfKube on ${escapeHtml(hostname)}</h3>
+                    <p style="color:var(--text-secondary); font-size:12px; margin:2px 0 0 0;">Kubernetes installations and cluster membership for this node.</p>
+                </div>
+            </div>
+        </div>
+    </div>`;
+
+    // Detected local installations
+    if (detected.length > 0) {
+        html += `<div class="card" style="margin-bottom:16px;">
+            <div class="card-header"><h3>Detected Installations</h3></div>
+            <div class="card-body" style="padding:0;">
+                <table class="data-table">
+                    <thead><tr><th>Name</th><th>Type</th><th>Kubeconfig</th><th>Actions</th></tr></thead>
+                    <tbody>`;
+        for (const d of detected) {
+            const alreadyImported = clusters.some(c => c.kubeconfig_path === d.kubeconfig_path);
+            html += `<tr>
+                <td style="font-weight:600;">${escapeHtml(d.name)}</td>
+                <td><span style="padding:2px 8px;border-radius:6px;font-size:11px;background:rgba(50,108,229,0.12);color:#326ce5;border:1px solid rgba(50,108,229,0.3);">${escapeHtml(d.cluster_type)}</span></td>
+                <td style="font-family:monospace; font-size:12px;">${escapeHtml(d.kubeconfig_path)}</td>
+                <td>${alreadyImported
+                    ? '<span style="color:var(--text-muted); font-size:12px;">Already imported</span>'
+                    : `<button class="btn btn-sm btn-primary" onclick="k8sImportDetected('${escapeHtml(d.name)}', '${escapeHtml(d.kubeconfig_path)}', '${escapeHtml(d.cluster_type)}')" style="background:#326ce5; border-color:#326ce5; font-size:11px;">Import</button>`
+                }</td>
+            </tr>`;
+        }
+        html += `</tbody></table></div></div>`;
+    }
+
+    // Registered clusters (from the datacenter-level list)
+    if (clusters.length > 0) {
+        html += `<div class="card" style="margin-bottom:16px;">
+            <div class="card-header"><h3>Registered Clusters</h3></div>
+            <div class="card-body" style="padding:0;">
+                <table class="data-table">
+                    <thead><tr><th>Cluster</th><th>Type</th><th>API URL</th><th>Nodes</th><th>Status</th></tr></thead>
+                    <tbody>`;
+        for (const c of clusters) {
+            const nodeCount = c.status?.nodes?.length || '—';
+            const ready = c.status?.nodes?.filter(n => n.ready).length || 0;
+            const statusBadge = c.status?.error
+                ? `<span style="color:#ef4444; font-size:12px;">${escapeHtml(c.status.error)}</span>`
+                : `<span style="color:#10b981; font-size:12px; font-weight:600;">${ready}/${nodeCount} ready</span>`;
+            html += `<tr>
+                <td style="font-weight:600;">${escapeHtml(c.name)}</td>
+                <td><span style="padding:2px 8px;border-radius:6px;font-size:11px;background:rgba(50,108,229,0.12);color:#326ce5;border:1px solid rgba(50,108,229,0.3);">${escapeHtml(c.cluster_type || 'k8s')}</span></td>
+                <td style="font-family:monospace; font-size:12px;">${escapeHtml(c.api_url || '—')}</td>
+                <td>${nodeCount}</td>
+                <td>${statusBadge}</td>
+            </tr>`;
+        }
+        html += `</tbody></table></div></div>`;
+    }
+
+    if (detected.length === 0 && clusters.length === 0) {
+        html += `
+        <div class="card">
+            <div class="card-body" style="padding:40px; text-align:center;">
+                <div style="font-size:48px; margin-bottom:16px; opacity:0.3;">&#9784;</div>
+                <h3 style="color:var(--text-secondary); margin-bottom:8px;">No Kubernetes Found</h3>
+                <p style="color:var(--text-muted); font-size:13px; margin-bottom:20px;">No Kubernetes installations were detected on this node.</p>
+                <p style="color:var(--text-muted); font-size:12px;">Use the cluster-level <strong>WolfKube</strong> page to provision a new cluster.</p>
+            </div>
+        </div>`;
+    }
+
+    el.innerHTML = html;
 }
 
 // ─── WolfNet Integration ───
