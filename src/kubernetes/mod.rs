@@ -1508,8 +1508,8 @@ pub fn allocate_wolfnet_route(cluster_id: &str, deployment_name: &str, namespace
     // Enable forwarding so DNAT packets can be routed
     let _ = Command::new("sysctl").args(["-w", "net.ipv4.ip_forward=1"]).output();
 
-    // Set up iptables DNAT rules to forward to the k8s node
-    apply_dnat_rules(&wolfnet_ip, &target_node_ip, &port_mappings);
+    // Set up iptables rules via k3s KUBE-SVC chains (not PREROUTING DNAT)
+    apply_kube_svc_rules(&wolfnet_ip, &kubeconfig, deployment_name, namespace, &port_mappings);
 
     // Register route in WolfNet so other peers can reach this IP
     let wn_status = crate::networking::get_wolfnet_status();
@@ -1559,56 +1559,142 @@ fn find_k8s_node_ip(kubeconfig: &str) -> Option<String> {
     })
 }
 
-/// Apply iptables DNAT + MASQUERADE rules for a k8s WolfNet route.
-fn apply_dnat_rules(wolfnet_ip: &str, target_node_ip: &str, port_mappings: &[K8sWolfNetPortMap]) {
+/// Get the ClusterIP of a Kubernetes service.
+fn get_service_cluster_ip(kubeconfig: &str, name: &str, namespace: &str) -> Option<String> {
+    let output = kubectl(kubeconfig, &["get", "service", name, "-n", namespace,
+                         "-o", "jsonpath={.spec.clusterIP}"]).ok()?;
+    let ip = output.trim().to_string();
+    if ip.is_empty() || ip == "None" { None } else { Some(ip) }
+}
+
+/// Find the KUBE-SVC chain name for a given ClusterIP, port, and protocol
+/// by parsing `iptables -t nat -S KUBE-SERVICES`.
+fn find_kube_svc_chain(cluster_ip: &str, service_port: u16, protocol: &str) -> Option<String> {
+    let output = Command::new("iptables")
+        .args(["-t", "nat", "-S", "KUBE-SERVICES"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let proto = protocol.to_lowercase();
+    let dest = format!("{}/32", cluster_ip);
+    let dport_str = format!("--dport {}", service_port);
+
+    for line in stdout.lines() {
+        if line.contains(&dest) && line.contains(&dport_str) && line.contains(&format!("-p {}", proto)) {
+            if let Some(pos) = line.find("-j KUBE-SVC-") {
+                let chain = line[pos + 3..].split_whitespace().next()?;
+                return Some(chain.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Apply iptables rules to route WolfNet IP traffic through k3s KUBE-SVC chains.
+/// Instead of PREROUTING DNAT (which conflicts with k3s's own NAT rules),
+/// we insert rules in the KUBE-SERVICES chain that jump directly to the
+/// service's KUBE-SVC-* chain, letting k3s handle pod routing natively.
+fn apply_kube_svc_rules(wolfnet_ip: &str, kubeconfig: &str, service_name: &str,
+                        namespace: &str, port_mappings: &[K8sWolfNetPortMap]) {
+    let cluster_ip = match get_service_cluster_ip(kubeconfig, service_name, namespace) {
+        Some(ip) => ip,
+        None => {
+            warn!("Could not find ClusterIP for service {}/{} — KUBE-SVC rules not applied", namespace, service_name);
+            return;
+        }
+    };
+
     for pm in port_mappings {
         let proto = pm.protocol.to_lowercase();
-        // DNAT: rewrite destination to k8s node IP:NodePort
-        let _ = Command::new("iptables")
-            .args(["-t", "nat", "-A", "PREROUTING",
-                   "-d", wolfnet_ip,
-                   "-p", &proto,
-                   "--dport", &pm.service_port.to_string(),
-                   "-j", "DNAT", "--to-destination",
-                   &format!("{}:{}", target_node_ip, pm.node_port)])
-            .output();
-        // MASQUERADE: ensure return traffic comes back through this node
-        let _ = Command::new("iptables")
-            .args(["-t", "nat", "-A", "POSTROUTING",
-                   "-d", target_node_ip,
-                   "-p", &proto,
-                   "--dport", &pm.node_port.to_string(),
-                   "-j", "MASQUERADE"])
-            .output();
+        let chain = match find_kube_svc_chain(&cluster_ip, pm.service_port, &proto) {
+            Some(c) => c,
+            None => {
+                warn!("Could not find KUBE-SVC chain for {}:{}/{} — skipping", cluster_ip, pm.service_port, proto);
+                continue;
+            }
+        };
+
+        let wolfnet_cidr = format!("{}/32", wolfnet_ip);
+        let sport = pm.service_port.to_string();
+
+        // Check if our KUBE-SVC jump rule already exists
+        let svc_exists = Command::new("iptables")
+            .args(["-t", "nat", "-C", "KUBE-SERVICES",
+                   "-d", &wolfnet_cidr, "-p", &proto,
+                   "-m", "comment", "--comment", "wolfstack-wolfnet",
+                   "--dport", &sport,
+                   "-j", &chain])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if !svc_exists {
+            // Insert KUBE-SVC jump rule (goes to position 1)
+            let _ = Command::new("iptables")
+                .args(["-t", "nat", "-I", "KUBE-SERVICES",
+                       "-d", &wolfnet_cidr, "-p", &proto,
+                       "-m", "comment", "--comment", "wolfstack-wolfnet",
+                       "--dport", &sport,
+                       "-j", &chain])
+                .output();
+            // Insert KUBE-MARK-MASQ rule before it (goes to position 1, pushing SVC to position 2)
+            // This ensures return traffic from pods gets masqueraded back through the node
+            let _ = Command::new("iptables")
+                .args(["-t", "nat", "-I", "KUBE-SERVICES",
+                       "-d", &wolfnet_cidr, "-p", &proto,
+                       "-m", "comment", "--comment", "wolfstack-wolfnet",
+                       "--dport", &sport,
+                       "-j", "KUBE-MARK-MASQ"])
+                .output();
+            info!("Added KUBE-SERVICES rules: {} → {} for port {}/{}", wolfnet_ip, chain, pm.service_port, proto);
+        }
     }
 }
 
-/// Remove iptables DNAT + MASQUERADE rules for a k8s WolfNet route.
-fn remove_dnat_rules(wolfnet_ip: &str, target_node_ip: &str, port_mappings: &[K8sWolfNetPortMap]) {
+/// Remove iptables KUBE-SERVICES rules for a k8s WolfNet route.
+/// Also cleans up any legacy PREROUTING DNAT + MASQUERADE rules from older versions.
+fn remove_kube_svc_rules(wolfnet_ip: &str, target_node_ip: &str, port_mappings: &[K8sWolfNetPortMap]) {
+    // Remove our rules from KUBE-SERVICES by scanning for wolfnet_ip
+    if let Ok(output) = Command::new("iptables")
+        .args(["-t", "nat", "-S", "KUBE-SERVICES"])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let dest = format!("{}/32", wolfnet_ip);
+        for line in stdout.lines() {
+            if line.contains(&dest) && line.starts_with("-A KUBE-SERVICES") {
+                // Convert "-A KUBE-SERVICES ..." to delete args
+                let delete_rule = line.replacen("-A ", "", 1);
+                let parts: Vec<&str> = delete_rule.split_whitespace().collect();
+                let _ = Command::new("iptables")
+                    .args(["-t", "nat", "-D"])
+                    .args(&parts)
+                    .output();
+            }
+        }
+    }
+
+    // Clean up legacy PREROUTING DNAT + MASQUERADE rules from older WolfStack versions
     for pm in port_mappings {
         let proto = pm.protocol.to_lowercase();
         if !target_node_ip.is_empty() {
             let _ = Command::new("iptables")
                 .args(["-t", "nat", "-D", "PREROUTING",
-                       "-d", wolfnet_ip,
-                       "-p", &proto,
+                       "-d", wolfnet_ip, "-p", &proto,
                        "--dport", &pm.service_port.to_string(),
                        "-j", "DNAT", "--to-destination",
                        &format!("{}:{}", target_node_ip, pm.node_port)])
                 .output();
             let _ = Command::new("iptables")
                 .args(["-t", "nat", "-D", "POSTROUTING",
-                       "-d", target_node_ip,
-                       "-p", &proto,
+                       "-d", target_node_ip, "-p", &proto,
                        "--dport", &pm.node_port.to_string(),
                        "-j", "MASQUERADE"])
                 .output();
         } else {
-            // Legacy REDIRECT cleanup
             let _ = Command::new("iptables")
                 .args(["-t", "nat", "-D", "PREROUTING",
-                       "-d", wolfnet_ip,
-                       "-p", &proto,
+                       "-d", wolfnet_ip, "-p", &proto,
                        "--dport", &pm.service_port.to_string(),
                        "-j", "REDIRECT", "--to-port", &pm.node_port.to_string()])
                 .output();
@@ -1628,8 +1714,8 @@ pub fn remove_wolfnet_route(cluster_id: &str, deployment_name: &str, namespace: 
         .cloned()
         .ok_or_else(|| "No WolfNet route found for this deployment".to_string())?;
 
-    // Remove iptables DNAT + MASQUERADE rules
-    remove_dnat_rules(&route.wolfnet_ip, &route.target_node_ip, &route.port_mappings);
+    // Remove iptables KUBE-SERVICES rules (and legacy DNAT rules)
+    remove_kube_svc_rules(&route.wolfnet_ip, &route.target_node_ip, &route.port_mappings);
 
     // Remove kernel route and secondary IP from wolfnet0
     let _ = Command::new("ip")
@@ -1664,7 +1750,7 @@ pub fn apply_all_wolfnet_routes() {
         .map(|ip| ip.split('/').next().unwrap_or(ip).to_string());
     let mut wn_routes = std::collections::HashMap::new();
 
-    // Enable forwarding for DNAT
+    // Enable forwarding for routed traffic
     let _ = Command::new("sysctl").args(["-w", "net.ipv4.ip_forward=1"]).output();
 
     for cluster in &config.clusters {
@@ -1679,71 +1765,37 @@ pub fn apply_all_wolfnet_routes() {
                 .args(["route", "replace", &format!("{}/32", route.wolfnet_ip), "dev", "wolfnet0"])
                 .output();
 
-            // Apply DNAT rules (check first to avoid duplicates)
-            if !route.target_node_ip.is_empty() {
-                for pm in &route.port_mappings {
-                    let proto = pm.protocol.to_lowercase();
-                    let dest = format!("{}:{}", route.target_node_ip, pm.node_port);
-                    let exists = Command::new("iptables")
-                        .args(["-t", "nat", "-C", "PREROUTING",
-                               "-d", &route.wolfnet_ip,
-                               "-p", &proto,
+            // Clean up any legacy PREROUTING DNAT rules from older versions
+            for pm in &route.port_mappings {
+                let proto = pm.protocol.to_lowercase();
+                if !route.target_node_ip.is_empty() {
+                    let _ = Command::new("iptables")
+                        .args(["-t", "nat", "-D", "PREROUTING",
+                               "-d", &route.wolfnet_ip, "-p", &proto,
                                "--dport", &pm.service_port.to_string(),
-                               "-j", "DNAT", "--to-destination", &dest])
-                        .output()
-                        .map(|o| o.status.success())
-                        .unwrap_or(false);
-                    if !exists {
-                        let _ = Command::new("iptables")
-                            .args(["-t", "nat", "-A", "PREROUTING",
-                                   "-d", &route.wolfnet_ip,
-                                   "-p", &proto,
-                                   "--dport", &pm.service_port.to_string(),
-                                   "-j", "DNAT", "--to-destination", &dest])
-                            .output();
-                        let _ = Command::new("iptables")
-                            .args(["-t", "nat", "-A", "POSTROUTING",
-                                   "-d", &route.target_node_ip,
-                                   "-p", &proto,
-                                   "--dport", &pm.node_port.to_string(),
-                                   "-j", "MASQUERADE"])
-                            .output();
-                    }
-                }
-            } else {
-                // Legacy: no target_node_ip — fall back to local REDIRECT
-                for pm in &route.port_mappings {
-                    let proto = pm.protocol.to_lowercase();
-                    let exists = Command::new("iptables")
-                        .args(["-t", "nat", "-C", "PREROUTING",
-                               "-d", &route.wolfnet_ip,
-                               "-p", &proto,
-                               "--dport", &pm.service_port.to_string(),
-                               "-j", "REDIRECT", "--to-port", &pm.node_port.to_string()])
-                        .output()
-                        .map(|o| o.status.success())
-                        .unwrap_or(false);
-                    if !exists {
-                        let _ = Command::new("iptables")
-                            .args(["-t", "nat", "-A", "PREROUTING",
-                                   "-d", &route.wolfnet_ip,
-                                   "-p", &proto,
-                                   "--dport", &pm.service_port.to_string(),
-                                   "-j", "REDIRECT", "--to-port", &pm.node_port.to_string()])
-                            .output();
-                    }
+                               "-j", "DNAT", "--to-destination",
+                               &format!("{}:{}", route.target_node_ip, pm.node_port)])
+                        .output();
+                    let _ = Command::new("iptables")
+                        .args(["-t", "nat", "-D", "POSTROUTING",
+                               "-d", &route.target_node_ip, "-p", &proto,
+                               "--dport", &pm.node_port.to_string(),
+                               "-j", "MASQUERADE"])
+                        .output();
                 }
             }
+
+            // Apply KUBE-SVC rules (hooks into k3s's own iptables chains)
+            apply_kube_svc_rules(&route.wolfnet_ip, &cluster.kubeconfig_path,
+                                 &route.deployment_name, &route.namespace, &route.port_mappings);
 
             // Register route so other WolfNet peers can reach this IP
             if let Some(ref lip) = local_wn_ip {
                 wn_routes.insert(route.wolfnet_ip.clone(), lip.clone());
             }
 
-            info!("Re-applied WolfNet route {} → {} for k8s deployment '{}'",
-                route.wolfnet_ip,
-                if route.target_node_ip.is_empty() { "local" } else { &route.target_node_ip },
-                route.deployment_name);
+            info!("Re-applied WolfNet route {} for k8s deployment '{}'",
+                route.wolfnet_ip, route.deployment_name);
         }
     }
 
