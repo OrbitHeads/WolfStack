@@ -171,10 +171,13 @@ impl VmManager {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 let vmid: u32 = parts.first()?.parse().ok()?;
                 let name = parts.get(1).unwrap_or(&"").to_string();
-                let state = parts.get(2).unwrap_or(&"stopped").to_lowercase();
                 let mem_mb: u32 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
                 let disk_gb: u32 = parts.get(4).and_then(|s| s.parse::<f64>().ok()).map(|f| f as u32).unwrap_or(0);
-                let running = state == "running";
+                // Use `qm status {vmid}` for reliable status (qm list column parsing
+                // can break on ARM/PiMox or when VM names contain spaces)
+                let running = Command::new("qm").args(["status", &vmid.to_string()]).output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains("running"))
+                    .unwrap_or(false);
 
                 // Read detailed config from qm config {vmid}
                 let mut cpus: u32 = 1;
@@ -1254,14 +1257,19 @@ impl VmManager {
     }
 
     fn check_running(&self, name: &str) -> bool {
-        let output = Command::new("pgrep")
-            .arg("-f")
-            .arg(format!("qemu-system-x86_64.*-name {}", name))
-            .output();
-        match output {
-            Ok(o) => o.status.success(),
-            Err(_) => false,
+        // Check both x86_64 and aarch64 QEMU binaries (for PiMox / ARM hosts)
+        for qemu_bin in &["qemu-system-x86_64", "qemu-system-aarch64"] {
+            let output = Command::new("pgrep")
+                .arg("-f")
+                .arg(format!("{}.*-name {}", qemu_bin, name))
+                .output();
+            if let Ok(o) = output {
+                if o.status.success() {
+                    return true;
+                }
+            }
         }
+        false
     }
 
     /// Read the VNC port from runtime file

@@ -206,10 +206,15 @@ impl PveClient {
             let name = v.get("name").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
                 .or_else(|| v.get("hostname").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
                 .unwrap_or("").to_string();
+            // Prefer qmpstatus (actual QEMU process state) over status
+            // Some PVE builds (e.g. PiMox on ARM) may not update status reliably
+            let status = v.get("qmpstatus").and_then(|v| v.as_str())
+                .or_else(|| v.get("status").and_then(|v| v.as_str()))
+                .unwrap_or("unknown").to_string();
             PveGuest {
                 vmid,
                 name,
-                status: v.get("status").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
+                status,
                 guest_type: "qemu".to_string(),
                 cpus: v.get("cpus").and_then(|v| v.as_u64()).unwrap_or(1) as u32,
                 cpu: v.get("cpu").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,

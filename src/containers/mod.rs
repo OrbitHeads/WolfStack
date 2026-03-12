@@ -1735,17 +1735,14 @@ done"#;
 
 /// Check if KVM/QEMU is installed
 pub fn kvm_installed() -> bool {
-    // Check for qemu-system-x86_64 or virsh
-    Command::new("which")
-        .arg("qemu-system-x86_64")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    || Command::new("which")
-        .arg("virsh")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    // Check for qemu-system-x86_64, qemu-system-aarch64 (ARM/PiMox), qm (Proxmox), or virsh
+    for bin in &["qemu-system-x86_64", "qemu-system-aarch64", "qm", "virsh"] {
+        if Command::new("which").arg(bin).output()
+            .map(|o| o.status.success()).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Check if Docker is installed and running
