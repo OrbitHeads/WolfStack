@@ -179,6 +179,9 @@ pub struct K8sWolfNetRoute {
     pub namespace: String,
     pub wolfnet_ip: String,
     pub port_mappings: Vec<K8sWolfNetPortMap>,
+    /// InternalIP of a k8s node to DNAT traffic to (NodePort is cluster-wide)
+    #[serde(default)]
+    pub target_node_ip: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1457,7 +1460,7 @@ fn find_available_k8s_wolfnet_ip(config: &KubernetesConfig) -> Option<String> {
 
 /// Allocate a WolfNet IP for a k8s deployment and set up iptables routing.
 /// The WolfNet IP is added as a secondary address on wolfnet0 and iptables
-/// REDIRECT rules forward traffic from service_port to the k8s NodePort.
+/// DNAT rules forward traffic to a k8s node's NodePort.
 pub fn allocate_wolfnet_route(cluster_id: &str, deployment_name: &str, namespace: &str) -> Result<K8sWolfNetRoute, String> {
     let config = load_config();
     let cluster = config.clusters.iter().find(|c| c.id == cluster_id)
@@ -1475,6 +1478,10 @@ pub fn allocate_wolfnet_route(cluster_id: &str, deployment_name: &str, namespace
         return Err("No NodePort service found for this deployment. Deploy the app first, and ensure it exposes ports.".to_string());
     }
 
+    // Find a Ready k8s node to DNAT traffic to (NodePort is cluster-wide)
+    let target_node_ip = find_k8s_node_ip(&kubeconfig)
+        .ok_or_else(|| "No Ready k8s node found with an InternalIP".to_string())?;
+
     // Find next available WolfNet IP
     let wolfnet_ip = find_available_k8s_wolfnet_ip(&config)
         .ok_or_else(|| "No available WolfNet IPs in the 10.10.10.0/24 range".to_string())?;
@@ -1487,17 +1494,11 @@ pub fn allocate_wolfnet_route(cluster_id: &str, deployment_name: &str, namespace
         return Err(format!("Failed to add IP to wolfnet0: {}. Is WolfNet running?", e));
     }
 
-    // Set up iptables REDIRECT rules for each port mapping
-    for pm in &port_mappings {
-        let proto = pm.protocol.to_lowercase();
-        let _ = Command::new("iptables")
-            .args(["-t", "nat", "-A", "PREROUTING",
-                   "-d", &wolfnet_ip,
-                   "-p", &proto,
-                   "--dport", &pm.service_port.to_string(),
-                   "-j", "REDIRECT", "--to-port", &pm.node_port.to_string()])
-            .output();
-    }
+    // Enable forwarding so DNAT packets can be routed
+    let _ = Command::new("sysctl").args(["-w", "net.ipv4.ip_forward=1"]).output();
+
+    // Set up iptables DNAT rules to forward to the k8s node
+    apply_dnat_rules(&wolfnet_ip, &target_node_ip, &port_mappings);
 
     // Register route in WolfNet so other peers can reach this IP
     let wn_status = crate::networking::get_wolfnet_status();
@@ -1513,6 +1514,7 @@ pub fn allocate_wolfnet_route(cluster_id: &str, deployment_name: &str, namespace
         namespace: namespace.to_string(),
         wolfnet_ip: wolfnet_ip.clone(),
         port_mappings,
+        target_node_ip: target_node_ip.clone(),
     };
 
     // Re-load config for mutable update (avoids borrow conflict)
@@ -1522,8 +1524,85 @@ pub fn allocate_wolfnet_route(cluster_id: &str, deployment_name: &str, namespace
     }
     save_config(&config)?;
 
-    info!("Allocated WolfNet IP {} for k8s deployment '{}' in '{}'", wolfnet_ip, deployment_name, namespace);
+    info!("Allocated WolfNet IP {} → {}(NodePort) for k8s deployment '{}'", wolfnet_ip, target_node_ip, deployment_name);
     Ok(route)
+}
+
+/// Find the InternalIP of the first Ready k8s node.
+fn find_k8s_node_ip(kubeconfig: &str) -> Option<String> {
+    let output = kubectl(kubeconfig, &["get", "nodes", "-o", "json"]).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&output).ok()?;
+    json["items"].as_array()?.iter().find_map(|item| {
+        // Prefer Ready nodes
+        let ready = item["status"]["conditions"].as_array()
+            .and_then(|c| c.iter().find(|cond| cond["type"].as_str() == Some("Ready")))
+            .and_then(|c| c["status"].as_str())
+            .map(|s| s == "True")
+            .unwrap_or(false);
+        if !ready { return None; }
+        item["status"]["addresses"].as_array()
+            .and_then(|addrs| addrs.iter()
+                .find(|a| a["type"].as_str() == Some("InternalIP"))
+                .and_then(|a| a["address"].as_str()))
+            .map(|s| s.to_string())
+    })
+}
+
+/// Apply iptables DNAT + MASQUERADE rules for a k8s WolfNet route.
+fn apply_dnat_rules(wolfnet_ip: &str, target_node_ip: &str, port_mappings: &[K8sWolfNetPortMap]) {
+    for pm in port_mappings {
+        let proto = pm.protocol.to_lowercase();
+        // DNAT: rewrite destination to k8s node IP:NodePort
+        let _ = Command::new("iptables")
+            .args(["-t", "nat", "-A", "PREROUTING",
+                   "-d", wolfnet_ip,
+                   "-p", &proto,
+                   "--dport", &pm.service_port.to_string(),
+                   "-j", "DNAT", "--to-destination",
+                   &format!("{}:{}", target_node_ip, pm.node_port)])
+            .output();
+        // MASQUERADE: ensure return traffic comes back through this node
+        let _ = Command::new("iptables")
+            .args(["-t", "nat", "-A", "POSTROUTING",
+                   "-d", target_node_ip,
+                   "-p", &proto,
+                   "--dport", &pm.node_port.to_string(),
+                   "-j", "MASQUERADE"])
+            .output();
+    }
+}
+
+/// Remove iptables DNAT + MASQUERADE rules for a k8s WolfNet route.
+fn remove_dnat_rules(wolfnet_ip: &str, target_node_ip: &str, port_mappings: &[K8sWolfNetPortMap]) {
+    for pm in port_mappings {
+        let proto = pm.protocol.to_lowercase();
+        if !target_node_ip.is_empty() {
+            let _ = Command::new("iptables")
+                .args(["-t", "nat", "-D", "PREROUTING",
+                       "-d", wolfnet_ip,
+                       "-p", &proto,
+                       "--dport", &pm.service_port.to_string(),
+                       "-j", "DNAT", "--to-destination",
+                       &format!("{}:{}", target_node_ip, pm.node_port)])
+                .output();
+            let _ = Command::new("iptables")
+                .args(["-t", "nat", "-D", "POSTROUTING",
+                       "-d", target_node_ip,
+                       "-p", &proto,
+                       "--dport", &pm.node_port.to_string(),
+                       "-j", "MASQUERADE"])
+                .output();
+        } else {
+            // Legacy REDIRECT cleanup
+            let _ = Command::new("iptables")
+                .args(["-t", "nat", "-D", "PREROUTING",
+                       "-d", wolfnet_ip,
+                       "-p", &proto,
+                       "--dport", &pm.service_port.to_string(),
+                       "-j", "REDIRECT", "--to-port", &pm.node_port.to_string()])
+                .output();
+        }
+    }
 }
 
 /// Remove the WolfNet IP route for a k8s deployment.
@@ -1538,17 +1617,8 @@ pub fn remove_wolfnet_route(cluster_id: &str, deployment_name: &str, namespace: 
         .cloned()
         .ok_or_else(|| "No WolfNet route found for this deployment".to_string())?;
 
-    // Remove iptables REDIRECT rules
-    for pm in &route.port_mappings {
-        let proto = pm.protocol.to_lowercase();
-        let _ = Command::new("iptables")
-            .args(["-t", "nat", "-D", "PREROUTING",
-                   "-d", &route.wolfnet_ip,
-                   "-p", &proto,
-                   "--dport", &pm.service_port.to_string(),
-                   "-j", "REDIRECT", "--to-port", &pm.node_port.to_string()])
-            .output();
-    }
+    // Remove iptables DNAT + MASQUERADE rules
+    remove_dnat_rules(&route.wolfnet_ip, &route.target_node_ip, &route.port_mappings);
 
     // Remove secondary IP from wolfnet0
     let _ = Command::new("ip")
@@ -1580,6 +1650,9 @@ pub fn apply_all_wolfnet_routes() {
         .map(|ip| ip.split('/').next().unwrap_or(ip).to_string());
     let mut wn_routes = std::collections::HashMap::new();
 
+    // Enable forwarding for DNAT
+    let _ = Command::new("sysctl").args(["-w", "net.ipv4.ip_forward=1"]).output();
+
     for cluster in &config.clusters {
         for route in &cluster.wolfnet_routes {
             // Add secondary IP to wolfnet0 (ignore errors if already exists)
@@ -1587,27 +1660,59 @@ pub fn apply_all_wolfnet_routes() {
                 .args(["addr", "add", &format!("{}/32", route.wolfnet_ip), "dev", "wolfnet0"])
                 .output();
 
-            // Add iptables REDIRECT rules (check first to avoid duplicates)
-            for pm in &route.port_mappings {
-                let proto = pm.protocol.to_lowercase();
-                let exists = Command::new("iptables")
-                    .args(["-t", "nat", "-C", "PREROUTING",
-                           "-d", &route.wolfnet_ip,
-                           "-p", &proto,
-                           "--dport", &pm.service_port.to_string(),
-                           "-j", "REDIRECT", "--to-port", &pm.node_port.to_string()])
-                    .output()
-                    .map(|o| o.status.success())
-                    .unwrap_or(false);
-
-                if !exists {
-                    let _ = Command::new("iptables")
-                        .args(["-t", "nat", "-A", "PREROUTING",
+            // Apply DNAT rules (check first to avoid duplicates)
+            if !route.target_node_ip.is_empty() {
+                for pm in &route.port_mappings {
+                    let proto = pm.protocol.to_lowercase();
+                    let dest = format!("{}:{}", route.target_node_ip, pm.node_port);
+                    let exists = Command::new("iptables")
+                        .args(["-t", "nat", "-C", "PREROUTING",
+                               "-d", &route.wolfnet_ip,
+                               "-p", &proto,
+                               "--dport", &pm.service_port.to_string(),
+                               "-j", "DNAT", "--to-destination", &dest])
+                        .output()
+                        .map(|o| o.status.success())
+                        .unwrap_or(false);
+                    if !exists {
+                        let _ = Command::new("iptables")
+                            .args(["-t", "nat", "-A", "PREROUTING",
+                                   "-d", &route.wolfnet_ip,
+                                   "-p", &proto,
+                                   "--dport", &pm.service_port.to_string(),
+                                   "-j", "DNAT", "--to-destination", &dest])
+                            .output();
+                        let _ = Command::new("iptables")
+                            .args(["-t", "nat", "-A", "POSTROUTING",
+                                   "-d", &route.target_node_ip,
+                                   "-p", &proto,
+                                   "--dport", &pm.node_port.to_string(),
+                                   "-j", "MASQUERADE"])
+                            .output();
+                    }
+                }
+            } else {
+                // Legacy: no target_node_ip — fall back to local REDIRECT
+                for pm in &route.port_mappings {
+                    let proto = pm.protocol.to_lowercase();
+                    let exists = Command::new("iptables")
+                        .args(["-t", "nat", "-C", "PREROUTING",
                                "-d", &route.wolfnet_ip,
                                "-p", &proto,
                                "--dport", &pm.service_port.to_string(),
                                "-j", "REDIRECT", "--to-port", &pm.node_port.to_string()])
-                        .output();
+                        .output()
+                        .map(|o| o.status.success())
+                        .unwrap_or(false);
+                    if !exists {
+                        let _ = Command::new("iptables")
+                            .args(["-t", "nat", "-A", "PREROUTING",
+                                   "-d", &route.wolfnet_ip,
+                                   "-p", &proto,
+                                   "--dport", &pm.service_port.to_string(),
+                                   "-j", "REDIRECT", "--to-port", &pm.node_port.to_string()])
+                            .output();
+                    }
                 }
             }
 
@@ -1616,7 +1721,10 @@ pub fn apply_all_wolfnet_routes() {
                 wn_routes.insert(route.wolfnet_ip.clone(), lip.clone());
             }
 
-            info!("Re-applied WolfNet route {} for k8s deployment '{}'", route.wolfnet_ip, route.deployment_name);
+            info!("Re-applied WolfNet route {} → {} for k8s deployment '{}'",
+                route.wolfnet_ip,
+                if route.target_node_ip.is_empty() { "local" } else { &route.target_node_ip },
+                route.deployment_name);
         }
     }
 
