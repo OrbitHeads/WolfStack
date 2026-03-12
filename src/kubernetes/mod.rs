@@ -26,6 +26,7 @@ const CONFIG_FILE: &str = "/etc/wolfstack/kubernetes.json";
 pub enum K8sClusterType {
     K3s,
     K8s,
+    MicroK8s,
     Eks,
     Gke,
     Aks,
@@ -37,6 +38,7 @@ impl std::fmt::Display for K8sClusterType {
         match self {
             Self::K3s => write!(f, "k3s"),
             Self::K8s => write!(f, "k8s"),
+            Self::MicroK8s => write!(f, "microk8s"),
             Self::Eks => write!(f, "eks"),
             Self::Gke => write!(f, "gke"),
             Self::Aks => write!(f, "aks"),
@@ -316,7 +318,7 @@ pub fn detect_existing_clusters() -> Vec<(String, String, K8sClusterType)> {
         found.push((
             "microk8s (local)".to_string(),
             microk8s_config.to_string(),
-            K8sClusterType::K8s,
+            K8sClusterType::MicroK8s,
         ));
     }
 
@@ -464,6 +466,384 @@ pub fn get_k3s_token(kubeconfig: &str) -> Result<String, String> {
     } else {
         Ok(output.trim().to_string())
     }
+}
+
+// ═══════════════════════════════════════════════
+// ─── MicroK8s Provisioning ───
+// ═══════════════════════════════════════════════
+
+/// Generate a bash script that installs MicroK8s on a node.
+pub fn provision_microk8s_server(node_address: &str, cluster_name: &str) -> Result<String, String> {
+    info!(
+        "Generating MicroK8s provisioning script for {} (cluster: {})",
+        node_address, cluster_name
+    );
+
+    let script = format!(
+        r#"#!/bin/bash
+set -euo pipefail
+
+echo "=== Installing MicroK8s on {node_address} for cluster '{cluster_name}' ==="
+
+# Install MicroK8s
+snap install microk8s --classic
+
+# Wait for MicroK8s to be ready
+echo "Waiting for MicroK8s to be ready..."
+microk8s status --wait-ready --timeout 120
+
+# Enable essential addons
+microk8s enable dns storage
+
+echo ""
+echo "=== MicroK8s Installed Successfully ==="
+echo "Kubeconfig: /var/snap/microk8s/current/credentials/client.config"
+echo "To add nodes, run: microk8s add-node"
+"#,
+        node_address = node_address,
+        cluster_name = cluster_name,
+    );
+
+    Ok(script)
+}
+
+/// Generate a bash script that joins a node to a MicroK8s cluster.
+pub fn provision_microk8s_agent(join_url: &str) -> Result<String, String> {
+    info!("Generating MicroK8s agent join script");
+
+    let script = format!(
+        r#"#!/bin/bash
+set -euo pipefail
+
+echo "=== Joining MicroK8s cluster ==="
+
+# Install MicroK8s if not present
+if ! command -v microk8s &>/dev/null; then
+    snap install microk8s --classic
+    microk8s status --wait-ready --timeout 120
+fi
+
+# Join the cluster
+{join_url}
+
+echo "=== MicroK8s node joined successfully ==="
+"#,
+        join_url = join_url,
+    );
+
+    Ok(script)
+}
+
+/// Get the MicroK8s add-node command from a server node.
+pub fn get_microk8s_join_command() -> Result<String, String> {
+    let output = Command::new("microk8s")
+        .args(["add-node", "--token-ttl", "3600"])
+        .output()
+        .map_err(|e| format!("Failed to run microk8s add-node: {}", e))?;
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        // Extract the "microk8s join ..." line
+        if let Some(join_line) = stdout.lines().find(|l| l.trim().starts_with("microk8s join")) {
+            Ok(join_line.trim().to_string())
+        } else {
+            Ok(stdout)
+        }
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+// ═══════════════════════════════════════════════
+// ─── kubeadm Provisioning ───
+// ═══════════════════════════════════════════════
+
+/// Generate a bash script that installs Kubernetes via kubeadm on a node.
+pub fn provision_kubeadm_server(node_address: &str, cluster_name: &str) -> Result<String, String> {
+    info!(
+        "Generating kubeadm provisioning script for {} (cluster: {})",
+        node_address, cluster_name
+    );
+
+    let script = format!(
+        r#"#!/bin/bash
+set -euo pipefail
+
+echo "=== Installing Kubernetes (kubeadm) on {node_address} for cluster '{cluster_name}' ==="
+
+# Disable swap (required by kubeadm)
+swapoff -a
+sed -i '/swap/d' /etc/fstab
+
+# Enable kernel modules
+modprobe br_netfilter overlay
+cat > /etc/modules-load.d/k8s.conf <<MODULES
+br_netfilter
+overlay
+MODULES
+
+cat > /etc/sysctl.d/k8s.conf <<SYSCTL
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward = 1
+SYSCTL
+sysctl --system
+
+# Install containerd
+apt-get update -qq
+apt-get install -y -qq containerd
+mkdir -p /etc/containerd
+containerd config default > /etc/containerd/config.toml
+sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+systemctl restart containerd
+systemctl enable containerd
+
+# Install kubeadm, kubelet, kubectl
+apt-get install -y -qq apt-transport-https ca-certificates curl gpg
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /' > /etc/apt/sources.list.d/kubernetes.list
+apt-get update -qq
+apt-get install -y -qq kubelet kubeadm kubectl
+apt-mark hold kubelet kubeadm kubectl
+
+# Initialize cluster
+kubeadm init --apiserver-advertise-address={node_address} --pod-network-cidr=10.244.0.0/16
+
+# Set up kubeconfig
+export KUBECONFIG=/etc/kubernetes/admin.conf
+mkdir -p /root/.kube
+cp /etc/kubernetes/admin.conf /root/.kube/config
+
+# Install Flannel CNI
+kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+
+# Wait for node to be ready
+echo "Waiting for node to be ready..."
+kubectl wait --for=condition=Ready nodes --all --timeout=120s
+
+echo ""
+echo "=== Kubernetes (kubeadm) Installed Successfully ==="
+echo "Kubeconfig: /etc/kubernetes/admin.conf"
+echo "Join command: $(kubeadm token create --print-join-command)"
+"#,
+        node_address = node_address,
+        cluster_name = cluster_name,
+    );
+
+    Ok(script)
+}
+
+/// Generate a bash script that joins a node to a kubeadm cluster as a worker.
+pub fn provision_kubeadm_agent(join_command: &str) -> Result<String, String> {
+    info!("Generating kubeadm agent join script");
+
+    let script = format!(
+        r#"#!/bin/bash
+set -euo pipefail
+
+echo "=== Joining Kubernetes cluster as worker node ==="
+
+# Disable swap
+swapoff -a
+sed -i '/swap/d' /etc/fstab
+
+# Enable kernel modules
+modprobe br_netfilter overlay
+cat > /etc/modules-load.d/k8s.conf <<MODULES
+br_netfilter
+overlay
+MODULES
+
+cat > /etc/sysctl.d/k8s.conf <<SYSCTL
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward = 1
+SYSCTL
+sysctl --system
+
+# Install containerd
+apt-get update -qq
+apt-get install -y -qq containerd
+mkdir -p /etc/containerd
+containerd config default > /etc/containerd/config.toml
+sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+systemctl restart containerd
+systemctl enable containerd
+
+# Install kubeadm and kubelet
+apt-get install -y -qq apt-transport-https ca-certificates curl gpg
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /' > /etc/apt/sources.list.d/kubernetes.list
+apt-get update -qq
+apt-get install -y -qq kubelet kubeadm
+apt-mark hold kubelet kubeadm
+
+# Join the cluster
+{join_command}
+
+echo "=== Node joined the cluster successfully ==="
+"#,
+        join_command = join_command,
+    );
+
+    Ok(script)
+}
+
+/// Get the kubeadm join command from a server node.
+pub fn get_kubeadm_join_command() -> Result<String, String> {
+    let output = Command::new("kubeadm")
+        .args(["token", "create", "--print-join-command"])
+        .output()
+        .map_err(|e| format!("Failed to run kubeadm token create: {}", e))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+// ═══════════════════════════════════════════════
+// ─── WolfNet Integration ───
+// ═══════════════════════════════════════════════
+
+/// Deploy WolfNet overlay networking to a Kubernetes cluster.
+/// This creates a DaemonSet that runs WolfNet on every k8s node,
+/// connecting them to the WolfNet mesh for encrypted inter-node communication.
+pub fn deploy_wolfnet_to_cluster(
+    kubeconfig: &str,
+    wolfnet_server: &str,
+    wolfnet_network: &str,
+) -> Result<String, String> {
+    info!(
+        "Deploying WolfNet to k8s cluster (server: {}, network: {})",
+        wolfnet_server, wolfnet_network
+    );
+
+    let yaml = format!(
+        r#"apiVersion: v1
+kind: Namespace
+metadata:
+  name: wolfnet-system
+  labels:
+    app.kubernetes.io/managed-by: wolfstack
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wolfnet-config
+  namespace: wolfnet-system
+data:
+  WOLFNET_SERVER: "{wolfnet_server}"
+  WOLFNET_NETWORK: "{wolfnet_network}"
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: wolfnet
+  namespace: wolfnet-system
+  labels:
+    app: wolfnet
+    app.kubernetes.io/managed-by: wolfstack
+spec:
+  selector:
+    matchLabels:
+      app: wolfnet
+  template:
+    metadata:
+      labels:
+        app: wolfnet
+    spec:
+      hostNetwork: true
+      hostPID: true
+      tolerations:
+      - operator: Exists
+      initContainers:
+      - name: wolfnet-setup
+        image: alpine:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          apk add --no-cache wireguard-tools bash curl git build-base linux-headers
+          if [ ! -d /opt/wolfnet-src ]; then
+            git clone https://github.com/wolfsoftwaresystemsltd/WolfNet.git /opt/wolfnet-src
+          else
+            cd /opt/wolfnet-src && git pull
+          fi
+          cd /opt/wolfnet-src && bash setup.sh
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: host-root
+          mountPath: /opt/wolfnet-src
+          subPath: opt/wolfnet-src
+        - name: host-modules
+          mountPath: /lib/modules
+          readOnly: true
+      containers:
+      - name: wolfnet-agent
+        image: alpine:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          echo "WolfNet overlay active on $(hostname)"
+          # Keep the pod running — WolfNet runs as a host service
+          while true; do
+            if wg show wolfnet0 &>/dev/null; then
+              echo "WolfNet interface wolfnet0 is up"
+            else
+              echo "WolfNet interface not found, attempting restart..."
+              systemctl restart wolfnet 2>/dev/null || true
+            fi
+            sleep 60
+          done
+        securityContext:
+          privileged: true
+          capabilities:
+            add: ["NET_ADMIN", "SYS_MODULE"]
+        envFrom:
+        - configMapRef:
+            name: wolfnet-config
+        volumeMounts:
+        - name: host-modules
+          mountPath: /lib/modules
+          readOnly: true
+        - name: host-etc-wolfnet
+          mountPath: /etc/wolfnet
+      volumes:
+      - name: host-root
+        hostPath:
+          path: /
+      - name: host-modules
+        hostPath:
+          path: /lib/modules
+      - name: host-etc-wolfnet
+        hostPath:
+          path: /etc/wolfnet
+          type: DirectoryOrCreate
+"#,
+        wolfnet_server = wolfnet_server,
+        wolfnet_network = wolfnet_network,
+    );
+
+    apply_yaml(kubeconfig, &yaml)
+}
+
+/// Remove WolfNet from a Kubernetes cluster.
+pub fn remove_wolfnet_from_cluster(kubeconfig: &str) -> Result<String, String> {
+    info!("Removing WolfNet from k8s cluster");
+    kubectl(kubeconfig, &["delete", "namespace", "wolfnet-system", "--ignore-not-found"])
+}
+
+/// Check if WolfNet is deployed on a Kubernetes cluster.
+pub fn is_wolfnet_deployed(kubeconfig: &str) -> bool {
+    kubectl(kubeconfig, &["get", "namespace", "wolfnet-system", "-o", "name"])
+        .map(|o| !o.trim().is_empty())
+        .unwrap_or(false)
 }
 
 // ═══════════════════════════════════════════════

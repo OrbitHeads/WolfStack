@@ -528,7 +528,7 @@ function selectView(page) {
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     document.querySelector(`.nav-item[data-page="${page}"]`)?.classList.add('active');
 
-    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', 'global-wolfnet': 'Global View', kubernetes: 'Kubernetes' };
+    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube' };
     document.getElementById('page-title').textContent = titles[page] || page;
 
     if (page === 'datacenter') {
@@ -756,7 +756,7 @@ function buildServerTree(nodes) {
                     <span class="icon" style="font-size:15px;">💾</span> <span style="font-weight:600;">Backups</span>
                 </a>
                 <a class="nav-item server-child-item k8s-cluster-item" data-cluster="${escapedName}" data-view="kubernetes" onclick="showK8sClusterPage('${escapedName}')" style="margin-left: 8px; padding: 6px 10px; display:flex; align-items:center; gap:6px;">
-                    <span class="icon" style="font-size:15px;">&#9784;</span> <span style="font-weight:600;">Kubernetes</span>
+                    <span class="icon" style="font-size:15px;">&#9784;</span> <span style="font-weight:600;">WolfKube</span>
                     <span class="k8s-cluster-count" id="k8s-count-${clusterId}" style="margin-left:auto; font-size:10px; padding:1px 6px; background:#326ce5; color:#fff; border-radius:10px; display:none;"></span>
                 </a>`;
 
@@ -18088,7 +18088,7 @@ function openAppStoreInstallModal(appId) {
     if (app.docker) targets.push({ key: 'docker', label: '🐳 Docker' });
     if (app.lxc) targets.push({ key: 'lxc', label: '📦 LXC' });
     if (app.bare_metal) targets.push({ key: 'bare_metal', label: '🖥️ Host' });
-    if (app.docker && k8sClusters.length > 0) targets.push({ key: 'kubernetes', label: '&#9784; Kubernetes' });
+    if (app.docker && k8sClusters.length > 0) targets.push({ key: 'kubernetes', label: '&#9784; WolfKube' });
 
     appStoreInstallTarget = targets[0]?.key || 'docker';
     targetHtml = targets.map(t =>
@@ -18121,7 +18121,7 @@ function openAppStoreInstallModal(appId) {
                 <input type="number" id="appstore-k8s-replicas" class="form-control" value="1" min="1" max="100" style="width:100px;">
             </div>`;
     } else {
-        k8sOptsEl.innerHTML = '<div style="margin-top:8px; font-size:12px; color:var(--text-muted);">No Kubernetes clusters configured. Go to Kubernetes page to add one.</div>';
+        k8sOptsEl.innerHTML = '<div style="margin-top:8px; font-size:12px; color:var(--text-muted);">No clusters configured. Go to WolfKube to add one.</div>';
     }
     k8sOptsEl.style.display = appStoreInstallTarget === 'kubernetes' ? '' : 'none';
 
@@ -18242,7 +18242,7 @@ async function executeAppStoreInstall() {
         const k8sClusterId = document.getElementById('appstore-k8s-cluster')?.value;
         const k8sNamespace = document.getElementById('appstore-k8s-namespace')?.value || 'default';
         const k8sReplicas = parseInt(document.getElementById('appstore-k8s-replicas')?.value) || 1;
-        if (!k8sClusterId) { showToast('Please select a Kubernetes cluster', 'error'); return; }
+        if (!k8sClusterId) { showToast('Please select a cluster', 'error'); return; }
         closeAppStoreInstallModal();
         try {
             const resp = await fetch(`/api/kubernetes/clusters/${k8sClusterId}/deploy-app`, {
@@ -18258,7 +18258,7 @@ async function executeAppStoreInstall() {
             });
             const data = await resp.json().catch(() => ({}));
             if (!resp.ok) throw new Error(data.error || 'Deploy failed');
-            showToast(data.message || `${appName} deployed to Kubernetes!`, 'success');
+            showToast(data.message || `${appName} deployed to WolfKube!`, 'success');
         } catch (e) { showToast('K8s deploy failed: ' + e.message, 'error'); }
         return;
     }
@@ -21280,7 +21280,7 @@ function renderWolfrunServicePicker(existingCheck) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ─── Kubernetes Management ───
+// ─── WolfKube — Kubernetes Management ───
 // ═══════════════════════════════════════════════════════════════════════════════
 
 let k8sClusters = [];
@@ -21320,12 +21320,12 @@ function renderKubernetesPage() {
             <div style="display:flex; align-items:center; gap:20px;">
                 <div style="width:64px; height:64px; background:linear-gradient(135deg,#326ce5,#54a3ff); border-radius:16px; display:flex; align-items:center; justify-content:center; font-size:32px; box-shadow:0 4px 20px rgba(50,108,229,0.3);">&#9784;</div>
                 <div>
-                    <h2 style="font-size:24px; margin-bottom:4px; color:var(--text-primary); font-weight:700;">Kubernetes</h2>
-                    <p style="color:var(--text-secondary); font-size:13px; margin:0;">Manage Kubernetes clusters, deploy workloads, and provision k3s across your nodes.</p>
+                    <h2 style="font-size:24px; margin-bottom:4px; color:var(--text-primary); font-weight:700;">WolfKube</h2>
+                    <p style="color:var(--text-secondary); font-size:13px; margin:0;">Provision and manage Kubernetes clusters across your nodes with WolfNet overlay networking.</p>
                 </div>
             </div>
             <div style="display:flex; gap:8px;">
-                <button class="btn btn-primary" onclick="showK8sProvisionModal()" style="background:#326ce5; border-color:#326ce5;">+ Provision k3s</button>
+                <button class="btn btn-primary" onclick="showK8sProvisionModal()" style="background:#326ce5; border-color:#326ce5;">+ Provision Cluster</button>
                 <button class="btn btn-secondary" onclick="showK8sImportModal()">Import Cluster</button>
             </div>
         </div>
@@ -21337,9 +21337,12 @@ function renderKubernetesPage() {
     if (k8sClusters.length === 0) {
         html += `<div class="card"><div class="card-body" style="padding:60px; text-align:center;">
             <div style="font-size:48px; margin-bottom:16px;">&#9784;</div>
-            <h3 style="margin-bottom:8px; color:var(--text-primary);">No Kubernetes Clusters</h3>
-            <p style="color:var(--text-muted); margin-bottom:20px;">Provision a new k3s cluster on your servers or import an existing kubeconfig.</p>
-            <button class="btn btn-primary" onclick="showK8sProvisionModal()" style="background:#326ce5; border-color:#326ce5;">Provision k3s Cluster</button>
+            <h3 style="margin-bottom:8px; color:var(--text-primary);">No Clusters Configured</h3>
+            <p style="color:var(--text-muted); margin-bottom:20px;">Provision a new cluster (k3s, MicroK8s, or kubeadm) or import an existing kubeconfig.</p>
+            <div style="display:flex; gap:8px; justify-content:center;">
+                <button class="btn btn-primary" onclick="showK8sProvisionModal()" style="background:#326ce5; border-color:#326ce5;">Provision Cluster</button>
+                <button class="btn btn-secondary" onclick="showK8sImportModal()">Import Cluster</button>
+            </div>
         </div></div>`;
     } else {
         // Cluster list
@@ -21391,7 +21394,7 @@ async function k8sDetectExisting() {
             <div class="card-body" style="padding:16px 24px;">
                 <div style="display:flex; align-items:center; gap:12px; margin-bottom:12px;">
                     <span style="font-size:20px;">&#128269;</span>
-                    <strong style="font-size:14px;">Existing Kubernetes installations detected on this server</strong>
+                    <strong style="font-size:14px;">Existing Kubernetes installations detected</strong>
                 </div>
                 ${detected.map(d => `<div style="display:flex; align-items:center; gap:12px; padding:8px 0; border-top:1px solid var(--border);">
                     <div style="flex:1;">
@@ -21470,6 +21473,7 @@ async function renderK8sClusterDetail() {
         { key: 'deployments', label: 'Deployments' },
         { key: 'pods', label: 'Pods' },
         { key: 'services', label: 'Services' },
+        { key: 'wolfnet', label: 'WolfNet' },
     ];
 
     let html = `<div class="card"><div class="card-body" style="padding:16px 24px;">
@@ -21557,6 +21561,11 @@ async function switchK8sTab(tab) {
             if (!resp.ok) throw new Error('Failed');
             const svcs = await resp.json();
             content.innerHTML = renderK8sServices(svcs);
+        } else if (tab === 'wolfnet') {
+            const resp = await fetch(`/api/kubernetes/clusters/${k8sCurrentCluster}/wolfnet`);
+            if (!resp.ok) throw new Error('Failed');
+            const status = await resp.json();
+            content.innerHTML = renderK8sWolfNet(status);
         }
     } catch (e) {
         content.innerHTML = `<div style="padding:20px; text-align:center; color:#ef4444;">Failed to load ${tab}: ${e.message}</div>`;
@@ -21696,7 +21705,7 @@ function renderK8sServices(svcs) {
 // ─── K8s Actions ───
 
 async function deleteK8sCluster(id, name) {
-    if (!(await showConfirm(`Remove Kubernetes cluster "${name}" from WolfStack? This only removes tracking, not the actual cluster.`))) return;
+    if (!(await showConfirm(`Remove cluster "${name}" from WolfKube? This only removes tracking, not the actual cluster.`))) return;
     try {
         const resp = await fetch(`/api/kubernetes/clusters/${id}`, { method: 'DELETE' });
         if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || `HTTP ${resp.status}`);
@@ -21758,12 +21767,18 @@ async function k8sDeleteService(name, namespace) {
 
 function showK8sScaleModal(name, namespace, currentReplicas) {
     showModal(`
-        <h3 style="margin-bottom:16px;">Scale Deployment: ${escapeHtml(name)}</h3>
-        <div class="form-group">
-            <label>Replicas</label>
-            <input type="number" id="k8s-scale-replicas" class="form-control" value="${currentReplicas}" min="0" max="100">
+        <div style="margin-bottom:20px;">
+            <h3 style="margin:0 0 4px 0; font-size:18px; font-weight:700;">Scale Deployment</h3>
+            <p style="color:var(--text-muted); font-size:12px; margin:0;">Adjust replicas for <strong>${escapeHtml(name)}</strong> in <code>${escapeHtml(namespace)}</code></p>
         </div>
-        <button class="btn btn-primary" onclick="k8sScaleDeployment('${escapeHtml(name)}', '${escapeHtml(namespace)}')" style="background:#326ce5; border-color:#326ce5;">Scale</button>
+        <div class="form-group" style="margin-bottom:20px;">
+            <label style="font-weight:600; font-size:13px; margin-bottom:6px; display:block;">Replicas</label>
+            <input type="number" id="k8s-scale-replicas" class="form-control" value="${currentReplicas}" min="0" max="100" style="font-size:16px; padding:10px 12px; width:120px;">
+        </div>
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
+            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+            <button class="btn btn-primary" onclick="k8sScaleDeployment('${escapeHtml(name)}', '${escapeHtml(namespace)}')" style="background:#326ce5; border-color:#326ce5; padding:10px 24px;">Scale</button>
+        </div>
     `);
 }
 
@@ -21784,12 +21799,18 @@ async function k8sScaleDeployment(name, namespace) {
 
 function showK8sCreateNamespaceModal() {
     showModal(`
-        <h3 style="margin-bottom:16px;">Create Namespace</h3>
-        <div class="form-group">
-            <label>Name</label>
-            <input type="text" id="k8s-ns-name" class="form-control" placeholder="my-namespace">
+        <div style="margin-bottom:20px;">
+            <h3 style="margin:0 0 4px 0; font-size:18px; font-weight:700;">Create Namespace</h3>
+            <p style="color:var(--text-muted); font-size:12px; margin:0;">Create a new Kubernetes namespace for isolating workloads.</p>
         </div>
-        <button class="btn btn-primary" onclick="k8sCreateNamespace()" style="background:#326ce5; border-color:#326ce5;">Create</button>
+        <div class="form-group" style="margin-bottom:20px;">
+            <label style="font-weight:600; font-size:13px; margin-bottom:6px; display:block;">Namespace Name</label>
+            <input type="text" id="k8s-ns-name" class="form-control" placeholder="my-namespace" style="font-size:14px; padding:10px 12px;">
+        </div>
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
+            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+            <button class="btn btn-primary" onclick="k8sCreateNamespace()" style="background:#326ce5; border-color:#326ce5; padding:10px 24px;">Create</button>
+        </div>
     `);
 }
 
@@ -21825,16 +21846,22 @@ async function showK8sPodLogs(pod, namespace) {
 
 function showK8sApplyYamlModal() {
     showModal(`
-        <h3 style="margin-bottom:16px;">Apply YAML Manifest</h3>
-        <div class="form-group">
-            <label>Namespace (optional)</label>
-            <input type="text" id="k8s-apply-ns" class="form-control" placeholder="default" value="${escapeHtml(k8sCurrentNamespace || '')}">
+        <div style="margin-bottom:20px;">
+            <h3 style="margin:0 0 4px 0; font-size:18px; font-weight:700;">Apply YAML Manifest</h3>
+            <p style="color:var(--text-muted); font-size:12px; margin:0;">Apply a Kubernetes YAML manifest to this cluster.</p>
         </div>
-        <div class="form-group">
-            <label>YAML</label>
-            <textarea id="k8s-apply-yaml" class="form-control" rows="15" style="font-family:monospace; font-size:12px;" placeholder="apiVersion: apps/v1\nkind: Deployment\n..."></textarea>
+        <div class="form-group" style="margin-bottom:16px;">
+            <label style="font-weight:600; font-size:13px; margin-bottom:6px; display:block;">Namespace <span style="font-weight:400; color:var(--text-muted);">(optional)</span></label>
+            <input type="text" id="k8s-apply-ns" class="form-control" placeholder="default" value="${escapeHtml(k8sCurrentNamespace || '')}" style="font-size:14px; padding:10px 12px;">
         </div>
-        <button class="btn btn-primary" onclick="k8sApplyYaml()" style="background:#326ce5; border-color:#326ce5;">Apply</button>
+        <div class="form-group" style="margin-bottom:20px;">
+            <label style="font-weight:600; font-size:13px; margin-bottom:6px; display:block;">YAML</label>
+            <textarea id="k8s-apply-yaml" class="form-control" rows="15" style="font-family:monospace; font-size:12px; padding:12px;" placeholder="apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: my-app\n..."></textarea>
+        </div>
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
+            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+            <button class="btn btn-primary" onclick="k8sApplyYaml()" style="background:#326ce5; border-color:#326ce5; padding:10px 24px;">Apply</button>
+        </div>
     `);
 }
 
@@ -21856,7 +21883,7 @@ async function k8sApplyYaml() {
     } catch (e) { showToast('Failed: ' + e.message, 'error'); }
 }
 
-// ─── Provision k3s Modal ───
+// ─── Provision Cluster Modal ───
 
 function showK8sProvisionModal() {
     const sortedNodes = [...allNodes].sort((a, b) => a.hostname.localeCompare(b.hostname));
@@ -21866,70 +21893,343 @@ function showK8sProvisionModal() {
     }).join('');
 
     showModal(`
-        <h3 style="margin-bottom:16px;">Provision k3s Cluster</h3>
-        <div class="form-group">
-            <label>Cluster Name</label>
-            <input type="text" id="k8s-provision-name" class="form-control" placeholder="my-cluster" value="k3s-cluster">
+        <div style="margin-bottom:20px;">
+            <div style="display:flex; align-items:center; gap:12px; margin-bottom:4px;">
+                <div style="width:40px; height:40px; background:linear-gradient(135deg,#326ce5,#54a3ff); border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:20px;">&#9784;</div>
+                <h3 style="margin:0; font-size:18px; font-weight:700;">Provision Kubernetes Cluster</h3>
+            </div>
+            <p style="color:var(--text-muted); font-size:12px; margin:4px 0 0 52px;">Install and configure a Kubernetes distribution across your nodes.</p>
         </div>
-        <div class="form-group">
-            <label>Server Node (control plane)</label>
-            <select id="k8s-provision-server" class="form-control">${nodeOpts}</select>
-            <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">k3s server will be installed on this node.</div>
+        <div class="form-group" style="margin-bottom:16px;">
+            <label style="font-weight:600; font-size:13px; margin-bottom:6px; display:block;">Cluster Name</label>
+            <input type="text" id="k8s-provision-name" class="form-control" placeholder="my-cluster" value="k8s-cluster" style="font-size:14px; padding:10px 12px;">
         </div>
-        <div class="form-group">
-            <label>Agent Nodes (workers, optional)</label>
-            <select id="k8s-provision-agents" class="form-control" multiple style="height:120px;">${nodeOpts}</select>
+        <div class="form-group" style="margin-bottom:16px;">
+            <label style="font-weight:600; font-size:13px; margin-bottom:6px; display:block;">Distribution</label>
+            <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px;" id="k8s-dist-selector">
+                <label style="display:flex; align-items:center; gap:8px; padding:12px; border:2px solid #326ce5; border-radius:10px; cursor:pointer; background:rgba(50,108,229,0.08); transition:all 0.15s;" onclick="k8sSelectDist('k3s')">
+                    <input type="radio" name="k8s-dist" value="k3s" checked style="accent-color:#326ce5;">
+                    <div>
+                        <div style="font-weight:700; font-size:13px;">k3s</div>
+                        <div style="font-size:10px; color:var(--text-muted);">Lightweight, ideal for edge/IoT</div>
+                    </div>
+                </label>
+                <label style="display:flex; align-items:center; gap:8px; padding:12px; border:2px solid var(--border); border-radius:10px; cursor:pointer; transition:all 0.15s;" onclick="k8sSelectDist('microk8s')">
+                    <input type="radio" name="k8s-dist" value="microk8s" style="accent-color:#326ce5;">
+                    <div>
+                        <div style="font-weight:700; font-size:13px;">MicroK8s</div>
+                        <div style="font-size:10px; color:var(--text-muted);">Snap-based, batteries included</div>
+                    </div>
+                </label>
+                <label style="display:flex; align-items:center; gap:8px; padding:12px; border:2px solid var(--border); border-radius:10px; cursor:pointer; transition:all 0.15s;" onclick="k8sSelectDist('kubeadm')">
+                    <input type="radio" name="k8s-dist" value="kubeadm" style="accent-color:#326ce5;">
+                    <div>
+                        <div style="font-weight:700; font-size:13px;">kubeadm</div>
+                        <div style="font-size:10px; color:var(--text-muted);">Full Kubernetes, production-grade</div>
+                    </div>
+                </label>
+            </div>
+        </div>
+        <div class="form-group" style="margin-bottom:16px;">
+            <label style="font-weight:600; font-size:13px; margin-bottom:6px; display:block;">Server Node <span style="font-weight:400; color:var(--text-muted);">(control plane)</span></label>
+            <select id="k8s-provision-server" class="form-control" style="font-size:14px; padding:10px 12px;">${nodeOpts}</select>
+            <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">The Kubernetes control plane will be installed on this node.</div>
+        </div>
+        <div class="form-group" style="margin-bottom:20px;">
+            <label style="font-weight:600; font-size:13px; margin-bottom:6px; display:block;">Worker Nodes <span style="font-weight:400; color:var(--text-muted);">(optional)</span></label>
+            <select id="k8s-provision-agents" class="form-control" multiple style="height:100px; font-size:14px; padding:8px;">${nodeOpts}</select>
             <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">Hold Ctrl/Cmd to select multiple. These will join as worker nodes.</div>
         </div>
-        <button class="btn btn-primary" onclick="k8sProvision()" style="background:#326ce5; border-color:#326ce5;">Provision</button>
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
+            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+            <button class="btn btn-primary" onclick="k8sProvision()" style="background:#326ce5; border-color:#326ce5; padding:10px 24px; font-size:14px;">Provision Cluster</button>
+        </div>
     `);
 }
+
+function k8sSelectDist(dist) {
+    document.querySelectorAll('#k8s-dist-selector label').forEach(el => {
+        el.style.borderColor = 'var(--border)';
+        el.style.background = 'transparent';
+    });
+    const radio = document.querySelector(`input[name="k8s-dist"][value="${dist}"]`);
+    if (radio) {
+        radio.checked = true;
+        radio.closest('label').style.borderColor = '#326ce5';
+        radio.closest('label').style.background = 'rgba(50,108,229,0.08)';
+    }
+}
+
+let k8sProvisionTerminals = [];  // active provision terminal instances
+let k8sProvisionMeta = null;     // metadata from prepare-provision
 
 async function k8sProvision() {
     const name = document.getElementById('k8s-provision-name').value.trim();
     const serverNodeId = document.getElementById('k8s-provision-server').value;
     const agentSelect = document.getElementById('k8s-provision-agents');
     const agentNodeIds = [...agentSelect.selectedOptions].map(o => o.value).filter(id => id !== serverNodeId);
+    const distribution = document.querySelector('input[name="k8s-dist"]:checked')?.value || 'k3s';
 
     if (!name) { showToast('Please enter a cluster name', 'error'); return; }
     if (!serverNodeId) { showToast('Please select a server node', 'error'); return; }
 
     closeModal();
-    showToast('Provisioning k3s cluster... This may take a few minutes.', 'info', 10000);
+
+    // Phase 1: Prepare server provisioning script
+    try {
+        const resp = await fetch('/api/kubernetes/clusters/prepare-provision', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, server_node_id: serverNodeId, agent_node_ids: agentNodeIds, distribution }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || 'Failed to prepare provisioning');
+
+        k8sProvisionMeta = data;
+
+        // Show the provisioning console view
+        renderK8sProvisionConsole(data, agentNodeIds);
+    } catch (e) {
+        showToast('Provisioning failed: ' + e.message, 'error');
+    }
+}
+
+function renderK8sProvisionConsole(meta, agentNodeIds) {
+    const el = document.getElementById('kubernetes-content');
+    if (!el) return;
+
+    const totalNodes = 1 + agentNodeIds.length;
+    const gridCols = totalNodes <= 1 ? '1fr' : totalNodes === 2 ? '1fr 1fr' : 'repeat(auto-fit, minmax(400px, 1fr))';
+
+    let html = `
+    <div class="card" style="margin-bottom:16px; background:linear-gradient(135deg, rgba(50,108,229,0.12), rgba(50,108,229,0.04)); border-color:rgba(50,108,229,0.25);">
+        <div class="card-body" style="display:flex; align-items:center; justify-content:space-between; padding:16px 24px;">
+            <div style="display:flex; align-items:center; gap:12px;">
+                <div style="width:40px; height:40px; background:linear-gradient(135deg,#326ce5,#54a3ff); border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:20px;">&#9784;</div>
+                <div>
+                    <h3 style="margin:0; font-size:16px; font-weight:700;">Provisioning: ${escapeHtml(meta.cluster_name)}</h3>
+                    <p style="color:var(--text-muted); font-size:12px; margin:2px 0 0 0;">${escapeHtml(meta.distribution)} cluster &mdash; ${totalNodes} node${totalNodes > 1 ? 's' : ''}</p>
+                </div>
+            </div>
+            <div style="display:flex; gap:8px; align-items:center;">
+                <span id="k8s-provision-status" style="font-size:12px; color:#eab308; font-weight:600;">Installing server...</span>
+                <button class="btn btn-sm btn-secondary" onclick="k8sProvisionDone()" style="font-size:11px;">Close</button>
+            </div>
+        </div>
+    </div>
+    <div style="display:grid; grid-template-columns:${gridCols}; gap:12px; height:calc(100vh - 200px); min-height:400px;">`;
+
+    // Server terminal panel
+    const serverSession = meta.sessions[0];
+    html += `
+        <div class="card" style="display:flex; flex-direction:column; overflow:hidden;">
+            <div style="padding:8px 12px; background:rgba(50,108,229,0.08); border-bottom:1px solid var(--border); display:flex; align-items:center; gap:8px;">
+                <span style="width:8px; height:8px; border-radius:50%; background:#eab308;" id="k8s-term-dot-0"></span>
+                <span style="font-weight:600; font-size:12px;">Server: ${escapeHtml(serverSession.hostname)}</span>
+                <span style="font-size:10px; color:var(--text-muted); margin-left:auto;">${escapeHtml(meta.distribution)}</span>
+            </div>
+            <div id="k8s-term-0" style="flex:1; background:#0a0a0a;"></div>
+        </div>`;
+
+    // Agent terminal panels (initially showing "waiting")
+    for (let i = 0; i < agentNodeIds.length; i++) {
+        const agentNode = allNodes.find(n => n.id === agentNodeIds[i]);
+        const hostname = agentNode ? agentNode.hostname : agentNodeIds[i];
+        html += `
+        <div class="card" style="display:flex; flex-direction:column; overflow:hidden;">
+            <div style="padding:8px 12px; background:rgba(50,108,229,0.08); border-bottom:1px solid var(--border); display:flex; align-items:center; gap:8px;">
+                <span style="width:8px; height:8px; border-radius:50%; background:#6b7280;" id="k8s-term-dot-${i + 1}"></span>
+                <span style="font-weight:600; font-size:12px;">Worker: ${escapeHtml(hostname)}</span>
+                <span style="font-size:10px; color:var(--text-muted); margin-left:auto;">agent ${i + 1}</span>
+            </div>
+            <div id="k8s-term-${i + 1}" style="flex:1; background:#0a0a0a; display:flex; align-items:center; justify-content:center;">
+                <span style="color:#6b7280; font-size:13px;" id="k8s-term-waiting-${i + 1}">Waiting for server to finish...</span>
+            </div>
+        </div>`;
+    }
+
+    html += `</div>`;
+    el.innerHTML = html;
+
+    // Start server terminal
+    k8sProvisionTerminals = [];
+    setTimeout(() => k8sStartProvisionTerminal(0, serverSession, agentNodeIds), 200);
+}
+
+function k8sStartProvisionTerminal(index, session, agentNodeIds) {
+    const container = document.getElementById(`k8s-term-${index}`);
+    if (!container) return;
+    container.innerHTML = '';
+
+    // Remove waiting message if present
+    const waitEl = document.getElementById(`k8s-term-waiting-${index}`);
+    if (waitEl) waitEl.remove();
+
+    const term = new Terminal({
+        cursorBlink: true,
+        fontSize: 13,
+        fontFamily: '"JetBrains Mono", "Fira Code", "Cascadia Code", "Courier New", monospace',
+        theme: { background: '#0a0a0a', foreground: '#f0f0f0', cursor: '#10b981', selectionBackground: 'rgba(16, 185, 129, 0.3)' },
+        scrollback: 5000,
+    });
+    const fitAddon = new FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(container);
+
+    function doFit() { try { fitAddon.fit(); } catch (e) {} }
+    setTimeout(doFit, 100);
+    const resizeHandler = () => doFit();
+    window.addEventListener('resize', resizeHandler);
+
+    k8sProvisionTerminals.push({ term, fitAddon, resizeHandler });
+
+    // Update status dot
+    const dot = document.getElementById(`k8s-term-dot-${index}`);
+    if (dot) dot.style.background = '#eab308';
+
+    // Connect WebSocket
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    let wsUrl;
+    if (session.is_remote) {
+        wsUrl = `${protocol}//${window.location.host}/ws/remote-console/${encodeURIComponent(session.node_id)}/k8s-provision/${encodeURIComponent(session.session_id)}`;
+    } else {
+        wsUrl = `${protocol}//${window.location.host}/ws/console/k8s-provision/${encodeURIComponent(session.session_id)}`;
+    }
+
+    const ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => {
+        if (dot) dot.style.background = '#10b981';
+        doFit();
+    };
+    ws.onmessage = (event) => {
+        if (typeof event.data === 'string') term.write(event.data);
+        else term.write(new Uint8Array(event.data));
+    };
+    ws.onclose = () => {
+        if (dot) dot.style.background = '#6366f1';
+
+        if (session.role === 'server' && agentNodeIds && agentNodeIds.length > 0) {
+            // Server done — register cluster, then start agent phase
+            k8sRegisterAndStartAgents(agentNodeIds);
+        } else if (session.role === 'agent') {
+            // Check if all agents are done
+            k8sCheckAllAgentsDone();
+        }
+    };
+    ws.onerror = () => {
+        if (dot) dot.style.background = '#ef4444';
+    };
+    term.onData(data => { if (ws.readyState === WebSocket.OPEN) ws.send(data); });
+}
+
+async function k8sRegisterAndStartAgents(agentNodeIds) {
+    const meta = k8sProvisionMeta;
+    if (!meta) return;
+
+    // Register the cluster first
+    const statusEl = document.getElementById('k8s-provision-status');
+    if (statusEl) statusEl.textContent = 'Registering cluster...';
 
     try {
-        const resp = await fetch('/api/kubernetes/clusters/provision', {
+        await fetch('/api/kubernetes/clusters', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                name,
-                server_node_id: serverNodeId,
+                name: meta.cluster_name,
+                kubeconfig_path: meta.kubeconfig_path,
+                cluster_type: meta.cluster_type,
+            }),
+        });
+    } catch (e) { /* will register on refresh anyway */ }
+
+    if (agentNodeIds.length === 0) {
+        if (statusEl) statusEl.textContent = 'Complete!';
+        if (statusEl) statusEl.style.color = '#10b981';
+        showToast(`${meta.distribution} cluster "${meta.cluster_name}" provisioned!`, 'success');
+        return;
+    }
+
+    // Phase 2: Prepare agent scripts
+    if (statusEl) statusEl.textContent = 'Starting worker nodes...';
+
+    try {
+        const resp = await fetch('/api/kubernetes/clusters/prepare-provision-agents', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                distribution: meta.distribution,
+                cluster_name: meta.cluster_name,
+                kubeconfig_path: meta.kubeconfig_path,
+                api_url: meta.api_url,
+                server_address: meta.server_address,
                 agent_node_ids: agentNodeIds,
             }),
         });
         const data = await resp.json().catch(() => ({}));
-        if (!resp.ok) throw new Error(data.error || 'Provisioning failed');
-        showToast(data.message || 'k3s cluster provisioned!', 'success');
-        loadKubernetesClusters();
+        if (!resp.ok) {
+            showToast('Agent provisioning failed: ' + (data.error || 'Unknown error'), 'error');
+            return;
+        }
+
+        // Start agent terminals
+        data.sessions.forEach((session, i) => {
+            setTimeout(() => k8sStartProvisionTerminal(i + 1, session, null), i * 500);
+        });
     } catch (e) {
-        showToast('Provisioning failed: ' + e.message, 'error');
+        showToast('Agent provisioning failed: ' + e.message, 'error');
     }
+}
+
+let k8sAgentsDoneCount = 0;
+function k8sCheckAllAgentsDone() {
+    k8sAgentsDoneCount++;
+    const meta = k8sProvisionMeta;
+    if (!meta) return;
+    const totalAgents = meta.agent_node_ids.length;
+    if (k8sAgentsDoneCount >= totalAgents) {
+        const statusEl = document.getElementById('k8s-provision-status');
+        if (statusEl) { statusEl.textContent = 'Complete!'; statusEl.style.color = '#10b981'; }
+        showToast(`${meta.distribution} cluster "${meta.cluster_name}" provisioned with ${totalAgents} worker${totalAgents > 1 ? 's' : ''}!`, 'success');
+    }
+}
+
+function k8sProvisionDone() {
+    // Cleanup terminals
+    k8sProvisionTerminals.forEach(t => {
+        window.removeEventListener('resize', t.resizeHandler);
+        try { t.term.dispose(); } catch (e) {}
+    });
+    k8sProvisionTerminals = [];
+    k8sProvisionMeta = null;
+    k8sAgentsDoneCount = 0;
+    loadKubernetesClusters();
 }
 
 // ─── Import Cluster Modal ───
 
 function showK8sImportModal() {
     showModal(`
-        <h3 style="margin-bottom:16px;">Import Kubernetes Cluster</h3>
-        <div class="form-group">
-            <label>Cluster Name</label>
-            <input type="text" id="k8s-import-name" class="form-control" placeholder="production-cluster">
+        <div style="margin-bottom:20px;">
+            <div style="display:flex; align-items:center; gap:12px; margin-bottom:4px;">
+                <div style="width:40px; height:40px; background:linear-gradient(135deg,#326ce5,#54a3ff); border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:20px;">&#9784;</div>
+                <h3 style="margin:0; font-size:18px; font-weight:700;">Import Kubernetes Cluster</h3>
+            </div>
+            <p style="color:var(--text-muted); font-size:12px; margin:4px 0 0 52px;">Paste a kubeconfig to add an existing cluster to WolfKube.</p>
         </div>
-        <div class="form-group">
-            <label>Kubeconfig Contents</label>
-            <textarea id="k8s-import-kubeconfig" class="form-control" rows="12" style="font-family:monospace; font-size:11px;" placeholder="Paste your kubeconfig YAML here..."></textarea>
+        <div class="form-group" style="margin-bottom:16px;">
+            <label style="font-weight:600; font-size:13px; margin-bottom:6px; display:block;">Cluster Name</label>
+            <input type="text" id="k8s-import-name" class="form-control" placeholder="production-cluster" style="font-size:14px; padding:10px 12px;">
         </div>
-        <button class="btn btn-primary" onclick="k8sImportCluster()" style="background:#326ce5; border-color:#326ce5;">Import</button>
+        <div class="form-group" style="margin-bottom:20px;">
+            <label style="font-weight:600; font-size:13px; margin-bottom:6px; display:block;">Kubeconfig YAML</label>
+            <textarea id="k8s-import-kubeconfig" class="form-control" rows="12" style="font-family:monospace; font-size:11px; padding:12px;" placeholder="apiVersion: v1\nclusters:\n- cluster:\n    server: https://...\n  name: my-cluster\n..."></textarea>
+        </div>
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
+            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+            <button class="btn btn-primary" onclick="k8sImportCluster()" style="background:#326ce5; border-color:#326ce5; padding:10px 24px; font-size:14px;">Import Cluster</button>
+        </div>
     `);
 }
 
@@ -21948,5 +22248,98 @@ async function k8sImportCluster() {
         if (!resp.ok) throw new Error(data.error || 'Import failed');
         showToast(data.message || 'Cluster imported!', 'success');
         loadKubernetesClusters();
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+}
+
+// ─── WolfNet Integration ───
+
+function renderK8sWolfNet(status) {
+    const deployed = status.deployed;
+    if (deployed) {
+        return `
+        <div class="card" style="border-color:rgba(16,185,129,0.3); background:rgba(16,185,129,0.06);">
+            <div class="card-body" style="padding:32px;">
+                <div style="display:flex; align-items:center; gap:16px; margin-bottom:16px;">
+                    <div style="width:48px; height:48px; background:linear-gradient(135deg,#10b981,#34d399); border-radius:12px; display:flex; align-items:center; justify-content:center; font-size:24px; color:#fff;">&#127760;</div>
+                    <div>
+                        <h3 style="margin:0; font-size:18px; font-weight:700; color:var(--text-primary);">WolfNet Active</h3>
+                        <p style="color:var(--text-secondary); font-size:13px; margin:2px 0 0 0;">WolfNet overlay networking is deployed on this cluster.</p>
+                    </div>
+                </div>
+                <div style="background:var(--bg-secondary); border-radius:8px; padding:16px; margin-bottom:16px;">
+                    <div style="font-size:12px; color:var(--text-muted); margin-bottom:8px; text-transform:uppercase; letter-spacing:1px;">Details</div>
+                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; font-size:13px;">
+                        <div><strong>Namespace:</strong> wolfnet-system</div>
+                        <div><strong>Type:</strong> DaemonSet (all nodes)</div>
+                        <div><strong>Encryption:</strong> WireGuard</div>
+                        <div><strong>Status:</strong> <span style="color:#10b981; font-weight:600;">Running</span></div>
+                    </div>
+                </div>
+                <button class="btn btn-danger" onclick="k8sRemoveWolfNet()" style="font-size:13px;">Remove WolfNet</button>
+            </div>
+        </div>`;
+    } else {
+        return `
+        <div class="card">
+            <div class="card-body" style="padding:32px;">
+                <div style="display:flex; align-items:center; gap:16px; margin-bottom:16px;">
+                    <div style="width:48px; height:48px; background:linear-gradient(135deg,#6366f1,#818cf8); border-radius:12px; display:flex; align-items:center; justify-content:center; font-size:24px; color:#fff;">&#127760;</div>
+                    <div>
+                        <h3 style="margin:0; font-size:18px; font-weight:700; color:var(--text-primary);">WolfNet Overlay Network</h3>
+                        <p style="color:var(--text-secondary); font-size:13px; margin:2px 0 0 0;">Connect this cluster's nodes with encrypted WireGuard tunnels via WolfNet.</p>
+                    </div>
+                </div>
+                <div style="background:var(--bg-secondary); border-radius:8px; padding:16px; margin-bottom:20px;">
+                    <div style="font-size:12px; color:var(--text-muted); margin-bottom:8px; text-transform:uppercase; letter-spacing:1px;">What WolfNet does</div>
+                    <ul style="margin:0; padding-left:20px; font-size:13px; color:var(--text-secondary); line-height:1.8;">
+                        <li>Deploys a WolfNet DaemonSet on every node in the cluster</li>
+                        <li>Creates encrypted WireGuard tunnels between all nodes</li>
+                        <li>Enables secure inter-node communication via the WolfNet mesh</li>
+                        <li>Pods on different nodes can communicate through the overlay</li>
+                    </ul>
+                </div>
+                <div class="form-group" style="margin-bottom:16px;">
+                    <label style="font-weight:600; font-size:13px; margin-bottom:6px; display:block;">WolfNet Server Address</label>
+                    <input type="text" id="k8s-wolfnet-server" class="form-control" placeholder="10.0.0.1" style="font-size:14px; padding:10px 12px;">
+                    <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">IP address of your WolfNet coordination server.</div>
+                </div>
+                <div class="form-group" style="margin-bottom:20px;">
+                    <label style="font-weight:600; font-size:13px; margin-bottom:6px; display:block;">WolfNet Network CIDR</label>
+                    <input type="text" id="k8s-wolfnet-network" class="form-control" value="10.10.0.0/24" placeholder="10.10.0.0/24" style="font-size:14px; padding:10px 12px;">
+                    <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">The overlay network CIDR for WolfNet.</div>
+                </div>
+                <button class="btn btn-primary" onclick="k8sDeployWolfNet()" style="background:linear-gradient(135deg,#6366f1,#818cf8); border:none; padding:10px 24px; font-size:14px;">Deploy WolfNet</button>
+            </div>
+        </div>`;
+    }
+}
+
+async function k8sDeployWolfNet() {
+    const wolfnetServer = document.getElementById('k8s-wolfnet-server')?.value.trim();
+    const wolfnetNetwork = document.getElementById('k8s-wolfnet-network')?.value.trim() || '10.10.0.0/24';
+    if (!wolfnetServer) { showToast('Please enter the WolfNet server address', 'error'); return; }
+
+    showToast('Deploying WolfNet to cluster...', 'info', 10000);
+    try {
+        const resp = await fetch(`/api/kubernetes/clusters/${k8sCurrentCluster}/wolfnet`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ wolfnet_server: wolfnetServer, wolfnet_network: wolfnetNetwork }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || 'Deployment failed');
+        showToast('WolfNet deployed successfully!', 'success');
+        setTimeout(() => switchK8sTab('wolfnet'), 1000);
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+}
+
+async function k8sRemoveWolfNet() {
+    if (!(await showConfirm('Remove WolfNet overlay from this cluster? This will tear down the encrypted tunnels between nodes.'))) return;
+    try {
+        const resp = await fetch(`/api/kubernetes/clusters/${k8sCurrentCluster}/wolfnet`, { method: 'DELETE' });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || 'Removal failed');
+        showToast('WolfNet removed from cluster', 'success');
+        setTimeout(() => switchK8sTab('wolfnet'), 1000);
     } catch (e) { showToast('Failed: ' + e.message, 'error'); }
 }

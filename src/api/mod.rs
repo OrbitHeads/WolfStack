@@ -8365,6 +8365,7 @@ pub async fn k8s_create_cluster(req: HttpRequest, state: web::Data<AppState>, bo
         .unwrap_or_default();
     let cluster_type = match body.cluster_type.as_deref() {
         Some("k3s") => crate::kubernetes::K8sClusterType::K3s,
+        Some("micro_k8s" | "microk8s") => crate::kubernetes::K8sClusterType::MicroK8s,
         Some("eks") => crate::kubernetes::K8sClusterType::Eks,
         Some("gke") => crate::kubernetes::K8sClusterType::Gke,
         Some("aks") => crate::kubernetes::K8sClusterType::Aks,
@@ -8652,17 +8653,92 @@ pub async fn k8s_deploy_app(req: HttpRequest, state: web::Data<AppState>, path: 
     }
 }
 
-/// POST /api/kubernetes/clusters/provision — provision a k3s cluster
+/// POST /api/kubernetes/clusters/provision — provision a kubernetes cluster
 #[derive(Deserialize)]
 pub struct K8sProvisionRequest {
     pub name: String,
     pub server_node_id: String,
     #[serde(default)]
     pub agent_node_ids: Vec<String>,
+    #[serde(default = "default_distribution")]
+    pub distribution: String,  // "k3s", "microk8s", "kubeadm"
+}
+
+fn default_distribution() -> String { "k3s".to_string() }
+
+/// Run a script locally on this node
+fn run_script_locally(script: &str) -> Result<String, String> {
+    let script_path = format!("/tmp/wolfstack-k8s-{}.sh", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
+    std::fs::write(&script_path, script).map_err(|e| format!("Failed to write script: {}", e))?;
+    let output = std::process::Command::new("bash").arg(&script_path).output();
+    let _ = std::fs::remove_file(&script_path);
+    match output {
+        Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).to_string()),
+        Ok(o) => Err(String::from_utf8_lossy(&o.stderr).to_string()),
+        Err(e) => Err(format!("Failed to run script: {}", e)),
+    }
+}
+
+/// Run a script on a remote node via the /api/kubernetes/run-script proxy endpoint
+async fn run_script_on_remote(address: &str, port: u16, cluster_secret: &str, script: &str) -> Result<String, String> {
+    let urls = build_node_urls(address, port, "/api/kubernetes/run-script");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+    for url in &urls {
+        match client.post(url)
+            .header("X-WolfStack-Secret", cluster_secret)
+            .json(&serde_json::json!({ "script": script }))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                return body["output"].as_str().map(|s| s.to_string())
+                    .ok_or_else(|| body["error"].as_str().unwrap_or("Unknown error").to_string());
+            }
+            _ => continue,
+        }
+    }
+    Err(format!("Failed to reach remote node at {}", address))
+}
+
+/// Fetch a JSON value from a remote node endpoint
+async fn fetch_from_remote(address: &str, port: u16, path: &str, cluster_secret: &str) -> Result<serde_json::Value, String> {
+    let urls = build_node_urls(address, port, path);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+    for url in &urls {
+        match client.get(url)
+            .header("X-WolfStack-Secret", cluster_secret)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                return resp.json().await.map_err(|e| format!("JSON parse error: {}", e));
+            }
+            _ => continue,
+        }
+    }
+    Err(format!("Failed to reach remote node at {}", address))
 }
 
 pub async fn k8s_provision(req: HttpRequest, state: web::Data<AppState>, body: web::Json<K8sProvisionRequest>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    let dist = body.distribution.to_lowercase();
+    let cluster_type = match dist.as_str() {
+        "k3s" => crate::kubernetes::K8sClusterType::K3s,
+        "microk8s" => crate::kubernetes::K8sClusterType::MicroK8s,
+        "kubeadm" | "k8s" => crate::kubernetes::K8sClusterType::K8s,
+        _ => return HttpResponse::BadRequest().json(serde_json::json!({ "error": format!("Unsupported distribution: {}. Use k3s, microk8s, or kubeadm.", dist) })),
+    };
 
     // Find the server node
     let server_node = match state.cluster.get_node(&body.server_node_id) {
@@ -8672,48 +8748,468 @@ pub async fn k8s_provision(req: HttpRequest, state: web::Data<AppState>, body: w
 
     let is_self = server_node.is_self;
     let server_address = server_node.address.clone();
+    let server_port = server_node.port;
     let cluster_name = body.name.clone();
+    let cluster_secret = state.cluster_secret.clone();
 
-    // Generate and run the k3s server install script
-    let script = match crate::kubernetes::provision_k3s_server(&server_address, &cluster_name) {
+    // Generate the server install script based on distribution
+    let script = match dist.as_str() {
+        "k3s" => crate::kubernetes::provision_k3s_server(&server_address, &cluster_name),
+        "microk8s" => crate::kubernetes::provision_microk8s_server(&server_address, &cluster_name),
+        "kubeadm" | "k8s" => crate::kubernetes::provision_kubeadm_server(&server_address, &cluster_name),
+        _ => unreachable!(),
+    };
+    let script = match script {
         Ok(s) => s,
         Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
     };
 
-    if is_self {
-        // Run locally
-        let script_path = format!("/tmp/wolfstack-k3s-{}.sh", cluster_name);
-        if let Err(e) = std::fs::write(&script_path, &script) {
+    // 1. Install server
+    let server_result = if is_self {
+        run_script_locally(&script)
+    } else {
+        run_script_on_remote(&server_address, server_port, &cluster_secret, &script).await
+    };
+    if let Err(e) = server_result {
+        return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("{} server install failed: {}", dist, e)
+        }));
+    }
+
+    // 2. Get the kubeconfig path
+    let default_kubeconfig_path = match dist.as_str() {
+        "k3s" => "/etc/rancher/k3s/k3s.yaml",
+        "microk8s" => "/var/snap/microk8s/current/credentials/client.config",
+        "kubeadm" | "k8s" => "/etc/kubernetes/admin.conf",
+        _ => "/root/.kube/config",
+    };
+
+    let kubeconfig_path = if is_self {
+        default_kubeconfig_path.to_string()
+    } else {
+        // Fetch kubeconfig from remote node
+        let fetch_result = fetch_from_remote(&server_address, server_port, "/api/kubernetes/kubeconfig", &cluster_secret).await;
+        match fetch_result {
+            Ok(body) => {
+                if let Some(content) = body["kubeconfig"].as_str() {
+                    let content = content.replace("127.0.0.1", &server_address).replace("localhost", &server_address);
+                    let dir = "/etc/wolfstack/kubernetes";
+                    let _ = std::fs::create_dir_all(dir);
+                    let safe_name = cluster_name.to_lowercase().replace(|c: char| !c.is_alphanumeric(), "-");
+                    let path = format!("{}/{}-{}.yaml", dir, dist, safe_name);
+                    let _ = std::fs::write(&path, &content);
+                    path
+                } else {
+                    return HttpResponse::InternalServerError().json(serde_json::json!({
+                        "error": format!("{} server installed but kubeconfig response was empty", dist)
+                    }));
+                }
+            }
+            Err(_) => {
+                return HttpResponse::InternalServerError().json(serde_json::json!({
+                    "error": format!("{} server installed but could not fetch kubeconfig from remote node", dist)
+                }));
+            }
+        }
+    };
+
+    let api_port = match dist.as_str() {
+        "microk8s" => 16443,
+        _ => 6443,
+    };
+    let api_url = format!("https://{}:{}", server_address, api_port);
+    let cluster_id = format!("k8s-{}", cluster_name.to_lowercase().replace(|c: char| !c.is_alphanumeric(), "-"));
+    let cluster = match crate::kubernetes::add_cluster(cluster_id, cluster_name.clone(), kubeconfig_path.clone(), api_url.clone(), cluster_type) {
+        Ok(c) => c,
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    };
+
+    // 3. Install agents on worker nodes
+    let mut agent_errors = Vec::new();
+    if !body.agent_node_ids.is_empty() {
+        // Get join credentials from the server
+        let join_info: Result<String, String> = if is_self {
+            match dist.as_str() {
+                "k3s" => crate::kubernetes::get_k3s_token(&kubeconfig_path),
+                "microk8s" => crate::kubernetes::get_microk8s_join_command(),
+                "kubeadm" | "k8s" => crate::kubernetes::get_kubeadm_join_command(),
+                _ => Err("Unsupported distribution".to_string()),
+            }
+        } else {
+            // Get join info from remote server
+            fetch_from_remote(&server_address, server_port, "/api/kubernetes/join-token", &cluster_secret).await
+                .and_then(|body| body["token"].as_str().map(|s| s.to_string())
+                    .ok_or_else(|| "No join token in response".to_string()))
+        };
+
+        let join_info = match join_info {
+            Ok(t) => t,
+            Err(e) => {
+                return HttpResponse::Ok().json(serde_json::json!({
+                    "message": format!("{} server provisioned but failed to get join credentials for agents: {}", dist, e),
+                    "cluster": cluster,
+                }));
+            }
+        };
+
+        for agent_node_id in &body.agent_node_ids {
+            let agent_node = match state.cluster.get_node(agent_node_id) {
+                Some(n) => n,
+                None => { agent_errors.push(format!("{}: node not found", agent_node_id)); continue; }
+            };
+            let agent_script = match dist.as_str() {
+                "k3s" => crate::kubernetes::provision_k3s_agent(&agent_node.address, &api_url, &join_info),
+                "microk8s" => crate::kubernetes::provision_microk8s_agent(&join_info),
+                "kubeadm" | "k8s" => crate::kubernetes::provision_kubeadm_agent(&join_info),
+                _ => Err("Unsupported distribution".to_string()),
+            };
+            let agent_script = match agent_script {
+                Ok(s) => s,
+                Err(e) => { agent_errors.push(format!("{}: {}", agent_node.hostname, e)); continue; }
+            };
+            let result = if agent_node.is_self {
+                run_script_locally(&agent_script)
+            } else {
+                run_script_on_remote(&agent_node.address, agent_node.port, &cluster_secret, &agent_script).await
+            };
+            if let Err(e) = result {
+                agent_errors.push(format!("{}: {}", agent_node.hostname, e));
+            }
+        }
+    }
+
+    let mut msg = format!("{} cluster '{}' provisioned successfully", dist, cluster_name);
+    if !agent_errors.is_empty() {
+        msg.push_str(&format!(". Agent errors: {}", agent_errors.join("; ")));
+    }
+    HttpResponse::Ok().json(serde_json::json!({ "message": msg, "cluster": cluster }))
+}
+
+/// POST /api/kubernetes/prepare-provision — generate provisioning scripts for live terminal execution
+/// Returns session IDs that can be used with the k8s-provision console type.
+pub async fn k8s_prepare_provision(req: HttpRequest, state: web::Data<AppState>, body: web::Json<K8sProvisionRequest>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    let dist = body.distribution.to_lowercase();
+    if !["k3s", "microk8s", "kubeadm", "k8s"].contains(&dist.as_str()) {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": format!("Unsupported distribution: {}. Use k3s, microk8s, or kubeadm.", dist)
+        }));
+    }
+
+    let server_node = match state.cluster.get_node(&body.server_node_id) {
+        Some(n) => n,
+        None => return HttpResponse::NotFound().json(serde_json::json!({ "error": "Server node not found" })),
+    };
+
+    let server_address = server_node.address.clone();
+    let server_port = server_node.port;
+    let cluster_name = body.name.clone();
+    let cluster_secret = state.cluster_secret.clone();
+    let ts = chrono::Utc::now().timestamp_millis();
+
+    // --- Generate server install script ---
+    let cluster_type = match dist.as_str() {
+        "k3s" => crate::kubernetes::K8sClusterType::K3s,
+        "microk8s" => crate::kubernetes::K8sClusterType::MicroK8s,
+        _ => crate::kubernetes::K8sClusterType::K8s,
+    };
+
+    let server_install = match dist.as_str() {
+        "k3s" => crate::kubernetes::provision_k3s_server(&server_address, &cluster_name),
+        "microk8s" => crate::kubernetes::provision_microk8s_server(&server_address, &cluster_name),
+        "kubeadm" | "k8s" => crate::kubernetes::provision_kubeadm_server(&server_address, &cluster_name),
+        _ => unreachable!(),
+    };
+    let server_install = match server_install {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    };
+
+    // Wrap in a nicer script with banner
+    let server_session_id = format!("{}-server-{}", dist, ts);
+    let kubeconfig_path = match dist.as_str() {
+        "k3s" => "/etc/rancher/k3s/k3s.yaml",
+        "microk8s" => "/var/snap/microk8s/current/credentials/client.config",
+        _ => "/etc/kubernetes/admin.conf",
+    };
+    let api_port: u16 = if dist == "microk8s" { 16443 } else { 6443 };
+
+    let server_script = format!(
+        "#!/bin/bash\nset -e\n\n\
+         echo -e '\\033[1;36m━━━ WolfKube — Installing {dist} server on {addr} ━━━\\033[0m'\n\
+         echo -e '\\033[0;90mCluster: {name}\\033[0m'\n\
+         echo ''\n\n\
+         {install}\n\n\
+         echo ''\n\
+         echo -e '\\033[1;32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\033[0m'\n\
+         echo -e '\\033[1;32m  ✅ {dist} server installed successfully!\\033[0m'\n\
+         echo -e '\\033[1;32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\033[0m'\n\
+         echo -e '\\033[0;36m  Kubeconfig: {kubeconfig}\\033[0m'\n",
+        dist = dist, addr = server_address, name = cluster_name,
+        install = server_install, kubeconfig = kubeconfig_path,
+    );
+
+    let server_script_path = format!("/tmp/wolfstack-k8s-provision-{}.sh", server_session_id);
+
+    // Write script: locally or on remote node
+    let mut sessions = Vec::new();
+
+    if server_node.is_self {
+        if let Err(e) = std::fs::write(&server_script_path, &server_script) {
             return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Failed to write script: {}", e) }));
         }
-        let output = std::process::Command::new("bash").arg(&script_path).output();
-        let _ = std::fs::remove_file(&script_path);
-        match output {
-            Ok(o) if o.status.success() => {},
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("k3s install failed: {}", stderr) }));
-            },
-            Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Failed to run script: {}", e) })),
+        let _ = std::process::Command::new("chmod").args(["+x", &server_script_path]).output();
+    } else {
+        // Write script on remote node via API
+        let write_result = run_script_on_remote(
+            &server_address, server_port, &cluster_secret,
+            &format!("cat > {} << 'WOLFKUBE_SCRIPT_EOF'\n{}\nWOLFKUBE_SCRIPT_EOF\nchmod +x {}", server_script_path, server_script, server_script_path),
+        ).await;
+        if let Err(e) = write_result {
+            return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Failed to write script on remote node: {}", e) }));
+        }
+    }
+
+    sessions.push(serde_json::json!({
+        "session_id": server_session_id,
+        "node_id": body.server_node_id,
+        "hostname": server_node.hostname,
+        "role": "server",
+        "is_remote": !server_node.is_self,
+    }));
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "sessions": sessions,
+        "cluster_name": cluster_name,
+        "distribution": dist,
+        "cluster_type": cluster_type.to_string(),
+        "kubeconfig_path": kubeconfig_path,
+        "api_url": format!("https://{}:{}", server_address, api_port),
+        "server_address": server_address,
+        "agent_node_ids": body.agent_node_ids,
+    }))
+}
+
+/// POST /api/kubernetes/prepare-provision-agents — generate agent scripts after server is ready
+#[derive(Deserialize)]
+#[allow(dead_code)]
+pub struct K8sPrepareAgentsRequest {
+    pub distribution: String,
+    pub cluster_name: String,
+    pub kubeconfig_path: String,
+    pub api_url: String,
+    pub server_address: String,
+    pub agent_node_ids: Vec<String>,
+}
+
+pub async fn k8s_prepare_provision_agents(req: HttpRequest, state: web::Data<AppState>, body: web::Json<K8sPrepareAgentsRequest>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    let dist = body.distribution.to_lowercase();
+    let cluster_secret = state.cluster_secret.clone();
+    let ts = chrono::Utc::now().timestamp_millis();
+
+    // Get join token/command from the server
+    let join_info = match dist.as_str() {
+        "k3s" => crate::kubernetes::get_k3s_token(&body.kubeconfig_path),
+        "microk8s" => crate::kubernetes::get_microk8s_join_command(),
+        "kubeadm" | "k8s" => crate::kubernetes::get_kubeadm_join_command(),
+        _ => Err("Unsupported distribution".to_string()),
+    };
+    let join_info = match join_info {
+        Ok(t) => t,
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("Failed to get join credentials: {}", e)
+        })),
+    };
+
+    let mut sessions = Vec::new();
+    let mut errors = Vec::new();
+
+    for (i, agent_node_id) in body.agent_node_ids.iter().enumerate() {
+        let agent_node = match state.cluster.get_node(agent_node_id) {
+            Some(n) => n,
+            None => { errors.push(format!("{}: node not found", agent_node_id)); continue; }
+        };
+
+        let agent_install = match dist.as_str() {
+            "k3s" => crate::kubernetes::provision_k3s_agent(&agent_node.address, &body.api_url, &join_info),
+            "microk8s" => crate::kubernetes::provision_microk8s_agent(&join_info),
+            "kubeadm" | "k8s" => crate::kubernetes::provision_kubeadm_agent(&join_info),
+            _ => Err("Unsupported".to_string()),
+        };
+        let agent_install = match agent_install {
+            Ok(s) => s,
+            Err(e) => { errors.push(format!("{}: {}", agent_node.hostname, e)); continue; }
+        };
+
+        let session_id = format!("{}-agent{}-{}", dist, i, ts);
+        let script = format!(
+            "#!/bin/bash\nset -e\n\n\
+             echo -e '\\033[1;36m━━━ WolfKube — Joining {hostname} as {dist} worker ━━━\\033[0m'\n\
+             echo ''\n\n\
+             {install}\n\n\
+             echo ''\n\
+             echo -e '\\033[1;32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\033[0m'\n\
+             echo -e '\\033[1;32m  ✅ {hostname} joined the cluster!\\033[0m'\n\
+             echo -e '\\033[1;32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\033[0m'\n",
+            hostname = agent_node.hostname, dist = dist, install = agent_install,
+        );
+
+        let script_path = format!("/tmp/wolfstack-k8s-provision-{}.sh", session_id);
+        if agent_node.is_self {
+            if let Err(e) = std::fs::write(&script_path, &script) {
+                errors.push(format!("{}: {}", agent_node.hostname, e));
+                continue;
+            }
+            let _ = std::process::Command::new("chmod").args(["+x", &script_path]).output();
+        } else {
+            let write_result = run_script_on_remote(
+                &agent_node.address, agent_node.port, &cluster_secret,
+                &format!("cat > {} << 'WOLFKUBE_SCRIPT_EOF'\n{}\nWOLFKUBE_SCRIPT_EOF\nchmod +x {}", script_path, script, script_path),
+            ).await;
+            if let Err(e) = write_result {
+                errors.push(format!("{}: {}", agent_node.hostname, e));
+                continue;
+            }
         }
 
-        // k3s installed — register the cluster
-        let kubeconfig_path = "/etc/rancher/k3s/k3s.yaml".to_string();
-        let api_url = format!("https://{}:6443", server_address);
-        let cluster_id = format!("k8s-{}", cluster_name.to_lowercase().replace(|c: char| !c.is_alphanumeric(), "-"));
-        match crate::kubernetes::add_cluster(cluster_id, cluster_name.clone(), kubeconfig_path, api_url, crate::kubernetes::K8sClusterType::K3s) {
-            Ok(cluster) => HttpResponse::Ok().json(serde_json::json!({
-                "message": format!("k3s cluster '{}' provisioned successfully", cluster_name),
-                "cluster": cluster,
-            })),
-            Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
-        }
-    } else {
-        // For remote nodes, we'd need to proxy the install — simplified for now
-        HttpResponse::BadRequest().json(serde_json::json!({
-            "error": "Remote k3s provisioning is not yet supported. Please install k3s on the remote node manually and import the kubeconfig."
-        }))
+        sessions.push(serde_json::json!({
+            "session_id": session_id,
+            "node_id": agent_node_id,
+            "hostname": agent_node.hostname,
+            "role": "agent",
+            "is_remote": !agent_node.is_self,
+        }));
     }
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "sessions": sessions,
+        "errors": errors,
+    }))
+}
+
+/// POST /api/kubernetes/run-script — run a provisioning script on this node (cluster-secret auth)
+#[derive(Deserialize)]
+pub struct K8sRunScriptRequest {
+    pub script: String,
+}
+
+pub async fn k8s_run_script(req: HttpRequest, state: web::Data<AppState>, body: web::Json<K8sRunScriptRequest>) -> HttpResponse {
+    // Agent-style auth: cluster secret header
+    let secret = req.headers().get("X-WolfStack-Secret").and_then(|v| v.to_str().ok()).unwrap_or("");
+    if secret != state.cluster_secret {
+        if let Err(resp) = require_auth(&req, &state) { return resp; }
+    }
+    let script_path = format!("/tmp/wolfstack-k8s-provision-{}.sh",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
+    if let Err(e) = std::fs::write(&script_path, &body.script) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Failed to write script: {}", e) }));
+    }
+    let output = std::process::Command::new("bash").arg(&script_path).output();
+    let _ = std::fs::remove_file(&script_path);
+    match output {
+        Ok(o) if o.status.success() => {
+            HttpResponse::Ok().json(serde_json::json!({ "output": String::from_utf8_lossy(&o.stdout).to_string() }))
+        }
+        Ok(o) => {
+            HttpResponse::InternalServerError().json(serde_json::json!({ "error": String::from_utf8_lossy(&o.stderr).to_string() }))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Failed to run script: {}", e) })),
+    }
+}
+
+/// GET /api/kubernetes/kubeconfig — return the local kubeconfig (cluster-secret auth)
+/// Tries k3s, microk8s, kubeadm in order of detection
+pub async fn k8s_kubeconfig(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    let secret = req.headers().get("X-WolfStack-Secret").and_then(|v| v.to_str().ok()).unwrap_or("");
+    if secret != state.cluster_secret {
+        if let Err(resp) = require_auth(&req, &state) { return resp; }
+    }
+    // Try known kubeconfig paths in order
+    let paths = [
+        "/etc/rancher/k3s/k3s.yaml",
+        "/var/snap/microk8s/current/credentials/client.config",
+        "/etc/kubernetes/admin.conf",
+        "/root/.kube/config",
+    ];
+    for path in &paths {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            return HttpResponse::Ok().json(serde_json::json!({ "kubeconfig": content, "path": path }));
+        }
+    }
+    HttpResponse::NotFound().json(serde_json::json!({ "error": "No kubeconfig found on this node" }))
+}
+
+/// GET /api/kubernetes/join-token — return the join token/command for this node (cluster-secret auth)
+pub async fn k8s_join_token(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    let secret = req.headers().get("X-WolfStack-Secret").and_then(|v| v.to_str().ok()).unwrap_or("");
+    if secret != state.cluster_secret {
+        if let Err(resp) = require_auth(&req, &state) { return resp; }
+    }
+    // Try k3s token
+    if std::path::Path::new("/var/lib/rancher/k3s/server/node-token").exists() {
+        match crate::kubernetes::get_k3s_token("/etc/rancher/k3s/k3s.yaml") {
+            Ok(token) => return HttpResponse::Ok().json(serde_json::json!({ "token": token, "type": "k3s" })),
+            Err(_) => {}
+        }
+    }
+    // Try microk8s join
+    if let Ok(join) = crate::kubernetes::get_microk8s_join_command() {
+        return HttpResponse::Ok().json(serde_json::json!({ "token": join, "type": "microk8s" }));
+    }
+    // Try kubeadm join
+    if let Ok(join) = crate::kubernetes::get_kubeadm_join_command() {
+        return HttpResponse::Ok().json(serde_json::json!({ "token": join, "type": "kubeadm" }));
+    }
+    HttpResponse::NotFound().json(serde_json::json!({ "error": "No join token available on this node" }))
+}
+
+/// POST /api/kubernetes/clusters/{id}/wolfnet — deploy WolfNet to a k8s cluster
+#[derive(Deserialize)]
+pub struct K8sWolfNetRequest {
+    pub wolfnet_server: String,
+    #[serde(default = "default_wolfnet_network")]
+    pub wolfnet_network: String,
+}
+
+fn default_wolfnet_network() -> String { "10.10.0.0/24".to_string() }
+
+pub async fn k8s_deploy_wolfnet(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<K8sWolfNetRequest>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let cluster = match crate::kubernetes::get_cluster(&path.into_inner()) {
+        Some(c) => c,
+        None => return HttpResponse::NotFound().json(serde_json::json!({ "error": "Cluster not found" })),
+    };
+    match crate::kubernetes::deploy_wolfnet_to_cluster(&cluster.kubeconfig_path, &body.wolfnet_server, &body.wolfnet_network) {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// DELETE /api/kubernetes/clusters/{id}/wolfnet — remove WolfNet from a k8s cluster
+pub async fn k8s_remove_wolfnet(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let cluster = match crate::kubernetes::get_cluster(&path.into_inner()) {
+        Some(c) => c,
+        None => return HttpResponse::NotFound().json(serde_json::json!({ "error": "Cluster not found" })),
+    };
+    match crate::kubernetes::remove_wolfnet_from_cluster(&cluster.kubeconfig_path) {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// GET /api/kubernetes/clusters/{id}/wolfnet — check WolfNet status on a k8s cluster
+pub async fn k8s_wolfnet_status(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let cluster = match crate::kubernetes::get_cluster(&path.into_inner()) {
+        Some(c) => c,
+        None => return HttpResponse::NotFound().json(serde_json::json!({ "error": "Cluster not found" })),
+    };
+    let deployed = crate::kubernetes::is_wolfnet_deployed(&cluster.kubeconfig_path);
+    HttpResponse::Ok().json(serde_json::json!({ "deployed": deployed }))
 }
 
 // ─── Security (Fail2ban, iptables, UFW) ───
@@ -11340,9 +11836,14 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/geolocate", web::get().to(geolocate))
         // Kubernetes
         .route("/api/kubernetes/detect", web::get().to(k8s_detect))
+        .route("/api/kubernetes/run-script", web::post().to(k8s_run_script))
+        .route("/api/kubernetes/kubeconfig", web::get().to(k8s_kubeconfig))
+        .route("/api/kubernetes/join-token", web::get().to(k8s_join_token))
         .route("/api/kubernetes/clusters", web::get().to(k8s_list_clusters))
         .route("/api/kubernetes/clusters", web::post().to(k8s_create_cluster))
         .route("/api/kubernetes/clusters/provision", web::post().to(k8s_provision))
+        .route("/api/kubernetes/clusters/prepare-provision", web::post().to(k8s_prepare_provision))
+        .route("/api/kubernetes/clusters/prepare-provision-agents", web::post().to(k8s_prepare_provision_agents))
         .route("/api/kubernetes/clusters/{id}", web::delete().to(k8s_delete_cluster))
         .route("/api/kubernetes/clusters/{id}/status", web::get().to(k8s_cluster_status))
         .route("/api/kubernetes/clusters/{id}/namespaces", web::get().to(k8s_namespaces))
@@ -11360,6 +11861,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/kubernetes/clusters/{id}/logs/{pod}", web::get().to(k8s_pod_logs))
         .route("/api/kubernetes/clusters/{id}/apply", web::post().to(k8s_apply))
         .route("/api/kubernetes/clusters/{id}/deploy-app", web::post().to(k8s_deploy_app))
+        .route("/api/kubernetes/clusters/{id}/wolfnet", web::get().to(k8s_wolfnet_status))
+        .route("/api/kubernetes/clusters/{id}/wolfnet", web::post().to(k8s_deploy_wolfnet))
+        .route("/api/kubernetes/clusters/{id}/wolfnet", web::delete().to(k8s_remove_wolfnet))
         // App Store
         .route("/api/appstore/apps", web::get().to(appstore_list))
         .route("/api/appstore/apps/{id}", web::get().to(appstore_get))

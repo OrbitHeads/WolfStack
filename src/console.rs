@@ -29,7 +29,7 @@ pub async fn console_ws(
     let (container_type, container_name) = path.into_inner();
 
     // Validate container name to prevent command injection (except for compound install names)
-    if container_type != "install" && container_type != "appstore-install"
+    if container_type != "install" && container_type != "appstore-install" && container_type != "k8s-provision"
         && !crate::auth::is_safe_name(&container_name)
     {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({
@@ -251,9 +251,10 @@ async fn console_session(
                 }
             }
         }
-        "appstore-install" => {
-            // App store install — name is the session ID from prepare-install API
-            let script_path = format!("/tmp/wolfstack-appinstall-{}.sh", name);
+        "appstore-install" | "k8s-provision" => {
+            // Script-based install — name is the session ID from prepare-install/prepare-provision API
+            let prefix = if ctype == "k8s-provision" { "wolfstack-k8s-provision" } else { "wolfstack-appinstall" };
+            let script_path = format!("/tmp/{}-{}.sh", prefix, name);
             if !std::path::Path::new(&script_path).exists() {
                 let _ = session.text(format!(
                     "\r\n\x1b[31mInstall script not found: {}\r\nDid you call prepare-install first?\x1b[0m\r\n",
@@ -268,7 +269,7 @@ async fn console_session(
                    echo '' ; echo -e '\\x1b[1;31m━━━ Installation failed (exit code '$EXIT_CODE') ━━━\\x1b[0m' ; \
                    echo -e '\\x1b[0;90mScroll up to see the error details.\\x1b[0m' ; \
                  fi ; \
-                 echo '' ; echo -e '\\x1b[0;90mYou can close this terminal now.\\x1b[0m'",
+                 echo '' ; echo -e '\\x1b[0;90mDone.\\x1b[0m'",
                 script_path, script_path
             ));
         }
@@ -409,7 +410,7 @@ pub async fn remote_console_ws(
     let (node_id, ctype, name) = path.into_inner();
 
     // Validate name to prevent command injection
-    if ctype != "install" && ctype != "appstore-install" && ctype != "pve-vnc"
+    if ctype != "install" && ctype != "appstore-install" && ctype != "k8s-provision" && ctype != "pve-vnc"
         && !crate::auth::is_safe_name(&name)
     {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({
