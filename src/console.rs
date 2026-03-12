@@ -160,10 +160,10 @@ async fn console_session(
                 format!("{} {}", binary, prefix_args.join(" "))
             };
             cmd.arg(format!(
-                "{} --kubeconfig {} exec -it {} -n {} {}-e TERM=xterm-256color -- \
-                 /bin/bash --login 2>/dev/null || \
-                 {} --kubeconfig {} exec -it {} -n {} {}-e TERM=xterm-256color -- \
-                 /bin/sh -l 2>/dev/null || \
+                "{} --kubeconfig {} exec -it {} -n {} {}-- \
+                 env TERM=xterm-256color /bin/bash --login 2>/dev/null || \
+                 {} --kubeconfig {} exec -it {} -n {} {}-- \
+                 env TERM=xterm-256color /bin/sh -l 2>/dev/null || \
                  echo 'No shell available in this pod'",
                 kubectl_cmd, kubeconfig, pod_name, namespace, container_arg,
                 kubectl_cmd, kubeconfig, pod_name, namespace, container_arg,
