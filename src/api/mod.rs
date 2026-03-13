@@ -8243,8 +8243,9 @@ pub async fn appstore_install(
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let id = path.into_inner();
 
-    // Block raw Docker/LXC installs on nodes running Kubernetes
-    if matches!(body.target.as_str(), "docker" | "lxc") && !crate::kubernetes::list_clusters().is_empty() {
+    // Block raw Docker/LXC installs on nodes running Kubernetes (server or worker)
+    if matches!(body.target.as_str(), "docker" | "lxc") &&
+       (!crate::kubernetes::list_clusters().is_empty() || !crate::kubernetes::detect_existing_clusters().is_empty()) {
         return HttpResponse::BadRequest().json(serde_json::json!({
             "error": "This node runs Kubernetes — use WolfKube to deploy applications instead of raw Docker/LXC"
         }));
@@ -8271,8 +8272,9 @@ pub async fn appstore_prepare_install(
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let id = path.into_inner();
 
-    // Block raw Docker/LXC installs on nodes running Kubernetes
-    if matches!(body.target.as_str(), "docker" | "lxc") && !crate::kubernetes::list_clusters().is_empty() {
+    // Block raw Docker/LXC installs on nodes running Kubernetes (server or worker)
+    if matches!(body.target.as_str(), "docker" | "lxc") &&
+       (!crate::kubernetes::list_clusters().is_empty() || !crate::kubernetes::detect_existing_clusters().is_empty()) {
         return HttpResponse::BadRequest().json(serde_json::json!({
             "error": "This node runs Kubernetes — use WolfKube to deploy applications instead of raw Docker/LXC"
         }));

@@ -18565,6 +18565,12 @@ function getK8sNodeIds() {
                 if (node) ids.add(node.id);
             } catch (e) {}
         }
+        // Include worker/agent nodes
+        if (c.nodes) {
+            for (const n of c.nodes) {
+                if (n.node_id) ids.add(n.node_id);
+            }
+        }
     }
     return ids;
 }
