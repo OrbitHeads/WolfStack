@@ -12268,6 +12268,100 @@ async fn patreon_disconnect(req: HttpRequest, state: web::Data<AppState>) -> Htt
     HttpResponse::Ok().json(serde_json::json!({ "ok": true }))
 }
 
+// ─── Icon Pack Endpoints ───
+
+/// GET /api/icon-packs — list all available icon packs (system + custom)
+async fn icon_packs_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let packs = crate::icons::scan_all_packs();
+    HttpResponse::Ok().json(serde_json::json!({ "packs": packs }))
+}
+
+/// GET /api/icon-packs/semantic-names — list all supported semantic icon names
+async fn icon_packs_semantic_names(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    HttpResponse::Ok().json(serde_json::json!({ "names": crate::icons::semantic_names() }))
+}
+
+/// POST /api/icon-packs/install — install from GitHub URL { "url": "https://github.com/..." }
+async fn icon_packs_install(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let url = match body.get("url").and_then(|v| v.as_str()) {
+        Some(u) => u,
+        None => return HttpResponse::BadRequest().json(serde_json::json!({ "error": "missing 'url' field" })),
+    };
+    match crate::icons::install_from_github(url).await {
+        Ok(pack) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "pack": pack })),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// DELETE /api/icon-packs/{pack_id} — remove a custom-installed pack
+async fn icon_packs_remove(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let pack_id = path.into_inner();
+    match crate::icons::remove_pack(&pack_id) {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// GET /api/icon-packs/{pack_id}/icon/{icon_name} — serve a single icon file
+/// Resolves semantic name → freedesktop icon → file on disk
+async fn icon_packs_serve(req: HttpRequest, state: web::Data<AppState>, path: web::Path<(String, String)>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let (pack_id, icon_name) = path.into_inner();
+
+    // Find the pack directory
+    let packs = crate::icons::scan_all_packs();
+    let pack = match packs.iter().find(|p| p.id == pack_id) {
+        Some(p) => p,
+        None => return HttpResponse::NotFound().json(serde_json::json!({ "error": "pack not found" })),
+    };
+
+    let theme_dir = std::path::Path::new(&pack.path);
+    match crate::icons::resolve_icon(theme_dir, &icon_name) {
+        Some(file_path) => {
+            let mime = crate::icons::icon_mime(&file_path);
+            match std::fs::read(&file_path) {
+                Ok(data) => HttpResponse::Ok()
+                    .content_type(mime)
+                    .insert_header(("Cache-Control", "public, max-age=86400"))
+                    .body(data),
+                Err(_) => HttpResponse::InternalServerError().finish(),
+            }
+        }
+        None => HttpResponse::NotFound().json(serde_json::json!({ "error": "icon not found in pack" })),
+    }
+}
+
+/// GET /api/icon-packs/{pack_id}/preview — serve a grid of sample icons for previewing
+async fn icon_packs_preview(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let pack_id = path.into_inner();
+
+    let packs = crate::icons::scan_all_packs();
+    let pack = match packs.iter().find(|p| p.id == pack_id) {
+        Some(p) => p,
+        None => return HttpResponse::NotFound().json(serde_json::json!({ "error": "pack not found" })),
+    };
+
+    // Return a list of which semantic icons are available
+    let theme_dir = std::path::Path::new(&pack.path);
+    let names = crate::icons::semantic_names();
+    let mut available: Vec<&str> = Vec::new();
+    for name in &names {
+        if crate::icons::resolve_icon(theme_dir, name).is_some() {
+            available.push(name);
+        }
+    }
+    HttpResponse::Ok().json(serde_json::json!({
+        "pack_id": pack_id,
+        "total_semantic": names.len(),
+        "available": available,
+    }))
+}
+
 /// Configure all API routes
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg
@@ -12700,6 +12794,13 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/patreon/status", web::get().to(patreon_status))
         .route("/api/patreon/sync", web::post().to(patreon_sync))
         .route("/api/patreon/disconnect", web::post().to(patreon_disconnect))
+        // Icon Packs
+        .route("/api/icon-packs", web::get().to(icon_packs_list))
+        .route("/api/icon-packs/semantic-names", web::get().to(icon_packs_semantic_names))
+        .route("/api/icon-packs/install", web::post().to(icon_packs_install))
+        .route("/api/icon-packs/{pack_id}", web::delete().to(icon_packs_remove))
+        .route("/api/icon-packs/{pack_id}/icon/{icon_name}", web::get().to(icon_packs_serve))
+        .route("/api/icon-packs/{pack_id}/preview", web::get().to(icon_packs_preview))
         // Status Page (public — NO auth)
         .route("/status", web::get().to(statuspage_public_index))
         .route("/status/{slug}", web::get().to(statuspage_public_page));

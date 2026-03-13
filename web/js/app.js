@@ -78,6 +78,244 @@ function applyMapCollapse() {
     }
 }
 
+// ─── Icon Theme System ───
+// Built-in themes (emoji-based)
+const BUILTIN_ICON_THEMES = {
+    standard: { name: 'Standard', description: 'Default system icons' },
+    candy:    { name: 'Candy',    description: 'Sweet candy-themed icons' },
+};
+
+const CANDY_ICON_MAP = {
+    '🏠': '🏰', '📦': '🍬', '⚙️': '🍭', '🖥️': '🧁', '💾': '🍪',
+    '🌐': '🍩', '🔒': '🍫', '🔑': '🥠', '📊': '🎂', '📈': '🍰',
+    '🔧': '🥄', '🛠️': '🍴', '📝': '🧇', '📋': '🥞', '🗄️': '🍯',
+    '📡': '🍡', '☁️': '🍧', '🔥': '🌶️', '💬': '🍦', '📧': '🧃',
+    '🚀': '🎉', '🛍️': '🧋', '⚡': '🍋', '💻': '🍮', '🧠': '🥧',
+    '📁': '🥐', '📂': '🥯', '💡': '🫐', '📄': '🧈', '📌': '🍒',
+    '🛡️': '🥥', '🔗': '🍇', '📎': '🍌', '🗂️': '🍕', '🗃️': '🌮',
+    '🔔': '🍓', '📢': '🍎', '🖼️': '🍉', '🌍': '🍊', '📸': '🍑',
+    '🔀': '🥨', '⚖️': '🧁', '📐': '🥝', '💳': '🥭', '🧩': '🍍',
+};
+
+// Mapping from emoji → semantic icon name (used to replace emojis with pack icons)
+const EMOJI_TO_SEMANTIC = {
+    '🏠': 'home', '📦': 'package', '⚙️': 'settings', '🖥️': 'computer', '💾': 'save',
+    '🌐': 'globe', '🔒': 'lock', '🔑': 'key', '📊': 'chart', '📈': 'chart-up',
+    '🔧': 'wrench', '🛠️': 'tools', '📝': 'edit', '📋': 'clipboard', '🗄️': 'database',
+    '📡': 'satellite', '☁️': 'cloud', '🔥': 'fire', '💬': 'chat', '📧': 'email',
+    '🚀': 'rocket', '🛍️': 'appstore', '⚡': 'lightning', '💻': 'laptop', '🧠': 'brain',
+    '📁': 'folder', '📂': 'folder-open', '💡': 'lightbulb', '📄': 'document', '📌': 'pin',
+    '🛡️': 'shield', '🔗': 'link', '📎': 'link', '🗂️': 'folder', '🗃️': 'file-data',
+    '🔔': 'bell', '📢': 'megaphone', '🖼️': 'image', '🌍': 'globe', '📸': 'camera',
+    '🔀': 'link', '⚖️': 'scale', '📐': 'tools', '💳': 'money', '🧩': 'tools',
+    '🎨': 'palette', '🤖': 'robot', '🔐': 'lock', '❤': 'heart', '❤️': 'heart',
+    '⚠️': 'warning', '❓': 'help', '➕': 'add', '🚪': 'door',
+    '🐳': 'docker', '🐧': 'docker', '🔍': 'search', '🎮': 'gamepad',
+    '🎵': 'music', '📷': 'camera', '🛒': 'cart', '💰': 'money', '📚': 'book',
+    '🔬': 'lab', '🧪': 'lab', '⭐': 'star', '🌟': 'star',
+};
+
+let currentIconTheme = localStorage.getItem('wolfstack-icon-theme') || 'standard';
+// Cache for icon pack icon URLs (pack_id → { semantic_name → url })
+let _iconPackCache = {};
+// Track available icons from active pack
+let _activePackAvailable = null;
+
+function isIconPackTheme() {
+    return currentIconTheme !== 'standard' && currentIconTheme !== 'candy';
+}
+
+function getIconThemeMap() {
+    if (currentIconTheme === 'candy') return CANDY_ICON_MAP;
+    return null;
+}
+
+function translateIconText(text) {
+    const map = getIconThemeMap();
+    if (!map) return text;
+    for (const [from, to] of Object.entries(map)) {
+        if (text.includes(from)) text = text.replaceAll(from, to);
+    }
+    return text;
+}
+
+/// Get the URL for a semantic icon from the active icon pack
+function getIconPackUrl(semanticName) {
+    if (!isIconPackTheme()) return null;
+    return `/api/icon-packs/${encodeURIComponent(currentIconTheme)}/icon/${encodeURIComponent(semanticName)}`;
+}
+
+/// Create an <img> element for an icon pack icon
+function createIconImg(semanticName, size) {
+    size = size || 18;
+    const url = getIconPackUrl(semanticName);
+    if (!url) return null;
+    const img = document.createElement('img');
+    img.src = url;
+    img.alt = semanticName;
+    img.style.cssText = `width:${size}px;height:${size}px;vertical-align:middle;display:inline-block;`;
+    img.className = 'ws-icon-pack-img';
+    img.onerror = function() { this.style.display = 'none'; };
+    return img;
+}
+
+/// Replace an emoji text node with an icon pack <img> if available
+function replaceEmojiWithPackIcon(textNode, emojiChar, semanticName) {
+    const text = textNode.nodeValue;
+    const idx = text.indexOf(emojiChar);
+    if (idx === -1) return false;
+
+    const img = createIconImg(semanticName, 18);
+    if (!img) return false;
+
+    // Check if this semantic icon is available in the pack
+    if (_activePackAvailable && !_activePackAvailable.has(semanticName)) return false;
+
+    const before = text.substring(0, idx);
+    const after = text.substring(idx + emojiChar.length);
+
+    const parent = textNode.parentNode;
+    if (!parent) return false;
+
+    if (before) parent.insertBefore(document.createTextNode(before), textNode);
+    parent.insertBefore(img, textNode);
+    if (after) parent.insertBefore(document.createTextNode(after), textNode);
+    parent.removeChild(textNode);
+    return true;
+}
+
+/// Load icon pack preview data (which icons are available)
+async function loadIconPackPreview(packId) {
+    try {
+        const resp = await fetch(`/api/icon-packs/${encodeURIComponent(packId)}/preview`);
+        if (!resp.ok) return null;
+        return await resp.json();
+    } catch { return null; }
+}
+
+/// Load and display icon packs in the settings UI
+async function loadIconPacks() {
+    try {
+        const resp = await fetch('/api/icon-packs');
+        if (!resp.ok) return;
+        const data = await resp.json();
+        renderIconPacksUI(data.packs || []);
+    } catch (e) {
+        console.error('Failed to load icon packs:', e);
+    }
+}
+
+/// Render the icon packs management UI
+function renderIconPacksUI(packs) {
+    const container = document.getElementById('icon-packs-grid');
+    if (!container) return;
+
+    let html = '';
+
+    // Built-in themes first
+    for (const [id, theme] of Object.entries(BUILTIN_ICON_THEMES)) {
+        const active = currentIconTheme === id ? ' active' : '';
+        const preview = id === 'standard'
+            ? '📦 🖥️ 🌐 💾 ⚙️'
+            : '🍬 🧁 🍩 🍪 🍭';
+        html += `
+            <div class="icon-theme-card theme-card${active}" data-icon-theme="${id}" onclick="applyIconTheme('${id}')">
+                <div style="padding:16px;text-align:center;">
+                    <div data-no-translate style="font-size:28px;letter-spacing:6px;margin-bottom:10px;">${preview}</div>
+                    <div class="theme-card-info">
+                        <div class="theme-card-name">${theme.name}</div>
+                        <div class="theme-card-desc">${theme.description}</div>
+                    </div>
+                </div>
+            </div>`;
+    }
+
+    // Installed icon packs
+    for (const pack of packs) {
+        const active = currentIconTheme === pack.id ? ' active' : '';
+        const source = pack.source === 'custom' ? 'Installed' : 'System';
+        const iconCount = pack.icon_count > 0 ? ` \u00b7 ${pack.icon_count}+ icons` : '';
+        const scalable = pack.has_scalable ? ' \u00b7 SVG' : '';
+        const canRemove = pack.source === 'custom'
+            ? `<button class="btn btn-sm" style="margin-top:8px;font-size:11px;padding:2px 8px;color:var(--danger);" onclick="event.stopPropagation();removeIconPack('${pack.id}')">Remove</button>`
+            : '';
+
+        // Preview: show icon images if this is the active pack, otherwise show folder icon
+        const previewIcons = (pack.sample_icons || []).slice(0, 5);
+        let previewHtml;
+        if (previewIcons.length > 0) {
+            previewHtml = previewIcons.map(name =>
+                `<img src="/api/icon-packs/${encodeURIComponent(pack.id)}/icon/${encodeURIComponent(name)}" style="width:28px;height:28px;margin:0 3px;" onerror="this.style.display='none'">`
+            ).join('');
+        } else {
+            previewHtml = `<span style="font-size:13px;color:var(--text-muted);">No preview</span>`;
+        }
+
+        html += `
+            <div class="icon-theme-card theme-card${active}" data-icon-theme="${pack.id}" onclick="applyIconTheme('${pack.id}')">
+                <div style="padding:16px;text-align:center;">
+                    <div style="height:38px;display:flex;align-items:center;justify-content:center;margin-bottom:10px;">${previewHtml}</div>
+                    <div class="theme-card-info">
+                        <div class="theme-card-name">${pack.name}</div>
+                        <div class="theme-card-desc">${pack.comment || source}${iconCount}${scalable}</div>
+                    </div>
+                    ${canRemove}
+                </div>
+            </div>`;
+    }
+
+    container.innerHTML = html;
+}
+
+/// Install an icon pack from a GitHub URL
+async function installIconPack() {
+    const input = document.getElementById('icon-pack-url');
+    if (!input) return;
+    const url = input.value.trim();
+    if (!url) { showToast('Enter a GitHub repository URL', 'warning'); return; }
+
+    const btn = document.getElementById('icon-pack-install-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Installing...'; }
+
+    try {
+        const resp = await fetch('/api/icon-packs/install', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url }),
+        });
+        const data = await resp.json();
+        if (data.ok) {
+            showToast(`Installed "${data.pack.name}" icon pack`, 'success');
+            input.value = '';
+            loadIconPacks();
+        } else {
+            showToast(data.error || 'Install failed', 'error');
+        }
+    } catch (e) {
+        showToast('Failed to install icon pack: ' + e.message, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Install'; }
+    }
+}
+
+/// Remove a custom-installed icon pack
+async function removeIconPack(packId) {
+    if (!confirm(`Remove icon pack "${packId}"?`)) return;
+    try {
+        const resp = await fetch(`/api/icon-packs/${encodeURIComponent(packId)}`, { method: 'DELETE' });
+        const data = await resp.json();
+        if (data.ok) {
+            showToast('Icon pack removed', 'success');
+            if (currentIconTheme === packId) applyIconTheme('standard');
+            else loadIconPacks();
+        } else {
+            showToast(data.error || 'Remove failed', 'error');
+        }
+    } catch (e) {
+        showToast('Failed to remove: ' + e.message, 'error');
+    }
+}
+
 // ─── Bookmarks ───
 const BOOKMARK_ICONS = [
     '🌐','📁','💻','🖥️','📊','📈','🔧','⚙️','🛠️','📝',
@@ -534,6 +772,11 @@ function selectView(page) {
     if (page === 'datacenter') {
         renderDatacenterOverview();
     } else if (page === 'settings') {
+        // Load icon packs for appearance tab (default)
+        const appearanceTab = document.getElementById('settings-tab-appearance');
+        if (appearanceTab && appearanceTab.classList.contains('active')) {
+            loadIconPacks();
+        }
         // If AI tab is active, load AI data
         const aiTab = document.getElementById('settings-tab-ai');
         if (aiTab && aiTab.classList.contains('active')) {
@@ -18824,7 +19067,190 @@ function applyTheme(themeId) {
 function initTheme() {
     const saved = localStorage.getItem('wolfstack-theme') || 'dark';
     applyTheme(saved);
+    initIconTheme();
     initIconToggle();
+}
+
+// ─── Icon Theme Application ───
+function applyIconTheme(themeName) {
+    localStorage.setItem('wolfstack-icon-theme', themeName);
+    location.reload();
+}
+
+async function initIconTheme() {
+    currentIconTheme = localStorage.getItem('wolfstack-icon-theme') || 'standard';
+    // Update icon theme selector UI
+    document.querySelectorAll('.icon-theme-card').forEach(card => {
+        card.classList.toggle('active', card.getAttribute('data-icon-theme') === currentIconTheme);
+    });
+    // Skip translation if icons are hidden
+    if (localStorage.getItem('wolfstack-no-icons') === '1') return;
+    if (currentIconTheme === 'standard') return;
+
+    if (isIconPackTheme()) {
+        // Load available icons for the active pack
+        const preview = await loadIconPackPreview(currentIconTheme);
+        if (preview && preview.available) {
+            _activePackAvailable = new Set(preview.available);
+            replaceEmojisWithPackIcons(document.body);
+            observeForIconPack();
+        }
+    } else {
+        // Built-in emoji theme (candy)
+        patchIconConstants();
+        translateIconsInDOM();
+        observeForIconTheme();
+    }
+}
+
+function patchIconConstants() {
+    const map = getIconThemeMap();
+    if (!map) return;
+    for (const k in componentIcons) {
+        if (map[componentIcons[k]]) componentIcons[k] = map[componentIcons[k]];
+    }
+    for (const k in MOUNT_TYPE_ICONS) {
+        if (map[MOUNT_TYPE_ICONS[k]]) MOUNT_TYPE_ICONS[k] = map[MOUNT_TYPE_ICONS[k]];
+    }
+    for (const k in APP_ICONS) {
+        if (map[APP_ICONS[k]]) APP_ICONS[k] = map[APP_ICONS[k]];
+    }
+    for (let i = 0; i < BOOKMARK_ICONS.length; i++) {
+        if (map[BOOKMARK_ICONS[i]]) BOOKMARK_ICONS[i] = map[BOOKMARK_ICONS[i]];
+    }
+}
+
+function translateIconsInDOM() {
+    const map = getIconThemeMap();
+    if (!map) return;
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+            return node.parentElement?.closest('[data-no-translate]')
+                ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+        }
+    });
+    while (walker.nextNode()) {
+        const node = walker.currentNode;
+        let text = node.nodeValue;
+        let changed = false;
+        for (const [from, to] of Object.entries(map)) {
+            if (text.includes(from)) { text = text.replaceAll(from, to); changed = true; }
+        }
+        if (changed) node.nodeValue = text;
+    }
+    document.querySelectorAll('input[placeholder]').forEach(el => {
+        if (el.closest('[data-no-translate]')) return;
+        let text = el.placeholder;
+        let changed = false;
+        for (const [from, to] of Object.entries(map)) {
+            if (text.includes(from)) { text = text.replaceAll(from, to); changed = true; }
+        }
+        if (changed) el.placeholder = text;
+    });
+}
+
+/// Replace emoji characters with <img> tags from the active icon pack
+function replaceEmojisWithPackIcons(root) {
+    if (!_activePackAvailable) return;
+    // Collect text nodes first (modifying during walk causes issues)
+    const textNodes = [];
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+            if (node.parentElement?.closest('[data-no-translate]')) return NodeFilter.FILTER_REJECT;
+            if (node.parentElement?.closest('.ws-icon-pack-img')) return NodeFilter.FILTER_REJECT;
+            if (node.parentElement?.tagName === 'SCRIPT' || node.parentElement?.tagName === 'STYLE') return NodeFilter.FILTER_REJECT;
+            return NodeFilter.FILTER_ACCEPT;
+        }
+    });
+    while (walker.nextNode()) textNodes.push(walker.currentNode);
+
+    for (const textNode of textNodes) {
+        if (!textNode.parentNode) continue;
+        const text = textNode.nodeValue;
+        // Find emojis that have semantic mappings
+        for (const [emoji, semantic] of Object.entries(EMOJI_TO_SEMANTIC)) {
+            if (text.includes(emoji) && _activePackAvailable.has(semantic)) {
+                replaceEmojiWithPackIcon(textNode, emoji, semantic);
+                break; // textNode is now split, move on
+            }
+        }
+    }
+}
+
+let _iconThemeObserver = null;
+function observeForIconTheme() {
+    if (_iconThemeObserver) return;
+    const map = getIconThemeMap();
+    if (!map) return;
+    _iconThemeObserver = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+            for (const node of m.addedNodes) {
+                if (node.nodeType === Node.TEXT_NODE) {
+                    if (node.parentElement?.closest('[data-no-translate]')) continue;
+                    let text = node.nodeValue;
+                    let changed = false;
+                    for (const [from, to] of Object.entries(map)) {
+                        if (text.includes(from)) { text = text.replaceAll(from, to); changed = true; }
+                    }
+                    if (changed) node.nodeValue = text;
+                } else if (node.nodeType === Node.ELEMENT_NODE) {
+                    if (node.closest?.('[data-no-translate]')) continue;
+                    const w = document.createTreeWalker(node, NodeFilter.SHOW_TEXT, {
+                        acceptNode(n) {
+                            return n.parentElement?.closest('[data-no-translate]')
+                                ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+                        }
+                    });
+                    while (w.nextNode()) {
+                        const t = w.currentNode;
+                        let txt = t.nodeValue;
+                        let ch = false;
+                        for (const [from, to] of Object.entries(map)) {
+                            if (txt.includes(from)) { txt = txt.replaceAll(from, to); ch = true; }
+                        }
+                        if (ch) t.nodeValue = txt;
+                    }
+                    node.querySelectorAll?.('input[placeholder]')?.forEach(el => {
+                        if (el.closest('[data-no-translate]')) return;
+                        let txt = el.placeholder;
+                        let ch = false;
+                        for (const [from, to] of Object.entries(map)) {
+                            if (txt.includes(from)) { txt = txt.replaceAll(from, to); ch = true; }
+                        }
+                        if (ch) el.placeholder = txt;
+                    });
+                }
+            }
+        }
+    });
+    _iconThemeObserver.observe(document.body, { childList: true, subtree: true });
+}
+
+/// MutationObserver for icon pack themes — replaces emojis in newly added DOM nodes
+function observeForIconPack() {
+    if (_iconThemeObserver) return;
+    if (!_activePackAvailable) return;
+    _iconThemeObserver = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+            for (const node of m.addedNodes) {
+                if (node.nodeType === Node.TEXT_NODE) {
+                    if (node.parentElement?.closest('[data-no-translate]')) continue;
+                    if (node.parentElement?.classList?.contains('ws-icon-pack-img')) continue;
+                    const text = node.nodeValue;
+                    for (const [emoji, semantic] of Object.entries(EMOJI_TO_SEMANTIC)) {
+                        if (text.includes(emoji) && _activePackAvailable.has(semantic)) {
+                            replaceEmojiWithPackIcon(node, emoji, semantic);
+                            break;
+                        }
+                    }
+                } else if (node.nodeType === Node.ELEMENT_NODE) {
+                    if (node.closest?.('[data-no-translate]')) continue;
+                    replaceEmojisWithPackIcons(node);
+                }
+            }
+        }
+    });
+    _iconThemeObserver.observe(document.body, { childList: true, subtree: true });
 }
 
 // ─── Icon Toggle System ───
@@ -18921,7 +19347,9 @@ function switchSettingsTab(tabName) {
     });
 
     // Lazy-load data when switching tabs
-    if (tabName === 'ai') {
+    if (tabName === 'appearance') {
+        loadIconPacks();
+    } else if (tabName === 'ai') {
         loadAiConfig();
         loadAiStatus();
         loadAiAlerts();

@@ -33,6 +33,7 @@ mod ceph;
 mod configurator;
 mod patreon;
 mod kubernetes;
+mod icons;
 mod tui;
 
 use actix_web::{web, App, HttpServer, HttpRequest, HttpResponse};

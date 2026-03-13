@@ -3199,6 +3199,46 @@
                             </div>
                         </div>
 
+                        <!-- Icon Theme -->
+                        <div style="margin-top:28px; padding-top:20px; border-top:1px solid var(--border);">
+                            <h4 style="margin:0 0 4px 0; font-size:16px; font-weight:600;">Icon Theme</h4>
+                            <p style="font-size:13px; color:var(--text-muted); margin:0 0 16px 0;">Choose the icon style used throughout the interface. Install Linux icon packs to match your desktop theme.</p>
+                            <div id="icon-packs-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;">
+                                <!-- Populated dynamically by loadIconPacks() -->
+                                <div class="icon-theme-card theme-card active" data-icon-theme="standard" onclick="applyIconTheme('standard')">
+                                    <div style="padding:16px;text-align:center;">
+                                        <div data-no-translate style="font-size:28px;letter-spacing:6px;margin-bottom:10px;">📦 🖥️ 🌐 💾 ⚙️</div>
+                                        <div class="theme-card-info">
+                                            <div class="theme-card-name">Standard</div>
+                                            <div class="theme-card-desc">Default system icons</div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="icon-theme-card theme-card" data-icon-theme="candy" onclick="applyIconTheme('candy')">
+                                    <div style="padding:16px;text-align:center;">
+                                        <div data-no-translate style="font-size:28px;letter-spacing:6px;margin-bottom:10px;">🍬 🧁 🍩 🍪 🍭</div>
+                                        <div class="theme-card-info">
+                                            <div class="theme-card-name">Candy</div>
+                                            <div class="theme-card-desc">Sweet candy-themed icons</div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Install Icon Pack -->
+                            <div style="margin-top:16px; padding:16px; background:var(--bg-primary); border:1px solid var(--border); border-radius:12px;">
+                                <div style="font-weight:600; font-size:13px; margin-bottom:8px;">Install Icon Pack</div>
+                                <p style="font-size:12px; color:var(--text-muted); margin:0 0 10px 0;">
+                                    Install any Linux icon theme from GitHub. Also detects icon themes already installed on your system
+                                    (e.g. from <code>/usr/share/icons</code>).
+                                </p>
+                                <div style="display:flex; gap:8px;">
+                                    <input type="text" id="icon-pack-url" placeholder="https://github.com/EliverLara/candy-icons" style="flex:1; padding:8px 12px; background:var(--bg-card); border:1px solid var(--border); border-radius:8px; color:var(--text-primary); font-size:13px; outline:none;">
+                                    <button id="icon-pack-install-btn" class="btn btn-sm btn-primary" onclick="installIconPack()" style="padding:8px 16px; font-size:13px; white-space:nowrap;">Install</button>
+                                </div>
+                            </div>
+                        </div>
+
                         <!-- Icon Toggle -->
                         <div style="margin-top:28px; padding-top:20px; border-top:1px solid var(--border);">
                             <div style="display:flex;align-items:center;justify-content:space-between;">
