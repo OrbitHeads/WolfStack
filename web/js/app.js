@@ -19089,8 +19089,37 @@ function initTheme() {
 
 // ─── Icon Theme Application ───
 function applyIconTheme(themeName) {
-    localStorage.setItem('wolfstack-icon-theme', themeName);
-    location.reload();
+    if (themeName === currentIconTheme) return;
+
+    // Determine display name
+    let displayName = themeName;
+    if (BUILTIN_ICON_THEMES[themeName]) {
+        displayName = BUILTIN_ICON_THEMES[themeName].name;
+    } else {
+        // Try to get name from the card
+        const card = document.querySelector(`.icon-theme-card[data-icon-theme="${themeName}"] .theme-card-name`);
+        if (card) displayName = card.textContent;
+    }
+
+    const modal = document.createElement('div');
+    modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:10000;display:flex;align-items:center;justify-content:center;';
+    modal.innerHTML = `
+        <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:16px;width:420px;max-width:90vw;box-shadow:0 20px 60px rgba(0,0,0,0.4);overflow:hidden;">
+            <div style="padding:24px 24px 16px;border-bottom:1px solid var(--border);">
+                <h3 style="margin:0 0 8px 0;font-size:17px;font-weight:700;">Change Icon Theme</h3>
+                <p style="margin:0;font-size:13px;color:var(--text-muted);">Switch to <strong>${escapeHtml(displayName)}</strong>? The page will reload to apply the new icons.</p>
+            </div>
+            <div style="padding:16px 24px;display:flex;justify-content:flex-end;gap:10px;">
+                <button class="btn btn-sm" onclick="this.closest('div[style*=fixed]').remove()" style="padding:8px 20px;font-size:13px;">Cancel</button>
+                <button class="btn btn-sm btn-primary" id="icon-theme-confirm-btn" style="padding:8px 20px;font-size:13px;">Confirm</button>
+            </div>
+        </div>`;
+    document.body.appendChild(modal);
+    modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+    document.getElementById('icon-theme-confirm-btn').onclick = function() {
+        localStorage.setItem('wolfstack-icon-theme', themeName);
+        location.reload();
+    };
 }
 
 async function initIconTheme() {

@@ -158,16 +158,25 @@ fn parse_index_theme(path: &Path) -> Option<(String, String)> {
 
 /// Search an icon theme directory for a named icon, returning the file path.
 /// Prefers scalable SVGs, then larger PNGs.
+///
+/// Handles all common freedesktop.org icon theme layouts:
+///   - Papirus-style:  `48x48/apps/icon.svg`   (size-first, NxN)
+///   - Mint-Y-style:   `apps/48/icon.svg`       (category-first, bare number)
+///   - Candy-style:    `apps/scalable/icon.svg`  (category-first, scalable)
+///   - Flat:           `scalable/apps/icon.svg`  (scalable-first)
 pub fn find_icon_file(theme_dir: &Path, icon_name: &str) -> Option<PathBuf> {
-    // Priority order for subdirectories to search
     let scalable_dirs = ["scalable", "symbolic"];
-    let size_dirs = ["512x512", "256x256", "128x128", "96x96", "64x64", "48x48", "32x32", "24x24", "22x22", "16x16"];
+    // NxN format (Papirus, Adwaita, etc.)
+    let nxn_sizes = ["512x512", "256x256", "128x128", "96x96", "64x64",
+                     "48x48", "42x42", "32x32", "24x24", "22x22", "18x18", "16x16"];
+    // Bare number format (Mint-Y, elementary, etc.)
+    let bare_sizes = ["256", "128", "96", "64", "48", "32", "24", "22", "16"];
     let context_dirs = ["apps", "actions", "categories", "devices", "emblems",
                         "mimetypes", "places", "status", "preferences", "panel",
                         "stock", "legacy"];
     let extensions = ["svg", "png", "xpm"];
 
-    // Try scalable first
+    // 1. scalable/category/ or symbolic/category/ (flat scalable-first)
     for sc in &scalable_dirs {
         for ctx in &context_dirs {
             for ext in &extensions {
@@ -175,24 +184,13 @@ pub fn find_icon_file(theme_dir: &Path, icon_name: &str) -> Option<PathBuf> {
                 if p.exists() { return Some(p); }
             }
         }
-        // Some themes put icons directly in scalable/
         for ext in &extensions {
             let p = theme_dir.join(sc).join(format!("{}.{}", icon_name, ext));
             if p.exists() { return Some(p); }
         }
     }
 
-    // Try size-based directories (bigger first)
-    for sz in &size_dirs {
-        for ctx in &context_dirs {
-            for ext in &extensions {
-                let p = theme_dir.join(sz).join(ctx).join(format!("{}.{}", icon_name, ext));
-                if p.exists() { return Some(p); }
-            }
-        }
-    }
-
-    // Some themes use context/scalable or context/48 layout
+    // 2. category/scalable/ or category/symbolic/ (Candy-style)
     for ctx in &context_dirs {
         for sc in &scalable_dirs {
             for ext in &extensions {
@@ -200,9 +198,23 @@ pub fn find_icon_file(theme_dir: &Path, icon_name: &str) -> Option<PathBuf> {
                 if p.exists() { return Some(p); }
             }
         }
-        for sz in &size_dirs {
+    }
+
+    // 3. category/size/ — bare numbers, biggest first (Mint-Y-style)
+    for ctx in &context_dirs {
+        for sz in &bare_sizes {
             for ext in &extensions {
                 let p = theme_dir.join(ctx).join(sz).join(format!("{}.{}", icon_name, ext));
+                if p.exists() { return Some(p); }
+            }
+        }
+    }
+
+    // 4. NxN/category/ — biggest first (Papirus-style)
+    for sz in &nxn_sizes {
+        for ctx in &context_dirs {
+            for ext in &extensions {
+                let p = theme_dir.join(sz).join(ctx).join(format!("{}.{}", icon_name, ext));
                 if p.exists() { return Some(p); }
             }
         }
