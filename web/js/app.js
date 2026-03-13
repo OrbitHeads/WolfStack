@@ -18636,10 +18636,14 @@ function rebuildAppStoreTargets(app) {
     const selectedNodeHasK8s = selectedOpt?.dataset?.k8s === 'true';
 
     const targets = [];
-    if (app.docker) targets.push({ key: 'docker', label: '🐳 Docker' });
-    if (app.lxc) targets.push({ key: 'lxc', label: '📦 LXC' });
+    if (selectedNodeHasK8s && k8sClusters.length > 0) {
+        // K8s node — only offer WolfKube (no raw Docker/LXC)
+        if (app.docker) targets.push({ key: 'kubernetes', label: '&#9784; WolfKube' });
+    } else {
+        if (app.docker) targets.push({ key: 'docker', label: '🐳 Docker' });
+        if (app.lxc) targets.push({ key: 'lxc', label: '📦 LXC' });
+    }
     if (app.bare_metal) targets.push({ key: 'bare_metal', label: '🖥️ Host' });
-    if (app.docker && selectedNodeHasK8s && k8sClusters.length > 0) targets.push({ key: 'kubernetes', label: '&#9784; WolfKube' });
 
     // Keep current target if still valid, else default to first
     if (!targets.some(t => t.key === appStoreInstallTarget)) {

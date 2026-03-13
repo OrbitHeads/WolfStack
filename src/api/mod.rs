@@ -8242,6 +8242,14 @@ pub async fn appstore_install(
 ) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let id = path.into_inner();
+
+    // Block raw Docker/LXC installs on nodes running Kubernetes
+    if matches!(body.target.as_str(), "docker" | "lxc") && !crate::kubernetes::list_clusters().is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "This node runs Kubernetes — use WolfKube to deploy applications instead of raw Docker/LXC"
+        }));
+    }
+
     let mut inputs = body.inputs.clone();
     // Inject CONTAINER_NAME for ${CONTAINER_NAME} substitution in manifests
     inputs.insert("CONTAINER_NAME".to_string(), body.container_name.clone());
@@ -8262,6 +8270,14 @@ pub async fn appstore_prepare_install(
 ) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let id = path.into_inner();
+
+    // Block raw Docker/LXC installs on nodes running Kubernetes
+    if matches!(body.target.as_str(), "docker" | "lxc") && !crate::kubernetes::list_clusters().is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "This node runs Kubernetes — use WolfKube to deploy applications instead of raw Docker/LXC"
+        }));
+    }
+
     let mut inputs = body.inputs.clone();
     inputs.insert("CONTAINER_NAME".to_string(), body.container_name.clone());
 
