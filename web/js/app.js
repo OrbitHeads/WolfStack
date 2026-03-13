@@ -99,6 +99,7 @@ const CANDY_ICON_MAP = {
 
 // Mapping from emoji → semantic icon name (used to replace emojis with pack icons)
 const EMOJI_TO_SEMANTIC = {
+    // Navigation & core
     '🏠': 'home', '📦': 'package', '⚙️': 'settings', '🖥️': 'computer', '💾': 'save',
     '🌐': 'globe', '🔒': 'lock', '🔑': 'key', '📊': 'chart', '📈': 'chart-up',
     '🔧': 'wrench', '🛠️': 'tools', '📝': 'edit', '📋': 'clipboard', '🗄️': 'database',
@@ -110,10 +111,18 @@ const EMOJI_TO_SEMANTIC = {
     '🔀': 'link', '⚖️': 'scale', '📐': 'tools', '💳': 'money', '🧩': 'tools',
     '🎨': 'palette', '🤖': 'robot', '🔐': 'lock', '❤': 'heart', '❤️': 'heart',
     '⚠️': 'warning', '❓': 'help', '➕': 'add', '🚪': 'door',
-    '🐳': 'docker', '🐧': 'docker', '🔍': 'search', '🎮': 'gamepad',
+    '🐳': 'whale', '🐧': 'penguin', '🔍': 'search', '🎮': 'gamepad',
     '🎵': 'music', '📷': 'camera', '🛒': 'cart', '💰': 'money', '📚': 'book',
     '🔬': 'lab', '🧪': 'lab', '⭐': 'star', '🌟': 'star',
     '🏃': 'runner',
+    // App store & game icons
+    '🦊': 'fox', '🐘': 'elephant', '🎬': 'movie', '🎯': 'target', '👾': 'alien',
+    '🐺': 'wolf', '🐍': 'file-code', '🦀': 'file-code',
+    '⛏️': 'gamepad', '🧱': 'gamepad', '⚔️': 'gamepad', '🌳': 'gamepad',
+    '🦎': 'gamepad', '🪓': 'gamepad', '🦖': 'gamepad', '🧟': 'gamepad',
+    '💀': 'gamepad', '🔫': 'gamepad', '🏭': 'gamepad',
+    // File manager
+    '📜': 'file-code', '🔵': 'file-code', '📖': 'book',
 };
 
 let currentIconTheme = localStorage.getItem('wolfstack-icon-theme') || 'standard';

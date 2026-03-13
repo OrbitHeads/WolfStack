@@ -26,89 +26,109 @@ const SYSTEM_ICON_DIRS: &[&str] = &[
 /// The frontend sends these semantic names; we resolve them to actual files.
 pub fn semantic_to_freedesktop() -> HashMap<&'static str, &'static [&'static str]> {
     let mut m: HashMap<&str, &[&str]> = HashMap::new();
-    // Navigation
-    m.insert("home",           &["user-home", "go-home", "folder-home"]);
-    m.insert("settings",       &["preferences-system", "configure", "system-settings"]);
-    m.insert("network",        &["network-workgroup", "preferences-system-network", "network-wired"]);
-    m.insert("globe",          &["internet-web-browser", "web-browser", "applications-internet"]);
-    m.insert("appstore",       &["system-software-install", "gnome-software", "applications-other"]);
-    m.insert("warning",        &["dialog-warning", "emblem-warning", "status-warning"]);
-    m.insert("help",           &["help-about", "help-contents", "system-help"]);
-    m.insert("add",            &["list-add", "add", "contact-new"]);
-    m.insert("logout",         &["system-log-out", "application-exit", "exit"]);
+    // Navigation — verified against Candy, Papirus, Mint-Y
+    m.insert("home",           &["user-home", "go-home", "folder-home", "start-here-kde"]);
+    m.insert("settings",       &["preferences", "preferences-system", "cs-themes", "configure", "system-settings"]);
+    m.insert("network",        &["network-workgroup", "preferences-system-network", "network-wired", "network-server"]);
+    m.insert("globe",          &["applications-internet", "internet-web-browser", "web-browser"]);
+    m.insert("appstore",       &["system-software-install", "gnome-software", "applications-other", "folder-download"]);
+    m.insert("warning",        &["dialog-warning", "emblem-warning", "folder-important"]);
+    m.insert("help",           &["help-faq", "help-about", "help-contents", "system-help"]);
+    m.insert("add",            &["list-add", "add", "contact-new", "folder-new"]);
+    m.insert("logout",         &["system-log-out", "application-exit", "cs-user"]);
     // Settings tabs
-    m.insert("palette",        &["preferences-desktop-theme", "preferences-desktop-wallpaper", "applications-graphics"]);
-    m.insert("bell",           &["preferences-desktop-notification", "notification-new", "appointment-soon"]);
-    m.insert("robot",          &["utilities-terminal", "application-x-executable", "system-run"]);
-    m.insert("package",        &["package-x-generic", "system-software-install", "application-x-archive"]);
-    m.insert("lock",           &["security-high", "dialog-password", "changes-prevent"]);
-    m.insert("heart",          &["emblem-favorite", "love", "bookmark-new"]);
+    m.insert("palette",        &["preferences-desktop-theme", "cs-cat-appearance", "cs-themes", "applications-graphics"]);
+    m.insert("bell",           &["bell", "preferences-desktop-notification", "notification-active", "notifications", "cs-notifications"]);
+    m.insert("robot",          &["utilities-terminal", "application-x-executable", "applications-development"]);
+    m.insert("package",        &["folder-tar", "folder-deb", "applications-utilities", "package-x-generic"]);
+    m.insert("lock",           &["system-lock-screen", "folder-locked", "security-high", "dialog-password", "changes-prevent"]);
+    m.insert("heart",          &["emblem-favorite", "favorites", "folder-favorites", "love"]);
     // Components
-    m.insert("shield",         &["security-high", "network-server-security", "shield"]);
-    m.insert("satellite",      &["network-wireless", "network-transmit-receive", "modem"]);
+    m.insert("shield",         &["security-high", "folder-locked", "network-server-security", "preferences-system-network"]);
+    m.insert("satellite",      &["network-wireless-connected-100", "network-wireless", "network-transmit-receive"]);
     m.insert("save",           &["drive-harddisk", "media-floppy", "document-save"]);
-    m.insert("scale",          &["preferences-desktop-display", "video-display", "utilities-system-monitor"]);
-    m.insert("database",       &["server-database", "drive-multidisk", "network-server"]);
-    m.insert("certbot",        &["application-certificate", "security-high", "dialog-password"]);
+    m.insert("scale",          &["preferences-desktop-display", "cs-display", "video-display", "utilities-system-monitor"]);
+    m.insert("database",       &["folder-database", "drive-multidisk", "network-server"]);
+    m.insert("certbot",        &["certificate-server", "folder-locked", "security-high"]);
     // Storage
-    m.insert("cloud",          &["weather-overcast", "cloud", "network-cloud"]);
-    m.insert("folder",         &["folder", "inode-directory"]);
+    m.insert("cloud",          &["folder-cloud", "weather-overcast", "folder-gdrive", "folder-nextcloud"]);
+    m.insert("folder",         &["folder", "inode-directory", "gtk-directory", "stock_folder"]);
     m.insert("folder-open",    &["folder-open", "folder-visiting"]);
-    m.insert("disk",           &["drive-harddisk", "media-removable", "drive-harddisk-system"]);
+    m.insert("disk",           &["drive-harddisk", "drive-removable-media", "drive-multidisk"]);
     // Containers
-    m.insert("docker",         &["docker", "application-x-container", "package-x-generic"]);
-    m.insert("container",      &["package-x-generic", "application-x-archive", "utilities-file-archiver"]);
-    m.insert("computer",       &["computer", "system", "user-desktop"]);
+    m.insert("docker",         &["folder-docker", "docker", "application-x-container", "applications-utilities"]);
+    m.insert("container",      &["folder-tar", "folder-deb", "applications-utilities", "package-x-generic"]);
+    m.insert("computer",       &["computer", "user-desktop", "cs-desktop"]);
     // Status
-    m.insert("fire",           &["dialog-warning", "emblem-important", "security-low"]);
-    m.insert("chat",           &["internet-group-chat", "user-available", "preferences-desktop-notification"]);
-    m.insert("email",          &["internet-mail", "mail-message-new", "evolution"]);
-    m.insert("rocket",         &["system-run", "media-playback-start", "go-next"]);
-    m.insert("lightning",      &["weather-storm", "battery-full-charging", "system-run"]);
-    m.insert("laptop",         &["computer-laptop", "computer", "system"]);
-    m.insert("brain",          &["preferences-system", "utilities-system-monitor", "system-run"]);
-    m.insert("lightbulb",      &["dialog-information", "help-about", "preferences-desktop-accessibility"]);
-    m.insert("document",       &["text-x-generic", "document-new", "text-plain"]);
-    m.insert("pin",            &["bookmark-new", "emblem-important", "contact-new"]);
-    m.insert("link",           &["emblem-symbolic-link", "insert-link", "go-jump"]);
-    m.insert("clipboard",      &["edit-paste", "edit-copy", "accessories-clipboard"]);
-    m.insert("chart",          &["utilities-system-monitor", "gnome-system-monitor", "ksysguard"]);
-    m.insert("chart-up",       &["go-up", "view-sort-ascending", "utilities-system-monitor"]);
-    m.insert("wrench",         &["preferences-other", "preferences-system", "configure"]);
-    m.insert("tools",          &["preferences-system", "applications-system", "configure"]);
-    m.insert("edit",           &["text-editor", "accessories-text-editor", "gedit"]);
-    m.insert("search",         &["edit-find", "system-search", "search"]);
-    m.insert("image",          &["image-x-generic", "applications-graphics", "eog"]);
-    m.insert("key",            &["dialog-password", "changes-allow", "gcr-key"]);
-    m.insert("megaphone",      &["preferences-desktop-notification", "notification-new", "dialog-warning"]);
+    m.insert("fire",           &["dialog-warning", "emblem-important", "folder-important"]);
+    m.insert("chat",           &["internet-group-chat", "folder-mail", "preferences-desktop-notification"]);
+    m.insert("email",          &["internet-mail", "mail-unread", "folder-mail", "evolution"]);
+    m.insert("rocket",         &["media-playback-playing", "system-run", "media-playback-start"]);
+    m.insert("lightning",      &["battery-full-charging", "battery-good-charging", "weather-storm"]);
+    m.insert("laptop",         &["computer", "user-desktop", "cs-desktop"]);
+    m.insert("brain",          &["preferences", "preferences-system", "applications-development"]);
+    m.insert("lightbulb",      &["dialog-information", "help-faq", "preferences-desktop-accessibility"]);
+    m.insert("document",       &["folder-text", "text-x-generic", "folder-documents", "document-new"]);
+    m.insert("pin",            &["folder-bookmark", "folder-favorites", "bookmark-new"]);
+    m.insert("link",           &["emblem-symbolic-link", "folder-remote", "folder-network"]);
+    m.insert("clipboard",      &["edit-paste", "edit-copy", "accessories-clipboard", "folder-notes"]);
+    m.insert("chart",          &["utilities-system-monitor", "folder-chart", "gnome-system-monitor"]);
+    m.insert("chart-up",       &["folder-chart", "go-up", "utilities-system-monitor"]);
+    m.insert("wrench",         &["preferences", "preferences-other", "preferences-system"]);
+    m.insert("tools",          &["preferences", "preferences-system", "applications-system"]);
+    m.insert("edit",           &["accessories-text-editor", "text-editor", "folder-text"]);
+    m.insert("search",         &["edit-find", "system-search", "folder-recent"]);
+    m.insert("image",          &["folder-image", "folder-pictures", "image-x-generic", "applications-graphics"]);
+    m.insert("key",            &["dialog-password", "folder-locked", "changes-allow"]);
+    m.insert("megaphone",      &["notification-active", "notifications", "preferences-desktop-notification"]);
     // File types
-    m.insert("file-code",      &["text-x-script", "text-x-generic-template", "application-x-executable"]);
-    m.insert("file-config",    &["text-x-generic", "preferences-other", "application-x-executable"]);
-    m.insert("file-archive",   &["application-x-archive", "package-x-generic", "application-zip"]);
-    m.insert("file-image",     &["image-x-generic", "application-image", "image"]);
-    m.insert("file-text",      &["text-plain", "text-x-generic", "document-new"]);
-    m.insert("file-data",      &["application-x-sqlite3", "server-database", "text-x-sql"]);
-    m.insert("file-shell",     &["text-x-script", "utilities-terminal", "application-x-shellscript"]);
+    m.insert("file-code",      &["applications-development", "text-x-script", "folder-development"]);
+    m.insert("file-config",    &["preferences", "text-x-generic", "folder-script"]);
+    m.insert("file-archive",   &["folder-tar", "application-x-archive", "package-x-generic"]);
+    m.insert("file-image",     &["folder-image", "image-x-generic", "folder-pictures"]);
+    m.insert("file-text",      &["folder-text", "text-plain", "text-x-generic"]);
+    m.insert("file-data",      &["folder-database", "application-x-sqlite3", "drive-multidisk"]);
+    m.insert("file-shell",     &["utilities-terminal", "text-x-script", "folder-script"]);
     // Monitoring
-    m.insert("cpu",            &["cpu", "utilities-system-monitor", "hwinfo"]);
-    m.insert("memory",         &["media-memory", "utilities-system-monitor", "memory"]);
-    m.insert("swap",           &["system-reboot", "view-refresh", "reload"]);
-    m.insert("load",           &["utilities-system-monitor", "go-up", "view-sort-ascending"]);
-    m.insert("service",        &["preferences-system", "system-run", "configure"]);
+    m.insert("cpu",            &["utilities-system-monitor", "cpu", "hwinfo"]);
+    m.insert("memory",         &["drive-harddisk", "utilities-system-monitor", "media-memory"]);
+    m.insert("swap",           &["drive-removable-media", "view-refresh", "system-reboot"]);
+    m.insert("load",           &["utilities-system-monitor", "folder-chart", "go-up"]);
+    m.insert("service",        &["preferences", "preferences-system", "system-run"]);
     // Misc
-    m.insert("door",           &["system-log-out", "application-exit", "window-close"]);
-    m.insert("wolf",           &["emblem-system", "security-high", "applications-system"]);
-    m.insert("gamepad",        &["input-gaming", "applications-games", "games"]);
-    m.insert("music",          &["audio-x-generic", "applications-multimedia", "rhythmbox"]);
-    m.insert("camera",         &["camera-photo", "applications-photography", "shotwell"]);
-    m.insert("cart",           &["applications-other", "system-software-install"]);
-    m.insert("money",          &["money-manager-ex", "applications-office", "accessories-calculator"]);
-    m.insert("book",           &["accessories-dictionary", "help-contents", "applications-office"]);
-    m.insert("lab",            &["applications-science", "utilities-system-monitor"]);
-    m.insert("star",           &["emblem-favorite", "starred", "bookmark-new"]);
-    m.insert("runner",         &["system-run", "media-playback-start", "go-next"]);
+    m.insert("door",           &["system-log-out", "application-exit", "cs-user"]);
+    m.insert("wolf",           &["emblem-system", "applications-system", "security-high"]);
+    m.insert("gamepad",        &["applications-games", "input-gaming", "folder-games"]);
+    m.insert("music",          &["folder-music", "audio-x-generic", "applications-multimedia"]);
+    m.insert("camera",         &["accessories-camera", "camera-photo", "folder-pictures"]);
+    m.insert("cart",           &["folder-download", "applications-other", "system-software-install"]);
+    m.insert("money",          &["accessories-calculator", "folder-calculate", "applications-office"]);
+    m.insert("book",           &["accessories-dictionary", "folder-book", "help-contents"]);
+    m.insert("lab",            &["applications-science", "applications-development", "utilities-system-monitor"]);
+    m.insert("star",           &["emblem-favorite", "favorites", "folder-favorites"]);
+    m.insert("runner",         &["media-playback-playing", "system-run", "media-playback-start"]);
+    // App-specific icons (for app store entries)
+    m.insert("fox",            &["firefox", "internet-web-browser", "applications-internet"]);
+    m.insert("elephant",       &["folder-database", "drive-multidisk", "database"]);
+    m.insert("whale",          &["folder-docker", "docker", "applications-utilities"]);
+    m.insert("penguin",        &["folder-linux", "applications-system", "utilities-terminal"]);
+    m.insert("movie",          &["folder-video", "folder-videos", "applications-multimedia"]);
+    m.insert("target",         &["folder-bookmark", "folder-important", "emblem-favorite"]);
+    m.insert("alien",          &["applications-games", "folder-games", "input-gaming"]);
     m
 }
+
+/// Fallback icon names to try when no semantic match is found.
+/// These are common icons that most freedesktop packs include.
+const FALLBACK_ICONS: &[&str] = &[
+    "applications-other",
+    "application-default-icon",
+    "preferences",
+    "folder",
+    "emblem-system",
+    "applications-utilities",
+    "text-x-generic",
+];
 
 /// Metadata about an installed icon pack
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,7 +243,8 @@ pub fn find_icon_file(theme_dir: &Path, icon_name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Resolve a WolfStack semantic icon name to a file in the given theme
+/// Resolve a WolfStack semantic icon name to a file in the given theme.
+/// Tries: specific candidates → semantic name directly → fallback icons.
 pub fn resolve_icon(theme_dir: &Path, semantic_name: &str) -> Option<PathBuf> {
     let map = semantic_to_freedesktop();
     if let Some(candidates) = map.get(semantic_name) {
@@ -233,8 +254,22 @@ pub fn resolve_icon(theme_dir: &Path, semantic_name: &str) -> Option<PathBuf> {
             }
         }
     }
-    // Also try the semantic name directly (some packs may have custom names)
-    find_icon_file(theme_dir, semantic_name)
+    // Try the semantic name directly (some packs may have custom names)
+    if let Some(p) = find_icon_file(theme_dir, semantic_name) {
+        return Some(p);
+    }
+    // Use a fallback icon so we never show a mix of emojis and pack icons
+    resolve_fallback(theme_dir)
+}
+
+/// Find any generic fallback icon from the pack
+fn resolve_fallback(theme_dir: &Path) -> Option<PathBuf> {
+    for name in FALLBACK_ICONS {
+        if let Some(p) = find_icon_file(theme_dir, name) {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// Scan a directory for valid icon themes (must have index.theme)
