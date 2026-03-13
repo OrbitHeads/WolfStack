@@ -224,14 +224,15 @@ async function loadIconPacks() {
 
 // Suggested icon packs — shown as installable cards if not already present
 const SUGGESTED_PACKS = [
-    { id: 'BeautyLine',           name: 'BeautyLine',  desc: 'Sleek outlined icons with gradient fills', url: 'https://github.com/gvolpe/BeautyLine' },
-    { id: 'candy-icons',          name: 'Candy Icons',  desc: 'Sweet, colorful SVG icons with candy-inspired gradients', url: 'https://github.com/EliverLara/candy-icons' },
-    { id: 'papirus-icon-theme',   name: 'Papirus',     desc: 'Material Design-inspired SVG icon theme', url: 'https://github.com/PapirusDevelopmentTeam/papirus-icon-theme' },
-    { id: 'Tela-icon-theme',      name: 'Tela',        desc: 'Flat, colourful design with multiple colour variants', url: 'https://github.com/vinceliuice/Tela-icon-theme' },
+    { id: 'BeautyLine',           name: 'BeautyLine',    desc: 'Sleek outlined icons with gradient fills', url: 'https://github.com/gvolpe/BeautyLine' },
+    { id: 'breeze-icons',         name: 'Breeze (KDE)',  desc: 'KDE Visual Design Group — clean, modern icons', url: 'https://github.com/KDE/breeze-icons' },
+    { id: 'candy-icons',          name: 'Candy Icons',   desc: 'Sweet, colorful SVG icons with candy-inspired gradients', url: 'https://github.com/EliverLara/candy-icons' },
+    { id: 'papirus-icon-theme',   name: 'Papirus',      desc: 'Material Design-inspired SVG icon theme', url: 'https://github.com/PapirusDevelopmentTeam/papirus-icon-theme' },
+    { id: 'Tela-icon-theme',      name: 'Tela',         desc: 'Flat, colourful design with multiple colour variants', url: 'https://github.com/vinceliuice/Tela-icon-theme' },
 ];
 
-/// Render the icon packs management UI
-function renderIconPacksUI(packs) {
+/// Render the icon packs management UI — auto-loads previews, hides packs with no matching icons
+async function renderIconPacksUI(packs) {
     const container = document.getElementById('icon-packs-grid');
     if (!container) return;
 
@@ -256,66 +257,67 @@ function renderIconPacksUI(packs) {
             </div>`;
     }
 
+    // Helper to build a pack card
+    function packCardHtml(id, name, desc, extra) {
+        const active = currentIconTheme === id ? ' active' : '';
+        const idEsc = id.replace(/'/g, "\\'");
+        return `
+            <div class="icon-theme-card theme-card${active}" data-icon-theme="${id}" data-icon-card="${id}" onclick="applyIconTheme('${idEsc}')">
+                <div style="padding:16px;text-align:center;">
+                    <div id="icon-pack-preview-${id}" style="min-height:38px;display:flex;align-items:center;justify-content:center;margin-bottom:10px;">
+                        <span style="font-size:11px;color:var(--text-muted);">Loading...</span>
+                    </div>
+                    <div class="theme-card-info">
+                        <div class="theme-card-name">${name}</div>
+                        <div class="theme-card-desc">${desc}</div>
+                    </div>
+                    ${extra || ''}
+                </div>
+            </div>`;
+    }
+
     // Installed icon packs
+    const allPackIds = [];
     for (const pack of packs) {
-        const active = currentIconTheme === pack.id ? ' active' : '';
         const source = pack.source === 'custom' ? 'Installed' : 'System';
         const iconCount = pack.icon_count > 0 ? ` \u00b7 ${pack.icon_count}+ icons` : '';
         const scalable = pack.has_scalable ? ' \u00b7 SVG' : '';
         const canRemove = pack.source === 'custom'
-            ? `<button class="btn btn-sm" style="margin-top:8px;font-size:11px;padding:2px 8px;color:var(--danger);" onclick="event.stopPropagation();removeIconPack('${pack.id}')">Remove</button>`
+            ? `<button class="btn btn-sm" style="margin-top:8px;font-size:11px;padding:2px 8px;color:var(--danger);" onclick="event.stopPropagation();removeIconPack('${pack.id.replace(/'/g, "\\'")}')">Remove</button>`
             : '';
-
-        const packIdEsc = pack.id.replace(/'/g, "\\'");
-        html += `
-            <div class="icon-theme-card theme-card${active}" data-icon-theme="${pack.id}" onclick="applyIconTheme('${packIdEsc}')">
-                <div style="padding:16px;text-align:center;">
-                    <div id="icon-pack-preview-${pack.id}" style="min-height:38px;display:flex;align-items:center;justify-content:center;margin-bottom:10px;">
-                        <button class="btn btn-sm" onclick="event.stopPropagation();previewIconPack('${packIdEsc}')" style="font-size:11px;padding:3px 10px;">Preview</button>
-                    </div>
-                    <div class="theme-card-info">
-                        <div class="theme-card-name">${pack.name}</div>
-                        <div class="theme-card-desc">${pack.comment || source}${iconCount}${scalable}</div>
-                    </div>
-                    ${canRemove}
-                </div>
-            </div>`;
+        html += packCardHtml(pack.id, pack.name, (pack.comment || source) + iconCount + scalable, canRemove);
+        allPackIds.push(pack.id);
     }
 
-    // Suggested packs not yet installed
+    // Suggested packs not yet installed — same card style, with Install button
     for (const sp of SUGGESTED_PACKS) {
         if (installedIds.has(sp.id)) continue;
         const urlEsc = sp.url.replace(/'/g, "\\'");
-        html += `
-            <div class="icon-theme-card theme-card" style="opacity:0.7;" data-icon-theme="${sp.id}">
-                <div style="padding:16px;text-align:center;">
-                    <div style="min-height:38px;display:flex;align-items:center;justify-content:center;margin-bottom:10px;">
-                        <span style="font-size:12px;color:var(--text-muted);">Not installed</span>
-                    </div>
-                    <div class="theme-card-info">
-                        <div class="theme-card-name">${sp.name}</div>
-                        <div class="theme-card-desc">${sp.desc}</div>
-                    </div>
-                    <button class="btn btn-sm btn-primary" onclick="event.stopPropagation();document.getElementById('icon-pack-url').value='${urlEsc}';installIconPack()" style="margin-top:8px;font-size:11px;padding:3px 10px;">Install</button>
-                </div>
-            </div>`;
+        const installBtn = `<button class="btn btn-sm btn-primary" onclick="event.stopPropagation();document.getElementById('icon-pack-url').value='${urlEsc}';installIconPack()" style="margin-top:8px;font-size:11px;padding:3px 10px;">Install</button>`;
+        html += packCardHtml(sp.id, sp.name, sp.desc, installBtn);
     }
 
     container.innerHTML = html;
+
+    // Auto-load previews for all packs; hide cards with no matching icons
+    for (const pack of packs) {
+        autoLoadPreview(pack.id);
+    }
 }
 
-/// Load and show preview icons for a specific pack
-async function previewIconPack(packId) {
-    const container = document.getElementById(`icon-pack-preview-${packId}`);
-    if (!container) return;
-    container.innerHTML = '<span style="font-size:11px;color:var(--text-muted);">Loading...</span>';
+/// Auto-load preview icons for a pack; hide the card if no icons match
+async function autoLoadPreview(packId) {
+    const previewEl = document.getElementById(`icon-pack-preview-${packId}`);
+    if (!previewEl) return;
     const preview = await loadIconPackPreview(packId);
     if (!preview || !preview.available || preview.available.length === 0) {
-        container.innerHTML = '<span style="font-size:11px;color:var(--text-muted);">No matching icons</span>';
+        // No matching icons — hide the entire card
+        const card = document.querySelector(`[data-icon-card="${packId}"]`);
+        if (card) card.style.display = 'none';
         return;
     }
     const icons = preview.available.slice(0, 5);
-    container.innerHTML = icons.map(name =>
+    previewEl.innerHTML = icons.map(name =>
         `<img src="/api/icon-packs/${encodeURIComponent(packId)}/icon/${encodeURIComponent(name)}" style="width:28px;height:28px;margin:0 3px;" onerror="this.style.display='none'">`
     ).join('');
 }
