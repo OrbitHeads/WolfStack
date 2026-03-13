@@ -213,12 +213,21 @@ async function loadIconPacks() {
     }
 }
 
+// Suggested icon packs — shown as installable cards if not already present
+const SUGGESTED_PACKS = [
+    { id: 'BeautyLine',           name: 'BeautyLine',  desc: 'Sleek outlined icons with gradient fills', url: 'https://github.com/gvolpe/BeautyLine' },
+    { id: 'candy-icons',          name: 'Candy Icons',  desc: 'Sweet, colorful SVG icons with candy-inspired gradients', url: 'https://github.com/EliverLara/candy-icons' },
+    { id: 'papirus-icon-theme',   name: 'Papirus',     desc: 'Material Design-inspired SVG icon theme', url: 'https://github.com/PapirusDevelopmentTeam/papirus-icon-theme' },
+    { id: 'Tela-icon-theme',      name: 'Tela',        desc: 'Flat, colourful design with multiple colour variants', url: 'https://github.com/vinceliuice/Tela-icon-theme' },
+];
+
 /// Render the icon packs management UI
 function renderIconPacksUI(packs) {
     const container = document.getElementById('icon-packs-grid');
     if (!container) return;
 
     let html = '';
+    const installedIds = new Set(packs.map(p => p.id));
 
     // Built-in themes first
     for (const [id, theme] of Object.entries(BUILTIN_ICON_THEMES)) {
@@ -260,6 +269,25 @@ function renderIconPacksUI(packs) {
                         <div class="theme-card-desc">${pack.comment || source}${iconCount}${scalable}</div>
                     </div>
                     ${canRemove}
+                </div>
+            </div>`;
+    }
+
+    // Suggested packs not yet installed
+    for (const sp of SUGGESTED_PACKS) {
+        if (installedIds.has(sp.id)) continue;
+        const urlEsc = sp.url.replace(/'/g, "\\'");
+        html += `
+            <div class="icon-theme-card theme-card" style="opacity:0.7;" data-icon-theme="${sp.id}">
+                <div style="padding:16px;text-align:center;">
+                    <div style="min-height:38px;display:flex;align-items:center;justify-content:center;margin-bottom:10px;">
+                        <span style="font-size:12px;color:var(--text-muted);">Not installed</span>
+                    </div>
+                    <div class="theme-card-info">
+                        <div class="theme-card-name">${sp.name}</div>
+                        <div class="theme-card-desc">${sp.desc}</div>
+                    </div>
+                    <button class="btn btn-sm btn-primary" onclick="event.stopPropagation();document.getElementById('icon-pack-url').value='${urlEsc}';installIconPack()" style="margin-top:8px;font-size:11px;padding:3px 10px;">Install</button>
                 </div>
             </div>`;
     }
