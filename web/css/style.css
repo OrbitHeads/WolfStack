@@ -2655,8 +2655,11 @@ body.sidebar-collapsed .main-content {
         grid-template-columns: 1fr 1fr;
     }
 
-    /* Hide enterprise banner on tablet */
+    /* Hide enterprise banner and share icons on tablet */
     .top-bar-actions a[href*="enterprise"] {
+        display: none !important;
+    }
+    .share-icons {
         display: none !important;
     }
 }
