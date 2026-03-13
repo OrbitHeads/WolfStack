@@ -772,9 +772,9 @@ function selectView(page) {
     if (page === 'datacenter') {
         renderDatacenterOverview();
     } else if (page === 'settings') {
-        // Load icon packs for appearance tab (default)
-        const appearanceTab = document.getElementById('settings-tab-appearance');
-        if (appearanceTab && appearanceTab.classList.contains('active')) {
+        // Load icon packs if icons tab is active
+        const iconsTab = document.getElementById('settings-tab-icons');
+        if (iconsTab && iconsTab.classList.contains('active')) {
             loadIconPacks();
         }
         // If AI tab is active, load AI data
@@ -19347,7 +19347,7 @@ function switchSettingsTab(tabName) {
     });
 
     // Lazy-load data when switching tabs
-    if (tabName === 'appearance') {
+    if (tabName === 'icons') {
         loadIconPacks();
     } else if (tabName === 'ai') {
         loadAiConfig();
