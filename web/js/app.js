@@ -1191,10 +1191,17 @@ function buildServerTree(nodes) {
                 <a class="nav-item server-child-item cluster-backups-item" data-cluster="${escapedName}" data-view="cluster-backups" onclick="showClusterBackupsPage('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
                     <span class="icon" style="font-size:15px;">💾</span> <span style="font-weight:600;">Backups</span>
                 </a>
+`;
+        // Only show WolfKube if this cluster has k8s clusters on its nodes
+        const clusterNodeIds = new Set(clusterNodes.map(n => n.id));
+        const clusterK8s = k8sClusters.filter(c => c.owner_node_id && clusterNodeIds.has(c.owner_node_id));
+        if (clusterK8s.length > 0 || clusterNodes.some(n => n.k8s_clusters && n.k8s_clusters.length > 0)) {
+            html += `
                 <a class="nav-item server-child-item k8s-cluster-item" data-cluster="${escapedName}" data-view="kubernetes" onclick="showK8sClusterPage('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
                     <span class="icon" style="font-size:15px;">&#9784;</span> <span style="font-weight:600;">WolfKube</span>
                     <span class="k8s-cluster-count" id="k8s-count-${clusterId}" style="margin-left:auto; font-size:10px; padding:1px 6px; background:#326ce5; color:#fff; border-radius:10px; display:none;"></span>
                 </a>`;
+        }
 
         // Each node within the cluster
         clusterNodes.forEach(node => {
