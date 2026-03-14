@@ -6,7 +6,7 @@
 #
 # WolfStack Quick Install Script
 # Installs WolfStack server management dashboard
-# Supported: Ubuntu/Debian, Fedora/RHEL/CentOS, SLES/openSUSE, IBM Power (ppc64le)
+# Supported: Ubuntu/Debian, Fedora/RHEL/CentOS, SLES/openSUSE, Arch Linux, IBM Power (ppc64le)
 #
 # Usage: curl -sSL https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfStack/master/setup.sh | sudo bash
 #        curl -sSL https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfStack/beta/setup.sh | sudo bash -s -- --beta
@@ -110,8 +110,11 @@ elif command -v yum &> /dev/null; then
 elif command -v zypper &> /dev/null; then
     PKG_MANAGER="zypper"
     echo "✓ Detected SLES/openSUSE (zypper)"
+elif command -v pacman &> /dev/null; then
+    PKG_MANAGER="pacman"
+    echo "✓ Detected Arch Linux (pacman)"
 else
-    echo "✗ Could not detect package manager (apt/dnf/yum/zypper)"
+    echo "✗ Could not detect package manager (apt/dnf/yum/zypper/pacman)"
     echo "  Please install dependencies manually."
     exit 1
 fi
@@ -129,6 +132,8 @@ elif [ "$PKG_MANAGER" = "yum" ]; then
     yum update -y -q
 elif [ "$PKG_MANAGER" = "zypper" ]; then
     zypper refresh -q && zypper update -y
+elif [ "$PKG_MANAGER" = "pacman" ]; then
+    pacman -Syu --noconfirm
 fi
 echo "✓ System packages up to date"
 
@@ -212,6 +217,14 @@ elif [ "$PKG_MANAGER" = "zypper" ]; then
         QEMU_ZYPP="qemu-kvm qemu-tools"
     fi
     zypper install -y git curl gcc gcc-c++ make libopenssl-devel pkg-config lxc dnsmasq bridge-utils $QEMU_ZYPP socat s3fs nfs-client fuse3
+elif [ "$PKG_MANAGER" = "pacman" ]; then
+    ARCH=$(uname -m)
+    if [ "$ARCH" = "aarch64" ]; then
+        QEMU_PAC="qemu-system-aarch64 qemu-img edk2-aarch64"
+    else
+        QEMU_PAC="qemu-full"
+    fi
+    pacman -Sy --noconfirm --needed git curl base-devel openssl pkg-config lxc dnsmasq bridge-utils $QEMU_PAC socat s3fs-fuse nfs-utils fuse3
 fi
 
 echo "✓ System dependencies installed"
