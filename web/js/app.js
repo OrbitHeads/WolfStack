@@ -14128,7 +14128,8 @@ async function loadBackups() {
         const backups = await backupsRes.json();
         const schedules = await schedulesRes.json();
         const targets = await targetsRes.json();
-        window._backupTargets = targets; // Store for PBS snapshot enrichment
+        window._backupTargets = targets;
+        window._backupEntries = backups; // Store for PBS snapshot enrichment
         renderBackupTargets(targets);
         renderBackupHistory(backups);
         renderSchedules(schedules);
@@ -14814,16 +14815,48 @@ async function loadPbsSnapshots() {
         }
         if (empty) empty.style.display = 'none';
 
-        // Enrich PBS snapshots with backup target details from loaded targets
+        // Enrich PBS snapshots from multiple sources:
+        // 1. WolfStack backup entries (have cluster, node, hostname, specs, comments)
+        // 2. Loaded backup targets (have hostname, specs for local containers)
+        // 3. PBS snapshot notes (if set)
+        const backupEntries = window._backupEntries || [];
         const targets = window._backupTargets || [];
-        const targetMap = {};
-        targets.forEach(t => {
-            if (t.type === 'lxc' || t.type === 'docker') {
-                targetMap[t.name] = t;
+
+        // Build lookup by target name → backup entry (most recent first)
+        const entryByName = {};
+        backupEntries.forEach(b => {
+            if (b.target && b.target.name && b.storage && (b.storage.type === 'pbs' || b.storage.storage_type === 'pbs')) {
+                const key = b.target.name;
+                if (!entryByName[key] || b.created_at > entryByName[key].created_at) {
+                    entryByName[key] = b;
+                }
             }
         });
+        // Also index by target type for broader matching
+        const targetMap = {};
+        targets.forEach(t => { if (t.name) targetMap[t.name] = t; });
+
         list.forEach(s => {
             const bid = s['backup-id'] || s.backup_id || '';
+
+            // Try matching against WolfStack backup entries first (best data)
+            const entry = entryByName[bid];
+            if (entry) {
+                if (!s.hostname && entry.target) {
+                    s.hostname = entry.target.hostname || '';
+                    s.specs = entry.target.specs || '';
+                }
+                if ((!s._cluster || s._cluster === '—') && entry.comments) {
+                    // Parse cluster from comments: "[ClusterName] LXC container: ..."
+                    const cm = entry.comments.match(/^\[([^\]]+)\]/);
+                    if (cm) s._cluster = cm[1];
+                }
+                if ((!s._node || s._node === '—') && entry.node_hostname) {
+                    s._node = entry.node_hostname;
+                }
+            }
+
+            // Fallback to backup targets (local containers)
             if (!s.hostname && targetMap[bid]) {
                 s.hostname = targetMap[bid].hostname || '';
                 s.specs = targetMap[bid].specs || '';
@@ -14856,30 +14889,26 @@ async function loadPbsSnapshots() {
                 timeStr = d.toLocaleString();
             }
 
-            // Parse structured notes: "Cluster: X | Node: Y | [X] LXC container: 131 (hostname) ..."
-            var clusterName = '—';
-            var nodeName = '—';
+            // Cluster & node: prefer enrichment from backup entries, then from PBS notes
+            var clusterName = s._cluster || '—';
+            var nodeName = s._node || '—';
             var detailText = '';
             if (comment) {
                 var parts = comment.split(' | ');
                 parts.forEach(function(p) {
                     p = p.trim();
-                    if (p.startsWith('Cluster:')) clusterName = p.substring(8).trim();
-                    else if (p.startsWith('Node:')) nodeName = p.substring(5).trim();
-                    else detailText = p;
+                    if (p.startsWith('Cluster:') && clusterName === '—') clusterName = p.substring(8).trim();
+                    else if (p.startsWith('Node:') && nodeName === '—') nodeName = p.substring(5).trim();
+                    else if (!p.startsWith('Cluster:') && !p.startsWith('Node:')) detailText = p;
                 });
-                // If notes aren't in structured format, show as-is
-                if (clusterName === '—' && nodeName === '—') detailText = comment;
             }
 
-            // Container name: prefer enriched hostname, then from notes, then raw comment
+            // Container name: prefer enriched hostname, then from notes detail, then bid
             var hostname = s.hostname || '';
             var specs = s.specs || '';
             var displayName = hostname && hostname !== bid ? escapeHtml(hostname) : '—';
             var specsLine = specs ? '<div style="font-size:11px; color:var(--text-muted);">' + escapeHtml(specs) + '</div>' : '';
-            // If we have detail text from notes but no hostname from enrichment, extract it
             if (displayName === '—' && detailText) {
-                // e.g. "[Cluster] LXC container: 131 (myhost) (vzdump full backup)"
                 var match = detailText.match(/:\s*\S+\s*\(([^)]+)\)/);
                 if (match) displayName = escapeHtml(match[1]);
                 else displayName = '<span style="font-size:11px; color:var(--text-muted);">' + escapeHtml(detailText.replace(/^\[.*?\]\s*/, '')) + '</span>';
@@ -15094,6 +15123,8 @@ async function loadClusterBackups() {
     if (statSchedules) statSchedules.textContent = totalSchedules;
     if (statPbs) statPbs.textContent = `${pbsConnected}/${clusterNodes.filter(n => n.online).length}`;
 
+    // Store all cluster backup entries for PBS enrichment
+    window._backupEntries = (window._backupEntries || []).concat(allBackups);
     renderClusterBackupHistory(allBackups);
     renderClusterSchedules(allSchedules);
     renderClusterPbsNodeStatus(nodeResults);
