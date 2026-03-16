@@ -16542,49 +16542,173 @@ async function mysqlLoadTableData() {
     }
 }
 
+// Store current grid data for edit form
+let _mysqlGridColumns = [];
+let _mysqlGridRows = [];
+
 function mysqlRenderGrid(columns, rows, container) {
+    _mysqlGridColumns = columns;
+    _mysqlGridRows = rows;
+
     if (columns.length === 0) {
         container.innerHTML = '<div style="padding:40px; text-align:center; color:var(--text-muted);">No data</div>';
         return;
     }
 
+    const thStyle = 'padding:8px 12px; text-align:left; background:var(--bg-tertiary); border-bottom:2px solid var(--border); color:var(--text-secondary); font-weight:600; white-space:nowrap; font-size:11px; text-transform:uppercase; letter-spacing:0.5px;';
     let html = `<table style="width:100%; border-collapse:collapse; font-family:var(--font-mono); font-size:12px;">
-        <thead>
-            <tr style="position:sticky; top:0; z-index:1;">`;
+        <thead><tr style="position:sticky; top:0; z-index:1;">`;
 
-    // Header
-    html += '<th style="padding:8px 12px; text-align:left; background:var(--bg-tertiary); border-bottom:2px solid var(--border); color:var(--text-secondary); font-weight:600; white-space:nowrap; font-size:11px; text-transform:uppercase; letter-spacing:0.5px;">#</th>';
     for (const col of columns) {
-        html += `<th style="padding:8px 12px; text-align:left; background:var(--bg-tertiary); border-bottom:2px solid var(--border); color:var(--text-secondary); font-weight:600; white-space:nowrap; font-size:11px; text-transform:uppercase; letter-spacing:0.5px;">${escapeHtml(col)}</th>`;
+        html += `<th style="${thStyle}">${escapeHtml(col)}</th>`;
     }
+    html += `<th style="${thStyle} width:40px;"></th>`;
     html += '</tr></thead><tbody>';
 
-    // Rows
-    const offset = mysqlCurrentPage * mysqlPageSize;
     for (let i = 0; i < rows.length; i++) {
         const row = rows[i];
-        const rowNum = offset + i + 1;
         const bgColor = i % 2 === 0 ? 'transparent' : 'rgba(255,255,255,0.02)';
-        html += `<tr style="background:${bgColor}; transition:background 0.1s;" onmouseover="this.style.background='var(--accent-primary-10)'" onmouseout="this.style.background='${bgColor}'">`;
-        html += `<td style="padding:6px 12px; border-bottom:1px solid var(--border); color:var(--text-muted); font-size:11px;">${rowNum}</td>`;
+        html += `<tr style="background:${bgColor}; transition:background 0.1s; cursor:pointer;" onmouseover="this.style.background='var(--bg-card-hover,rgba(255,255,255,0.04))'" onmouseout="this.style.background='${bgColor}'" ondblclick="mysqlEditRow(${i})">`;
         for (let j = 0; j < columns.length; j++) {
             const val = j < row.length ? row[j] : null;
             let display, style = 'padding:6px 12px; border-bottom:1px solid var(--border); max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
             if (val === null) {
                 display = '<span style="color:var(--text-muted); font-style:italic;">NULL</span>';
             } else if (typeof val === 'number') {
-                display = `<span style="color:#3498db;">${val}</span>`;
+                display = `<span style="color:var(--accent);">${val}</span>`;
                 style += ' text-align:right;';
+            } else if (typeof val === 'boolean') {
+                display = `<span style="color:${val ? '#22c55e' : '#ef4444'};">${val}</span>`;
             } else {
                 display = escapeHtml(String(val));
             }
             html += `<td style="${style}" title="${escapeHtml(String(val ?? 'NULL'))}">${display}</td>`;
         }
+        html += `<td style="padding:6px 8px; border-bottom:1px solid var(--border); text-align:center;">
+            <button class="btn btn-sm" onclick="mysqlEditRow(${i})" style="font-size:10px; padding:2px 6px; background:var(--bg-tertiary); color:var(--text-muted); border:1px solid var(--border);" title="Edit row">✏️</button>
+        </td>`;
         html += '</tr>';
     }
 
     html += '</tbody></table>';
     container.innerHTML = html;
+}
+
+function mysqlEditRow(rowIndex) {
+    const columns = _mysqlGridColumns;
+    const row = _mysqlGridRows[rowIndex];
+    if (!columns || !row) return;
+
+    closeModal();
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+        <div class="modal" style="max-width:700px; width:95%; max-height:90vh; display:flex; flex-direction:column;">
+            <div class="modal-header" style="flex-shrink:0;">
+                <h3>Edit Row — ${escapeHtml(mysqlCurrentTable || 'Table')}</h3>
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-body" style="flex:1; overflow-y:auto; padding:16px;">
+                <div id="mysql-edit-fields" style="display:grid; gap:12px;">
+                    ${columns.map((col, j) => {
+                        const val = j < row.length ? row[j] : null;
+                        const isNull = val === null;
+                        const displayVal = isNull ? '' : String(val);
+                        const isLong = displayVal.length > 100;
+                        const inputId = 'mysql-edit-' + j;
+                        const nullId = 'mysql-null-' + j;
+                        return `<div style="display:grid; grid-template-columns:140px 1fr auto; gap:8px; align-items:start;">
+                            <label style="font-size:12px; font-weight:600; color:var(--text-secondary); padding-top:8px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(col)}">${escapeHtml(col)}</label>
+                            ${isLong
+                                ? `<textarea id="${inputId}" class="form-control" rows="3" style="font-size:12px; font-family:var(--font-mono); resize:vertical;" ${isNull ? 'disabled placeholder="NULL"' : ''}>${escapeHtml(displayVal)}</textarea>`
+                                : `<input id="${inputId}" type="text" class="form-control" value="${escapeHtml(displayVal)}" style="font-size:12px; font-family:var(--font-mono);" ${isNull ? 'disabled placeholder="NULL"' : ''}>`
+                            }
+                            <label style="display:flex; align-items:center; gap:4px; font-size:11px; color:var(--text-muted); padding-top:6px; cursor:pointer; white-space:nowrap;">
+                                <input type="checkbox" id="${nullId}" ${isNull ? 'checked' : ''} onchange="document.getElementById('${inputId}').disabled = this.checked; if(this.checked) document.getElementById('${inputId}').value = '';"> NULL
+                            </label>
+                        </div>`;
+                    }).join('')}
+                </div>
+            </div>
+            <div class="modal-footer" style="flex-shrink:0; display:flex; justify-content:space-between; align-items:center;">
+                <span style="font-size:11px; color:var(--text-muted);">${escapeHtml(mysqlCurrentDb || '')} → ${escapeHtml(mysqlCurrentTable || '')}</span>
+                <div style="display:flex; gap:8px;">
+                    <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                    <button class="btn btn-primary" onclick="mysqlSaveRow(${rowIndex})">Save Changes</button>
+                </div>
+            </div>
+        </div>`;
+    document.body.appendChild(overlay);
+    requestAnimationFrame(() => overlay.classList.add('active'));
+}
+
+async function mysqlSaveRow(rowIndex) {
+    const columns = _mysqlGridColumns;
+    const origRow = _mysqlGridRows[rowIndex];
+    if (!columns || !origRow || !mysqlCurrentTable || !mysqlCurrentDb) return;
+
+    // Build SET clause from changed fields
+    const sets = [];
+    const wheres = [];
+
+    for (let j = 0; j < columns.length; j++) {
+        const isNull = document.getElementById('mysql-null-' + j)?.checked;
+        const newVal = isNull ? null : (document.getElementById('mysql-edit-' + j)?.value ?? '');
+        const origVal = j < origRow.length ? origRow[j] : null;
+
+        // Build WHERE from original values (for identifying the row)
+        if (origVal === null) {
+            wheres.push(quoteIdent(columns[j]) + ' IS NULL');
+        } else {
+            wheres.push(quoteIdent(columns[j]) + ' = ' + quoteLiteral(String(origVal)));
+        }
+
+        // Only include changed fields in SET
+        const changed = isNull ? (origVal !== null) : (String(newVal) !== String(origVal ?? ''));
+        if (changed) {
+            sets.push(quoteIdent(columns[j]) + ' = ' + (isNull ? 'NULL' : quoteLiteral(newVal)));
+        }
+    }
+
+    if (sets.length === 0) {
+        showToast('No changes to save', 'info');
+        closeModal();
+        return;
+    }
+
+    const tableName = quoteIdent(mysqlCurrentTable);
+    const sql = `UPDATE ${tableName} SET ${sets.join(', ')} WHERE ${wheres.join(' AND ')} LIMIT 1`;
+
+    try {
+        const baseUrl = getNodeApiBase(mysqlConnectedNodeId);
+        const resp = await fetch(`${baseUrl}/mysql/query`, {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...mysqlCreds, database: mysqlCurrentDb, query: sql }),
+        });
+        const data = await resp.json();
+        if (data.error) {
+            showToast('Update failed: ' + data.error, 'error');
+        } else {
+            showToast('Row updated', 'success');
+            taskLog('DB update: ' + mysqlCurrentTable);
+            closeModal();
+            mysqlLoadTableData();
+        }
+    } catch (e) {
+        showToast('Update failed: ' + e.message, 'error');
+    }
+}
+
+function quoteIdent(name) {
+    // Use backticks for MySQL, double quotes for PostgreSQL
+    if (mysqlDbType === 'postgres') return '"' + name.replace(/"/g, '""') + '"';
+    return '`' + name.replace(/`/g, '``') + '`';
+}
+
+function quoteLiteral(val) {
+    return "'" + String(val).replace(/'/g, "''") + "'";
 }
 
 function mysqlChangePage(delta) {
