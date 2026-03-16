@@ -6893,7 +6893,7 @@ async function upgradeNode(nodeId) {
     window.open(url, 'upgrade_console_' + nodeId, 'width=960,height=600,menubar=no,toolbar=no');
 
     showToast('Upgrade started — watch the terminal window for progress.', 'info');
-    taskLog('Upgrade node: ' + machine);
+    taskLogStart('Upgrade node: ' + machine);
 
     // Close the settings modal
     const modal = document.getElementById('node-settings-modal');
@@ -7142,20 +7142,29 @@ function renderTaskLog() {
     const tbody = document.getElementById('task-log-table');
     const count = document.getElementById('task-log-count');
     if (!tbody) return;
-    if (count) count.textContent = `(${_taskLogEntries.length})`;
+    const runningCount = _taskLogEntries.filter(e => e.status === 'running').length;
+    const runningLabel = runningCount > 0 ? ` — ${runningCount} running` : '';
+    if (count) count.textContent = `(${_taskLogEntries.length}${runningLabel})`;
 
     tbody.innerHTML = _taskLogEntries.map(entry => {
         const timeStr = entry.time.toLocaleTimeString();
+        const isRunning = entry.status === 'running';
+        const isFailed = entry.status === 'failed';
+        const spinnerHtml = isRunning
+            ? '<span style="display:inline-block; width:12px; height:12px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin 0.8s linear infinite; vertical-align:middle; margin-right:4px;"></span>'
+            : '';
         const statusBadge = entry.status === 'completed'
             ? '<span style="color:#22c55e; font-weight:500;">✓ OK</span>'
-            : entry.status === 'failed'
+            : isFailed
                 ? '<span style="color:#ef4444; font-weight:500;">✗ Failed</span>'
-                : '<span style="color:var(--accent);">⏳ Running</span>';
+                : spinnerHtml + '<span style="color:var(--accent);">Running</span>';
+
+        const rowBg = isFailed ? 'background:rgba(239,68,68,0.08);' : isRunning ? 'background:rgba(59,130,246,0.05);' : '';
 
         const hasLog = entry.logLines.length > 0;
         const expandBtn = hasLog ? `<span style="cursor:pointer; margin-right:4px; color:var(--text-muted);" onclick="toggleTaskLogExpand('${entry.id}')">${entry.expanded ? '▼' : '▶'}</span>` : '<span style="display:inline-block; width:16px;"></span>';
 
-        let row = `<tr style="border-bottom:1px solid var(--border);">
+        let row = `<tr style="border-bottom:1px solid var(--border); ${rowBg}">
             <td style="padding:5px 10px; white-space:nowrap; color:var(--text-muted);">${timeStr}</td>
             <td style="padding:5px 10px;">${escapeHtml(entry.cluster)}</td>
             <td style="padding:5px 10px;">${escapeHtml(entry.node)}</td>
@@ -7187,12 +7196,17 @@ function toggleTaskLogExpand(id) {
     if (entry) { entry.expanded = !entry.expanded; renderTaskLog(); }
 }
 
-/// Quick helper: log a completed action to the task footer
+/// Quick helper: log an action to the task footer (defaults to completed)
 function taskLog(description, status = 'completed') {
     const node = currentNodeId ? allNodes.find(n => n.id === currentNodeId) : null;
     const clusterLabel = node ? (node.cluster_name || node.pve_cluster_name || 'WolfStack') : 'WolfStack';
     const nodeName = node ? (node.hostname || node.address) : 'local';
-    addTaskLogEntry({ cluster: clusterLabel, node: nodeName, description, status });
+    return addTaskLogEntry({ cluster: clusterLabel, node: nodeName, description, status });
+}
+
+/// Start a long-running task — returns id for later update via updateTaskLogEntry
+function taskLogStart(description) {
+    return taskLog(description, 'running');
 }
 
 function showToast(message, type = 'info', duration = 5000, id = null) {
@@ -12756,6 +12770,7 @@ async function createDockerContainer() {
     closeContainerDetail();
     showToast(`Pulling image '${image}' and creating container...`, 'info');
 
+    const _dockerTaskId = taskLogStart('Creating Docker container: ' + name);
     try {
         // Pull the image first
         const pullResp = await fetch(apiUrl('/api/containers/docker/pull'), {
@@ -12779,15 +12794,15 @@ async function createDockerContainer() {
         const createData = await createResp.json();
         if (createResp.ok) {
             showToast(createData.message || `Container '${name}' created!`, 'success');
-            taskLog('Created Docker container: ' + name);
+            updateTaskLogEntry(_dockerTaskId, { status: 'completed', description: 'Created Docker container: ' + name });
             setTimeout(loadDockerContainers, 500);
         } else {
             showToast(createData.error || 'Failed to create container', 'error');
-            taskLog('Create Docker container: ' + name, 'failed');
+            updateTaskLogEntry(_dockerTaskId, { status: 'failed', description: 'Create Docker container: ' + name });
         }
     } catch (e) {
         showToast(`Create failed: ${e.message}`, 'error');
-        taskLog('Create Docker container: ' + name, 'failed');
+        updateTaskLogEntry(_dockerTaskId, { status: 'failed', description: 'Create Docker container: ' + name });
     }
 }
 // ─── Docker / LXC Volume Mount Helpers ───
@@ -13294,6 +13309,7 @@ async function createLxcContainer() {
     updateStep('step-template', '⏳', 'Downloading template (this may take a minute)...', true);
     setStatus(`Creating <strong>${name}</strong> on ${storage_path || 'default storage'}...`);
 
+    const _lxcTaskId = taskLogStart('Creating LXC container: ' + name);
     try {
         const resp = await fetch(apiUrl('/api/containers/lxc/create'), {
             method: 'POST',
@@ -13331,13 +13347,13 @@ async function createLxcContainer() {
 
             const msg = data.message || `Container '${name}' created successfully`;
             showResult(true, msg);
-            taskLog('Created LXC container: ' + name);
+            updateTaskLogEntry(_lxcTaskId, { status: 'completed', description: 'Created LXC container: ' + name });
             setTimeout(loadLxcContainers, 500);
         } else {
             updateStep('step-template', '❌', 'Failed', true);
             const errMsg = data.error || data.message || `HTTP ${resp.status}: Creation failed`;
             showResult(false, errMsg);
-            taskLog('Create LXC container: ' + name, 'failed');
+            updateTaskLogEntry(_lxcTaskId, { status: 'failed', description: 'Create LXC container: ' + name });
         }
     } catch (e) {
         updateStep('step-template', '❌', 'Connection error', true);
@@ -13346,7 +13362,7 @@ async function createLxcContainer() {
             errMsg = 'Request timed out or connection lost. The template download may still be running on the server. Check the Proxmox UI or try again in a few minutes.';
         }
         showResult(false, errMsg);
-        taskLog('Create LXC container: ' + name, 'failed');
+        updateTaskLogEntry(_lxcTaskId, { status: 'failed', description: 'Create LXC container: ' + name });
     }
 }
 
@@ -14363,14 +14379,15 @@ async function restoreBackup(id) {
     const origText = btn ? btn.textContent : '';
     if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner" style="display:inline-block; width:12px; height:12px; border:2px solid var(--border); border-top-color:#fff; border-radius:50%; animation:spin 0.8s linear infinite; vertical-align:middle;"></span> Restoring...'; }
     showToast('🔄 Restore in progress... This may take a while.', 'info');
+    const _restoreTaskId = taskLogStart('Restoring backup: ' + id);
     try {
         const res = await fetch(apiUrl(`/api/backups/${id}/restore`), { method: 'POST' });
         const data = await res.json();
-        if (data.error) { showToast(`Restore failed: ${data.error}`, 'error'); taskLog('Restore backup: ' + id, 'failed'); }
-        else { showToast(data.message || '✅ Restore completed!', 'success'); taskLog('Restored backup: ' + id); }
+        if (data.error) { showToast(`Restore failed: ${data.error}`, 'error'); updateTaskLogEntry(_restoreTaskId, { status: 'failed' }); }
+        else { showToast(data.message || '✅ Restore completed!', 'success'); updateTaskLogEntry(_restoreTaskId, { status: 'completed', description: 'Restored backup: ' + id }); }
     } catch (e) {
         showToast(`Restore error: ${e.message}`, 'error');
-        taskLog('Restore backup: ' + id, 'failed');
+        updateTaskLogEntry(_restoreTaskId, { status: 'failed' });
     }
     if (btn) { btn.disabled = false; btn.textContent = origText; }
     loadBackups();
@@ -20523,6 +20540,7 @@ async function executeWolfRunDeploy() {
         logBox.scrollTop = logBox.scrollHeight;
     }
 
+    const _wrTaskId = taskLogStart('WolfRun deploy: ' + name);
     logStep('📋', `Validating service <b>${name}</b>...`, 'var(--info)');
     await new Promise(r => setTimeout(r, 300));
 
@@ -20571,7 +20589,7 @@ async function executeWolfRunDeploy() {
             }
 
             logStep('✅', 'Deployment complete', 'var(--success)');
-            taskLog('WolfRun deploy: ' + name);
+            updateTaskLogEntry(_wrTaskId, { status: 'completed', description: 'WolfRun deploy: ' + name });
             loadWolfRunServices();
 
             // Auto-close after a short delay
@@ -20582,12 +20600,12 @@ async function executeWolfRunDeploy() {
         } else {
             logStep('❌', `Error: ${data.error || 'Deploy failed'}`, 'var(--danger)');
             showToast(data.error || 'Deploy failed', 'error');
-            taskLog('WolfRun deploy: ' + name, 'failed');
+            updateTaskLogEntry(_wrTaskId, { status: 'failed', description: 'WolfRun deploy: ' + name });
         }
     } catch (e) {
         logStep('❌', `Connection failed: ${e.message}`, 'var(--danger)');
         showToast('Deploy failed: ' + e.message, 'error');
-        taskLog('WolfRun deploy: ' + name, 'failed');
+        updateTaskLogEntry(_wrTaskId, { status: 'failed', description: 'WolfRun deploy: ' + name });
     } finally {
         btn.disabled = false;
         btn.textContent = '🚀 Deploy';
