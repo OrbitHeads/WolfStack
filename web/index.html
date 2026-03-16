@@ -5552,6 +5552,11 @@ region = us-east-1"></textarea>
 
     <!-- Task Log Footer -->
     <div id="task-log-footer" style="display:none; position:fixed; bottom:0; left:260px; right:0; z-index:900; transition:left 0.3s ease; height:220px; flex-direction:column; background:var(--bg-primary); border-top:2px solid var(--accent); box-shadow:0 -4px 20px rgba(0,0,0,0.3);">
+        <!-- Drag handle for resizing -->
+        <div id="task-log-drag" style="height:6px; cursor:ns-resize; background:transparent; flex-shrink:0; position:relative; margin-top:-3px;"
+            onmousedown="startTaskLogResize(event)" ontouchstart="startTaskLogResize(event)">
+            <div style="width:40px; height:4px; background:var(--border); border-radius:2px; margin:auto; position:relative; top:1px;"></div>
+        </div>
         <!-- Header bar — always visible when footer is shown -->
         <div id="task-log-header" style="display:flex; align-items:center; justify-content:space-between; padding:6px 16px; background:var(--bg-secondary); cursor:pointer; user-select:none; flex-shrink:0;" onclick="toggleTaskLogBody()">
             <div style="display:flex; align-items:center; gap:8px;">

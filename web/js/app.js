@@ -7112,6 +7112,7 @@ function loadTaskLog() {
             }
         }
         // Always show the task log footer on load
+        loadTaskLogHeight();
         showTaskLog();
         renderTaskLog();
     } catch (_) {}
@@ -7157,12 +7158,55 @@ function updateTaskLogToggleBtn() {
 function repositionAiBubble() {
     const bubble = document.getElementById('ai-chat-bubble');
     const panel = document.getElementById('ai-chat-panel');
-    if (bubble) {
-        bubble.style.bottom = _taskLogVisible ? '236px' : '24px';
-    }
-    if (panel) {
-        panel.style.bottom = _taskLogVisible ? '302px' : '90px';
-    }
+    const footer = document.getElementById('task-log-footer');
+    const h = (_taskLogVisible && footer) ? footer.offsetHeight + 16 : 24;
+    if (bubble) bubble.style.bottom = h + 'px';
+    if (panel) panel.style.bottom = (h + 66) + 'px';
+}
+
+// ─── Task Log Resize ───
+let _taskLogResizing = false;
+
+function startTaskLogResize(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    _taskLogResizing = true;
+    const footer = document.getElementById('task-log-footer');
+    if (!footer) return;
+    // Disable transition during drag for smooth resizing
+    footer.style.transition = 'left 0.3s ease';
+
+    const onMove = (ev) => {
+        if (!_taskLogResizing) return;
+        const clientY = ev.touches ? ev.touches[0].clientY : ev.clientY;
+        const newHeight = Math.max(100, Math.min(window.innerHeight - 60, window.innerHeight - clientY));
+        footer.style.height = newHeight + 'px';
+        repositionAiBubble();
+    };
+    const onEnd = () => {
+        _taskLogResizing = false;
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onEnd);
+        document.removeEventListener('touchmove', onMove);
+        document.removeEventListener('touchend', onEnd);
+        // Save height
+        try { localStorage.setItem('wolfstack_task_log_height', footer.style.height); } catch(_) {}
+        repositionAiBubble();
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onEnd);
+    document.addEventListener('touchmove', onMove, { passive: false });
+    document.addEventListener('touchend', onEnd);
+}
+
+function loadTaskLogHeight() {
+    try {
+        const saved = localStorage.getItem('wolfstack_task_log_height');
+        if (saved) {
+            const footer = document.getElementById('task-log-footer');
+            if (footer) footer.style.height = saved;
+        }
+    } catch(_) {}
 }
 
 function toggleTaskLogBody() {
