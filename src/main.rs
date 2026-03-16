@@ -177,12 +177,13 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    // Ensure lxcbr0 bridge is up (needed for WolfNet container networking)
-    containers::ensure_lxc_bridge();
-    // Re-apply host routes for running containers (routes are lost on restart)
-    containers::reapply_wolfnet_routes();
     // Set kernel networking prerequisites for WolfNet container routing
     containers::wolfnet_init();
+    // Ensure lxcbr0 bridge + reapply WolfNet routes in background (can be slow on Proxmox)
+    std::thread::spawn(|| {
+        containers::ensure_lxc_bridge();
+        containers::reapply_wolfnet_routes();
+    });
 
     // Load per-installation cluster secret for inter-node authentication
     let cluster_secret = auth::load_cluster_secret();
@@ -233,24 +234,18 @@ async fn main() -> std::io::Result<()> {
         cli.port,
     ));
 
-    // Auto-mount storage entries
-    storage::auto_mount_all();
-
-    // Restore IP mapping iptables rules
-    networking::apply_ip_mappings();
-
     // Initialize VM manager
     let vms_manager = vms::manager::VmManager::new();
-
-    // Autostart containers & VMs
-    containers::lxc_autostart_all();
     vms_manager.autostart_vms();
 
-    // Re-apply WireGuard bridge interfaces (survives reboot)
-    networking::apply_all_wireguard_bridges();
-
-    // Re-apply WolfNet routes for k8s deployments (secondary IPs + iptables rules)
-    kubernetes::apply_all_wolfnet_routes();
+    // Run potentially slow startup tasks in background so HTTP server can bind immediately
+    std::thread::spawn(move || {
+        storage::auto_mount_all();
+        networking::apply_ip_mappings();
+        containers::lxc_autostart_all();
+        networking::apply_all_wireguard_bridges();
+        kubernetes::apply_all_wolfnet_routes();
+    });
 
     // Check if TLS will be available (so the frontend knows the correct protocol for URLs)
     let tls_enabled = if cli.no_tls {

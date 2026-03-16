@@ -1271,11 +1271,11 @@ pub fn reapply_wolfnet_routes() {
             };
 
             // Check if the container is actually running
-            let mut info_args = vec!["-n".to_string(), container.clone(), "-sH".to_string()];
+            let mut info_args = vec!["5".to_string(), "lxc-info".to_string(), "-n".to_string(), container.clone(), "-sH".to_string()];
             if base_path != LXC_DEFAULT_PATH {
-                info_args = vec!["-P".to_string(), base_path.clone(), "-n".to_string(), container.clone(), "-sH".to_string()];
+                info_args = vec!["5".to_string(), "lxc-info".to_string(), "-P".to_string(), base_path.clone(), "-n".to_string(), container.clone(), "-sH".to_string()];
             }
-            let running = Command::new("lxc-info")
+            let running = Command::new("timeout")
                 .args(&info_args)
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_uppercase().contains("RUNNING"))
@@ -4477,8 +4477,11 @@ pub fn detect_network_conflicts() -> Vec<NetworkConflict> {
 /// Autostart all enabled LXC containers, then re-apply WolfNet networking.
 /// lxc-autostart doesn't call our lxc_apply_wolfnet(), so we do it afterwards.
 pub fn lxc_autostart_all() {
-    // Wait for autostart to complete so containers are running
-    let _ = Command::new("lxc-autostart").output();
+    // Proxmox handles container autostart itself — skip
+    if is_proxmox() { return; }
+
+    // Start containers with autostart enabled (timeout to prevent blocking startup)
+    let _ = Command::new("timeout").args(["30", "lxc-autostart"]).output();
 
     // Give containers a moment to initialise their network interfaces
     std::thread::sleep(std::time::Duration::from_secs(3));
