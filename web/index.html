@@ -1749,6 +1749,34 @@
                 </div>
             </div>
 
+            <!-- Schedules Card -->
+            <div class="card" style="margin-bottom:16px;">
+                <div class="card-header">
+                    <h3>📅 Backup Schedules</h3>
+                </div>
+                <div class="card-body" style="overflow-x:auto;">
+                    <table class="data-table" style="width:100%;">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Frequency</th>
+                                <th>Time (UTC)</th>
+                                <th>Targets</th>
+                                <th>Storage</th>
+                                <th>Retention</th>
+                                <th>Enabled</th>
+                                <th style="text-align:right;">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="schedules-table"></tbody>
+                    </table>
+                    <p id="schedules-empty"
+                        style="display:none; text-align:center; padding:20px; color: var(--text-muted);">
+                        No schedules configured. Select targets and click <strong>📅 Schedule</strong>.
+                    </p>
+                </div>
+            </div>
+
             <!-- Backup History Card -->
             <div class="card" style="margin-bottom:16px;">
                 <div class="card-header">
@@ -1773,34 +1801,6 @@
                     <p id="backups-empty"
                         style="display:none; text-align:center; padding:20px; color: var(--text-muted);">
                         No backups yet. Select items above and click <strong>⚡ Backup Now</strong>.
-                    </p>
-                </div>
-            </div>
-
-            <!-- Schedules Card -->
-            <div class="card">
-                <div class="card-header">
-                    <h3>📅 Backup Schedules</h3>
-                </div>
-                <div class="card-body" style="overflow-x:auto;">
-                    <table class="data-table" style="width:100%;">
-                        <thead>
-                            <tr>
-                                <th>Name</th>
-                                <th>Frequency</th>
-                                <th>Time (UTC)</th>
-                                <th>Targets</th>
-                                <th>Storage</th>
-                                <th>Retention</th>
-                                <th>Enabled</th>
-                                <th style="text-align:right;">Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody id="schedules-table"></tbody>
-                    </table>
-                    <p id="schedules-empty"
-                        style="display:none; text-align:center; padding:20px; color: var(--text-muted);">
-                        No schedules configured. Select targets and click <strong>📅 Schedule</strong>.
                     </p>
                 </div>
             </div>
@@ -1899,7 +1899,9 @@
                         <thead>
                             <tr>
                                 <th>Type</th>
+                                <th>ID</th>
                                 <th>Name</th>
+                                <th>Specs</th>
                                 <th>Date</th>
                                 <th>Size</th>
                                 <th style="text-align:right;">Actions</th>

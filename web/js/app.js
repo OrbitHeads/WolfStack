@@ -14526,13 +14526,10 @@ async function loadPbsSnapshots() {
                 timeStr = d.toLocaleString();
             }
 
-            // Show name: hostname if available, then comment, then backup-id
             var hostname = s.hostname || '';
             var specs = s.specs || '';
-            var displayName = hostname && hostname !== bid ? bid + ' (' + hostname + ')' : (comment || bid);
-            var detailLine = '';
-            if (specs) detailLine += '<span style="font-size:11px; color:var(--text-muted);">' + escapeHtml(specs) + '</span>';
-            if (comment && hostname) detailLine += (detailLine ? '<br>' : '') + '<span style="font-size:11px; color:var(--text-muted);">' + escapeHtml(comment) + '</span>';
+            var displayName = hostname && hostname !== bid ? escapeHtml(hostname) : (comment ? escapeHtml(comment) : '—');
+            var commentLine = (comment && hostname) ? '<div style="font-size:11px; color:var(--text-muted);">' + escapeHtml(comment) + '</div>' : '';
 
             var snapshot = btype + '/' + bid + '/' + btime;
             var snapEsc = escapeHtml(snapshot);
@@ -14540,9 +14537,9 @@ async function loadPbsSnapshots() {
 
             return '<tr>' +
                 '<td>' + emoji + ' ' + escapeHtml(typeLabel) + '</td>' +
-                '<td><strong>' + escapeHtml(displayName) + '</strong>' +
-                (detailLine ? '<br>' + detailLine : '') +
-                '</td>' +
+                '<td><strong>' + escapeHtml(bid) + '</strong></td>' +
+                '<td>' + displayName + commentLine + '</td>' +
+                '<td style="font-size:12px; color:var(--text-muted);">' + (specs ? escapeHtml(specs) : '—') + '</td>' +
                 '<td style="font-size:12px;">' + timeStr + '</td>' +
                 '<td>' + formatPbsSize(size) + '</td>' +
                 '<td style="text-align:right;">' +
