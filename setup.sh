@@ -389,15 +389,21 @@ if ! command -v docker >/dev/null 2>&1; then
                 fi
             fi
             echo "  Detected Debian family (${DISTRO_ID}, using ${UPSTREAM}/${CODENAME})"
-            apt update -qq 2>/dev/null
-            apt install -y ca-certificates curl gnupg 2>/dev/null
-            install -m 0755 -d /etc/apt/keyrings
-            curl -fsSL "https://download.docker.com/linux/${UPSTREAM}/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg 2>/dev/null
-            chmod a+r /etc/apt/keyrings/docker.gpg
-            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${UPSTREAM} ${CODENAME} stable" > /etc/apt/sources.list.d/docker.list
-            apt update -qq 2>/dev/null
-            if apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; then
+            # Try distro's own docker package first (works on Kali, Parrot, ARM, etc.)
+            if apt install -y docker.io 2>/dev/null; then
+                echo "  ✓ Installed docker.io from distro repos"
                 DOCKER_INSTALLED=true
+            else
+                # Fall back to Docker's official repo
+                apt install -y ca-certificates curl gnupg 2>/dev/null
+                install -m 0755 -d /etc/apt/keyrings
+                curl -fsSL "https://download.docker.com/linux/${UPSTREAM}/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg 2>/dev/null
+                chmod a+r /etc/apt/keyrings/docker.gpg
+                echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${UPSTREAM} ${CODENAME} stable" > /etc/apt/sources.list.d/docker.list
+                apt update -qq 2>/dev/null
+                if apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin 2>/dev/null; then
+                    DOCKER_INSTALLED=true
+                fi
             fi
         elif echo "$DISTRO_ID $DISTRO_LIKE" | grep -qiE "arch|manjaro"; then
             # Arch family
