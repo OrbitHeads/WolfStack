@@ -1065,6 +1065,7 @@ pub async fn pg_execute_query(params: &ConnParams, database: &str, query: &str) 
 }
 
 /// Detect PostgreSQL installation
+#[allow(dead_code)]
 pub fn detect_postgres() -> serde_json::Value {
     let installed = std::process::Command::new("which").arg("psql")
         .output().map(|o| o.status.success()).unwrap_or(false)
