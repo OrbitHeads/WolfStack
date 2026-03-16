@@ -2157,11 +2157,21 @@ pub fn get_nodes(kubeconfig: &str) -> Vec<K8sNode> {
         None => return Vec::new(),
     };
 
-    // Try to get metrics for CPU/memory usage
-    let metrics: Option<serde_json::Value> =
-        kubectl(kubeconfig, &["top", "nodes", "--no-headers", "-o", "json"])
-            .ok()
-            .and_then(|o| serde_json::from_str(&o).ok());
+    // Try to get metrics for CPU/memory usage (kubectl top doesn't support -o json)
+    // Output format: "node-name   123m   4%   456Mi   12%"
+    let metrics_text = kubectl(kubeconfig, &["top", "nodes", "--no-headers"]).ok();
+    let mut node_metrics: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
+    if let Some(ref text) = metrics_text {
+        for line in text.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 5 {
+                let node_name = parts[0].to_string();
+                let cpu = parts[1].to_string();    // e.g. "123m"
+                let mem = parts[3].to_string();    // e.g. "456Mi"
+                node_metrics.insert(node_name, (cpu, mem));
+            }
+        }
+    }
 
     items
         .iter()
@@ -2226,25 +2236,9 @@ pub fn get_nodes(kubeconfig: &str) -> Vec<K8sNode> {
                 .to_string();
 
             // Try to find usage from metrics
-            let (cpu_usage, memory_usage) = metrics
-                .as_ref()
-                .and_then(|m| m["items"].as_array())
-                .and_then(|items| {
-                    items.iter().find(|mi| {
-                        mi["metadata"]["name"].as_str() == Some(&name)
-                    })
-                })
-                .map(|mi| {
-                    let cpu = mi["usage"]["cpu"]
-                        .as_str()
-                        .unwrap_or("0")
-                        .to_string();
-                    let mem = mi["usage"]["memory"]
-                        .as_str()
-                        .unwrap_or("0")
-                        .to_string();
-                    (cpu, mem)
-                })
+            let (cpu_usage, memory_usage) = node_metrics
+                .get(&name)
+                .map(|(cpu, mem)| (cpu.clone(), mem.clone()))
                 .unwrap_or_else(|| ("0".to_string(), "0".to_string()));
 
             K8sNode {
