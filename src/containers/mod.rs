@@ -5190,18 +5190,26 @@ pub fn lxc_export(container: &str) -> Result<(std::path::PathBuf, ContainerExpor
 
         Ok((archive_path, meta))
     } else {
-        // Standalone: tar the rootfs + config
+        // Standalone: tar only the rootfs (not the LXC config or other host-side files)
 
         let container_dir = format!("{}/{}", lxc_base_dir(container), container);
-        if !std::path::Path::new(&container_dir).exists() {
+        let rootfs_dir = format!("{}/rootfs", container_dir);
+        // Use rootfs/ subdir if it exists, otherwise tar the container dir directly
+        let tar_source = if std::path::Path::new(&rootfs_dir).exists() {
+            &rootfs_dir
+        } else if std::path::Path::new(&container_dir).exists() {
+            &container_dir
+        } else {
             return Err(format!("Container directory not found: {}", container_dir));
-        }
+        };
 
         let archive_name = format!("{}.tar.gz", container);
         let archive_path = export_dir.join(&archive_name);
 
         let output = Command::new("tar")
-            .args(["czf", archive_path.to_str().unwrap(), "-C", &container_dir, "."])
+            .args(["czf", archive_path.to_str().unwrap(),
+                   "--exclude=./proc/*", "--exclude=./sys/*", "--exclude=./dev/*",
+                   "-C", tar_source, "."])
             .output()
             .map_err(|e| format!("tar failed: {}", e))?;
 
@@ -5315,8 +5323,14 @@ pub fn lxc_import(archive_path: &str, new_name: &str, storage: Option<&str>) -> 
         let new_vmid = pct_next_vmid()?;
         let storage_id = storage.unwrap_or("local-lvm");
 
-        // Check if this is a vzdump archive (has vzdump- in filename) or a plain rootfs tar
-        let is_vzdump = archive_path.contains("vzdump-");
+        // Check if this is a vzdump archive by looking for etc/vzdump/pct.conf inside
+        let is_vzdump = archive_path.contains("vzdump-") || {
+            // Peek inside the archive for the vzdump config marker
+            let check = Command::new("tar")
+                .args(["tf", archive_path, "--wildcards", "*/etc/vzdump/pct.conf", "etc/vzdump/pct.conf"])
+                .output();
+            check.map(|o| o.status.success()).unwrap_or(false)
+        };
 
         if is_vzdump {
             // vzdump archive — pct restore handles it natively
@@ -5352,7 +5366,7 @@ pub fn lxc_import(archive_path: &str, new_name: &str, storage: Option<&str>) -> 
 
             // Calculate rootfs size from extracted content (round up to nearest GB, min 4GB)
             let rootfs_bytes = Command::new("du")
-                .args(["-sb", &rootfs_dir])
+                .args(["-sxb", &rootfs_dir])
                 .output()
                 .ok()
                 .and_then(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().map(|s| s.to_string()))
@@ -5402,20 +5416,21 @@ pub fn lxc_import(archive_path: &str, new_name: &str, storage: Option<&str>) -> 
             }
         }
     } else {
-        // Standalone: create empty container + extract archive (always to default path)
+        // Standalone: create container dir with rootfs subdir and extract there
         let container_dir = format!("{}/{}", LXC_DEFAULT_PATH, new_name);
+        let rootfs_target = format!("{}/rootfs", container_dir);
         if std::path::Path::new(&container_dir).exists() {
             return Err(format!("Container '{}' already exists", new_name));
         }
 
-        std::fs::create_dir_all(&container_dir)
+        std::fs::create_dir_all(&rootfs_target)
             .map_err(|e| format!("Failed to create container dir: {}", e))?;
 
         // Detect archive format and use appropriate decompressor
         let tar_args: Vec<&str> = if archive_path.ends_with(".tar.zst") || archive_path.ends_with(".zst") {
-            vec!["--zstd", "-xf", archive_path, "-C", &container_dir]
+            vec!["--zstd", "-xf", archive_path, "-C", &rootfs_target]
         } else {
-            vec!["xzf", archive_path, "-C", &container_dir]
+            vec!["xzf", archive_path, "-C", &rootfs_target]
         };
 
         let output = Command::new("tar")
@@ -5424,16 +5439,27 @@ pub fn lxc_import(archive_path: &str, new_name: &str, storage: Option<&str>) -> 
             .map_err(|e| format!("tar extract failed: {}", e))?;
 
         if output.status.success() {
-            // If this was a vzdump archive, the rootfs is nested — move contents up
-            let vzdump_rootfs = format!("{}/rootfs", container_dir);
-            if std::path::Path::new(&vzdump_rootfs).exists() {
+            // If a vzdump archive was extracted, rootfs is double-nested (rootfs/rootfs/) — flatten
+            let nested_rootfs = format!("{}/rootfs", rootfs_target);
+            if std::path::Path::new(&nested_rootfs).exists() {
                 let _ = Command::new("bash")
                     .args(["-c", &format!(
                         "shopt -s dotglob; mv {}/rootfs/* {}/ 2>/dev/null; rmdir {}/rootfs 2>/dev/null; rm -rf {}/etc/vzdump 2>/dev/null; true",
-                        container_dir, container_dir, container_dir, container_dir
+                        rootfs_target, rootfs_target, rootfs_target, rootfs_target
                     )])
                     .output();
             }
+
+            // Generate a minimal LXC config if one doesn't exist
+            let config_path = format!("{}/config", container_dir);
+            if !std::path::Path::new(&config_path).exists() {
+                let config_content = format!(
+                    "lxc.rootfs.path = dir:{}/rootfs\nlxc.uts.name = {}\nlxc.net.0.type = empty\n",
+                    container_dir, new_name
+                );
+                let _ = std::fs::write(&config_path, config_content);
+            }
+
             Ok(format!("Container '{}' imported from archive", new_name))
         } else {
             // Cleanup on failure
