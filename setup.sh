@@ -125,7 +125,15 @@ fi
 echo ""
 echo "Updating system packages..."
 if [ "$PKG_MANAGER" = "apt" ]; then
-    apt update -qq 2>/dev/null || echo "  ⚠ Some repositories failed to update (non-critical — continuing)"
+    if ! apt update -qq 2>/dev/null; then
+        echo "  ⚠ Some repositories failed to update."
+        echo "    This is usually caused by a third-party repo (e.g. Docker) that doesn't"
+        echo "    support your distro version. WolfStack will still install, but you may"
+        echo "    need to fix the broken repo afterwards:"
+        echo "      sudo apt update    (to see which repo is failing)"
+        echo "      Check /etc/apt/sources.list.d/ for the problematic .list file"
+        echo "    Continuing installation..."
+    fi
     apt upgrade -y -qq 2>/dev/null || true
 elif [ "$PKG_MANAGER" = "dnf" ]; then
     dnf upgrade -y --quiet
@@ -405,8 +413,22 @@ if ! command -v docker >/dev/null 2>&1; then
         systemctl start docker 2>/dev/null || true
         echo "✓ Docker installed"
     else
-        echo "⚠ Failed to install Docker automatically."
-        echo "  Please install Docker manually: https://docs.docker.com/engine/install/"
+        echo ""
+        echo "  ⚠ Docker could not be installed automatically."
+        echo "    Your distro may not be directly supported by Docker's official repos."
+        echo "    WolfStack will still work for LXC containers, VMs, and server management."
+        echo "    To add Docker support, install it manually:"
+        echo "      https://docs.docker.com/engine/install/"
+        if [ "$PKG_MANAGER" = "apt" ]; then
+            echo "    Or try: sudo apt install docker.io  (community package, may be older)"
+        elif [ "$PKG_MANAGER" = "dnf" ]; then
+            echo "    Or try: sudo dnf install docker  (community package)"
+        elif [ "$PKG_MANAGER" = "pacman" ]; then
+            echo "    Or try: sudo pacman -S docker  (community package)"
+        elif [ "$PKG_MANAGER" = "zypper" ]; then
+            echo "    Or try: sudo zypper install docker  (community package)"
+        fi
+        echo ""
     fi
 else
     echo "✓ Docker already installed"
