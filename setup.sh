@@ -98,19 +98,19 @@ REAL_HOME=$(eval echo "~$REAL_USER")
 # ─── Detect package manager ─────────────────────────────────────────────────
 echo "Checking system requirements..."
 
-if command -v apt &> /dev/null; then
+if command -v apt >/dev/null 2>&1; then
     PKG_MANAGER="apt"
     echo "✓ Detected Debian/Ubuntu (apt)"
-elif command -v dnf &> /dev/null; then
+elif command -v dnf >/dev/null 2>&1; then
     PKG_MANAGER="dnf"
     echo "✓ Detected Fedora/RHEL (dnf)"
-elif command -v yum &> /dev/null; then
+elif command -v yum >/dev/null 2>&1; then
     PKG_MANAGER="yum"
     echo "✓ Detected RHEL/CentOS (yum)"
-elif command -v zypper &> /dev/null; then
+elif command -v zypper >/dev/null 2>&1; then
     PKG_MANAGER="zypper"
     echo "✓ Detected SLES/openSUSE (zypper)"
-elif command -v pacman &> /dev/null; then
+elif command -v pacman >/dev/null 2>&1; then
     PKG_MANAGER="pacman"
     echo "✓ Detected Arch Linux (pacman)"
 else
@@ -139,7 +139,7 @@ echo "✓ System packages up to date"
 
 # ─── Detect Proxmox VE host ─────────────────────────────────────────────────
 IS_PROXMOX=false
-if command -v pveversion &> /dev/null || [ -f /etc/pve/.version ] || dpkg -l proxmox-ve &> /dev/null 2>&1; then
+if command -v pveversion >/dev/null 2>&1 || [ -f /etc/pve/.version ] || dpkg -l proxmox-ve >/dev/null 2>&1 2>&1; then
     IS_PROXMOX=true
     PVE_VER=$(pveversion 2>/dev/null || echo "unknown")
     echo "✓ Detected Proxmox VE host ($PVE_VER)"
@@ -161,12 +161,12 @@ if [ "$PKG_MANAGER" = "apt" ]; then
         apt install -y --no-install-recommends git curl build-essential pkg-config libssl-dev libcrypt-dev || {
             echo "⚠ Some build dependencies failed to install. Trying individually..."
             for pkg in git curl build-essential pkg-config libssl-dev libcrypt-dev; do
-                dpkg -s "$pkg" &>/dev/null || apt install -y --no-install-recommends "$pkg" 2>/dev/null || true
+                dpkg -s "$pkg" >/dev/null 2>&1 || apt install -y --no-install-recommends "$pkg" 2>/dev/null || true
             done
         }
         # Install optional runtime deps one-by-one — skip if already provided by PVE
         for pkg in dnsmasq-base bridge-utils socat nfs-common fuse3; do
-            if dpkg -s "$pkg" &>/dev/null; then
+            if dpkg -s "$pkg" >/dev/null 2>&1; then
                 echo "  ✓ $pkg already installed"
             else
                 echo "  Installing $pkg..."
@@ -175,7 +175,7 @@ if [ "$PKG_MANAGER" = "apt" ]; then
             fi
         done
         # s3fs — try both package names (s3fs-fuse on Kali/some Debian, s3fs on Ubuntu/Proxmox)
-        if ! dpkg -s s3fs-fuse &>/dev/null && ! dpkg -s s3fs &>/dev/null; then
+        if ! dpkg -s s3fs-fuse >/dev/null 2>&1 && ! dpkg -s s3fs >/dev/null 2>&1; then
             apt install -y --no-install-recommends s3fs-fuse 2>/dev/null || \
                 apt install -y --no-install-recommends s3fs 2>/dev/null || \
                 echo "  ⚠ s3fs not available — S3 mounts will use built-in sync"
@@ -233,7 +233,7 @@ echo "✓ System dependencies installed"
 echo ""
 echo "Installing Proxmox Backup Client..."
 
-if command -v proxmox-backup-client &> /dev/null; then
+if command -v proxmox-backup-client >/dev/null 2>&1; then
     echo "✓ proxmox-backup-client already installed"
 elif [ "$PKG_MANAGER" = "apt" ]; then
     # Add Proxmox PBS repo for Debian/Ubuntu
@@ -311,7 +311,7 @@ mkdir -p /etc/wolfstack/s3 /etc/wolfstack/pbs /mnt/wolfstack /var/cache/wolfstac
 echo "✓ Storage directories configured"
 
 # ─── Install Docker if missing ──────────────────────────────────────────────
-if ! command -v docker &> /dev/null; then
+if ! command -v docker >/dev/null 2>&1; then
     echo ""
     echo "Installing Docker..."
     DOCKER_INSTALLED=false
@@ -412,7 +412,7 @@ fi
 echo ""
 echo "Checking WolfNet (cluster networking)..."
 
-if command -v wolfnet &> /dev/null && systemctl is-active --quiet wolfnet 2>/dev/null; then
+if command -v wolfnet >/dev/null 2>&1 && systemctl is-active --quiet wolfnet 2>/dev/null; then
     # Already installed and running — check for upgrades
     echo "✓ WolfNet already installed and running"
     WOLFNET_IP=$(ip -4 addr show wolfnet0 2>/dev/null | awk '/inet / {split($2,a,"/"); print a[1]}' || echo "")
@@ -444,7 +444,7 @@ if command -v wolfnet &> /dev/null && systemctl is-active --quiet wolfnet 2>/dev
 
     # Rebuild
     export PATH="${CARGO_HOME:-$REAL_HOME/.cargo}/bin:/usr/local/bin:/usr/bin:$PATH"
-    if command -v cargo &> /dev/null; then
+    if command -v cargo >/dev/null 2>&1; then
         cd "$WOLFNET_SRC_DIR"
         if [ -n "$CUSTOM_INSTALL_DIR" ]; then
             chown -R "$REAL_USER:$REAL_USER" "$WOLFNET_SRC_DIR" "$CARGO_HOME" "$RUSTUP_HOME" "$TMPDIR" 2>/dev/null || true
@@ -474,7 +474,7 @@ if command -v wolfnet &> /dev/null && systemctl is-active --quiet wolfnet 2>/dev
         echo "  ⚠ Cargo not found — skipping WolfNet rebuild"
     fi
 
-elif command -v wolfnet &> /dev/null && [ -f "/etc/systemd/system/wolfnet.service" ]; then
+elif command -v wolfnet >/dev/null 2>&1 && [ -f "/etc/systemd/system/wolfnet.service" ]; then
     # Installed but not running — check for upgrades, then start
     echo "✓ WolfNet installed (not running)"
 
@@ -501,7 +501,7 @@ elif command -v wolfnet &> /dev/null && [ -f "/etc/systemd/system/wolfnet.servic
     fi
 
     export PATH="${CARGO_HOME:-$REAL_HOME/.cargo}/bin:/usr/local/bin:/usr/bin:$PATH"
-    if command -v cargo &> /dev/null; then
+    if command -v cargo >/dev/null 2>&1; then
         cd "$WOLFNET_SRC_DIR"
         if [ -n "$CUSTOM_INSTALL_DIR" ]; then
             chown -R "$REAL_USER:$REAL_USER" "$WOLFNET_SRC_DIR" "$CARGO_HOME" "$RUSTUP_HOME" "$TMPDIR" 2>/dev/null || true
@@ -590,7 +590,7 @@ else
     # Ensure Rust is available for building WolfNet
     export PATH="${CARGO_HOME:-$REAL_HOME/.cargo}/bin:/usr/local/bin:/usr/bin:$PATH"
 
-    if ! command -v cargo &> /dev/null; then
+    if ! command -v cargo >/dev/null 2>&1; then
         echo "  Installing Rust first..."
         if [ -n "$CUSTOM_INSTALL_DIR" ] || [ "$REAL_USER" = "root" ]; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -664,7 +664,7 @@ else
         TRIES=0
         while [ $TRIES -lt 253 ]; do
             # Quick ping check — if nobody responds, it's free
-            if ! ping -c 1 -W 1 "$WOLFNET_IP" &>/dev/null; then
+            if ! ping -c 1 -W 1 "$WOLFNET_IP" >/dev/null 2>&1; then
                 break
             fi
             echo "  ⚠ ${WOLFNET_IP} already in use, trying next..."
@@ -766,10 +766,10 @@ CARGO_BIN="${CARGO_HOME:-$REAL_HOME/.cargo}/bin/cargo"
 
 if [ -f "$CARGO_BIN" ]; then
     echo "✓ Rust already installed"
-elif command -v cargo &> /dev/null; then
+elif command -v cargo >/dev/null 2>&1; then
     CARGO_BIN="$(command -v cargo)"
     echo "✓ Rust already installed (system-wide)"
-elif command -v rustup &> /dev/null; then
+elif command -v rustup >/dev/null 2>&1; then
     # rustup installed (e.g. via pacman on Arch) but no toolchain set yet
     echo "  Setting default Rust toolchain via rustup..."
     rustup default stable
@@ -792,7 +792,7 @@ fi
 # Ensure cargo is found
 export PATH="${CARGO_HOME:-$REAL_HOME/.cargo}/bin:/usr/local/bin:/usr/bin:$PATH"
 
-if ! command -v cargo &> /dev/null; then
+if ! command -v cargo >/dev/null 2>&1; then
     echo "✗ cargo not found after installation. Check Rust install."
     exit 1
 fi
@@ -1042,10 +1042,10 @@ fi
 
 # ─── Firewall ───────────────────────────────────────────────────────────────
 echo ""
-if command -v ufw &> /dev/null; then
+if command -v ufw >/dev/null 2>&1; then
     ufw allow "$WS_PORT/tcp" 2>/dev/null && echo "✓ Firewall: Opened port $WS_PORT/tcp (ufw)" || true
     ufw allow 9600/udp 2>/dev/null && echo "✓ Firewall: Opened port 9600/udp for WolfNet (ufw)" || true
-elif command -v firewall-cmd &> /dev/null; then
+elif command -v firewall-cmd >/dev/null 2>&1; then
     firewall-cmd --permanent --add-port="$WS_PORT/tcp" 2>/dev/null && \
     firewall-cmd --permanent --add-port="9600/udp" 2>/dev/null && \
     firewall-cmd --reload 2>/dev/null && \
@@ -1053,11 +1053,11 @@ elif command -v firewall-cmd &> /dev/null; then
 fi
 
 # ─── Set up lxcbr0 bridge for LXC containers ────────────────────────────────
-if command -v lxc-ls &> /dev/null; then
+if command -v lxc-ls >/dev/null 2>&1; then
     # Only configure lxc-net on fresh installs — restarting lxc-net on upgrades
     # destroys lxcbr0 and all container kernel routes, breaking WolfNet routing.
     # WolfStack's reapply_wolfnet_routes() handles route restoration on startup.
-    if ip link show lxcbr0 &>/dev/null && ip -4 addr show lxcbr0 2>/dev/null | grep -q "inet "; then
+    if ip link show lxcbr0 >/dev/null 2>&1 && ip -4 addr show lxcbr0 2>/dev/null | grep -q "inet "; then
         echo "✓ LXC networking already active (lxcbr0 up)"
     else
         echo ""
@@ -1128,5 +1128,5 @@ echo "Please Refresh your browser if upgrading..."
 
 # ─── Restart service if upgrading (must be last!) ────────────────────────────
 if [ "$RESTART_SERVICE" = "true" ]; then
-    nohup bash -c "sleep 3 && systemctl restart wolfstack" &>/dev/null &
+    nohup bash -c "sleep 3 && systemctl restart wolfstack" >/dev/null 2>&1 &
 fi
