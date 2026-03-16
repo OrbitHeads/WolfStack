@@ -35,8 +35,8 @@ pub fn build_node_urls(address: &str, port: u16, path: &str) -> Vec<String> {
 }
 
 /// Build ordered URLs to try for external (cross-cluster) communication.
-/// Parses the user-provided URL and automatically tries WolfStack (8553) and Proxmox (8006) ports
-/// so the user doesn't have to guess which port the destination is running on.
+/// All destination nodes run WolfStack (HTTPS 8553, HTTP 8554), so we try those ports
+/// automatically — the user only needs to provide the hostname.
 pub fn build_external_urls(target_url: &str, path: &str) -> Vec<String> {
     let trimmed = target_url.trim_end_matches('/');
 
@@ -61,17 +61,12 @@ pub fn build_external_urls(target_url: &str, path: &str) -> Vec<String> {
     // First: try exactly what the user specified
     urls.push(format!("{}{}", trimmed, path));
 
-    // Then try WolfStack ports (8553 HTTPS, 8554 HTTP) if not already the user's port
+    // Then try WolfStack ports if not already the user's port
     if user_port != Some(8553) {
         urls.push(format!("https://{}:8553{}", host, path));
     }
     if user_port != Some(8554) {
         urls.push(format!("http://{}:8554{}", host, path));
-    }
-
-    // Then try Proxmox port (8006 HTTPS) if not already the user's port
-    if user_port != Some(8006) {
-        urls.push(format!("https://{}:8006{}", host, path));
     }
 
     urls
