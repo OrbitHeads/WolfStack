@@ -291,6 +291,14 @@ impl ClusterState {
         nodes.get(id).cloned()
     }
 
+    /// Get this node's cluster name
+    pub fn get_self_cluster_name(&self) -> String {
+        let nodes = self.nodes.read().unwrap();
+        nodes.get(&self.self_id)
+            .and_then(|n| n.cluster_name.clone())
+            .unwrap_or_else(|| "WolfStack".to_string())
+    }
+
     /// Add a server by address — persists to disk (join_verified=true because only called after token validation)
     pub fn add_server(&self, address: String, port: u16, cluster_name: Option<String>) -> String {
         let id = self.add_server_full(address, port, "wolfstack".to_string(), None, None, None, None, cluster_name);

@@ -733,7 +733,8 @@ fn local_hostname() -> String {
 }
 
 /// Get the local cluster name from /etc/wolfstack/self_cluster.json
-fn local_cluster_name() -> String {
+/// Used as fallback when cluster name isn't passed from the API layer
+pub fn local_cluster_name() -> String {
     std::fs::read_to_string("/etc/wolfstack/self_cluster.json")
         .ok()
         .and_then(|data| serde_json::from_str::<String>(&data).ok())
@@ -743,7 +744,10 @@ fn local_cluster_name() -> String {
 
 /// Generate a descriptive comment for a backup target, prefixed with cluster name
 fn backup_comments(target: &BackupTarget) -> String {
-    let cluster = local_cluster_name();
+    backup_comments_with_cluster(target, &local_cluster_name())
+}
+
+fn backup_comments_with_cluster(target: &BackupTarget, cluster: &str) -> String {
     let detail = match target.target_type {
         BackupTargetType::Docker => {
             let image = Command::new("docker")
@@ -1335,6 +1339,7 @@ pub fn create_backup_with_log(
     target: Option<BackupTarget>,
     storage: BackupStorage,
     log: std::sync::mpsc::Sender<String>,
+    cluster_name: Option<String>,
 ) -> Vec<BackupEntry> {
     let targets = match target {
         Some(t) => vec![t],
@@ -1343,7 +1348,7 @@ pub fn create_backup_with_log(
 
     let mut entries = Vec::new();
     let total = targets.len();
-    let cluster = local_cluster_name();
+    let cluster = cluster_name.unwrap_or_else(local_cluster_name);
     let _ = log.send(format!("Cluster: {} | Node: {}", cluster, local_hostname()));
 
     for (i, t) in targets.iter().enumerate() {
@@ -1357,7 +1362,7 @@ pub fn create_backup_with_log(
         let _ = log.send(format!("[{}/{}] Starting {} backup: {}",
             i + 1, total, type_name, display_name));
 
-        let comments = backup_comments(t);
+        let comments = backup_comments_with_cluster(t, &cluster);
 
         // Run the backup with line-by-line output for vzdump
         let result = match t.target_type {

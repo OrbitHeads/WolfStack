@@ -4766,6 +4766,7 @@ pub async fn backup_stream(
     }
 
     let target = body.target.clone();
+    let cluster_name = Some(state.cluster.get_self_cluster_name());
 
     // Use tokio mpsc so we can await recv() without blocking the runtime
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(256);
@@ -4775,7 +4776,7 @@ pub async fn backup_stream(
 
     // Spawn the backup in a blocking thread using std channel
     std::thread::spawn(move || {
-        backup::create_backup_with_log(target, storage, std_tx);
+        backup::create_backup_with_log(target, storage, std_tx, cluster_name);
     });
 
     // Bridge thread: reads from std channel and forwards to tokio channel
