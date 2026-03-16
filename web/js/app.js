@@ -16181,6 +16181,7 @@ function loadMySQLEditor() {
     containerSelect.innerHTML = '<option value="">Manual connection</option>';
 
     const nodeId = currentNodeId;
+    const baseUrl = nodeId ? getNodeApiBase(nodeId) : '';
 
     // Detect MySQL containers (Docker/LXC)
     fetch(`${baseUrl}/mysql/detect-containers`, { credentials: 'include' })
