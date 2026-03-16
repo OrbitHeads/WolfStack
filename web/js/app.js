@@ -936,6 +936,26 @@ function apiUrl(path) {
     return `/api/nodes/${currentNodeId}/proxy/${cleanPath}`;
 }
 
+// Normalize a WolfStack URL: ensure https:// scheme and :8553 port
+function normalizeWolfStackUrl(url) {
+    let u = url.trim().replace(/\/+$/, '');
+    if (!u.includes('://')) u = 'https://' + u;
+    // If no explicit port, add :8553
+    try {
+        const parsed = new URL(u);
+        if (!url.match(/:\d+/) || parsed.port === '') {
+            parsed.port = '8553';
+            u = parsed.toString().replace(/\/+$/, '');
+        }
+    } catch {
+        // URL parsing failed — try simple regex
+        if (!u.match(/:\/\/[^:/]+:\d+/)) {
+            u = u.replace(/:\/\/([^/]+)/, '://$1:8553');
+        }
+    }
+    return u;
+}
+
 function configuratorApiUrl(path) {
     const base = apiUrl(path);
     if (!currentConfiguratorTarget) return base;
@@ -12168,7 +12188,7 @@ async function migrateDockerContainer(name) {
 
 async function doMigrate(name) {
     const targetEl = document.getElementById('migrate-target');
-    const targetUrl = targetEl.value.trim();
+    const targetUrl = normalizeWolfStackUrl(targetEl.value.trim());
     const storageVal = document.getElementById('docker-migrate-storage')?.value || '';
 
     if (!targetUrl) {
@@ -12460,13 +12480,14 @@ async function doMigrateLxc(name) {
     if (!target) { showToast('Select a target node', 'error'); return; }
 
     // Read values BEFORE removing the modal
-    const extUrl = document.getElementById('migrate-ext-url')?.value.trim() || '';
+    const rawExtUrl = document.getElementById('migrate-ext-url')?.value.trim() || '';
     const extToken = document.getElementById('migrate-ext-token')?.value.trim() || '';
     const migrateStorage = document.getElementById('migrate-storage')?.value || '';
     document.getElementById('lxc-migrate-modal')?.remove();
 
     const isExternal = target === '__external__';
-    if (isExternal && (!extUrl || !extToken)) { showToast('Enter URL and token', 'error'); return; }
+    if (isExternal && (!rawExtUrl || !extToken)) { showToast('Enter URL and token', 'error'); return; }
+    const extUrl = isExternal ? normalizeWolfStackUrl(rawExtUrl) : '';
 
     const lxcTargetLabel = isExternal ? extUrl.replace(/https?:\/\//, '').split('/')[0] : target;
     const lxcTaskId = taskLogStart(`Migrating LXC '${name}' to ${lxcTargetLabel}`);
@@ -12747,12 +12768,13 @@ async function doMigrateVm(name) {
     const target = document.getElementById('vm-migrate-target').value;
     if (!target) { showToast('Select a target node', 'error'); return; }
 
-    const extUrl = document.getElementById('vm-migrate-ext-url')?.value.trim() || '';
+    const rawExtUrl = document.getElementById('vm-migrate-ext-url')?.value.trim() || '';
     const extToken = document.getElementById('vm-migrate-ext-token')?.value.trim() || '';
     const migrateStorage = document.getElementById('vm-migrate-storage')?.value || '';
 
     const isExternal = target === '__external__';
-    if (isExternal && (!extUrl || !extToken)) { showToast('Enter URL and token', 'error'); return; }
+    if (isExternal && (!rawExtUrl || !extToken)) { showToast('Enter URL and token', 'error'); return; }
+    const extUrl = isExternal ? normalizeWolfStackUrl(rawExtUrl) : '';
 
     document.getElementById('vm-migrate-modal')?.remove();
 
