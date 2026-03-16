@@ -811,7 +811,8 @@ fn create_backup_entry(target: BackupTarget, storage: &BackupStorage) -> BackupE
                 .map(|f| f.to_string_lossy().to_string())
                 .unwrap_or_else(|| format!("backup-{}.tar.gz", id));
 
-            match store_backup(&local_path, storage, &filename) {
+            let pbs_notes = format!("Cluster: {} | Node: {} | {}", local_cluster_name(), hostname, comments);
+            match store_backup_with_notes(&local_path, storage, &filename, Some(&pbs_notes)) {
                 Ok(_) => {
                     // Remove staging file after successful store
                     let _ = fs::remove_file(&local_path);
@@ -870,13 +871,13 @@ fn create_backup_entry(target: BackupTarget, storage: &BackupStorage) -> BackupE
 // ─── Storage Functions ───
 
 /// Store a backup file to the configured storage target
-fn store_backup(local_path: &Path, storage: &BackupStorage, filename: &str) -> Result<(), String> {
+fn store_backup_with_notes(local_path: &Path, storage: &BackupStorage, filename: &str, notes: Option<&str>) -> Result<(), String> {
     match storage.storage_type {
         StorageType::Local => store_local(local_path, &storage.path, filename),
         StorageType::S3 => store_s3(local_path, storage, filename),
         StorageType::Remote => store_remote(local_path, &storage.remote_url, filename),
-        StorageType::Wolfdisk => store_local(local_path, &storage.path, filename), // WolfDisk is just a mount path
-        StorageType::Pbs => store_pbs(local_path, storage, filename),
+        StorageType::Wolfdisk => store_local(local_path, &storage.path, filename),
+        StorageType::Pbs => store_pbs_with_notes(local_path, storage, filename, notes),
     }
 }
 
@@ -981,7 +982,7 @@ fn pbs_repo_string(storage: &BackupStorage) -> String {
 }
 
 /// Store backup to Proxmox Backup Server
-fn store_pbs(local_path: &Path, storage: &BackupStorage, filename: &str) -> Result<(), String> {
+fn store_pbs_with_notes(local_path: &Path, storage: &BackupStorage, filename: &str, notes: Option<&str>) -> Result<(), String> {
     let repo = pbs_repo_string(storage);
 
     // Extract the actual VMID/container name from the filename
@@ -1024,6 +1025,48 @@ fn store_pbs(local_path: &Path, storage: &BackupStorage, filename: &str) -> Resu
     if !output.status.success() {
         return Err(format!("PBS backup failed: {}",
             String::from_utf8_lossy(&output.stderr)));
+    }
+
+    // Set snapshot notes with cluster/node/container metadata for identification
+    if let Some(notes_text) = notes {
+        // Find the snapshot we just created — it's the latest one for this backup-id
+        // proxmox-backup-client snapshot notes update <snapshot> --notes "text"
+        let snapshot_output = Command::new("proxmox-backup-client")
+            .args(["snapshot", "list", "--output-format", "json", "--repository", &repo])
+            .env("PBS_FINGERPRINT", &storage.pbs_fingerprint)
+            .env("PBS_PASSWORD", pbs_pw)
+            .output();
+
+        if let Ok(snap_out) = snapshot_output {
+            if let Ok(snaps) = serde_json::from_slice::<serde_json::Value>(&snap_out.stdout) {
+                if let Some(arr) = snaps.as_array() {
+                    // Find our snapshot: matching backup-type and backup-id, newest
+                    let mut best_time: i64 = 0;
+                    let mut best_snap = String::new();
+                    for s in arr {
+                        let st = s.get("backup-type").and_then(|v| v.as_str()).unwrap_or("");
+                        let si = s.get("backup-id").and_then(|v| v.as_str()).unwrap_or("");
+                        let stime = s.get("backup-time").and_then(|v| v.as_i64()).unwrap_or(0);
+                        if st == backup_type && si == backup_id && stime > best_time {
+                            best_time = stime;
+                            best_snap = format!("{}/{}/{}", st, si, stime);
+                        }
+                    }
+                    if !best_snap.is_empty() {
+                        let mut notes_cmd = Command::new("proxmox-backup-client");
+                        notes_cmd.args(["snapshot", "notes", "set", &best_snap,
+                                       "--repository", &repo, notes_text]);
+                        if !storage.pbs_fingerprint.is_empty() {
+                            notes_cmd.env("PBS_FINGERPRINT", &storage.pbs_fingerprint);
+                        }
+                        if !pbs_pw.is_empty() {
+                            notes_cmd.env("PBS_PASSWORD", pbs_pw);
+                        }
+                        let _ = notes_cmd.output(); // Best-effort
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
@@ -1404,7 +1447,9 @@ pub fn create_backup_with_log(
                     .unwrap_or_else(|| format!("backup-{}.tar.gz", id));
 
                 let _ = log.send(format!("  Storing to {}...", storage_label(&storage)));
-                match store_backup(&local_path, &storage, &filename) {
+                // Build PBS notes with cluster, node, and target details
+                let pbs_notes = format!("Cluster: {} | Node: {} | {}", cluster, hostname, comments);
+                match store_backup_with_notes(&local_path, &storage, &filename, Some(&pbs_notes)) {
                     Ok(_) => {
                         let _ = fs::remove_file(&local_path);
                         let _ = log.send(format!("  ✓ {} backup complete ({})", type_name, format_size_human(size)));

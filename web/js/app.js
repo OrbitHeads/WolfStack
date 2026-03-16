@@ -14505,10 +14505,34 @@ async function loadPbsSnapshots() {
                 timeStr = d.toLocaleString();
             }
 
+            // Parse structured notes: "Cluster: X | Node: Y | [X] LXC container: 131 (hostname) ..."
+            var clusterName = '—';
+            var nodeName = '—';
+            var detailText = '';
+            if (comment) {
+                var parts = comment.split(' | ');
+                parts.forEach(function(p) {
+                    p = p.trim();
+                    if (p.startsWith('Cluster:')) clusterName = p.substring(8).trim();
+                    else if (p.startsWith('Node:')) nodeName = p.substring(5).trim();
+                    else detailText = p;
+                });
+                // If notes aren't in structured format, show as-is
+                if (clusterName === '—' && nodeName === '—') detailText = comment;
+            }
+
+            // Container name: prefer enriched hostname, then from notes, then raw comment
             var hostname = s.hostname || '';
             var specs = s.specs || '';
-            var displayName = hostname && hostname !== bid ? escapeHtml(hostname) : (comment ? escapeHtml(comment) : '—');
-            var commentLine = (comment && hostname) ? '<div style="font-size:11px; color:var(--text-muted);">' + escapeHtml(comment) + '</div>' : '';
+            var displayName = hostname && hostname !== bid ? escapeHtml(hostname) : '—';
+            var specsLine = specs ? '<div style="font-size:11px; color:var(--text-muted);">' + escapeHtml(specs) + '</div>' : '';
+            // If we have detail text from notes but no hostname from enrichment, extract it
+            if (displayName === '—' && detailText) {
+                // e.g. "[Cluster] LXC container: 131 (myhost) (vzdump full backup)"
+                var match = detailText.match(/:\s*\S+\s*\(([^)]+)\)/);
+                if (match) displayName = escapeHtml(match[1]);
+                else displayName = '<span style="font-size:11px; color:var(--text-muted);">' + escapeHtml(detailText.replace(/^\[.*?\]\s*/, '')) + '</span>';
+            }
 
             var snapshot = btype + '/' + bid + '/' + btime;
             var snapEsc = escapeHtml(snapshot);
@@ -14517,8 +14541,9 @@ async function loadPbsSnapshots() {
             return '<tr>' +
                 '<td>' + emoji + ' ' + escapeHtml(typeLabel) + '</td>' +
                 '<td><strong>' + escapeHtml(bid) + '</strong></td>' +
-                '<td>' + displayName + commentLine + '</td>' +
-                '<td style="font-size:12px; color:var(--text-muted);">' + (specs ? escapeHtml(specs) : '—') + '</td>' +
+                '<td>' + displayName + specsLine + '</td>' +
+                '<td style="font-size:12px;">' + escapeHtml(clusterName) + '</td>' +
+                '<td style="font-size:12px;">' + escapeHtml(nodeName) + '</td>' +
                 '<td style="font-size:12px;">' + timeStr + '</td>' +
                 '<td>' + formatPbsSize(size) + '</td>' +
                 '<td style="text-align:right;">' +
