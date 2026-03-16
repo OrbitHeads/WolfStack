@@ -12129,11 +12129,8 @@ async function migrateDockerContainer(name) {
                         <option value="">Auto (default)</option>
                     </select>
                 </div>
-                <div style="margin-bottom: 1rem;">
-                    <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
-                        <input type="checkbox" id="migrate-remove" checked>
-                        Remove container from this machine after migration
-                    </label>
+                <div style="background:var(--info-bg,#1a2332);border:1px solid var(--info,#3b82f6);border-radius:8px;padding:10px 12px;margin-bottom:1rem;color:var(--info,#3b82f6);font-size:0.82em;">
+                    The source container will be stopped but not deleted. Verify the destination is working, then remove the source manually.
                 </div>
                 <div style="display:flex; gap:8px;">
                     <button class="btn btn-primary" onclick="doMigrate('${name}')">🚀 Migrate</button>
@@ -12157,11 +12154,8 @@ async function migrateDockerContainer(name) {
                         <option value="">Auto (default)</option>
                     </select>
                 </div>
-                <div style="margin-bottom: 1rem;">
-                    <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
-                        <input type="checkbox" id="migrate-remove" checked>
-                        Remove container from this machine after migration
-                    </label>
+                <div style="background:var(--info-bg,#1a2332);border:1px solid var(--info,#3b82f6);border-radius:8px;padding:10px 12px;margin-bottom:1rem;color:var(--info,#3b82f6);font-size:0.82em;">
+                    The source container will be stopped but not deleted. Verify the destination is working, then remove the source manually.
                 </div>
                 <div style="display:flex; gap:8px;">
                     <button class="btn btn-primary" onclick="doMigrate('${name}')">🚀 Migrate</button>
@@ -12174,9 +12168,7 @@ async function migrateDockerContainer(name) {
 
 async function doMigrate(name) {
     const targetEl = document.getElementById('migrate-target');
-    const removeEl = document.getElementById('migrate-remove');
     const targetUrl = targetEl.value.trim();
-    const removeSource = removeEl.checked;
     const storageVal = document.getElementById('docker-migrate-storage')?.value || '';
 
     if (!targetUrl) {
@@ -12191,7 +12183,7 @@ async function doMigrate(name) {
     const dockerTaskId = taskLogStart(`Migrating Docker '${name}' to ${dockerTargetLabel}`);
 
     try {
-        const migrateBody = { target_url: targetUrl, remove_source: removeSource };
+        const migrateBody = { target_url: targetUrl };
         if (storageVal) migrateBody.storage = storageVal;
         const resp = await fetch(apiUrl(`/api/containers/docker/${name}/migrate`), {
             method: 'POST',
@@ -12559,7 +12551,7 @@ async function doMigrateLxc(name) {
             resp = await fetch(apiUrl(`/api/containers/lxc/${name}/migrate-external`), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ target_url: extUrl, target_token: extToken, delete_source: true }),
+                body: JSON.stringify({ target_url: extUrl, target_token: extToken }),
             });
         } else {
             const migrateBody = { target_node: target };
@@ -12821,7 +12813,7 @@ async function doMigrateVm(name) {
     try {
         let resp;
         if (isExternal) {
-            const extBody = { target_url: extUrl, target_token: extToken, delete_source: true };
+            const extBody = { target_url: extUrl, target_token: extToken };
             if (migrateStorage) extBody.storage = migrateStorage;
             resp = await fetch(apiUrl(`/api/vms/${name}/migrate-external`), {
                 method: 'POST',

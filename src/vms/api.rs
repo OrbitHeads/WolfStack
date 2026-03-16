@@ -261,12 +261,13 @@ struct VmMigrateRequest {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct VmMigrateExternalRequest {
     target_url: String,
     target_token: String,
     new_name: Option<String>,
     storage: Option<String>,
-    delete_source: Option<bool>,
+    delete_source: Option<bool>, // accepted but ignored — source is never deleted
 }
 
 /// POST /api/vms/{name}/migrate — migrate VM to another cluster node
@@ -350,11 +351,9 @@ async fn vm_migrate(
             Ok(r) => {
                 super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
                 if r.status().is_success() {
-                    // Delete source VM
-                    let manager = state.vms.lock().unwrap();
-                    let _ = manager.delete_vm(&name);
+                    // Source VM is left stopped — user can verify destination then clean up manually
                     return HttpResponse::Ok().json(serde_json::json!({
-                        "message": format!("VM '{}' migrated to '{}' on node '{}'", name, new_name, body.target_node)
+                        "message": format!("VM '{}' migrated to '{}' on node '{}'. Source VM left stopped — verify destination then delete manually.", name, new_name, body.target_node)
                     }));
                 } else {
                     let err_text = r.text().await.unwrap_or_default();
@@ -440,12 +439,9 @@ async fn vm_migrate_external(
             Ok(r) => {
                 super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
                 if r.status().is_success() {
-                    if body.delete_source.unwrap_or(false) {
-                        let manager = state.vms.lock().unwrap();
-                        let _ = manager.delete_vm(&name);
-                    }
+                    // Source VM is left stopped — user can verify destination then clean up manually
                     return HttpResponse::Ok().json(serde_json::json!({
-                        "message": format!("VM '{}' transferred to {}", name, body.target_url)
+                        "message": format!("VM '{}' transferred to {}. Source VM left stopped — verify destination then delete manually.", name, body.target_url)
                     }));
                 } else {
                     let err = r.text().await.unwrap_or_default();

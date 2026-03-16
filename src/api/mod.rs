@@ -2885,12 +2885,13 @@ pub struct MigrateRequest {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 pub struct MigrateExternalRequest {
     pub target_url: String,
     pub target_token: String,
     pub new_name: Option<String>,
     pub storage: Option<String>,
-    pub delete_source: Option<bool>,
+    pub delete_source: Option<bool>, // accepted but ignored — source is never deleted
 }
 
 #[derive(Deserialize)]
@@ -3232,17 +3233,9 @@ pub async fn lxc_migrate(
     // Clone to target node
     let clone_resp = lxc_remote_clone(&state, &name, new_name, &body.target_node, body.storage.as_deref(), None).await;
 
-    // If clone succeeded, destroy source
+    // Source container is left intact — user can verify destination then clean up manually
     if clone_resp.status().is_success() {
         let _ = containers::lxc_stop(&name);
-        match containers::lxc_destroy(&name) {
-            Ok(_) => {
-
-            }
-            Err(e) => {
-                tracing::warn!("Migration: clone succeeded but failed to destroy source '{}': {}", name, e);
-            }
-        }
     }
 
     clone_resp
@@ -3482,13 +3475,9 @@ pub async fn lxc_migrate_external(
             Ok(r) => {
                 containers::lxc_export_cleanup(archive_path.to_str().unwrap_or(""));
                 if r.status().is_success() {
-                    if body.delete_source.unwrap_or(false) {
-                        let _ = containers::lxc_destroy(&name);
-                    } else {
-                        let _ = containers::lxc_start(&name);
-                    }
+                    // Source container is left stopped — user can verify destination then clean up manually
                     return HttpResponse::Ok().json(serde_json::json!({
-                        "message": format!("Container '{}' transferred to {}", name, body.target_url)
+                        "message": format!("Container '{}' transferred to {}. Source left stopped — verify destination then delete manually.", name, body.target_url)
                     }));
                 } else {
                     let _ = containers::lxc_start(&name);

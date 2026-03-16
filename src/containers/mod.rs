@@ -5794,7 +5794,7 @@ pub fn docker_clone(container: &str, new_name: &str) -> Result<String, String> {
 
 /// Migrate a Docker container to a remote WolfStack node
 /// Exports the container, sends it to the target, imports and optionally starts it
-pub fn docker_migrate(container: &str, target_url: &str, remove_source: bool) -> Result<String, String> {
+pub fn docker_migrate(container: &str, target_url: &str, _remove_source: bool) -> Result<String, String> {
 
 
     // Step 1: Stop the container if running
@@ -5883,17 +5883,9 @@ pub fn docker_migrate(container: &str, target_url: &str, remove_source: bool) ->
 
 
     
-    // Step 5: Optionally remove the source container (only after confirmed success)
-    if remove_source {
-        let _ = docker_remove(container);
+    // Source container is left stopped — user can verify destination then clean up manually
 
-    } else {
-        // Restart the source container since we're keeping it
-        let _ = docker_start(container);
-
-    }
-
-    Ok(format!("Container migrated to {} successfully. {}", target_url, last_response))
+    Ok(format!("Container migrated to {} successfully. Source left stopped — verify destination then delete manually. {}", target_url, last_response))
 }
 
 /// Import a Docker container image from a tar file
