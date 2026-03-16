@@ -2610,8 +2610,7 @@ fn pct_list_all() -> Vec<ContainerInfo> {
             let cfg_text = cfg_text.clone();
             s.spawn(move || {
                 let status = if state == "running" {
-                    let pid = Command::new("lxc-info")
-                        .args(["-n", &vmid, "-pH"])
+                    let pid = Command::new("timeout").args(["5", "lxc-info", "-n", &vmid, "-pH"])
                         .output().ok()
                         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                         .unwrap_or("-".to_string());
@@ -2623,8 +2622,7 @@ fn pct_list_all() -> Vec<ContainerInfo> {
                 // Get IP addresses for running containers
                 let mut ip = String::new();
                 if state == "running" {
-                    if let Ok(info_out) = Command::new("lxc-info")
-                        .args(["-n", &vmid, "-iH"])
+                    if let Ok(info_out) = Command::new("timeout").args(["5", "lxc-info", "-n", &vmid, "-iH"])
                         .output()
                     {
                         let info_ip = String::from_utf8_lossy(&info_out.stdout)
@@ -2697,7 +2695,8 @@ fn pct_list_all() -> Vec<ContainerInfo> {
                 } else { None };
 
                 let (du, dt, ft) = if state == "running" {
-                    match Command::new("pct").args(["exec", &vmid, "--", "df", "-T", "--block-size=1", "/"]).output() {
+                    // Use timeout to prevent hanging on unresponsive containers
+                    match Command::new("timeout").args(["5", "pct", "exec", &vmid, "--", "df", "-T", "--block-size=1", "/"]).output() {
                         Ok(out) if out.status.success() => {
                             let text = String::from_utf8_lossy(&out.stdout);
                             if let Some(line) = text.lines().nth(1) {
@@ -2910,10 +2909,10 @@ fn lxc_info(name: &str) -> LxcDetailInfo {
     // Fallback: if still 0, try reading /proc/meminfo inside the container
     if memory_limit == 0 {
         let base = lxc_base_dir(name);
-        let mut attach_args: Vec<&str> = Vec::new();
-        if base != LXC_DEFAULT_PATH { attach_args.extend_from_slice(&["-P", &base]); }
-        attach_args.extend_from_slice(&["-n", name, "--", "cat", "/proc/meminfo"]);
-        if let Ok(out) = Command::new("lxc-attach")
+        let mut attach_args: Vec<String> = vec!["5".to_string(), "lxc-attach".to_string()];
+        if base != LXC_DEFAULT_PATH { attach_args.extend_from_slice(&["-P".to_string(), base.clone()]); }
+        attach_args.extend_from_slice(&["-n".to_string(), name.to_string(), "--".to_string(), "cat".to_string(), "/proc/meminfo".to_string()]);
+        if let Ok(out) = Command::new("timeout")
             .args(&attach_args)
             .output()
         {
