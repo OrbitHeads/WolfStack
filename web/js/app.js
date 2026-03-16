@@ -7115,6 +7115,8 @@ function loadTaskLog() {
         loadTaskLogHeight();
         showTaskLog();
         renderTaskLog();
+        // Log the session start
+        taskLog('Dashboard loaded');
     } catch (_) {}
 }
 
@@ -7215,15 +7217,6 @@ function toggleTaskLogBody() {
     const chevron = document.getElementById('task-log-chevron');
     if (body) body.style.display = _taskLogBodyVisible ? '' : 'none';
     if (chevron) chevron.style.transform = _taskLogBodyVisible ? '' : 'rotate(-90deg)';
-}
-
-function clearTaskLog() {
-    _taskLogEntries = [];
-    renderTaskLog();
-    saveTaskLog();
-    const spinner = document.getElementById('task-log-spinner');
-    if (spinner) spinner.style.display = 'none';
-    updateTaskLogToggleBtn();
 }
 
 function addTaskLogEntry(opts) {
