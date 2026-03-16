@@ -14048,48 +14048,40 @@ function formatBytes(bytes) {
 
 // ─── Backup Now (selected targets) ───
 
-function showBackupProgress(container, items, title) {
-    const EMOJIS = { docker: '🐳', lxc: '📦', vm: '🖥️', config: '⚙️' };
+function showBackupLog(container, title) {
     container.innerHTML = `
-        <tr><td colspan="7" style="padding:0; border:none;">
-            <div style="padding:20px; background:var(--bg-primary); border-radius:var(--radius-sm); border:1px solid var(--border);">
-                <div style="display:flex; align-items:center; gap:10px; margin-bottom:16px;">
-                    <div id="backup-progress-spinner" style="width:20px; height:20px; border:3px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin 0.8s linear infinite;"></div>
+        <tr><td colspan="8" style="padding:0; border:none;">
+            <div style="padding:16px; background:var(--bg-primary); border-radius:var(--radius-sm); border:1px solid var(--border);">
+                <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;">
+                    <div id="backup-progress-spinner" style="width:16px; height:16px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin 0.8s linear infinite;"></div>
                     <strong id="backup-progress-title">${title}</strong>
                 </div>
-                <div id="backup-progress-items" style="display:grid; gap:6px;">
-                    ${items.map((t, i) => {
-        const emoji = EMOJIS[t.type || t.target_type] || '📄';
-        let name = t.name || t.type || 'item';
-        if (t.hostname && t.hostname !== t.name) name = `${t.name} (${t.hostname})`;
-        return `<div id="backup-item-${i}" style="display:flex; align-items:center; gap:8px; padding:6px 10px; background:var(--bg-tertiary); border-radius:var(--radius-sm); font-size:13px;">
-                            <span style="width:20px; text-align:center;" id="backup-icon-${i}">⏳</span>
-                            <span>${emoji} <strong>${escapeHtml(name)}</strong></span>
-                            <span id="backup-status-${i}" style="margin-left:auto; color:var(--text-muted); font-size:12px;">Waiting...</span>
-                        </div>`;
-    }).join('')}
-                </div>
+                <div id="backup-log" style="background:#0d1117; color:#c9d1d9; font-family:'JetBrains Mono',Consolas,monospace; font-size:12px; line-height:1.6; padding:12px; border-radius:6px; max-height:400px; overflow-y:auto; white-space:pre-wrap; word-break:break-word;"></div>
             </div>
         </td></tr>`;
+}
+
+function appendBackupLog(line) {
+    const log = document.getElementById('backup-log');
+    if (!log) return;
+    // Color code lines
+    let color = '#c9d1d9';
+    if (line.includes('✓')) color = '#3fb950';
+    else if (line.includes('✗') || line.includes('Failed') || line.includes('failed')) color = '#f85149';
+    else if (line.startsWith('[')) color = '#58a6ff';
+    else if (line.startsWith('  vzdump') || line.startsWith('  INFO:')) color = '#8b949e';
+    else if (line.startsWith('Done:')) color = '#d2a8ff';
+
+    const span = document.createElement('span');
+    span.style.color = color;
+    span.textContent = line + '\n';
+    log.appendChild(span);
+    log.scrollTop = log.scrollHeight;
 }
 
 function stopBackupProgressSpinner() {
     const spinner = document.getElementById('backup-progress-spinner');
     if (spinner) spinner.style.display = 'none';
-}
-
-function updateBackupItemStatus(index, status, success) {
-    const icon = document.getElementById(`backup-icon-${index}`);
-    const statusEl = document.getElementById(`backup-status-${index}`);
-    const row = document.getElementById(`backup-item-${index}`);
-    if (icon) icon.textContent = success === true ? '✅' : success === false ? '❌' : '⏳';
-    if (statusEl) {
-        statusEl.textContent = status;
-        statusEl.style.color = success === true ? 'var(--success)' : success === false ? '#ef4444' : 'var(--accent)';
-    }
-    if (row && success !== null) {
-        row.style.borderLeft = `3px solid ${success ? 'var(--success)' : '#ef4444'}`;
-    }
 }
 
 async function backupSelected() {
@@ -14102,102 +14094,68 @@ async function backupSelected() {
     const storage = await getSelectedStorage();
     const storageLabel = storage.type === 'pbs' ? `PBS (${storage.pbs_server})` : (storage.path || storage.type);
 
-    // Disable backup button
     const backupBtn = document.querySelector('[onclick="backupSelected()"]');
     if (backupBtn) { backupBtn.disabled = true; backupBtn.textContent = '⏳ Backing up...'; }
 
     const tbody = document.getElementById('backups-table');
     const allTargets = targets.length === document.querySelectorAll('.backup-target-cb').length;
 
+    // Show log panel
+    if (tbody) showBackupLog(tbody, `Backing up ${targets.length} item${targets.length > 1 ? 's' : ''} to ${storageLabel}...`);
+
     try {
-        if (allTargets) {
-            // All targets — single request
-            if (tbody) showBackupProgress(tbody, targets, `Backing up all ${targets.length} items to ${storageLabel}...`);
-
-            // Mark all as in-progress
-            targets.forEach((_, i) => updateBackupItemStatus(i, 'Backing up...', null));
-
-            const res = await fetch(apiUrl('/api/backups'), {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ storage }),
-            });
-            const data = await res.json();
-
-            stopBackupProgressSpinner();
-            const titleEl = document.getElementById('backup-progress-title');
-            if (data.error) {
-                targets.forEach((_, i) => updateBackupItemStatus(i, 'Failed', false));
-                if (titleEl) titleEl.textContent = `❌ Backup failed`;
-                showToast(`Backup failed: ${data.error}`, 'error');
-            } else {
-                // Mark individual results
-                const entries = data.entries || [];
-                let ok = 0, fail = 0;
-                targets.forEach((t, i) => {
-                    const entry = entries[i];
-                    if (entry && entry.status === 'completed') {
-                        ok++;
-                        updateBackupItemStatus(i, `Done (${formatBytes(entry.size_bytes || 0)})`, true);
-                    } else if (entry) {
-                        fail++;
-                        updateBackupItemStatus(i, entry.error || 'Failed', false);
-                    } else {
-                        ok++;
-                        updateBackupItemStatus(i, 'Done', true);
-                    }
-                });
-                if (titleEl) titleEl.textContent = fail === 0 ? `✅ All ${ok} backups completed!` : `Done: ${ok} succeeded, ${fail} failed`;
-                showToast(data.message || 'Backup completed', 'success');
+        // Use streaming endpoint for real-time log
+        const reqBody = allTargets ? { storage } : { target: targets.length === 1 ? targets[0] : null, storage };
+        // For multiple individual targets, send them one at a time via stream
+        if (!allTargets && targets.length > 1) {
+            for (let i = 0; i < targets.length; i++) {
+                await runStreamingBackup({ target: targets[i], storage });
             }
         } else {
-            // Individual targets — sequential requests with per-item progress
-            if (tbody) showBackupProgress(tbody, targets, `Backing up ${targets.length} item${targets.length > 1 ? 's' : ''} to ${storageLabel}...`);
-
-            let ok = 0, fail = 0;
-            for (let i = 0; i < targets.length; i++) {
-                const t = targets[i];
-                const name = t.name || t.type || 'item';
-                updateBackupItemStatus(i, 'Backing up...', null);
-                const titleEl = document.getElementById('backup-progress-title');
-                if (titleEl) titleEl.textContent = `Backing up ${name} (${i + 1}/${targets.length})...`;
-
-                try {
-                    const res = await fetch(apiUrl('/api/backups'), {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ target: t, storage }),
-                    });
-                    const data = await res.json();
-                    if (data.error) {
-                        fail++;
-                        updateBackupItemStatus(i, data.error, false);
-                    } else {
-                        ok++;
-                        const entry = (data.entries || [])[0];
-                        const sizeStr = entry ? formatBytes(entry.size_bytes || 0) : '';
-                        updateBackupItemStatus(i, `Done${sizeStr ? ' (' + sizeStr + ')' : ''}`, true);
-                    }
-                } catch (e) {
-                    fail++;
-                    updateBackupItemStatus(i, e.message, false);
-                }
-            }
-            stopBackupProgressSpinner();
-            const titleEl = document.getElementById('backup-progress-title');
-            if (titleEl) titleEl.textContent = fail === 0 ? `✅ All ${ok} backups completed!` : `Done: ${ok} succeeded, ${fail} failed`;
-            if (fail === 0) showToast(`All ${ok} backups completed`, 'success');
-            else showToast(`${ok} succeeded, ${fail} failed`, 'error');
+            await runStreamingBackup(reqBody);
         }
     } catch (e) {
-        stopBackupProgressSpinner();
+        appendBackupLog(`Error: ${e.message}`);
         showToast(`Backup error: ${e.message}`, 'error');
     }
 
-    // Re-enable button
+    stopBackupProgressSpinner();
+    const titleEl = document.getElementById('backup-progress-title');
+    if (titleEl) titleEl.textContent = '✅ Backup complete';
+
     if (backupBtn) { backupBtn.disabled = false; backupBtn.textContent = '⚡ Backup Now'; }
-    // Refresh after a short delay so user can see the final status
-    setTimeout(() => loadBackups(), 2000);
+    setTimeout(() => loadBackups(), 3000);
+}
+
+async function runStreamingBackup(body) {
+    const res = await fetch(apiUrl('/api/backups/stream'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    });
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+            if (line.startsWith('data: ')) {
+                appendBackupLog(line.substring(6));
+            }
+        }
+    }
+    // Process remaining buffer
+    if (buffer.startsWith('data: ')) {
+        appendBackupLog(buffer.substring(6));
+    }
 }
 
 async function deleteBackup(id) {

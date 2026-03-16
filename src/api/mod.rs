@@ -4741,6 +4741,65 @@ pub async fn backup_create(
     }))
 }
 
+/// POST /api/backups/stream — run backup with SSE log output
+pub async fn backup_stream(
+    req: HttpRequest, state: web::Data<AppState>,
+    body: web::Json<CreateBackupRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+
+    let mut storage = body.storage.clone();
+    if storage.storage_type == backup::StorageType::Pbs {
+        let saved = backup::load_pbs_config();
+        if storage.pbs_password.is_empty() && !saved.pbs_password.is_empty() {
+            storage.pbs_password = saved.pbs_password;
+        }
+        if storage.pbs_token_secret.is_empty() && !saved.pbs_token_secret.is_empty() {
+            storage.pbs_token_secret = saved.pbs_token_secret;
+        }
+        if storage.pbs_server.is_empty() { storage.pbs_server = saved.pbs_server; }
+        if storage.pbs_datastore.is_empty() { storage.pbs_datastore = saved.pbs_datastore; }
+        if storage.pbs_user.is_empty() { storage.pbs_user = saved.pbs_user; }
+        if storage.pbs_token_name.is_empty() { storage.pbs_token_name = saved.pbs_token_name; }
+        if storage.pbs_fingerprint.is_empty() { storage.pbs_fingerprint = saved.pbs_fingerprint; }
+        if storage.pbs_namespace.is_empty() { storage.pbs_namespace = saved.pbs_namespace; }
+    }
+
+    let target = body.target.clone();
+
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+
+    // Spawn blocking backup thread
+    std::thread::spawn(move || {
+        backup::create_backup_with_log(target, storage, tx);
+    });
+
+    // Stream SSE events from the channel
+    let stream = futures::stream::unfold(rx, |rx| async move {
+        // Use spawn_blocking to avoid blocking the async runtime
+        let result = tokio::task::spawn_blocking(move || {
+            match rx.recv_timeout(std::time::Duration::from_secs(300)) {
+                Ok(msg) => Some((msg, rx)),
+                Err(_) => None,
+            }
+        }).await.ok().flatten();
+
+        match result {
+            Some((msg, rx)) => {
+                let event = format!("data: {}\n\n", msg.replace('\n', "\ndata: "));
+                Some((Ok::<_, actix_web::Error>(actix_web::web::Bytes::from(event)), rx))
+            }
+            None => None,
+        }
+    });
+
+    HttpResponse::Ok()
+        .insert_header(("Content-Type", "text/event-stream"))
+        .insert_header(("Cache-Control", "no-cache"))
+        .insert_header(("X-Accel-Buffering", "no"))
+        .streaming(stream)
+}
+
 /// DELETE /api/backups/{id} — delete a backup entry + file
 pub async fn backup_delete(
     req: HttpRequest, state: web::Data<AppState>,
@@ -12635,6 +12694,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // Backups
         .route("/api/backups", web::get().to(backup_list))
         .route("/api/backups", web::post().to(backup_create))
+        .route("/api/backups/stream", web::post().to(backup_stream))
         .route("/api/backups/targets", web::get().to(backup_targets))
         .route("/api/backups/schedules", web::get().to(backup_schedules_list))
         .route("/api/backups/schedules", web::post().to(backup_schedule_create))

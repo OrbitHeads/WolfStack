@@ -966,16 +966,26 @@ fn pbs_repo_string(storage: &BackupStorage) -> String {
 fn store_pbs(local_path: &Path, storage: &BackupStorage, filename: &str) -> Result<(), String> {
     let repo = pbs_repo_string(storage);
 
+    // Extract the actual VMID/container name from the filename
+    // Formats: "vzdump-lxc-131-2026..." → "131", "lxc-myct-2026..." → "myct",
+    //          "docker-myapp-2026..." → "myapp", "vm-myvm-2026..." → "myvm"
+    let backup_id = extract_backup_id_from_filename(filename);
 
-    // Extract container/VM name from filename (e.g. "mycontainer-2026-02-12.tar.gz" -> "mycontainer")
-    let backup_id = filename.split('-').next().unwrap_or(filename.split('.').next().unwrap_or(filename));
+    // Determine backup type from filename prefix
+    let backup_type = if filename.starts_with("vzdump-lxc-") || filename.starts_with("lxc-") {
+        "ct"
+    } else if filename.starts_with("vm-") || filename.starts_with("vzdump-qemu-") {
+        "vm"
+    } else {
+        "host"
+    };
 
     let mut cmd = Command::new("proxmox-backup-client");
     cmd.arg("backup")
-       .arg(format!("{}.pxar:{}", backup_id, local_path.parent().unwrap_or(Path::new("/tmp")).display()))
+       .arg(format!("backup.pxar:{}", local_path.parent().unwrap_or(Path::new("/tmp")).display()))
        .arg("--repository").arg(&repo)
-       .arg("--backup-id").arg(backup_id)
-       .arg("--backup-type").arg("ct");
+       .arg("--backup-id").arg(&backup_id)
+       .arg("--backup-type").arg(backup_type);
 
     if !storage.pbs_fingerprint.is_empty() {
         cmd.env("PBS_FINGERPRINT", &storage.pbs_fingerprint);
@@ -984,7 +994,6 @@ fn store_pbs(local_path: &Path, storage: &BackupStorage, filename: &str) -> Resu
         cmd.arg("--ns").arg(&storage.pbs_namespace);
     }
 
-    // Pass token secret or password via env
     let pbs_pw = if !storage.pbs_token_secret.is_empty() { &storage.pbs_token_secret }
                  else { &storage.pbs_password };
     if !pbs_pw.is_empty() {
@@ -999,8 +1008,29 @@ fn store_pbs(local_path: &Path, storage: &BackupStorage, filename: &str) -> Resu
             String::from_utf8_lossy(&output.stderr)));
     }
 
-
     Ok(())
+}
+
+/// Extract the container/VM ID from a backup filename
+fn extract_backup_id_from_filename(filename: &str) -> String {
+    // "vzdump-lxc-131-2026..." → "131"
+    if filename.starts_with("vzdump-lxc-") || filename.starts_with("vzdump-qemu-") {
+        let rest = filename.splitn(3, '-').nth(2).unwrap_or("");
+        return rest.split('-').next().unwrap_or("unknown").to_string();
+    }
+    // "lxc-myct-2026..." → "myct", "docker-myapp-2026..." → "myapp", "vm-myvm-2026..." → "myvm"
+    if let Some(rest) = filename.split_once('-') {
+        // rest.1 = "myct-20260316-123456.tar.gz" — take everything before the timestamp
+        let parts: Vec<&str> = rest.1.split('-').collect();
+        // Find where the timestamp starts (8 digits)
+        for (i, part) in parts.iter().enumerate() {
+            if part.len() == 8 && part.chars().all(|c| c.is_ascii_digit()) {
+                return parts[..i].join("-");
+            }
+        }
+        return parts[0].to_string();
+    }
+    filename.split('.').next().unwrap_or("unknown").to_string()
 }
 
 /// Retrieve a backup file from storage for restore
@@ -1284,6 +1314,194 @@ pub fn create_backup(target: Option<BackupTarget>, storage: BackupStorage) -> Ve
     let _ = save_config(&config);
 
     new_entries
+}
+
+/// Create a backup with real-time log output via a sender channel
+pub fn create_backup_with_log(
+    target: Option<BackupTarget>,
+    storage: BackupStorage,
+    log: std::sync::mpsc::Sender<String>,
+) -> Vec<BackupEntry> {
+    let targets = match target {
+        Some(t) => vec![t],
+        None => list_available_targets(),
+    };
+
+    let mut entries = Vec::new();
+    let total = targets.len();
+
+    for (i, t) in targets.iter().enumerate() {
+        let type_name = t.target_type.to_string().to_uppercase();
+        let display_name = if let Some(h) = &t.hostname {
+            format!("{} ({})", t.name, h)
+        } else {
+            t.name.clone()
+        };
+
+        let _ = log.send(format!("[{}/{}] Starting {} backup: {}",
+            i + 1, total, type_name, display_name));
+
+        let comments = backup_comments(t);
+
+        // Run the backup with line-by-line output for vzdump
+        let result = match t.target_type {
+            BackupTargetType::Docker => {
+                let _ = log.send(format!("  Exporting Docker container '{}'...", t.name));
+                backup_docker(&t.name)
+            }
+            BackupTargetType::Lxc => {
+                if crate::containers::is_proxmox() {
+                    let _ = log.send(format!("  Running vzdump for container {}...", t.name));
+                    backup_lxc_proxmox_with_log(&t.name, &log)
+                } else {
+                    let _ = log.send(format!("  Tarring LXC rootfs for '{}'...", t.name));
+                    backup_lxc(&t.name)
+                }
+            }
+            BackupTargetType::Vm => {
+                let _ = log.send(format!("  Backing up VM '{}'...", t.name));
+                backup_vm(&t.name)
+            }
+            BackupTargetType::Config => {
+                let _ = log.send("  Archiving WolfStack config files...".to_string());
+                backup_config()
+            }
+        };
+
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        let hostname = local_hostname();
+
+        let entry = match result {
+            Ok((local_path, size)) => {
+                let _ = log.send(format!("  Backup created: {} ({})",
+                    local_path.file_name().unwrap_or_default().to_string_lossy(),
+                    format_size_human(size)));
+
+                let filename = local_path.file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| format!("backup-{}.tar.gz", id));
+
+                let _ = log.send(format!("  Storing to {}...", storage_label(&storage)));
+                match store_backup(&local_path, &storage, &filename) {
+                    Ok(_) => {
+                        let _ = fs::remove_file(&local_path);
+                        let _ = log.send(format!("  ✓ {} backup complete ({})", type_name, format_size_human(size)));
+                        BackupEntry {
+                            id, target: t.clone(), storage: storage.clone(), filename,
+                            size_bytes: size, created_at: now, status: BackupStatus::Completed,
+                            error: String::new(), schedule_id: String::new(),
+                            comments, node_hostname: hostname,
+                        }
+                    }
+                    Err(e) => {
+                        let _ = fs::remove_file(&local_path);
+                        let _ = log.send(format!("  ✗ Storage failed: {}", e));
+                        BackupEntry {
+                            id, target: t.clone(), storage: storage.clone(), filename,
+                            size_bytes: size, created_at: now, status: BackupStatus::Failed,
+                            error: e, schedule_id: String::new(),
+                            comments, node_hostname: hostname,
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = log.send(format!("  ✗ Backup failed: {}", e));
+                BackupEntry {
+                    id, target: t.clone(), storage: storage.clone(),
+                    filename: String::new(), size_bytes: 0, created_at: now,
+                    status: BackupStatus::Failed, error: e,
+                    schedule_id: String::new(), comments, node_hostname: hostname,
+                }
+            }
+        };
+        entries.push(entry);
+    }
+
+    let ok = entries.iter().filter(|e| e.status == BackupStatus::Completed).count();
+    let fail = entries.iter().filter(|e| e.status == BackupStatus::Failed).count();
+    let _ = log.send(format!("\nDone: {} succeeded, {} failed", ok, fail));
+
+    let mut config = load_config();
+    config.entries.extend(entries.clone());
+    let _ = save_config(&config);
+
+    entries
+}
+
+/// Proxmox vzdump with real-time log output
+fn backup_lxc_proxmox_with_log(
+    vmid: &str,
+    log: &std::sync::mpsc::Sender<String>,
+) -> Result<(PathBuf, u64), String> {
+    let staging = ensure_staging_dir()?;
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+
+    // Try snapshot mode first, then stop mode
+    for mode in &["snapshot", "stop"] {
+        let _ = log.send(format!("  vzdump --mode {} ...", mode));
+
+        let mut child = Command::new("vzdump")
+            .args([
+                vmid,
+                "--dumpdir", &staging.to_string_lossy(),
+                "--mode", mode,
+                "--compress", "zstd",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("vzdump failed to start: {}", e))?;
+
+        // Read stdout line by line
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let mut all_stdout = String::new();
+
+        if let Some(stdout) = stdout {
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(stdout);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    let _ = log.send(format!("  {}", line));
+                    all_stdout.push_str(&line);
+                    all_stdout.push('\n');
+                }
+            }
+        }
+        if let Some(stderr) = stderr {
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(stderr);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    let _ = log.send(format!("  {}", line));
+                }
+            }
+        }
+
+        let status = child.wait().map_err(|e| format!("vzdump wait failed: {}", e))?;
+        if status.success() {
+            return find_vzdump_result(&all_stdout, &staging, vmid, &timestamp);
+        }
+
+        if *mode == "snapshot" {
+            let _ = log.send("  Snapshot mode not supported, trying stop mode...".to_string());
+        }
+    }
+
+    Err("vzdump failed in all modes".to_string())
+}
+
+
+fn storage_label(storage: &BackupStorage) -> String {
+    match storage.storage_type {
+        StorageType::Local => format!("local: {}", storage.path),
+        StorageType::S3 => format!("S3: {}", storage.bucket),
+        StorageType::Remote => format!("remote: {}", storage.remote_url),
+        StorageType::Wolfdisk => format!("WolfDisk: {}", storage.path),
+        StorageType::Pbs => format!("PBS: {}", storage.pbs_server),
+    }
 }
 
 /// Delete a backup entry and its file
