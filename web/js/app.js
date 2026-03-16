@@ -12585,7 +12585,9 @@ async function doMigrateLxc(name) {
     try {
         let resp;
         if (isExternal) {
-            resp = await fetch(apiUrl(`/api/containers/lxc/${name}/migrate-external`), {
+            // External migration: always run on the LOCAL server (not proxied)
+            // — the local node exports and pushes to the destination
+            resp = await fetch(`/api/containers/lxc/${name}/migrate-external`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ target_url: extUrl, target_token: extToken, ...(migrateStorage && { storage: migrateStorage }) }),
@@ -12869,9 +12871,10 @@ async function doMigrateVm(name) {
     try {
         let resp;
         if (isExternal) {
+            // External migration: always run on the LOCAL server (not proxied)
             const extBody = { target_url: extUrl, target_token: extToken };
             if (migrateStorage) extBody.storage = migrateStorage;
-            resp = await fetch(apiUrl(`/api/vms/${name}/migrate-external`), {
+            resp = await fetch(`/api/vms/${name}/migrate-external`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(extBody),
