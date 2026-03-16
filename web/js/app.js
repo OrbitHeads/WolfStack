@@ -12435,7 +12435,7 @@ async function migrateLxcContainer(name) {
         } catch (err) { hint.textContent = 'Could not reach target node for storage list'; }
     });
 
-    // Fetch storages from external URL when user finishes typing
+    // Fetch storages from external URL via backend proxy (handles auth + port detection)
     let lxcExtUrlTimer = null;
     document.getElementById('migrate-ext-url')?.addEventListener('input', (e) => {
         clearTimeout(lxcExtUrlTimer);
@@ -12446,20 +12446,11 @@ async function migrateLxcContainer(name) {
             sel.innerHTML = '<option value="">Auto (default)</option>';
             if (!url) { hint.textContent = 'Enter a target URL to load available storages'; return; }
             hint.textContent = 'Connecting to remote cluster...';
-            const base = url.includes('://') ? url.replace(/\/+$/, '') : 'https://' + url.replace(/\/+$/, '');
-            // Try HTTPS 8553, then HTTP 8554, then user's exact URL
-            const tryUrls = [];
-            if (!base.match(/:8553\b/)) tryUrls.push(base.replace(/(:\d+)?$/, ':8553'));
-            else tryUrls.push(base);
-            if (!base.match(/:8554\b/)) tryUrls.push(base.replace(/^https:/, 'http:').replace(/(:\d+)?$/, ':8554'));
-            tryUrls.push(base);
-            for (const tryUrl of tryUrls) {
-                try {
-                    const resp = await fetch(`${tryUrl}/api/storage/list`, { signal: AbortSignal.timeout(5000) });
-                    if (resp.ok) { lxcPopulateStorages(await resp.json()); return; }
-                } catch {}
-            }
-            hint.textContent = 'Could not reach remote cluster — check the URL';
+            try {
+                const resp = await fetch(`/api/storage/remote-list?url=${encodeURIComponent(url)}`);
+                if (resp.ok) { lxcPopulateStorages(await resp.json()); }
+                else { hint.textContent = 'Could not reach remote cluster — check the URL'; }
+            } catch { hint.textContent = 'Could not reach remote cluster — check the URL'; }
         }, 800);
     });
 }
@@ -12732,7 +12723,7 @@ async function migrateVm(name) {
         } catch (err) { hint.textContent = 'Could not reach target node for storage list'; }
     });
 
-    // Fetch storages from external URL when user finishes typing
+    // Fetch storages from external URL via backend proxy (handles auth + port detection)
     let vmExtUrlTimer = null;
     document.getElementById('vm-migrate-ext-url')?.addEventListener('input', (e) => {
         clearTimeout(vmExtUrlTimer);
@@ -12743,19 +12734,11 @@ async function migrateVm(name) {
             sel.innerHTML = '<option value="">Default</option>';
             if (!url) { hint.textContent = 'Enter a target URL to load available storages'; return; }
             hint.textContent = 'Connecting to remote cluster...';
-            const base = url.includes('://') ? url.replace(/\/+$/, '') : 'https://' + url.replace(/\/+$/, '');
-            const tryUrls = [];
-            if (!base.match(/:8553\b/)) tryUrls.push(base.replace(/(:\d+)?$/, ':8553'));
-            else tryUrls.push(base);
-            if (!base.match(/:8554\b/)) tryUrls.push(base.replace(/^https:/, 'http:').replace(/(:\d+)?$/, ':8554'));
-            tryUrls.push(base);
-            for (const tryUrl of tryUrls) {
-                try {
-                    const resp = await fetch(`${tryUrl}/api/storage/list`, { signal: AbortSignal.timeout(5000) });
-                    if (resp.ok) { vmPopulateStorages(await resp.json()); return; }
-                } catch {}
-            }
-            hint.textContent = 'Could not reach remote cluster — check the URL';
+            try {
+                const resp = await fetch(`/api/storage/remote-list?url=${encodeURIComponent(url)}`);
+                if (resp.ok) { vmPopulateStorages(await resp.json()); }
+                else { hint.textContent = 'Could not reach remote cluster — check the URL'; }
+            } catch { hint.textContent = 'Could not reach remote cluster — check the URL'; }
         }, 800);
     });
 }

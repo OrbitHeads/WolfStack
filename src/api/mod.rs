@@ -2662,6 +2662,46 @@ pub async fn lxc_create(
     }
 }
 
+/// GET /api/storage/remote-list?url=<target> — proxy storage list from a remote WolfStack node
+pub async fn remote_storage_list(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    let target = match query.get("url") {
+        Some(u) if !u.is_empty() => u.clone(),
+        _ => return HttpResponse::BadRequest().json(serde_json::json!({"error": "url parameter required"})),
+    };
+
+    let urls = build_external_urls(&target, "/api/storage/list");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap_or_default();
+
+    for url in &urls {
+        match client.get(url)
+            .header("X-WolfStack-Secret", state.cluster_secret.clone())
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                let body = r.text().await.unwrap_or_default();
+                return HttpResponse::Ok()
+                    .content_type("application/json")
+                    .body(body);
+            }
+            Ok(_) => continue,
+            Err(_) => continue,
+        }
+    }
+
+    HttpResponse::BadGateway().json(serde_json::json!({"error": "Could not reach remote cluster"}))
+}
+
 /// GET /api/storage/list — list available storage locations (Proxmox-aware)
 pub async fn storage_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
@@ -12708,6 +12748,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/containers/lxc/import-external", web::post().to(lxc_import_external))
         .route("/api/containers/transfer-token", web::post().to(generate_transfer_token))
         .route("/api/storage/list", web::get().to(storage_list))
+        .route("/api/storage/remote-list", web::get().to(remote_storage_list))
         .route("/api/containers/lxc/stats", web::get().to(lxc_stats))
         .route("/api/containers/lxc/{name}/logs", web::get().to(lxc_logs))
         .route("/api/containers/lxc/{name}/config", web::get().to(lxc_config))
