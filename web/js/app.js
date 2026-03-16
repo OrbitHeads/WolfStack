@@ -24046,11 +24046,11 @@ async function openK8sYamlEditor(kind, name, namespace) {
 
         const yaml = data.yaml || '';
 
-        // Create modal
-        document.querySelectorAll('.modal-overlay').forEach(m => m.remove());
-        const overlay = document.createElement('div');
+        // Use the system modal pattern
+        closeModal();
+        const overlay = document.getElementById('k8s-yaml-modal') || document.createElement('div');
+        overlay.id = 'k8s-yaml-modal';
         overlay.className = 'modal-overlay';
-        overlay.style.cssText = 'display:flex; position:fixed; top:0; left:0; right:0; bottom:0; z-index:2000; background:rgba(0,0,0,0.6); align-items:center; justify-content:center;';
         overlay.innerHTML = `
             <div class="modal" style="max-width:900px; width:95%; max-height:90vh; display:flex; flex-direction:column;">
                 <div class="modal-header" style="flex-shrink:0;">
@@ -24058,18 +24058,18 @@ async function openK8sYamlEditor(kind, name, namespace) {
                     <button class="modal-close" onclick="closeModal()">&times;</button>
                 </div>
                 <div class="modal-body" style="flex:1; overflow:hidden; padding:0;">
-                    <textarea id="k8s-yaml-editor" style="width:100%; height:100%; min-height:400px; font-family:'JetBrains Mono',Consolas,monospace; font-size:12px; line-height:1.5; padding:12px; border:none; background:#0d1117; color:#c9d1d9; resize:none; outline:none; tab-size:2;">${escapeHtml(yaml)}</textarea>
+                    <textarea id="k8s-yaml-editor" style="width:100%; height:100%; min-height:400px; font-family:'JetBrains Mono',Consolas,monospace; font-size:12px; line-height:1.5; padding:12px; border:none; background:var(--bg-input); color:var(--text-primary); resize:none; outline:none; tab-size:2;">${escapeHtml(yaml)}</textarea>
                 </div>
                 <div class="modal-footer" style="flex-shrink:0; display:flex; justify-content:space-between; align-items:center;">
                     <span style="font-size:11px; color:var(--text-muted);">${kind}/${name} in ${namespace}</span>
                     <div style="display:flex; gap:8px;">
                         <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-                        <button class="btn btn-primary" id="k8s-yaml-apply-btn" onclick="applyK8sYamlEdit()" style="background:#326ce5; border-color:#326ce5;">Apply Changes</button>
+                        <button class="btn btn-primary" id="k8s-yaml-apply-btn" onclick="applyK8sYamlEdit()" style="background:var(--accent); border-color:var(--accent);">Apply Changes</button>
                     </div>
                 </div>
             </div>`;
-        document.body.appendChild(overlay);
-        overlay.addEventListener('click', (e) => { if (e.target === overlay) closeModal(); });
+        if (!overlay.parentNode) document.body.appendChild(overlay);
+        requestAnimationFrame(() => overlay.classList.add('active'));
 
         // Allow Tab key in textarea
         const editor = document.getElementById('k8s-yaml-editor');
