@@ -7076,12 +7076,25 @@ let _taskLogBodyVisible = true;
 
 function saveTaskLog() {
     try {
-        // Store entries without expanded state, convert Date to ISO string
-        const toStore = _taskLogEntries.slice(0, 1000).map(e => ({
-            ...e, time: e.time instanceof Date ? e.time.toISOString() : e.time, expanded: false
+        // Store entries without expanded state or log lines (too large for localStorage)
+        const toStore = _taskLogEntries.slice(0, 500).map(e => ({
+            id: e.id, time: e.time instanceof Date ? e.time.toISOString() : e.time,
+            cluster: e.cluster, node: e.node, description: e.description,
+            status: e.status, type: e.type,
+            logLines: e.logLines.length > 0 ? e.logLines.slice(-20) : [],
         }));
         localStorage.setItem('wolfstack_task_log', JSON.stringify(toStore));
-    } catch (_) {}
+    } catch (_) {
+        // If still too large, try without any log lines
+        try {
+            const minimal = _taskLogEntries.slice(0, 200).map(e => ({
+                id: e.id, time: e.time instanceof Date ? e.time.toISOString() : e.time,
+                cluster: e.cluster, node: e.node, description: e.description,
+                status: e.status, type: e.type, logLines: [],
+            }));
+            localStorage.setItem('wolfstack_task_log', JSON.stringify(minimal));
+        } catch (_) {}
+    }
 }
 
 function loadTaskLog() {
