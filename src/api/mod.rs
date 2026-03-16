@@ -4705,6 +4705,9 @@ pub struct CreateBackupRequest {
     /// Optional specific target — if omitted, backup everything
     pub target: Option<backup::BackupTarget>,
     pub storage: backup::BackupStorage,
+    /// Cluster name override — sent by frontend so remote nodes use the correct cluster
+    #[serde(default)]
+    pub cluster_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -4788,7 +4791,8 @@ pub async fn backup_stream(
     }
 
     let target = body.target.clone();
-    let cluster_name = Some(state.cluster.get_self_cluster_name());
+    let cluster_name = Some(body.cluster_name.clone()
+        .unwrap_or_else(|| state.cluster.get_self_cluster_name()));
 
     // Use tokio mpsc so we can await recv() without blocking the runtime
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(256);

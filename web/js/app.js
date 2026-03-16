@@ -14094,6 +14094,10 @@ async function backupSelected() {
     const storage = await getSelectedStorage();
     const storageLabel = storage.type === 'pbs' ? `PBS (${storage.pbs_server})` : (storage.path || storage.type);
 
+    // Get the cluster name for the current node so remote nodes use the correct one
+    const node = currentNodeId ? allNodes.find(n => n.id === currentNodeId) : null;
+    const cluster_name = node ? (node.cluster_name || node.pve_cluster_name || 'WolfStack') : null;
+
     const backupBtn = document.querySelector('[onclick="backupSelected()"]');
     if (backupBtn) { backupBtn.disabled = true; backupBtn.textContent = '⏳ Backing up...'; }
 
@@ -14105,11 +14109,11 @@ async function backupSelected() {
 
     try {
         // Use streaming endpoint for real-time log
-        const reqBody = allTargets ? { storage } : { target: targets.length === 1 ? targets[0] : null, storage };
+        const reqBody = allTargets ? { storage, cluster_name } : { target: targets.length === 1 ? targets[0] : null, storage, cluster_name };
         // For multiple individual targets, send them one at a time via stream
         if (!allTargets && targets.length > 1) {
             for (let i = 0; i < targets.length; i++) {
-                await runStreamingBackup({ target: targets[i], storage });
+                await runStreamingBackup({ target: targets[i], storage, cluster_name });
             }
         } else {
             await runStreamingBackup(reqBody);
