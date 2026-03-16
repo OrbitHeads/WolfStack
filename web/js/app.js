@@ -12096,11 +12096,16 @@ async function migrateDockerContainer(name) {
         const data = await resp.json();
         const nodes = Array.isArray(data) ? data : (data.nodes || []);
 
+        // Filter to same cluster, exclude self node
+        const currentNode = nodes.find(n => n.is_self) || allNodes.find(n => n.id === currentNodeId);
+        const myCluster = currentNode?.cluster_name || 'WolfStack';
+        const clusterNodes = nodes.filter(n => !n.is_self && n.online && (n.cluster_name || 'WolfStack') === myCluster);
+
         let nodeOpts = '';
-        if (nodes && nodes.length > 0) {
-            nodeOpts = nodes
+        if (clusterNodes.length > 0) {
+            nodeOpts = clusterNodes
                 .sort((a, b) => (a.name || a.address).localeCompare(b.name || b.address))
-                .map(n => `<option value="${n.url || 'http://' + n.address + ':8553'}">${n.name || n.address} (${n.address})</option>`).join('');
+                .map(n => `<option value="${n.url || 'https://' + n.address + ':8553'}">${n.name || n.address} (${n.address})</option>`).join('');
         }
 
         body.innerHTML = `
@@ -12353,7 +12358,10 @@ async function migrateLxcContainer(name) {
             nodes = Array.isArray(data) ? data : (data.nodes || []);
         }
     } catch (e) { }
-    const remoteNodes = nodes.filter(n => !n.is_self && n.online)
+    // Filter to same cluster, exclude self node
+    const currentNode = nodes.find(n => n.is_self) || allNodes.find(n => n.id === currentNodeId);
+    const myCluster = currentNode?.cluster_name || 'WolfStack';
+    const remoteNodes = nodes.filter(n => !n.is_self && n.online && (n.cluster_name || 'WolfStack') === myCluster)
         .sort((a, b) => (a.hostname || a.address).localeCompare(b.hostname || b.address));
 
     const modal = document.createElement('div');
@@ -12623,7 +12631,10 @@ async function migrateVm(name) {
             nodes = Array.isArray(data) ? data : (data.nodes || []);
         }
     } catch (e) { }
-    const remoteNodes = nodes.filter(n => !n.is_self && n.online)
+    // Filter to same cluster, exclude self node
+    const currentNode = nodes.find(n => n.is_self) || allNodes.find(n => n.id === currentNodeId);
+    const myCluster = currentNode?.cluster_name || 'WolfStack';
+    const remoteNodes = nodes.filter(n => !n.is_self && n.online && (n.cluster_name || 'WolfStack') === myCluster)
         .sort((a, b) => (a.hostname || a.address).localeCompare(b.hostname || b.address));
 
     const modal = document.createElement('div');
