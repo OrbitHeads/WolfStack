@@ -261,17 +261,33 @@ async fn main() -> std::io::Result<()> {
         installer::find_tls_certificate(cli.tls_domain.as_deref()).is_some()
     };
 
-    // Initial self-update
+    // Initial self-update — don't block startup on container listing
     {
         let mut mon = monitor;
         let metrics = mon.collect();
         let components = installer::get_all_status();
-        let docker_count = containers::docker_list_all().len() as u32;
-        let lxc_count = containers::lxc_list_all().len() as u32;
-        let vm_count = vms_manager.list_vms().len() as u32;
         let has_docker = containers::docker_status().installed;
         let has_lxc = containers::lxc_status().installed;
         let has_kvm = containers::kvm_installed();
+        // Get container counts with a timeout — don't let a stuck container block startup
+        let (docker_count, lxc_count) = {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let tx2 = tx.clone();
+            std::thread::spawn(move || { let _ = tx.send(('d', containers::docker_list_all().len() as u32)); });
+            std::thread::spawn(move || { let _ = tx2.send(('l', containers::lxc_list_all().len() as u32)); });
+            let mut dc = 0u32;
+            let mut lc = 0u32;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            for _ in 0..2 {
+                match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+                    Ok(('d', n)) => dc = n,
+                    Ok(('l', n)) => lc = n,
+                    _ => break,
+                }
+            }
+            (dc, lc)
+        };
+        let vm_count = vms_manager.list_vms().len() as u32;
         cluster.update_self(metrics, components, docker_count, lxc_count, vm_count, public_ip.clone(), has_docker, has_lxc, has_kvm, tls_enabled);
 
         // Initialize AI agent
