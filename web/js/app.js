@@ -12455,11 +12455,9 @@ async function doMigrateLxc(name) {
 
     // Step definitions
     const steps = [
-        { id: 'stop', label: 'Stopping container', icon: '⏹️' },
         { id: 'export', label: 'Creating archive (vzdump/tar)', icon: '📦' },
         { id: 'upload', label: isExternal ? `Uploading to ${extUrl.replace(/https?:\/\//, '').split('/')[0]}` : 'Transferring to target node', icon: '📤' },
-        { id: 'import', label: 'Importing on target node', icon: '📥' },
-        { id: 'cleanup', label: 'Cleaning up source', icon: '🧹' },
+        { id: 'import', label: 'Importing on target node (stopped)', icon: '📥' },
     ];
 
     // Progress modal with step list
@@ -12554,7 +12552,9 @@ async function doMigrateLxc(name) {
                 body: JSON.stringify({ target_url: extUrl, target_token: extToken }),
             });
         } else {
+            const targetNode = allNodes.find(n => n.id === target);
             const migrateBody = { target_node: target };
+            if (targetNode) { migrateBody.target_address = targetNode.address; migrateBody.target_port = targetNode.port || 8553; }
             if (migrateStorage) migrateBody.storage = migrateStorage;
             resp = await fetch(apiUrl(`/api/containers/lxc/${name}/migrate`), {
                 method: 'POST',
@@ -12724,11 +12724,9 @@ async function doMigrateVm(name) {
     const taskId = taskLogStart(`Migrating VM '${name}' to ${targetLabel}`);
 
     const steps = [
-        { id: 'stop', label: 'Stopping VM', icon: '⏹️' },
         { id: 'export', label: 'Creating disk archive', icon: '💾' },
         { id: 'upload', label: isExternal ? `Uploading to ${extUrl.replace(/https?:\/\//, '').split('/')[0]}` : 'Transferring to target node', icon: '📤' },
-        { id: 'import', label: 'Importing on target node', icon: '📥' },
-        { id: 'cleanup', label: 'Cleaning up source', icon: '🧹' },
+        { id: 'import', label: 'Importing on target node (stopped)', icon: '📥' },
     ];
 
     const modal = document.createElement('div');
@@ -12821,7 +12819,9 @@ async function doMigrateVm(name) {
                 body: JSON.stringify(extBody),
             });
         } else {
+            const targetNode = allNodes.find(n => n.id === target);
             const migrateBody = { target_node: target };
+            if (targetNode) { migrateBody.target_address = targetNode.address; migrateBody.target_port = targetNode.port || 8553; }
             if (migrateStorage) migrateBody.storage = migrateStorage;
             resp = await fetch(apiUrl(`/api/vms/${name}/migrate`), {
                 method: 'POST',

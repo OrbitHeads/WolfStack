@@ -2882,6 +2882,10 @@ pub struct MigrateRequest {
     pub target_node: String,
     pub storage: Option<String>,
     pub new_name: Option<String>,
+    #[serde(default)]
+    pub target_address: Option<String>,
+    #[serde(default)]
+    pub target_port: Option<u16>,
 }
 
 #[derive(Deserialize)]
@@ -3021,7 +3025,7 @@ pub async fn lxc_clone(
 
     // Remote clone: export → transfer → import on target node
     if let Some(ref target_node_id) = body.target_node {
-        return lxc_remote_clone(&state, &name, &body.new_name, target_node_id, body.storage.as_deref(), body.wolfnet_ip.as_deref()).await;
+        return lxc_remote_clone(&state, &name, &body.new_name, target_node_id, body.storage.as_deref(), body.wolfnet_ip.as_deref(), None, None).await;
     }
 
     // Local clone — lxc-copy requires container to be stopped
@@ -3055,11 +3059,49 @@ async fn lxc_remote_clone(
     target_node_id: &str,
     storage: Option<&str>,
     wolfnet_ip: Option<&str>,
+    fallback_address: Option<&str>,
+    fallback_port: Option<u16>,
 ) -> HttpResponse {
-    // 1. Find target node
+    // 1. Find target node — fall back to address/port if node ID not in local cluster state
+    //    (can happen when request is proxied to a remote node with different cluster state)
     let node = match state.cluster.get_node(target_node_id) {
         Some(n) => n,
-        None => return HttpResponse::NotFound().json(serde_json::json!({"error": "Target node not found"})),
+        None => {
+            if let Some(addr) = fallback_address {
+                let port = fallback_port.unwrap_or(8553);
+                tracing::info!("Node '{}' not in cluster state, using fallback address {}:{}", target_node_id, addr, port);
+                crate::agent::Node {
+                    id: target_node_id.to_string(),
+                    address: addr.to_string(),
+                    port,
+                    hostname: addr.to_string(),
+                    is_self: false,
+                    online: true,
+                    node_type: "wolfstack".to_string(),
+                    last_seen: 0,
+                    metrics: None,
+                    components: vec![],
+                    docker_count: 0,
+                    lxc_count: 0,
+                    vm_count: 0,
+                    public_ip: None,
+                    pve_token: None,
+                    pve_fingerprint: None,
+                    pve_node_name: None,
+                    pve_cluster_name: None,
+                    cluster_name: None,
+                    join_verified: false,
+                    has_docker: false,
+                    has_lxc: false,
+                    has_kvm: false,
+                    login_disabled: false,
+                    tls: false,
+                    update_script: None,
+                }
+            } else {
+                return HttpResponse::NotFound().json(serde_json::json!({"error": "Target node not found"}));
+            }
+        }
     };
     if node.is_self {
         // Local clone, not remote
@@ -3231,7 +3273,7 @@ pub async fn lxc_migrate(
     let new_name = body.new_name.as_deref().unwrap_or(&name);
 
     // Clone to target node — source stays running, destination is not started
-    let clone_resp = lxc_remote_clone(&state, &name, new_name, &body.target_node, body.storage.as_deref(), None).await;
+    let clone_resp = lxc_remote_clone(&state, &name, new_name, &body.target_node, body.storage.as_deref(), None, body.target_address.as_deref(), body.target_port).await;
 
     clone_resp
 }

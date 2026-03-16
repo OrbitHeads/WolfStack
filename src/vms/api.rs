@@ -258,6 +258,10 @@ struct VmMigrateRequest {
     target_node: String,
     new_name: Option<String>,
     storage: Option<String>,
+    #[serde(default)]
+    target_address: Option<String>,
+    #[serde(default)]
+    target_port: Option<u16>,
 }
 
 #[derive(Deserialize)]
@@ -281,10 +285,45 @@ async fn vm_migrate(
     let name = path.into_inner();
     let new_name = body.new_name.as_deref().unwrap_or(&name);
 
-    // Find target node
+    // Find target node — fall back to address/port if not in local cluster state
     let node = match state.cluster.get_node(&body.target_node) {
         Some(n) => n,
-        None => return HttpResponse::NotFound().json(serde_json::json!({"error": "Target node not found"})),
+        None => {
+            if let Some(ref addr) = body.target_address {
+                let port = body.target_port.unwrap_or(8553);
+                tracing::info!("VM migrate: node '{}' not in cluster state, using fallback {}:{}", body.target_node, addr, port);
+                crate::agent::Node {
+                    id: body.target_node.clone(),
+                    address: addr.clone(),
+                    port,
+                    hostname: addr.clone(),
+                    is_self: false,
+                    online: true,
+                    node_type: "wolfstack".to_string(),
+                    last_seen: 0,
+                    metrics: None,
+                    components: vec![],
+                    docker_count: 0,
+                    lxc_count: 0,
+                    vm_count: 0,
+                    public_ip: None,
+                    pve_token: None,
+                    pve_fingerprint: None,
+                    pve_node_name: None,
+                    pve_cluster_name: None,
+                    cluster_name: None,
+                    join_verified: false,
+                    has_docker: false,
+                    has_lxc: false,
+                    has_kvm: false,
+                    login_disabled: false,
+                    tls: false,
+                    update_script: None,
+                }
+            } else {
+                return HttpResponse::NotFound().json(serde_json::json!({"error": "Target node not found"}));
+            }
+        }
     };
     if node.is_self {
         return HttpResponse::BadRequest().json(serde_json::json!({"error": "Cannot migrate to the same node"}));
