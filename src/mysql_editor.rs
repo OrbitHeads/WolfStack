@@ -274,7 +274,7 @@ pub async fn list_tables(params: &ConnParams, database: &str) -> Result<Vec<serd
     let rows: Vec<Row> = conn
         .exec(
             "SELECT TABLE_NAME, TABLE_TYPE, TABLE_ROWS, DATA_LENGTH \
-             FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?",
+             FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
             (database,)
         )
         .await
