@@ -7098,7 +7098,7 @@ function loadTaskLog() {
             status: e.status === 'running' ? 'failed' : e.status,
         }));
         if (_taskLogEntries.length > 0) {
-            updateTaskLogToggleBtn();
+            showTaskLog();
             renderTaskLog();
         }
     } catch (_) {}
