@@ -61,10 +61,12 @@ pub fn build_external_urls(target_url: &str, path: &str) -> Vec<String> {
     // First: try exactly what the user specified
     urls.push(format!("{}{}", trimmed, path));
 
-    // Then try WolfStack ports (8553 HTTPS, then HTTP) if not already the user's port
+    // Then try WolfStack ports (8553 HTTPS, 8554 HTTP) if not already the user's port
     if user_port != Some(8553) {
         urls.push(format!("https://{}:8553{}", host, path));
-        urls.push(format!("http://{}:8553{}", host, path));
+    }
+    if user_port != Some(8554) {
+        urls.push(format!("http://{}:8554{}", host, path));
     }
 
     // Then try Proxmox port (8006 HTTPS) if not already the user's port
