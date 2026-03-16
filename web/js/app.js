@@ -13819,13 +13819,15 @@ async function populateStorageDropdown() {
     } catch (e) {
         console.error('Failed to load storage mounts for backup dropdown:', e);
     }
-    // Add PBS option if configured
+    // Add PBS option if configured — make it the default
     try {
         const pbsResp = await fetch(apiUrl('/api/backups/pbs/config'));
         if (pbsResp.ok) {
             const pbs = await pbsResp.json();
             if (pbs.pbs_server) {
-                sel.innerHTML += `<option value="pbs:${escapeHtml(pbs.pbs_server)}">📦 PBS — ${escapeHtml(pbs.pbs_server)}/${escapeHtml(pbs.pbs_datastore)}</option>`;
+                const pbsVal = `pbs:${pbs.pbs_server}`;
+                sel.innerHTML = `<option value="${escapeHtml(pbsVal)}">📦 PBS — ${escapeHtml(pbs.pbs_server)}/${escapeHtml(pbs.pbs_datastore)}</option>` + sel.innerHTML;
+                sel.value = pbsVal;
             }
         }
     } catch (e) { /* PBS not configured, skip */ }
@@ -14052,7 +14054,7 @@ function showBackupProgress(container, items, title) {
         <tr><td colspan="7" style="padding:0; border:none;">
             <div style="padding:20px; background:var(--bg-primary); border-radius:var(--radius-sm); border:1px solid var(--border);">
                 <div style="display:flex; align-items:center; gap:10px; margin-bottom:16px;">
-                    <div class="spinner" style="width:20px; height:20px; border:3px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin 0.8s linear infinite;"></div>
+                    <div id="backup-progress-spinner" style="width:20px; height:20px; border:3px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin 0.8s linear infinite;"></div>
                     <strong id="backup-progress-title">${title}</strong>
                 </div>
                 <div id="backup-progress-items" style="display:grid; gap:6px;">
@@ -14069,6 +14071,11 @@ function showBackupProgress(container, items, title) {
                 </div>
             </div>
         </td></tr>`;
+}
+
+function stopBackupProgressSpinner() {
+    const spinner = document.getElementById('backup-progress-spinner');
+    if (spinner) spinner.style.display = 'none';
 }
 
 function updateBackupItemStatus(index, status, success) {
@@ -14117,22 +14124,30 @@ async function backupSelected() {
             });
             const data = await res.json();
 
+            stopBackupProgressSpinner();
+            const titleEl = document.getElementById('backup-progress-title');
             if (data.error) {
                 targets.forEach((_, i) => updateBackupItemStatus(i, 'Failed', false));
+                if (titleEl) titleEl.textContent = `❌ Backup failed`;
                 showToast(`Backup failed: ${data.error}`, 'error');
             } else {
                 // Mark individual results
                 const entries = data.entries || [];
+                let ok = 0, fail = 0;
                 targets.forEach((t, i) => {
                     const entry = entries[i];
                     if (entry && entry.status === 'completed') {
+                        ok++;
                         updateBackupItemStatus(i, `Done (${formatBytes(entry.size_bytes || 0)})`, true);
                     } else if (entry) {
+                        fail++;
                         updateBackupItemStatus(i, entry.error || 'Failed', false);
                     } else {
+                        ok++;
                         updateBackupItemStatus(i, 'Done', true);
                     }
                 });
+                if (titleEl) titleEl.textContent = fail === 0 ? `✅ All ${ok} backups completed!` : `Done: ${ok} succeeded, ${fail} failed`;
                 showToast(data.message || 'Backup completed', 'success');
             }
         } else {
@@ -14168,12 +14183,14 @@ async function backupSelected() {
                     updateBackupItemStatus(i, e.message, false);
                 }
             }
+            stopBackupProgressSpinner();
             const titleEl = document.getElementById('backup-progress-title');
             if (titleEl) titleEl.textContent = fail === 0 ? `✅ All ${ok} backups completed!` : `Done: ${ok} succeeded, ${fail} failed`;
             if (fail === 0) showToast(`All ${ok} backups completed`, 'success');
             else showToast(`${ok} succeeded, ${fail} failed`, 'error');
         }
     } catch (e) {
+        stopBackupProgressSpinner();
         showToast(`Backup error: ${e.message}`, 'error');
     }
 
