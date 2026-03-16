@@ -1072,54 +1072,62 @@ pub fn docker_connect_wolfnet(container: &str, ip: &str) -> Result<String, Strin
 
 /// Ensure lxcbr0 bridge exists for default LXC container networking (with DHCP/NAT)
 pub fn ensure_lxc_bridge() {
-    // 1. Try standard systemd service first
-    let _ = Command::new("systemctl").args(["enable", "--now", "lxc-net"]).output();
-    
-    // Wait briefly for service to start
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // 1. Try standard systemd service first — wait for it to fully start
+    let lxc_net_ok = Command::new("systemctl").args(["enable", "--now", "lxc-net"]).output()
+        .map(|o| o.status.success()).unwrap_or(false);
 
-    // Check if lxcbr0 exists and has an IP
-    let bridge_ok = if let Ok(output) = Command::new("ip").args(["addr", "show", "lxcbr0"]).output() {
-        if output.status.success() { 
-            // Check if dnsmasq is running on it
-            let ps = Command::new("pgrep").args(["-f", "dnsmasq.*lxcbr0"]).output();
-            ps.map(|p| p.status.success()).unwrap_or(false)
-        } else { false }
-    } else { false };
+    if lxc_net_ok {
+        // Wait for lxc-net to fully bring up the bridge and dnsmasq
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let bridge_up = Command::new("ip").args(["addr", "show", "lxcbr0"]).output()
+                .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("10.0.3.1"))
+                .unwrap_or(false);
+            if bridge_up { break; }
+        }
+    }
 
-    if !bridge_ok {
+    // Check if lxcbr0 exists with an IP
+    let bridge_exists = Command::new("ip").args(["addr", "show", "lxcbr0"]).output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("10.0.3.1"))
+        .unwrap_or(false);
 
-
-        // Create bridge (idempotent)
+    if !bridge_exists {
+        // Create bridge manually (lxc-net not available or failed)
         let _ = Command::new("ip").args(["link", "add", "lxcbr0", "type", "bridge"]).output();
         let _ = Command::new("ip").args(["addr", "add", "10.0.3.1/24", "dev", "lxcbr0"]).output();
         let _ = Command::new("ip").args(["link", "set", "lxcbr0", "up"]).output();
+    }
 
-        // Start dnsmasq for DHCP — but only if nothing is already listening on 10.0.3.1:53
-        let port_in_use = Command::new("ss").args(["-lnu", "sport", "=", "53"])
-            .output().ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains("10.0.3.1"))
-            .unwrap_or(false);
+    // Only start dnsmasq if nothing is already listening on 10.0.3.1
+    // Check both port 53 (DNS) and for any dnsmasq process on lxcbr0
+    let dns_in_use = Command::new("ss").args(["-lnup", "sport", "=", "53"])
+        .output().ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("10.0.3.1"))
+        .unwrap_or(false);
+    let dnsmasq_running = Command::new("pgrep").args(["-f", "dnsmasq.*lxcbr0"])
+        .output().map(|o| o.status.success()).unwrap_or(false)
+        || Command::new("pgrep").args(["-f", "dnsmasq.*10.0.3.1"])
+        .output().map(|o| o.status.success()).unwrap_or(false);
 
-        if port_in_use {
-            tracing::info!("dnsmasq: 10.0.3.1:53 already in use — skipping (another dnsmasq/lxc-net is managing it)");
-        } else {
-            let _ = std::fs::create_dir_all("/run/lxc");
-            let _ = Command::new("dnsmasq")
-                .args([
-                    "--strict-order",
-                    "--bind-interfaces",
-                    "--pid-file=/run/lxc/dnsmasq.pid",
-                    "--listen-address", "10.0.3.1",
-                    "--dhcp-range", "10.0.3.2,10.0.3.254",
-                    "--dhcp-lease-max=253",
-                    "--dhcp-no-override",
-                    "--except-interface=lo",
-                    "--interface=lxcbr0",
-                    "--conf-file=" // avoid reading /etc/dnsmasq.conf
-                ])
-                .spawn(); // Run in background
-        }
+    if !dns_in_use && !dnsmasq_running {
+        let _ = std::fs::create_dir_all("/run/lxc");
+        let _ = Command::new("dnsmasq")
+            .args([
+                "--strict-order",
+                "--bind-interfaces",
+                "--pid-file=/run/lxc/dnsmasq.pid",
+                "--listen-address", "10.0.3.1",
+                "--dhcp-range", "10.0.3.2,10.0.3.254",
+                "--dhcp-lease-max=253",
+                "--dhcp-no-override",
+                "--except-interface=lo",
+                "--interface=lxcbr0",
+                "--conf-file=" // avoid reading /etc/dnsmasq.conf
+            ])
+            .spawn();
+    } else {
+        tracing::info!("dnsmasq: already running on lxcbr0/10.0.3.1 — skipping");
     }
 
     // ALWAYS force the bridge UP (it can exist but be DOWN if no interfaces are attached yet)
