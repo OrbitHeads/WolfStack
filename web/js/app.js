@@ -23182,6 +23182,7 @@ function renderK8sDeployments(deps) {
             <td style="text-align:right; white-space:nowrap;">
                 <button class="btn btn-sm btn-secondary" onclick="showK8sDeploymentDetail('${escapeHtml(d.name)}', '${escapeHtml(d.namespace || 'default')}')" style="font-size:11px;">Manage</button>
                 <button class="btn btn-sm btn-secondary" onclick="showK8sScaleModal('${escapeHtml(d.name)}', '${escapeHtml(d.namespace || 'default')}', ${d.desired_replicas || 1})" style="font-size:11px;">Scale</button>
+                <button class="btn btn-sm btn-secondary" onclick="openK8sYamlEditor('deployment', '${escapeHtml(d.name)}', '${escapeHtml(d.namespace || 'default')}')" style="font-size:11px;">YAML</button>
                 <button class="btn btn-sm btn-danger" onclick="k8sDeleteDeploymentFull('${escapeHtml(d.name)}', '${escapeHtml(d.namespace || 'default')}')" style="font-size:11px;">Remove</button>
             </td>
         </tr>`;
@@ -23209,6 +23210,7 @@ function renderK8sPods(pods) {
             <td style="text-align:right; white-space:nowrap;">
                 ${isRunning ? `<button class="btn btn-sm btn-secondary" onclick="openK8sPodConsole('${escapeHtml(p.name)}', '${escapeHtml(ns)}')" style="font-size:11px;" title="Terminal">Console</button>` : ''}
                 <button class="btn btn-sm btn-secondary" onclick="showK8sPodDetail('${escapeHtml(p.name)}', '${escapeHtml(ns)}')" style="font-size:11px;">Manage</button>
+                <button class="btn btn-sm btn-secondary" onclick="openK8sYamlEditor('pod', '${escapeHtml(p.name)}', '${escapeHtml(ns)}')" style="font-size:11px;">YAML</button>
                 <button class="btn btn-sm btn-danger" onclick="k8sDeletePod('${escapeHtml(p.name)}', '${escapeHtml(ns)}')" style="font-size:11px;">Delete</button>
             </td>
         </tr>`;
@@ -23229,6 +23231,7 @@ function renderK8sServices(svcs) {
             <td style="font-size:11px;">${escapeHtml(s.ports || '')}</td>
             <td>${escapeHtml(s.age || '')}</td>
             <td style="text-align:right;">
+                <button class="btn btn-sm btn-secondary" onclick="openK8sYamlEditor('service', '${escapeHtml(s.name)}', '${escapeHtml(s.namespace || 'default')}')" style="font-size:11px;">YAML</button>
                 <button class="btn btn-sm btn-danger" onclick="k8sDeleteService('${escapeHtml(s.name)}', '${escapeHtml(s.namespace || 'default')}')" style="font-size:11px;">Delete</button>
             </td>
         </tr>`;
@@ -23420,7 +23423,16 @@ let k8sPodDetailTab = 'overview';
 
 function openK8sPodConsole(podName, namespace, container) {
     const target = `${k8sCurrentCluster}/${podName}/${namespace}${container ? '/' + container : ''}`;
-    openConsole('k8s', target);
+    // K8s clusters may be on a different node — use the cluster's owner_node_id, not currentNodeId
+    const cluster = k8sClusters.find(c => c.id === k8sCurrentCluster);
+    let url = '/console.html?type=k8s&name=' + encodeURIComponent(target);
+    if (cluster && cluster.owner_node_id) {
+        const node = allNodes.find(n => n.id === cluster.owner_node_id);
+        if (node && !node.is_self) {
+            url += '&node_id=' + encodeURIComponent(cluster.owner_node_id);
+        }
+    }
+    window.open(url, 'console_' + target, 'width=960,height=600,menubar=no,toolbar=no');
 }
 
 async function showK8sPodDetail(name, namespace) {
@@ -24018,6 +24030,89 @@ async function k8sApplyYaml() {
         showToast(data.message || 'Applied successfully', 'success');
         setTimeout(() => switchK8sTab(k8sCurrentView), 1000);
     } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+}
+
+// ─── YAML Editor ───
+
+async function openK8sYamlEditor(kind, name, namespace) {
+    // Fetch current YAML from the cluster
+    const url = `/api/kubernetes/clusters/${encodeURIComponent(k8sCurrentCluster)}/resource-yaml?kind=${encodeURIComponent(kind)}&name=${encodeURIComponent(name)}&namespace=${encodeURIComponent(namespace)}`;
+    showToast('Loading YAML...', 'info', 2000);
+
+    try {
+        const resp = await fetch(url);
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || 'Failed to fetch YAML');
+
+        const yaml = data.yaml || '';
+
+        // Create modal
+        document.querySelectorAll('.modal-overlay').forEach(m => m.remove());
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.style.cssText = 'display:flex; position:fixed; top:0; left:0; right:0; bottom:0; z-index:2000; background:rgba(0,0,0,0.6); align-items:center; justify-content:center;';
+        overlay.innerHTML = `
+            <div class="modal" style="max-width:900px; width:95%; max-height:90vh; display:flex; flex-direction:column;">
+                <div class="modal-header" style="flex-shrink:0;">
+                    <h3>Edit ${kind.charAt(0).toUpperCase() + kind.slice(1)}: ${name}</h3>
+                    <button class="modal-close" onclick="closeModal()">&times;</button>
+                </div>
+                <div class="modal-body" style="flex:1; overflow:hidden; padding:0;">
+                    <textarea id="k8s-yaml-editor" style="width:100%; height:100%; min-height:400px; font-family:'JetBrains Mono',Consolas,monospace; font-size:12px; line-height:1.5; padding:12px; border:none; background:#0d1117; color:#c9d1d9; resize:none; outline:none; tab-size:2;">${escapeHtml(yaml)}</textarea>
+                </div>
+                <div class="modal-footer" style="flex-shrink:0; display:flex; justify-content:space-between; align-items:center;">
+                    <span style="font-size:11px; color:var(--text-muted);">${kind}/${name} in ${namespace}</span>
+                    <div style="display:flex; gap:8px;">
+                        <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                        <button class="btn btn-primary" id="k8s-yaml-apply-btn" onclick="applyK8sYamlEdit()" style="background:#326ce5; border-color:#326ce5;">Apply Changes</button>
+                    </div>
+                </div>
+            </div>`;
+        document.body.appendChild(overlay);
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) closeModal(); });
+
+        // Allow Tab key in textarea
+        const editor = document.getElementById('k8s-yaml-editor');
+        if (editor) {
+            editor.addEventListener('keydown', (e) => {
+                if (e.key === 'Tab') {
+                    e.preventDefault();
+                    const start = editor.selectionStart;
+                    const end = editor.selectionEnd;
+                    editor.value = editor.value.substring(0, start) + '  ' + editor.value.substring(end);
+                    editor.selectionStart = editor.selectionEnd = start + 2;
+                }
+            });
+        }
+    } catch (e) {
+        showToast('Failed to load YAML: ' + e.message, 'error');
+    }
+}
+
+async function applyK8sYamlEdit() {
+    const yaml = document.getElementById('k8s-yaml-editor')?.value?.trim();
+    if (!yaml) return;
+    const btn = document.getElementById('k8s-yaml-apply-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Applying...'; }
+
+    try {
+        const resp = await fetch(`/api/kubernetes/clusters/${encodeURIComponent(k8sCurrentCluster)}/apply`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ yaml }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || 'Apply failed');
+
+        showToast(data.message || 'Applied successfully', 'success');
+        taskLog('K8s YAML applied');
+        closeModal();
+        setTimeout(() => switchK8sTab(k8sCurrentView), 1000);
+    } catch (e) {
+        showToast('Apply failed: ' + e.message, 'error');
+        taskLog('K8s YAML apply failed', 'failed');
+        if (btn) { btn.disabled = false; btn.textContent = 'Apply Changes'; }
+    }
 }
 
 // ─── Provision Cluster Modal ───

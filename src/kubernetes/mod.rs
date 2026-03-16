@@ -3082,6 +3082,16 @@ pub fn update_cluster_settings(id: &str, wolfnet_server: Option<&str>, wolfnet_n
     Ok(updated)
 }
 
+/// Get the YAML definition of a Kubernetes resource
+pub fn get_resource_yaml(kubeconfig: &str, kind: &str, name: &str, namespace: &str) -> Result<String, String> {
+    let mut args = vec!["get", kind, name, "-o", "yaml"];
+    if !namespace.is_empty() {
+        args.push("-n");
+        args.push(namespace);
+    }
+    kubectl(kubeconfig, &args)
+}
+
 pub fn apply_yaml(kubeconfig: &str, yaml_content: &str) -> Result<String, String> {
     // Write YAML to a temporary file
     let tmp_path = format!(

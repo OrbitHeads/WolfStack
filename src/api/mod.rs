@@ -9037,6 +9037,29 @@ pub struct K8sApplyRequest {
     pub namespace: Option<String>,
 }
 
+/// GET /api/kubernetes/clusters/{id}/resource-yaml?kind=deployment&name=myapp&namespace=default
+pub async fn k8s_resource_yaml(
+    req: HttpRequest, state: web::Data<AppState>,
+    path: web::Path<String>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let cluster = match crate::kubernetes::get_cluster(&path.into_inner()) {
+        Some(c) => c,
+        None => return HttpResponse::NotFound().json(serde_json::json!({ "error": "Cluster not found" })),
+    };
+    let kind = query.get("kind").map(|s| s.as_str()).unwrap_or("pod");
+    let name = match query.get("name") {
+        Some(n) => n.as_str(),
+        None => return HttpResponse::BadRequest().json(serde_json::json!({ "error": "name parameter required" })),
+    };
+    let namespace = query.get("namespace").map(|s| s.as_str()).unwrap_or("");
+    match crate::kubernetes::get_resource_yaml(&cluster.kubeconfig_path, kind, name, namespace) {
+        Ok(yaml) => HttpResponse::Ok().json(serde_json::json!({ "yaml": yaml })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
 pub async fn k8s_apply(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<K8sApplyRequest>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let cluster = match crate::kubernetes::get_cluster(&path.into_inner()) {
@@ -12802,6 +12825,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/kubernetes/clusters/{id}/services/{name}", web::delete().to(k8s_delete_service))
         .route("/api/kubernetes/clusters/{id}/nodes", web::get().to(k8s_nodes))
         .route("/api/kubernetes/clusters/{id}/logs/{pod}", web::get().to(k8s_pod_logs))
+        .route("/api/kubernetes/clusters/{id}/resource-yaml", web::get().to(k8s_resource_yaml))
         .route("/api/kubernetes/clusters/{id}/apply", web::post().to(k8s_apply))
         .route("/api/kubernetes/clusters/{id}/deploy-app", web::post().to(k8s_deploy_app))
         .route("/api/kubernetes/clusters/{id}/wolfnet", web::get().to(k8s_wolfnet_status))
