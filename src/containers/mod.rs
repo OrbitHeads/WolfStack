@@ -5315,33 +5315,81 @@ pub fn lxc_import(archive_path: &str, new_name: &str, storage: Option<&str>) -> 
         let new_vmid = pct_next_vmid()?;
         let storage_id = storage.unwrap_or("local-lvm");
 
-        let mut args = vec![
-            "restore".to_string(),
-            new_vmid.to_string(),
-            archive_path.to_string(),
-            "--storage".to_string(), storage_id.to_string(),
-            "--hostname".to_string(), new_name.to_string(),
-        ];
+        // Check if this is a vzdump archive or a plain rootfs tar from a standalone node
+        let is_vzdump = archive_path.contains("vzdump-") ||
+            archive_path.ends_with(".tar.zst") ||
+            archive_path.ends_with(".vma.zst");
 
-        // For vzdump archives, pct restore handles them natively
-        // For tar.gz archives from standalone nodes, we need --rootfs
-        if archive_path.ends_with(".tar.gz") {
-            args.push("--unprivileged".to_string());
-            args.push("1".to_string());
-        }
+        if is_vzdump {
+            // vzdump archive — pct restore handles it natively
+            let output = Command::new("pct")
+                .args(["restore", &new_vmid.to_string(), archive_path,
+                       "--storage", storage_id, "--hostname", new_name])
+                .output()
+                .map_err(|e| format!("pct restore failed: {}", e))?;
 
-    
-        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let output = Command::new("pct").args(&args_ref).output()
-            .map_err(|e| format!("pct restore failed: {}", e))?;
-
-        if output.status.success() {
-
-            Ok(format!("Container '{}' imported (VMID {}, storage: {})", new_name, new_vmid, storage_id))
+            if output.status.success() {
+                Ok(format!("Container '{}' imported (VMID {}, storage: {})", new_name, new_vmid, storage_id))
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                Err(format!("Import failed: {} {}", stderr.trim(), stdout.trim()))
+            }
         } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            Err(format!("Import failed: {} {}", stderr.trim(), stdout.trim()))
+            // Plain rootfs tar.gz from standalone WolfStack — convert to vzdump format
+            // vzdump expects: archive containing ./etc/vzdump/pct.conf and rootfs at ./
+            let convert_dir = format!("/tmp/wolfstack-vzdump-convert-{}", new_vmid);
+            let _ = std::fs::create_dir_all(&convert_dir);
+
+            // Extract standalone archive to temp dir
+            let output = Command::new("tar")
+                .args(["xzf", archive_path, "-C", &convert_dir])
+                .output()
+                .map_err(|e| format!("Extract failed: {}", e))?;
+            if !output.status.success() {
+                let _ = std::fs::remove_dir_all(&convert_dir);
+                return Err(format!("Extract failed: {}", String::from_utf8_lossy(&output.stderr)));
+            }
+
+            // Create minimal vzdump config
+            let conf_dir = format!("{}/etc/vzdump", convert_dir);
+            let _ = std::fs::create_dir_all(&conf_dir);
+            let conf_content = format!(
+                "arch: amd64\nhostname: {}\nmemory: 512\nswap: 512\nnet0: name=eth0,bridge=vmbr0,ip=dhcp\nrootfs: {}:{}\nunprivileged: 1\n",
+                new_name, storage_id, "4"
+            );
+            std::fs::write(format!("{}/pct.conf", conf_dir), &conf_content)
+                .map_err(|e| format!("Failed to write config: {}", e))?;
+
+            // Re-pack as vzdump-compatible archive
+            let vzdump_path = format!("/tmp/vzdump-lxc-{}-converted.tar.gz", new_vmid);
+            let output = Command::new("tar")
+                .args(["czf", &vzdump_path, "-C", &convert_dir, "."])
+                .output()
+                .map_err(|e| format!("Repack failed: {}", e))?;
+            let _ = std::fs::remove_dir_all(&convert_dir);
+
+            if !output.status.success() {
+                return Err(format!("Repack failed: {}", String::from_utf8_lossy(&output.stderr)));
+            }
+
+            // Now pct restore the vzdump-compatible archive
+            let output = Command::new("pct")
+                .args(["restore", &new_vmid.to_string(), &vzdump_path,
+                       "--storage", storage_id, "--hostname", new_name,
+                       "--unprivileged", "1"])
+                .output()
+                .map_err(|e| format!("pct restore failed: {}", e))?;
+
+            let _ = std::fs::remove_file(&vzdump_path);
+
+            if output.status.success() {
+                Ok(format!("Container '{}' imported (VMID {}, storage: {})", new_name, new_vmid, storage_id))
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                Err(format!("Import failed: {} {}", stderr.trim(), stdout.trim()))
+            }
         }
     } else {
         // Standalone: create empty container + extract archive (always to default path)
@@ -5353,13 +5401,28 @@ pub fn lxc_import(archive_path: &str, new_name: &str, storage: Option<&str>) -> 
         std::fs::create_dir_all(&container_dir)
             .map_err(|e| format!("Failed to create container dir: {}", e))?;
 
+        // Detect archive format and use appropriate decompressor
+        let tar_args: Vec<&str> = if archive_path.ends_with(".tar.zst") || archive_path.ends_with(".zst") {
+            vec!["--zstd", "-xf", archive_path, "-C", &container_dir]
+        } else {
+            vec!["xzf", archive_path, "-C", &container_dir]
+        };
+
         let output = Command::new("tar")
-            .args(["xzf", archive_path, "-C", &container_dir])
+            .args(&tar_args)
             .output()
             .map_err(|e| format!("tar extract failed: {}", e))?;
 
         if output.status.success() {
-
+            // If this was a vzdump archive, the rootfs is nested — check for it
+            let vzdump_rootfs = format!("{}/rootfs", container_dir);
+            if std::path::Path::new(&vzdump_rootfs).exists() {
+                // Proxmox vzdump archive extracted on standalone — move rootfs contents up
+                let output = Command::new("bash")
+                    .args(["-c", &format!("mv {}/rootfs/* {}/rootfs/.* {}/ 2>/dev/null; rmdir {}/rootfs 2>/dev/null; rm -rf {}/etc/vzdump 2>/dev/null; true", container_dir, container_dir, container_dir, container_dir, container_dir)])
+                    .output();
+                let _ = output; // best-effort
+            }
             Ok(format!("Container '{}' imported from archive", new_name))
         } else {
             // Cleanup on failure
