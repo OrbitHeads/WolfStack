@@ -1095,22 +1095,31 @@ pub fn ensure_lxc_bridge() {
         let _ = Command::new("ip").args(["addr", "add", "10.0.3.1/24", "dev", "lxcbr0"]).output();
         let _ = Command::new("ip").args(["link", "set", "lxcbr0", "up"]).output();
 
-        // Start dnsmasq for DHCP
-        let _ = std::fs::create_dir_all("/run/lxc");
-        let _ = Command::new("dnsmasq")
-            .args([
-                "--strict-order",
-                "--bind-interfaces",
-                "--pid-file=/run/lxc/dnsmasq.pid",
-                "--listen-address", "10.0.3.1",
-                "--dhcp-range", "10.0.3.2,10.0.3.254",
-                "--dhcp-lease-max=253",
-                "--dhcp-no-override",
-                "--except-interface=lo",
-                "--interface=lxcbr0",
-                "--conf-file=" // avoid reading /etc/dnsmasq.conf
-            ])
-            .spawn(); // Run in background
+        // Start dnsmasq for DHCP — but only if nothing is already listening on 10.0.3.1:53
+        let port_in_use = Command::new("ss").args(["-lnu", "sport", "=", "53"])
+            .output().ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("10.0.3.1"))
+            .unwrap_or(false);
+
+        if port_in_use {
+            tracing::info!("dnsmasq: 10.0.3.1:53 already in use — skipping (another dnsmasq/lxc-net is managing it)");
+        } else {
+            let _ = std::fs::create_dir_all("/run/lxc");
+            let _ = Command::new("dnsmasq")
+                .args([
+                    "--strict-order",
+                    "--bind-interfaces",
+                    "--pid-file=/run/lxc/dnsmasq.pid",
+                    "--listen-address", "10.0.3.1",
+                    "--dhcp-range", "10.0.3.2,10.0.3.254",
+                    "--dhcp-lease-max=253",
+                    "--dhcp-no-override",
+                    "--except-interface=lo",
+                    "--interface=lxcbr0",
+                    "--conf-file=" // avoid reading /etc/dnsmasq.conf
+                ])
+                .spawn(); // Run in background
+        }
     }
 
     // ALWAYS force the bridge UP (it can exist but be DOWN if no interfaces are attached yet)
