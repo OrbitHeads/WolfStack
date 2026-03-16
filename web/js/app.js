@@ -7124,6 +7124,7 @@ function showTaskLog() {
     const footer = document.getElementById('task-log-footer');
     if (footer) { footer.style.display = 'flex'; _taskLogVisible = true; }
     updateTaskLogToggleBtn();
+    updateContentPadding();
     repositionAiBubble();
 }
 
@@ -7131,6 +7132,7 @@ function hideTaskLog() {
     const footer = document.getElementById('task-log-footer');
     if (footer) { footer.style.display = 'none'; _taskLogVisible = false; }
     updateTaskLogToggleBtn();
+    updateContentPadding();
     repositionAiBubble();
 }
 
@@ -7154,6 +7156,14 @@ function updateTaskLogToggleBtn() {
         } else {
             badge.style.display = 'none';
         }
+    }
+}
+
+function updateContentPadding() {
+    const main = document.querySelector('.main-content');
+    const footer = document.getElementById('task-log-footer');
+    if (main) {
+        main.style.paddingBottom = (_taskLogVisible && footer) ? footer.offsetHeight + 'px' : '';
     }
 }
 
@@ -7183,6 +7193,7 @@ function startTaskLogResize(e) {
         const clientY = ev.touches ? ev.touches[0].clientY : ev.clientY;
         const newHeight = Math.max(100, Math.min(window.innerHeight - 60, window.innerHeight - clientY));
         footer.style.height = newHeight + 'px';
+        updateContentPadding();
         repositionAiBubble();
     };
     const onEnd = () => {
@@ -7191,8 +7202,8 @@ function startTaskLogResize(e) {
         document.removeEventListener('mouseup', onEnd);
         document.removeEventListener('touchmove', onMove);
         document.removeEventListener('touchend', onEnd);
-        // Save height
         try { localStorage.setItem('wolfstack_task_log_height', footer.style.height); } catch(_) {}
+        updateContentPadding();
         repositionAiBubble();
     };
     document.addEventListener('mousemove', onMove);
@@ -7227,6 +7238,7 @@ function toggleTaskLogBody() {
             footer.style.height = 'auto';
         }
     }
+    updateContentPadding();
     repositionAiBubble();
 }
 
@@ -16215,11 +16227,13 @@ async function mysqlConnect() {
             // Load databases
             await mysqlLoadDatabases();
             showToast('Connected to MySQL ' + data.version, 'success');
+            taskLog('MySQL connected: ' + (host || 'localhost') + (port && port !== '3306' ? ':' + port : ''));
         } else {
             badge.textContent = 'Connection failed';
             badge.style.background = 'rgba(231,76,60,0.15)';
             badge.style.color = '#e74c3c';
             showToast(data.error || 'Connection failed — no details returned by server', 'error');
+            taskLog('MySQL connect failed: ' + (host || 'localhost'), 'failed');
         }
     } catch (e) {
         clearTimeout(timeoutId);
