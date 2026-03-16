@@ -414,7 +414,10 @@ fn backup_lxc_proxmox(vmid: &str, staging: &Path, timestamp: &str) -> Result<(Pa
         .output()
         .map_err(|e| format!("vzdump failed to start: {}", e))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Combine stdout+stderr — vzdump may log the archive path to either
+    let all_output = format!("{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr));
 
     if !output.status.success() {
         // Snapshot mode may not be supported (e.g. directory storage) — retry with stop mode
@@ -428,16 +431,18 @@ fn backup_lxc_proxmox(vmid: &str, staging: &Path, timestamp: &str) -> Result<(Pa
             .output()
             .map_err(|e| format!("vzdump (stop mode) failed to start: {}", e))?;
 
-        let stdout2 = String::from_utf8_lossy(&output2.stdout);
         if !output2.status.success() {
             let stderr2 = String::from_utf8_lossy(&output2.stderr);
             return Err(format!("vzdump failed: {}", stderr2.trim()));
         }
 
-        return find_vzdump_result(&stdout2, staging, vmid, timestamp);
+        let all_output2 = format!("{}{}",
+            String::from_utf8_lossy(&output2.stdout),
+            String::from_utf8_lossy(&output2.stderr));
+        return find_vzdump_result(&all_output2, staging, vmid, timestamp);
     }
 
-    find_vzdump_result(&stdout, staging, vmid, timestamp)
+    find_vzdump_result(&all_output, staging, vmid, timestamp)
 }
 
 /// Locate the vzdump archive and return its path + size
@@ -1454,35 +1459,48 @@ fn backup_lxc_proxmox_with_log(
             .spawn()
             .map_err(|e| format!("vzdump failed to start: {}", e))?;
 
-        // Read stdout line by line
+        // Read stdout and stderr in parallel threads to avoid pipe deadlock
+        // (vzdump writes to both — if one pipe buffer fills while we block on
+        // the other, the process hangs)
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        let mut all_stdout = String::new();
 
-        if let Some(stdout) = stdout {
-            use std::io::BufRead;
-            let reader = std::io::BufReader::new(stdout);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    let _ = log.send(format!("  {}", line));
-                    all_stdout.push_str(&line);
-                    all_stdout.push('\n');
+        let log_clone = log.clone();
+        let stdout_handle = std::thread::spawn(move || {
+            let mut all = String::new();
+            if let Some(stdout) = stdout {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stdout).lines().flatten() {
+                    let _ = log_clone.send(format!("  {}", line));
+                    all.push_str(&line);
+                    all.push('\n');
                 }
             }
-        }
-        if let Some(stderr) = stderr {
-            use std::io::BufRead;
-            let reader = std::io::BufReader::new(stderr);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    let _ = log.send(format!("  {}", line));
+            all
+        });
+
+        let log_clone2 = log.clone();
+        let stderr_handle = std::thread::spawn(move || {
+            let mut all = String::new();
+            if let Some(stderr) = stderr {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stderr).lines().flatten() {
+                    let _ = log_clone2.send(format!("  {}", line));
+                    all.push_str(&line);
+                    all.push('\n');
                 }
             }
-        }
+            all
+        });
+
+        let all_stdout = stdout_handle.join().unwrap_or_default();
+        let all_stderr = stderr_handle.join().unwrap_or_default();
+        // Combine stdout+stderr — vzdump may log the archive path to either
+        let all_output = format!("{}{}", all_stdout, all_stderr);
 
         let status = child.wait().map_err(|e| format!("vzdump wait failed: {}", e))?;
         if status.success() {
-            return find_vzdump_result(&all_stdout, &staging, vmid, &timestamp);
+            return find_vzdump_result(&all_output, &staging, vmid, &timestamp);
         }
 
         if *mode == "snapshot" {
