@@ -353,15 +353,20 @@ pub fn backup_lxc(name: &str) -> Result<(PathBuf, u64), String> {
 
     let staging = ensure_staging_dir()?;
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
+
+    // Proxmox: use vzdump which properly handles ZFS/LVM/Ceph storage backends
+    if crate::containers::is_proxmox() {
+        return backup_lxc_proxmox(name, &staging, &timestamp.to_string());
+    }
+
+    // Native LXC: tar the container directory (rootfs + config)
     let filename = format!("lxc-{}-{}.tar.gz", name, timestamp);
     let tar_path = staging.join(&filename);
 
     // Check if container is running — stop it for consistent backup
     let was_running = is_lxc_running(name);
     if was_running {
-
         let _ = Command::new("lxc-stop").args(["-n", name]).output();
-        // Wait briefly for clean stop
         std::thread::sleep(std::time::Duration::from_secs(3));
     }
 
@@ -375,7 +380,7 @@ pub fn backup_lxc(name: &str) -> Result<(PathBuf, u64), String> {
         return Err(format!("LXC container path not found: {}", lxc_path));
     }
 
-    // Create tar.gz of the entire container directory
+    // Create tar.gz of the entire container directory (rootfs + config)
     let output = Command::new("tar")
         .args(["czf", &tar_path.to_string_lossy(), "-C", &lxc_base, name])
         .output()
@@ -383,7 +388,6 @@ pub fn backup_lxc(name: &str) -> Result<(PathBuf, u64), String> {
 
     // Restart if it was running
     if was_running {
-
         let _ = Command::new("lxc-start").args(["-n", name]).output();
     }
 
@@ -392,8 +396,91 @@ pub fn backup_lxc(name: &str) -> Result<(PathBuf, u64), String> {
     }
 
     let size = fs::metadata(&tar_path).map(|m| m.len()).unwrap_or(0);
-
     Ok((tar_path, size))
+}
+
+/// Proxmox LXC backup using vzdump — handles ZFS, LVM, Ceph, and directory storage
+fn backup_lxc_proxmox(vmid: &str, staging: &Path, timestamp: &str) -> Result<(PathBuf, u64), String> {
+    // vzdump creates a full container backup including rootfs on any storage backend
+    // --mode snapshot uses LVM/ZFS snapshots for live backup when available,
+    // falls back to suspend mode, then stop mode
+    let output = Command::new("vzdump")
+        .args([
+            vmid,
+            "--dumpdir", &staging.to_string_lossy(),
+            "--mode", "snapshot",
+            "--compress", "zstd",
+        ])
+        .output()
+        .map_err(|e| format!("vzdump failed to start: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    if !output.status.success() {
+        // Snapshot mode may not be supported (e.g. directory storage) — retry with stop mode
+        let output2 = Command::new("vzdump")
+            .args([
+                vmid,
+                "--dumpdir", &staging.to_string_lossy(),
+                "--mode", "stop",
+                "--compress", "zstd",
+            ])
+            .output()
+            .map_err(|e| format!("vzdump (stop mode) failed to start: {}", e))?;
+
+        let stdout2 = String::from_utf8_lossy(&output2.stdout);
+        if !output2.status.success() {
+            let stderr2 = String::from_utf8_lossy(&output2.stderr);
+            return Err(format!("vzdump failed: {}", stderr2.trim()));
+        }
+
+        return find_vzdump_result(&stdout2, staging, vmid, timestamp);
+    }
+
+    find_vzdump_result(&stdout, staging, vmid, timestamp)
+}
+
+/// Locate the vzdump archive and return its path + size
+fn find_vzdump_result(stdout: &str, staging: &Path, vmid: &str, _timestamp: &str) -> Result<(PathBuf, u64), String> {
+    // Try to find the archive from vzdump output
+    for line in stdout.lines() {
+        if line.contains("creating") && line.contains("vzdump") {
+            if let Some(start) = line.find('\'') {
+                if let Some(end) = line.rfind('\'') {
+                    if start < end {
+                        let path = PathBuf::from(&line[start+1..end]);
+                        if path.exists() {
+                            let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                            return Ok((path, size));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: search staging dir for the newest vzdump file for this VMID
+    if let Ok(entries) = fs::read_dir(staging) {
+        let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(&format!("vzdump-lxc-{}-", vmid)) {
+                if let Ok(meta) = entry.metadata() {
+                    if let Ok(modified) = meta.modified() {
+                        if best.as_ref().map(|(_, t)| modified > *t).unwrap_or(true) {
+                            best = Some((entry.path(), modified));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((path, _)) = best {
+            let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            return Ok((path, size));
+        }
+    }
+
+    Err(format!("vzdump completed but could not find archive for VMID {}", vmid))
 }
 
 /// Check if an LXC container is running
@@ -658,7 +745,16 @@ fn backup_comments(target: &BackupTarget) -> String {
             }
         }
         BackupTargetType::Lxc => {
-            format!("LXC container: {} (rootfs + config)", target.name)
+            if crate::containers::is_proxmox() {
+                let hostname = target.hostname.as_deref().unwrap_or("");
+                if hostname.is_empty() || hostname == target.name {
+                    format!("LXC container: {} (vzdump full backup)", target.name)
+                } else {
+                    format!("LXC container: {} ({}) (vzdump full backup)", target.name, hostname)
+                }
+            } else {
+                format!("LXC container: {} (rootfs + config)", target.name)
+            }
         }
         BackupTargetType::Vm => {
             // Check if it's a Proxmox VM or local QEMU VM
@@ -1007,8 +1103,19 @@ pub fn restore_docker(entry: &BackupEntry) -> Result<String, String> {
 pub fn restore_lxc(entry: &BackupEntry) -> Result<String, String> {
 
     let local_path = retrieve_backup(entry)?;
+    let container_name = &entry.target.name;
 
-    // Extract to /var/lib/lxc/
+    // Detect if this is a vzdump archive (Proxmox backup)
+    let filename = local_path.file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let is_vzdump = filename.contains("vzdump");
+
+    if is_vzdump && crate::containers::is_proxmox() {
+        return restore_lxc_proxmox(entry, &local_path);
+    }
+
+    // Native LXC restore: extract tar to /var/lib/lxc/
     let output = Command::new("tar")
         .args(["xzf", &local_path.to_string_lossy(), "-C", "/var/lib/lxc/"])
         .output()
@@ -1020,7 +1127,6 @@ pub fn restore_lxc(entry: &BackupEntry) -> Result<String, String> {
         return Err(format!("LXC extract failed: {}", String::from_utf8_lossy(&output.stderr)));
     }
 
-    let container_name = &entry.target.name;
     let container_dir = format!("/var/lib/lxc/{}", container_name);
     let config_path = format!("{}/config", container_dir);
     let rootfs_path = format!("{}/rootfs", container_dir);
@@ -1036,10 +1142,8 @@ pub fn restore_lxc(entry: &BackupEntry) -> Result<String, String> {
             .filter(|l| !l.trim().starts_with("lxc.rootfs.path"))
             .map(|l| l.to_string())
             .collect();
-        // Add correct rootfs path at the beginning
         lines.insert(0, format!("lxc.rootfs.path = dir:{}", rootfs_path));
 
-        // Ensure apparmor profile is set (unconfined for restored containers)
         if !lines.iter().any(|l| l.contains("lxc.apparmor.profile")) {
             lines.push("lxc.apparmor.profile = unconfined".to_string());
         }
@@ -1048,18 +1152,46 @@ pub fn restore_lxc(entry: &BackupEntry) -> Result<String, String> {
         let _ = std::fs::write(&config_path, &new_config);
     }
 
-    // Fix ownership — root should own the container dir
-    let _ = Command::new("chown")
-        .args(["-R", "root:root", &container_dir])
-        .output();
-
-    // Fix rootfs permissions
-    let _ = Command::new("chmod")
-        .args(["755", &container_dir])
-        .output();
-
+    let _ = Command::new("chown").args(["-R", "root:root", &container_dir]).output();
+    let _ = Command::new("chmod").args(["755", &container_dir]).output();
 
     Ok(format!("LXC container '{}' restored — you can now start it from the Containers page", container_name))
+}
+
+/// Restore a Proxmox LXC container from a vzdump archive using pct restore
+fn restore_lxc_proxmox(entry: &BackupEntry, archive_path: &Path) -> Result<String, String> {
+    let vmid = &entry.target.name;
+
+    // Check if the VMID already exists — pct restore will fail if it does
+    let exists = Command::new("pct").args(["status", vmid]).output()
+        .map(|o| o.status.success()).unwrap_or(false);
+
+    if exists {
+        // Container exists — stop it first if running, then destroy and recreate
+        let _ = Command::new("pct").args(["stop", vmid]).output();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let destroy = Command::new("pct").args(["destroy", vmid, "--force", "1"]).output()
+            .map_err(|e| format!("Failed to destroy existing container {}: {}", vmid, e))?;
+        if !destroy.status.success() {
+            return Err(format!("Failed to destroy existing container {}: {}",
+                vmid, String::from_utf8_lossy(&destroy.stderr)));
+        }
+    }
+
+    // Restore using pct restore — handles all storage backends
+    let output = Command::new("pct")
+        .args(["restore", vmid, &archive_path.to_string_lossy()])
+        .output()
+        .map_err(|e| format!("pct restore failed to start: {}", e))?;
+
+    let _ = fs::remove_file(archive_path);
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("pct restore failed: {}", stderr.trim()));
+    }
+
+    Ok(format!("Proxmox LXC container {} restored from vzdump backup — you can now start it from the Containers page", vmid))
 }
 
 /// Restore a VM from backup
