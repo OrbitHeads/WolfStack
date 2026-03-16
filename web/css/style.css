@@ -1144,6 +1144,11 @@ body.sidebar-collapsed .main-content {
     margin-left: 0;
 }
 
+#task-log-footer {
+    left: 260px;
+    transition: left 0.3s ease;
+}
+
 body.sidebar-collapsed #task-log-footer {
     left: 0;
 }
