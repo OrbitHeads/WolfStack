@@ -3517,6 +3517,7 @@ pub async fn lxc_migrate_external(
 
         match client.post(import_url)
             .header("X-Transfer-Token", &body.target_token)
+            .header("X-WolfStack-Secret", state.cluster_secret.clone())
             .multipart(form)
             .send()
             .await

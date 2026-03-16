@@ -12376,11 +12376,6 @@ async function migrateLxcContainer(name) {
                         ${remoteNodes.map(n => `<option value="${n.id}">${n.hostname} (${n.address})</option>`).join('')}
                         <option value="__external__">External cluster...</option>
                     </select></div>
-                <div><label style="font-size:13px;color:var(--text-muted,#aaa);">Target Storage</label>
-                    <select id="migrate-storage" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;">
-                        <option value="">Auto (default)</option>
-                    </select>
-                    <span id="migrate-storage-hint" style="font-size:11px;color:var(--text-muted,#666);margin-top:2px;display:block;">Select a target node to load available storages</span></div>
                 <div id="migrate-external-fields" style="display:none;">
                     <div style="background:var(--info-bg);border:1px solid var(--info);border-radius:8px;padding:10px 12px;margin-bottom:12px;color:var(--info);font-size:0.82em;line-height:1.5;">
                         💡 <strong>Cross-cluster migration</strong> lets you move a container to a WolfStack instance on a different network.
@@ -12392,6 +12387,11 @@ async function migrateLxcContainer(name) {
                     <label style="font-size:13px;color:var(--text-muted,#aaa);">Transfer Token</label>
                     <input id="migrate-ext-token" type="text" placeholder="wst_..." style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;">
                 </div>
+                <div><label style="font-size:13px;color:var(--text-muted,#aaa);">Target Storage</label>
+                    <select id="migrate-storage" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;">
+                        <option value="">Auto (default)</option>
+                    </select>
+                    <span id="migrate-storage-hint" style="font-size:11px;color:var(--text-muted,#666);margin-top:2px;display:block;">Select a target node to load available storages</span></div>
                 <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px;">
                     <button class="btn" onclick="document.getElementById('lxc-migrate-modal')?.remove()">Cancel</button>
                     <button class="btn" style="background:#ef4444;color:#fff;" onclick="doMigrateLxc('${name}')">Migrate</button>
@@ -12401,39 +12401,66 @@ async function migrateLxcContainer(name) {
     `;
     document.body.appendChild(modal);
 
+    // Helper: populate storage dropdown from a storage list response
+    function lxcPopulateStorages(data) {
+        const sel = document.getElementById('migrate-storage');
+        const hint = document.getElementById('migrate-storage-hint');
+        sel.innerHTML = '<option value="">Auto (default)</option>';
+        const storages = data.storages || [];
+        const suitable = storages.filter(s => s.content && s.content.some(c => c === 'rootdir' || c === 'images'));
+        (suitable.length ? suitable : storages.filter(s => s.status === 'active')).forEach(s => {
+            const free = typeof formatBytes === 'function' ? formatBytes(s.available_bytes) : Math.round(s.available_bytes / 1073741824) + ' GB';
+            sel.insertAdjacentHTML('beforeend', `<option value="${s.id}">${s.id} (${s.type || ''}, ${free} free)</option>`);
+        });
+        hint.textContent = storages.length ? '' : 'No storages found';
+    }
+
     // Show/hide external fields + fetch storages from selected target node
     document.getElementById('migrate-target').addEventListener('change', async (e) => {
         const val = e.target.value;
         document.getElementById('migrate-external-fields').style.display = val === '__external__' ? 'block' : 'none';
 
-        // Fetch storages from the selected target node
         const sel = document.getElementById('migrate-storage');
         const hint = document.getElementById('migrate-storage-hint');
         sel.innerHTML = '<option value="">Auto (default)</option>';
         if (!val || val === '__external__') {
-            hint.textContent = 'Select a target node to load available storages';
+            hint.textContent = val === '__external__' ? 'Enter a target URL to load available storages' : 'Select a target node to load available storages';
             return;
         }
         hint.textContent = 'Loading storages...';
         try {
             const resp = await fetch(`/api/nodes/${val}/proxy/storage/list`);
-            if (resp.ok) {
-                const data = await resp.json();
-                const storages = data.storages || [];
-                const suitable = storages.filter(s =>
-                    s.content && s.content.some(c => c === 'rootdir' || c === 'images')
-                );
-                (suitable.length ? suitable : storages.filter(s => s.status === 'active')).forEach(s => {
-                    const free = typeof formatBytes === 'function' ? formatBytes(s.available_bytes) : Math.round(s.available_bytes / 1073741824) + ' GB';
-                    sel.insertAdjacentHTML('beforeend', `<option value="${s.id}">${s.id} (${s.type || ''}, ${free} free)</option>`);
-                });
-                hint.textContent = '';
-            } else {
-                hint.textContent = 'Could not load storages from target node';
+            if (resp.ok) { lxcPopulateStorages(await resp.json()); }
+            else { hint.textContent = 'Could not load storages from target node'; }
+        } catch (err) { hint.textContent = 'Could not reach target node for storage list'; }
+    });
+
+    // Fetch storages from external URL when user finishes typing
+    let lxcExtUrlTimer = null;
+    document.getElementById('migrate-ext-url')?.addEventListener('input', (e) => {
+        clearTimeout(lxcExtUrlTimer);
+        lxcExtUrlTimer = setTimeout(async () => {
+            const url = e.target.value.trim();
+            const sel = document.getElementById('migrate-storage');
+            const hint = document.getElementById('migrate-storage-hint');
+            sel.innerHTML = '<option value="">Auto (default)</option>';
+            if (!url) { hint.textContent = 'Enter a target URL to load available storages'; return; }
+            hint.textContent = 'Connecting to remote cluster...';
+            const base = url.includes('://') ? url.replace(/\/+$/, '') : 'https://' + url.replace(/\/+$/, '');
+            // Try HTTPS 8553, then HTTP 8554, then user's exact URL
+            const tryUrls = [];
+            if (!base.match(/:8553\b/)) tryUrls.push(base.replace(/(:\d+)?$/, ':8553'));
+            else tryUrls.push(base);
+            if (!base.match(/:8554\b/)) tryUrls.push(base.replace(/^https:/, 'http:').replace(/(:\d+)?$/, ':8554'));
+            tryUrls.push(base);
+            for (const tryUrl of tryUrls) {
+                try {
+                    const resp = await fetch(`${tryUrl}/api/storage/list`, { signal: AbortSignal.timeout(5000) });
+                    if (resp.ok) { lxcPopulateStorages(await resp.json()); return; }
+                } catch {}
             }
-        } catch (err) {
-            hint.textContent = 'Could not reach target node for storage list';
-        }
+            hint.textContent = 'Could not reach remote cluster — check the URL';
+        }, 800);
     });
 }
 
@@ -12649,11 +12676,6 @@ async function migrateVm(name) {
                         ${remoteNodes.map(n => `<option value="${n.id}">${n.hostname} (${n.address})</option>`).join('')}
                         <option value="__external__">External cluster...</option>
                     </select></div>
-                <div><label style="font-size:13px;color:var(--text-muted,#aaa);">Destination Storage</label>
-                    <select id="vm-migrate-storage" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;">
-                        <option value="">Default</option>
-                    </select>
-                    <span id="vm-migrate-storage-hint" style="font-size:11px;color:var(--text-muted,#666);margin-top:2px;display:block;">Select a target node to load available storages</span></div>
                 <div id="vm-migrate-external-fields" style="display:none;">
                     <div style="background:var(--info-bg);border:1px solid var(--info);border-radius:8px;padding:10px 12px;margin-bottom:12px;color:var(--info);font-size:0.82em;line-height:1.5;">
                         <strong>Cross-cluster migration</strong>: On the destination cluster, go to <strong>LXC Containers</strong> and click <strong>Generate Transfer Token</strong>. The same token works for VM transfers.
@@ -12663,6 +12685,11 @@ async function migrateVm(name) {
                     <label style="font-size:13px;color:var(--text-muted,#aaa);">Transfer Token</label>
                     <input id="vm-migrate-ext-token" type="text" placeholder="wst_..." style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;">
                 </div>
+                <div><label style="font-size:13px;color:var(--text-muted,#aaa);">Destination Storage</label>
+                    <select id="vm-migrate-storage" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;">
+                        <option value="">Default</option>
+                    </select>
+                    <span id="vm-migrate-storage-hint" style="font-size:11px;color:var(--text-muted,#666);margin-top:2px;display:block;">Select a target node to load available storages</span></div>
                 <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px;">
                     <button class="btn" onclick="document.getElementById('vm-migrate-modal')?.remove()">Cancel</button>
                     <button class="btn" style="background:#ef4444;color:#fff;" onclick="doMigrateVm('${name}')">Migrate</button>
@@ -12672,38 +12699,64 @@ async function migrateVm(name) {
     `;
     document.body.appendChild(modal);
 
+    // Helper: populate VM storage dropdown
+    function vmPopulateStorages(data) {
+        const sel = document.getElementById('vm-migrate-storage');
+        const hint = document.getElementById('vm-migrate-storage-hint');
+        sel.innerHTML = '<option value="">Default</option>';
+        const storages = data.storages || [];
+        const suitable = storages.filter(s => s.content && s.content.some(c => c === 'rootdir' || c === 'images'));
+        (suitable.length ? suitable : storages.filter(s => s.status === 'active')).forEach(s => {
+            const free = typeof formatBytes === 'function' ? formatBytes(s.available_bytes) : Math.round(s.available_bytes / 1073741824) + ' GB';
+            sel.insertAdjacentHTML('beforeend', `<option value="${s.id}">${s.id} (${s.type || ''}, ${free} free)</option>`);
+        });
+        hint.textContent = storages.length ? '' : 'No storages found';
+    }
+
     document.getElementById('vm-migrate-target').addEventListener('change', async (e) => {
         const val = e.target.value;
         document.getElementById('vm-migrate-external-fields').style.display = val === '__external__' ? 'block' : 'none';
 
-        // Fetch storages from the selected target node
         const sel = document.getElementById('vm-migrate-storage');
         const hint = document.getElementById('vm-migrate-storage-hint');
         sel.innerHTML = '<option value="">Default</option>';
         if (!val || val === '__external__') {
-            hint.textContent = val === '__external__' ? 'Storage selection is not available for external migrations' : 'Select a target node to load available storages';
+            hint.textContent = val === '__external__' ? 'Enter a target URL to load available storages' : 'Select a target node to load available storages';
             return;
         }
         hint.textContent = 'Loading storages...';
         try {
             const resp = await fetch(`/api/nodes/${val}/proxy/storage/list`);
-            if (resp.ok) {
-                const data = await resp.json();
-                const storages = data.storages || [];
-                const suitable = storages.filter(s =>
-                    s.content && s.content.some(c => c === 'rootdir' || c === 'images')
-                );
-                (suitable.length ? suitable : storages.filter(s => s.status === 'active')).forEach(s => {
-                    const free = typeof formatBytes === 'function' ? formatBytes(s.available_bytes) : Math.round(s.available_bytes / 1073741824) + ' GB';
-                    sel.insertAdjacentHTML('beforeend', `<option value="${s.id}">${s.id} (${s.type || ''}, ${free} free)</option>`);
-                });
-                hint.textContent = '';
-            } else {
-                hint.textContent = 'Could not load storages from target node';
+            if (resp.ok) { vmPopulateStorages(await resp.json()); }
+            else { hint.textContent = 'Could not load storages from target node'; }
+        } catch (err) { hint.textContent = 'Could not reach target node for storage list'; }
+    });
+
+    // Fetch storages from external URL when user finishes typing
+    let vmExtUrlTimer = null;
+    document.getElementById('vm-migrate-ext-url')?.addEventListener('input', (e) => {
+        clearTimeout(vmExtUrlTimer);
+        vmExtUrlTimer = setTimeout(async () => {
+            const url = e.target.value.trim();
+            const sel = document.getElementById('vm-migrate-storage');
+            const hint = document.getElementById('vm-migrate-storage-hint');
+            sel.innerHTML = '<option value="">Default</option>';
+            if (!url) { hint.textContent = 'Enter a target URL to load available storages'; return; }
+            hint.textContent = 'Connecting to remote cluster...';
+            const base = url.includes('://') ? url.replace(/\/+$/, '') : 'https://' + url.replace(/\/+$/, '');
+            const tryUrls = [];
+            if (!base.match(/:8553\b/)) tryUrls.push(base.replace(/(:\d+)?$/, ':8553'));
+            else tryUrls.push(base);
+            if (!base.match(/:8554\b/)) tryUrls.push(base.replace(/^https:/, 'http:').replace(/(:\d+)?$/, ':8554'));
+            tryUrls.push(base);
+            for (const tryUrl of tryUrls) {
+                try {
+                    const resp = await fetch(`${tryUrl}/api/storage/list`, { signal: AbortSignal.timeout(5000) });
+                    if (resp.ok) { vmPopulateStorages(await resp.json()); return; }
+                } catch {}
             }
-        } catch (err) {
-            hint.textContent = 'Could not reach target node for storage list';
-        }
+            hint.textContent = 'Could not reach remote cluster — check the URL';
+        }, 800);
     });
 }
 
