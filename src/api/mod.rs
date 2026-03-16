@@ -8185,6 +8185,10 @@ pub struct MysqlDataRequest {
     #[serde(default = "mysql_default_page_size")]
     pub page_size: u64,
     #[serde(default)]
+    pub order_by: Option<String>,
+    #[serde(default)]
+    pub order_dir: Option<String>,
+    #[serde(default)]
     pub db_type: crate::mysql_editor::DbType,
 }
 
@@ -8204,12 +8208,16 @@ pub async fn mysql_data(
     let tbl = body.table.clone();
     let page = body.page;
     let page_size = body.page_size;
+    let order_by = body.order_by.clone();
+    let order_dir = body.order_dir.clone();
+    let ob = order_by.as_deref();
+    let od = order_dir.as_deref();
     let result = if body.db_type == crate::mysql_editor::DbType::Postgres {
         tokio::time::timeout(std::time::Duration::from_secs(30),
-            crate::mysql_editor::pg_table_data(&params, &db, &tbl, page as u32, page_size as u32)).await
+            crate::mysql_editor::pg_table_data(&params, &db, &tbl, page as u32, page_size as u32, ob, od)).await
     } else {
         tokio::time::timeout(std::time::Duration::from_secs(30),
-            crate::mysql_editor::table_data(&params, &db, &tbl, page, page_size)).await
+            crate::mysql_editor::table_data(&params, &db, &tbl, page, page_size, ob, od)).await
     };
     match result {
         Ok(Ok(data)) => HttpResponse::Ok().json(data),

@@ -16483,6 +16483,8 @@ async function mysqlSelectTable(db, table) {
     mysqlCurrentDb = db;
     mysqlCurrentTable = table;
     mysqlCurrentPage = 0;
+    mysqlSortColumn = null;
+    mysqlSortDir = 'asc';
 
     // Update table info in header
     document.getElementById('mysql-table-info').innerHTML =
@@ -16520,6 +16522,8 @@ async function mysqlLoadTableData() {
                 table: mysqlCurrentTable,
                 page: mysqlCurrentPage,
                 page_size: mysqlPageSize,
+                order_by: mysqlSortColumn || undefined,
+                order_dir: mysqlSortColumn ? mysqlSortDir : undefined,
             }),
         });
         const data = await resp.json();
@@ -16547,9 +16551,22 @@ async function mysqlLoadTableData() {
     }
 }
 
-// Store current grid data for edit form
+// Store current grid data for edit form + sort state
 let _mysqlGridColumns = [];
 let _mysqlGridRows = [];
+let mysqlSortColumn = null;
+let mysqlSortDir = 'asc'; // 'asc' or 'desc'
+
+function mysqlSortBy(col) {
+    if (mysqlSortColumn === col) {
+        mysqlSortDir = mysqlSortDir === 'asc' ? 'desc' : 'asc';
+    } else {
+        mysqlSortColumn = col;
+        mysqlSortDir = 'asc';
+    }
+    mysqlCurrentPage = 0;
+    mysqlLoadTableData();
+}
 
 function mysqlRenderGrid(columns, rows, container) {
     _mysqlGridColumns = columns;
@@ -16566,7 +16583,10 @@ function mysqlRenderGrid(columns, rows, container) {
 
     html += `<th style="${thStyle} width:32px;"></th>`;
     for (const col of columns) {
-        html += `<th style="${thStyle}">${escapeHtml(col)}</th>`;
+        const isSorted = mysqlSortColumn === col;
+        const arrow = isSorted ? (mysqlSortDir === 'asc' ? ' ▲' : ' ▼') : '';
+        const sortColor = isSorted ? 'color:var(--accent);' : '';
+        html += `<th style="${thStyle} cursor:pointer; ${sortColor}" onclick="mysqlSortBy('${escapeHtml(col)}')" title="Sort by ${escapeHtml(col)}">${escapeHtml(col)}${arrow}</th>`;
     }
     html += '</tr></thead><tbody>';
 

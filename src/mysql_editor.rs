@@ -365,6 +365,8 @@ pub async fn table_data(
     table: &str,
     page: u64,
     page_size: u64,
+    order_by: Option<&str>,
+    order_dir: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let mut p = params.clone();
     p.database = Some(database.to_string());
@@ -399,10 +401,15 @@ pub async fn table_data(
 
     // Get data page
     let offset = page * page_size;
+    let order_clause = if let Some(col) = order_by {
+        let safe_col = format!("`{}`", col.replace('`', "``"));
+        let dir = match order_dir { Some("desc") | Some("DESC") => "DESC", _ => "ASC" };
+        format!(" ORDER BY {} {}", safe_col, dir)
+    } else { String::new() };
     let data_rows: Vec<Row> = conn
         .query(format!(
-            "SELECT * FROM {} LIMIT {} OFFSET {}",
-            safe_table, page_size, offset
+            "SELECT * FROM {}{} LIMIT {} OFFSET {}",
+            safe_table, order_clause, page_size, offset
         ))
         .await
         .map_err(|e| format!("Data query failed: {}", detailed_mysql_error(&e)))?;
@@ -975,7 +982,7 @@ pub async fn pg_table_structure(params: &ConnParams, database: &str, table: &str
 }
 
 /// Get PostgreSQL table data (paginated)
-pub async fn pg_table_data(params: &ConnParams, database: &str, table: &str, page: u32, page_size: u32) -> Result<serde_json::Value, String> {
+pub async fn pg_table_data(params: &ConnParams, database: &str, table: &str, page: u32, page_size: u32, order_by: Option<&str>, order_dir: Option<&str>) -> Result<serde_json::Value, String> {
     let mut p = params.clone();
     p.database = Some(database.to_string());
     let client = pg_connect(&p).await?;
@@ -991,7 +998,12 @@ pub async fn pg_table_data(params: &ConnParams, database: &str, table: &str, pag
         .map_err(|e| format!("Count failed: {}", e))?
         .get(0);
 
-    let data_query = format!("SELECT * FROM \"{}\" LIMIT {} OFFSET {}", table, page_size, offset);
+    let order_clause = if let Some(col) = order_by {
+        let safe_col = format!("\"{}\"", col.replace('"', "\"\""));
+        let dir = match order_dir { Some("desc") | Some("DESC") => "DESC", _ => "ASC" };
+        format!(" ORDER BY {} {}", safe_col, dir)
+    } else { String::new() };
+    let data_query = format!("SELECT * FROM \"{}\"{} LIMIT {} OFFSET {}", table, order_clause, page_size, offset);
     let rows = client.query(&data_query, &[]).await
         .map_err(|e| format!("Data query failed: {}", e))?;
 
