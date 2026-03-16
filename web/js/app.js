@@ -14815,31 +14815,65 @@ async function loadPbsSnapshots() {
         }
         if (empty) empty.style.display = 'none';
 
-        // Enrich PBS snapshots from multiple sources:
-        // 1. WolfStack backup entries (have cluster, node, hostname, specs, comments)
-        // 2. Loaded backup targets (have hostname, specs for local containers)
+        // Enrich PBS snapshots from all available sources:
+        // 1. Backup entries from ALL known nodes (have cluster, node, hostname, specs)
+        // 2. Backup targets from ALL known nodes (have hostname, specs)
         // 3. PBS snapshot notes (if set)
-        const backupEntries = window._backupEntries || [];
-        const targets = window._backupTargets || [];
 
-        // Build lookup by target name → backup entry (most recent first)
+        // Fetch backup entries + targets from all cluster nodes in parallel
+        const allWsNodes = typeof getAllWolfStackNodes === 'function' ? getAllWolfStackNodes() : [];
+        const enrichPromises = allWsNodes.filter(n => n.online).map(async (n) => {
+            try {
+                const [bRes, tRes] = await Promise.all([
+                    fetch(nodeApiUrl(n.id, '/api/backups')).catch(() => null),
+                    fetch(nodeApiUrl(n.id, '/api/backups/targets')).catch(() => null),
+                ]);
+                const backups = bRes && bRes.ok ? await bRes.json() : [];
+                const targets = tRes && tRes.ok ? await tRes.json() : [];
+                return { node: n, backups: Array.isArray(backups) ? backups : [], targets: Array.isArray(targets) ? targets : [] };
+            } catch { return { node: n, backups: [], targets: [] }; }
+        });
+        const nodeData = await Promise.allSettled(enrichPromises);
+
+        // Build combined lookups from all nodes
         const entryByName = {};
-        backupEntries.forEach(b => {
-            if (b.target && b.target.name && b.storage && (b.storage.type === 'pbs' || b.storage.storage_type === 'pbs')) {
+        const targetMap = {};
+        for (const result of nodeData) {
+            const nd = result.status === 'fulfilled' ? result.value : null;
+            if (!nd) continue;
+            // Backup entries → best source for cluster/node/hostname
+            nd.backups.forEach(b => {
+                if (b.target && b.target.name) {
+                    const key = b.target.name;
+                    if (!entryByName[key] || b.created_at > (entryByName[key].created_at || '')) {
+                        entryByName[key] = b;
+                    }
+                }
+            });
+            // Targets → hostname/specs for containers on this node
+            nd.targets.forEach(t => {
+                if (t.name && !targetMap[t.name]) {
+                    targetMap[t.name] = { ...t, _nodeName: nd.node.hostname || nd.node.address };
+                }
+            });
+        }
+        // Also include locally cached data
+        (window._backupEntries || []).forEach(b => {
+            if (b.target && b.target.name) {
                 const key = b.target.name;
-                if (!entryByName[key] || b.created_at > entryByName[key].created_at) {
+                if (!entryByName[key] || b.created_at > (entryByName[key].created_at || '')) {
                     entryByName[key] = b;
                 }
             }
         });
-        // Also index by target type for broader matching
-        const targetMap = {};
-        targets.forEach(t => { if (t.name) targetMap[t.name] = t; });
+        (window._backupTargets || []).forEach(t => {
+            if (t.name && !targetMap[t.name]) targetMap[t.name] = t;
+        });
 
         list.forEach(s => {
             const bid = s['backup-id'] || s.backup_id || '';
 
-            // Try matching against WolfStack backup entries first (best data)
+            // Try matching against backup entries first (best data — has cluster, node, all details)
             const entry = entryByName[bid];
             if (entry) {
                 if (!s.hostname && entry.target) {
@@ -14847,7 +14881,6 @@ async function loadPbsSnapshots() {
                     s.specs = entry.target.specs || '';
                 }
                 if ((!s._cluster || s._cluster === '—') && entry.comments) {
-                    // Parse cluster from comments: "[ClusterName] LXC container: ..."
                     const cm = entry.comments.match(/^\[([^\]]+)\]/);
                     if (cm) s._cluster = cm[1];
                 }
@@ -14856,10 +14889,13 @@ async function loadPbsSnapshots() {
                 }
             }
 
-            // Fallback to backup targets (local containers)
+            // Fallback to backup targets from any node
             if (!s.hostname && targetMap[bid]) {
                 s.hostname = targetMap[bid].hostname || '';
                 s.specs = targetMap[bid].specs || '';
+                if ((!s._node || s._node === '—') && targetMap[bid]._nodeName) {
+                    s._node = targetMap[bid]._nodeName;
+                }
             }
         });
 
