@@ -2576,14 +2576,28 @@ fn pct_list_all() -> Vec<ContainerInfo> {
     };
 
     // Parse listing into (vmid, state, pct_name) tuples first
+    // Header: VMID       Status     Lock         Name
     let entries: Vec<(String, String, String)> = output.lines()
-        .skip(1) // Skip header: VMID       Status     Lock         Name
+        .skip(1)
         .filter(|l| !l.trim().is_empty())
         .filter_map(|line| {
             let parts: Vec<&str> = line.split_whitespace().collect();
             let vmid = parts.first()?.to_string();
             let state = parts.get(1).unwrap_or(&"stopped").to_lowercase();
-            let pct_name = parts.get(2..).map(|p| p.join(" ")).unwrap_or_default();
+            // Detect lock field — if present it sits between status and name
+            // e.g. "138    running    backup     myhost"
+            let lock = parts.get(2).unwrap_or(&"").to_string();
+            let pct_name = if lock == "backup" || lock == "snapshot" || lock == "migrate"
+                || lock == "rollback" || lock == "create" || lock == "mounted" {
+                // Auto-unlock stale backup/snapshot locks
+                if lock == "backup" || lock == "snapshot" {
+                    warn!("Container {} has stale '{}' lock — auto-unlocking", vmid, lock);
+                    let _ = Command::new("pct").args(["unlock", &vmid]).output();
+                }
+                parts.get(3..).map(|p| p.join(" ")).unwrap_or_default()
+            } else {
+                parts.get(2..).map(|p| p.join(" ")).unwrap_or_default()
+            };
             Some((vmid, state, pct_name))
         })
         .collect();
