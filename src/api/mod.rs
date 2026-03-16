@@ -2345,10 +2345,32 @@ pub async fn node_proxy(
         match builder.send().await {
             Ok(resp) => {
                 let status = resp.status().as_u16();
+                let resp_ct = resp.headers().get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("application/json")
+                    .to_string();
+
+                // Stream SSE responses through without buffering
+                if resp_ct.contains("text/event-stream") {
+                    use futures::StreamExt;
+                    let byte_stream = resp.bytes_stream().map(|chunk| -> Result<actix_web::web::Bytes, actix_web::Error> {
+                        match chunk {
+                            Ok(b) => Ok(actix_web::web::Bytes::copy_from_slice(&b)),
+                            Err(e) => Err(actix_web::error::ErrorBadGateway(e.to_string())),
+                        }
+                    });
+                    return HttpResponse::build(actix_web::http::StatusCode::from_u16(status).unwrap_or(actix_web::http::StatusCode::OK))
+                        .insert_header(("Content-Type", "text/event-stream"))
+                        .insert_header(("Cache-Control", "no-cache"))
+                        .insert_header(("Connection", "keep-alive"))
+                        .insert_header(("X-Accel-Buffering", "no"))
+                        .streaming(byte_stream);
+                }
+
                 match resp.bytes().await {
                     Ok(bytes) => {
                         return HttpResponse::build(actix_web::http::StatusCode::from_u16(status).unwrap_or(actix_web::http::StatusCode::OK))
-                            .content_type("application/json")
+                            .content_type(resp_ct)
                             .body(bytes.to_vec());
                     }
                     Err(e) => {
