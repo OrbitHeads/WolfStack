@@ -1386,9 +1386,12 @@ body.sidebar-collapsed #task-log-footer {
 }
 
 /* ─── Main Content ─── */
+:root { --task-log-height: 0px; }
+
 .main-content {
     margin-left: 260px;
     min-height: 100vh;
+    padding-bottom: var(--task-log-height);
     transition: margin-left 0.3s ease;
 }
 

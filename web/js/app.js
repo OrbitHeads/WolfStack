@@ -7164,13 +7164,17 @@ function updateContentPadding() {
     const footer = document.getElementById('task-log-footer');
     if (!main) return;
     if (_taskLogVisible && footer) {
-        // Use a short delay so the browser has laid out the footer first
-        requestAnimationFrame(() => {
+        // Double-measure: once now, once after layout
+        const setHeight = () => {
             const h = footer.offsetHeight || parseInt(footer.style.height) || 220;
             main.style.paddingBottom = h + 'px';
-        });
+            document.documentElement.style.setProperty('--task-log-height', h + 'px');
+        };
+        setHeight();
+        requestAnimationFrame(setHeight);
     } else {
-        main.style.paddingBottom = '';
+        main.style.paddingBottom = '0px';
+        document.documentElement.style.setProperty('--task-log-height', '0px');
     }
 }
 
@@ -16560,16 +16564,19 @@ function mysqlRenderGrid(columns, rows, container) {
     let html = `<table style="width:100%; border-collapse:collapse; font-family:var(--font-mono); font-size:12px;">
         <thead><tr style="position:sticky; top:0; z-index:1;">`;
 
+    html += `<th style="${thStyle} width:32px;"></th>`;
     for (const col of columns) {
         html += `<th style="${thStyle}">${escapeHtml(col)}</th>`;
     }
-    html += `<th style="${thStyle} width:40px;"></th>`;
     html += '</tr></thead><tbody>';
 
     for (let i = 0; i < rows.length; i++) {
         const row = rows[i];
         const bgColor = i % 2 === 0 ? 'transparent' : 'rgba(255,255,255,0.02)';
         html += `<tr style="background:${bgColor}; transition:background 0.1s; cursor:pointer;" onmouseover="this.style.background='var(--bg-card-hover,rgba(255,255,255,0.04))'" onmouseout="this.style.background='${bgColor}'" ondblclick="mysqlEditRow(${i})">`;
+        html += `<td style="padding:4px 6px; border-bottom:1px solid var(--border); text-align:center;">
+            <button class="btn btn-sm" onclick="event.stopPropagation(); mysqlEditRow(${i})" style="font-size:10px; padding:2px 5px; background:var(--bg-tertiary); color:var(--text-muted); border:1px solid var(--border);" title="Edit row">✏️</button>
+        </td>`;
         for (let j = 0; j < columns.length; j++) {
             const val = j < row.length ? row[j] : null;
             let display, style = 'padding:6px 12px; border-bottom:1px solid var(--border); max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
@@ -16585,9 +16592,6 @@ function mysqlRenderGrid(columns, rows, container) {
             }
             html += `<td style="${style}" title="${escapeHtml(String(val ?? 'NULL'))}">${display}</td>`;
         }
-        html += `<td style="padding:6px 8px; border-bottom:1px solid var(--border); text-align:center;">
-            <button class="btn btn-sm" onclick="mysqlEditRow(${i})" style="font-size:10px; padding:2px 6px; background:var(--bg-tertiary); color:var(--text-muted); border:1px solid var(--border);" title="Edit row">✏️</button>
-        </td>`;
         html += '</tr>';
     }
 
@@ -16595,7 +16599,42 @@ function mysqlRenderGrid(columns, rows, container) {
     container.innerHTML = html;
 }
 
+let _mysqlPrimaryKeys = []; // populated when structure is loaded
+
 function mysqlEditRow(rowIndex) {
+    const columns = _mysqlGridColumns;
+    const row = _mysqlGridRows[rowIndex];
+    if (!columns || !row) return;
+
+    // Fetch structure to identify primary keys before showing form
+    const baseUrl = getNodeApiBase(mysqlConnectedNodeId);
+    fetch(`${baseUrl}/mysql/structure`, {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...mysqlCreds, database: mysqlCurrentDb, table: mysqlCurrentTable }),
+    }).then(r => r.json()).then(data => {
+        // Extract PK column names
+        const cols = data.columns || [];
+        // For MySQL: columns array has {field, key} where key='PRI'
+        // For PostgreSQL: check indexes for primary
+        if (Array.isArray(cols)) {
+            _mysqlPrimaryKeys = cols.filter(c => c.key === 'PRI').map(c => c.field);
+        }
+        // Also check indexes
+        if (data.indexes && Array.isArray(data.indexes)) {
+            data.indexes.filter(idx => idx.key_name === 'PRIMARY').forEach(idx => {
+                const col = idx.column_name;
+                if (col && !_mysqlPrimaryKeys.includes(col)) _mysqlPrimaryKeys.push(col);
+            });
+        }
+        mysqlShowEditForm(rowIndex);
+    }).catch(() => {
+        _mysqlPrimaryKeys = [];
+        mysqlShowEditForm(rowIndex);
+    });
+}
+
+function mysqlShowEditForm(rowIndex) {
     const columns = _mysqlGridColumns;
     const row = _mysqlGridRows[rowIndex];
     if (!columns || !row) return;
@@ -16616,17 +16655,21 @@ function mysqlEditRow(rowIndex) {
                         const isNull = val === null;
                         const displayVal = isNull ? '' : String(val);
                         const isLong = displayVal.length > 100;
+                        const isPK = _mysqlPrimaryKeys.includes(col);
                         const inputId = 'mysql-edit-' + j;
                         const nullId = 'mysql-null-' + j;
                         return `<div style="display:grid; grid-template-columns:140px 1fr auto; gap:8px; align-items:start;">
-                            <label style="font-size:12px; font-weight:600; color:var(--text-secondary); padding-top:8px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(col)}">${escapeHtml(col)}</label>
+                            <label style="font-size:12px; font-weight:600; color:var(--text-secondary); padding-top:8px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(col)}${isPK ? ' (Primary Key)' : ''}">${isPK ? '🔑 ' : ''}${escapeHtml(col)}</label>
                             ${isLong
-                                ? `<textarea id="${inputId}" class="form-control" rows="3" style="font-size:12px; font-family:var(--font-mono); resize:vertical;" ${isNull ? 'disabled placeholder="NULL"' : ''}>${escapeHtml(displayVal)}</textarea>`
-                                : `<input id="${inputId}" type="text" class="form-control" value="${escapeHtml(displayVal)}" style="font-size:12px; font-family:var(--font-mono);" ${isNull ? 'disabled placeholder="NULL"' : ''}>`
+                                ? `<textarea id="${inputId}" class="form-control" rows="3" style="font-size:12px; font-family:var(--font-mono); resize:vertical;${isPK ? ' opacity:0.6;' : ''}" ${isNull ? 'disabled placeholder="NULL"' : ''} ${isPK ? 'readonly' : ''}>${escapeHtml(displayVal)}</textarea>`
+                                : `<input id="${inputId}" type="text" class="form-control" value="${escapeHtml(displayVal)}" style="font-size:12px; font-family:var(--font-mono);${isPK ? ' opacity:0.6;' : ''}" ${isNull ? 'disabled placeholder="NULL"' : ''} ${isPK ? 'readonly' : ''}>`
                             }
-                            <label style="display:flex; align-items:center; gap:4px; font-size:11px; color:var(--text-muted); padding-top:6px; cursor:pointer; white-space:nowrap;">
-                                <input type="checkbox" id="${nullId}" ${isNull ? 'checked' : ''} onchange="document.getElementById('${inputId}').disabled = this.checked; if(this.checked) document.getElementById('${inputId}').value = '';"> NULL
-                            </label>
+                            ${isPK
+                                ? '<span style="font-size:10px; color:var(--text-muted); padding-top:8px;">PK</span>'
+                                : `<label style="display:flex; align-items:center; gap:4px; font-size:11px; color:var(--text-muted); padding-top:6px; cursor:pointer; white-space:nowrap;">
+                                    <input type="checkbox" id="${nullId}" ${isNull ? 'checked' : ''} onchange="document.getElementById('${inputId}').disabled = this.checked; if(this.checked) document.getElementById('${inputId}').value = '';"> NULL
+                                </label>`
+                            }
                         </div>`;
                     }).join('')}
                 </div>
@@ -16657,12 +16700,17 @@ async function mysqlSaveRow(rowIndex) {
         const newVal = isNull ? null : (document.getElementById('mysql-edit-' + j)?.value ?? '');
         const origVal = j < origRow.length ? origRow[j] : null;
 
+        const isPK = _mysqlPrimaryKeys.includes(columns[j]);
+
         // Build WHERE from original values (for identifying the row)
         if (origVal === null) {
             wheres.push(quoteIdent(columns[j]) + ' IS NULL');
         } else {
             wheres.push(quoteIdent(columns[j]) + ' = ' + quoteLiteral(String(origVal)));
         }
+
+        // Never update primary key columns — skip them from SET
+        if (isPK) continue;
 
         // Only include changed fields in SET
         const changed = isNull ? (origVal !== null) : (String(newVal) !== String(origVal ?? ''));
