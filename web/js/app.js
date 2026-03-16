@@ -1016,7 +1016,7 @@ function selectServerView(nodeId, view) {
         certificates: 'Certificates',
         cron: 'Cron Jobs',
         'pve-resources': 'VMs & Containers',
-        'mysql-editor': 'MariaDB/MySQL',
+        'mysql-editor': 'Database Manager',
         'terminal': 'Terminal',
         'syslogs': 'System Logs',
         'security': 'Security',
@@ -1270,7 +1270,7 @@ function buildServerTree(nodes) {
                             <span class="icon">📋</span> System Logs
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="mysql-editor" onclick="selectServerView('${node.id}', 'mysql-editor')">
-                            <span class="icon">🗄️</span> MariaDB/MySQL
+                            <span class="icon">🗄️</span> Database Manager
                         </a>
                     </div>
                 </div>`;
@@ -16135,8 +16135,27 @@ async function importConfigFile(input) {
 
 // ─── MySQL Database Editor ───
 
-let mysqlCreds = null; // { host, port, user, password }
+let mysqlCreds = null; // { host, port, user, password, db_type }
 let mysqlConnectedNodeId = null; // node ID captured at connect time — never changes mid-session
+let mysqlDbType = 'mysql'; // 'mysql' or 'postgres'
+
+function dbTypeChanged() {
+    const sel = document.getElementById('mysql-db-type');
+    mysqlDbType = sel ? sel.value : 'mysql';
+    const portEl = document.getElementById('mysql-port');
+    const userEl = document.getElementById('mysql-user');
+    if (mysqlDbType === 'postgres') {
+        if (portEl && (portEl.value === '3306' || !portEl.value)) portEl.value = '5432';
+        if (userEl && (userEl.value === 'root' || !userEl.value)) userEl.value = 'postgres';
+    } else {
+        if (portEl && (portEl.value === '5432' || !portEl.value)) portEl.value = '3306';
+        if (userEl && (userEl.value === 'postgres' || !userEl.value)) userEl.value = 'root';
+    }
+}
+
+function getDbCreds() {
+    return mysqlCreds ? { ...mysqlCreds, db_type: mysqlDbType } : null;
+}
 let mysqlCurrentDb = null;
 let mysqlCurrentTable = null;
 let mysqlCurrentPage = 0;
@@ -16148,14 +16167,11 @@ function loadMySQLEditor() {
     // ── Full state reset when switching nodes ──
     mysqlDisconnect();
 
-    const banner = document.getElementById('mysql-detect-banner');
-    banner.style.display = 'none';
-
-    // Always use localhost — API calls are proxied to the target node via
-    // /api/nodes/{id}/proxy/..., so the backend connects to MySQL locally.
+    // Reset connection fields based on current db type
     const hostInput = document.getElementById('mysql-host');
     hostInput.value = 'localhost';
-    document.getElementById('mysql-port').value = '3306';
+    const portEl = document.getElementById('mysql-port');
+    portEl.value = mysqlDbType === 'postgres' ? '5432' : '3306';
     document.getElementById('mysql-user').value = '';
     document.getElementById('mysql-pass').value = '';
 
@@ -16164,24 +16180,7 @@ function loadMySQLEditor() {
     containerSelect.style.display = 'none';
     containerSelect.innerHTML = '<option value="">Manual connection</option>';
 
-    // Detect MySQL on this node
     const nodeId = currentNodeId;
-    const baseUrl = nodeId ? getNodeApiBase(nodeId) : '';
-    fetch(`${baseUrl}/mysql/detect`, { credentials: 'include' })
-        .then(r => r.json())
-        .then(data => {
-            banner.style.display = 'block';
-            if (data.installed) {
-                banner.innerHTML = `<div style="padding:8px 14px; background:rgba(46,204,113,0.1); border:1px solid rgba(46,204,113,0.3); border-radius:6px; font-size:12px; color:#2ecc71;">
-                    ✅ MySQL detected — ${data.version || 'installed'} ${data.service_running ? '• Service running' : '• Service not running'}
-                </div>`;
-            } else {
-                banner.innerHTML = `<div style="padding:8px 14px; background:rgba(231,76,60,0.1); border:1px solid rgba(231,76,60,0.3); border-radius:6px; font-size:12px; color:#e74c3c;">
-                    ⚠️ MySQL not detected on this node. You can still connect to a remote MySQL server using the connection bar above.
-                </div>`;
-            }
-        })
-        .catch(() => { });
 
     // Detect MySQL containers (Docker/LXC)
     fetch(`${baseUrl}/mysql/detect-containers`, { credentials: 'include' })
@@ -16256,7 +16255,7 @@ async function mysqlConnect() {
             method: 'POST',
             credentials: 'include',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ host, port, user, password: pass }),
+            body: JSON.stringify({ host, port, user, password: pass, db_type: mysqlDbType }),
             signal: controller.signal,
         });
         clearTimeout(timeoutId);
@@ -16285,7 +16284,7 @@ async function mysqlConnect() {
         }
 
         if (data.connected) {
-            mysqlCreds = { host, port, user, password: pass };
+            mysqlCreds = { host, port, user, password: pass, db_type: mysqlDbType };
             mysqlConnectedNodeId = currentNodeId; // lock to current node for entire session
             badge.textContent = `Connected — MySQL ${data.version}`;
             badge.style.background = 'rgba(46,204,113,0.15)';

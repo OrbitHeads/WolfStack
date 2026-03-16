@@ -9,6 +9,18 @@ use mysql_async::{Opts, OptsBuilder, Pool, Row, Value};
 use serde::{Deserialize, Serialize};
 use tracing::error;
 
+/// Supported database types
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DbType {
+    Mysql,
+    Postgres,
+}
+
+impl Default for DbType {
+    fn default() -> Self { DbType::Mysql }
+}
+
 /// Connection parameters sent from the frontend
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ConnParams {
@@ -21,6 +33,8 @@ pub struct ConnParams {
     /// Optional: which database to USE
     #[serde(default)]
     pub database: Option<String>,
+    #[serde(default)]
+    pub db_type: DbType,
 }
 
 fn default_port() -> u16 {
@@ -840,4 +854,266 @@ fn resolve_wolfnet_hostname(ip: &str) -> String {
         }
     }
     String::new()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PostgreSQL Support
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Test a PostgreSQL connection
+pub async fn pg_test_connection(params: &ConnParams) -> Result<String, String> {
+    let conn_str = pg_conn_string(params);
+    let (client, connection) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+    ).await
+        .map_err(|_| "Connection timed out (5s)".to_string())?
+        .map_err(|e| format!("PostgreSQL connection failed: {}", e))?;
+
+    tokio::spawn(async move { let _ = connection.await; });
+
+    let row = client.query_one("SELECT version()", &[]).await
+        .map_err(|e| format!("Query failed: {}", e))?;
+    let version: String = row.get(0);
+    Ok(version)
+}
+
+/// List PostgreSQL databases
+pub async fn pg_list_databases(params: &ConnParams) -> Result<Vec<String>, String> {
+    let client = pg_connect(params).await?;
+    let rows = client.query(
+        "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname", &[]
+    ).await.map_err(|e| format!("Failed to list databases: {}", e))?;
+
+    Ok(rows.iter().map(|r| { let name: String = r.get(0); name }).collect())
+}
+
+/// List PostgreSQL tables and views
+pub async fn pg_list_tables(params: &ConnParams, database: &str) -> Result<Vec<serde_json::Value>, String> {
+    let mut p = params.clone();
+    p.database = Some(database.to_string());
+    let client = pg_connect(&p).await?;
+
+    let rows = client.query(
+        "SELECT table_name, table_type,
+         (SELECT n_live_tup FROM pg_stat_user_tables s WHERE s.relname = t.table_name LIMIT 1) as row_est,
+         pg_total_relation_size(quote_ident(table_schema) || '.' || quote_ident(table_name)) as size_bytes
+         FROM information_schema.tables t
+         WHERE table_schema = 'public'
+         ORDER BY table_name",
+        &[]
+    ).await.map_err(|e| format!("Tables query failed: {}", e))?;
+
+    let mut tables = Vec::new();
+    for row in &rows {
+        let name: String = row.get(0);
+        let table_type: String = row.get(1);
+        let row_count: Option<i64> = row.try_get(2).ok();
+        let data_length: Option<i64> = row.try_get(3).ok();
+
+        tables.push(serde_json::json!({
+            "name": name,
+            "type": table_type,
+            "rows": row_count.map(|r| r as u64),
+            "data_length": data_length.map(|d| d as u64),
+        }));
+    }
+    Ok(tables)
+}
+
+/// Get PostgreSQL table structure
+pub async fn pg_table_structure(params: &ConnParams, database: &str, table: &str) -> Result<serde_json::Value, String> {
+    let mut p = params.clone();
+    p.database = Some(database.to_string());
+    let client = pg_connect(&p).await?;
+
+    // Columns
+    let cols = client.query(
+        "SELECT column_name, data_type, character_maximum_length, is_nullable,
+                column_default, ordinal_position
+         FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = $1
+         ORDER BY ordinal_position", &[&table]
+    ).await.map_err(|e| format!("Column query failed: {}", e))?;
+
+    let columns: Vec<serde_json::Value> = cols.iter().map(|r| {
+        let name: String = r.get(0);
+        let dtype: String = r.get(1);
+        let max_len: Option<i32> = r.try_get(2).ok();
+        let nullable: String = r.get(3);
+        let default: Option<String> = r.try_get(4).ok();
+        serde_json::json!({
+            "field": name,
+            "type": if let Some(len) = max_len { format!("{}({})", dtype, len) } else { dtype },
+            "null": nullable,
+            "default": default,
+            "key": "",
+            "extra": "",
+        })
+    }).collect();
+
+    // Indexes
+    let idx = client.query(
+        "SELECT indexname, indexdef FROM pg_indexes
+         WHERE tablename = $1 AND schemaname = 'public'
+         ORDER BY indexname", &[&table]
+    ).await.map_err(|e| format!("Index query failed: {}", e))?;
+
+    let indexes: Vec<serde_json::Value> = idx.iter().map(|r| {
+        let name: String = r.get(0);
+        let def: String = r.get(1);
+        let unique = def.to_lowercase().contains("unique");
+        serde_json::json!({
+            "key_name": name,
+            "column_name": def,
+            "non_unique": if unique { 0 } else { 1 },
+            "index_type": if def.to_lowercase().contains("btree") { "BTREE" } else { "OTHER" },
+        })
+    }).collect();
+
+    Ok(serde_json::json!({ "columns": columns, "indexes": indexes, "triggers": [] }))
+}
+
+/// Get PostgreSQL table data (paginated)
+pub async fn pg_table_data(params: &ConnParams, database: &str, table: &str, page: u32, page_size: u32) -> Result<serde_json::Value, String> {
+    let mut p = params.clone();
+    p.database = Some(database.to_string());
+    let client = pg_connect(&p).await?;
+
+    // Validate table name to prevent injection
+    if table.contains(';') || table.contains('\'') || table.contains('"') || table.contains('-') {
+        return Err("Invalid table name".to_string());
+    }
+
+    let offset = page * page_size;
+    let count_query = format!("SELECT COUNT(*) FROM \"{}\"", table);
+    let total: i64 = client.query_one(&count_query, &[]).await
+        .map_err(|e| format!("Count failed: {}", e))?
+        .get(0);
+
+    let data_query = format!("SELECT * FROM \"{}\" LIMIT {} OFFSET {}", table, page_size, offset);
+    let rows = client.query(&data_query, &[]).await
+        .map_err(|e| format!("Data query failed: {}", e))?;
+
+    let columns: Vec<String> = if rows.is_empty() {
+        vec![]
+    } else {
+        rows[0].columns().iter().map(|c| c.name().to_string()).collect()
+    };
+
+    let data: Vec<Vec<serde_json::Value>> = rows.iter().map(|row| {
+        columns.iter().enumerate().map(|(i, _)| pg_value_to_json(row, i)).collect()
+    }).collect();
+
+    Ok(serde_json::json!({
+        "columns": columns,
+        "rows": data,
+        "total_rows": total,
+        "page": page,
+        "page_size": page_size,
+    }))
+}
+
+/// Execute a PostgreSQL query
+pub async fn pg_execute_query(params: &ConnParams, database: &str, query: &str) -> Result<serde_json::Value, String> {
+    let mut p = params.clone();
+    p.database = Some(database.to_string());
+    let client = pg_connect(&p).await?;
+
+    let query_upper = query.trim().to_uppercase();
+    if query_upper.starts_with("SELECT") || query_upper.starts_with("SHOW") || query_upper.starts_with("EXPLAIN") || query_upper.starts_with("WITH") {
+        let rows = client.query(query, &[]).await
+            .map_err(|e| format!("Query failed: {}", e))?;
+
+        let columns: Vec<String> = if rows.is_empty() {
+            vec![]
+        } else {
+            rows[0].columns().iter().map(|c| c.name().to_string()).collect()
+        };
+
+        let data: Vec<Vec<serde_json::Value>> = rows.iter().map(|row| {
+            columns.iter().enumerate().map(|(i, _)| pg_value_to_json(row, i)).collect()
+        }).collect();
+
+        Ok(serde_json::json!({
+            "columns": columns,
+            "rows": data,
+            "row_count": data.len(),
+        }))
+    } else {
+        let affected = client.execute(query, &[]).await
+            .map_err(|e| format!("Execute failed: {}", e))?;
+        Ok(serde_json::json!({
+            "columns": ["affected_rows"],
+            "rows": [[affected]],
+            "row_count": 1,
+            "affected_rows": affected,
+        }))
+    }
+}
+
+/// Detect PostgreSQL installation
+pub fn detect_postgres() -> serde_json::Value {
+    let installed = std::process::Command::new("which").arg("psql")
+        .output().map(|o| o.status.success()).unwrap_or(false)
+        || std::path::Path::new("/usr/bin/psql").exists();
+
+    let running = std::process::Command::new("systemctl")
+        .args(["is-active", "postgresql"])
+        .output().map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
+        .unwrap_or(false);
+
+    let version = std::process::Command::new("psql").arg("--version")
+        .output().ok()
+        .and_then(|o| if o.status.success() {
+            Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+        } else { None });
+
+    serde_json::json!({
+        "installed": installed,
+        "service_running": running,
+        "version": version,
+    })
+}
+
+// ─── PostgreSQL helpers ─────────────────────────────────────────────────────
+
+fn pg_conn_string(params: &ConnParams) -> String {
+    let db = params.database.as_deref().unwrap_or("postgres");
+    format!("host={} port={} user={} password={} dbname={} connect_timeout=5",
+        params.host, params.port, params.user, params.password, db)
+}
+
+async fn pg_connect(params: &ConnParams) -> Result<tokio_postgres::Client, String> {
+    let conn_str = pg_conn_string(params);
+    let (client, connection) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+    ).await
+        .map_err(|_| "Connection timed out (5s)".to_string())?
+        .map_err(|e| format!("PostgreSQL connection failed: {}", e))?;
+
+    tokio::spawn(async move { let _ = connection.await; });
+    Ok(client)
+}
+
+fn pg_value_to_json(row: &tokio_postgres::Row, idx: usize) -> serde_json::Value {
+    // Try common types — PostgreSQL has many, handle the most common ones
+    if let Ok(v) = row.try_get::<_, Option<String>>(idx) {
+        return v.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null);
+    }
+    if let Ok(v) = row.try_get::<_, Option<i64>>(idx) {
+        return v.map(|n| serde_json::json!(n)).unwrap_or(serde_json::Value::Null);
+    }
+    if let Ok(v) = row.try_get::<_, Option<i32>>(idx) {
+        return v.map(|n| serde_json::json!(n)).unwrap_or(serde_json::Value::Null);
+    }
+    if let Ok(v) = row.try_get::<_, Option<f64>>(idx) {
+        return v.map(|n| serde_json::json!(n)).unwrap_or(serde_json::Value::Null);
+    }
+    if let Ok(v) = row.try_get::<_, Option<bool>>(idx) {
+        return v.map(|b| serde_json::json!(b)).unwrap_or(serde_json::Value::Null);
+    }
+    // Fallback: try to get as string representation
+    serde_json::Value::Null
 }

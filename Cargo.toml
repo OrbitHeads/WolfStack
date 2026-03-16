@@ -61,8 +61,9 @@ lettre = { version = "0.11", features = ["tokio1-rustls-tls", "smtp-transport", 
 rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustls-tls"] }
 lz4_flex = "0.11"
 
-# MySQL database editor
+# Database editors
 mysql_async = "0.34"
+tokio-postgres = { version = "0.7", features = ["runtime"] }
 async-stream = "0.3.6"
 
 [profile.release]

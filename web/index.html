@@ -2409,7 +2409,11 @@
             <div class="card" style="margin-bottom:16px;">
                 <div class="card-body" style="padding:16px;">
                     <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-                        <span style="font-size:20px;">🗄️</span>
+                        <select id="mysql-db-type" onchange="dbTypeChanged()"
+                            style="font-size:13px; padding:6px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg-secondary); color:var(--text-primary); font-weight:600;">
+                            <option value="mysql">MySQL / MariaDB</option>
+                            <option value="postgres">PostgreSQL</option>
+                        </select>
                         <div style="display:flex; align-items:center; gap:6px; flex:1; min-width:0; flex-wrap:wrap;">
                             <select id="mysql-container-select" onchange="mysqlSelectContainer(this.value)"
                                 style="display:none; font-size:13px; padding:6px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg-secondary); color:var(--text-primary); font-family:var(--font-mono); max-width:200px;">
@@ -2434,8 +2438,6 @@
                             Not connected
                         </div>
                     </div>
-                    <!-- Detection banner -->
-                    <div id="mysql-detect-banner" style="margin-top:10px; display:none;"></div>
                 </div>
             </div>
 

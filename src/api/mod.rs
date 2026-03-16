@@ -7990,18 +7990,18 @@ pub struct MysqlConnectRequest {
     pub user: String,
     #[serde(default)]
     pub password: String,
+    #[serde(default)]
+    pub db_type: crate::mysql_editor::DbType,
 }
 
 fn mysql_default_port() -> u16 { 3306 }
 
-/// POST /api/mysql/connect — test a MySQL connection
+/// POST /api/mysql/connect — test a database connection (MySQL or PostgreSQL)
 pub async fn mysql_connect(
     req: HttpRequest, state: web::Data<AppState>,
     body: web::Json<MysqlConnectRequest>,
 ) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
-
-
 
     let params = crate::mysql_editor::ConnParams {
         host: body.host.clone(),
@@ -8009,35 +8009,34 @@ pub async fn mysql_connect(
         user: body.user.clone(),
         password: body.password.clone(),
         database: None,
+        db_type: body.db_type,
     };
 
-    // Wrap the entire connection test in a 10-second timeout so the handler
-    // ALWAYS returns a response — even if mysql_async hangs internally.
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        crate::mysql_editor::test_connection(&params),
-    ).await;
+    let result = if body.db_type == crate::mysql_editor::DbType::Postgres {
+        tokio::time::timeout(std::time::Duration::from_secs(10),
+            crate::mysql_editor::pg_test_connection(&params)).await
+    } else {
+        tokio::time::timeout(std::time::Duration::from_secs(10),
+            crate::mysql_editor::test_connection(&params)).await
+    };
 
     match result {
         Ok(Ok(version)) => {
-
             HttpResponse::Ok().json(serde_json::json!({
                 "connected": true,
                 "version": version,
             }))
         }
         Ok(Err(e)) => {
-            error!("MySQL connection failed: {}", e);
             HttpResponse::Ok().json(serde_json::json!({
                 "connected": false,
                 "error": e,
             }))
         }
         Err(_) => {
-            error!("MySQL connect handler timed out after 10s for {}:{}", body.host, body.port);
             HttpResponse::Ok().json(serde_json::json!({
                 "connected": false,
-                "error": format!("Connection to {}:{} timed out after 10 seconds. Possible causes: host unreachable, firewall blocking port {}, or MySQL not accepting connections.", body.host, body.port, body.port),
+                "error": format!("Connection to {}:{} timed out after 10 seconds.", body.host, body.port),
             }))
         }
     }
@@ -8053,6 +8052,8 @@ pub struct MysqlCredsRequest {
     pub password: String,
     #[serde(default)]
     pub database: Option<String>,
+    #[serde(default)]
+    pub db_type: crate::mysql_editor::DbType,
 }
 
 impl MysqlCredsRequest {
@@ -8063,6 +8064,7 @@ impl MysqlCredsRequest {
             user: self.user.clone(),
             password: self.password.clone(),
             database: self.database.clone(),
+            db_type: self.db_type,
         }
     }
 }
@@ -8073,10 +8075,14 @@ pub async fn mysql_databases(
     body: web::Json<MysqlCredsRequest>,
 ) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        crate::mysql_editor::list_databases(&body.to_params()),
-    ).await;
+    let params = body.to_params();
+    let result = if params.db_type == crate::mysql_editor::DbType::Postgres {
+        tokio::time::timeout(std::time::Duration::from_secs(15),
+            crate::mysql_editor::pg_list_databases(&params)).await
+    } else {
+        tokio::time::timeout(std::time::Duration::from_secs(15),
+            crate::mysql_editor::list_databases(&params)).await
+    };
     match result {
         Ok(Ok(dbs)) => HttpResponse::Ok().json(serde_json::json!({ "databases": dbs })),
         Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
@@ -8093,6 +8099,8 @@ pub struct MysqlTablesRequest {
     #[serde(default)]
     pub password: String,
     pub database: String,
+    #[serde(default)]
+    pub db_type: crate::mysql_editor::DbType,
 }
 
 /// POST /api/mysql/tables — list tables in a database
@@ -8102,20 +8110,21 @@ pub async fn mysql_tables(
 ) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
     let params = crate::mysql_editor::ConnParams {
-        host: body.host.clone(),
-        port: body.port,
-        user: body.user.clone(),
-        password: body.password.clone(),
-        database: Some(body.database.clone()),
+        host: body.host.clone(), port: body.port, user: body.user.clone(),
+        password: body.password.clone(), database: Some(body.database.clone()), db_type: body.db_type,
     };
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        crate::mysql_editor::list_tables(&params, &body.database),
-    ).await;
+    let db = body.database.clone();
+    let result = if body.db_type == crate::mysql_editor::DbType::Postgres {
+        tokio::time::timeout(std::time::Duration::from_secs(15),
+            crate::mysql_editor::pg_list_tables(&params, &db)).await
+    } else {
+        tokio::time::timeout(std::time::Duration::from_secs(15),
+            crate::mysql_editor::list_tables(&params, &db)).await
+    };
     match result {
         Ok(Ok(tables)) => HttpResponse::Ok().json(serde_json::json!({ "tables": tables })),
         Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
-        Err(_) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": "Table list request timed out after 15 seconds" })),
+        Err(_) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": "Table list timed out" })),
     }
 }
 
@@ -8129,6 +8138,8 @@ pub struct MysqlStructureRequest {
     pub password: String,
     pub database: String,
     pub table: String,
+    #[serde(default)]
+    pub db_type: crate::mysql_editor::DbType,
 }
 
 /// POST /api/mysql/structure — get table structure
@@ -8138,20 +8149,24 @@ pub async fn mysql_structure(
 ) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
     let params = crate::mysql_editor::ConnParams {
-        host: body.host.clone(),
-        port: body.port,
-        user: body.user.clone(),
-        password: body.password.clone(),
-        database: Some(body.database.clone()),
+        host: body.host.clone(), port: body.port, user: body.user.clone(),
+        password: body.password.clone(), database: Some(body.database.clone()), db_type: body.db_type,
     };
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        crate::mysql_editor::table_structure(&params, &body.database, &body.table),
-    ).await;
+    let db = body.database.clone();
+    let tbl = body.table.clone();
+    let result = if body.db_type == crate::mysql_editor::DbType::Postgres {
+        tokio::time::timeout(std::time::Duration::from_secs(15),
+            crate::mysql_editor::pg_table_structure(&params, &db, &tbl)).await
+    } else {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            crate::mysql_editor::table_structure(&params, &db, &tbl).await
+                .map(serde_json::Value::Array)
+        }).await
+    };
     match result {
         Ok(Ok(cols)) => HttpResponse::Ok().json(serde_json::json!({ "columns": cols })),
         Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
-        Err(_) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": "Structure request timed out after 15 seconds" })),
+        Err(_) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": "Structure request timed out" })),
     }
 }
 
@@ -8169,6 +8184,8 @@ pub struct MysqlDataRequest {
     pub page: u64,
     #[serde(default = "mysql_default_page_size")]
     pub page_size: u64,
+    #[serde(default)]
+    pub db_type: crate::mysql_editor::DbType,
 }
 
 fn mysql_default_page_size() -> u64 { 50 }
@@ -8180,24 +8197,24 @@ pub async fn mysql_data(
 ) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
     let params = crate::mysql_editor::ConnParams {
-        host: body.host.clone(),
-        port: body.port,
-        user: body.user.clone(),
-        password: body.password.clone(),
-        database: Some(body.database.clone()),
+        host: body.host.clone(), port: body.port, user: body.user.clone(),
+        password: body.password.clone(), database: Some(body.database.clone()), db_type: body.db_type,
     };
+    let db = body.database.clone();
+    let tbl = body.table.clone();
     let page = body.page;
     let page_size = body.page_size;
-    let database = body.database.clone();
-    let table = body.table.clone();
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        crate::mysql_editor::table_data(&params, &database, &table, page, page_size),
-    ).await;
+    let result = if body.db_type == crate::mysql_editor::DbType::Postgres {
+        tokio::time::timeout(std::time::Duration::from_secs(30),
+            crate::mysql_editor::pg_table_data(&params, &db, &tbl, page as u32, page_size as u32)).await
+    } else {
+        tokio::time::timeout(std::time::Duration::from_secs(30),
+            crate::mysql_editor::table_data(&params, &db, &tbl, page, page_size)).await
+    };
     match result {
         Ok(Ok(data)) => HttpResponse::Ok().json(data),
         Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
-        Err(_) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": "Data request timed out after 30 seconds" })),
+        Err(_) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": "Data request timed out" })),
     }
 }
 
@@ -8212,6 +8229,8 @@ pub struct MysqlQueryRequest {
     #[serde(default)]
     pub database: String,
     pub query: String,
+    #[serde(default)]
+    pub db_type: crate::mysql_editor::DbType,
 }
 
 /// POST /api/mysql/query — execute arbitrary SQL
@@ -8220,23 +8239,25 @@ pub async fn mysql_query(
     body: web::Json<MysqlQueryRequest>,
 ) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
-
-
     let params = crate::mysql_editor::ConnParams {
-        host: body.host.clone(),
-        port: body.port,
-        user: body.user.clone(),
+        host: body.host.clone(), port: body.port, user: body.user.clone(),
         password: body.password.clone(),
         database: if body.database.is_empty() { None } else { Some(body.database.clone()) },
+        db_type: body.db_type,
     };
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        crate::mysql_editor::execute_query(&params, &body.database, &body.query),
-    ).await;
+    let db = body.database.clone();
+    let query = body.query.clone();
+    let result = if body.db_type == crate::mysql_editor::DbType::Postgres {
+        tokio::time::timeout(std::time::Duration::from_secs(30),
+            crate::mysql_editor::pg_execute_query(&params, &db, &query)).await
+    } else {
+        tokio::time::timeout(std::time::Duration::from_secs(30),
+            crate::mysql_editor::execute_query(&params, &db, &query)).await
+    };
     match result {
         Ok(Ok(result)) => HttpResponse::Ok().json(result),
         Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
-        Err(_) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": "Query timed out after 30 seconds" })),
+        Err(_) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": "Query timed out" })),
     }
 }
 
@@ -8263,6 +8284,7 @@ pub async fn mysql_dump(
         user: body.user.clone(),
         password: body.password.clone(),
         database: Some(body.database.clone()),
+        db_type: crate::mysql_editor::DbType::Mysql, // dump is MySQL-only for now
     };
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(120),
