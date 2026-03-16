@@ -7074,6 +7074,36 @@ let _taskLogEntries = [];
 let _taskLogVisible = false;
 let _taskLogBodyVisible = true;
 
+function saveTaskLog() {
+    try {
+        // Store entries without expanded state, convert Date to ISO string
+        const toStore = _taskLogEntries.slice(0, 1000).map(e => ({
+            ...e, time: e.time instanceof Date ? e.time.toISOString() : e.time, expanded: false
+        }));
+        localStorage.setItem('wolfstack_task_log', JSON.stringify(toStore));
+    } catch (_) {}
+}
+
+function loadTaskLog() {
+    try {
+        const raw = localStorage.getItem('wolfstack_task_log');
+        if (!raw) return;
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return;
+        _taskLogEntries = parsed.map(e => ({
+            ...e,
+            time: new Date(e.time),
+            expanded: false,
+            // Any tasks that were "running" when the page closed are now stale
+            status: e.status === 'running' ? 'failed' : e.status,
+        }));
+        if (_taskLogEntries.length > 0) {
+            updateTaskLogToggleBtn();
+            renderTaskLog();
+        }
+    } catch (_) {}
+}
+
 function showTaskLog() {
     const footer = document.getElementById('task-log-footer');
     if (footer) { footer.style.display = 'flex'; _taskLogVisible = true; }
@@ -7133,8 +7163,10 @@ function toggleTaskLogBody() {
 function clearTaskLog() {
     _taskLogEntries = [];
     renderTaskLog();
+    saveTaskLog();
     const spinner = document.getElementById('task-log-spinner');
     if (spinner) spinner.style.display = 'none';
+    updateTaskLogToggleBtn();
 }
 
 function addTaskLogEntry(opts) {
@@ -7151,11 +7183,11 @@ function addTaskLogEntry(opts) {
         expanded: false,
     };
     _taskLogEntries.unshift(entry);
-    // Limit to 1000 entries
     if (_taskLogEntries.length > 1000) _taskLogEntries.length = 1000;
     showTaskLog();
     updateTaskLogSpinner();
     renderTaskLog();
+    saveTaskLog();
     return entry.id;
 }
 
@@ -7168,6 +7200,7 @@ function updateTaskLogEntry(id, updates) {
     if (updates.logLines) entry.logLines.push(...updates.logLines);
     updateTaskLogSpinner();
     renderTaskLog();
+    saveTaskLog();
 }
 
 function updateTaskLogSpinner() {
@@ -8629,6 +8662,7 @@ function tomlToggleRaw(component, displayName) {
 const POLL_INTERVAL = isMobileView() ? 30000 : 10000;
 fetchNodes();
 fetchMetricsHistory(); // Initial history load
+loadTaskLog(); // Restore task log from localStorage
 setInterval(fetchNodes, POLL_INTERVAL);
 // Load k8s cluster data for sidebar badges (non-blocking)
 (async () => {
