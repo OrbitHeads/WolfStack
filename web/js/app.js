@@ -20124,7 +20124,7 @@ async function loadPatreonHeaderBadge() {
             if (!window._wsPatreonToastShown) {
                 window._wsPatreonToastShown = true;
                 setTimeout(() => {
-                    showToast('Enjoying WolfStack? <a href="#" onclick="event.preventDefault();selectView(\'settings\');setTimeout(function(){switchSettingsTab(\'patreon\');},100);this.closest(\'.toast\')?.remove();" style="color:#facc15;text-decoration:underline;">Support us on Patreon</a> to unlock extra features and remove this message.', 'info', 10000);
+                    showToast('Enjoying WolfStack? <a href="https://www.wolfstack.org/support.php" target="_blank" style="color:#facc15;text-decoration:underline;">Support WolfStack</a> to unlock extra features and help keep it free.', 'info', 10000);
                 }, 4000);
             }
         }
