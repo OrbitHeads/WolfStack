@@ -7213,10 +7213,21 @@ function loadTaskLogHeight() {
 
 function toggleTaskLogBody() {
     _taskLogBodyVisible = !_taskLogBodyVisible;
+    const footer = document.getElementById('task-log-footer');
     const body = document.getElementById('task-log-body');
     const chevron = document.getElementById('task-log-chevron');
     if (body) body.style.display = _taskLogBodyVisible ? '' : 'none';
     if (chevron) chevron.style.transform = _taskLogBodyVisible ? '' : 'rotate(-90deg)';
+    if (footer) {
+        if (_taskLogBodyVisible) {
+            // Restore saved height
+            const saved = localStorage.getItem('wolfstack_task_log_height');
+            footer.style.height = saved || '220px';
+        } else {
+            footer.style.height = 'auto';
+        }
+    }
+    repositionAiBubble();
 }
 
 function addTaskLogEntry(opts) {
