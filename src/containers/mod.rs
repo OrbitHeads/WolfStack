@@ -5350,12 +5350,22 @@ pub fn lxc_import(archive_path: &str, new_name: &str, storage: Option<&str>) -> 
                 return Err(format!("Extract failed: {}", String::from_utf8_lossy(&output.stderr)));
             }
 
+            // Calculate rootfs size from extracted content (round up to nearest GB, min 4GB)
+            let rootfs_bytes = Command::new("du")
+                .args(["-sb", &rootfs_dir])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().map(|s| s.to_string()))
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(4 * 1024 * 1024 * 1024);
+            let rootfs_gb = std::cmp::max(4, (rootfs_bytes / (1024 * 1024 * 1024)) + 2); // add 2GB headroom
+
             // Create minimal vzdump config at top level
             let conf_dir = format!("{}/etc/vzdump", convert_dir);
             let _ = std::fs::create_dir_all(&conf_dir);
             let conf_content = format!(
-                "arch: amd64\nhostname: {}\nmemory: 512\nswap: 512\nnet0: name=eth0,bridge=vmbr0,ip=dhcp\nrootfs: {}:4\nunprivileged: 1\n",
-                new_name, storage_id
+                "arch: amd64\nhostname: {}\nmemory: 512\nswap: 512\nnet0: name=eth0,bridge=vmbr0,ip=dhcp\nrootfs: {}:{}\nunprivileged: 1\n",
+                new_name, storage_id, rootfs_gb
             );
             std::fs::write(format!("{}/pct.conf", conf_dir), &conf_content)
                 .map_err(|e| format!("Failed to write config: {}", e))?;
