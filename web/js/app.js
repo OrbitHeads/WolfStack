@@ -7160,20 +7160,15 @@ function updateTaskLogToggleBtn() {
 }
 
 function updateContentPadding() {
-    const main = document.querySelector('.main-content');
     const footer = document.getElementById('task-log-footer');
-    if (!main) return;
     if (_taskLogVisible && footer) {
-        // Double-measure: once now, once after layout
         const setHeight = () => {
             const h = footer.offsetHeight || parseInt(footer.style.height) || 220;
-            main.style.paddingBottom = h + 'px';
             document.documentElement.style.setProperty('--task-log-height', h + 'px');
         };
         setHeight();
         requestAnimationFrame(setHeight);
     } else {
-        main.style.paddingBottom = '0px';
         document.documentElement.style.setProperty('--task-log-height', '0px');
     }
 }

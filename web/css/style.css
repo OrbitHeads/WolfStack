@@ -1390,8 +1390,9 @@ body.sidebar-collapsed #task-log-footer {
 
 .main-content {
     margin-left: 260px;
-    min-height: 100vh;
-    padding-bottom: var(--task-log-height);
+    min-height: calc(100vh - var(--task-log-height));
+    max-height: calc(100vh - var(--task-log-height));
+    overflow-y: auto;
     transition: margin-left 0.3s ease;
 }
 

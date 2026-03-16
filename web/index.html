@@ -2442,7 +2442,7 @@
             </div>
 
             <!-- Main Editor Layout -->
-            <div id="mysql-editor-main" style="display:none; gap:16px; height:calc(100vh - 260px); min-height:400px;">
+            <div id="mysql-editor-main" style="display:none; gap:16px; height:calc(100vh - 260px - var(--task-log-height, 0px)); min-height:400px;">
                 <!-- Left Panel: Database Tree -->
                 <div
                     style="width:260px; min-width:200px; display:flex; flex-direction:column; background:var(--bg-card); border:1px solid var(--border); border-radius:10px; overflow:hidden;">
@@ -2697,7 +2697,7 @@
 
         <!-- ═══ Inline Terminal Page ═══ -->
         <div id="page-terminal" class="page-view" style="display:none;">
-            <div class="card" style="height: calc(100vh - 140px); display:flex; flex-direction:column;">
+            <div class="card" style="height: calc(100vh - 140px - var(--task-log-height, 0px)); display:flex; flex-direction:column;">
                 <div class="card-header"
                     style="display:flex; justify-content:space-between; align-items:center; flex-shrink:0;">
                     <div style="display:flex; align-items:center; gap:10px;">
