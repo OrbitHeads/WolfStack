@@ -1288,3 +1288,338 @@ impl VmManager {
         runtime.get("vnc_ws_port").and_then(|v| v.as_u64()).map(|v| v as u16)
     }
 }
+
+// ─── VM Migration (standalone functions — no mutex needed) ───
+
+const VM_BASE: &str = "/var/lib/wolfstack/vms";
+
+/// Export a VM as a tar.gz archive containing config JSON + disk images.
+/// Returns the archive path. The VM must be stopped first.
+pub fn export_vm(name: &str) -> Result<PathBuf, String> {
+    // Validate name to prevent path traversal
+    if name.contains('/') || name.contains("..") || name.contains('\0') || name.is_empty() {
+        return Err("Invalid VM name".to_string());
+    }
+
+    let base = Path::new(VM_BASE);
+    let config_path = base.join(format!("{}.json", name));
+
+    if !config_path.exists() {
+        return Err(format!("VM config not found: {}", config_path.display()));
+    }
+
+    let content = fs::read_to_string(&config_path)
+        .map_err(|e| format!("Failed to read VM config: {}", e))?;
+    let config: VmConfig = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse VM config: {}", e))?;
+
+    // Create export staging directory
+    let export_dir = PathBuf::from("/tmp/wolfstack-vm-exports");
+    fs::create_dir_all(&export_dir)
+        .map_err(|e| format!("Failed to create export dir: {}", e))?;
+
+    // Stage files into a temp directory, then tar from there
+    let staging = export_dir.join(format!("staging-{}-{}", name, uuid::Uuid::new_v4()));
+    fs::create_dir_all(&staging)
+        .map_err(|e| format!("Failed to create staging dir: {}", e))?;
+
+    // Copy config JSON (clear runtime fields for portability)
+    let mut portable = config.clone();
+    portable.running = false;
+    portable.vnc_port = None;
+    portable.vnc_ws_port = None;
+    portable.wolfnet_ip = None;
+    portable.storage_path = None; // will use target default
+    portable.vmid = None; // clear Proxmox VMID
+    // Reset extra disk storage paths to default
+    for disk in &mut portable.extra_disks {
+        disk.storage_path = VM_BASE.to_string();
+    }
+    let portable_json = serde_json::to_string_pretty(&portable)
+        .map_err(|e| format!("Failed to serialize config: {}", e))?;
+    fs::write(staging.join(format!("{}.json", name)), &portable_json)
+        .map_err(|e| format!("Failed to write staged config: {}", e))?;
+
+    // Copy OS disk — may be in custom storage_path or default
+    let os_disk = if let Some(ref sp) = config.storage_path {
+        Path::new(sp).join(format!("{}.qcow2", name))
+    } else {
+        base.join(format!("{}.qcow2", name))
+    };
+
+    if containers::is_proxmox() && config.vmid.is_some() {
+        // On Proxmox, export disk via qemu-img convert
+        let vmid = config.vmid.unwrap();
+        // Get the disk path from Proxmox storage
+        let pvesm = Command::new("pvesm")
+            .args(["path", &format!("local-lvm:vm-{}-disk-0", vmid)])
+            .output();
+        let disk_source = match pvesm {
+            Ok(ref o) if o.status.success() => {
+                String::from_utf8_lossy(&o.stdout).trim().to_string()
+            }
+            _ => {
+                // Fallback: try common paths
+                format!("/dev/pve/vm-{}-disk-0", vmid)
+            }
+        };
+        let dest = staging.join(format!("{}.qcow2", name));
+        let output = Command::new("qemu-img")
+            .args(["convert", "-f", "raw", "-O", "qcow2", &disk_source, &dest.to_string_lossy()])
+            .output()
+            .map_err(|e| format!("qemu-img convert failed to start: {}", e))?;
+        if !output.status.success() {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(format!("qemu-img convert failed: {}", String::from_utf8_lossy(&output.stderr)));
+        }
+    } else if os_disk.exists() {
+        fs::copy(&os_disk, staging.join(format!("{}.qcow2", name)))
+            .map_err(|e| format!("Failed to copy OS disk: {}", e))?;
+    } else {
+        warn!("VM '{}' has no OS disk at {}", name, os_disk.display());
+    }
+
+    // Copy extra disks
+    for disk in &config.extra_disks {
+        let src = disk.file_path();
+        if src.exists() {
+            let dest_name = src.file_name().unwrap_or_default();
+            fs::copy(&src, staging.join(dest_name))
+                .map_err(|e| format!("Failed to copy extra disk '{}': {}", disk.name, e))?;
+        }
+    }
+
+    // Create tar.gz archive
+    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let archive_name = format!("vm-{}-{}.tar.gz", name, timestamp);
+    let archive_path = export_dir.join(&archive_name);
+
+    // Collect filenames in staging for tar
+    let mut tar_items: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&staging) {
+        for entry in entries.flatten() {
+            if let Some(fname) = entry.file_name().to_str() {
+                tar_items.push(fname.to_string());
+            }
+        }
+    }
+
+    let output = Command::new("tar")
+        .arg("czf")
+        .arg(archive_path.to_string_lossy().as_ref())
+        .arg("-C")
+        .arg(staging.to_string_lossy().as_ref())
+        .args(&tar_items)
+        .output()
+        .map_err(|e| format!("Failed to create archive: {}", e))?;
+
+    // Clean up staging
+    let _ = fs::remove_dir_all(&staging);
+
+    if !output.status.success() {
+        return Err(format!("tar failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+
+    Ok(archive_path)
+}
+
+/// Import a VM from a tar.gz archive. Extracts to the VM base directory.
+/// Returns a success message with the VM name.
+pub fn import_vm(archive_path: &str, new_name: Option<&str>, storage: Option<&str>) -> Result<String, String> {
+    // Validate new_name to prevent path traversal
+    if let Some(n) = new_name {
+        if n.contains('/') || n.contains("..") || n.contains('\0') || n.is_empty() {
+            return Err("Invalid VM name: must not contain path separators".to_string());
+        }
+    }
+
+    let base = Path::new(VM_BASE);
+    fs::create_dir_all(base)
+        .map_err(|e| format!("Failed to create VM dir: {}", e))?;
+
+    // Extract to a unique temp directory to avoid race conditions
+    let tmp = PathBuf::from(format!("/tmp/wolfstack-vm-import-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&tmp)
+        .map_err(|e| format!("Failed to create import temp dir: {}", e))?;
+
+    let output = Command::new("tar")
+        .args(["xzf", archive_path, "-C"])
+        .arg(tmp.to_string_lossy().as_ref())
+        .output()
+        .map_err(|e| format!("Failed to extract archive: {}", e))?;
+
+    if !output.status.success() {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(format!("tar extract failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+
+    // Find the config JSON
+    let config_file = fs::read_dir(&tmp)
+        .map_err(|e| format!("Failed to read temp dir: {}", e))?
+        .flatten()
+        .find(|e| e.path().extension().map(|x| x == "json").unwrap_or(false))
+        .ok_or_else(|| "No .json config file found in archive".to_string())?;
+
+    let config_content = fs::read_to_string(config_file.path())
+        .map_err(|e| format!("Failed to read config: {}", e))?;
+    let mut config: VmConfig = serde_json::from_str(&config_content)
+        .map_err(|e| format!("Failed to parse config: {}", e))?;
+
+    let original_name = config.name.clone();
+    let target_name = new_name.unwrap_or(&original_name).to_string();
+
+    // Validate names from the archive to prevent path traversal
+    if original_name.contains('/') || original_name.contains("..") || original_name.contains('\0') ||
+       target_name.contains('/') || target_name.contains("..") || target_name.contains('\0') ||
+       target_name.is_empty() {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err("Invalid VM name in archive: must not contain path separators".to_string());
+    }
+
+    // Check for name conflict
+    if base.join(format!("{}.json", target_name)).exists() {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(format!("A VM named '{}' already exists on this node", target_name));
+    }
+
+    // Determine destination storage path
+    let dest_storage = storage.filter(|s| !s.is_empty());
+
+    // Update config for the new host
+    config.name = target_name.clone();
+    config.running = false;
+    config.vnc_port = None;
+    config.vnc_ws_port = None;
+    config.wolfnet_ip = None;
+    config.storage_path = dest_storage.map(|s| s.to_string());
+    config.vmid = None;
+    config.mac_address = Some(generate_mac()); // new MAC to avoid conflicts
+    // Reset extra disk storage paths
+    let disk_storage = dest_storage.unwrap_or(VM_BASE);
+    for disk in &mut config.extra_disks {
+        disk.storage_path = disk_storage.to_string();
+    }
+
+    // On Proxmox, create via qm and import the disk
+    if containers::is_proxmox() {
+        // Get next VMID
+        let nextid = Command::new("pvesh")
+            .args(["get", "/cluster/nextid"])
+            .output()
+            .map_err(|e| format!("Failed to get next VMID: {}", e))?;
+        if !nextid.status.success() {
+            let _ = fs::remove_dir_all(&tmp);
+            return Err("Failed to allocate Proxmox VMID".to_string());
+        }
+        let vmid: u32 = String::from_utf8_lossy(&nextid.stdout).trim().trim_matches('"').parse()
+            .map_err(|_| "Failed to parse VMID".to_string())?;
+
+        // Create a minimal VM shell
+        let create = Command::new("qm")
+            .args([
+                "create", &vmid.to_string(),
+                "--name", &target_name,
+                "--cores", &config.cpus.to_string(),
+                "--memory", &config.memory_mb.to_string(),
+                "--net0", &format!("virtio={},bridge=vmbr0", config.mac_address.as_deref().unwrap_or("auto")),
+            ])
+            .output()
+            .map_err(|e| format!("qm create failed: {}", e))?;
+        if !create.status.success() {
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(format!("qm create failed: {}", String::from_utf8_lossy(&create.stderr)));
+        }
+
+        // Import the disk
+        let pve_storage = dest_storage.unwrap_or("local-lvm");
+        let qcow2 = tmp.join(format!("{}.qcow2", original_name));
+        if qcow2.exists() {
+            let import = Command::new("qm")
+                .args(["importdisk", &vmid.to_string(), &qcow2.to_string_lossy(), pve_storage])
+                .output()
+                .map_err(|e| format!("qm importdisk failed: {}", e))?;
+            if !import.status.success() {
+                // Clean up the VM shell we created since disk import failed
+                let _ = Command::new("qm").args(["destroy", &vmid.to_string(), "--purge"]).output();
+                let _ = fs::remove_dir_all(&tmp);
+                return Err(format!("qm importdisk failed: {}", String::from_utf8_lossy(&import.stderr)));
+            }
+            // Attach the imported disk
+            let attach = Command::new("qm")
+                .args(["set", &vmid.to_string(), "--scsi0", &format!("{}:vm-{}-disk-0", pve_storage, vmid)])
+                .output()
+                .map_err(|e| format!("qm set disk failed: {}", e))?;
+            if !attach.status.success() {
+                let _ = Command::new("qm").args(["destroy", &vmid.to_string(), "--purge"]).output();
+                let _ = fs::remove_dir_all(&tmp);
+                return Err(format!("qm set disk failed: {}", String::from_utf8_lossy(&attach.stderr)));
+            }
+            let boot = Command::new("qm")
+                .args(["set", &vmid.to_string(), "--boot", "order=scsi0"])
+                .output()
+                .map_err(|e| format!("qm set boot failed: {}", e))?;
+            if !boot.status.success() {
+                warn!("qm set boot order failed: {}", String::from_utf8_lossy(&boot.stderr));
+            }
+        }
+
+        config.vmid = Some(vmid);
+        // Save WolfStack tracking config
+        let json = serde_json::to_string_pretty(&config).unwrap_or_default();
+        let _ = fs::write(base.join(format!("{}.json", target_name)), &json);
+
+        let _ = fs::remove_dir_all(&tmp);
+        return Ok(format!("VM '{}' imported as Proxmox VMID {} ({})", original_name, vmid, target_name));
+    }
+
+    // Standalone: move files to destination storage directory
+    let disk_dest = if let Some(sp) = dest_storage {
+        let p = Path::new(sp);
+        fs::create_dir_all(p).map_err(|e| format!("Failed to create storage dir '{}': {}", sp, e))?;
+        p.to_path_buf()
+    } else {
+        base.to_path_buf()
+    };
+
+    // Move the qcow2 disk
+    let src_disk = tmp.join(format!("{}.qcow2", original_name));
+    if src_disk.exists() {
+        let dest_disk = disk_dest.join(format!("{}.qcow2", target_name));
+        fs::rename(&src_disk, &dest_disk)
+            .or_else(|_| fs::copy(&src_disk, &dest_disk).map(|_| ()))
+            .map_err(|e| format!("Failed to move OS disk: {}", e))?;
+    }
+
+    // Move extra disk files (rename if target_name differs)
+    for disk in &mut config.extra_disks {
+        let old_filename = format!("{}.{}", disk.name, disk.format);
+        let src = tmp.join(&old_filename);
+        if src.exists() {
+            // Update disk name if VM was renamed
+            if target_name != original_name && disk.name.starts_with(&original_name) {
+                disk.name = disk.name.replacen(&original_name, &target_name, 1);
+            }
+            let new_filename = format!("{}.{}", disk.name, disk.format);
+            let dest = disk_dest.join(&new_filename);
+            fs::rename(&src, &dest)
+                .or_else(|_| fs::copy(&src, &dest).map(|_| ()))
+                .map_err(|e| format!("Failed to move extra disk '{}': {}", disk.name, e))?;
+        }
+    }
+
+    // Write the updated config
+    let json = serde_json::to_string_pretty(&config)
+        .map_err(|e| format!("Failed to serialize config: {}", e))?;
+    fs::write(base.join(format!("{}.json", target_name)), &json)
+        .map_err(|e| format!("Failed to write config: {}", e))?;
+
+    // Clean up
+    let _ = fs::remove_dir_all(&tmp);
+
+    Ok(format!("VM '{}' imported successfully as '{}'", original_name, target_name))
+}
+
+/// Clean up an export archive
+pub fn export_cleanup(archive_path: &str) {
+    let _ = fs::remove_file(archive_path);
+}

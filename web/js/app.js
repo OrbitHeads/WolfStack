@@ -3007,6 +3007,7 @@ function renderVms(vms) {
                     : (vm.vnc_ws_port ? `<button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="openVmVnc('${vm.name}', ${vm.vnc_ws_port})" title="Console">🖥️</button>` : '')}
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#ef4444;" onclick="vmAction('${vm.name}', 'stop', this)" title="Stop">⏹️</button>` :
                 `<button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="showVmSettings('${vm.name}')" title="Settings">⚙️</button>
+                         <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#3b82f6;" onclick="migrateVm('${vm.name}')" title="Migrate">🚀</button>
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#22c55e;" onclick="vmAction('${vm.name}', 'start', this)" title="Start">▶️</button>
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#ef4444;" onclick="deleteVm('${vm.name}')" title="Delete">🗑️</button>`
             }
@@ -12108,6 +12109,9 @@ async function migrateDockerContainer(name) {
                     This will export the container, transfer it to the target WolfStack node, and import it there.
                     The container will be stopped during migration.
                 </p>
+                <div style="background:var(--warning-bg);border:1px solid var(--warning);border-radius:8px;padding:10px 12px;margin-bottom:1rem;color:var(--warning);font-size:0.85em;">
+                    Note: After migration you may need to update the container's network settings (IP address, gateway, DNS) on the destination node to match the new network.
+                </div>
                 <div style="margin-bottom: 1rem;">
                     <label style="display:block; margin-bottom:4px; font-weight:600;">Target Node</label>
                     ${nodeOpts ? `<select id="migrate-target" style="width:100%; padding:8px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary);">
@@ -12178,6 +12182,9 @@ async function doMigrate(name) {
     closeContainerDetail();
     showToast(`Migrating ${name} to ${targetUrl}... This may take a while.`, 'info');
 
+    const dockerTargetLabel = targetUrl.replace(/https?:\/\//, '').split('/')[0];
+    const dockerTaskId = taskLogStart(`Migrating Docker '${name}' to ${dockerTargetLabel}`);
+
     try {
         const migrateBody = { target_url: targetUrl, remove_source: removeSource };
         if (storageVal) migrateBody.storage = storageVal;
@@ -12189,12 +12196,15 @@ async function doMigrate(name) {
         const data = await resp.json();
         if (resp.ok) {
             showToast(data.message || 'Migration complete', 'success');
+            updateTaskLogEntry(dockerTaskId, { status: 'completed', description: `Migrated Docker '${name}' to ${dockerTargetLabel}` });
             setTimeout(loadDockerContainers, 500);
         } else {
             showToast(data.error || 'Migration failed', 'error');
+            updateTaskLogEntry(dockerTaskId, { status: 'failed', description: `Migrate Docker '${name}': ${data.error || 'Migration failed'}` });
         }
     } catch (e) {
         showToast(`Migration failed: ${e.message}`, 'error');
+        updateTaskLogEntry(dockerTaskId, { status: 'failed', description: `Migrate Docker '${name}': ${e.message}` });
     }
 }
 
@@ -12353,8 +12363,11 @@ async function migrateLxcContainer(name) {
         <div style="background:var(--card-bg,#1e1e2e);border:1px solid var(--border,#333);border-radius:12px;padding:28px 36px;min-width:420px;max-width:520px;box-shadow:0 20px 60px rgba(0,0,0,0.5);">
             <h3 style="margin:0 0 16px;color:var(--text,#fff);">🚀 Migrate Container</h3>
             <p style="margin:0 0 12px;color:var(--text-muted,#aaa);font-size:0.9em;">Move <strong>${name}</strong> to another node. The container will be stopped, transferred, and destroyed on this node.</p>
-            <div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:10px 12px;margin-bottom:16px;color:#ef4444;font-size:0.85em;">
+            <div style="background:var(--danger-bg);border:1px solid var(--danger);border-radius:8px;padding:10px 12px;margin-bottom:10px;color:var(--danger);font-size:0.85em;">
                 ⚠️ The container will experience downtime during migration.
+            </div>
+            <div style="background:var(--warning-bg);border:1px solid var(--warning);border-radius:8px;padding:10px 12px;margin-bottom:16px;color:var(--warning);font-size:0.85em;">
+                Note: After migration you may need to update the container's network settings (IP address, gateway, DNS) on the destination node to match the new network.
             </div>
             <div style="display:flex;flex-direction:column;gap:12px;">
                 <div><label style="font-size:13px;color:var(--text-muted,#aaa);">Migrate to</label>
@@ -12369,7 +12382,7 @@ async function migrateLxcContainer(name) {
                     </select>
                     <span id="migrate-storage-hint" style="font-size:11px;color:var(--text-muted,#666);margin-top:2px;display:block;">Select a target node to load available storages</span></div>
                 <div id="migrate-external-fields" style="display:none;">
-                    <div style="background:rgba(59,130,246,0.1);border:1px solid rgba(59,130,246,0.3);border-radius:8px;padding:10px 12px;margin-bottom:12px;color:#60a5fa;font-size:0.82em;line-height:1.5;">
+                    <div style="background:var(--info-bg);border:1px solid var(--info);border-radius:8px;padding:10px 12px;margin-bottom:12px;color:var(--info);font-size:0.82em;line-height:1.5;">
                         💡 <strong>Cross-cluster migration</strong> lets you move a container to a WolfStack instance on a different network.
                         On the <em>destination</em> cluster, go to <strong>LXC Containers → Generate Transfer Token</strong> to create a one-time token.
                         The token is valid for 30 minutes and authorises this node to push the container to that cluster.
@@ -12436,6 +12449,9 @@ async function doMigrateLxc(name) {
 
     const isExternal = target === '__external__';
     if (isExternal && (!extUrl || !extToken)) { showToast('Enter URL and token', 'error'); return; }
+
+    const lxcTargetLabel = isExternal ? extUrl.replace(/https?:\/\//, '').split('/')[0] : target;
+    const lxcTaskId = taskLogStart(`Migrating LXC '${name}' to ${lxcTargetLabel}`);
 
     // Step definitions
     const steps = [
@@ -12569,6 +12585,7 @@ async function doMigrateLxc(name) {
             resultEl.style.background = 'rgba(16,185,129,0.15)';
             resultEl.style.color = '#10b981';
             resultEl.textContent = data.message || 'Migrated successfully';
+            updateTaskLogEntry(lxcTaskId, { status: 'completed', description: `Migrated LXC '${name}' to ${lxcTargetLabel}` });
             setTimeout(loadLxcContainers, 500);
         } else {
             // Mark current step as failed, leave rest as pending
@@ -12578,6 +12595,7 @@ async function doMigrateLxc(name) {
             resultEl.style.background = 'rgba(239,68,68,0.15)';
             resultEl.style.color = '#ef4444';
             resultEl.textContent = data.error || 'Unknown error';
+            updateTaskLogEntry(lxcTaskId, { status: 'failed', description: `Migrate LXC '${name}': ${data.error || 'Unknown error'}` });
         }
     } catch (e) {
         stepTimers.forEach(t => clearTimeout(t));
@@ -12590,6 +12608,268 @@ async function doMigrateLxc(name) {
         r.style.display = 'block'; r.style.background = 'rgba(239,68,68,0.15)'; r.style.color = '#ef4444';
         r.textContent = e.message;
         document.getElementById('lxc-op-close').style.display = '';
+        updateTaskLogEntry(lxcTaskId, { status: 'failed', description: `Migrate LXC '${name}': ${e.message}` });
+    }
+}
+
+// ─── VM Migration ───
+
+async function migrateVm(name) {
+    let nodes = [];
+    try {
+        const resp = await fetch('/api/nodes');
+        if (resp.ok) {
+            const data = await resp.json();
+            nodes = Array.isArray(data) ? data : (data.nodes || []);
+        }
+    } catch (e) { }
+    const remoteNodes = nodes.filter(n => !n.is_self && n.online)
+        .sort((a, b) => (a.hostname || a.address).localeCompare(b.hostname || b.address));
+
+    const modal = document.createElement('div');
+    modal.id = 'vm-migrate-modal';
+    modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:10000;backdrop-filter:blur(4px);';
+    modal.innerHTML = `
+        <div style="background:var(--card-bg,#1e1e2e);border:1px solid var(--border,#333);border-radius:12px;padding:28px 36px;min-width:420px;max-width:520px;box-shadow:0 20px 60px rgba(0,0,0,0.5);">
+            <h3 style="margin:0 0 16px;color:var(--text,#fff);">Migrate VM</h3>
+            <p style="margin:0 0 12px;color:var(--text-muted,#aaa);font-size:0.9em;">Move <strong>${name}</strong> to another node. The VM will be stopped, its disk image transferred, and then deleted from this node.</p>
+            <div style="background:var(--danger-bg);border:1px solid var(--danger);border-radius:8px;padding:10px 12px;margin-bottom:10px;color:var(--danger);font-size:0.85em;">
+                Warning: The VM will experience downtime during migration. Large disks may take a long time to transfer.
+            </div>
+            <div style="background:var(--warning-bg);border:1px solid var(--warning);border-radius:8px;padding:10px 12px;margin-bottom:16px;color:var(--warning);font-size:0.85em;">
+                Note: After migration you will likely need to update the VM's network settings (IP address, gateway, DNS) on the destination node to match the new network.
+            </div>
+            <div style="display:flex;flex-direction:column;gap:12px;">
+                <div><label style="font-size:13px;color:var(--text-muted,#aaa);">Migrate to</label>
+                    <select id="vm-migrate-target" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;">
+                        <option value="">-- Select a cluster node --</option>
+                        ${remoteNodes.map(n => `<option value="${n.id}">${n.hostname} (${n.address})</option>`).join('')}
+                        <option value="__external__">External cluster...</option>
+                    </select></div>
+                <div><label style="font-size:13px;color:var(--text-muted,#aaa);">Destination Storage</label>
+                    <select id="vm-migrate-storage" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;">
+                        <option value="">Default</option>
+                    </select>
+                    <span id="vm-migrate-storage-hint" style="font-size:11px;color:var(--text-muted,#666);margin-top:2px;display:block;">Select a target node to load available storages</span></div>
+                <div id="vm-migrate-external-fields" style="display:none;">
+                    <div style="background:var(--info-bg);border:1px solid var(--info);border-radius:8px;padding:10px 12px;margin-bottom:12px;color:var(--info);font-size:0.82em;line-height:1.5;">
+                        <strong>Cross-cluster migration</strong>: On the destination cluster, go to <strong>LXC Containers</strong> and click <strong>Generate Transfer Token</strong>. The same token works for VM transfers.
+                    </div>
+                    <label style="font-size:13px;color:var(--text-muted,#aaa);">Target URL</label>
+                    <input id="vm-migrate-ext-url" type="text" placeholder="https://target.example.com:8553" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;margin-bottom:8px;">
+                    <label style="font-size:13px;color:var(--text-muted,#aaa);">Transfer Token</label>
+                    <input id="vm-migrate-ext-token" type="text" placeholder="wst_..." style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;">
+                </div>
+                <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px;">
+                    <button class="btn" onclick="document.getElementById('vm-migrate-modal')?.remove()">Cancel</button>
+                    <button class="btn" style="background:#ef4444;color:#fff;" onclick="doMigrateVm('${name}')">Migrate</button>
+                </div>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+
+    document.getElementById('vm-migrate-target').addEventListener('change', async (e) => {
+        const val = e.target.value;
+        document.getElementById('vm-migrate-external-fields').style.display = val === '__external__' ? 'block' : 'none';
+
+        // Fetch storages from the selected target node
+        const sel = document.getElementById('vm-migrate-storage');
+        const hint = document.getElementById('vm-migrate-storage-hint');
+        sel.innerHTML = '<option value="">Default</option>';
+        if (!val || val === '__external__') {
+            hint.textContent = val === '__external__' ? 'Storage selection is not available for external migrations' : 'Select a target node to load available storages';
+            return;
+        }
+        hint.textContent = 'Loading storages...';
+        try {
+            const resp = await fetch(`/api/nodes/${val}/proxy/storage/list`);
+            if (resp.ok) {
+                const data = await resp.json();
+                const storages = data.storages || [];
+                const suitable = storages.filter(s =>
+                    s.content && s.content.some(c => c === 'rootdir' || c === 'images')
+                );
+                (suitable.length ? suitable : storages.filter(s => s.status === 'active')).forEach(s => {
+                    const free = typeof formatBytes === 'function' ? formatBytes(s.available_bytes) : Math.round(s.available_bytes / 1073741824) + ' GB';
+                    sel.insertAdjacentHTML('beforeend', `<option value="${s.id}">${s.id} (${s.type || ''}, ${free} free)</option>`);
+                });
+                hint.textContent = '';
+            } else {
+                hint.textContent = 'Could not load storages from target node';
+            }
+        } catch (err) {
+            hint.textContent = 'Could not reach target node for storage list';
+        }
+    });
+}
+
+async function doMigrateVm(name) {
+    const target = document.getElementById('vm-migrate-target').value;
+    if (!target) { showToast('Select a target node', 'error'); return; }
+
+    const extUrl = document.getElementById('vm-migrate-ext-url')?.value.trim() || '';
+    const extToken = document.getElementById('vm-migrate-ext-token')?.value.trim() || '';
+    const migrateStorage = document.getElementById('vm-migrate-storage')?.value || '';
+
+    const isExternal = target === '__external__';
+    if (isExternal && (!extUrl || !extToken)) { showToast('Enter URL and token', 'error'); return; }
+
+    document.getElementById('vm-migrate-modal')?.remove();
+
+    const targetLabel = isExternal ? extUrl.replace(/https?:\/\//, '').split('/')[0] : target;
+    const taskId = taskLogStart(`Migrating VM '${name}' to ${targetLabel}`);
+
+    const steps = [
+        { id: 'stop', label: 'Stopping VM', icon: '⏹️' },
+        { id: 'export', label: 'Creating disk archive', icon: '💾' },
+        { id: 'upload', label: isExternal ? `Uploading to ${extUrl.replace(/https?:\/\//, '').split('/')[0]}` : 'Transferring to target node', icon: '📤' },
+        { id: 'import', label: 'Importing on target node', icon: '📥' },
+        { id: 'cleanup', label: 'Cleaning up source', icon: '🧹' },
+    ];
+
+    const modal = document.createElement('div');
+    modal.id = 'vm-op-modal';
+    modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:10000;backdrop-filter:blur(4px);';
+    modal.innerHTML = `
+        <div style="background:var(--card-bg,#1e1e2e);border:1px solid var(--border,#333);border-radius:12px;padding:28px 36px;min-width:440px;max-width:540px;box-shadow:0 20px 60px rgba(0,0,0,0.5);">
+            <h3 style="margin:0 0 6px;color:var(--text,#fff);">Migrating VM</h3>
+            <p style="margin:0 0 16px;color:var(--text-muted,#aaa);font-size:0.85em;">Moving <strong>${name}</strong> — this may take a while for large disk images.</p>
+            <div id="vm-migrate-steps" style="display:flex;flex-direction:column;gap:6px;margin-bottom:16px;">
+                ${steps.map(s => `
+                    <div id="vmstep-${s.id}" style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:8px;background:var(--bg-secondary,#161622);transition:all 0.3s;">
+                        <span class="mstep-icon" style="width:24px;text-align:center;font-size:14px;color:var(--text-muted,#555);">${s.icon}</span>
+                        <span style="flex:1;font-size:0.88em;color:var(--text-muted,#666);">${s.label}</span>
+                        <span class="mstep-status" style="font-size:12px;color:var(--text-muted,#555);min-width:20px;text-align:center;"></span>
+                    </div>
+                `).join('')}
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+                <div id="vm-migrate-spinner" style="width:20px;height:20px;border:3px solid var(--border,#555);border-top:3px solid #3b82f6;border-radius:50%;animation:spin 1s linear infinite;flex-shrink:0;"></div>
+                <span id="vm-migrate-elapsed" style="font-size:0.82em;color:var(--text-muted,#888);">Elapsed: 0s</span>
+            </div>
+            <div id="vm-op-result" style="display:none;margin-top:12px;padding:12px;border-radius:8px;text-align:left;font-size:0.9em;"></div>
+            <button id="vm-op-close" style="display:none;margin-top:12px;" class="btn" onclick="document.getElementById('vm-op-modal')?.remove()">Close</button>
+        </div>
+    `;
+    if (!document.getElementById('lxc-spin-style')) {
+        const s = document.createElement('style'); s.id = 'lxc-spin-style';
+        s.textContent = '@keyframes spin { to { transform: rotate(360deg); } }';
+        document.head.appendChild(s);
+    }
+    document.body.appendChild(modal);
+
+    const startTime = Date.now();
+    const elapsedEl = document.getElementById('vm-migrate-elapsed');
+    const elapsedTimer = setInterval(() => {
+        const secs = Math.floor((Date.now() - startTime) / 1000);
+        const mins = Math.floor(secs / 60);
+        elapsedEl.textContent = mins > 0 ? `Elapsed: ${mins}m ${secs % 60}s` : `Elapsed: ${secs}s`;
+    }, 1000);
+
+    function setVmStepActive(stepId) {
+        const el = document.getElementById('vmstep-' + stepId);
+        if (!el) return;
+        el.style.background = 'rgba(59,130,246,0.15)';
+        el.style.border = '1px solid rgba(59,130,246,0.3)';
+        el.querySelector('.mstep-status').innerHTML = '<div style="width:14px;height:14px;border:2px solid var(--border,#555);border-top:2px solid #3b82f6;border-radius:50%;animation:spin 1s linear infinite;display:inline-block;"></div>';
+        el.querySelector('span:nth-child(2)').style.color = 'var(--text,#fff)';
+    }
+    function setVmStepDone(stepId) {
+        const el = document.getElementById('vmstep-' + stepId);
+        if (!el) return;
+        el.style.background = 'rgba(16,185,129,0.08)';
+        el.style.border = '1px solid rgba(16,185,129,0.2)';
+        el.querySelector('.mstep-status').textContent = '✅';
+        el.querySelector('span:nth-child(2)').style.color = '#10b981';
+    }
+    function setVmStepFailed(stepId) {
+        const el = document.getElementById('vmstep-' + stepId);
+        if (!el) return;
+        el.style.background = 'rgba(239,68,68,0.1)';
+        el.style.border = '1px solid rgba(239,68,68,0.2)';
+        el.querySelector('.mstep-status').textContent = '❌';
+        el.querySelector('span:nth-child(2)').style.color = '#ef4444';
+    }
+
+    let currentStep = 0;
+    const stepTimings = [3000, 15000, 60000, 90000]; // VM disks are larger, longer timings
+    const stepTimers = [];
+
+    setVmStepActive(steps[0].id);
+    for (let i = 0; i < stepTimings.length; i++) {
+        stepTimers.push(setTimeout(() => {
+            setVmStepDone(steps[i].id);
+            if (i + 1 < steps.length) {
+                setVmStepActive(steps[i + 1].id);
+                currentStep = i + 1;
+            }
+        }, stepTimings[i]));
+    }
+
+    try {
+        let resp;
+        if (isExternal) {
+            const extBody = { target_url: extUrl, target_token: extToken, delete_source: true };
+            if (migrateStorage) extBody.storage = migrateStorage;
+            resp = await fetch(apiUrl(`/api/vms/${name}/migrate-external`), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(extBody),
+            });
+        } else {
+            const migrateBody = { target_node: target };
+            if (migrateStorage) migrateBody.storage = migrateStorage;
+            resp = await fetch(apiUrl(`/api/vms/${name}/migrate`), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(migrateBody),
+            });
+        }
+
+        stepTimers.forEach(t => clearTimeout(t));
+        clearInterval(elapsedTimer);
+        const totalSecs = Math.floor((Date.now() - startTime) / 1000);
+        const totalMins = Math.floor(totalSecs / 60);
+        elapsedEl.textContent = totalMins > 0 ? `Completed in ${totalMins}m ${totalSecs % 60}s` : `Completed in ${totalSecs}s`;
+
+        let data;
+        try { data = await resp.json(); } catch { data = {}; }
+
+        const resultEl = document.getElementById('vm-op-result');
+        const spinner = document.getElementById('vm-migrate-spinner');
+        if (spinner) spinner.style.display = 'none';
+        document.getElementById('vm-op-close').style.display = '';
+
+        if (resp.ok) {
+            steps.forEach(s => setVmStepDone(s.id));
+            resultEl.style.display = 'block';
+            resultEl.style.background = 'rgba(16,185,129,0.15)';
+            resultEl.style.color = '#10b981';
+            resultEl.textContent = data.message || 'VM migrated successfully';
+            updateTaskLogEntry(taskId, { status: 'completed', description: `Migrated VM '${name}' to ${targetLabel}` });
+            setTimeout(loadVms, 500);
+        } else {
+            steps.slice(0, currentStep).forEach(s => setVmStepDone(s.id));
+            setVmStepFailed(steps[currentStep].id);
+            resultEl.style.display = 'block';
+            resultEl.style.background = 'rgba(239,68,68,0.15)';
+            resultEl.style.color = '#ef4444';
+            resultEl.textContent = data.error || 'Unknown error';
+            updateTaskLogEntry(taskId, { status: 'failed', description: `Migrate VM '${name}': ${data.error || 'Unknown error'}` });
+        }
+    } catch (e) {
+        stepTimers.forEach(t => clearTimeout(t));
+        clearInterval(elapsedTimer);
+        steps.slice(0, currentStep).forEach(s => setVmStepDone(s.id));
+        setVmStepFailed(steps[currentStep].id);
+        const spinner = document.getElementById('vm-migrate-spinner');
+        if (spinner) spinner.style.display = 'none';
+        const r = document.getElementById('vm-op-result');
+        r.style.display = 'block'; r.style.background = 'rgba(239,68,68,0.15)'; r.style.color = '#ef4444';
+        r.textContent = e.message;
+        document.getElementById('vm-op-close').style.display = '';
+        updateTaskLogEntry(taskId, { status: 'failed', description: `Migrate VM '${name}': ${e.message}` });
     }
 }
 

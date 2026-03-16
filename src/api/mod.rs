@@ -3245,7 +3245,7 @@ pub async fn generate_transfer_token(
 }
 
 /// Validate and consume a transfer token
-fn validate_transfer_token(token: &str) -> bool {
+pub(crate) fn validate_transfer_token(token: &str) -> bool {
     if let Ok(mut tokens) = TRANSFER_TOKENS.lock() {
         tokens.retain(|t| t.expires > std::time::Instant::now()); // purge expired
         if let Some(pos) = tokens.iter().position(|t| t.token == token) {

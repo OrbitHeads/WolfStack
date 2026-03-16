@@ -4,7 +4,7 @@
 
 use actix_web::{web, HttpResponse, HttpRequest};
 use serde::Deserialize;
-use crate::api::{AppState, require_auth};
+use crate::api::{AppState, require_auth, build_node_urls};
 use super::manager::{VmConfig, StorageVolume};
 
 pub fn config(cfg: &mut web::ServiceConfig) {
@@ -13,8 +13,11 @@ pub fn config(cfg: &mut web::ServiceConfig) {
             .route("", web::get().to(list_vms))
             .route("/create", web::post().to(create_vm))
             .route("/storage", web::get().to(list_storage))
+            .route("/import-external", web::post().to(vm_import_external))
             .route("/{name}/action", web::post().to(vm_action))
             .route("/{name}/logs", web::get().to(vm_logs))
+            .route("/{name}/migrate", web::post().to(vm_migrate))
+            .route("/{name}/migrate-external", web::post().to(vm_migrate_external))
             .route("/{name}/volumes", web::post().to(add_volume))
             .route("/{name}/volumes/{vol}", web::delete().to(remove_volume))
             .route("/{name}/volumes/{vol}/resize", web::post().to(resize_volume))
@@ -245,5 +248,309 @@ async fn resize_volume(req: HttpRequest, state: web::Data<AppState>, path: web::
     match manager.resize_volume(&vm_name, &vol_name, body.size_gb) {
         Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "success": true })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
+// ─── VM Migration Endpoints ───
+
+#[derive(Deserialize)]
+struct VmMigrateRequest {
+    target_node: String,
+    new_name: Option<String>,
+    storage: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct VmMigrateExternalRequest {
+    target_url: String,
+    target_token: String,
+    new_name: Option<String>,
+    storage: Option<String>,
+    delete_source: Option<bool>,
+}
+
+/// POST /api/vms/{name}/migrate — migrate VM to another cluster node
+async fn vm_migrate(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<VmMigrateRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let name = path.into_inner();
+    let new_name = body.new_name.as_deref().unwrap_or(&name);
+
+    // Find target node
+    let node = match state.cluster.get_node(&body.target_node) {
+        Some(n) => n,
+        None => return HttpResponse::NotFound().json(serde_json::json!({"error": "Target node not found"})),
+    };
+    if node.is_self {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "Cannot migrate to the same node"}));
+    }
+
+    // Stop the VM before export
+    {
+        let manager = state.vms.lock().unwrap();
+        if let Err(e) = manager.stop_vm(&name) {
+            tracing::warn!("Failed to stop VM '{}' before migration: {}", name, e);
+        }
+    }
+
+    // Export (outside of mutex — this is I/O heavy)
+    let archive_path = match super::manager::export_vm(&name) {
+        Ok(p) => p,
+        Err(e) => {
+            return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("Export failed: {}", e)}));
+        }
+    };
+
+    // Read archive
+    let archive_bytes = match std::fs::read(&archive_path) {
+        Ok(b) => b,
+        Err(e) => {
+            super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
+            return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("Read archive: {}", e)}));
+        }
+    };
+
+    // Build import URLs for the target node
+    let import_urls = if node.node_type == "proxmox" {
+        let mut urls = build_node_urls(&node.address, 8553, "/api/vms/import-external");
+        urls.extend(build_node_urls(&node.address, 8552, "/api/vms/import-external"));
+        urls
+    } else {
+        build_node_urls(&node.address, node.port, "/api/vms/import-external")
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3600)) // 1 hour for large VM disks
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap_or_default();
+
+    let file_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let mut last_err: Option<String> = None;
+
+    let storage_val = body.storage.as_deref().unwrap_or("").to_string();
+
+    for import_url in &import_urls {
+        let form = reqwest::multipart::Form::new()
+            .text("new_name", new_name.to_string())
+            .text("storage", storage_val.clone())
+            .part("archive", reqwest::multipart::Part::bytes(archive_bytes.clone())
+                .file_name(file_name.clone()));
+
+        match client.post(import_url)
+            .header("X-WolfStack-Secret", state.cluster_secret.clone())
+            .multipart(form)
+            .send()
+            .await
+        {
+            Ok(r) => {
+                super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
+                if r.status().is_success() {
+                    // Delete source VM
+                    let manager = state.vms.lock().unwrap();
+                    let _ = manager.delete_vm(&name);
+                    return HttpResponse::Ok().json(serde_json::json!({
+                        "message": format!("VM '{}' migrated to '{}' on node '{}'", name, new_name, body.target_node)
+                    }));
+                } else {
+                    let err_text = r.text().await.unwrap_or_default();
+                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("Import on target failed: {}", err_text)}));
+                }
+            }
+            Err(e) => {
+                last_err = Some(e.to_string());
+                continue;
+            }
+        }
+    }
+
+    // All URLs failed
+    super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
+    HttpResponse::BadGateway().json(serde_json::json!({
+        "error": format!("Transfer to {} failed on all ports/protocols: {}", node.address, last_err.unwrap_or_default())
+    }))
+}
+
+/// POST /api/vms/{name}/migrate-external — migrate VM to external cluster
+async fn vm_migrate_external(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<VmMigrateExternalRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let name = path.into_inner();
+    let new_name = body.new_name.as_deref().unwrap_or(&name);
+
+    // Stop the VM before export
+    {
+        let manager = state.vms.lock().unwrap();
+        if let Err(e) = manager.stop_vm(&name) {
+            tracing::warn!("Failed to stop VM '{}' before migration: {}", name, e);
+        }
+    }
+
+    // Export
+    let archive_path = match super::manager::export_vm(&name) {
+        Ok(p) => p,
+        Err(e) => {
+            return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("Export failed: {}", e)}));
+        }
+    };
+
+    // Read archive
+    let archive_bytes = match std::fs::read(&archive_path) {
+        Ok(b) => b,
+        Err(e) => {
+            super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
+            return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("Read archive: {}", e)}));
+        }
+    };
+
+    // POST to external cluster
+    let import_url = format!("{}/api/vms/import-external", body.target_url.trim_end_matches('/'));
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3600))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap_or_default();
+
+    let form = reqwest::multipart::Form::new()
+        .text("new_name", new_name.to_string())
+        .text("storage", body.storage.as_deref().unwrap_or("").to_string())
+        .part("archive", reqwest::multipart::Part::bytes(archive_bytes)
+            .file_name(archive_path.file_name().unwrap_or_default().to_string_lossy().to_string()));
+
+    let resp = client.post(&import_url)
+        .header("X-Transfer-Token", &body.target_token)
+        .multipart(form)
+        .send()
+        .await;
+
+    super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
+
+    match resp {
+        Ok(r) => {
+            if r.status().is_success() {
+                if body.delete_source.unwrap_or(false) {
+                    let manager = state.vms.lock().unwrap();
+                    let _ = manager.delete_vm(&name);
+                }
+                HttpResponse::Ok().json(serde_json::json!({
+                    "message": format!("VM '{}' transferred to {}", name, body.target_url)
+                }))
+            } else {
+                let err = r.text().await.unwrap_or_default();
+                HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("External import failed: {}", err)}))
+            }
+        }
+        Err(e) => {
+            HttpResponse::BadGateway().json(serde_json::json!({
+                "error": format!("Transfer to {} failed: {}", body.target_url, e)
+            }))
+        }
+    }
+}
+
+/// POST /api/vms/import-external — receive a migrated VM (multipart upload)
+/// Auth: X-WolfStack-Secret (intra-cluster) or X-Transfer-Token (cross-cluster)
+async fn vm_import_external(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    mut payload: actix_multipart::Multipart,
+) -> HttpResponse {
+    // Auth: accept either cluster secret or transfer token
+    let has_secret = req.headers().get("X-WolfStack-Secret")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == state.cluster_secret.as_str())
+        .unwrap_or(false);
+
+    let has_token = req.headers().get("X-Transfer-Token")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| crate::api::validate_transfer_token(v))
+        .unwrap_or(false);
+
+    if !has_secret && !has_token {
+        // Fall back to session auth
+        if let Err(resp) = require_auth(&req, &state) { return resp; }
+    }
+
+    use futures::StreamExt;
+
+    let import_dir = std::path::PathBuf::from("/tmp/wolfstack-vm-imports");
+    let _ = std::fs::create_dir_all(&import_dir);
+
+    let mut new_name: Option<String> = None;
+    let mut storage: Option<String> = None;
+    let mut archive_path: Option<std::path::PathBuf> = None;
+
+    while let Some(item) = payload.next().await {
+        let mut field = match item {
+            Ok(f) => f,
+            Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({"error": format!("Multipart error: {}", e)})),
+        };
+
+        let field_name = field.name().unwrap_or("").to_string();
+        match field_name.as_str() {
+            "new_name" => {
+                let mut buf = Vec::new();
+                while let Some(chunk) = field.next().await {
+                    if let Ok(data) = chunk { buf.extend_from_slice(&data); }
+                }
+                let val = String::from_utf8_lossy(&buf).trim().to_string();
+                if !val.is_empty() { new_name = Some(val); }
+            }
+            "storage" => {
+                let mut buf = Vec::new();
+                while let Some(chunk) = field.next().await {
+                    if let Ok(data) = chunk { buf.extend_from_slice(&data); }
+                }
+                let val = String::from_utf8_lossy(&buf).trim().to_string();
+                if !val.is_empty() { storage = Some(val); }
+            }
+            "archive" => {
+                let fname = format!("vm-import-{}.tar.gz", uuid::Uuid::new_v4());
+                let dest = import_dir.join(&fname);
+                let mut file = match std::fs::File::create(&dest) {
+                    Ok(f) => f,
+                    Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("Failed to create temp file: {}", e)})),
+                };
+                use std::io::Write;
+                while let Some(chunk) = field.next().await {
+                    if let Ok(data) = chunk {
+                        if let Err(e) = file.write_all(&data) {
+                            return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("Write failed: {}", e)}));
+                        }
+                    }
+                }
+                archive_path = Some(dest);
+            }
+            _ => { while let Some(_) = field.next().await {} }
+        }
+    }
+
+    let archive = match archive_path {
+        Some(p) => p,
+        None => return HttpResponse::BadRequest().json(serde_json::json!({"error": "No archive uploaded"})),
+    };
+
+    match super::manager::import_vm(
+        archive.to_str().unwrap_or(""),
+        new_name.as_deref(),
+        storage.as_deref(),
+    ) {
+        Ok(msg) => {
+            let _ = std::fs::remove_file(&archive);
+            HttpResponse::Ok().json(serde_json::json!({"message": msg}))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&archive);
+            HttpResponse::InternalServerError().json(serde_json::json!({"error": e}))
+        }
     }
 }
