@@ -125,7 +125,8 @@ fi
 echo ""
 echo "Updating system packages..."
 if [ "$PKG_MANAGER" = "apt" ]; then
-    apt update -qq && apt upgrade -y -qq
+    apt update -qq 2>/dev/null || echo "  ⚠ Some repositories failed to update (non-critical — continuing)"
+    apt upgrade -y -qq 2>/dev/null || true
 elif [ "$PKG_MANAGER" = "dnf" ]; then
     dnf upgrade -y --quiet
 elif [ "$PKG_MANAGER" = "yum" ]; then
@@ -151,7 +152,7 @@ echo ""
 echo "Installing system dependencies..."
 
 if [ "$PKG_MANAGER" = "apt" ]; then
-    apt update -qq
+    apt update -qq 2>/dev/null || true
     # On Proxmox hosts, QEMU and LXC are already provided by pve-qemu-kvm and lxc-pve.
     # Many Debian packages conflict with PVE equivalents, causing APT to try removing
     # the proxmox-ve metapackage. We must be very conservative on PVE hosts.
@@ -373,8 +374,11 @@ if ! command -v docker >/dev/null 2>&1; then
                 UPSTREAM="ubuntu"
             else
                 CODENAME=$(. /etc/os-release 2>/dev/null && echo "$VERSION_CODENAME")
-                # For derivatives, fall back to a known stable codename
-                if [ -z "$CODENAME" ]; then CODENAME="bookworm"; fi
+                # For rolling/derivative distros (Kali, Parrot, etc.), Docker has no matching repo
+                # Fall back to a known Debian stable codename
+                if [ -z "$CODENAME" ] || echo "$CODENAME" | grep -qiE "rolling|sid|unstable"; then
+                    CODENAME="bookworm"
+                fi
             fi
             echo "  Detected Debian family (${DISTRO_ID}, using ${UPSTREAM}/${CODENAME})"
             apt update -qq 2>/dev/null
