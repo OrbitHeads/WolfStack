@@ -4847,14 +4847,18 @@ pub async fn pbs_status(
     HttpResponse::Ok().json(backup::check_pbs_status(&config))
 }
 
-/// GET /api/backups/pbs/snapshots — list all PBS snapshots
+/// GET /api/backups/pbs/snapshots — list all PBS snapshots, enriched with container details
 pub async fn pbs_snapshots(
     req: HttpRequest, state: web::Data<AppState>,
 ) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
     let config = backup::load_pbs_config();
     match backup::list_pbs_snapshots(&config) {
-        Ok(snapshots) => HttpResponse::Ok().json(snapshots),
+        Ok(snapshots) => {
+            // Enrich ct/vm snapshots with local container/VM details
+            let enriched = backup::enrich_pbs_snapshots(snapshots);
+            HttpResponse::Ok().json(enriched)
+        },
         Err(e) => {
             eprintln!("PBS snapshot list failed: {}", e);
             HttpResponse::Ok().json(serde_json::json!([]))

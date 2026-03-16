@@ -14526,8 +14526,13 @@ async function loadPbsSnapshots() {
                 timeStr = d.toLocaleString();
             }
 
-            // Show name: use comment if available, otherwise backup-id
-            var displayName = comment ? escapeHtml(comment) : escapeHtml(bid);
+            // Show name: hostname if available, then comment, then backup-id
+            var hostname = s.hostname || '';
+            var specs = s.specs || '';
+            var displayName = hostname && hostname !== bid ? bid + ' (' + hostname + ')' : (comment || bid);
+            var detailLine = '';
+            if (specs) detailLine += '<span style="font-size:11px; color:var(--text-muted);">' + escapeHtml(specs) + '</span>';
+            if (comment && hostname) detailLine += (detailLine ? '<br>' : '') + '<span style="font-size:11px; color:var(--text-muted);">' + escapeHtml(comment) + '</span>';
 
             var snapshot = btype + '/' + bid + '/' + btime;
             var snapEsc = escapeHtml(snapshot);
@@ -14535,8 +14540,8 @@ async function loadPbsSnapshots() {
 
             return '<tr>' +
                 '<td>' + emoji + ' ' + escapeHtml(typeLabel) + '</td>' +
-                '<td><strong>' + displayName + '</strong>' +
-                (comment ? '<br><span style="font-size:11px; color:var(--text-muted);">ID: ' + escapeHtml(bid) + '</span>' : '') +
+                '<td><strong>' + escapeHtml(displayName) + '</strong>' +
+                (detailLine ? '<br>' + detailLine : '') +
                 '</td>' +
                 '<td style="font-size:12px;">' + timeStr + '</td>' +
                 '<td>' + formatPbsSize(size) + '</td>' +

@@ -1769,6 +1769,107 @@ pub fn list_pbs_snapshots(storage: &BackupStorage) -> Result<serde_json::Value, 
     Ok(snapshots)
 }
 
+/// Enrich PBS snapshots with local container/VM details (hostname, specs)
+pub fn enrich_pbs_snapshots(snapshots: serde_json::Value) -> serde_json::Value {
+    let arr = match snapshots.as_array() {
+        Some(a) => a,
+        None => return snapshots,
+    };
+
+    // Build a lookup of VMID → (hostname, specs) from pct list + pct config
+    let ct_info = build_pct_lookup();
+
+    let enriched: Vec<serde_json::Value> = arr.iter().map(|snap| {
+        let mut s = snap.clone();
+        let btype = s.get("backup-type").or_else(|| s.get("backup_type"))
+            .and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let bid = s.get("backup-id").or_else(|| s.get("backup_id"))
+            .and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+        if btype == "ct" || btype == "lxc" {
+            if let Some((hostname, specs)) = ct_info.get(&bid) {
+                if let Some(obj) = s.as_object_mut() {
+                    if !hostname.is_empty() {
+                        obj.insert("hostname".to_string(), serde_json::json!(hostname));
+                    }
+                    if !specs.is_empty() {
+                        obj.insert("specs".to_string(), serde_json::json!(specs));
+                    }
+                }
+            }
+        }
+        s
+    }).collect();
+
+    serde_json::json!(enriched)
+}
+
+/// Build a VMID → (hostname, specs) lookup from Proxmox pct list/config
+fn build_pct_lookup() -> std::collections::HashMap<String, (String, String)> {
+    let mut map = std::collections::HashMap::new();
+
+    let output = match Command::new("pct").arg("list").output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return map,
+    };
+
+    let entries: Vec<(String, String)> = output.lines()
+        .skip(1)
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            let vmid = parts.first()?.to_string();
+            let pct_name = parts.last().map(|s| s.to_string()).unwrap_or_default();
+            Some((vmid, pct_name))
+        })
+        .collect();
+
+    // Fetch configs in parallel
+    let configs: Vec<String> = std::thread::scope(|s| {
+        let handles: Vec<_> = entries.iter().map(|(vmid, _)| {
+            let vmid = vmid.clone();
+            s.spawn(move || {
+                Command::new("pct").args(["config", &vmid]).output().ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                    .unwrap_or_default()
+            })
+        }).collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+    });
+
+    for ((vmid, pct_name), cfg) in entries.iter().zip(configs.iter()) {
+        let mut hostname = pct_name.clone();
+        let mut memory_mb: u64 = 0;
+        let mut cores: u64 = 0;
+        let mut os_type = String::new();
+
+        for cline in cfg.lines() {
+            let cline = cline.trim();
+            if cline.starts_with("hostname:") {
+                hostname = cline.split(':').nth(1).unwrap_or("").trim().to_string();
+            } else if cline.starts_with("memory:") {
+                memory_mb = cline.split(':').nth(1).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            } else if cline.starts_with("cores:") {
+                cores = cline.split(':').nth(1).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            } else if cline.starts_with("ostype:") {
+                os_type = cline.split(':').nth(1).unwrap_or("").trim().to_string();
+            }
+        }
+
+        let mut spec_parts = Vec::new();
+        if cores > 0 { spec_parts.push(format!("{} core{}", cores, if cores > 1 { "s" } else { "" })); }
+        if memory_mb > 0 {
+            if memory_mb >= 1024 { spec_parts.push(format!("{}GB RAM", memory_mb / 1024)); }
+            else { spec_parts.push(format!("{}MB RAM", memory_mb)); }
+        }
+        if !os_type.is_empty() { spec_parts.push(os_type); }
+
+        map.insert(vmid.clone(), (hostname, spec_parts.join(", ")));
+    }
+
+    map
+}
+
 /// Restore with real-time progress tracking via callback
 pub fn restore_from_pbs_with_progress<F>(
     storage: &BackupStorage,
