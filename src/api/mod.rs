@@ -34,6 +34,47 @@ pub fn build_node_urls(address: &str, port: u16, path: &str) -> Vec<String> {
     ]
 }
 
+/// Build ordered URLs to try for external (cross-cluster) communication.
+/// Parses the user-provided URL and automatically tries WolfStack (8553) and Proxmox (8006) ports
+/// so the user doesn't have to guess which port the destination is running on.
+pub fn build_external_urls(target_url: &str, path: &str) -> Vec<String> {
+    let trimmed = target_url.trim_end_matches('/');
+
+    // Extract host from URL (scheme://host:port/path → host)
+    let after_scheme = trimmed.find("://")
+        .map(|pos| &trimmed[pos + 3..])
+        .unwrap_or(trimmed);
+    let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
+    let (host, user_port) = match host_port.rfind(':') {
+        Some(pos) => {
+            let port_str = &host_port[pos + 1..];
+            match port_str.parse::<u16>() {
+                Ok(port) => (&host_port[..pos], Some(port)),
+                Err(_) => (host_port, None),
+            }
+        }
+        None => (host_port, None),
+    };
+
+    let mut urls = Vec::new();
+
+    // First: try exactly what the user specified
+    urls.push(format!("{}{}", trimmed, path));
+
+    // Then try WolfStack ports (8553 HTTPS, then HTTP) if not already the user's port
+    if user_port != Some(8553) {
+        urls.push(format!("https://{}:8553{}", host, path));
+        urls.push(format!("http://{}:8553{}", host, path));
+    }
+
+    // Then try Proxmox port (8006 HTTPS) if not already the user's port
+    if user_port != Some(8006) {
+        urls.push(format!("https://{}:8006{}", host, path));
+    }
+
+    urls
+}
+
 /// Progress state for PBS restore operations
 #[derive(Clone, Serialize, Default)]
 pub struct PbsRestoreProgress {
@@ -3414,9 +3455,10 @@ pub async fn lxc_migrate_external(
         }
     };
 
-    // 3. POST to external cluster's import-external endpoint
-    let import_url = format!("{}/api/containers/lxc/import-external", body.target_url.trim_end_matches('/'));
+    // 3. POST to external cluster — automatically tries WolfStack (8553) and Proxmox (8006) ports
+    let import_urls = build_external_urls(&body.target_url, "/api/containers/lxc/import-external");
     let storage_val = body.storage.as_deref().unwrap_or("").to_string();
+    let file_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
@@ -3424,48 +3466,52 @@ pub async fn lxc_migrate_external(
         .build()
         .unwrap_or_default();
 
-    let form = reqwest::multipart::Form::new()
-        .text("new_name", new_name.to_string())
-        .text("storage", storage_val)
-        .text("meta", serde_json::to_string(&meta).unwrap_or_default())
-        .part("archive", reqwest::multipart::Part::bytes(archive_bytes)
-            .file_name(archive_path.file_name().unwrap_or_default().to_string_lossy().to_string()));
+    let mut last_err: Option<String> = None;
 
-    let resp = client.post(&import_url)
-        .header("X-Transfer-Token", &body.target_token)
-        .multipart(form)
-        .send()
-        .await;
+    for import_url in &import_urls {
+        let form = reqwest::multipart::Form::new()
+            .text("new_name", new_name.to_string())
+            .text("storage", storage_val.clone())
+            .text("meta", serde_json::to_string(&meta).unwrap_or_default())
+            .part("archive", reqwest::multipart::Part::bytes(archive_bytes.clone())
+                .file_name(file_name.clone()));
 
-    // Cleanup
-    containers::lxc_export_cleanup(archive_path.to_str().unwrap_or(""));
-
-    match resp {
-        Ok(r) => {
-            if r.status().is_success() {
-                // Optionally destroy source
-                if body.delete_source.unwrap_or(false) {
-                    let _ = containers::lxc_destroy(&name);
-
+        match client.post(import_url)
+            .header("X-Transfer-Token", &body.target_token)
+            .multipart(form)
+            .send()
+            .await
+        {
+            Ok(r) => {
+                containers::lxc_export_cleanup(archive_path.to_str().unwrap_or(""));
+                if r.status().is_success() {
+                    if body.delete_source.unwrap_or(false) {
+                        let _ = containers::lxc_destroy(&name);
+                    } else {
+                        let _ = containers::lxc_start(&name);
+                    }
+                    return HttpResponse::Ok().json(serde_json::json!({
+                        "message": format!("Container '{}' transferred to {}", name, body.target_url)
+                    }));
                 } else {
                     let _ = containers::lxc_start(&name);
+                    let err = r.text().await.unwrap_or_default();
+                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("External import failed: {}", err)}));
                 }
-                HttpResponse::Ok().json(serde_json::json!({
-                    "message": format!("Container '{}' transferred to {}", name, body.target_url)
-                }))
-            } else {
-                let _ = containers::lxc_start(&name);
-                let err = r.text().await.unwrap_or_default();
-                HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("External import failed: {}", err)}))
+            }
+            Err(e) => {
+                last_err = Some(e.to_string());
+                continue;
             }
         }
-        Err(e) => {
-            let _ = containers::lxc_start(&name);
-            HttpResponse::BadGateway().json(serde_json::json!({
-                "error": format!("Transfer to {} failed: {}", body.target_url, e)
-            }))
-        }
     }
+
+    // All URLs failed
+    containers::lxc_export_cleanup(archive_path.to_str().unwrap_or(""));
+    let _ = containers::lxc_start(&name);
+    HttpResponse::BadGateway().json(serde_json::json!({
+        "error": format!("Transfer to {} failed on all ports: {}", body.target_url, last_err.unwrap_or_default())
+    }))
 }
 
 // ─── Mount / Volume Management Endpoints ───

@@ -411,8 +411,8 @@ async fn vm_migrate_external(
         }
     };
 
-    // POST to external cluster
-    let import_url = format!("{}/api/vms/import-external", body.target_url.trim_end_matches('/'));
+    // Build URLs to try — automatically tries WolfStack (8553) and Proxmox (8006) ports
+    let import_urls = crate::api::build_external_urls(&body.target_url, "/api/vms/import-external");
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3600))
@@ -420,41 +420,49 @@ async fn vm_migrate_external(
         .build()
         .unwrap_or_default();
 
-    let form = reqwest::multipart::Form::new()
-        .text("new_name", new_name.to_string())
-        .text("storage", body.storage.as_deref().unwrap_or("").to_string())
-        .part("archive", reqwest::multipart::Part::bytes(archive_bytes)
-            .file_name(archive_path.file_name().unwrap_or_default().to_string_lossy().to_string()));
+    let file_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let storage_val = body.storage.as_deref().unwrap_or("").to_string();
+    let mut last_err: Option<String> = None;
 
-    let resp = client.post(&import_url)
-        .header("X-Transfer-Token", &body.target_token)
-        .multipart(form)
-        .send()
-        .await;
+    for import_url in &import_urls {
+        let form = reqwest::multipart::Form::new()
+            .text("new_name", new_name.to_string())
+            .text("storage", storage_val.clone())
+            .part("archive", reqwest::multipart::Part::bytes(archive_bytes.clone())
+                .file_name(file_name.clone()));
 
-    super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
-
-    match resp {
-        Ok(r) => {
-            if r.status().is_success() {
-                if body.delete_source.unwrap_or(false) {
-                    let manager = state.vms.lock().unwrap();
-                    let _ = manager.delete_vm(&name);
+        match client.post(import_url)
+            .header("X-Transfer-Token", &body.target_token)
+            .multipart(form)
+            .send()
+            .await
+        {
+            Ok(r) => {
+                super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
+                if r.status().is_success() {
+                    if body.delete_source.unwrap_or(false) {
+                        let manager = state.vms.lock().unwrap();
+                        let _ = manager.delete_vm(&name);
+                    }
+                    return HttpResponse::Ok().json(serde_json::json!({
+                        "message": format!("VM '{}' transferred to {}", name, body.target_url)
+                    }));
+                } else {
+                    let err = r.text().await.unwrap_or_default();
+                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("External import failed: {}", err)}));
                 }
-                HttpResponse::Ok().json(serde_json::json!({
-                    "message": format!("VM '{}' transferred to {}", name, body.target_url)
-                }))
-            } else {
-                let err = r.text().await.unwrap_or_default();
-                HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("External import failed: {}", err)}))
+            }
+            Err(e) => {
+                last_err = Some(e.to_string());
+                continue;
             }
         }
-        Err(e) => {
-            HttpResponse::BadGateway().json(serde_json::json!({
-                "error": format!("Transfer to {} failed: {}", body.target_url, e)
-            }))
-        }
     }
+
+    super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
+    HttpResponse::BadGateway().json(serde_json::json!({
+        "error": format!("Transfer to {} failed on all ports: {}", body.target_url, last_err.unwrap_or_default())
+    }))
 }
 
 /// POST /api/vms/import-external — receive a migrated VM (multipart upload)

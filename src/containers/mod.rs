@@ -5828,46 +5828,56 @@ pub fn docker_migrate(container: &str, target_url: &str, remove_source: bool) ->
         ));
     }
 
-    // Step 4: Send the tar to the remote WolfStack node
-    let import_url = format!("{}/api/containers/docker/import?name={}", target_url.trim_end_matches('/'), container);
+    // Step 4: Send the tar to the remote node — try WolfStack (8553) and Proxmox (8006) ports
+    let import_urls = crate::api::build_external_urls(target_url, &format!("/api/containers/docker/import?name={}", container));
 
-    let output = Command::new("curl")
-        .args([
-            "-s", "-f",          // --fail: return error on HTTP errors (4xx, 5xx)
-            "--max-time", "300", // 5 minute timeout for large images
-            "-X", "POST",
-            "-H", "Content-Type: application/octet-stream",
-            "--data-binary", &format!("@{}", export_path),
-            &import_url,
-        ])
-        .output()
-        .map_err(|e| format!("Failed to send to remote: {}", e))?;
+    let mut transfer_ok = false;
+    let mut last_response = String::new();
+    let mut last_stderr = String::new();
+
+    for import_url in &import_urls {
+        let output = Command::new("curl")
+            .args([
+                "-s", "-f", "-k",    // --fail + accept self-signed certs
+                "--connect-timeout", "5",
+                "--max-time", "300", // 5 minute timeout for large images
+                "-X", "POST",
+                "-H", "Content-Type: application/octet-stream",
+                "--data-binary", &format!("@{}", export_path),
+                import_url,
+            ])
+            .output();
+
+        match output {
+            Ok(o) => {
+                last_response = String::from_utf8_lossy(&o.stdout).to_string();
+                last_stderr = String::from_utf8_lossy(&o.stderr).to_string();
+                if o.status.success() && !last_response.contains("\"error\"") {
+                    transfer_ok = true;
+                    break;
+                }
+                // Got an HTTP response but it was an error — stop trying, the port was right
+                if !last_stderr.contains("couldn't connect") && !last_stderr.contains("Connection refused") {
+                    break;
+                }
+            }
+            Err(e) => {
+                last_stderr = e.to_string();
+                continue;
+            }
+        }
+    }
 
     // Clean up temp files
     let _ = std::fs::remove_file(&export_path);
     let _ = Command::new("docker").args(["rmi", &temp_image]).output();
 
-    let response = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    if !output.status.success() {
-        // curl --fail returns non-zero on HTTP errors — do NOT remove the source
-        error!("Migration transfer failed for {}: {} {}", container, stderr, response);
-        // Restart the source container since migration failed
+    if !transfer_ok {
+        error!("Migration transfer failed for {}: {} {}", container, last_stderr, last_response);
         let _ = docker_start(container);
         return Err(format!(
             "Transfer to remote node failed (container preserved on source): {}",
-            if stderr.is_empty() { &response } else { &stderr }
-        ));
-    }
-
-    // Verify the remote actually confirmed success — check for "error" in response
-    if response.contains("\"error\"") {
-        error!("Remote import failed for {}: {}", container, response);
-        let _ = docker_start(container);
-        return Err(format!(
-            "Remote import failed (container preserved on source): {}",
-            response
+            if last_stderr.is_empty() { &last_response } else { &last_stderr }
         ));
     }
 
@@ -5883,7 +5893,7 @@ pub fn docker_migrate(container: &str, target_url: &str, remove_source: bool) ->
 
     }
 
-    Ok(format!("Container migrated to {} successfully. {}", target_url, response))
+    Ok(format!("Container migrated to {} successfully. {}", target_url, last_response))
 }
 
 /// Import a Docker container image from a tar file
