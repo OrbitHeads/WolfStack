@@ -5797,10 +5797,7 @@ pub fn docker_clone(container: &str, new_name: &str) -> Result<String, String> {
 pub fn docker_migrate(container: &str, target_url: &str, _remove_source: bool) -> Result<String, String> {
 
 
-    // Step 1: Stop the container if running
-    let _ = docker_stop(container);
-
-    // Step 2: Commit the container to a temporary image
+    // Step 1: Commit the running container to a temporary image (no stop needed)
     let temp_image = format!("wolfstack-migrate/{}", container);
     let output = Command::new("docker")
         .args(["commit", container, &temp_image])
@@ -5874,18 +5871,14 @@ pub fn docker_migrate(container: &str, target_url: &str, _remove_source: bool) -
 
     if !transfer_ok {
         error!("Migration transfer failed for {}: {} {}", container, last_stderr, last_response);
-        let _ = docker_start(container);
         return Err(format!(
-            "Transfer to remote node failed (container preserved on source): {}",
+            "Transfer failed (source still running): {}",
             if last_stderr.is_empty() { &last_response } else { &last_stderr }
         ));
     }
 
-
-    
-    // Source container is left stopped — user can verify destination then clean up manually
-
-    Ok(format!("Container migrated to {} successfully. Source left stopped — verify destination then delete manually. {}", target_url, last_response))
+    // Source stays running — destination is imported but not started
+    Ok(format!("Container transferred to {}. Destination is stopped — start it manually when ready. {}", target_url, last_response))
 }
 
 /// Import a Docker container image from a tar file

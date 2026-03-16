@@ -3230,13 +3230,8 @@ pub async fn lxc_migrate(
     let name = path.into_inner();
     let new_name = body.new_name.as_deref().unwrap_or(&name);
 
-    // Clone to target node
+    // Clone to target node — source stays running, destination is not started
     let clone_resp = lxc_remote_clone(&state, &name, new_name, &body.target_node, body.storage.as_deref(), None).await;
-
-    // Source container is left intact — user can verify destination then clean up manually
-    if clone_resp.status().is_success() {
-        let _ = containers::lxc_stop(&name);
-    }
 
     clone_resp
 }
@@ -3395,8 +3390,7 @@ async fn lxc_import_endpoint_inner(
             // so it doesn't conflict with the template's IP
             containers::lxc_clone_fixup_ip(&new_name);
 
-            // Start the imported container
-            let _ = containers::lxc_start(&new_name);
+            // Imported container is left stopped — user starts it manually when ready
 
             // Allocate a fresh wolfnet IP — use pre-allocated one from orchestrator if available
             let ip_to_use = wolfnet_ip.clone().or_else(|| containers::next_available_wolfnet_ip());
@@ -3425,7 +3419,7 @@ pub async fn lxc_migrate_external(
     let name = path.into_inner();
     let new_name = body.new_name.as_deref().unwrap_or(&name);
 
-    // 1. Stop and export
+    // 1. Stop temporarily for consistent export, then restart source
     let _ = containers::lxc_stop(&name);
     let (archive_path, meta) = match containers::lxc_export(&name) {
         Ok(v) => v,
@@ -3434,13 +3428,14 @@ pub async fn lxc_migrate_external(
             return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("Export failed: {}", e)}));
         }
     };
+    // Restart source immediately after export — source stays running
+    let _ = containers::lxc_start(&name);
 
     // 2. Read archive
     let archive_bytes = match std::fs::read(&archive_path) {
         Ok(b) => b,
         Err(e) => {
             containers::lxc_export_cleanup(archive_path.to_str().unwrap_or(""));
-            let _ = containers::lxc_start(&name);
             return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("Read archive: {}", e)}));
         }
     };
@@ -3475,12 +3470,11 @@ pub async fn lxc_migrate_external(
             Ok(r) => {
                 containers::lxc_export_cleanup(archive_path.to_str().unwrap_or(""));
                 if r.status().is_success() {
-                    // Source container is left stopped — user can verify destination then clean up manually
+                    // Source is already running — destination is imported but not started
                     return HttpResponse::Ok().json(serde_json::json!({
-                        "message": format!("Container '{}' transferred to {}. Source left stopped — verify destination then delete manually.", name, body.target_url)
+                        "message": format!("Container '{}' transferred to {}. Destination is stopped — start it manually when ready.", name, body.target_url)
                     }));
                 } else {
-                    let _ = containers::lxc_start(&name);
                     let err = r.text().await.unwrap_or_default();
                     return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("External import failed: {}", err)}));
                 }
@@ -3492,9 +3486,8 @@ pub async fn lxc_migrate_external(
         }
     }
 
-    // All URLs failed
+    // All URLs failed — source is still running
     containers::lxc_export_cleanup(archive_path.to_str().unwrap_or(""));
-    let _ = containers::lxc_start(&name);
     HttpResponse::BadGateway().json(serde_json::json!({
         "error": format!("Transfer to {} failed on all ports: {}", body.target_url, last_err.unwrap_or_default())
     }))
@@ -3788,10 +3781,7 @@ pub async fn docker_import(
 
     match containers::docker_import_image(&tar_path, &container_name) {
         Ok(msg) => {
-            // Start the imported container
-            let _ = containers::docker_start(&container_name);
-
-
+            // Imported container is left stopped — user starts it manually when ready
             HttpResponse::Ok().json(serde_json::json!({ "message": msg }))
         },
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),

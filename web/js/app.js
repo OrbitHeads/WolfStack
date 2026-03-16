@@ -12112,7 +12112,7 @@ async function migrateDockerContainer(name) {
             <div style="padding: 1rem;">
                 <p style="margin-bottom: 1rem; color: var(--text-secondary);">
                     This will export the container, transfer it to the target WolfStack node, and import it there.
-                    The container will be stopped during migration.
+                    The source container will keep running. The destination will be imported but not started.
                 </p>
                 <div style="background:var(--warning-bg);border:1px solid var(--warning);border-radius:8px;padding:10px 12px;margin-bottom:1rem;color:var(--warning);font-size:0.85em;">
                     Note: After migration you may need to update the container's network settings (IP address, gateway, DNS) on the destination node to match the new network.
@@ -12130,7 +12130,7 @@ async function migrateDockerContainer(name) {
                     </select>
                 </div>
                 <div style="background:var(--info-bg,#1a2332);border:1px solid var(--info,#3b82f6);border-radius:8px;padding:10px 12px;margin-bottom:1rem;color:var(--info,#3b82f6);font-size:0.82em;">
-                    The source container will be stopped but not deleted. Verify the destination is working, then remove the source manually.
+                    The source container will keep running. The destination will be imported but not started — start it manually when ready.
                 </div>
                 <div style="display:flex; gap:8px;">
                     <button class="btn btn-primary" onclick="doMigrate('${name}')">🚀 Migrate</button>
@@ -12155,7 +12155,7 @@ async function migrateDockerContainer(name) {
                     </select>
                 </div>
                 <div style="background:var(--info-bg,#1a2332);border:1px solid var(--info,#3b82f6);border-radius:8px;padding:10px 12px;margin-bottom:1rem;color:var(--info,#3b82f6);font-size:0.82em;">
-                    The source container will be stopped but not deleted. Verify the destination is working, then remove the source manually.
+                    The source container will keep running. The destination will be imported but not started — start it manually when ready.
                 </div>
                 <div style="display:flex; gap:8px;">
                     <button class="btn btn-primary" onclick="doMigrate('${name}')">🚀 Migrate</button>
@@ -12362,7 +12362,7 @@ async function migrateLxcContainer(name) {
     modal.innerHTML = `
         <div style="background:var(--card-bg,#1e1e2e);border:1px solid var(--border,#333);border-radius:12px;padding:28px 36px;min-width:420px;max-width:520px;box-shadow:0 20px 60px rgba(0,0,0,0.5);">
             <h3 style="margin:0 0 16px;color:var(--text,#fff);">🚀 Migrate Container</h3>
-            <p style="margin:0 0 12px;color:var(--text-muted,#aaa);font-size:0.9em;">Move <strong>${name}</strong> to another node. The container will be stopped, transferred, and destroyed on this node.</p>
+            <p style="margin:0 0 12px;color:var(--text-muted,#aaa);font-size:0.9em;">Copy <strong>${name}</strong> to another node. The source stays running — the destination will be imported but not started.</p>
             <div style="background:var(--danger-bg);border:1px solid var(--danger);border-radius:8px;padding:10px 12px;margin-bottom:10px;color:var(--danger);font-size:0.85em;">
                 ⚠️ The container will experience downtime during migration.
             </div>
@@ -12635,7 +12635,7 @@ async function migrateVm(name) {
     modal.innerHTML = `
         <div style="background:var(--card-bg,#1e1e2e);border:1px solid var(--border,#333);border-radius:12px;padding:28px 36px;min-width:420px;max-width:520px;box-shadow:0 20px 60px rgba(0,0,0,0.5);">
             <h3 style="margin:0 0 16px;color:var(--text,#fff);">Migrate VM</h3>
-            <p style="margin:0 0 12px;color:var(--text-muted,#aaa);font-size:0.9em;">Move <strong>${name}</strong> to another node. The VM will be stopped, its disk image transferred, and then deleted from this node.</p>
+            <p style="margin:0 0 12px;color:var(--text-muted,#aaa);font-size:0.9em;">Copy <strong>${name}</strong> to another node. The source VM stays running — the destination will be imported but not started.</p>
             <div style="background:var(--danger-bg);border:1px solid var(--danger);border-radius:8px;padding:10px 12px;margin-bottom:10px;color:var(--danger);font-size:0.85em;">
                 Warning: The VM will experience downtime during migration. Large disks may take a long time to transfer.
             </div>

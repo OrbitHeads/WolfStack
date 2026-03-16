@@ -290,7 +290,7 @@ async fn vm_migrate(
         return HttpResponse::BadRequest().json(serde_json::json!({"error": "Cannot migrate to the same node"}));
     }
 
-    // Stop the VM before export
+    // Stop VM temporarily for a consistent export, then restart
     {
         let manager = state.vms.lock().unwrap();
         if let Err(e) = manager.stop_vm(&name) {
@@ -302,9 +302,18 @@ async fn vm_migrate(
     let archive_path = match super::manager::export_vm(&name) {
         Ok(p) => p,
         Err(e) => {
+            // Restart source on failure
+            let manager = state.vms.lock().unwrap();
+            let _ = manager.start_vm(&name);
             return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("Export failed: {}", e)}));
         }
     };
+
+    // Restart source immediately after export — source stays running
+    {
+        let manager = state.vms.lock().unwrap();
+        let _ = manager.start_vm(&name);
+    }
 
     // Read archive
     let archive_bytes = match std::fs::read(&archive_path) {
@@ -351,9 +360,9 @@ async fn vm_migrate(
             Ok(r) => {
                 super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
                 if r.status().is_success() {
-                    // Source VM is left stopped — user can verify destination then clean up manually
+                    // Source stays running, destination is stopped
                     return HttpResponse::Ok().json(serde_json::json!({
-                        "message": format!("VM '{}' migrated to '{}' on node '{}'. Source VM left stopped — verify destination then delete manually.", name, new_name, body.target_node)
+                        "message": format!("VM '{}' transferred to '{}' on node '{}'. Destination is stopped — start it manually when ready.", name, new_name, body.target_node)
                     }));
                 } else {
                     let err_text = r.text().await.unwrap_or_default();
@@ -385,7 +394,7 @@ async fn vm_migrate_external(
     let name = path.into_inner();
     let new_name = body.new_name.as_deref().unwrap_or(&name);
 
-    // Stop the VM before export
+    // Stop VM temporarily for a consistent export, then restart
     {
         let manager = state.vms.lock().unwrap();
         if let Err(e) = manager.stop_vm(&name) {
@@ -397,9 +406,17 @@ async fn vm_migrate_external(
     let archive_path = match super::manager::export_vm(&name) {
         Ok(p) => p,
         Err(e) => {
+            let manager = state.vms.lock().unwrap();
+            let _ = manager.start_vm(&name);
             return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("Export failed: {}", e)}));
         }
     };
+
+    // Restart source immediately after export — source stays running
+    {
+        let manager = state.vms.lock().unwrap();
+        let _ = manager.start_vm(&name);
+    }
 
     // Read archive
     let archive_bytes = match std::fs::read(&archive_path) {
@@ -439,9 +456,9 @@ async fn vm_migrate_external(
             Ok(r) => {
                 super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
                 if r.status().is_success() {
-                    // Source VM is left stopped — user can verify destination then clean up manually
+                    // Source stays running, destination is stopped
                     return HttpResponse::Ok().json(serde_json::json!({
-                        "message": format!("VM '{}' transferred to {}. Source VM left stopped — verify destination then delete manually.", name, body.target_url)
+                        "message": format!("VM '{}' transferred to {}. Destination is stopped — start it manually when ready.", name, body.target_url)
                     }));
                 } else {
                     let err = r.text().await.unwrap_or_default();
