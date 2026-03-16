@@ -4767,35 +4767,36 @@ pub async fn backup_stream(
 
     let target = body.target.clone();
 
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    // Use tokio mpsc so we can await recv() without blocking the runtime
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(256);
 
-    // Spawn blocking backup thread
+    // Bridge: backup code uses std::sync::mpsc, so we bridge to tokio channel
+    let (std_tx, std_rx) = std::sync::mpsc::channel::<String>();
+
+    // Spawn the backup in a blocking thread using std channel
     std::thread::spawn(move || {
-        backup::create_backup_with_log(target, storage, tx);
+        backup::create_backup_with_log(target, storage, std_tx);
     });
 
-    // Stream SSE events from the channel
-    let stream = futures::stream::unfold(rx, |rx| async move {
-        // Use spawn_blocking to avoid blocking the async runtime
-        let result = tokio::task::spawn_blocking(move || {
-            match rx.recv_timeout(std::time::Duration::from_secs(300)) {
-                Ok(msg) => Some((msg, rx)),
-                Err(_) => None,
-            }
-        }).await.ok().flatten();
-
-        match result {
-            Some((msg, rx)) => {
-                let event = format!("data: {}\n\n", msg.replace('\n', "\ndata: "));
-                Some((Ok::<_, actix_web::Error>(actix_web::web::Bytes::from(event)), rx))
-            }
-            None => None,
+    // Bridge thread: reads from std channel and forwards to tokio channel
+    tokio::task::spawn_blocking(move || {
+        while let Ok(msg) = std_rx.recv() {
+            if tx.blocking_send(msg).is_err() { break; }
         }
     });
+
+    // Stream SSE events from the tokio channel
+    let stream = async_stream::stream! {
+        while let Some(msg) = rx.recv().await {
+            let event = format!("data: {}\n\n", msg.replace('\n', "\ndata: "));
+            yield Ok::<_, actix_web::Error>(actix_web::web::Bytes::from(event));
+        }
+    };
 
     HttpResponse::Ok()
         .insert_header(("Content-Type", "text/event-stream"))
         .insert_header(("Cache-Control", "no-cache"))
+        .insert_header(("Connection", "keep-alive"))
         .insert_header(("X-Accel-Buffering", "no"))
         .streaming(stream)
 }
