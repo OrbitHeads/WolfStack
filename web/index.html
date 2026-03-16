@@ -1822,14 +1822,14 @@
                     <!-- Saved credentials summary (shown when config is saved) -->
                     <div id="pbs-config-saved" style="display:none;">
                         <div
-                            style="display:grid; grid-template-columns:repeat(auto-fill, minmax(200px, 1fr)); gap:8px; margin-bottom:12px;">
-                            <div><span style="font-size:11px; color:var(--text-muted);">Server</span><br><strong
-                                    id="pbs-saved-server">—</strong></div>
-                            <div><span style="font-size:11px; color:var(--text-muted);">Datastore</span><br><strong
+                            style="display:grid; grid-template-columns:2fr 1fr 1fr 1fr; gap:16px; margin-bottom:12px;">
+                            <div style="min-width:0;"><span style="font-size:11px; color:var(--text-muted);">Server</span><br><strong
+                                    id="pbs-saved-server" style="word-break:break-all;">—</strong></div>
+                            <div style="min-width:0;"><span style="font-size:11px; color:var(--text-muted);">Datastore</span><br><strong
                                     id="pbs-saved-datastore">—</strong></div>
-                            <div><span style="font-size:11px; color:var(--text-muted);">User</span><br><strong
+                            <div style="min-width:0;"><span style="font-size:11px; color:var(--text-muted);">User</span><br><strong
                                     id="pbs-saved-user">—</strong></div>
-                            <div><span style="font-size:11px; color:var(--text-muted);">Auth</span><br><strong
+                            <div style="min-width:0;"><span style="font-size:11px; color:var(--text-muted);">Auth</span><br><strong
                                     id="pbs-saved-auth">—</strong></div>
                         </div>
                         <button class="btn btn-sm" onclick="showPbsConfigForm()"
