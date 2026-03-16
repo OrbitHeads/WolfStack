@@ -732,11 +732,20 @@ fn local_hostname() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
-/// Generate a descriptive comment for a backup target
+/// Get the local cluster name from /etc/wolfstack/self_cluster.json
+fn local_cluster_name() -> String {
+    std::fs::read_to_string("/etc/wolfstack/self_cluster.json")
+        .ok()
+        .and_then(|data| serde_json::from_str::<String>(&data).ok())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "WolfStack".to_string())
+}
+
+/// Generate a descriptive comment for a backup target, prefixed with cluster name
 fn backup_comments(target: &BackupTarget) -> String {
-    match target.target_type {
+    let cluster = local_cluster_name();
+    let detail = match target.target_type {
         BackupTargetType::Docker => {
-            // Get image name and container info
             let image = Command::new("docker")
                 .args(["inspect", "--format", "{{.Config.Image}}", &target.name])
                 .output()
@@ -762,19 +771,19 @@ fn backup_comments(target: &BackupTarget) -> String {
             }
         }
         BackupTargetType::Vm => {
-            // Check if it's a Proxmox VM or local QEMU VM
             let config_path = format!("/var/lib/wolfstack/vms/{}.json", target.name);
             if let Ok(data) = std::fs::read_to_string(&config_path) {
                 if let Ok(vm) = serde_json::from_str::<serde_json::Value>(&data) {
                     let os = vm.get("os").and_then(|v| v.as_str()).unwrap_or("unknown");
                     let mem = vm.get("memory_mb").and_then(|v| v.as_u64()).unwrap_or(0);
-                    return format!("VM: {} (OS: {}, {}MB RAM, disks + config)", target.name, os, mem);
+                    return format!("[{}] VM: {} (OS: {}, {}MB RAM, disks + config)", cluster, target.name, os, mem);
                 }
             }
             format!("VM: {} (disks + config)", target.name)
         }
         BackupTargetType::Config => "WolfStack configuration files".to_string(),
-    }
+    };
+    format!("[{}] {}", cluster, detail)
 }
 
 /// Create a single backup entry — performs the backup and stores it
@@ -1334,6 +1343,8 @@ pub fn create_backup_with_log(
 
     let mut entries = Vec::new();
     let total = targets.len();
+    let cluster = local_cluster_name();
+    let _ = log.send(format!("Cluster: {} | Node: {}", cluster, local_hostname()));
 
     for (i, t) in targets.iter().enumerate() {
         let type_name = t.target_type.to_string().to_uppercase();
@@ -1898,7 +1909,7 @@ pub fn import_backup(data: &[u8], filename: &str) -> Result<String, String> {
         status: BackupStatus::Completed,
         error: String::new(),
         schedule_id: String::new(),
-        comments: format!("Imported backup: {}", filename),
+        comments: format!("[{}] Imported backup: {}", local_cluster_name(), filename),
         node_hostname: local_hostname(),
     });
     let _ = save_config(&config);
