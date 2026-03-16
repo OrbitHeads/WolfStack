@@ -718,5 +718,126 @@ pub fn detect_mysql_containers() -> Vec<serde_json::Value> {
         }
     }
 
+    // ── WolfNet IPs — scan 10.10.10.0/24 for MySQL on port 3306 ──
+    let wolfnet_ips = scan_wolfnet_mysql();
+    let existing_hosts: std::collections::HashSet<String> = results.iter()
+        .filter_map(|r| r.get("host").and_then(|h| h.as_str()).map(|s| s.to_string()))
+        .collect();
+    for (ip, hostname) in wolfnet_ips {
+        if !existing_hosts.contains(&ip) {
+            results.push(serde_json::json!({
+                "name": if hostname.is_empty() { ip.clone() } else { hostname },
+                "image": "mysql (wolfnet)",
+                "runtime": "wolfnet",
+                "host": ip,
+                "port": 3306,
+            }));
+        }
+    }
+
     results
+}
+
+/// Scan WolfNet IPs (10.10.10.0/24) for MySQL on port 3306
+fn scan_wolfnet_mysql() -> Vec<(String, String)> {
+    use std::net::{TcpStream, SocketAddr};
+
+    // Get all IPs with routes in the 10.10.10.0/24 range
+    let output = match std::process::Command::new("ip")
+        .args(["route", "show"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return vec![],
+    };
+
+    let mut ips_to_scan: Vec<String> = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let ip = match line.split_whitespace().next() {
+            Some(ip) if ip.starts_with("10.10.10.") && !ip.contains('/') => ip,
+            _ => continue,
+        };
+        if !ips_to_scan.contains(&ip.to_string()) {
+            ips_to_scan.push(ip.to_string());
+        }
+    }
+
+    // Also scan .wolfnet/ip files in /var/lib/lxc/*/
+    if let Ok(entries) = std::fs::read_dir("/var/lib/lxc") {
+        for entry in entries.flatten() {
+            let ip_file = entry.path().join(".wolfnet/ip");
+            if let Ok(ip) = std::fs::read_to_string(&ip_file) {
+                let ip = ip.trim().to_string();
+                if !ip.is_empty() && !ips_to_scan.contains(&ip) {
+                    ips_to_scan.push(ip);
+                }
+            }
+        }
+    }
+
+    // Scan in parallel with 1-second connect timeout
+    std::thread::scope(|s| {
+        let handles: Vec<_> = ips_to_scan.iter().map(|ip| {
+            let ip = ip.clone();
+            s.spawn(move || {
+                let addr: SocketAddr = match format!("{}:3306", ip).parse() {
+                    Ok(a) => a,
+                    Err(_) => return None,
+                };
+                match TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(1)) {
+                    Ok(_) => {
+                        // Try reverse DNS or hostname lookup
+                        let hostname = resolve_wolfnet_hostname(&ip);
+                        Some((ip, hostname))
+                    }
+                    Err(_) => None,
+                }
+            })
+        }).collect();
+
+        handles.into_iter()
+            .filter_map(|h| h.join().ok().flatten())
+            .collect()
+    })
+}
+
+/// Try to resolve a WolfNet IP to a container hostname
+fn resolve_wolfnet_hostname(ip: &str) -> String {
+    // Check LXC containers for matching WolfNet IP
+    if let Ok(entries) = std::fs::read_dir("/var/lib/lxc") {
+        for entry in entries.flatten() {
+            let ip_file = entry.path().join(".wolfnet/ip");
+            if let Ok(stored_ip) = std::fs::read_to_string(&ip_file) {
+                if stored_ip.trim() == ip {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    // Try to get hostname from config
+                    let config = entry.path().join("config");
+                    if let Ok(content) = std::fs::read_to_string(&config) {
+                        for line in content.lines() {
+                            if line.trim().starts_with("lxc.uts.name") {
+                                if let Some(h) = line.split('=').nth(1) {
+                                    return h.trim().to_string();
+                                }
+                            }
+                        }
+                    }
+                    // Proxmox: try pct config
+                    if let Ok(out) = std::process::Command::new("pct")
+                        .args(["config", &name])
+                        .output()
+                    {
+                        for line in String::from_utf8_lossy(&out.stdout).lines() {
+                            if line.trim().starts_with("hostname:") {
+                                if let Some(h) = line.split(':').nth(1) {
+                                    return h.trim().to_string();
+                                }
+                            }
+                        }
+                    }
+                    return name;
+                }
+            }
+        }
+    }
+    String::new()
 }
