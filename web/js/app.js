@@ -2920,12 +2920,15 @@ async function serviceAction(service, action) {
         const data = await resp.json();
         if (resp.ok) {
             showToast(data.message, 'success');
+            taskLog('Service ' + action + ': ' + service);
         } else {
             showToast(data.error || 'Action failed', 'error');
+            taskLog('Service ' + action + ': ' + service, 'failed');
         }
         loadComponents();
     } catch (e) {
         showToast('Failed: ' + e.message, 'error');
+        taskLog('Service ' + action + ': ' + service, 'failed');
     }
 }
 
@@ -3741,10 +3744,12 @@ async function createStorageMount() {
         });
         const data = await resp.json();
         if (!resp.ok) throw new Error(data.error || 'Failed to create mount');
+        taskLog('Created storage mount: ' + name);
         closeMountModal();
         loadStorageMounts();
     } catch (e) {
         showModal('Error creating mount: ' + e.message);
+        taskLog('Create storage mount: ' + name, 'failed');
     }
 }
 
@@ -3779,12 +3784,14 @@ async function mountStorage(id) {
         document.getElementById('mount-progress-status').textContent = 'Mounted successfully!';
         document.getElementById('mount-progress-status').style.color = 'var(--success)';
         document.getElementById('mount-progress-detail').textContent = data.message || '';
+        taskLog('Mounted storage: ' + name);
     } catch (e) {
         // Error
         document.getElementById('mount-progress-spinner').textContent = '❌';
         document.getElementById('mount-progress-status').textContent = 'Mount Failed';
         document.getElementById('mount-progress-status').style.color = '#ef4444';
         document.getElementById('mount-progress-detail').textContent = e.message;
+        taskLog('Mount storage: ' + name, 'failed');
     }
     // Show OK button
     document.getElementById('mount-progress-footer').style.display = '';
@@ -3796,15 +3803,19 @@ function closeMountProgress() {
 }
 
 async function unmountStorage(id) {
+    const _mount = allStorageMounts.find(m => m.id === id);
+    const _name = _mount ? _mount.name : id;
     try {
         showToast('Unmounting...', 'info');
         const resp = await fetch(apiUrl(`/api/storage/mounts/${id}/unmount`), { method: 'POST' });
         const data = await resp.json();
         if (!resp.ok) throw new Error(data.error || 'Unmount failed');
         showToast(data.message || 'Unmounted', 'success');
+        taskLog('Unmounted storage: ' + _name);
         loadStorageMounts();
     } catch (e) {
         showToast('Unmount error: ' + e.message, 'error');
+        taskLog('Unmount storage: ' + _name, 'failed');
     }
 }
 
@@ -5544,13 +5555,16 @@ async function createVm() {
 
         if (resp.ok) {
             showToast('VM created successfully', 'success');
+            taskLog('Created VM: ' + name);
             closeVmCreate();
             loadVms();
         } else {
             showToast(data.error || 'Failed to create VM', 'error');
+            taskLog('Create VM: ' + name, 'failed');
         }
     } catch (e) {
         showToast('Error: ' + e.message, 'error');
+        taskLog('Create VM: ' + name, 'failed');
     }
 }
 
@@ -5571,13 +5585,16 @@ async function vmAction(name, action, btn) {
         const data = await resp.json();
         if (resp.ok) {
             showToast(`VM ${action}ed`, 'success');
+            taskLog('VM ' + action + ': ' + name);
             setTimeout(loadVms, 2000);
         } else {
             showToast(data.error || 'Action failed', 'error');
+            taskLog('VM ' + action + ': ' + name, 'failed');
             buttons.forEach(b => { b.disabled = false; b.style.opacity = ''; b.style.pointerEvents = ''; });
         }
     } catch (e) {
         showToast('Error: ' + e.message, 'error');
+        taskLog('VM ' + action + ': ' + name, 'failed');
         buttons.forEach(b => { b.disabled = false; b.style.opacity = ''; b.style.pointerEvents = ''; });
     } finally {
         activityStop();
@@ -5591,13 +5608,16 @@ async function deleteVm(name) {
         const resp = await fetch(apiUrl(`/api/vms/${name}`), { method: 'DELETE' });
         if (resp.ok) {
             showToast('VM deleted', 'success');
+            taskLog('Deleted VM: ' + name);
             loadVms();
         } else {
             const data = await resp.json();
             showToast(data.error || 'Failed to delete VM', 'error');
+            taskLog('Delete VM: ' + name, 'failed');
         }
     } catch (e) {
         showToast('Error: ' + e.message, 'error');
+        taskLog('Delete VM: ' + name, 'failed');
     }
 }
 
@@ -5905,12 +5925,15 @@ async function addServer() {
         var data = await resp.json();
         if (data.error) {
             showToast(data.error, 'error');
+            taskLog('Add server: ' + address, 'failed');
             return;
         }
         if (nodeType === 'proxmox' && data.nodes_discovered) {
             showToast('Proxmox cluster added — ' + data.nodes_discovered.length + ' node(s) discovered: ' + data.nodes_discovered.join(', '), 'success');
+            taskLog('Added Proxmox cluster: ' + address);
         } else {
             showToast('Server ' + address + ' added', 'success');
+            taskLog('Added server: ' + address);
             setTimeout(() => showToast('💡 When done adding nodes, use "Update WolfNet Connections" in Cluster Settings to sync networking', 'info'), 1500);
         }
         closeModal();
@@ -5924,6 +5947,7 @@ async function addServer() {
         fetchNodes();
     } catch (e) {
         showToast('Failed: ' + e.message, 'error');
+        taskLog('Add server: ' + address, 'failed');
     }
 }
 
@@ -6162,9 +6186,11 @@ async function removeServer(id) {
     try {
         await fetch(`/api/nodes/${id}`, { method: 'DELETE' });
         showToast('Server removed', 'success');
+        taskLog('Removed server: ' + id);
         fetchNodes();
     } catch (e) {
         showToast('Failed to remove server', 'error');
+        taskLog('Remove server: ' + id, 'failed');
     }
 }
 
@@ -6867,6 +6893,7 @@ async function upgradeNode(nodeId) {
     window.open(url, 'upgrade_console_' + nodeId, 'width=960,height=600,menubar=no,toolbar=no');
 
     showToast('Upgrade started — watch the terminal window for progress.', 'info');
+    taskLog('Upgrade node: ' + machine);
 
     // Close the settings modal
     const modal = document.getElementById('node-settings-modal');
@@ -7041,6 +7068,133 @@ function activityStop() {
 }
 
 // ─── Toast Notifications ───
+// ─── Task Log Footer ───
+
+let _taskLogEntries = [];
+let _taskLogVisible = false;
+let _taskLogBodyVisible = true;
+
+function showTaskLog() {
+    const footer = document.getElementById('task-log-footer');
+    if (footer) { footer.style.display = 'flex'; _taskLogVisible = true; }
+}
+
+function hideTaskLog() {
+    const footer = document.getElementById('task-log-footer');
+    if (footer) { footer.style.display = 'none'; _taskLogVisible = false; }
+}
+
+function toggleTaskLogBody() {
+    _taskLogBodyVisible = !_taskLogBodyVisible;
+    const body = document.getElementById('task-log-body');
+    const chevron = document.getElementById('task-log-chevron');
+    if (body) body.style.display = _taskLogBodyVisible ? '' : 'none';
+    if (chevron) chevron.style.transform = _taskLogBodyVisible ? '' : 'rotate(-90deg)';
+}
+
+function clearTaskLog() {
+    _taskLogEntries = [];
+    renderTaskLog();
+    const spinner = document.getElementById('task-log-spinner');
+    if (spinner) spinner.style.display = 'none';
+}
+
+function addTaskLogEntry(opts) {
+    // opts: { cluster, node, description, status, type, logLines, id }
+    const entry = {
+        id: opts.id || ('task-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6)),
+        time: new Date(),
+        cluster: opts.cluster || '—',
+        node: opts.node || '—',
+        description: opts.description || '',
+        status: opts.status || 'running',
+        type: opts.type || 'info',
+        logLines: opts.logLines || [],
+        expanded: false,
+    };
+    _taskLogEntries.unshift(entry);
+    // Limit to 1000 entries
+    if (_taskLogEntries.length > 1000) _taskLogEntries.length = 1000;
+    showTaskLog();
+    updateTaskLogSpinner();
+    renderTaskLog();
+    return entry.id;
+}
+
+function updateTaskLogEntry(id, updates) {
+    const entry = _taskLogEntries.find(e => e.id === id);
+    if (!entry) return;
+    if (updates.status !== undefined) entry.status = updates.status;
+    if (updates.description !== undefined) entry.description = updates.description;
+    if (updates.logLine) entry.logLines.push(updates.logLine);
+    if (updates.logLines) entry.logLines.push(...updates.logLines);
+    updateTaskLogSpinner();
+    renderTaskLog();
+}
+
+function updateTaskLogSpinner() {
+    const spinner = document.getElementById('task-log-spinner');
+    const hasRunning = _taskLogEntries.some(e => e.status === 'running');
+    if (spinner) spinner.style.display = hasRunning ? '' : 'none';
+}
+
+function renderTaskLog() {
+    const tbody = document.getElementById('task-log-table');
+    const count = document.getElementById('task-log-count');
+    if (!tbody) return;
+    if (count) count.textContent = `(${_taskLogEntries.length})`;
+
+    tbody.innerHTML = _taskLogEntries.map(entry => {
+        const timeStr = entry.time.toLocaleTimeString();
+        const statusBadge = entry.status === 'completed'
+            ? '<span style="color:#22c55e; font-weight:500;">✓ OK</span>'
+            : entry.status === 'failed'
+                ? '<span style="color:#ef4444; font-weight:500;">✗ Failed</span>'
+                : '<span style="color:var(--accent);">⏳ Running</span>';
+
+        const hasLog = entry.logLines.length > 0;
+        const expandBtn = hasLog ? `<span style="cursor:pointer; margin-right:4px; color:var(--text-muted);" onclick="toggleTaskLogExpand('${entry.id}')">${entry.expanded ? '▼' : '▶'}</span>` : '<span style="display:inline-block; width:16px;"></span>';
+
+        let row = `<tr style="border-bottom:1px solid var(--border);">
+            <td style="padding:5px 10px; white-space:nowrap; color:var(--text-muted);">${timeStr}</td>
+            <td style="padding:5px 10px;">${escapeHtml(entry.cluster)}</td>
+            <td style="padding:5px 10px;">${escapeHtml(entry.node)}</td>
+            <td style="padding:5px 10px;">${expandBtn}${escapeHtml(entry.description)}</td>
+            <td style="padding:5px 10px;">${statusBadge}</td>
+        </tr>`;
+
+        if (entry.expanded && hasLog) {
+            row += `<tr><td colspan="5" style="padding:0; border:none;">
+                <div style="background:#0d1117; color:#c9d1d9; font-family:'JetBrains Mono',Consolas,monospace; font-size:11px; line-height:1.5; padding:8px 12px; max-height:200px; overflow-y:auto; white-space:pre-wrap; word-break:break-word; margin:0 10px 6px;">` +
+                entry.logLines.map(line => {
+                    let color = '#c9d1d9';
+                    if (line.includes('✓')) color = '#3fb950';
+                    else if (line.includes('✗') || line.toLowerCase().includes('failed')) color = '#f85149';
+                    else if (line.startsWith('[')) color = '#58a6ff';
+                    else if (line.startsWith('Cluster:')) color = '#d2a8ff';
+                    else if (line.trim().startsWith('INFO:') || line.trim().startsWith('vzdump')) color = '#8b949e';
+                    return `<span style="color:${color}">${escapeHtml(line)}</span>`;
+                }).join('\n') +
+                `</div></td></tr>`;
+        }
+
+        return row;
+    }).join('');
+}
+
+function toggleTaskLogExpand(id) {
+    const entry = _taskLogEntries.find(e => e.id === id);
+    if (entry) { entry.expanded = !entry.expanded; renderTaskLog(); }
+}
+
+/// Quick helper: log a completed action to the task footer
+function taskLog(description, status = 'completed') {
+    const node = currentNodeId ? allNodes.find(n => n.id === currentNodeId) : null;
+    const clusterLabel = node ? (node.cluster_name || node.pve_cluster_name || 'WolfStack') : 'WolfStack';
+    const nodeName = node ? (node.hostname || node.address) : 'local';
+    addTaskLogEntry({ cluster: clusterLabel, node: nodeName, description, status });
+}
+
 function showToast(message, type = 'info', duration = 5000, id = null) {
     // Always create container on document.body so it's never trapped inside
     // a parent with transforms/transitions that break position:fixed
@@ -7233,12 +7387,15 @@ async function detailServiceAction(action) {
         const data = await resp.json();
         if (resp.ok) {
             showToast(data.message, 'success');
+            taskLog('Service ' + action + ': ' + currentComponent);
         } else {
             showToast(data.error || 'Action failed', 'error');
+            taskLog('Service ' + action + ': ' + currentComponent, 'failed');
         }
         setTimeout(() => refreshComponentDetail(currentComponent), 1000);
     } catch (e) {
         showToast('Failed: ' + e.message, 'error');
+        taskLog('Service ' + action + ': ' + currentComponent, 'failed');
     }
 }
 
@@ -10201,13 +10358,16 @@ async function dockerAction(container, action, btn) {
         const data = await resp.json();
         if (resp.ok) {
             showToast(`${action} ${container}: OK`, 'success');
+            taskLog('Docker ' + action + ': ' + container);
             setTimeout(loadDockerContainers, 500);
         } else {
             showToast(data.error || `Failed to ${action}`, 'error');
+            taskLog('Docker ' + action + ': ' + container, 'failed');
             buttons.forEach(b => { b.disabled = false; b.style.opacity = ''; b.style.pointerEvents = ''; });
         }
     } catch (e) {
         showToast(`Failed: ${e.message}`, 'error');
+        taskLog('Docker ' + action + ': ' + container, 'failed');
         buttons.forEach(b => { b.disabled = false; b.style.opacity = ''; b.style.pointerEvents = ''; });
     } finally {
         activityStop();
@@ -10692,13 +10852,16 @@ async function lxcAction(container, action, btn) {
         const data = await resp.json();
         if (resp.ok) {
             showToast(`${action} ${container}: OK`, 'success');
+            taskLog('LXC ' + action + ': ' + container);
             setTimeout(loadLxcContainers, 500);
         } else {
             showToast(data.error || `Failed to ${action}`, 'error');
+            taskLog('LXC ' + action + ': ' + container, 'failed');
             buttons.forEach(b => { b.disabled = false; b.style.opacity = ''; b.style.pointerEvents = ''; });
         }
     } catch (e) {
         showToast(`Failed: ${e.message}`, 'error');
+        taskLog('LXC ' + action + ': ' + container, 'failed');
         buttons.forEach(b => { b.disabled = false; b.style.opacity = ''; b.style.pointerEvents = ''; });
     } finally {
         activityStop();
@@ -12616,12 +12779,15 @@ async function createDockerContainer() {
         const createData = await createResp.json();
         if (createResp.ok) {
             showToast(createData.message || `Container '${name}' created!`, 'success');
+            taskLog('Created Docker container: ' + name);
             setTimeout(loadDockerContainers, 500);
         } else {
             showToast(createData.error || 'Failed to create container', 'error');
+            taskLog('Create Docker container: ' + name, 'failed');
         }
     } catch (e) {
         showToast(`Create failed: ${e.message}`, 'error');
+        taskLog('Create Docker container: ' + name, 'failed');
     }
 }
 // ─── Docker / LXC Volume Mount Helpers ───
@@ -13165,11 +13331,13 @@ async function createLxcContainer() {
 
             const msg = data.message || `Container '${name}' created successfully`;
             showResult(true, msg);
+            taskLog('Created LXC container: ' + name);
             setTimeout(loadLxcContainers, 500);
         } else {
             updateStep('step-template', '❌', 'Failed', true);
             const errMsg = data.error || data.message || `HTTP ${resp.status}: Creation failed`;
             showResult(false, errMsg);
+            taskLog('Create LXC container: ' + name, 'failed');
         }
     } catch (e) {
         updateStep('step-template', '❌', 'Connection error', true);
@@ -13178,6 +13346,7 @@ async function createLxcContainer() {
             errMsg = 'Request timed out or connection lost. The template download may still be running on the server. Check the Proxmox UI or try again in a few minutes.';
         }
         showResult(false, errMsg);
+        taskLog('Create LXC container: ' + name, 'failed');
     }
 }
 
@@ -14095,9 +14264,11 @@ async function backupSelected() {
     const storage = await getSelectedStorage();
     const storageLabel = storage.type === 'pbs' ? `PBS (${storage.pbs_server})` : (storage.path || storage.type);
 
-    // Get the cluster name for the current node so remote nodes use the correct one
+    // Get the cluster name and node for the current node
     const node = currentNodeId ? allNodes.find(n => n.id === currentNodeId) : null;
     const cluster_name = node ? (node.cluster_name || node.pve_cluster_name || 'WolfStack') : null;
+    const nodeName = node ? (node.hostname || node.address) : 'local';
+    const clusterLabel = cluster_name || 'WolfStack';
 
     const backupBtn = document.querySelector('[onclick="backupSelected()"]');
     if (backupBtn) { backupBtn.disabled = true; backupBtn.textContent = '⏳ Backing up...'; }
@@ -14105,34 +14276,39 @@ async function backupSelected() {
     const tbody = document.getElementById('backups-table');
     const allTargets = targets.length === document.querySelectorAll('.backup-target-cb').length;
 
-    // Show log panel
+    // Show log panel in backup table
     if (tbody) showBackupLog(tbody, `Backing up ${targets.length} item${targets.length > 1 ? 's' : ''} to ${storageLabel}...`);
 
+    // Add to task log footer
+    const desc = `Backup ${targets.length} item${targets.length > 1 ? 's' : ''} → ${storageLabel}`;
+    const taskId = addTaskLogEntry({ cluster: clusterLabel, node: nodeName, description: desc, status: 'running' });
+
+    let failed = false;
     try {
-        // Use streaming endpoint for real-time log
         const reqBody = allTargets ? { storage, cluster_name } : { target: targets.length === 1 ? targets[0] : null, storage, cluster_name };
-        // For multiple individual targets, send them one at a time via stream
         if (!allTargets && targets.length > 1) {
             for (let i = 0; i < targets.length; i++) {
-                await runStreamingBackup({ target: targets[i], storage, cluster_name });
+                await runStreamingBackup({ target: targets[i], storage, cluster_name }, taskId);
             }
         } else {
-            await runStreamingBackup(reqBody);
+            await runStreamingBackup(reqBody, taskId);
         }
     } catch (e) {
         appendBackupLog(`Error: ${e.message}`);
         showToast(`Backup error: ${e.message}`, 'error');
+        failed = true;
     }
 
     stopBackupProgressSpinner();
     const titleEl = document.getElementById('backup-progress-title');
     if (titleEl) titleEl.textContent = '✅ Backup complete';
+    updateTaskLogEntry(taskId, { status: failed ? 'failed' : 'completed' });
 
     if (backupBtn) { backupBtn.disabled = false; backupBtn.textContent = '⚡ Backup Now'; }
     setTimeout(() => loadBackups(), 3000);
 }
 
-async function runStreamingBackup(body) {
+async function runStreamingBackup(body, taskId) {
     const res = await fetch(apiUrl('/api/backups/stream'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -14153,13 +14329,16 @@ async function runStreamingBackup(body) {
 
         for (const line of lines) {
             if (line.startsWith('data: ')) {
-                appendBackupLog(line.substring(6));
+                const msg = line.substring(6);
+                appendBackupLog(msg);
+                if (taskId) updateTaskLogEntry(taskId, { logLine: msg });
             }
         }
     }
-    // Process remaining buffer
     if (buffer.startsWith('data: ')) {
-        appendBackupLog(buffer.substring(6));
+        const msg = buffer.substring(6);
+        appendBackupLog(msg);
+        if (taskId) updateTaskLogEntry(taskId, { logLine: msg });
     }
 }
 
@@ -14168,10 +14347,11 @@ async function deleteBackup(id) {
     try {
         const res = await fetch(apiUrl(`/api/backups/${id}`), { method: 'DELETE' });
         const data = await res.json();
-        if (data.error) showToast(`Delete failed: ${data.error}`, 'error');
-        else showToast('Backup deleted', 'success');
+        if (data.error) { showToast(`Delete failed: ${data.error}`, 'error'); taskLog('Delete backup: ' + id, 'failed'); }
+        else { showToast('Backup deleted', 'success'); taskLog('Deleted backup: ' + id); }
     } catch (e) {
         showToast(`Delete error: ${e.message}`, 'error');
+        taskLog('Delete backup: ' + id, 'failed');
     }
     loadBackups();
 }
@@ -14186,10 +14366,11 @@ async function restoreBackup(id) {
     try {
         const res = await fetch(apiUrl(`/api/backups/${id}/restore`), { method: 'POST' });
         const data = await res.json();
-        if (data.error) showToast(`Restore failed: ${data.error}`, 'error');
-        else showToast(data.message || '✅ Restore completed!', 'success');
+        if (data.error) { showToast(`Restore failed: ${data.error}`, 'error'); taskLog('Restore backup: ' + id, 'failed'); }
+        else { showToast(data.message || '✅ Restore completed!', 'success'); taskLog('Restored backup: ' + id); }
     } catch (e) {
         showToast(`Restore error: ${e.message}`, 'error');
+        taskLog('Restore backup: ' + id, 'failed');
     }
     if (btn) { btn.disabled = false; btn.textContent = origText; }
     loadBackups();
@@ -14589,6 +14770,7 @@ async function restorePbsSnapshot(snapshot, backupType) {
         if (data.error) {
             console.error('PBS restore error:', data.error);
             showToast('PBS restore failed: ' + data.error, 'error');
+            taskLog('PBS restore: ' + snapshot, 'failed');
             if (btn) { btn.disabled = false; btn.innerHTML = origText; }
             return;
         }
@@ -14617,10 +14799,12 @@ async function restorePbsSnapshot(snapshot, backupType) {
                     clearInterval(pollInterval);
                     if (progress.success) {
                         showToast('✅ PBS restore complete: ' + progress.message, 'success');
+                        taskLog('PBS restore: ' + snapshot);
                         if (typeof loadContainers === 'function') loadContainers();
                         if (typeof loadVMs === 'function') loadVMs();
                     } else {
                         showToast('❌ PBS restore failed: ' + progress.message, 'error');
+                        taskLog('PBS restore: ' + snapshot, 'failed');
                     }
                     if (btn) { btn.disabled = false; btn.innerHTML = origText; }
                 }
@@ -14632,6 +14816,7 @@ async function restorePbsSnapshot(snapshot, backupType) {
 
     } catch (e) {
         showToast('PBS restore error: ' + e.message, 'error');
+        taskLog('PBS restore: ' + snapshot, 'failed');
         if (btn) { btn.disabled = false; btn.innerHTML = origText; }
     }
 }
@@ -18901,7 +19086,8 @@ async function executeAppStoreInstall() {
             const data = await resp.json().catch(() => ({}));
             if (!resp.ok) throw new Error(data.error || 'Deploy failed');
             showToast(data.message || `${appName} deployed to WolfKube!`, 'success');
-        } catch (e) { showToast('K8s deploy failed: ' + e.message, 'error'); }
+            taskLog('App install (K8s): ' + appName);
+        } catch (e) { showToast('K8s deploy failed: ' + e.message, 'error'); taskLog('App install (K8s): ' + appName, 'failed'); }
         return;
     }
 
@@ -18945,8 +19131,10 @@ async function executeAppStoreInstall() {
         }
 
         showToast(`Installation terminal opened for ${appName}`, 'success');
+        taskLog('App install: ' + appName);
     } catch (e) {
         showToast('Installation failed: ' + e.message, 'error');
+        taskLog('App install: ' + appName, 'failed');
     }
 }
 
@@ -18992,12 +19180,15 @@ async function uninstallApp(installId, name) {
         const data = await res.json();
         if (res.ok) {
             showToast(data.message || `${name} uninstalled`, 'success');
+            taskLog('Uninstalled app: ' + name);
             loadInstalledApps();
         } else {
             showToast(data.error || 'Uninstall failed', 'error');
+            taskLog('Uninstall app: ' + name, 'failed');
         }
     } catch (e) {
         showToast('Uninstall failed: ' + e.message, 'error');
+        taskLog('Uninstall app: ' + name, 'failed');
     }
 }
 
@@ -20380,6 +20571,7 @@ async function executeWolfRunDeploy() {
             }
 
             logStep('✅', 'Deployment complete', 'var(--success)');
+            taskLog('WolfRun deploy: ' + name);
             loadWolfRunServices();
 
             // Auto-close after a short delay
@@ -20390,10 +20582,12 @@ async function executeWolfRunDeploy() {
         } else {
             logStep('❌', `Error: ${data.error || 'Deploy failed'}`, 'var(--danger)');
             showToast(data.error || 'Deploy failed', 'error');
+            taskLog('WolfRun deploy: ' + name, 'failed');
         }
     } catch (e) {
         logStep('❌', `Connection failed: ${e.message}`, 'var(--danger)');
         showToast('Deploy failed: ' + e.message, 'error');
+        taskLog('WolfRun deploy: ' + name, 'failed');
     } finally {
         btn.disabled = false;
         btn.textContent = '🚀 Deploy';
@@ -20532,12 +20726,15 @@ async function wolfrunAction(serviceId, action) {
         if (resp.ok) {
             const label = action.charAt(0).toUpperCase() + action.slice(1);
             showToast(`${label}: ${data.ok} succeeded${data.failed ? ', ' + data.failed + ' failed' : ''}`, data.failed ? 'warning' : 'success');
+            taskLog('WolfRun ' + action + ': ' + serviceId);
             setTimeout(() => loadWolfRunServices(), 1500);
         } else {
             showToast(data.error || `${action} failed`, 'error');
+            taskLog('WolfRun ' + action + ': ' + serviceId, 'failed');
         }
     } catch (e) {
         showToast(`${action} failed: ` + e.message, 'error');
+        taskLog('WolfRun ' + action + ': ' + serviceId, 'failed');
     }
 }
 
@@ -20704,6 +20901,7 @@ async function executeWolfRunDelete() {
             }
             addLog('', '');
             addLog('✅ Service deleted successfully!', '#10b981');
+            taskLog('WolfRun delete: ' + (document.getElementById('wolfrun-delete-name')?.textContent || wolfrunDeleteServiceId));
             setTimeout(() => {
                 closeWolfRunDeleteModal();
                 loadWolfRunServices();
@@ -20711,9 +20909,11 @@ async function executeWolfRunDelete() {
         } else {
             const data = await resp.json().catch(() => ({}));
             addLog(`❌ Delete failed: ${data.error || resp.statusText}`, '#ef4444');
+            taskLog('WolfRun delete: ' + wolfrunDeleteServiceId, 'failed');
         }
     } catch (e) {
         addLog(`❌ Error: ${e.message}`, '#ef4444');
+        taskLog('WolfRun delete: ' + wolfrunDeleteServiceId, 'failed');
     }
 }
 
@@ -22824,8 +23024,9 @@ async function k8sDeletePod(name, namespace) {
         const resp = await fetch(`/api/kubernetes/clusters/${k8sCurrentCluster}/pods/${name}?namespace=${encodeURIComponent(namespace)}`, { method: 'DELETE' });
         if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Failed');
         showToast(`Pod "${name}" deleted`, 'success');
+        taskLog('K8s delete pod: ' + name);
         switchK8sTab('pods');
-    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); taskLog('K8s delete pod: ' + name, 'failed'); }
 }
 
 async function k8sDeleteDeployment(name, namespace) {
@@ -22834,8 +23035,9 @@ async function k8sDeleteDeployment(name, namespace) {
         const resp = await fetch(`/api/kubernetes/clusters/${k8sCurrentCluster}/deployments/${name}?namespace=${encodeURIComponent(namespace)}`, { method: 'DELETE' });
         if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Failed');
         showToast(`Deployment "${name}" deleted`, 'success');
+        taskLog('K8s delete deployment: ' + name);
         switchK8sTab('deployments');
-    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); taskLog('K8s delete deployment: ' + name, 'failed'); }
 }
 
 async function k8sRestartDeployment(name, namespace) {
@@ -22843,8 +23045,9 @@ async function k8sRestartDeployment(name, namespace) {
         const resp = await fetch(`/api/kubernetes/clusters/${k8sCurrentCluster}/deployments/${name}/restart?namespace=${encodeURIComponent(namespace)}`, { method: 'POST' });
         if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Failed');
         showToast(`Deployment "${name}" restarting`, 'success');
+        taskLog('K8s restart deployment: ' + name);
         setTimeout(() => switchK8sTab('deployments'), 2000);
-    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); taskLog('K8s restart deployment: ' + name, 'failed'); }
 }
 
 async function k8sDeleteService(name, namespace) {
@@ -22895,8 +23098,9 @@ async function k8sScaleDeployment(name, namespace) {
         });
         if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Failed');
         showToast(`Scaled "${name}" to ${replicas} replicas`, 'success');
+        taskLog('K8s scale deployment: ' + name + ' to ' + replicas);
         setTimeout(() => switchK8sTab('deployments'), 1000);
-    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); taskLog('K8s scale deployment: ' + name, 'failed'); }
 }
 
 function showK8sCreateNamespaceModal() {
@@ -23725,8 +23929,10 @@ async function k8sProvision() {
 
         // Show the provisioning console view
         renderK8sProvisionConsole(data, agentNodeIds);
+        taskLog('K8s provision cluster: ' + name);
     } catch (e) {
         showToast('Provisioning failed: ' + e.message, 'error');
+        taskLog('K8s provision cluster: ' + name, 'failed');
     }
 }
 

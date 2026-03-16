@@ -1144,6 +1144,10 @@ body.sidebar-collapsed .main-content {
     margin-left: 0;
 }
 
+body.sidebar-collapsed #task-log-footer {
+    left: 0;
+}
+
 .sidebar-toggle {
     display: flex;
     align-items: center;
@@ -2850,6 +2854,10 @@ body.sidebar-collapsed .main-content {
 
     .main-content {
         margin-left: 0;
+    }
+
+    #task-log-footer {
+        left: 0 !important;
     }
 
     body.sidebar-collapsed .main-content {
