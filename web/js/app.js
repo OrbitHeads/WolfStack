@@ -12449,8 +12449,8 @@ async function migrateLxcContainer(name) {
             try {
                 const resp = await fetch(`/api/storage/remote-list?url=${encodeURIComponent(url)}`);
                 if (resp.ok) { lxcPopulateStorages(await resp.json()); }
-                else { hint.textContent = 'Could not reach remote cluster — check the URL'; }
-            } catch { hint.textContent = 'Could not reach remote cluster — check the URL'; }
+                else { const d = await resp.json().catch(() => ({})); hint.textContent = d.error || 'Could not reach remote cluster'; }
+            } catch { hint.textContent = 'Could not reach remote cluster'; }
         }, 800);
     });
 }
@@ -12737,8 +12737,8 @@ async function migrateVm(name) {
             try {
                 const resp = await fetch(`/api/storage/remote-list?url=${encodeURIComponent(url)}`);
                 if (resp.ok) { vmPopulateStorages(await resp.json()); }
-                else { hint.textContent = 'Could not reach remote cluster — check the URL'; }
-            } catch { hint.textContent = 'Could not reach remote cluster — check the URL'; }
+                else { const d = await resp.json().catch(() => ({})); hint.textContent = d.error || 'Could not reach remote cluster'; }
+            } catch { hint.textContent = 'Could not reach remote cluster'; }
         }, 800);
     });
 }

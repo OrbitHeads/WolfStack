@@ -2677,11 +2677,13 @@ pub async fn remote_storage_list(
 
     let urls = build_external_urls(&target, "/api/storage/list");
     let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(10))
         .danger_accept_invalid_certs(true)
         .build()
         .unwrap_or_default();
 
+    let mut last_err = String::new();
     for url in &urls {
         match client.get(url)
             .header("X-WolfStack-Secret", state.cluster_secret.clone())
@@ -2694,12 +2696,19 @@ pub async fn remote_storage_list(
                     .content_type("application/json")
                     .body(body);
             }
-            Ok(_) => continue,
-            Err(_) => continue,
+            Ok(r) => {
+                last_err = format!("{}: HTTP {}", url, r.status());
+                continue;
+            }
+            Err(e) => {
+                last_err = format!("{}: {}", url, e);
+                continue;
+            }
         }
     }
 
-    HttpResponse::BadGateway().json(serde_json::json!({"error": "Could not reach remote cluster"}))
+    tracing::warn!("remote_storage_list failed for '{}': {}", target, last_err);
+    HttpResponse::BadGateway().json(serde_json::json!({"error": format!("Could not reach remote cluster: {}", last_err)}))
 }
 
 /// GET /api/storage/list — list available storage locations (Proxmox-aware)
