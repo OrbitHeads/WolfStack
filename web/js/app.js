@@ -7077,11 +7077,49 @@ let _taskLogBodyVisible = true;
 function showTaskLog() {
     const footer = document.getElementById('task-log-footer');
     if (footer) { footer.style.display = 'flex'; _taskLogVisible = true; }
+    updateTaskLogToggleBtn();
+    repositionAiBubble();
 }
 
 function hideTaskLog() {
     const footer = document.getElementById('task-log-footer');
     if (footer) { footer.style.display = 'none'; _taskLogVisible = false; }
+    updateTaskLogToggleBtn();
+    repositionAiBubble();
+}
+
+function toggleTaskLogVisible() {
+    if (_taskLogVisible) hideTaskLog();
+    else showTaskLog();
+}
+
+function updateTaskLogToggleBtn() {
+    const btn = document.getElementById('task-log-toggle-btn');
+    const badge = document.getElementById('task-log-badge');
+    if (!btn) return;
+    // Show the button once we have any entries
+    if (_taskLogEntries.length > 0) btn.style.display = 'flex';
+    // Show badge with running count when footer is hidden
+    const runningCount = _taskLogEntries.filter(e => e.status === 'running').length;
+    if (badge) {
+        if (!_taskLogVisible && runningCount > 0) {
+            badge.style.display = '';
+            badge.textContent = runningCount;
+        } else {
+            badge.style.display = 'none';
+        }
+    }
+}
+
+function repositionAiBubble() {
+    const bubble = document.getElementById('ai-chat-bubble');
+    const panel = document.getElementById('ai-chat-panel');
+    if (bubble) {
+        bubble.style.bottom = _taskLogVisible ? '236px' : '24px';
+    }
+    if (panel) {
+        panel.style.bottom = _taskLogVisible ? '302px' : '90px';
+    }
 }
 
 function toggleTaskLogBody() {
@@ -7136,6 +7174,7 @@ function updateTaskLogSpinner() {
     const spinner = document.getElementById('task-log-spinner');
     const hasRunning = _taskLogEntries.some(e => e.status === 'running');
     if (spinner) spinner.style.display = hasRunning ? '' : 'none';
+    updateTaskLogToggleBtn();
 }
 
 function renderTaskLog() {
