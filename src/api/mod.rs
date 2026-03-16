@@ -2931,7 +2931,7 @@ pub async fn docker_migrate(
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let id = path.into_inner();
     let remove = body.remove_source.unwrap_or(false);
-    match containers::docker_migrate(&id, &body.target_url, remove) {
+    match containers::docker_migrate(&id, &body.target_url, remove, &state.cluster_secret) {
         Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
     }
@@ -3282,24 +3282,29 @@ pub(crate) fn validate_transfer_token(token: &str) -> bool {
     false
 }
 
-/// POST /api/containers/lxc/import-external — import from external cluster (requires transfer token)
+/// POST /api/containers/lxc/import-external — import from external cluster
+/// Auth: X-WolfStack-Secret (same cluster) or X-Transfer-Token (cross-cluster) or session cookie
 pub async fn lxc_import_external(
     req: HttpRequest,
-    _state: web::Data<AppState>,
+    state: web::Data<AppState>,
     mut payload: actix_multipart::Multipart,
 ) -> HttpResponse {
-    // Extract token from header
-    let token = match req.headers().get("X-Transfer-Token") {
-        Some(v) => v.to_str().unwrap_or("").to_string(),
-        None => return HttpResponse::Unauthorized().json(serde_json::json!({"error": "X-Transfer-Token header required"})),
-    };
+    // Accept cluster secret (same cluster), transfer token (cross-cluster), or session auth
+    let has_secret = req.headers().get("X-WolfStack-Secret")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == state.cluster_secret.as_str())
+        .unwrap_or(false);
 
-    if !validate_transfer_token(&token) {
-        return HttpResponse::Forbidden().json(serde_json::json!({"error": "Invalid or expired transfer token"}));
+    let has_token = req.headers().get("X-Transfer-Token")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| validate_transfer_token(v))
+        .unwrap_or(false);
+
+    if !has_secret && !has_token {
+        if let Err(resp) = require_auth(&req, &state) { return resp; }
     }
 
-
-    // Delegate to the standard import logic (re-auth not needed — token was validated)
+    // Delegate to the standard import logic
     lxc_import_endpoint_inner(&mut payload).await
 }
 
@@ -3463,6 +3468,7 @@ pub async fn lxc_migrate_external(
 
         match client.post(import_url)
             .header("X-Transfer-Token", &body.target_token)
+            .header("X-WolfStack-Secret", state.cluster_secret.clone())
             .multipart(form)
             .send()
             .await
@@ -3750,15 +3756,23 @@ pub async fn network_conflicts(
 }
 
 /// POST /api/containers/docker/import — receive a migrated container image
-/// Accepts the tar file as raw body bytes, container name via query param
+/// Auth: X-WolfStack-Secret (same cluster) or X-Transfer-Token (cross-cluster) or session cookie
 pub async fn docker_import(
     req: HttpRequest,
     state: web::Data<AppState>,
     body: web::Bytes,
     query: web::Query<std::collections::HashMap<String, String>>,
 ) -> HttpResponse {
-    // Require cluster auth — this is for inter-node communication during migration
-    if let Err(resp) = require_cluster_auth(&req, &state) { return resp; }
+    let has_secret = require_cluster_auth(&req, &state).is_ok();
+
+    let has_token = req.headers().get("X-Transfer-Token")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| validate_transfer_token(v))
+        .unwrap_or(false);
+
+    if !has_secret && !has_token {
+        if let Err(resp) = require_auth(&req, &state) { return resp; }
+    }
 
     let container_name = query.get("name")
         .cloned()

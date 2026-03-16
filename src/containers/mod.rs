@@ -5794,7 +5794,7 @@ pub fn docker_clone(container: &str, new_name: &str) -> Result<String, String> {
 
 /// Migrate a Docker container to a remote WolfStack node
 /// Exports the container, sends it to the target, imports and optionally starts it
-pub fn docker_migrate(container: &str, target_url: &str, _remove_source: bool) -> Result<String, String> {
+pub fn docker_migrate(container: &str, target_url: &str, _remove_source: bool, cluster_secret: &str) -> Result<String, String> {
 
 
     // Step 1: Commit the running container to a temporary image (no stop needed)
@@ -5832,6 +5832,7 @@ pub fn docker_migrate(container: &str, target_url: &str, _remove_source: bool) -
     let mut last_response = String::new();
     let mut last_stderr = String::new();
 
+    let secret_header = format!("X-WolfStack-Secret: {}", cluster_secret);
     for import_url in &import_urls {
         let output = Command::new("curl")
             .args([
@@ -5840,6 +5841,7 @@ pub fn docker_migrate(container: &str, target_url: &str, _remove_source: bool) -
                 "--max-time", "300", // 5 minute timeout for large images
                 "-X", "POST",
                 "-H", "Content-Type: application/octet-stream",
+                "-H", &secret_header,
                 "--data-binary", &format!("@{}", export_path),
                 import_url,
             ])
