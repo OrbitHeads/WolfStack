@@ -1029,18 +1029,22 @@ fn store_pbs_with_notes(local_path: &Path, storage: &BackupStorage, filename: &s
 
     // Set snapshot notes with cluster/node/container metadata for identification
     if let Some(notes_text) = notes {
-        // Find the snapshot we just created — it's the latest one for this backup-id
-        // proxmox-backup-client snapshot notes update <snapshot> --notes "text"
-        let snapshot_output = Command::new("proxmox-backup-client")
-            .args(["snapshot", "list", "--output-format", "json", "--repository", &repo])
-            .env("PBS_FINGERPRINT", &storage.pbs_fingerprint)
-            .env("PBS_PASSWORD", pbs_pw)
-            .output();
+        // Find the snapshot we just created — latest one matching our backup-type/id
+        let mut list_cmd = Command::new("proxmox-backup-client");
+        list_cmd.args(["snapshot", "list", "--output-format", "json", "--repository", &repo]);
+        if !storage.pbs_fingerprint.is_empty() {
+            list_cmd.env("PBS_FINGERPRINT", &storage.pbs_fingerprint);
+        }
+        if !storage.pbs_namespace.is_empty() {
+            list_cmd.arg("--ns").arg(&storage.pbs_namespace);
+        }
+        if !pbs_pw.is_empty() {
+            list_cmd.env("PBS_PASSWORD", pbs_pw);
+        }
 
-        if let Ok(snap_out) = snapshot_output {
+        if let Ok(snap_out) = list_cmd.output() {
             if let Ok(snaps) = serde_json::from_slice::<serde_json::Value>(&snap_out.stdout) {
                 if let Some(arr) = snaps.as_array() {
-                    // Find our snapshot: matching backup-type and backup-id, newest
                     let mut best_time: i64 = 0;
                     let mut best_snap = String::new();
                     for s in arr {
@@ -1053,16 +1057,26 @@ fn store_pbs_with_notes(local_path: &Path, storage: &BackupStorage, filename: &s
                         }
                     }
                     if !best_snap.is_empty() {
+                        // proxmox-backup-client snapshot notes update <snapshot> --notes <text> --repository <repo>
                         let mut notes_cmd = Command::new("proxmox-backup-client");
-                        notes_cmd.args(["snapshot", "notes", "set", &best_snap,
-                                       "--repository", &repo, notes_text]);
+                        notes_cmd.args(["snapshot", "notes", "update", &best_snap,
+                                       "--notes", notes_text, "--repository", &repo]);
                         if !storage.pbs_fingerprint.is_empty() {
                             notes_cmd.env("PBS_FINGERPRINT", &storage.pbs_fingerprint);
+                        }
+                        if !storage.pbs_namespace.is_empty() {
+                            notes_cmd.arg("--ns").arg(&storage.pbs_namespace);
                         }
                         if !pbs_pw.is_empty() {
                             notes_cmd.env("PBS_PASSWORD", pbs_pw);
                         }
-                        let _ = notes_cmd.output(); // Best-effort
+                        let notes_result = notes_cmd.output();
+                        if let Ok(out) = &notes_result {
+                            if !out.status.success() {
+                                warn!("Failed to set PBS snapshot notes: {}",
+                                    String::from_utf8_lossy(&out.stderr));
+                            }
+                        }
                     }
                 }
             }
