@@ -5795,7 +5795,10 @@ pub fn docker_clone(container: &str, new_name: &str) -> Result<String, String> {
 /// Migrate a Docker container to a remote WolfStack node
 /// Exports the container, sends it to the target, imports and optionally starts it
 pub fn docker_migrate(container: &str, target_url: &str, _remove_source: bool, cluster_secret: &str) -> Result<String, String> {
-
+    // Validate container name to prevent path traversal in export path and URL
+    if !crate::auth::is_safe_name(container) {
+        return Err("Invalid container name".to_string());
+    }
 
     // Step 1: Commit the running container to a temporary image (no stop needed)
     let temp_image = format!("wolfstack-migrate/{}", container);

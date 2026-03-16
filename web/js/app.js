@@ -12549,7 +12549,7 @@ async function doMigrateLxc(name) {
             resp = await fetch(apiUrl(`/api/containers/lxc/${name}/migrate-external`), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ target_url: extUrl, target_token: extToken }),
+                body: JSON.stringify({ target_url: extUrl, target_token: extToken, ...(migrateStorage && { storage: migrateStorage }) }),
             });
         } else {
             const targetNode = allNodes.find(n => n.id === target);

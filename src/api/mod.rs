@@ -3111,24 +3111,26 @@ async fn lxc_remote_clone(
         }
     }
 
-    // 2. Stop container before export
+    // 2. Stop container temporarily for consistent export, then restart immediately
     let _ = containers::lxc_stop(source);
 
     // 3. Export container
     let (archive_path, meta) = match containers::lxc_export(source) {
         Ok(v) => v,
         Err(e) => {
-            let _ = containers::lxc_start(source); // restart on failure
+            let _ = containers::lxc_start(source);
             return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("Export failed: {}", e)}));
         }
     };
+
+    // Restart source immediately after export — source stays running during transfer
+    let _ = containers::lxc_start(source);
 
     // 4. Read archive
     let archive_bytes = match std::fs::read(&archive_path) {
         Ok(b) => b,
         Err(e) => {
             containers::lxc_export_cleanup(archive_path.to_str().unwrap_or(""));
-            let _ = containers::lxc_start(source);
             return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("Failed to read archive: {}", e)}));
         }
     };
@@ -3179,10 +3181,7 @@ async fn lxc_remote_clone(
             .await
         {
             Ok(r) => {
-                // Cleanup export
                 containers::lxc_export_cleanup(archive_path.to_str().unwrap_or(""));
-                let _ = containers::lxc_start(source); // restart source
-
                 if r.status().is_success() {
                     return match r.json::<serde_json::Value>().await {
                         Ok(data) => HttpResponse::Ok().json(serde_json::json!({
@@ -3205,9 +3204,8 @@ async fn lxc_remote_clone(
         }
     }
 
-    // All URLs failed
+    // All URLs failed — source is already running
     containers::lxc_export_cleanup(archive_path.to_str().unwrap_or(""));
-    let _ = containers::lxc_start(source); // restart source
     HttpResponse::BadGateway().json(serde_json::json!({
         "error": format!("Transfer to {} failed on all ports/protocols: {}", node.address, last_err.unwrap_or_default())
     }))
@@ -3395,9 +3393,8 @@ async fn lxc_import_endpoint_inner(
                 if !s.is_empty() { wolfnet_ip = Some(s); }
             }
             "archive" => {
-                let filename = field.content_disposition()
-                    .and_then(|cd| cd.get_filename().map(|s| s.to_string()))
-                    .unwrap_or_else(|| "import.tar.gz".to_string());
+                // Use UUID filename to prevent path traversal and concurrent collision
+                let filename = format!("lxc-import-{}.tar.gz", uuid::Uuid::new_v4());
                 let dest = import_dir.join(&filename);
                 let mut file = match std::fs::File::create(&dest) {
                     Ok(f) => f,
@@ -3419,6 +3416,9 @@ async fn lxc_import_endpoint_inner(
 
     if new_name.is_empty() {
         return HttpResponse::BadRequest().json(serde_json::json!({"error": "new_name is required"}));
+    }
+    if !crate::auth::is_safe_name(&new_name) {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "Invalid container name"}));
     }
     let archive = match archive_path {
         Some(p) => p,
@@ -3510,7 +3510,6 @@ pub async fn lxc_migrate_external(
 
         match client.post(import_url)
             .header("X-Transfer-Token", &body.target_token)
-            .header("X-WolfStack-Secret", state.cluster_secret.clone())
             .multipart(form)
             .send()
             .await
