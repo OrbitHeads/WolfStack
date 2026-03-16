@@ -13790,6 +13790,7 @@ async function loadBackups() {
         const backups = await backupsRes.json();
         const schedules = await schedulesRes.json();
         const targets = await targetsRes.json();
+        window._backupTargets = targets; // Store for PBS snapshot enrichment
         renderBackupTargets(targets);
         renderBackupHistory(backups);
         renderSchedules(schedules);
@@ -14461,6 +14462,22 @@ async function loadPbsSnapshots() {
             return;
         }
         if (empty) empty.style.display = 'none';
+
+        // Enrich PBS snapshots with backup target details from loaded targets
+        const targets = window._backupTargets || [];
+        const targetMap = {};
+        targets.forEach(t => {
+            if (t.type === 'lxc' || t.type === 'docker') {
+                targetMap[t.name] = t;
+            }
+        });
+        list.forEach(s => {
+            const bid = s['backup-id'] || s.backup_id || '';
+            if (!s.hostname && targetMap[bid]) {
+                s.hostname = targetMap[bid].hostname || '';
+                s.specs = targetMap[bid].specs || '';
+            }
+        });
 
         const TYPE_EMOJIS = { vm: '🖥️', ct: '📦', host: '🏠' };
         const TYPE_LABELS = { vm: 'VM', ct: 'Container', host: 'Host' };
