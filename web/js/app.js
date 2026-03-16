@@ -12116,8 +12116,7 @@ async function migrateDockerContainer(name) {
                     <label style="display:block; margin-bottom:4px; font-weight:600;">Target Node</label>
                     ${nodeOpts ? `<select id="migrate-target" style="width:100%; padding:8px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary);">
                         ${nodeOpts}
-                    </select>` : `<input id="migrate-target" type="text" placeholder="http://10.10.10.2:8553" style="width:100%; padding:8px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary);">
-                    <span style="font-size:11px;color:var(--text-muted);margin-top:2px;display:block;">Use port 8553 for WolfStack nodes, port 8006 for Proxmox clusters</span>`}
+                    </select>` : `<input id="migrate-target" type="text" placeholder="http://10.10.10.2:8553" style="width:100%; padding:8px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary);">`}
                 </div>
                 <div style="margin-bottom: 1rem;">
                     <label style="display:block; margin-bottom:4px; font-weight:600;">Target Storage</label>
@@ -12146,7 +12145,6 @@ async function migrateDockerContainer(name) {
                 <div style="margin-bottom: 1rem;">
                     <label style="display:block; margin-bottom:4px; font-weight:600;">Target URL</label>
                     <input id="migrate-target" type="text" placeholder="http://10.10.10.2:8553" style="width:100%; padding:8px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary);">
-                    <span style="font-size:11px;color:var(--text-muted);margin-top:2px;display:block;">Use port 8553 for WolfStack nodes, port 8006 for Proxmox clusters</span>
                 </div>
                 <div style="margin-bottom: 1rem;">
                     <label style="display:block; margin-bottom:4px; font-weight:600;">Target Storage</label>
@@ -12390,8 +12388,7 @@ async function migrateLxcContainer(name) {
                         The token is valid for 30 minutes and authorises this node to push the container to that cluster.
                     </div>
                     <label style="font-size:13px;color:var(--text-muted,#aaa);">Target URL</label>
-                    <input id="migrate-ext-url" type="text" placeholder="https://target.example.com:8553" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;margin-bottom:4px;">
-                    <span style="font-size:11px;color:var(--text-muted,#888);display:block;margin-bottom:8px;">Use port 8553 for WolfStack nodes, port 8006 for Proxmox clusters</span>
+                    <input id="migrate-ext-url" type="text" placeholder="https://target.example.com:8553" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;margin-bottom:8px;">
                     <label style="font-size:13px;color:var(--text-muted,#aaa);">Transfer Token</label>
                     <input id="migrate-ext-token" type="text" placeholder="wst_..." style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;">
                 </div>
@@ -12659,8 +12656,7 @@ async function migrateVm(name) {
                         <strong>Cross-cluster migration</strong>: On the destination cluster, go to <strong>LXC Containers</strong> and click <strong>Generate Transfer Token</strong>. The same token works for VM transfers.
                     </div>
                     <label style="font-size:13px;color:var(--text-muted,#aaa);">Target URL</label>
-                    <input id="vm-migrate-ext-url" type="text" placeholder="https://target.example.com:8553" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;margin-bottom:4px;">
-                    <span style="font-size:11px;color:var(--text-muted,#888);display:block;margin-bottom:8px;">Use port 8553 for WolfStack nodes, port 8006 for Proxmox clusters</span>
+                    <input id="vm-migrate-ext-url" type="text" placeholder="https://target.example.com:8553" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;margin-bottom:8px;">
                     <label style="font-size:13px;color:var(--text-muted,#aaa);">Transfer Token</label>
                     <input id="vm-migrate-ext-token" type="text" placeholder="wst_..." style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;">
                 </div>
