@@ -93,6 +93,7 @@ async fn index_handler(req: HttpRequest, state: web::Data<api::AppState>) -> Htt
             Ok(content) => {
                 // Inject cache-busting version into asset URLs so browsers
                 // fetch fresh JS/CSS after an upgrade without Ctrl+Shift+R.
+                // this has become a bit of a problem on chrome browsers. PC
                 let content = content
                     .replace("/css/style.css\"", &format!("/css/style.css?v={}\"", APP_VERSION))
                     .replace("/js/app.js\"", &format!("/js/app.js?v={}\"", APP_VERSION));
@@ -104,6 +105,7 @@ async fn index_handler(req: HttpRequest, state: web::Data<api::AppState>) -> Htt
             Err(_) => HttpResponse::InternalServerError().body("Web UI not found"),
         }
     } else {
+        // we're logged out switch to login
         let path = format!("{}/login.html", web_dir);
         match std::fs::read_to_string(&path) {
             Ok(content) => HttpResponse::Ok().content_type("text/html").body(content),
@@ -155,7 +157,8 @@ async fn main() -> std::io::Result<()> {
     info!("  Node ID:    {}", node_id);
     info!("  Hostname:   {}", hostname);
     info!("  Dashboard:  http://{}:{}", cli.bind, cli.port);
-
+    info!("  (C)Copyright Wolf Software Systems Ltd — https://wolf.uk.com");
+    info!("  By Paul Clevett and my mate Claude - I have Autism");
     // Seed LXC storage paths from any mounted storage that has LXC containers
     if let Ok(entries) = std::fs::read_dir("/mnt/wolfstack") {
         for entry in entries.flatten() {

@@ -13844,8 +13844,25 @@ function renderBackupTargets(targets) {
 
     container.innerHTML = targets.map(t => {
         const emoji = EMOJIS[t.type] || '📄';
-        const label = t.type === 'config' ? 'WolfStack Config' : (t.name || t.type);
+        // Build display name: prefer hostname, fall back to name
+        let label = t.type === 'config' ? 'WolfStack Config' : (t.name || t.type);
         const typeLabel = t.type.toUpperCase();
+        // For LXC/Docker with a hostname different from the name, show both
+        let subtitle = '';
+        if (t.hostname && t.hostname !== t.name) {
+            subtitle = t.hostname;
+            label = `${t.name} (${t.hostname})`;
+        }
+        // State badge
+        const stateBadge = t.state
+            ? `<span style="display:inline-block; padding:1px 6px; border-radius:3px; font-size:10px; font-weight:500; margin-left:6px; ${
+                t.state === 'running' ? 'background:#22c55e22; color:#22c55e;' : 'background:#6b728022; color:#6b7280;'
+            }">${t.state}</span>`
+            : '';
+        // Specs line (cores, RAM, OS for Proxmox; image for Docker)
+        const specsLine = t.specs
+            ? `<div style="font-size:11px; color:var(--text-muted); margin-top:1px;">${escapeHtml(t.specs)}</div>`
+            : '';
         const val = JSON.stringify(t).replace(/"/g, '&quot;');
         return `<label style="display:flex; align-items:center; gap:10px; padding:10px 14px;
             background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-sm);
@@ -13857,6 +13874,8 @@ function renderBackupTargets(targets) {
             <span style="flex:1;">
                 <span style="font-weight:500;">${escapeHtml(label)}</span>
                 <span style="color:var(--text-muted); font-size:11px; margin-left:6px;">${typeLabel}</span>
+                ${stateBadge}
+                ${specsLine}
             </span>
         </label>`;
     }).join('');
@@ -13939,7 +13958,11 @@ function renderBackupHistory(backups) {
     tbody.innerHTML = backups.map(b => {
         const typeEmoji = { docker: '🐳', lxc: '📦', vm: '🖥️', config: '⚙️' }[b.target?.type] || '📄';
         const typeName = (b.target?.type || 'unknown').toUpperCase();
-        const targetName = b.target?.name || (b.target?.type === 'config' ? 'WolfStack Config' : 'Unknown');
+        let targetName = b.target?.name || (b.target?.type === 'config' ? 'WolfStack Config' : 'Unknown');
+        if (b.target?.hostname && b.target.hostname !== b.target.name) {
+            targetName = `${b.target.name} (${b.target.hostname})`;
+        }
+        const specsNote = b.target?.specs ? `<div style="font-size:11px; color:var(--text-muted); margin-top:1px;">${escapeHtml(b.target.specs)}</div>` : '';
         const storageLabel = formatStorageLabel(b.storage);
         const size = formatBytes(b.size_bytes || 0);
         const date = b.created_at ? new Date(b.created_at).toLocaleString() : '—';
@@ -13952,7 +13975,7 @@ function renderBackupHistory(backups) {
         const nodeLabel = b.node_hostname ? `<span style="font-size:11px; color:var(--text-muted);">${escapeHtml(b.node_hostname)}</span>` : '';
 
         return `<tr>
-            <td>${typeEmoji} ${escapeHtml(targetName)}${comments}</td>
+            <td>${typeEmoji} ${escapeHtml(targetName)}${specsNote}${comments}</td>
             <td>${typeName}</td>
             <td>${nodeLabel}</td>
             <td>${escapeHtml(storageLabel)}</td>
@@ -14035,7 +14058,8 @@ function showBackupProgress(container, items, title) {
                 <div id="backup-progress-items" style="display:grid; gap:6px;">
                     ${items.map((t, i) => {
         const emoji = EMOJIS[t.type || t.target_type] || '📄';
-        const name = t.name || t.type || 'item';
+        let name = t.name || t.type || 'item';
+        if (t.hostname && t.hostname !== t.name) name = `${t.name} (${t.hostname})`;
         return `<div id="backup-item-${i}" style="display:flex; align-items:center; gap:8px; padding:6px 10px; background:var(--bg-tertiary); border-radius:var(--radius-sm); font-size:13px;">
                             <span style="width:20px; text-align:center;" id="backup-icon-${i}">⏳</span>
                             <span>${emoji} <strong>${escapeHtml(name)}</strong></span>
@@ -14716,7 +14740,11 @@ function renderClusterBackupHistory(backups) {
     tbody.innerHTML = backups.slice(0, 100).map(b => {
         const typeEmoji = { docker: '🐳', lxc: '📦', vm: '🖥️', config: '⚙️' }[b.target?.type] || '📄';
         const typeName = (b.target?.type || 'unknown').toUpperCase();
-        const targetName = b.target?.name || (b.target?.type === 'config' ? 'WolfStack Config' : 'Unknown');
+        let targetName = b.target?.name || (b.target?.type === 'config' ? 'WolfStack Config' : 'Unknown');
+        if (b.target?.hostname && b.target.hostname !== b.target.name) {
+            targetName = `${b.target.name} (${b.target.hostname})`;
+        }
+        const specsNote = b.target?.specs ? `<div style="font-size:11px; color:var(--text-muted); margin-top:1px;">${escapeHtml(b.target.specs)}</div>` : '';
         const storageLabel = formatStorageLabel(b.storage);
         const size = formatBytes(b.size_bytes || 0);
         const date = b.created_at ? new Date(b.created_at).toLocaleString() : '—';
@@ -14729,7 +14757,7 @@ function renderClusterBackupHistory(backups) {
 
         return `<tr>
             <td><span class="server-dot ${b._node?.online ? 'online' : 'offline'}" style="display:inline-block; margin-right:4px;"></span>${nodeName}</td>
-            <td>${typeEmoji} ${escapeHtml(targetName)}</td>
+            <td>${typeEmoji} ${escapeHtml(targetName)}${specsNote}</td>
             <td>${typeName}</td>
             <td>${escapeHtml(storageLabel)}</td>
             <td>${size}</td>

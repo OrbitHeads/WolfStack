@@ -7,6 +7,9 @@
 //! Supports storage targets: local path, S3, remote WolfStack node, WolfDisk
 //! Includes scheduling with retention policies
 
+
+//! backup needs lxcs to have more information
+
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -46,6 +49,15 @@ pub struct BackupTarget {
     pub target_type: BackupTargetType,
     /// Name of the container/VM (empty for Config type)
     pub name: String,
+    /// Actual hostname (e.g. Proxmox LXC where name is a numeric VMID)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// Running state (running, stopped, etc.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// Brief spec summary (e.g. "2 cores, 2GB RAM, Ubuntu 22.04")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub specs: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -575,7 +587,7 @@ pub fn backup_all(storage: &BackupStorage) -> Vec<BackupEntry> {
             .collect();
         for name in names {
             entries.push(create_backup_entry(
-                BackupTarget { target_type: BackupTargetType::Docker, name: name.clone() },
+                BackupTarget { target_type: BackupTargetType::Docker, name: name.clone(), hostname: None, state: None, specs: None },
                 storage,
             ));
         }
@@ -590,7 +602,7 @@ pub fn backup_all(storage: &BackupStorage) -> Vec<BackupEntry> {
             .collect();
         for name in names {
             entries.push(create_backup_entry(
-                BackupTarget { target_type: BackupTargetType::Lxc, name: name.clone() },
+                BackupTarget { target_type: BackupTargetType::Lxc, name: name.clone(), hostname: None, state: None, specs: None },
                 storage,
             ));
         }
@@ -604,7 +616,7 @@ pub fn backup_all(storage: &BackupStorage) -> Vec<BackupEntry> {
                 if entry.path().is_dir() {
                     let name = entry.file_name().to_string_lossy().to_string();
                     entries.push(create_backup_entry(
-                        BackupTarget { target_type: BackupTargetType::Vm, name },
+                        BackupTarget { target_type: BackupTargetType::Vm, name, hostname: None, state: None, specs: None },
                         storage,
                     ));
                 }
@@ -614,7 +626,7 @@ pub fn backup_all(storage: &BackupStorage) -> Vec<BackupEntry> {
 
     // Backup config
     entries.push(create_backup_entry(
-        BackupTarget { target_type: BackupTargetType::Config, name: String::new() },
+        BackupTarget { target_type: BackupTargetType::Config, name: String::new(), hostname: None, state: None, specs: None },
         storage,
     ));
 
@@ -1211,32 +1223,128 @@ pub fn delete_schedule(id: &str) -> Result<String, String> {
 
 // ─── Available Targets ───
 
-/// List all available backup targets on the system
+/// List all available backup targets on the system with full details
 pub fn list_available_targets() -> Vec<BackupTarget> {
     let mut targets = Vec::new();
 
-    // Docker containers
+    // Docker containers — include image and state
     if let Ok(output) = Command::new("docker")
-        .args(["ps", "-a", "--format", "{{.Names}}"])
+        .args(["ps", "-a", "--format", "{{.Names}}\t{{.Image}}\t{{.State}}"])
         .output()
     {
-        for name in String::from_utf8_lossy(&output.stdout).lines() {
-            if !name.is_empty() {
-                targets.push(BackupTarget {
-                    target_type: BackupTargetType::Docker,
-                    name: name.to_string(),
-                });
-            }
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            let name = parts.first().unwrap_or(&"").to_string();
+            if name.is_empty() { continue; }
+            let image = parts.get(1).unwrap_or(&"").to_string();
+            let state = parts.get(2).map(|s| s.to_string());
+            targets.push(BackupTarget {
+                target_type: BackupTargetType::Docker,
+                name,
+                hostname: None,
+                state,
+                specs: if image.is_empty() { None } else { Some(image) },
+            });
         }
     }
 
-    // LXC containers
-    if let Ok(output) = Command::new("lxc-ls").output() {
-        for name in String::from_utf8_lossy(&output.stdout).split_whitespace() {
-            if !name.is_empty() {
+    // LXC containers — detect Proxmox (pct) vs native LXC and gather full details
+    let is_proxmox = Command::new("which").arg("pct").output()
+        .map(|o| o.status.success()).unwrap_or(false);
+
+    if is_proxmox {
+        // Proxmox: use pct list + pct config for hostname, cores, memory
+        if let Ok(output) = Command::new("pct").arg("list").output() {
+            if output.status.success() {
+                let listing = String::from_utf8_lossy(&output.stdout);
+                let entries: Vec<(String, String, String)> = listing.lines()
+                    .skip(1)
+                    .filter(|l| !l.trim().is_empty())
+                    .filter_map(|line| {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        let vmid = parts.first()?.to_string();
+                        let state = parts.get(1).unwrap_or(&"stopped").to_lowercase();
+                        // Name may have a "Lock" column before it on locked containers
+                        let pct_name = parts.last().map(|s| s.to_string()).unwrap_or_default();
+                        Some((vmid, state, pct_name))
+                    })
+                    .collect();
+
+                // Fetch configs in parallel
+                let configs: Vec<String> = std::thread::scope(|s| {
+                    let handles: Vec<_> = entries.iter().map(|(vmid, _, _)| {
+                        let vmid = vmid.clone();
+                        s.spawn(move || {
+                            Command::new("pct").args(["config", &vmid]).output().ok()
+                                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                                .unwrap_or_default()
+                        })
+                    }).collect();
+                    handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+                });
+
+                for ((vmid, state, pct_name), cfg) in entries.iter().zip(configs.iter()) {
+                    let mut hostname = if pct_name.is_empty() { None } else { Some(pct_name.clone()) };
+                    let mut memory_mb: u64 = 0;
+                    let mut cores: u64 = 0;
+                    let mut os_type = String::new();
+
+                    for cline in cfg.lines() {
+                        let cline = cline.trim();
+                        if cline.starts_with("hostname:") {
+                            hostname = cline.split(':').nth(1).map(|s| s.trim().to_string());
+                        } else if cline.starts_with("memory:") {
+                            memory_mb = cline.split(':').nth(1)
+                                .and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+                        } else if cline.starts_with("cores:") {
+                            cores = cline.split(':').nth(1)
+                                .and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+                        } else if cline.starts_with("ostype:") {
+                            os_type = cline.split(':').nth(1).unwrap_or("").trim().to_string();
+                        }
+                    }
+
+                    let mut spec_parts = Vec::new();
+                    if cores > 0 { spec_parts.push(format!("{} core{}", cores, if cores > 1 { "s" } else { "" })); }
+                    if memory_mb > 0 {
+                        if memory_mb >= 1024 { spec_parts.push(format!("{}GB RAM", memory_mb / 1024)); }
+                        else { spec_parts.push(format!("{}MB RAM", memory_mb)); }
+                    }
+                    if !os_type.is_empty() { spec_parts.push(os_type); }
+
+                    targets.push(BackupTarget {
+                        target_type: BackupTargetType::Lxc,
+                        name: vmid.clone(),
+                        hostname,
+                        state: Some(state.clone()),
+                        specs: if spec_parts.is_empty() { None } else { Some(spec_parts.join(", ")) },
+                    });
+                }
+            }
+        }
+    } else {
+        // Native LXC: use lxc-ls -f for state + hostname from config
+        if let Ok(output) = Command::new("lxc-ls")
+            .args(["-f", "-F", "NAME,STATE"])
+            .output()
+        {
+            for line in String::from_utf8_lossy(&output.stdout).lines().skip(1) {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                let name = match parts.first() {
+                    Some(n) if !n.is_empty() => n.to_string(),
+                    _ => continue,
+                };
+                let state = parts.get(1).map(|s| s.to_lowercase());
+
+                // Try to read hostname from LXC config
+                let hostname = lxc_config_hostname(&name);
+
                 targets.push(BackupTarget {
                     target_type: BackupTargetType::Lxc,
-                    name: name.to_string(),
+                    name,
+                    hostname,
+                    state,
+                    specs: None,
                 });
             }
         }
@@ -1255,6 +1363,7 @@ pub fn list_available_targets() -> Vec<BackupTarget> {
                         targets.push(BackupTarget {
                             target_type: BackupTargetType::Vm,
                             name: stem.to_string(),
+                            hostname: None, state: None, specs: None,
                         });
                     }
                 }
@@ -1266,9 +1375,23 @@ pub fn list_available_targets() -> Vec<BackupTarget> {
     targets.push(BackupTarget {
         target_type: BackupTargetType::Config,
         name: String::new(),
+        hostname: None, state: None, specs: None,
     });
 
     targets
+}
+
+/// Read hostname from native LXC config file
+fn lxc_config_hostname(name: &str) -> Option<String> {
+    for base in &["/var/lib/lxc", "/var/snap/lxd/common/lxd/storage-pools"] {
+        let config_path = format!("{}/{}/config", base, name);
+        if let Ok(content) = fs::read_to_string(&config_path) {
+            if let Some(line) = content.lines().find(|l| l.trim().starts_with("lxc.uts.name")) {
+                return line.split('=').nth(1).map(|s| s.trim().to_string());
+            }
+        }
+    }
+    None
 }
 
 // ─── Scheduling ───
@@ -1398,6 +1521,7 @@ pub fn import_backup(data: &[u8], filename: &str) -> Result<String, String> {
         target: BackupTarget {
             target_type: guess_target_type(filename),
             name: extract_name_from_filename(filename),
+            hostname: None, state: None, specs: None,
         },
         storage: BackupStorage::local(dest_dir),
         filename: filename.to_string(),
