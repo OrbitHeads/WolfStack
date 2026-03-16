@@ -7162,8 +7162,15 @@ function updateTaskLogToggleBtn() {
 function updateContentPadding() {
     const main = document.querySelector('.main-content');
     const footer = document.getElementById('task-log-footer');
-    if (main) {
-        main.style.paddingBottom = (_taskLogVisible && footer) ? footer.offsetHeight + 'px' : '';
+    if (!main) return;
+    if (_taskLogVisible && footer) {
+        // Use a short delay so the browser has laid out the footer first
+        requestAnimationFrame(() => {
+            const h = footer.offsetHeight || parseInt(footer.style.height) || 220;
+            main.style.paddingBottom = h + 'px';
+        });
+    } else {
+        main.style.paddingBottom = '';
     }
 }
 
