@@ -7100,20 +7100,20 @@ function saveTaskLog() {
 function loadTaskLog() {
     try {
         const raw = localStorage.getItem('wolfstack_task_log');
-        if (!raw) return;
-        const parsed = JSON.parse(raw);
-        if (!Array.isArray(parsed)) return;
-        _taskLogEntries = parsed.map(e => ({
-            ...e,
-            time: new Date(e.time),
-            expanded: false,
-            // Any tasks that were "running" when the page closed are now stale
-            status: e.status === 'running' ? 'failed' : e.status,
-        }));
-        if (_taskLogEntries.length > 0) {
-            showTaskLog();
-            renderTaskLog();
+        if (raw) {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) {
+                _taskLogEntries = parsed.map(e => ({
+                    ...e,
+                    time: new Date(e.time),
+                    expanded: false,
+                    status: e.status === 'running' ? 'failed' : e.status,
+                }));
+            }
         }
+        // Always show the task log footer on load
+        showTaskLog();
+        renderTaskLog();
     } catch (_) {}
 }
 
