@@ -40,10 +40,15 @@ pub fn build_node_urls(address: &str, port: u16, path: &str) -> Vec<String> {
 pub fn build_external_urls(target_url: &str, path: &str) -> Vec<String> {
     let trimmed = target_url.trim_end_matches('/');
 
+    // Ensure we have a scheme — prepend https:// if missing
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{}", trimmed)
+    };
+
     // Extract host from URL (scheme://host:port/path → host)
-    let after_scheme = trimmed.find("://")
-        .map(|pos| &trimmed[pos + 3..])
-        .unwrap_or(trimmed);
+    let after_scheme = &with_scheme[with_scheme.find("://").unwrap() + 3..];
     let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
     let (host, user_port) = match host_port.rfind(':') {
         Some(pos) => {
@@ -58,10 +63,12 @@ pub fn build_external_urls(target_url: &str, path: &str) -> Vec<String> {
 
     let mut urls = Vec::new();
 
-    // First: try exactly what the user specified
-    urls.push(format!("{}{}", trimmed, path));
+    // If user specified a port, try their exact URL first
+    if user_port.is_some() {
+        urls.push(format!("{}{}", with_scheme, path));
+    }
 
-    // Then try WolfStack ports if not already the user's port
+    // Always try WolfStack ports
     if user_port != Some(8553) {
         urls.push(format!("https://{}:8553{}", host, path));
     }
