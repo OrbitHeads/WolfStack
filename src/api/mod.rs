@@ -118,6 +118,18 @@ pub struct AppState {
     pub wireguard_bridges: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::networking::WireGuardBridge>>>,
     /// Patreon integration state
     pub patreon: Arc<crate::patreon::PatreonState>,
+    /// Migration task progress tracker
+    pub migration_tasks: Arc<std::sync::RwLock<std::collections::HashMap<String, MigrationTask>>>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct MigrationTask {
+    pub id: String,
+    pub stage: String,       // "preflight", "export", "upload", "import", "done", "failed"
+    pub message: String,
+    pub completed: bool,
+    pub error: Option<String>,
+    pub started_at: u64,
 }
 
 /// Load or generate the join token from /etc/wolfstack/join-token
@@ -3512,7 +3524,54 @@ async fn lxc_import_endpoint_inner(
     }
 }
 
-/// POST /api/containers/lxc/{name}/migrate-external — migrate to external cluster
+/// Helper: update a migration task's status
+fn migration_update(tasks: &Arc<std::sync::RwLock<std::collections::HashMap<String, MigrationTask>>>, id: &str, stage: &str, message: &str) {
+    if let Ok(mut map) = tasks.write() {
+        if let Some(task) = map.get_mut(id) {
+            task.stage = stage.to_string();
+            task.message = message.to_string();
+        }
+    }
+}
+
+fn migration_fail(tasks: &Arc<std::sync::RwLock<std::collections::HashMap<String, MigrationTask>>>, id: &str, error: &str) {
+    if let Ok(mut map) = tasks.write() {
+        if let Some(task) = map.get_mut(id) {
+            task.stage = "failed".to_string();
+            task.message = error.to_string();
+            task.error = Some(error.to_string());
+            task.completed = true;
+        }
+    }
+}
+
+fn migration_done(tasks: &Arc<std::sync::RwLock<std::collections::HashMap<String, MigrationTask>>>, id: &str, message: &str) {
+    if let Ok(mut map) = tasks.write() {
+        if let Some(task) = map.get_mut(id) {
+            task.stage = "done".to_string();
+            task.message = message.to_string();
+            task.completed = true;
+        }
+    }
+}
+
+/// GET /api/migration/{id}/status — poll migration task progress
+pub async fn migration_status(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    if let Ok(map) = state.migration_tasks.read() {
+        if let Some(task) = map.get(&id) {
+            return HttpResponse::Ok().json(task);
+        }
+    }
+    HttpResponse::NotFound().json(serde_json::json!({"error": "Task not found"}))
+}
+
+/// POST /api/containers/lxc/{name}/migrate-external — migrate to external cluster (background task)
 pub async fn lxc_migrate_external(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -3521,109 +3580,138 @@ pub async fn lxc_migrate_external(
 ) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let name = path.into_inner();
-    let new_name = body.new_name.as_deref().unwrap_or(&name);
-
-    // Pre-flight: verify we can reach the destination before doing the expensive export
-    let preflight_urls = build_external_urls(&body.target_url, "/api/storage/list");
-    let preflight_client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(10))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap_or_default();
-
-    let mut preflight_ok = false;
-    let mut preflight_err = String::new();
-    for url in &preflight_urls {
-        match preflight_client.get(url)
-            .header("X-WolfStack-Secret", state.cluster_secret.clone())
-            .send()
-            .await
-        {
-            Ok(r) if r.status().is_success() => { preflight_ok = true; break; }
-            Ok(r) => { preflight_err = format!("{}: HTTP {}", url, r.status()); }
-            Err(e) => { preflight_err = format!("{}: {}", url, e); }
-        }
-    }
-    if !preflight_ok {
-        return HttpResponse::BadGateway().json(serde_json::json!({
-            "error": format!("Pre-flight check failed — cannot reach destination: {}", preflight_err)
-        }));
-    }
-
-    // 1. Stop temporarily for consistent export, then restart source
-    let _ = containers::lxc_stop(&name);
-    let (archive_path, meta) = match containers::lxc_export(&name) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = containers::lxc_start(&name);
-            return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("Export failed: {}", e)}));
-        }
-    };
-    // Restart source immediately after export — source stays running
-    let _ = containers::lxc_start(&name);
-
-    // 2. Read archive
-    let archive_bytes = match std::fs::read(&archive_path) {
-        Ok(b) => b,
-        Err(e) => {
-            containers::lxc_export_cleanup(archive_path.to_str().unwrap_or(""));
-            return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("Read archive: {}", e)}));
-        }
-    };
-
-    // 3. POST to external cluster — automatically tries WolfStack (8553) and Proxmox (8006) ports
-    let import_urls = build_external_urls(&body.target_url, "/api/containers/lxc/import-external");
+    let new_name = body.new_name.as_deref().unwrap_or(&name).to_string();
+    let target_url = body.target_url.clone();
+    let target_token = body.target_token.clone();
     let storage_val = body.storage.as_deref().unwrap_or("").to_string();
-    let file_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let cluster_secret = state.cluster_secret.clone();
+    let tasks = state.migration_tasks.clone();
 
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(600))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap_or_default();
+    // Create task entry
+    let task_id = format!("mig_{}", uuid::Uuid::new_v4().to_string().replace('-', "")[..12].to_string());
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    {
+        let mut map = tasks.write().unwrap();
+        map.insert(task_id.clone(), MigrationTask {
+            id: task_id.clone(),
+            stage: "preflight".to_string(),
+            message: "Checking destination connectivity...".to_string(),
+            completed: false,
+            error: None,
+            started_at: now,
+        });
+    }
 
-    let mut last_err: Option<String> = None;
+    let tid = task_id.clone();
+    // Spawn migration in background
+    tokio::spawn(async move {
+        // 1. Pre-flight
+        let preflight_urls = build_external_urls(&target_url, "/api/storage/list");
+        let preflight_client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10))
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap_or_default();
 
-    for import_url in &import_urls {
-        let form = reqwest::multipart::Form::new()
-            .text("new_name", new_name.to_string())
-            .text("storage", storage_val.clone())
-            .text("meta", serde_json::to_string(&meta).unwrap_or_default())
-            .part("archive", reqwest::multipart::Part::bytes(archive_bytes.clone())
-                .file_name(file_name.clone()));
+        let mut preflight_ok = false;
+        let mut preflight_err = String::new();
+        for url in &preflight_urls {
+            match preflight_client.get(url)
+                .header("X-WolfStack-Secret", cluster_secret.clone())
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => { preflight_ok = true; break; }
+                Ok(r) => { preflight_err = format!("{}: HTTP {}", url, r.status()); }
+                Err(e) => { preflight_err = format!("{}: {}", url, e); }
+            }
+        }
+        if !preflight_ok {
+            migration_fail(&tasks, &tid, &format!("Cannot reach destination: {}", preflight_err));
+            return;
+        }
 
-        match client.post(import_url)
-            .header("X-Transfer-Token", &body.target_token)
-            .header("X-WolfStack-Secret", state.cluster_secret.clone())
-            .multipart(form)
-            .send()
-            .await
-        {
-            Ok(r) => {
+        // 2. Export
+        migration_update(&tasks, &tid, "export", "Stopping container for export...");
+        let _ = containers::lxc_stop(&name);
+        let (archive_path, meta) = match containers::lxc_export(&name) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = containers::lxc_start(&name);
+                migration_fail(&tasks, &tid, &format!("Export failed: {}", e));
+                return;
+            }
+        };
+        let _ = containers::lxc_start(&name);
+        migration_update(&tasks, &tid, "export", "Reading archive...");
+
+        let archive_bytes = match std::fs::read(&archive_path) {
+            Ok(b) => b,
+            Err(e) => {
                 containers::lxc_export_cleanup(archive_path.to_str().unwrap_or(""));
-                if r.status().is_success() {
-                    // Source is already running — destination is imported but not started
-                    return HttpResponse::Ok().json(serde_json::json!({
-                        "message": format!("Container '{}' transferred to {}. Destination is stopped — start it manually when ready.", name, body.target_url)
-                    }));
-                } else {
-                    let err = r.text().await.unwrap_or_default();
-                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("External import failed: {}", err)}));
+                migration_fail(&tasks, &tid, &format!("Read archive: {}", e));
+                return;
+            }
+        };
+
+        let size_mb = archive_bytes.len() / (1024 * 1024);
+        migration_update(&tasks, &tid, "upload", &format!("Uploading {} MB to destination...", size_mb));
+
+        // 3. Upload
+        let import_urls = build_external_urls(&target_url, "/api/containers/lxc/import-external");
+        let file_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(600))
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap_or_default();
+
+        let mut last_err: Option<String> = None;
+
+        for import_url in &import_urls {
+            let form = reqwest::multipart::Form::new()
+                .text("new_name", new_name.clone())
+                .text("storage", storage_val.clone())
+                .text("meta", serde_json::to_string(&meta).unwrap_or_default())
+                .part("archive", reqwest::multipart::Part::bytes(archive_bytes.clone())
+                    .file_name(file_name.clone()));
+
+            match client.post(import_url)
+                .header("X-Transfer-Token", &target_token)
+                .header("X-WolfStack-Secret", cluster_secret.clone())
+                .multipart(form)
+                .send()
+                .await
+            {
+                Ok(r) => {
+                    containers::lxc_export_cleanup(archive_path.to_str().unwrap_or(""));
+                    if r.status().is_success() {
+                        migration_update(&tasks, &tid, "import", "Importing on destination...");
+                        migration_done(&tasks, &tid, &format!("Container '{}' transferred. Destination is stopped — start it manually.", name));
+                    } else {
+                        let err = r.text().await.unwrap_or_default();
+                        migration_fail(&tasks, &tid, &format!("Import failed: {}", err));
+                    }
+                    return;
+                }
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                    continue;
                 }
             }
-            Err(e) => {
-                last_err = Some(e.to_string());
-                continue;
-            }
         }
-    }
 
-    // All URLs failed — source is still running
-    containers::lxc_export_cleanup(archive_path.to_str().unwrap_or(""));
-    HttpResponse::BadGateway().json(serde_json::json!({
-        "error": format!("Transfer to {} failed on all ports: {}", body.target_url, last_err.unwrap_or_default())
+        containers::lxc_export_cleanup(archive_path.to_str().unwrap_or(""));
+        migration_fail(&tasks, &tid, &format!("Transfer failed on all ports: {}", last_err.unwrap_or_default()));
+    });
+
+    // Return task ID immediately
+    HttpResponse::Ok().json(serde_json::json!({
+        "task_id": task_id,
+        "message": "Migration started"
     }))
 }
 
@@ -12804,6 +12892,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/containers/lxc/{name}/export", web::post().to(lxc_export_endpoint))
         .route("/api/containers/lxc/{name}/migrate", web::post().to(lxc_migrate))
         .route("/api/containers/lxc/{name}/migrate-external", web::post().to(lxc_migrate_external))
+        .route("/api/migration/{id}/status", web::get().to(migration_status))
         // Network Conflicts
         .route("/api/network/conflicts", web::get().to(network_conflicts))
         // WolfNet

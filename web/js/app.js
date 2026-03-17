@@ -12494,6 +12494,7 @@ async function doMigrateLxc(name) {
 
     // Step definitions
     const steps = [
+        { id: 'preflight', label: 'Checking destination connectivity', icon: '🔍' },
         { id: 'export', label: 'Creating archive (vzdump/tar)', icon: '📦' },
         { id: 'upload', label: isExternal ? `Uploading to ${extUrl.replace(/https?:\/\//, '').split('/')[0]}` : 'Transferring to target node', icon: '📤' },
         { id: 'import', label: 'Importing on target node (stopped)', icon: '📥' },
@@ -12566,90 +12567,105 @@ async function doMigrateLxc(name) {
         el.querySelector('span:nth-child(2)').style.color = '#ef4444';
     }
 
-    // Animate steps on realistic timers (the backend is doing these steps sequentially)
-    let currentStep = 0;
-    const stepTimings = [2000, 8000, 15000, 20000]; // cumulative approximate timings; upload is the longest
-    const stepTimers = [];
+    // Map backend stages to step indices
+    const stageMap = { preflight: 0, export: 1, upload: 2, import: 3 };
+    let lastStage = '';
 
     setStepActive(steps[0].id);
-    for (let i = 0; i < stepTimings.length; i++) {
-        stepTimers.push(setTimeout(() => {
-            setStepDone(steps[i].id);
-            if (i + 1 < steps.length) {
-                setStepActive(steps[i + 1].id);
-                currentStep = i + 1;
-            }
-        }, stepTimings[i]));
-    }
 
-    try {
-        let resp;
-        if (isExternal) {
-            // External migration: always run on the LOCAL server (not proxied)
-            // — the local node exports and pushes to the destination
-            resp = await fetch(`/api/containers/lxc/${name}/migrate-external`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ target_url: extUrl, target_token: extToken, ...(migrateStorage && { storage: migrateStorage }) }),
-            });
-        } else {
-            const targetNode = allNodes.find(n => n.id === target);
-            const migrateBody = { target_node: target };
-            if (targetNode) { migrateBody.target_address = targetNode.address; migrateBody.target_port = targetNode.port || 8553; }
-            if (migrateStorage) migrateBody.storage = migrateStorage;
-            resp = await fetch(apiUrl(`/api/containers/lxc/${name}/migrate`), {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(migrateBody),
-            });
-        }
-
-        // Clear step timers — backend has finished
-        stepTimers.forEach(t => clearTimeout(t));
+    // Helper to finish the modal
+    function finishMigration(success, message) {
         clearInterval(elapsedTimer);
         const totalSecs = Math.floor((Date.now() - startTime) / 1000);
         const totalMins = Math.floor(totalSecs / 60);
         elapsedEl.textContent = totalMins > 0 ? `Completed in ${totalMins}m ${totalSecs % 60}s` : `Completed in ${totalSecs}s`;
-
-        let data;
-        try { data = await resp.json(); } catch { data = {}; }
-
-        const resultEl = document.getElementById('lxc-op-result');
         const spinner = document.getElementById('migrate-spinner');
         if (spinner) spinner.style.display = 'none';
         document.getElementById('lxc-op-close').style.display = '';
-
-        if (resp.ok) {
-            // Mark all steps done
+        const resultEl = document.getElementById('lxc-op-result');
+        resultEl.style.display = 'block';
+        if (success) {
             steps.forEach(s => setStepDone(s.id));
-            resultEl.style.display = 'block';
             resultEl.style.background = 'rgba(16,185,129,0.15)';
             resultEl.style.color = '#10b981';
-            resultEl.textContent = data.message || 'Migrated successfully';
+            resultEl.textContent = message;
             updateTaskLogEntry(lxcTaskId, { status: 'completed', description: `Migrated LXC '${name}' to ${lxcTargetLabel}` });
             setTimeout(loadLxcContainers, 500);
         } else {
-            // Mark current step as failed, leave rest as pending
-            steps.slice(0, currentStep).forEach(s => setStepDone(s.id));
-            setStepFailed(steps[currentStep].id);
-            resultEl.style.display = 'block';
+            const idx = stageMap[lastStage] || 0;
+            steps.slice(0, idx).forEach(s => setStepDone(s.id));
+            setStepFailed(steps[idx]?.id || steps[0].id);
             resultEl.style.background = 'rgba(239,68,68,0.15)';
             resultEl.style.color = '#ef4444';
-            resultEl.textContent = data.error || 'Unknown error';
-            updateTaskLogEntry(lxcTaskId, { status: 'failed', description: `Migrate LXC '${name}': ${data.error || 'Unknown error'}` });
+            resultEl.textContent = message;
+            updateTaskLogEntry(lxcTaskId, { status: 'failed', description: `Migrate LXC '${name}': ${message}` });
+        }
+    }
+
+    try {
+        if (isExternal) {
+            // External: background task with polling
+            const startResp = await fetch(`/api/containers/lxc/${name}/migrate-external`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ target_url: extUrl, target_token: extToken, ...(migrateStorage && { storage: migrateStorage }) }),
+            });
+            const startData = await startResp.json().catch(() => ({}));
+            if (!startResp.ok || !startData.task_id) {
+                finishMigration(false, startData.error || 'Failed to start migration');
+                return;
+            }
+
+            // Poll for real-time status updates
+            const taskId = startData.task_id;
+            const poll = setInterval(async () => {
+                try {
+                    const sr = await fetch(`/api/migration/${taskId}/status`);
+                    if (!sr.ok) return;
+                    const status = await sr.json();
+                    const stage = status.stage;
+
+                    // Update steps based on real backend stage
+                    if (stage !== lastStage) {
+                        const newIdx = stageMap[stage] ?? -1;
+                        const oldIdx = stageMap[lastStage] ?? -1;
+                        // Mark all previous steps as done
+                        for (let i = 0; i <= oldIdx && i < steps.length; i++) setStepDone(steps[i].id);
+                        // Set current step active
+                        if (newIdx >= 0 && newIdx < steps.length) setStepActive(steps[newIdx].id);
+                        lastStage = stage;
+                    }
+
+                    // Update message on current step
+                    const curIdx = stageMap[stage] ?? -1;
+                    if (curIdx >= 0 && curIdx < steps.length) {
+                        const el = document.getElementById('mstep-' + steps[curIdx].id);
+                        if (el) el.querySelector('span:nth-child(2)').textContent = status.message;
+                    }
+
+                    if (status.completed) {
+                        clearInterval(poll);
+                        finishMigration(!status.error, status.message);
+                    }
+                } catch {}
+            }, 1500);
+        } else {
+            // Intra-cluster: synchronous (fast, same network)
+            const targetNode = allNodes.find(n => n.id === target);
+            const migrateBody = { target_node: target };
+            if (targetNode) { migrateBody.target_address = targetNode.address; migrateBody.target_port = targetNode.port || 8553; }
+            if (migrateStorage) migrateBody.storage = migrateStorage;
+            const resp = await fetch(apiUrl(`/api/containers/lxc/${name}/migrate`), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(migrateBody),
+            });
+            const data = await resp.json().catch(() => ({}));
+            steps.forEach(s => setStepDone(s.id));
+            finishMigration(resp.ok, data.message || data.error || 'Unknown error');
         }
     } catch (e) {
-        stepTimers.forEach(t => clearTimeout(t));
-        clearInterval(elapsedTimer);
-        steps.slice(0, currentStep).forEach(s => setStepDone(s.id));
-        setStepFailed(steps[currentStep].id);
-        const spinner = document.getElementById('migrate-spinner');
-        if (spinner) spinner.style.display = 'none';
-        const r = document.getElementById('lxc-op-result');
-        r.style.display = 'block'; r.style.background = 'rgba(239,68,68,0.15)'; r.style.color = '#ef4444';
-        r.textContent = e.message;
-        document.getElementById('lxc-op-close').style.display = '';
-        updateTaskLogEntry(lxcTaskId, { status: 'failed', description: `Migrate LXC '${name}': ${e.message}` });
+        finishMigration(false, e.message);
     }
 }
 

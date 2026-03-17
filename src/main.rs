@@ -307,6 +307,7 @@ async fn main() -> std::io::Result<()> {
             login_limiter: Arc::new(auth::LoginRateLimiter::new()),
             wireguard_bridges: Arc::new(std::sync::RwLock::new(networking::load_wireguard_bridges())),
             patreon: Arc::new(patreon::PatreonState::new()),
+            migration_tasks: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         });
 
         // Background: periodic self-monitoring update
