@@ -434,6 +434,34 @@ async fn vm_migrate_external(
     let name = path.into_inner();
     let new_name = body.new_name.as_deref().unwrap_or(&name);
 
+    // Pre-flight: verify we can reach the destination before doing the expensive export
+    let preflight_urls = crate::api::build_external_urls(&body.target_url, "/api/storage/list");
+    let preflight_client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap_or_default();
+
+    let mut preflight_ok = false;
+    let mut preflight_err = String::new();
+    for url in &preflight_urls {
+        match preflight_client.get(url)
+            .header("X-WolfStack-Secret", state.cluster_secret.clone())
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => { preflight_ok = true; break; }
+            Ok(r) => { preflight_err = format!("{}: HTTP {}", url, r.status()); }
+            Err(e) => { preflight_err = format!("{}: {}", url, e); }
+        }
+    }
+    if !preflight_ok {
+        return HttpResponse::BadGateway().json(serde_json::json!({
+            "error": format!("Pre-flight check failed — cannot reach destination: {}", preflight_err)
+        }));
+    }
+
     // Stop VM temporarily for a consistent export, then restart
     {
         let manager = state.vms.lock().unwrap();
