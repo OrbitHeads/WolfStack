@@ -373,7 +373,8 @@ async fn vm_migrate(
     };
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3600)) // 1 hour for large VM disks
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(3600))
         .danger_accept_invalid_certs(true)
         .build()
         .unwrap_or_default();

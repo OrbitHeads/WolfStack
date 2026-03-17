@@ -3208,7 +3208,8 @@ async fn lxc_remote_clone(
     let storage_val = storage.unwrap_or("").to_string();
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(600)) // 10 min for large transfers
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(600))
         .danger_accept_invalid_certs(true)
         .build()
         .unwrap_or_default();
@@ -3549,8 +3550,9 @@ pub async fn lxc_migrate_external(
     let file_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
 
     let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(600))
-        .danger_accept_invalid_certs(true) // cross-cluster may have self-signed certs
+        .danger_accept_invalid_certs(true)
         .build()
         .unwrap_or_default();
 
