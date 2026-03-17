@@ -5349,73 +5349,27 @@ pub fn lxc_import(archive_path: &str, new_name: &str, storage: Option<&str>) -> 
             }
         } else {
             // Plain rootfs tar.gz from standalone WolfStack
-            // Create an empty container with pct create, mount it, extract rootfs directly
+            // Use pct create with the archive as the ostemplate — Proxmox handles it natively
             let rootfs_spec = format!("{}:4", storage_id);
             let output = Command::new("pct")
-                .args(["create", &new_vmid.to_string(),
+                .args(["create", &new_vmid.to_string(), archive_path,
                        "--hostname", new_name,
                        "--storage", storage_id,
                        "--rootfs", &rootfs_spec,
                        "--memory", "512",
                        "--swap", "512",
                        "--net0", "name=eth0,bridge=vmbr0,ip=dhcp",
-                       "--unprivileged", "1",
-                       "--ostype", "unmanaged"])
+                       "--unprivileged", "1"])
                 .output()
                 .map_err(|e| format!("pct create failed: {}", e))?;
 
-            if !output.status.success() {
+            if output.status.success() {
+                Ok(format!("Container '{}' imported (VMID {}, storage: {})", new_name, new_vmid, storage_id))
+            } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(format!("Create container failed: {}", stderr.trim()));
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                Err(format!("Import failed: {} {}", stderr.trim(), stdout.trim()))
             }
-
-            // Mount the container's rootfs
-            let output = Command::new("pct")
-                .args(["mount", &new_vmid.to_string()])
-                .output()
-                .map_err(|e| format!("pct mount failed: {}", e))?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let _ = Command::new("pct").args(["destroy", &new_vmid.to_string(), "--purge"]).output();
-                return Err(format!("Mount failed: {}", stderr.trim()));
-            }
-
-            // Find the mount point (typically /var/lib/lxc/<vmid>/rootfs)
-            let mount_point = format!("/var/lib/lxc/{}/rootfs", new_vmid);
-
-            // Extract the standalone rootfs archive directly into the mounted rootfs
-            let output = Command::new("tar")
-                .args(["xzf", archive_path, "-C", &mount_point])
-                .output()
-                .map_err(|e| format!("Extract failed: {}", e))?;
-
-            // Unmount
-            let _ = Command::new("pct").args(["unmount", &new_vmid.to_string()]).output();
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let _ = Command::new("pct").args(["destroy", &new_vmid.to_string(), "--purge"]).output();
-                return Err(format!("Extract to rootfs failed: {}", stderr.trim()));
-            }
-
-            // Resize rootfs to fit actual content + headroom
-            let rootfs_bytes = Command::new("bash")
-                .args(["-c", &format!("pct mount {} && du -sxb /var/lib/lxc/{}/rootfs 2>/dev/null | cut -f1 && pct unmount {}", new_vmid, new_vmid, new_vmid)])
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok())
-                .unwrap_or(0);
-
-            if rootfs_bytes > 3 * 1024 * 1024 * 1024 {
-                // Content > 3GB, resize to fit (current is 4GB)
-                let needed_gb = (rootfs_bytes / (1024 * 1024 * 1024)) + 2;
-                let _ = Command::new("pct")
-                    .args(["resize", &new_vmid.to_string(), "rootfs", &format!("{}G", needed_gb)])
-                    .output();
-            }
-
-            Ok(format!("Container '{}' imported (VMID {}, storage: {})", new_name, new_vmid, storage_id))
         }
     } else {
         // Standalone: create container dir with rootfs subdir and extract there
