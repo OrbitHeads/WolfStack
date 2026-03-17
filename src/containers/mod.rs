@@ -5348,72 +5348,74 @@ pub fn lxc_import(archive_path: &str, new_name: &str, storage: Option<&str>) -> 
                 Err(format!("Import failed: {} {}", stderr.trim(), stdout.trim()))
             }
         } else {
-            // Plain rootfs tar.gz from standalone WolfStack — convert to vzdump format
-            // vzdump expects: ./etc/vzdump/pct.conf at top level, rootfs under ./rootfs/
-            let convert_dir = format!("/tmp/wolfstack-vzdump-convert-{}", new_vmid);
-            let rootfs_dir = format!("{}/rootfs", convert_dir);
-            let _ = std::fs::create_dir_all(&rootfs_dir);
+            // Plain rootfs tar.gz from standalone WolfStack
+            // Create an empty container with pct create, mount it, extract rootfs directly
+            let rootfs_spec = format!("{}:4", storage_id);
+            let output = Command::new("pct")
+                .args(["create", &new_vmid.to_string(),
+                       "--hostname", new_name,
+                       "--storage", storage_id,
+                       "--rootfs", &rootfs_spec,
+                       "--memory", "512",
+                       "--swap", "512",
+                       "--net0", "name=eth0,bridge=vmbr0,ip=dhcp",
+                       "--unprivileged", "1",
+                       "--ostype", "unmanaged"])
+                .output()
+                .map_err(|e| format!("pct create failed: {}", e))?;
 
-            // Extract standalone archive into rootfs/ subdirectory
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("Create container failed: {}", stderr.trim()));
+            }
+
+            // Mount the container's rootfs
+            let output = Command::new("pct")
+                .args(["mount", &new_vmid.to_string()])
+                .output()
+                .map_err(|e| format!("pct mount failed: {}", e))?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let _ = Command::new("pct").args(["destroy", &new_vmid.to_string(), "--purge"]).output();
+                return Err(format!("Mount failed: {}", stderr.trim()));
+            }
+
+            // Find the mount point (typically /var/lib/lxc/<vmid>/rootfs)
+            let mount_point = format!("/var/lib/lxc/{}/rootfs", new_vmid);
+
+            // Extract the standalone rootfs archive directly into the mounted rootfs
             let output = Command::new("tar")
-                .args(["xzf", archive_path, "-C", &rootfs_dir])
+                .args(["xzf", archive_path, "-C", &mount_point])
                 .output()
                 .map_err(|e| format!("Extract failed: {}", e))?;
+
+            // Unmount
+            let _ = Command::new("pct").args(["unmount", &new_vmid.to_string()]).output();
+
             if !output.status.success() {
-                let _ = std::fs::remove_dir_all(&convert_dir);
-                return Err(format!("Extract failed: {}", String::from_utf8_lossy(&output.stderr)));
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let _ = Command::new("pct").args(["destroy", &new_vmid.to_string(), "--purge"]).output();
+                return Err(format!("Extract to rootfs failed: {}", stderr.trim()));
             }
 
-            // Calculate rootfs size from extracted content (round up to nearest GB, min 4GB)
-            let rootfs_bytes = Command::new("du")
-                .args(["-sxb", &rootfs_dir])
+            // Resize rootfs to fit actual content + headroom
+            let rootfs_bytes = Command::new("bash")
+                .args(["-c", &format!("pct mount {} && du -sxb /var/lib/lxc/{}/rootfs 2>/dev/null | cut -f1 && pct unmount {}", new_vmid, new_vmid, new_vmid)])
                 .output()
                 .ok()
-                .and_then(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().map(|s| s.to_string()))
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(4 * 1024 * 1024 * 1024);
-            let rootfs_gb = std::cmp::max(4, (rootfs_bytes / (1024 * 1024 * 1024)) + 2); // add 2GB headroom
+                .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok())
+                .unwrap_or(0);
 
-            // Create minimal vzdump config at top level
-            let conf_dir = format!("{}/etc/vzdump", convert_dir);
-            let _ = std::fs::create_dir_all(&conf_dir);
-            let conf_content = format!(
-                "arch: amd64\nhostname: {}\nmemory: 512\nswap: 512\nnet0: name=eth0,bridge=vmbr0,ip=dhcp\nrootfs: {}:{}\nunprivileged: 1\n",
-                new_name, storage_id, rootfs_gb
-            );
-            std::fs::write(format!("{}/pct.conf", conf_dir), &conf_content)
-                .map_err(|e| format!("Failed to write config: {}", e))?;
-
-            // Re-pack as vzdump-compatible archive
-            let vzdump_path = format!("/tmp/vzdump-lxc-{}-converted.tar.gz", new_vmid);
-            let output = Command::new("tar")
-                .args(["czf", &vzdump_path, "-C", &convert_dir, "."])
-                .output()
-                .map_err(|e| format!("Repack failed: {}", e))?;
-            let _ = std::fs::remove_dir_all(&convert_dir);
-
-            if !output.status.success() {
-                let _ = std::fs::remove_file(&vzdump_path);
-                return Err(format!("Repack failed: {}", String::from_utf8_lossy(&output.stderr)));
+            if rootfs_bytes > 3 * 1024 * 1024 * 1024 {
+                // Content > 3GB, resize to fit (current is 4GB)
+                let needed_gb = (rootfs_bytes / (1024 * 1024 * 1024)) + 2;
+                let _ = Command::new("pct")
+                    .args(["resize", &new_vmid.to_string(), "rootfs", &format!("{}G", needed_gb)])
+                    .output();
             }
 
-            // Now pct restore the vzdump-compatible archive
-            let output = Command::new("pct")
-                .args(["restore", &new_vmid.to_string(), &vzdump_path,
-                       "--storage", storage_id, "--hostname", new_name,
-                       "--unprivileged", "1"])
-                .output()
-                .map_err(|e| format!("pct restore failed: {}", e))?;
-
-            let _ = std::fs::remove_file(&vzdump_path);
-
-            if output.status.success() {
-                Ok(format!("Container '{}' imported (VMID {}, storage: {})", new_name, new_vmid, storage_id))
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                Err(format!("Import failed: {} {}", stderr.trim(), stdout.trim()))
-            }
+            Ok(format!("Container '{}' imported (VMID {}, storage: {})", new_name, new_vmid, storage_id))
         }
     } else {
         // Standalone: create container dir with rootfs subdir and extract there
