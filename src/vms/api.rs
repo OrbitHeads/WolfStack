@@ -451,8 +451,7 @@ async fn vm_migrate_external(
             .send()
             .await
         {
-            Ok(r) if r.status().is_success() => { preflight_ok = true; break; }
-            Ok(r) => { preflight_err = format!("{}: HTTP {}", url, r.status()); }
+            Ok(_) => { preflight_ok = true; break; } // any response = reachable
             Err(e) => { preflight_err = format!("{}: {}", url, e); }
         }
     }

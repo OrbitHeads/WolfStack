@@ -3428,6 +3428,7 @@ async fn lxc_import_endpoint_inner(
     let mut storage = None;
     let mut archive_path = None;
     let mut wolfnet_ip: Option<String> = None;
+    let mut archive_format = String::new(); // "vzdump" or "tar.gz"
 
     use futures::StreamExt;
     while let Some(item) = payload.next().await {
@@ -3461,9 +3462,20 @@ async fn lxc_import_endpoint_inner(
                 let s = String::from_utf8_lossy(&buf).trim().to_string();
                 if !s.is_empty() { wolfnet_ip = Some(s); }
             }
+            "meta" => {
+                let mut buf = Vec::new();
+                while let Some(chunk) = field.next().await {
+                    if let Ok(data) = chunk { buf.extend_from_slice(&data); }
+                }
+                let s = String::from_utf8_lossy(&buf).trim().to_string();
+                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&s) {
+                    archive_format = meta.get("archive_format").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                }
+            }
             "archive" => {
-                // Use UUID filename to prevent path traversal and concurrent collision
-                let filename = format!("lxc-import-{}.tar.gz", uuid::Uuid::new_v4());
+                // Use UUID filename — pick extension based on source archive format
+                let ext = if archive_format == "vzdump" { "tar.zst" } else { "tar.gz" };
+                let filename = format!("lxc-import-{}.{}", uuid::Uuid::new_v4(), ext);
                 let dest = import_dir.join(&filename);
                 let mut file = match std::fs::File::create(&dest) {
                     Ok(f) => f,
@@ -3617,13 +3629,13 @@ pub async fn lxc_migrate_external(
         let mut preflight_ok = false;
         let mut preflight_err = String::new();
         for url in &preflight_urls {
+            // Just check connectivity — any HTTP response means the destination is running
             match preflight_client.get(url)
                 .header("X-WolfStack-Secret", cluster_secret.clone())
                 .send()
                 .await
             {
-                Ok(r) if r.status().is_success() => { preflight_ok = true; break; }
-                Ok(r) => { preflight_err = format!("{}: HTTP {}", url, r.status()); }
+                Ok(_) => { preflight_ok = true; break; } // any response = reachable
                 Err(e) => { preflight_err = format!("{}: {}", url, e); }
             }
         }
