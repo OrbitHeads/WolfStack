@@ -26652,29 +26652,50 @@ function buildServerRack(node, color) {
         unit.userData = { isUnit: true, unitIndex: i, unitType, isMother };
         group.add(unit);
 
-        // Front panel with tiny text label baked into texture
+        // Front panel with LED dots and type label baked into canvas texture
         const panelW = rackW - 0.2;
         const panelH = (isMother ? unitH + 0.02 : unitH) - 0.04;
         const panelCvs = document.createElement('canvas');
-        panelCvs.width = 256;
-        panelCvs.height = 48;
+        panelCvs.width = 512;
+        panelCvs.height = 64;
         const pCtx = panelCvs.getContext('2d');
+        // Background
         pCtx.fillStyle = isMother ? '#333345' : '#2a2a38';
-        pCtx.fillRect(0, 0, 256, 48);
-        // Type label text
-        pCtx.font = 'bold 16px Inter, sans-serif';
-        pCtx.fillStyle = '#' + unitTypeColor.toString(16).padStart(6, '0');
-        pCtx.fillText(unitType, 70, 30);
-        // LED dot circles
-        const dotColors = [cpuCol, memCol, dskCol];
-        const dotLabels = ['C', 'M', 'S'];
-        dotColors.forEach((dc, di) => {
-            const dx = 8 + di * 18;
-            pCtx.beginPath();
-            pCtx.arc(dx + 5, 24, 5, 0, Math.PI * 2);
-            pCtx.fillStyle = '#' + dc.toString(16).padStart(6, '0');
-            pCtx.fill();
-        });
+        pCtx.fillRect(0, 0, 512, 64);
+
+        if (node.online) {
+            // 3 LED dots: CPU, MEM, STORAGE
+            const dotDefs = [
+                { color: cpuCol, label: 'CPU', x: 16 },
+                { color: memCol, label: 'MEM', x: 80 },
+                { color: dskCol, label: 'STR', x: 144 },
+            ];
+            dotDefs.forEach(d => {
+                // Glow
+                pCtx.beginPath();
+                pCtx.arc(d.x + 8, 32, 12, 0, Math.PI * 2);
+                const hex = '#' + d.color.toString(16).padStart(6, '0');
+                pCtx.fillStyle = hex + '40';
+                pCtx.fill();
+                // Dot
+                pCtx.beginPath();
+                pCtx.arc(d.x + 8, 32, 7, 0, Math.PI * 2);
+                pCtx.fillStyle = hex;
+                pCtx.fill();
+                // Label
+                pCtx.font = '10px Inter, sans-serif';
+                pCtx.fillStyle = '#666678';
+                pCtx.fillText(d.label, d.x + 22, 36);
+            });
+        }
+
+        // Type label on right side
+        const typeHex = '#' + unitTypeColor.toString(16).padStart(6, '0');
+        pCtx.font = isMother ? 'bold 22px Inter, sans-serif' : 'bold 18px Inter, sans-serif';
+        pCtx.fillStyle = typeHex;
+        pCtx.textAlign = 'right';
+        pCtx.fillText(unitType, 500, 38);
+        pCtx.textAlign = 'left';
 
         const panelTex = new THREE.CanvasTexture(panelCvs);
         panelTex.minFilter = THREE.LinearFilter;
@@ -26913,7 +26934,7 @@ function topoRenderFrame(timestamp, xrFrame) {
                 const nodeId = n.id;
                 const esc = s => escapeHtml(s || '');
                 const ui = _topo.selectedUnitIndex;
-                tooltip.style.pointerEvents = 'auto';
+                // tooltip is interactive when visible
 
                 if (ui <= 0) {
                     // Rack overview (mother / whole node)
@@ -26998,7 +27019,7 @@ function topoRenderFrame(timestamp, xrFrame) {
                 }
             }
         } else if (tooltip) {
-            tooltip.style.pointerEvents = 'none';
+            // tooltip hidden
         }
     }
 
