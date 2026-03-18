@@ -26562,8 +26562,9 @@ function initTopology3D() {
                 } else {
                     state.selectedRackId = newRackId;
                     state.selectedUnitIndex = clickedUnit;
-                    // Lazy-fetch container names for this node
-                    topoFetchContainers(newRackId);
+                    // Lazy-fetch container names then update tooltip
+                    topoFetchContainers(newRackId).then(() => topoUpdateTooltip());
+                    topoUpdateTooltip(); // show immediately with what we have
                 }
             }
         } else {
@@ -26666,28 +26667,55 @@ function buildServerRack(node, color) {
         panel.position.set(0, unitY + unitH / 2, frontZ + 0.12);
         group.add(panel);
 
-        // 3 real LED spheres on front: CPU, MEM, STORAGE (self-lit, always visible)
+        // LEDs on front panel
         if (node.online) {
             const ledR = 0.035;
             const ledGeo2 = new THREE.SphereGeometry(ledR, 10, 10);
             const ledY = unitY + unitH / 2;
             const ledZ = frontZ + 0.13;
-            const leds = [
-                { x: -panelW/2 + 0.08, col: cpuCol },
-                { x: -panelW/2 + 0.19, col: memCol },
-                { x: -panelW/2 + 0.30, col: dskCol },
-            ];
-            leds.forEach(l => {
-                const led = new THREE.Mesh(ledGeo2, new THREE.MeshBasicMaterial({ color: l.col }));
-                led.position.set(l.x, ledY, ledZ);
+
+            if (isMother) {
+                // HOST: 3 LEDs showing real CPU, MEM, STORAGE status
+                const leds = [
+                    { x: -panelW/2 + 0.08, col: cpuCol },
+                    { x: -panelW/2 + 0.19, col: memCol },
+                    { x: -panelW/2 + 0.30, col: dskCol },
+                ];
+                leds.forEach(l => {
+                    const led = new THREE.Mesh(ledGeo2, new THREE.MeshBasicMaterial({ color: l.col }));
+                    led.position.set(l.x, ledY, ledZ);
+                    group.add(led);
+                });
+            } else {
+                // Container/VM: single LED in type color (shows it's online)
+                const led = new THREE.Mesh(ledGeo2, new THREE.MeshBasicMaterial({ color: unitTypeColor }));
+                led.position.set(-panelW/2 + 0.08, ledY, ledZ);
                 group.add(led);
-            });
+            }
+        } else {
+            // Offline: single dim red LED
+            const ledR = 0.035;
+            const ledGeo2 = new THREE.SphereGeometry(ledR, 10, 10);
+            const led = new THREE.Mesh(ledGeo2, new THREE.MeshBasicMaterial({ color: 0x662222 }));
+            led.position.set(-panelW/2 + 0.08, unitY + unitH / 2, frontZ + 0.13);
+            group.add(led);
         }
 
-        // Tiny type label sprite in front of the server unit
+        // Tiny label: HOST shows hostname, containers show type + number
+        const ci = i - 1;
+        let labelText = '';
+        if (isMother) {
+            labelText = node.hostname || 'HOST';
+        } else if (ci < dockerCount) {
+            labelText = 'Docker ' + (ci + 1);
+        } else if (ci < dockerCount + lxcCount) {
+            labelText = 'LXC ' + (ci - dockerCount + 1);
+        } else {
+            labelText = 'VM ' + (ci - dockerCount - lxcCount + 1);
+        }
         const typeHex = '#' + unitTypeColor.toString(16).padStart(6, '0');
-        const typeLabel = makeTextSprite(unitType, { fontSize: 18, color: typeHex, scale: 0.25 });
-        typeLabel.position.set(panelW/2 - 0.15, unitY + unitH / 2, frontZ + 0.15);
+        const typeLabel = makeTextSprite(labelText, { fontSize: 16, color: isMother ? '#ccccdd' : typeHex, scale: 0.18 });
+        typeLabel.position.set(0.05, unitY + unitH / 2, frontZ + 0.15);
         typeLabel.userData = { isLabel: true, isSideLabel: true };
         group.add(typeLabel);
 
@@ -26753,8 +26781,8 @@ function buildTopologyScene() {
 
     const cNames = Object.keys(clusters);
     const cColors = [0xdc2626, 0x3b82f6, 0x10b981, 0xf59e0b, 0x8b5cf6, 0xec4899, 0x06b6d4, 0xf97316];
-    const rackSpacing = 3.0;
-    const clusterGap = 5.0;
+    const rackSpacing = 2.0;
+    const clusterGap = 4.0;
 
     // Lay out racks in rows per cluster
     let offsetX = 0;
@@ -26924,100 +26952,17 @@ function topoRenderFrame(timestamp, xrFrame) {
         // Cursor
         _topo.container.style.cursor = hits.length > 0 ? 'pointer' : (_topo.isDragging ? 'grabbing' : 'grab');
 
-        // Show info panel for selected rack / unit
-        if (_topo.selectedRackId && tooltip) {
+        // Reposition tooltip (content is set in topoUpdateTooltip, not here)
+        if (_topo.selectedRackId && tooltip && tooltip.style.display !== 'none') {
             const rack = _topo.nodeMeshes.find(m => m.userData.id === _topo.selectedRackId);
-            const n = rack?.userData?.node;
-            if (n) {
-                const nodeId = n.id;
-                const esc = s => escapeHtml(s || '');
-                const ui = _topo.selectedUnitIndex;
-                // tooltip is interactive when visible
-
-                if (ui <= 0) {
-                    // Rack overview (mother / whole node)
-                    const m = n.metrics || {};
-                    const cpu = m.cpu_usage_percent?.toFixed(0) || '?';
-                    const mem = m.memory_percent?.toFixed(0) || '?';
-                    const root = m.disks?.find(d => d.mount_point === '/') || m.disks?.[0];
-                    const dsk = root ? root.usage_percent.toFixed(0) : '?';
-                    // Container list from cache
-                    const cc = _topoContainerCache[nodeId];
-                    let listHtml = '';
-                    if (cc) {
-                        const all = [
-                            ...cc.docker.map(c => ({ ...c, rt: 'docker', icon: '&#9632;', clr: '#3b82f6' })),
-                            ...cc.lxc.map(c => ({ ...c, rt: 'lxc', icon: '&#9632;', clr: '#10b981' })),
-                            ...cc.vms.map(v => ({ ...v, rt: 'vm', icon: '&#9632;', clr: '#f59e0b' })),
-                        ];
-                        if (all.length > 0) {
-                            listHtml = '<div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.1);max-height:140px;overflow-y:auto;">';
-                            all.forEach(c => {
-                                const stateClr = (c.state === 'running' || c.state === 'Running') ? '#22c55e' : '#ef4444';
-                                const termBtn = (c.rt === 'docker' || c.rt === 'lxc') ?
-                                    `<button onclick="topoOpenTerminal('${esc(nodeId)}','${c.rt}','${esc(c.name)}')" style="margin-left:auto;padding:2px 6px;border:1px solid rgba(255,255,255,0.15);border-radius:4px;background:rgba(255,255,255,0.06);color:#aaa;font-size:9px;cursor:pointer;font-family:inherit;">Terminal</button>` : '';
-                                listHtml += `<div style="display:flex;align-items:center;gap:6px;font-size:10px;line-height:2;color:rgba(255,255,255,0.6);">` +
-                                    `<span style="color:${c.clr};">${c.icon}</span>` +
-                                    `<span style="color:${stateClr};font-size:8px;">&#9679;</span>` +
-                                    `<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(c.name)}</span>` +
-                                    termBtn + `</div>`;
-                            });
-                            listHtml += '</div>';
-                        }
-                    }
-                    tooltip.innerHTML =
-                        `<div style="font-weight:700;font-size:14px;margin-bottom:4px;">${esc(n.hostname || n.id)}</div>` +
-                        `<div style="color:rgba(255,255,255,0.45);font-size:11px;margin-bottom:8px;">${esc(n.address)}</div>` +
-                        `<div style="color:rgba(255,255,255,0.7);line-height:1.8;font-size:12px;">` +
-                        `<div>${n.online ? '<span style="color:#22c55e;">&#9679;</span> Online' : '<span style="color:#ef4444;">&#9679;</span> Offline'}</div>` +
-                        `<div><span style="color:#22c55e;">&#9679;</span> CPU: ${cpu}%</div>` +
-                        `<div><span style="color:#3b82f6;">&#9679;</span> Memory: ${mem}%</div>` +
-                        `<div><span style="color:#8b5cf6;">&#9679;</span> Disk: ${dsk}%</div>` +
-                        `</div>` +
-                        listHtml +
-                        `<div style="margin-top:10px;display:flex;gap:6px;">` +
-                        `<button onclick="topoOpenTerminal('${esc(nodeId)}')" style="flex:1;padding:7px 0;border:1px solid rgba(255,255,255,0.15);border-radius:6px;background:rgba(255,255,255,0.08);color:#fff;font-size:11px;cursor:pointer;font-family:inherit;">Terminal</button>` +
-                        `<button onclick="topoOpenDashboard('${esc(nodeId)}')" style="flex:1;padding:7px 0;border:1px solid rgba(220,38,38,0.3);border-radius:6px;background:rgba(220,38,38,0.15);color:#fff;font-size:11px;cursor:pointer;font-family:inherit;">Dashboard</button>` +
-                        `</div>`;
-                } else {
-                    // Specific container/VM unit
-                    const info = topoGetUnitInfo(nodeId, ui);
-                    if (info) {
-                        const typeColors = { HOST: '#22c55e', DOCKER: '#3b82f6', LXC: '#10b981', VM: '#f59e0b' };
-                        const tc = typeColors[info.type] || '#888';
-                        const stateText = info.state ? `<div style="margin-top:2px;"><span style="color:${(info.state === 'running' || info.state === 'Running') ? '#22c55e' : '#ef4444'};">&#9679;</span> ${esc(info.state)}</div>` : '';
-                        const termBtn = (info.runtime === 'docker' || info.runtime === 'lxc' || info.runtime === 'host') ?
-                            `<button onclick="topoOpenTerminal('${esc(nodeId)}','${info.runtime}','${esc(info.name)}')" style="flex:1;padding:7px 0;border:1px solid rgba(255,255,255,0.15);border-radius:6px;background:rgba(255,255,255,0.08);color:#fff;font-size:11px;cursor:pointer;font-family:inherit;">Terminal</button>` : '';
-                        tooltip.innerHTML =
-                            `<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">` +
-                            `<span style="background:${tc};color:#fff;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;">${info.type}</span>` +
-                            `<span style="font-weight:700;font-size:13px;">${esc(info.name)}</span>` +
-                            `</div>` +
-                            `<div style="color:rgba(255,255,255,0.6);font-size:11px;line-height:1.7;">` +
-                            `<div>Node: ${esc(n.hostname || n.id)}</div>` +
-                            stateText +
-                            `</div>` +
-                            `<div style="margin-top:10px;display:flex;gap:6px;">` +
-                            termBtn +
-                            `<button onclick="topoOpenDashboard('${esc(nodeId)}')" style="flex:1;padding:7px 0;border:1px solid rgba(220,38,38,0.3);border-radius:6px;background:rgba(220,38,38,0.15);color:#fff;font-size:11px;cursor:pointer;font-family:inherit;">Node Dashboard</button>` +
-                            `</div>`;
-                    }
-                }
-
-                tooltip.style.display = 'block';
-                if (rack) {
-                    const pos = rack.position.clone();
-                    pos.y += 6;
-                    pos.project(_topo.camera);
-                    const rect = _topo.container.getBoundingClientRect();
-                    const tx = Math.min((pos.x + 1) / 2 * rect.width + 16, rect.width - 300);
-                    const ty = Math.max((-pos.y + 1) / 2 * rect.height - 10, 10);
-                    tooltip.style.left = tx + 'px';
-                    tooltip.style.top = ty + 'px';
-                }
+            if (rack) {
+                const pos = rack.position.clone();
+                pos.y += 6;
+                pos.project(_topo.camera);
+                const rect = _topo.container.getBoundingClientRect();
+                tooltip.style.left = Math.min((pos.x + 1) / 2 * rect.width + 16, rect.width - 330) + 'px';
+                tooltip.style.top = Math.max((-pos.y + 1) / 2 * rect.height - 10, 10) + 'px';
             }
-        } else if (tooltip) {
-            // tooltip hidden
         }
     }
 
@@ -27106,6 +27051,82 @@ function topologyResetCamera() {
 
 function topologyToggleLabels() { if (_topo) _topo.showLabels = !_topo.showLabels; }
 function topologyToggleAutoRotate() { if (_topo) _topo.autoRotate = !_topo.autoRotate; }
+
+// Update tooltip content (called on selection change, NOT every frame)
+function topoUpdateTooltip() {
+    const tooltip = document.getElementById('topology-tooltip');
+    if (!_topo || !tooltip) return;
+    if (!_topo.selectedRackId) { tooltip.style.display = 'none'; return; }
+
+    const rack = _topo.nodeMeshes.find(m => m.userData.id === _topo.selectedRackId);
+    const n = rack?.userData?.node;
+    if (!n) { tooltip.style.display = 'none'; return; }
+
+    const nodeId = n.id;
+    const esc = s => escapeHtml(s || '');
+    const ui = _topo.selectedUnitIndex;
+
+    if (ui <= 0) {
+        // Rack overview (host)
+        const m = n.metrics || {};
+        const cpu = m.cpu_usage_percent?.toFixed(0) || '?';
+        const mem = m.memory_percent?.toFixed(0) || '?';
+        const root = m.disks?.find(d => d.mount_point === '/') || m.disks?.[0];
+        const dsk = root ? root.usage_percent.toFixed(0) : '?';
+        const cc = _topoContainerCache[nodeId];
+        let listHtml = '';
+        if (cc) {
+            const all = [
+                ...cc.docker.map(c => ({ ...c, rt: 'docker', clr: '#3b82f6' })),
+                ...cc.lxc.map(c => ({ ...c, rt: 'lxc', clr: '#10b981' })),
+                ...cc.vms.map(v => ({ ...v, rt: 'vm', clr: '#f59e0b' })),
+            ];
+            if (all.length > 0) {
+                listHtml = '<div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.1);max-height:140px;overflow-y:auto;">';
+                all.forEach(c => {
+                    const stClr = (c.state === 'running' || c.state === 'Running') ? '#22c55e' : '#ef4444';
+                    const tb = (c.rt === 'docker' || c.rt === 'lxc') ?
+                        `<button onclick="topoOpenTerminal('${esc(nodeId)}','${c.rt}','${esc(c.name)}')" style="margin-left:auto;padding:2px 6px;border:1px solid rgba(255,255,255,0.15);border-radius:4px;background:rgba(255,255,255,0.06);color:#aaa;font-size:9px;cursor:pointer;font-family:inherit;">Terminal</button>` : '';
+                    listHtml += `<div style="display:flex;align-items:center;gap:6px;font-size:10px;line-height:2;color:rgba(255,255,255,0.6);">` +
+                        `<span style="color:${c.clr};">&#9632;</span>` +
+                        `<span style="color:${stClr};font-size:8px;">&#9679;</span>` +
+                        `<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(c.name)}</span>` +
+                        tb + `</div>`;
+                });
+                listHtml += '</div>';
+            }
+        }
+        tooltip.innerHTML =
+            `<div style="font-weight:700;font-size:14px;margin-bottom:4px;">${esc(n.hostname || n.id)}</div>` +
+            `<div style="color:rgba(255,255,255,0.45);font-size:11px;margin-bottom:8px;">${esc(n.address)}</div>` +
+            `<div style="color:rgba(255,255,255,0.7);line-height:1.8;font-size:12px;">` +
+            `<div>${n.online ? '<span style="color:#22c55e;">&#9679;</span> Online' : '<span style="color:#ef4444;">&#9679;</span> Offline'}</div>` +
+            `<div><span style="color:#22c55e;">&#9679;</span> CPU: ${cpu}%</div>` +
+            `<div><span style="color:#3b82f6;">&#9679;</span> Memory: ${mem}%</div>` +
+            `<div><span style="color:#8b5cf6;">&#9679;</span> Disk: ${dsk}%</div></div>` +
+            listHtml +
+            `<div style="margin-top:10px;display:flex;gap:6px;">` +
+            `<button onclick="topoOpenTerminal('${esc(nodeId)}')" style="flex:1;padding:7px 0;border:1px solid rgba(255,255,255,0.15);border-radius:6px;background:rgba(255,255,255,0.08);color:#fff;font-size:11px;cursor:pointer;font-family:inherit;">Terminal</button>` +
+            `<button onclick="topoOpenDashboard('${esc(nodeId)}')" style="flex:1;padding:7px 0;border:1px solid rgba(220,38,38,0.3);border-radius:6px;background:rgba(220,38,38,0.15);color:#fff;font-size:11px;cursor:pointer;font-family:inherit;">Dashboard</button></div>`;
+    } else {
+        const info = topoGetUnitInfo(nodeId, ui);
+        if (info) {
+            const tc = { HOST: '#22c55e', DOCKER: '#3b82f6', LXC: '#10b981', VM: '#f59e0b' }[info.type] || '#888';
+            const stateText = info.state ? `<div style="margin-top:2px;"><span style="color:${(info.state === 'running' || info.state === 'Running') ? '#22c55e' : '#ef4444'};">&#9679;</span> ${esc(info.state)}</div>` : '';
+            const termBtn = (info.runtime === 'docker' || info.runtime === 'lxc' || info.runtime === 'host') ?
+                `<button onclick="topoOpenTerminal('${esc(nodeId)}','${info.runtime}','${esc(info.name)}')" style="flex:1;padding:7px 0;border:1px solid rgba(255,255,255,0.15);border-radius:6px;background:rgba(255,255,255,0.08);color:#fff;font-size:11px;cursor:pointer;font-family:inherit;">Terminal</button>` : '';
+            tooltip.innerHTML =
+                `<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">` +
+                `<span style="background:${tc};color:#fff;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;">${info.type}</span>` +
+                `<span style="font-weight:700;font-size:13px;">${esc(info.name)}</span></div>` +
+                `<div style="color:rgba(255,255,255,0.6);font-size:11px;line-height:1.7;">` +
+                `<div>Node: ${esc(n.hostname || n.id)}</div>${stateText}</div>` +
+                `<div style="margin-top:10px;display:flex;gap:6px;">${termBtn}` +
+                `<button onclick="topoOpenDashboard('${esc(nodeId)}')" style="flex:1;padding:7px 0;border:1px solid rgba(220,38,38,0.3);border-radius:6px;background:rgba(220,38,38,0.15);color:#fff;font-size:11px;cursor:pointer;font-family:inherit;">Node Dashboard</button></div>`;
+        }
+    }
+    tooltip.style.display = 'block';
+}
 
 // Fetch container names for a node (cached for 30s)
 async function topoFetchContainers(nodeId) {
