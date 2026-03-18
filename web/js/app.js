@@ -26528,11 +26528,16 @@ function initTopology3D() {
         updateCameraFromSpherical();
     }, { passive: false });
 
+    // Stop tooltip clicks from reaching the canvas
+    document.getElementById('topology-tooltip')?.addEventListener('click', e => e.stopPropagation());
+
     // Click — select a specific server unit in a rack; click empty = dismiss
     state.selectedRackId = null;
     state.selectedUnitIndex = -1; // -1 = whole rack overview, 0+ = specific unit
     container.addEventListener('click', e => {
         if (state.isDragging) return;
+        // Ignore clicks on the tooltip
+        if (e.target.closest('#topology-tooltip')) return;
         const rect = container.getBoundingClientRect();
         state.mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
         state.mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
@@ -26652,58 +26657,39 @@ function buildServerRack(node, color) {
         unit.userData = { isUnit: true, unitIndex: i, unitType, isMother };
         group.add(unit);
 
-        // Front panel with LED dots and type label baked into canvas texture
+        // Front panel (plain dark)
         const panelW = rackW - 0.2;
         const panelH = (isMother ? unitH + 0.02 : unitH) - 0.04;
-        const panelCvs = document.createElement('canvas');
-        panelCvs.width = 512;
-        panelCvs.height = 64;
-        const pCtx = panelCvs.getContext('2d');
-        // Background
-        pCtx.fillStyle = isMother ? '#333345' : '#2a2a38';
-        pCtx.fillRect(0, 0, 512, 64);
-
-        if (node.online) {
-            // 3 LED dots: CPU, MEM, STORAGE
-            const dotDefs = [
-                { color: cpuCol, label: 'CPU', x: 16 },
-                { color: memCol, label: 'MEM', x: 80 },
-                { color: dskCol, label: 'STR', x: 144 },
-            ];
-            dotDefs.forEach(d => {
-                // Glow
-                pCtx.beginPath();
-                pCtx.arc(d.x + 8, 32, 12, 0, Math.PI * 2);
-                const hex = '#' + d.color.toString(16).padStart(6, '0');
-                pCtx.fillStyle = hex + '40';
-                pCtx.fill();
-                // Dot
-                pCtx.beginPath();
-                pCtx.arc(d.x + 8, 32, 7, 0, Math.PI * 2);
-                pCtx.fillStyle = hex;
-                pCtx.fill();
-                // Label
-                pCtx.font = '10px Inter, sans-serif';
-                pCtx.fillStyle = '#666678';
-                pCtx.fillText(d.label, d.x + 22, 36);
-            });
-        }
-
-        // Type label on right side
-        const typeHex = '#' + unitTypeColor.toString(16).padStart(6, '0');
-        pCtx.font = isMother ? 'bold 22px Inter, sans-serif' : 'bold 18px Inter, sans-serif';
-        pCtx.fillStyle = typeHex;
-        pCtx.textAlign = 'right';
-        pCtx.fillText(unitType, 500, 38);
-        pCtx.textAlign = 'left';
-
-        const panelTex = new THREE.CanvasTexture(panelCvs);
-        panelTex.minFilter = THREE.LinearFilter;
         const panelGeo = new THREE.BoxGeometry(panelW, panelH, 0.02);
-        const panelMat = new THREE.MeshBasicMaterial({ map: panelTex });
+        const panelMat = new THREE.MeshPhongMaterial({ color: isMother ? 0x333345 : 0x2a2a38, shininess: 20 });
         const panel = new THREE.Mesh(panelGeo, panelMat);
         panel.position.set(0, unitY + unitH / 2, frontZ + 0.12);
         group.add(panel);
+
+        // 3 real LED spheres on front: CPU, MEM, STORAGE (self-lit, always visible)
+        if (node.online) {
+            const ledR = 0.035;
+            const ledGeo2 = new THREE.SphereGeometry(ledR, 10, 10);
+            const ledY = unitY + unitH / 2;
+            const ledZ = frontZ + 0.13;
+            const leds = [
+                { x: -panelW/2 + 0.08, col: cpuCol },
+                { x: -panelW/2 + 0.19, col: memCol },
+                { x: -panelW/2 + 0.30, col: dskCol },
+            ];
+            leds.forEach(l => {
+                const led = new THREE.Mesh(ledGeo2, new THREE.MeshBasicMaterial({ color: l.col }));
+                led.position.set(l.x, ledY, ledZ);
+                group.add(led);
+            });
+        }
+
+        // Tiny type label sprite in front of the server unit
+        const typeHex = '#' + unitTypeColor.toString(16).padStart(6, '0');
+        const typeLabel = makeTextSprite(unitType, { fontSize: 18, color: typeHex, scale: 0.25 });
+        typeLabel.position.set(panelW/2 - 0.15, unitY + unitH / 2, frontZ + 0.15);
+        typeLabel.userData = { isLabel: true, isSideLabel: true };
+        group.add(typeLabel);
 
         // Mother server accent stripe (cluster color)
         if (isMother) {
