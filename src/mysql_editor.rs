@@ -739,7 +739,7 @@ pub fn detect_mysql_containers() -> Vec<serde_json::Value> {
         }
     }
 
-    // ── WolfNet IPs — scan 10.10.10.0/24 for MySQL on port 3306 ──
+    // ── WolfNet IPs — scan for MySQL on port 3306 ──
     let wolfnet_ips = scan_wolfnet_mysql();
     let existing_hosts: std::collections::HashSet<String> = results.iter()
         .filter_map(|r| r.get("host").and_then(|h| h.as_str()).map(|s| s.to_string()))
@@ -759,11 +759,16 @@ pub fn detect_mysql_containers() -> Vec<serde_json::Value> {
     results
 }
 
-/// Scan WolfNet IPs (10.10.10.0/24) for MySQL on port 3306
+/// Scan WolfNet IPs for MySQL on port 3306
 fn scan_wolfnet_mysql() -> Vec<(String, String)> {
     use std::net::{TcpStream, SocketAddr};
 
-    // Get all IPs with routes in the 10.10.10.0/24 range
+    let prefix = match crate::containers::wolfnet_subnet_prefix() {
+        Some(p) => format!("{}.", p),
+        None => return vec![],
+    };
+
+    // Get all IPs with routes in the WolfNet range
     let output = match std::process::Command::new("ip")
         .args(["route", "show"])
         .output()
@@ -775,7 +780,7 @@ fn scan_wolfnet_mysql() -> Vec<(String, String)> {
     let mut ips_to_scan: Vec<String> = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let ip = match line.split_whitespace().next() {
-            Some(ip) if ip.starts_with("10.10.10.") && !ip.contains('/') => ip,
+            Some(ip) if ip.starts_with(&prefix) && !ip.contains('/') => ip,
             _ => continue,
         };
         if !ips_to_scan.contains(&ip.to_string()) {

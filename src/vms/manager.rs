@@ -310,7 +310,7 @@ impl VmManager {
             if !ip.is_empty() {
                 let parts: Vec<&str> = ip.split('.').collect();
                 if parts.len() != 4 || parts.iter().any(|p| p.parse::<u8>().is_err()) {
-                    return Err(format!("Invalid WolfNet IP: '{}' — must be like 10.10.10.100", ip));
+                    return Err(format!("Invalid WolfNet IP: '{}' — must be a valid IPv4 address", ip));
                 }
                 config.wolfnet_ip = Some(ip.to_string());
             } else {
@@ -1112,13 +1112,23 @@ impl VmManager {
         // Exclude WolfNet-destined traffic so the VM appears as its own WolfNet IP,
         // not the host's IP, when communicating with other WolfNet nodes.
         // Remove old overly-broad rule if it exists, then add the correct one.
+        let wn_subnet = {
+            let parts: Vec<&str> = wolfnet_ip.split('.').collect();
+            if parts.len() == 4 {
+                format!("{}.{}.{}.0/24", parts[0], parts[1], parts[2])
+            } else {
+                crate::containers::wolfnet_subnet_prefix().map(|p| format!("{}.0/24", p)).unwrap_or_default()
+            }
+        };
         let _ = Command::new("iptables")
             .args(["-t", "nat", "-D", "POSTROUTING", "-s", &format!("{}/32", wolfnet_ip), "-j", "MASQUERADE"]).output();
-        let check_nat = Command::new("iptables")
-            .args(["-t", "nat", "-C", "POSTROUTING", "-s", &format!("{}/32", wolfnet_ip), "!", "-d", "10.10.10.0/24", "-j", "MASQUERADE"]).output();
-        if check_nat.map(|o| !o.status.success()).unwrap_or(true) {
-            let _ = Command::new("iptables")
-                .args(["-t", "nat", "-A", "POSTROUTING", "-s", &format!("{}/32", wolfnet_ip), "!", "-d", "10.10.10.0/24", "-j", "MASQUERADE"]).output();
+        if !wn_subnet.is_empty() {
+            let check_nat = Command::new("iptables")
+                .args(["-t", "nat", "-C", "POSTROUTING", "-s", &format!("{}/32", wolfnet_ip), "!", "-d", &wn_subnet, "-j", "MASQUERADE"]).output();
+            if check_nat.map(|o| !o.status.success()).unwrap_or(true) {
+                let _ = Command::new("iptables")
+                    .args(["-t", "nat", "-A", "POSTROUTING", "-s", &format!("{}/32", wolfnet_ip), "!", "-d", &wn_subnet, "-j", "MASQUERADE"]).output();
+            }
         }
 
         Ok(())

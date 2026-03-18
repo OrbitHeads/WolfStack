@@ -1448,13 +1448,15 @@ fn find_available_k8s_wolfnet_ip(config: &KubernetesConfig) -> Option<String> {
         }
     }
 
-    // Reserve gateway and broadcast
-    used.insert("10.10.10.1".to_string());
-    used.insert("10.10.10.255".to_string());
+    let prefix = crate::containers::wolfnet_subnet_prefix()?;
 
-    // Find next available in 10.10.10.2-254
+    // Reserve gateway and broadcast
+    used.insert(format!("{}.1", prefix));
+    used.insert(format!("{}.255", prefix));
+
+    // Find next available in the WolfNet /24 range
     for i in 2..=254u8 {
-        let candidate = format!("10.10.10.{}", i);
+        let candidate = format!("{}.{}", prefix, i);
         if !used.contains(&candidate) {
             return Some(candidate);
         }
@@ -1489,7 +1491,7 @@ pub fn allocate_wolfnet_route(cluster_id: &str, deployment_name: &str, namespace
 
     // Find next available WolfNet IP
     let wolfnet_ip = find_available_k8s_wolfnet_ip(&config)
-        .ok_or_else(|| "No available WolfNet IPs in the 10.10.10.0/24 range".to_string())?;
+        .ok_or_else(|| "No available WolfNet IPs in the WolfNet subnet".to_string())?;
 
     // Add IP as secondary address on wolfnet0
     let add_result = Command::new("ip")

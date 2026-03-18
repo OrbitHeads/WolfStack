@@ -3963,14 +3963,18 @@ pub async fn wolfnet_next_ip(
         }
     }
 
-    // Find next available IP in 10.10.10.2-254 that isn't in the combined used set
+    // Find next available IP that isn't in the combined used set
+    let prefix = containers::wolfnet_subnet_prefix().unwrap_or_default();
+    if prefix.is_empty() {
+        return HttpResponse::Ok().json(serde_json::json!({ "ip": null, "error": "WolfNet is not configured" }));
+    }
     let next_ip = (2..=254u8)
-        .map(|i| format!("10.10.10.{}", i))
+        .map(|i| format!("{}.{}", prefix, i))
         .find(|ip| !all_used.contains(ip));
 
     match next_ip {
         Some(ip) => HttpResponse::Ok().json(serde_json::json!({ "ip": ip })),
-        None => HttpResponse::Ok().json(serde_json::json!({ "ip": null, "error": "No available IPs in 10.10.10.0/24" })),
+        None => HttpResponse::Ok().json(serde_json::json!({ "ip": null, "error": "No available IPs in the WolfNet subnet" })),
     }
 }
 

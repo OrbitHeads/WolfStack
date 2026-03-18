@@ -349,7 +349,12 @@ pub fn lxc_base_dir(container: &str) -> String {
 pub fn cleanup_stale_wolfnet_routes() {
     let local_ips: std::collections::HashSet<String> = wolfnet_used_ips_cached().into_iter().collect();
 
-    // Get all kernel routes in the 10.10.10.0/24 range
+    let prefix = match wolfnet_subnet_prefix() {
+        Some(p) => format!("{}.", p),
+        None => return, // WolfNet not configured
+    };
+
+    // Get all kernel routes in the WolfNet range
     let output = match Command::new("ip").args(["route", "show"]).output() {
         Ok(o) => o,
         Err(_) => return,
@@ -358,9 +363,8 @@ pub fn cleanup_stale_wolfnet_routes() {
 
     let mut removed = 0;
     for line in text.lines() {
-        // Match lines like: "10.10.10.X via 10.0.3.Y dev lxcbr0" or "10.10.10.X dev docker0 scope link"
         let ip = match line.split_whitespace().next() {
-            Some(ip) if ip.starts_with("10.10.10.") && !ip.contains('/') => ip,
+            Some(ip) if ip.starts_with(&prefix) && !ip.contains('/') => ip,
             _ => continue,
         };
 
@@ -445,8 +449,9 @@ pub fn cleanup_stale_wolfnet_routes() {
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_else(|_| "172.17.0.1".to_string());
             let gw = if gateway.is_empty() { "172.17.0.1".to_string() } else { gateway };
+            let wn_subnet = format!("{}.0/24", prefix.trim_end_matches('.'));
             let _ = Command::new("nsenter")
-                .args(["--target", &pid_out, "--net", "ip", "route", "replace", "10.10.10.0/24", "via", &gw, "src", &label])
+                .args(["--target", &pid_out, "--net", "ip", "route", "replace", &wn_subnet, "via", &gw, "src", &label])
                 .output();
         }
     }
@@ -475,6 +480,44 @@ pub fn cleanup_stale_wolfnet_routes() {
 
 // ─── WolfNet Integration ───
 
+/// Detect the WolfNet subnet prefix (e.g. "10.100.10") from the live wolfnet0
+/// interface or /etc/wolfnet/config.toml.  Never hardcode "10.10.10" — users
+/// choose their own subnet when they set up WolfNet.
+pub fn wolfnet_subnet_prefix() -> Option<String> {
+    // Primary: read wolfnet0 interface IP
+    if let Ok(out) = Command::new("ip").args(["addr", "show", "wolfnet0"]).output() {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some(ip) = text.lines()
+                .find(|l| l.contains("inet "))
+                .and_then(|l| l.trim().split_whitespace().nth(1))
+                .and_then(|s| s.split('/').next())
+            {
+                let parts: Vec<&str> = ip.split('.').collect();
+                if parts.len() == 4 {
+                    return Some(format!("{}.{}.{}", parts[0], parts[1], parts[2]));
+                }
+            }
+        }
+    }
+    // Fallback: config file
+    if let Ok(content) = std::fs::read_to_string("/etc/wolfnet/config.toml") {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("address") && trimmed.contains('=') {
+                if let Some(val) = trimmed.split('=').nth(1) {
+                    let addr = val.trim().trim_matches('"').trim();
+                    let parts: Vec<&str> = addr.split('.').collect();
+                    if parts.len() >= 3 {
+                        return Some(format!("{}.{}.{}", parts[0], parts[1], parts[2]));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// WolfNet status for container networking
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WolfNetStatus {
@@ -495,7 +538,7 @@ pub fn wolfnet_status(extra_used: &[u8]) -> WolfNetStatus {
     match output {
         Ok(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout);
-            // Parse IP: look for inet 10.10.10.X/24
+            // Parse IP from wolfnet0 interface
             let ip = text.lines()
                 .find(|l| l.contains("inet "))
                 .and_then(|l| l.trim().split_whitespace().nth(1))
@@ -504,12 +547,12 @@ pub fn wolfnet_status(extra_used: &[u8]) -> WolfNetStatus {
                 .to_string();
 
             let subnet = if !ip.is_empty() {
-                // Derive subnet from IP (e.g., 10.10.10.0/24)
+                // Derive subnet from IP (e.g., x.x.x.0/24)
                 let parts: Vec<&str> = ip.split('.').collect();
                 if parts.len() == 4 {
                     format!("{}.{}.{}.0/24", parts[0], parts[1], parts[2])
                 } else {
-                    "10.10.10.0/24".to_string()
+                    wolfnet_subnet_prefix().map(|p| format!("{}.0/24", p)).unwrap_or_default()
                 }
             } else {
                 String::new()
@@ -536,11 +579,15 @@ pub fn wolfnet_status(extra_used: &[u8]) -> WolfNetStatus {
 }
 
 /// Allocate the next available WolfNet IP for a container
-/// Scans existing containers and picks the next free IP in 10.10.10.100-254 range
+/// Scans existing containers and picks the next free IP in the WolfNet /24 range
 pub fn wolfnet_allocate_ip(host_ip: &str, extra_used: &[u8]) -> String {
     let parts: Vec<&str> = host_ip.split('.').collect();
     if parts.len() != 4 {
-        return "10.10.10.100".to_string();
+        // Fall back to dynamic detection instead of hardcoded prefix
+        if let Some(pfx) = wolfnet_subnet_prefix() {
+            return format!("{}.100", pfx);
+        }
+        return String::new();
     }
     let prefix = format!("{}.{}.{}", parts[0], parts[1], parts[2]);
 
@@ -993,10 +1040,17 @@ pub fn docker_connect_wolfnet(container: &str, ip: &str) -> Result<String, Strin
         // Add route to WolfNet subnet via gateway so container can reach other WolfNet hosts.
         // The `src` hint ensures the kernel uses the WolfNet IP as source, not the
         // Docker bridge IP — critical for cross-node connectivity.
-        let subnet = "10.10.10.0/24";
-        let _ = Command::new("nsenter")
-            .args(["--target", &container_pid, "--net", "ip", "route", "replace", subnet, "via", &gateway, "src", ip])
-            .output();
+        let ip_parts: Vec<&str> = ip.split('.').collect();
+        let subnet = if ip_parts.len() == 4 {
+            format!("{}.{}.{}.0/24", ip_parts[0], ip_parts[1], ip_parts[2])
+        } else {
+            wolfnet_subnet_prefix().map(|p| format!("{}.0/24", p)).unwrap_or_default()
+        };
+        if !subnet.is_empty() {
+            let _ = Command::new("nsenter")
+                .args(["--target", &container_pid, "--net", "ip", "route", "replace", &subnet, "via", &gateway, "src", ip])
+                .output();
+        }
     }
 
     // 5. Configure Host Side
@@ -1318,6 +1372,14 @@ fn lxc_apply_wolfnet(container: &str) {
         let is_pve = is_proxmox();
         let _wolfnet_iface = if is_pve { "wn0" } else { "eth0" };
 
+        // Derive WolfNet subnet from the container's WolfNet IP
+        let wn_parts: Vec<&str> = ip.split('.').collect();
+        let wn_subnet = if wn_parts.len() == 4 {
+            format!("{}.{}.{}.0/24", wn_parts[0], wn_parts[1], wn_parts[2])
+        } else {
+            wolfnet_subnet_prefix().map(|p| format!("{}.0/24", p)).unwrap_or_default()
+        };
+
         if is_pve {
             // Proxmox: wn0 is on lxcbr0 with NO IP/gateway in pct config.
             // We assign a 10.0.3.x bridge IP for host routing and the WolfNet IP
@@ -1335,14 +1397,14 @@ fn lxc_apply_wolfnet(container: &str) {
                 "if [ -d /etc/NetworkManager ]; then \
                      mkdir -p /etc/NetworkManager/system-connections && \
                      printf '[connection]\\nid=wn0\\ntype=ethernet\\ninterface-name=wn0\\nautoconnect=true\\n\\n\
-[ipv4]\\nmethod=manual\\naddress1={}/24\\naddress2={}/32\\nroute1=10.10.10.0/24,10.0.3.1\\nroute1_options=src={}\\n\\n\
+[ipv4]\\nmethod=manual\\naddress1={}/24\\naddress2={}/32\\nroute1={},10.0.3.1\\nroute1_options=src={}\\n\\n\
 [ipv6]\\nmethod=disabled\\n' \
                      > /etc/NetworkManager/system-connections/wn0.nmconnection && \
                      chmod 600 /etc/NetworkManager/system-connections/wn0.nmconnection && \
                      nmcli con reload 2>/dev/null && \
                      nmcli con up wn0 2>/dev/null; \
                  fi; true",
-                bridge_ip, ip, ip
+                bridge_ip, ip, wn_subnet, ip
             );
             let mut nm_args: Vec<String> = attach_prefix.clone();
             nm_args.extend(["sh", "-c", &nm_cmd].iter().map(|s| s.to_string()));
@@ -1364,12 +1426,12 @@ fn lxc_apply_wolfnet(container: &str) {
             let _ = Command::new("lxc-attach").args(&args).output();
 
             // Route WolfNet subnet through wn0 via lxcbr0 gateway — without this,
-            // 10.10.10.x traffic goes out via eth0/vmbr0 where WolfNet is unreachable.
+            // WolfNet traffic goes out via eth0/vmbr0 where WolfNet is unreachable.
             // The `src` hint ensures the kernel uses the WolfNet IP as source, not the
             // bridge IP — critical for cross-node connectivity (remote hosts reply to the
             // WolfNet IP, which gets routed back through the overlay).
             let mut args: Vec<String> = attach_prefix.clone();
-            args.extend(["ip", "route", "replace", "10.10.10.0/24", "via", "10.0.3.1", "dev", "wn0", "src", ip].iter().map(|s| s.to_string()));
+            args.extend(["ip", "route", "replace", &wn_subnet, "via", "10.0.3.1", "dev", "wn0", "src", ip].iter().map(|s| s.to_string()));
             let _ = Command::new("lxc-attach").args(&args).output();
 
             // Try to bring up eth0 via NetworkManager (write DHCP config if missing)
@@ -1475,7 +1537,7 @@ fn lxc_apply_wolfnet(container: &str) {
             // uses its WolfNet IP (not the bridge IP) as source when talking to
             // remote WolfNet hosts, so replies get routed back correctly.
             let mut args: Vec<String> = attach_prefix.clone();
-            args.extend(["ip", "route", "replace", "10.10.10.0/24", "via", "10.0.3.1", "src", ip].iter().map(|s| s.to_string()));
+            args.extend(["ip", "route", "replace", &wn_subnet, "via", "10.0.3.1", "src", ip].iter().map(|s| s.to_string()));
             let _ = Command::new("lxc-attach").args(&args).output();
 
             // Host route — via bridge IP so ARP resolves on lxcbr0
@@ -1672,7 +1734,7 @@ fn find_free_bridge_ip() -> u8 {
 }
 
 /// Assign a bridge IP to a container. If a WolfNet IP is provided, derives the
-/// bridge IP from its last octet (10.10.10.101 → 10.0.3.101). Otherwise allocates
+/// bridge IP from its last octet (e.g. x.x.x.101 → 10.0.3.101). Otherwise allocates
 /// the next free bridge IP. Writes network config in either case.
 fn assign_container_bridge_ip(container: &str) -> String {
     // Try to derive from wolfnet IP (deterministic — no allocation needed)
@@ -4244,15 +4306,15 @@ pub fn lxc_set_network_link(container: &str, link: &str) -> Result<String, Strin
     Ok(format!("Network link set to {}", link))
 }
 
-/// Find the next available WolfNet IP (10.10.10.x) not in use by any LXC container
+/// Find the next available WolfNet IP not in use by any LXC container
 pub fn next_available_wolfnet_ip() -> Option<String> {
+    let prefix = wolfnet_subnet_prefix()?;
     let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Scan WolfNet config for node's own IP and all peer IPs
     if let Ok(content) = std::fs::read_to_string("/etc/wolfnet/config.toml") {
         for line in content.lines() {
             let trimmed = line.trim();
-            // Node's own address: address = "10.10.10.3"
             if trimmed.starts_with("address") && trimmed.contains('=') {
                 if let Some(val) = trimmed.split('=').nth(1) {
                     let ip = val.trim().trim_matches('"').trim().to_string();
@@ -4270,8 +4332,8 @@ pub fn next_available_wolfnet_ip() -> Option<String> {
     }
 
     // Also reserve .1 (usually gateway) and .255 (broadcast)
-    used.insert("10.10.10.1".to_string());
-    used.insert("10.10.10.255".to_string());
+    used.insert(format!("{}.1", prefix));
+    used.insert(format!("{}.255", prefix));
 
     // Scan live IPs on wolfnet0 interface (catches VIPs, manual assignments)
     if let Ok(output) = std::process::Command::new("ip")
@@ -4393,9 +4455,9 @@ pub fn next_available_wolfnet_ip() -> Option<String> {
         }
     }
 
-    // Find next available in 10.10.10.2 - 10.10.10.254
+    // Find next available in the WolfNet /24 range
     for i in 2..=254u8 {
-        let candidate = format!("10.10.10.{}", i);
+        let candidate = format!("{}.{}", prefix, i);
         if !used.contains(&candidate) {
             return Some(candidate);
         }
@@ -5703,7 +5765,7 @@ pub fn docker_create(name: &str, image: &str, ports: &[String], env: &[String], 
             // Validate IP format
             let parts: Vec<&str> = ip.split('.').collect();
             if parts.len() != 4 || parts.iter().any(|p| p.parse::<u8>().is_err()) {
-                return Err(format!("Invalid WolfNet IP: '{}' — must be like 10.10.10.100", ip));
+                return Err(format!("Invalid WolfNet IP: '{}' — must be a valid IPv4 address", ip));
             }
             args.push("--label".to_string());
             args.push(format!("wolfnet.ip={}", ip));

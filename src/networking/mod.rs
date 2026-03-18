@@ -2214,7 +2214,7 @@ pub fn detect_wolfnet_ips() -> Vec<serde_json::Value> {
                     let vmid = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
                     if let Ok(conf) = std::fs::read_to_string(&path) {
                         for line in conf.lines() {
-                            // net lines look like: net1: name=wn0,bridge=lxcbr0,ip=10.10.10.x/24,...
+                            // net lines look like: net1: name=wn0,bridge=lxcbr0,ip=x.x.x.x/24,...
                             if line.contains("name=wn0") {
                                 if let Some(ip_part) = line.split(',').find(|p| p.starts_with("ip=")) {
                                     let ip = ip_part.trim_start_matches("ip=")
@@ -2812,7 +2812,7 @@ fn detect_wolfnet_subnet() -> Option<String> {
         for line in content.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with("address") && trimmed.contains('=') {
-                // address = "10.10.10.1" or address = 10.10.10.1
+                // address = "x.x.x.1" or address = x.x.x.1
                 if let Some(val) = trimmed.split('=').nth(1) {
                     let addr = val.trim().trim_matches('"').trim();
                     let parts: Vec<&str> = addr.split('.').collect();
