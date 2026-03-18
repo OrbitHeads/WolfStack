@@ -394,8 +394,8 @@ pub fn cleanup_stale_wolfnet_routes() {
     }
 
     // Ensure Docker containers with WolfNet IPs have correct host routes
-    // (route via docker0, not lxcbr0 or missing entirely)
-    let mut docker_found = false;
+    // Uses each container's actual bridge device (docker0 or br-<id> for custom networks)
+    let mut bridge_devs: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Ok(output) = Command::new("docker")
         .args(["ps", "-a", "--format", "{{.Names}}"])
         .output()
@@ -416,11 +416,13 @@ pub fn cleanup_stale_wolfnet_routes() {
                 .unwrap_or_default();
             if pid_out.is_empty() || pid_out == "0" { continue; }
 
-            docker_found = true;
+            // Detect this container's actual bridge device and gateway
+            let (bridge_dev, gw) = docker_bridge_info(name);
+            bridge_devs.insert(bridge_dev.clone());
 
-            // Ensure host route via docker0 (idempotent — replace if exists)
+            // Ensure host route via the container's actual bridge (idempotent — replace if exists)
             let _ = Command::new("ip")
-                .args(["route", "replace", &format!("{}/32", label), "dev", "docker0"])
+                .args(["route", "replace", &format!("{}/32", label), "dev", &bridge_dev])
                 .output();
 
             // Ensure static ARP entry (get MAC via docker inspect)
@@ -431,7 +433,7 @@ pub fn cleanup_stale_wolfnet_routes() {
                 let mac = String::from_utf8_lossy(&mac_out.stdout).trim().to_string();
                 if !mac.is_empty() {
                     let _ = Command::new("ip")
-                        .args(["neigh", "replace", &label, "lladdr", &mac, "dev", "docker0", "nud", "permanent"])
+                        .args(["neigh", "replace", &label, "lladdr", &mac, "dev", &bridge_dev, "nud", "permanent"])
                         .output();
                 }
             }
@@ -441,14 +443,8 @@ pub fn cleanup_stale_wolfnet_routes() {
                 .args(["--target", &pid_out, "--net", "ip", "addr", "add", &format!("{}/32", label), "dev", "eth0"])
                 .output(); // Silently ignores EEXIST
 
-            // Ensure container can route WolfNet subnet via bridge gateway
+            // Ensure container can route WolfNet subnet via its network's gateway
             // with src hint so the container uses its WolfNet IP as source
-            let gateway = Command::new("docker")
-                .args(["network", "inspect", "bridge", "--format", "{{range .IPAM.Config}}{{.Gateway}}{{end}}"])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .unwrap_or_else(|_| "172.17.0.1".to_string());
-            let gw = if gateway.is_empty() { "172.17.0.1".to_string() } else { gateway };
             let wn_subnet = format!("{}.0/24", prefix.trim_end_matches('.'));
             let _ = Command::new("nsenter")
                 .args(["--target", &pid_out, "--net", "ip", "route", "replace", &wn_subnet, "via", &gw, "src", &label])
@@ -458,23 +454,27 @@ pub fn cleanup_stale_wolfnet_routes() {
 
     // Ensure iptables forwarding rules are at the TOP of FORWARD chain
     // (before DOCKER-USER/DOCKER-FORWARD which may DROP traffic)
-    if docker_found {
+    // Apply for every bridge device we found (docker0, br-xxx, etc.)
+    if !bridge_devs.is_empty() {
         let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.wolfnet0.forwarding=1"]).output();
-        let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.docker0.forwarding=1"]).output();
         let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.wolfnet0.send_redirects=0"]).output();
-        let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.docker0.send_redirects=0"]).output();
-        let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.docker0.proxy_arp=1"]).output();
 
-        // Remove old rules first (idempotent — ignore errors)
-        let _ = Command::new("iptables").args(["-D", "FORWARD", "-i", "wolfnet0", "-o", "docker0", "-j", "ACCEPT"]).output();
-        let _ = Command::new("iptables").args(["-D", "FORWARD", "-i", "docker0", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
-        // Remove duplicates if any
-        let _ = Command::new("iptables").args(["-D", "FORWARD", "-i", "wolfnet0", "-o", "docker0", "-j", "ACCEPT"]).output();
-        let _ = Command::new("iptables").args(["-D", "FORWARD", "-i", "docker0", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
+        for bd in &bridge_devs {
+            let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.forwarding=1", bd)]).output();
+            let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.send_redirects=0", bd)]).output();
+            let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.proxy_arp=1", bd)]).output();
 
-        // Re-insert at position 1 (before DOCKER-USER/DOCKER-FORWARD)
-        let _ = Command::new("iptables").args(["-I", "FORWARD", "1", "-i", "docker0", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
-        let _ = Command::new("iptables").args(["-I", "FORWARD", "1", "-i", "wolfnet0", "-o", "docker0", "-j", "ACCEPT"]).output();
+            // Remove old rules first (idempotent — ignore errors)
+            let _ = Command::new("iptables").args(["-D", "FORWARD", "-i", "wolfnet0", "-o", bd, "-j", "ACCEPT"]).output();
+            let _ = Command::new("iptables").args(["-D", "FORWARD", "-i", bd, "-o", "wolfnet0", "-j", "ACCEPT"]).output();
+            // Remove duplicates if any
+            let _ = Command::new("iptables").args(["-D", "FORWARD", "-i", "wolfnet0", "-o", bd, "-j", "ACCEPT"]).output();
+            let _ = Command::new("iptables").args(["-D", "FORWARD", "-i", bd, "-o", "wolfnet0", "-j", "ACCEPT"]).output();
+
+            // Re-insert at position 1 (before DOCKER-USER/DOCKER-FORWARD)
+            let _ = Command::new("iptables").args(["-I", "FORWARD", "1", "-i", bd, "-o", "wolfnet0", "-j", "ACCEPT"]).output();
+            let _ = Command::new("iptables").args(["-I", "FORWARD", "1", "-i", "wolfnet0", "-o", bd, "-j", "ACCEPT"]).output();
+        }
     }
 }
 
@@ -970,20 +970,69 @@ pub fn ensure_docker_wolfnet_network() -> Result<(), String> {
     Ok(())
 }
 
+/// Detect the host bridge interface and gateway for a Docker container.
+/// Custom Docker networks use `br-<id>` instead of `docker0`, so we inspect
+/// the container's actual network settings rather than assuming the default bridge.
+fn docker_bridge_info(container: &str) -> (String, String) {
+    // Get the network name, gateway, and IP from the container's first network
+    let inspect_fmt = "{{range $net, $cfg := .NetworkSettings.Networks}}{{$net}}|{{$cfg.Gateway}}|{{$cfg.IPAddress}}|{{$cfg.MacAddress}}\n{{end}}";
+    let network_info = Command::new("docker")
+        .args(["inspect", "--format", inspect_fmt, container])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    // Take the first network line
+    let first_line = network_info.lines().next().unwrap_or("");
+    let parts: Vec<&str> = first_line.split('|').collect();
+    let net_name = if !parts.is_empty() { parts[0].trim() } else { "bridge" };
+    let gateway = if parts.len() > 1 && !parts[1].is_empty() {
+        parts[1].to_string()
+    } else {
+        "172.17.0.1".to_string()
+    };
+
+    // Determine the host bridge interface for this Docker network
+    let bridge_dev = if net_name == "bridge" || net_name == "host" || net_name.is_empty() {
+        "docker0".to_string()
+    } else {
+        // Custom network — check for explicit bridge name, then fall back to br-<id>
+        let explicit = Command::new("docker")
+            .args(["network", "inspect", net_name, "--format",
+                   "{{index .Options \"com.docker.network.bridge.name\"}}"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        if !explicit.is_empty() && explicit != "<no value>" {
+            explicit
+        } else {
+            // Default: br-<first 12 chars of network ID>
+            let net_id = Command::new("docker")
+                .args(["network", "inspect", net_name, "--format", "{{.Id}}"])
+                .output()
+                .map(|o| {
+                    let id = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if id.len() >= 12 { id[..12].to_string() } else { id }
+                })
+                .unwrap_or_default();
+            if !net_id.is_empty() {
+                format!("br-{}", net_id)
+            } else {
+                "docker0".to_string()
+            }
+        }
+    };
+
+    (bridge_dev, gateway)
+}
+
 /// Connect a Docker container to WolfNet via host routing (IP alias)
 pub fn docker_connect_wolfnet(container: &str, ip: &str) -> Result<String, String> {
     ensure_docker_wolfnet_network()?;
 
-
-
-    // 1. Get Docker Bridge Gateway IP (usually 172.17.0.1)
-    let gateway = Command::new("docker")
-        .args(["network", "inspect", "bridge", "--format", "{{range .IPAM.Config}}{{.Gateway}}{{end}}"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|_| "172.17.0.1".to_string());
-
-    let gateway = if gateway.is_empty() { "172.17.0.1".to_string() } else { gateway };
+    // 1. Detect the container's actual bridge device and gateway
+    //    Custom Docker networks use br-<id>, not docker0
+    let (bridge_dev, gateway) = docker_bridge_info(container);
 
     // 2. Get the container's bridge IP
     let container_bridge_ip = Command::new("docker")
@@ -1003,8 +1052,6 @@ pub fn docker_connect_wolfnet(container: &str, ip: &str) -> Result<String, Strin
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
 
-
-
     // 4. Configure Container Side — use nsenter to avoid requiring 'ip' inside the container.
     //    Many images (e.g. official nginx) don't ship iproute2, so `docker exec ip ...` silently fails.
     //    nsenter enters the container's network namespace using the host's /sbin/ip binary.
@@ -1017,7 +1064,6 @@ pub fn docker_connect_wolfnet(container: &str, ip: &str) -> Result<String, Strin
     if container_pid.is_empty() || container_pid == "0" {
 
     } else {
-
 
         // Add IP alias /32 (idempotent — ignore EEXIST)
         let alias_result = Command::new("nsenter")
@@ -1054,25 +1100,25 @@ pub fn docker_connect_wolfnet(container: &str, ip: &str) -> Result<String, Strin
     }
 
     // 5. Configure Host Side
-    // Enable per-interface forwarding
+    // Enable per-interface forwarding on both wolfnet0 and the container's bridge
     let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.wolfnet0.forwarding=1"]).output();
-    let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.docker0.forwarding=1"]).output();
+    let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.forwarding=1", bridge_dev)]).output();
     let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.wolfnet0.send_redirects=0"]).output();
-    let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.docker0.send_redirects=0"]).output();
-    let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.docker0.proxy_arp=1"]).output();
+    let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.send_redirects=0", bridge_dev)]).output();
+    let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.proxy_arp=1", bridge_dev)]).output();
 
     // iptables FORWARD rules (idempotent — check before adding)
     let check = Command::new("iptables")
-        .args(["-C", "FORWARD", "-i", "wolfnet0", "-o", "docker0", "-j", "ACCEPT"]).output();
+        .args(["-C", "FORWARD", "-i", "wolfnet0", "-o", &bridge_dev, "-j", "ACCEPT"]).output();
     if check.map(|o| !o.status.success()).unwrap_or(true) {
-        let _ = Command::new("iptables").args(["-I", "FORWARD", "-i", "wolfnet0", "-o", "docker0", "-j", "ACCEPT"]).output();
-        let _ = Command::new("iptables").args(["-I", "FORWARD", "-i", "docker0", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
+        let _ = Command::new("iptables").args(["-I", "FORWARD", "-i", "wolfnet0", "-o", &bridge_dev, "-j", "ACCEPT"]).output();
+        let _ = Command::new("iptables").args(["-I", "FORWARD", "-i", &bridge_dev, "-o", "wolfnet0", "-j", "ACCEPT"]).output();
     }
 
     // 6. Add static ARP entry so the host can reach the WolfNet IP without ARP resolution.
     if !container_mac.is_empty() {
         let neigh_result = Command::new("ip")
-            .args(["neigh", "replace", ip, "lladdr", &container_mac, "dev", "docker0", "nud", "permanent"])
+            .args(["neigh", "replace", ip, "lladdr", &container_mac, "dev", &bridge_dev, "nud", "permanent"])
             .output();
         match &neigh_result {
             Ok(_o) if _o.status.success() => {}
@@ -1085,7 +1131,7 @@ pub fn docker_connect_wolfnet(container: &str, ip: &str) -> Result<String, Strin
 
         // Ping the bridge IP to populate ARP table
         let _ = Command::new("ping").args(["-c", "1", "-W", "1", &container_bridge_ip]).output();
-        if let Ok(output) = Command::new("ip").args(["neigh", "show", &container_bridge_ip, "dev", "docker0"]).output() {
+        if let Ok(output) = Command::new("ip").args(["neigh", "show", &container_bridge_ip, "dev", &bridge_dev]).output() {
             let line = String::from_utf8_lossy(&output.stdout);
             // Parse: "172.17.0.2 lladdr 02:42:ac:11:00:02 REACHABLE"
             let parts: Vec<&str> = line.trim().split_whitespace().collect();
@@ -1093,7 +1139,7 @@ pub fn docker_connect_wolfnet(container: &str, ip: &str) -> Result<String, Strin
                 let mac = parts[2];
 
                 let _ = Command::new("ip")
-                    .args(["neigh", "replace", ip, "lladdr", mac, "dev", "docker0", "nud", "permanent"])
+                    .args(["neigh", "replace", ip, "lladdr", mac, "dev", &bridge_dev, "nud", "permanent"])
                     .output();
 
             } else {
@@ -1102,10 +1148,10 @@ pub fn docker_connect_wolfnet(container: &str, ip: &str) -> Result<String, Strin
         }
     }
 
-    // 7. Route traffic for this WolfNet IP to docker0
+    // 7. Route traffic for this WolfNet IP to the container's bridge
     let _ = Command::new("ip").args(["route", "del", &format!("{}/32", ip)]).output();
     let route_result = Command::new("ip")
-        .args(["route", "add", &format!("{}/32", ip), "dev", "docker0"])
+        .args(["route", "add", &format!("{}/32", ip), "dev", &bridge_dev])
         .output();
 
     match route_result {
@@ -1121,7 +1167,7 @@ pub fn docker_connect_wolfnet(container: &str, ip: &str) -> Result<String, Strin
         }
     }
 
-    Ok(format!("Container '{}' routed to WolfNet at {}", container, ip))
+    Ok(format!("Container '{}' routed to WolfNet at {} via {}", container, ip, bridge_dev))
 }
 
 /// Ensure lxcbr0 bridge exists for default LXC container networking (with DHCP/NAT)
