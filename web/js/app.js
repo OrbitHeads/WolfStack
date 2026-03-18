@@ -26621,7 +26621,7 @@ function initTopology3D() {
     const state = {
         scene, camera, renderer, canvas, container, vrDolly,
         nodeMeshes: [], extraMeshes: [], connectionLines: [], labelSprites: [],
-        showLabels: true, autoRotate: true, disposed: false,
+        showLabels: true, autoRotate: false, disposed: false,
         animId: null, clock: new THREE.Clock(),
         raycaster: new THREE.Raycaster(), mouse: new THREE.Vector2(),
         isDragging: false, prevMouse: { x: 0, y: 0 },
@@ -27165,9 +27165,9 @@ function topoRenderFrame(timestamp, xrFrame) {
         // Cursor
         _topo.container.style.cursor = hits.length > 0 ? 'pointer' : (_topo.isDragging ? 'grabbing' : 'grab');
 
-        // Highlight selected rack with a glowing outline box (visible in VR too)
+        // Highlight selected rack with outline box — VR only
         if (_topo._selectionBox) { _topo.scene.remove(_topo._selectionBox); _topo._selectionBox = null; }
-        if (_topo.selectedRackId) {
+        if (_topo.selectedRackId && _topo.renderer.xr.isPresenting) {
             const selRack = _topo.nodeMeshes.find(m => m.userData.id === _topo.selectedRackId);
             if (selRack) {
                 const box = new THREE.BoxHelper(selRack, 0xdc2626);
@@ -27273,7 +27273,7 @@ function makeTextSprite(text, opts = {}) {
 function topologyResetCamera() {
     if (!_topo) return;
     _topo.spherical = { radius: 25, theta: Math.PI, phi: Math.PI / 3 };
-    _topo.autoRotate = true;
+    // Don't re-enable autoRotate — user can toggle it manually
     if (_topo.vrDolly) _topo.vrDolly.position.set(0, 0, 0);
     const s = _topo.spherical;
     _topo.camera.position.set(
