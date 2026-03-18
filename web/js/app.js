@@ -26591,11 +26591,17 @@ function initTopology3D() {
                 }
             }
 
-            // Check racks — point at any part → show info panel with Console button
-            const rackMeshes = _topo.nodeMeshes.filter(m => m.userData.isRack);
-            const hits = ray.intersectObjects(rackMeshes, true);
+            // Check racks — collect all mesh children for raycast (Groups aren't raycasted directly)
+            const allRackChildren = [];
+            _topo.nodeMeshes.filter(m => m.userData.isRack).forEach(rack => {
+                rack.traverse(child => {
+                    if (child.isMesh) allRackChildren.push(child);
+                });
+            });
+            const hits = ray.intersectObjects(allRackChildren, false);
             if (hits.length > 0) {
                 const hitObj = hits[0].object;
+                // Walk up to find the rack Group
                 let rack = hitObj;
                 while (rack && !rack.userData.isRack && rack.parent) rack = rack.parent;
                 if (rack?.userData?.id) {
@@ -27225,7 +27231,11 @@ function topologyEnterVR() {
         .then(session => {
             _topo.renderer.xr.setSession(session);
             // Position user in front of racks at standing height
-            _topo.vrDolly.position.set(0, 0, 8);
+            // Position user in front of racks, facing them
+            // Racks face -Z, so user needs to be at +Z looking toward -Z
+            // WebXR default: user faces -Z. So at +Z facing -Z = correct
+            _topo.vrDolly.position.set(0, 0, 6);
+            _topo.vrDolly.rotation.set(0, 0, 0); // no rotation — default WebXR -Z forward
             showToast('Entering VR — use thumbsticks to walk around your server room', 'success');
         })
         .catch(err => {
@@ -27444,7 +27454,7 @@ function topoUpdateVRPanel() {
 
     // Position floating in front of the rack
     const rackPos = rack.position.clone();
-    panel.position.set(rackPos.x, 4.5, rackPos.z - 2.5);
+    panel.position.set(rackPos.x, 4.5, rackPos.z + 2.5); // in front of rack (user is at +Z)
 
     // Store button info for VR trigger detection
     panel.userData = { isVRPanel: true, nodeId: n.id, unitIndex: ui };
