@@ -26501,19 +26501,24 @@ function initTopology3D() {
     updateCameraFromSpherical();
 
     // Mouse orbit
-    container.addEventListener('mousedown', e => { state.isDragging = true; state.prevMouse = { x: e.clientX, y: e.clientY }; });
-    container.addEventListener('mouseup', () => { state.isDragging = false; });
-    container.addEventListener('mouseleave', () => { state.isDragging = false; });
+    container.addEventListener('mousedown', e => { state.isDragging = false; state.dragStart = { x: e.clientX, y: e.clientY }; state.prevMouse = { x: e.clientX, y: e.clientY }; state.mouseDown = true; });
+    container.addEventListener('mouseup', () => { state.mouseDown = false; setTimeout(() => { state.isDragging = false; }, 10); });
+    container.addEventListener('mouseleave', () => { state.isDragging = false; state.mouseDown = false; });
     container.addEventListener('mousemove', e => {
         const rect = container.getBoundingClientRect();
         state.mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
         state.mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-        if (state.isDragging) {
-            state.spherical.theta -= (e.clientX - state.prevMouse.x) * 0.005;
-            state.spherical.phi += (e.clientY - state.prevMouse.y) * 0.005;
-            updateCameraFromSpherical();
-            state.prevMouse = { x: e.clientX, y: e.clientY };
-            state.autoRotate = false;
+        if (state.mouseDown) {
+            const dx = e.clientX - (state.dragStart?.x || e.clientX);
+            const dy = e.clientY - (state.dragStart?.y || e.clientY);
+            if (Math.abs(dx) > 3 || Math.abs(dy) > 3) state.isDragging = true;
+            if (state.isDragging) {
+                state.spherical.theta -= (e.clientX - state.prevMouse.x) * 0.005;
+                state.spherical.phi += (e.clientY - state.prevMouse.y) * 0.005;
+                updateCameraFromSpherical();
+                state.prevMouse = { x: e.clientX, y: e.clientY };
+                state.autoRotate = false;
+            }
         }
     });
     container.addEventListener('wheel', e => {
@@ -26522,15 +26527,45 @@ function initTopology3D() {
         updateCameraFromSpherical();
     }, { passive: false });
 
-    // Click
+    // Click — toggle stats panel for clicked rack; click empty space to dismiss
+    state.selectedRackId = null;
     container.addEventListener('click', e => {
+        if (state.isDragging) return; // don't trigger on drag release
         const rect = container.getBoundingClientRect();
         state.mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
         state.mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
         state.raycaster.setFromCamera(state.mouse, camera);
-        const hits = state.raycaster.intersectObjects(state.nodeMeshes.filter(m => m.userData.id && m.userData.isRack));
-        if (hits.length > 0 && hits[0].object.userData.id) {
-            selectServerView(hits[0].object.userData.id, 'dashboard');
+        const rackMeshes = state.nodeMeshes.filter(m => m.userData.isRack);
+        const hits = state.raycaster.intersectObjects(rackMeshes, true);
+        const tooltip = document.getElementById('topology-tooltip');
+        if (hits.length > 0) {
+            let obj = hits[0].object;
+            while (obj && !obj.userData.isRack && obj.parent) obj = obj.parent;
+            if (obj?.userData?.id) {
+                // Toggle: click same rack again = deselect
+                if (state.selectedRackId === obj.userData.id) {
+                    state.selectedRackId = null;
+                    if (tooltip) tooltip.style.display = 'none';
+                } else {
+                    state.selectedRackId = obj.userData.id;
+                }
+            }
+        } else {
+            state.selectedRackId = null;
+            if (tooltip) tooltip.style.display = 'none';
+        }
+    });
+    // Double-click navigates to node dashboard
+    container.addEventListener('dblclick', e => {
+        const rect = container.getBoundingClientRect();
+        state.mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        state.mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+        state.raycaster.setFromCamera(state.mouse, camera);
+        const hits = state.raycaster.intersectObjects(state.nodeMeshes.filter(m => m.userData.isRack), true);
+        if (hits.length > 0) {
+            let obj = hits[0].object;
+            while (obj && !obj.userData.isRack && obj.parent) obj = obj.parent;
+            if (obj?.userData?.id) selectServerView(obj.userData.id, 'dashboard');
         }
     });
 
@@ -26559,7 +26594,6 @@ function buildServerRack(node, color) {
 
     // Rack frame (dark metal)
     const frameMat = new THREE.MeshPhongMaterial({ color: 0x1a1a20, shininess: 40, specular: 0x333344 });
-    // Posts
     const postGeo = new THREE.BoxGeometry(0.08, rackH, 0.08);
     [[-rackW/2, rackH/2, -rackD/2], [rackW/2, rackH/2, -rackD/2],
      [-rackW/2, rackH/2, rackD/2], [rackW/2, rackH/2, rackD/2]].forEach(p => {
@@ -26568,31 +26602,28 @@ function buildServerRack(node, color) {
         post.castShadow = true;
         group.add(post);
     });
-    // Top/bottom rails
     const railH = new THREE.BoxGeometry(rackW + 0.08, 0.06, 0.08);
     const railD = new THREE.BoxGeometry(0.08, 0.06, rackD + 0.08);
     [0, rackH].forEach(y => {
-        [[-rackD/2], [rackD/2]].forEach(z => {
-            const r = new THREE.Mesh(railH, frameMat);
-            r.position.set(0, y, z[0]);
-            group.add(r);
-        });
-        [[-rackW/2], [rackW/2]].forEach(x => {
-            const r = new THREE.Mesh(railD, frameMat);
-            r.position.set(x[0], y, 0);
-            group.add(r);
-        });
+        [[-rackD/2], [rackD/2]].forEach(z => { const r = new THREE.Mesh(railH, frameMat); r.position.set(0, y, z[0]); group.add(r); });
+        [[-rackW/2], [rackW/2]].forEach(x => { const r = new THREE.Mesh(railD, frameMat); r.position.set(x[0], y, 0); group.add(r); });
     });
 
-    // Server units — stack them in the rack
+    // Server units stacked in rack
     const unitH = 0.35, unitGap = 0.05;
     const totalContainers = (node.docker_count || 0) + (node.lxc_count || 0) + (node.vm_count || 0);
     const unitCount = Math.max(3, Math.min(12, totalContainers + 2));
-    const serverMat = new THREE.MeshPhongMaterial({
-        color: node.online ? 0x222230 : 0x1a1a1a,
-        shininess: 30,
-        specular: 0x444455,
-    });
+    const serverMat = new THREE.MeshPhongMaterial({ color: node.online ? 0x222230 : 0x1a1a1a, shininess: 30, specular: 0x444455 });
+
+    // Get metrics for the status dots
+    const m = node.metrics || {};
+    const cpu = m.cpu_usage_percent || 0;
+    const mem = m.memory_percent || 0;
+    const rootDisk = m.disks?.find(d => d.mount_point === '/') || m.disks?.[0];
+    const disk = rootDisk ? rootDisk.usage_percent : 0;
+    const cpuColor = cpu > 80 ? 0xef4444 : cpu > 50 ? 0xf59e0b : 0x22c55e;
+    const memColor = mem > 90 ? 0xef4444 : mem > 70 ? 0xf59e0b : 0x3b82f6;
+    const diskColor = disk > 90 ? 0xef4444 : disk > 70 ? 0xf59e0b : 0x8b5cf6;
 
     for (let i = 0; i < unitCount; i++) {
         const unitY = 0.3 + i * (unitH + unitGap);
@@ -26603,39 +26634,39 @@ function buildServerRack(node, color) {
         unit.castShadow = true;
         group.add(unit);
 
-        // Front panel detail line
+        // Front panel
         const panelGeo = new THREE.BoxGeometry(rackW - 0.2, unitH - 0.04, 0.02);
         const panelMat = new THREE.MeshPhongMaterial({ color: 0x2a2a38, shininess: 20 });
         const panel = new THREE.Mesh(panelGeo, panelMat);
         panel.position.set(0, unitY + unitH / 2, -rackD / 2 + 0.12);
         group.add(panel);
 
-        // Status LED on front
+        // 3 status dots on each server unit: CPU, MEM, DSK
         if (node.online) {
-            const ledGeo = new THREE.SphereGeometry(0.03, 8, 8);
-            const isContainer = i >= 2;
-            const ledColor = !isContainer ? 0x22c55e :
-                (i - 2) < (node.docker_count || 0) ? 0x3b82f6 :
-                (i - 2) < (node.docker_count || 0) + (node.lxc_count || 0) ? 0x10b981 : 0xf59e0b;
-            const ledMat = new THREE.MeshBasicMaterial({ color: ledColor });
-            const led = new THREE.Mesh(ledGeo, ledMat);
-            led.position.set(-rackW / 2 + 0.2, unitY + unitH / 2, -rackD / 2 + 0.1);
-            led.userData = { isLed: true, baseColor: ledColor };
-            group.add(led);
+            const ledGeo = new THREE.SphereGeometry(0.025, 8, 8);
+            const dotZ = -rackD / 2 + 0.1;
+            const dotY = unitY + unitH / 2;
+            const dots = [
+                { x: -rackW/2 + 0.18, color: cpuColor },
+                { x: -rackW/2 + 0.28, color: memColor },
+                { x: -rackW/2 + 0.38, color: diskColor },
+            ];
+            dots.forEach(d => {
+                const led = new THREE.Mesh(ledGeo, new THREE.MeshBasicMaterial({ color: d.color }));
+                led.position.set(d.x, dotY, dotZ);
+                led.userData = { isLed: true };
+                group.add(led);
+            });
         }
     }
 
-    // Accent light strip on side (cluster color)
+    // Cluster color accent strips
     const stripGeo = new THREE.BoxGeometry(0.02, rackH - 0.5, 0.02);
     const stripMat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: node.online ? 0.8 : 0.2 });
-    const stripL = new THREE.Mesh(stripGeo, stripMat);
-    stripL.position.set(-rackW / 2 - 0.02, rackH / 2, -rackD / 2);
-    group.add(stripL);
-    const stripR = new THREE.Mesh(stripGeo, stripMat);
-    stripR.position.set(rackW / 2 + 0.02, rackH / 2, -rackD / 2);
-    group.add(stripR);
+    const stripL = new THREE.Mesh(stripGeo, stripMat); stripL.position.set(-rackW/2 - 0.02, rackH/2, -rackD/2); group.add(stripL);
+    const stripR = new THREE.Mesh(stripGeo, stripMat); stripR.position.set(rackW/2 + 0.02, rackH/2, -rackD/2); group.add(stripR);
 
-    // Point light for online glow
+    // Glow light
     if (node.online) {
         const glow = new THREE.PointLight(color, 0.3, 6);
         glow.position.set(0, 3, -rackD / 2 - 0.5);
@@ -26688,83 +26719,19 @@ function buildTopologyScene() {
             scene.add(rack);
             _topo.nodeMeshes.push(rack);
 
-            // Hostname label above rack
-            const label = makeTextSprite(node.hostname || node.id, {
-                fontSize: 26,
-                color: node.online ? '#ffffff' : '#555566'
-            });
-            label.position.set(x, 6.2, 0);
-            label.userData = { isLabel: true };
-            scene.add(label);
-            _topo.labelSprites.push(label);
-
-            // IP address label below hostname
-            const ipLabel = makeTextSprite(node.address || '', {
-                fontSize: 20,
-                color: node.online ? '#8888aa' : '#444455'
-            });
-            ipLabel.position.set(x, 5.6, 0);
-            ipLabel.userData = { isLabel: true };
-            scene.add(ipLabel);
-            _topo.labelSprites.push(ipLabel);
-
-            // 3D metric bars (CPU, Memory, Disk) — displayed beside the rack
-            if (node.online && node.metrics) {
-                const m = node.metrics;
-                const cpu = m.cpu_usage_percent || 0;
-                const mem = m.memory_percent || 0;
-                const rootDisk = m.disks?.find(d => d.mount_point === '/') || m.disks?.[0];
-                const disk = rootDisk ? rootDisk.usage_percent : 0;
-
-                const bars = [
-                    { pct: cpu, color: cpu > 80 ? 0xef4444 : cpu > 50 ? 0xf59e0b : 0x22c55e, label: 'CPU' },
-                    { pct: mem, color: mem > 90 ? 0xef4444 : mem > 70 ? 0xf59e0b : 0x3b82f6, label: 'MEM' },
-                    { pct: disk, color: disk > 90 ? 0xef4444 : disk > 70 ? 0xf59e0b : 0x8b5cf6, label: 'DSK' },
-                ];
-                const barW = 0.15, barD = 0.15, maxH = 4.0;
-                const barStartX = x + 1.0;
-                const barZ = -1.3;
-                bars.forEach((b, bi) => {
-                    const h = Math.max(0.1, (b.pct / 100) * maxH);
-                    // Background bar (dark)
-                    const bgGeo = new THREE.BoxGeometry(barW, maxH, barD);
-                    const bgMat = new THREE.MeshPhongMaterial({ color: 0x111118, transparent: true, opacity: 0.5 });
-                    const bg = new THREE.Mesh(bgGeo, bgMat);
-                    bg.position.set(barStartX + bi * 0.3, maxH / 2 + 0.3, barZ);
-                    scene.add(bg);
-                    _topo.extraMeshes.push(bg);
-                    // Fill bar
-                    const fillGeo = new THREE.BoxGeometry(barW + 0.02, h, barD + 0.02);
-                    const fillMat = new THREE.MeshBasicMaterial({ color: b.color });
-                    const fill = new THREE.Mesh(fillGeo, fillMat);
-                    fill.position.set(barStartX + bi * 0.3, h / 2 + 0.3, barZ);
-                    scene.add(fill);
-                    _topo.extraMeshes.push(fill);
-                    // Percentage label
-                    const pctLabel = makeTextSprite(`${b.label} ${b.pct.toFixed(0)}%`, {
-                        fontSize: 16,
-                        color: '#' + b.color.toString(16).padStart(6, '0')
-                    });
-                    pctLabel.position.set(barStartX + bi * 0.3, maxH + 0.8, barZ);
-                    pctLabel.userData = { isLabel: true };
-                    scene.add(pctLabel);
-                    _topo.labelSprites.push(pctLabel);
-                });
-            }
         });
 
-        // Cluster name label
-        if (cNames.length > 1) {
-            const midX = startX + (clusterNodes.length - 1) * rackSpacing / 2;
-            const clabel = makeTextSprite(cName, {
-                fontSize: 32,
-                color: '#' + color.toString(16).padStart(6, '0')
-            });
-            clabel.position.set(midX, 7.5, 0);
-            clabel.userData = { isLabel: true };
-            scene.add(clabel);
-            _topo.labelSprites.push(clabel);
-        }
+        // Cluster name label above racks
+        const midX = startX + (clusterNodes.length - 1) * rackSpacing / 2;
+        const clabel = makeTextSprite(cName, {
+            fontSize: 40,
+            color: '#' + color.toString(16).padStart(6, '0'),
+            scale: 2.5
+        });
+        clabel.position.set(midX, 7.0, 0);
+        clabel.userData = { isLabel: true, isClusterLabel: true };
+        scene.add(clabel);
+        _topo.labelSprites.push(clabel);
 
         // WolfNet cables between racks in same cluster (glowing lines on the floor)
         for (let i = 0; i < clusterNodes.length - 1; i++) {
@@ -26830,7 +26797,7 @@ function buildTopologyScene() {
         `<div><span style="color:#3b82f6;">&#9679;</span> ${dc} Docker</div>` +
         `<div><span style="color:#10b981;">&#9679;</span> ${lc} LXC</div>` +
         `<div><span style="color:#f59e0b;">&#9679;</span> ${vc} VMs</div>` +
-        `<div style="margin-top:6px;color:rgba(255,255,255,0.4);font-size:10px;">Drag to orbit &bull; Scroll to zoom &bull; Click rack to open</div>`;
+        `<div style="margin-top:6px;color:rgba(255,255,255,0.4);font-size:10px;">Drag to orbit &bull; Scroll to zoom &bull; Click rack for stats &bull; Double-click to open</div>`;
 }
 
 // ─── Render loop (XR-compatible) ───
@@ -26883,34 +26850,48 @@ function topoRenderFrame(timestamp, xrFrame) {
         }
     }
 
-    // Hover tooltip (desktop only)
+    // Show stats panel for selected rack; hover changes cursor
     if (!_topo.renderer.xr.isPresenting) {
         _topo.raycaster.setFromCamera(_topo.mouse, _topo.camera);
         const rackMeshes = _topo.nodeMeshes.filter(m => m.userData.isRack);
         const hits = _topo.raycaster.intersectObjects(rackMeshes, true);
         const tooltip = document.getElementById('topology-tooltip');
-        if (hits.length > 0) {
-            // Walk up to find rack group
-            let obj = hits[0].object;
-            while (obj && !obj.userData.isRack && obj.parent) obj = obj.parent;
-            const nd = obj?.userData;
-            if (nd?.node) {
-                const n = nd.node;
+
+        // Cursor
+        _topo.container.style.cursor = hits.length > 0 ? 'pointer' : (_topo.isDragging ? 'grabbing' : 'grab');
+
+        // Show stats for selected rack
+        if (_topo.selectedRackId && tooltip) {
+            const rack = _topo.nodeMeshes.find(m => m.userData.id === _topo.selectedRackId);
+            const n = rack?.userData?.node;
+            if (n) {
+                const m = n.metrics || {};
+                const cpu = m.cpu_usage_percent?.toFixed(0) || '?';
+                const mem = m.memory_percent?.toFixed(0) || '?';
+                const root = m.disks?.find(d => d.mount_point === '/') || m.disks?.[0];
+                const dsk = root ? root.usage_percent.toFixed(0) : '?';
                 tooltip.innerHTML =
-                    `<div style="font-weight:700;font-size:13px;margin-bottom:6px;">${escapeHtml(n.hostname || n.id)}</div>` +
-                    `<div style="color:rgba(255,255,255,0.6);line-height:1.7;">` +
-                    `<div>${n.online ? '<span style="color:#22c55e;">&#9679;</span> Online' : '<span style="color:#ef4444;">&#9679;</span> Offline'} &bull; ${escapeHtml(n.address)}</div>` +
-                    `<div>CPU: ${n.metrics?.cpu_usage_percent?.toFixed(0) || '?'}% &bull; Mem: ${n.metrics?.memory_percent?.toFixed(0) || '?'}%</div>` +
-                    `<div>${n.docker_count || 0} Docker &bull; ${n.lxc_count || 0} LXC &bull; ${n.vm_count || 0} VMs</div></div>`;
+                    `<div style="font-weight:700;font-size:14px;margin-bottom:8px;">${escapeHtml(n.hostname || n.id)}</div>` +
+                    `<div style="color:rgba(255,255,255,0.5);font-size:11px;margin-bottom:8px;">${escapeHtml(n.address)}</div>` +
+                    `<div style="color:rgba(255,255,255,0.7);line-height:2;">` +
+                    `<div>${n.online ? '<span style="color:#22c55e;">&#9679;</span> Online' : '<span style="color:#ef4444;">&#9679;</span> Offline'}</div>` +
+                    `<div><span style="color:#22c55e;">&#9679;</span> CPU: ${cpu}%</div>` +
+                    `<div><span style="color:#3b82f6;">&#9679;</span> Memory: ${mem}%</div>` +
+                    `<div><span style="color:#8b5cf6;">&#9679;</span> Disk: ${dsk}%</div>` +
+                    `<div style="margin-top:4px;">${n.docker_count || 0} Docker &bull; ${n.lxc_count || 0} LXC &bull; ${n.vm_count || 0} VMs</div>` +
+                    `</div>` +
+                    `<div style="margin-top:8px;color:rgba(255,255,255,0.3);font-size:10px;">Double-click to open dashboard</div>`;
                 tooltip.style.display = 'block';
-                const rect = _topo.container.getBoundingClientRect();
-                tooltip.style.left = ((_topo.mouse.x + 1) / 2 * rect.width + 16) + 'px';
-                tooltip.style.top = ((-_topo.mouse.y + 1) / 2 * rect.height - 10) + 'px';
+                // Position: project rack 3D position to screen
+                if (rack) {
+                    const pos = rack.position.clone();
+                    pos.y += 6;
+                    pos.project(_topo.camera);
+                    const rect = _topo.container.getBoundingClientRect();
+                    tooltip.style.left = ((pos.x + 1) / 2 * rect.width + 16) + 'px';
+                    tooltip.style.top = ((-pos.y + 1) / 2 * rect.height - 10) + 'px';
+                }
             }
-            _topo.container.style.cursor = 'pointer';
-        } else {
-            tooltip.style.display = 'none';
-            _topo.container.style.cursor = _topo.isDragging ? 'grabbing' : 'grab';
         }
     }
 
@@ -26974,7 +26955,8 @@ function makeTextSprite(text, opts = {}) {
     tex.minFilter = THREE.LinearFilter;
     const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
     const sprite = new THREE.Sprite(mat);
-    sprite.scale.set((cvs.width / cvs.height) * 1.5, 1.5, 1);
+    const sc = opts.scale || 1.0;
+    sprite.scale.set((cvs.width / cvs.height) * sc, sc, 1);
     return sprite;
 }
 
