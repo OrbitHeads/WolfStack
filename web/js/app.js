@@ -977,7 +977,7 @@ function selectView(page) {
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     document.querySelector(`.nav-item[data-page="${page}"]`)?.classList.add('active');
 
-    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Topology' };
+    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room' };
     document.getElementById('page-title').textContent = titles[page] || page;
 
     if (page === 'datacenter') {
@@ -26697,6 +26697,60 @@ function buildTopologyScene() {
             label.userData = { isLabel: true };
             scene.add(label);
             _topo.labelSprites.push(label);
+
+            // IP address label below hostname
+            const ipLabel = makeTextSprite(node.address || '', {
+                fontSize: 20,
+                color: node.online ? '#8888aa' : '#444455'
+            });
+            ipLabel.position.set(x, 5.6, 0);
+            ipLabel.userData = { isLabel: true };
+            scene.add(ipLabel);
+            _topo.labelSprites.push(ipLabel);
+
+            // 3D metric bars (CPU, Memory, Disk) — displayed beside the rack
+            if (node.online && node.metrics) {
+                const m = node.metrics;
+                const cpu = m.cpu_usage_percent || 0;
+                const mem = m.memory_percent || 0;
+                const rootDisk = m.disks?.find(d => d.mount_point === '/') || m.disks?.[0];
+                const disk = rootDisk ? rootDisk.usage_percent : 0;
+
+                const bars = [
+                    { pct: cpu, color: cpu > 80 ? 0xef4444 : cpu > 50 ? 0xf59e0b : 0x22c55e, label: 'CPU' },
+                    { pct: mem, color: mem > 90 ? 0xef4444 : mem > 70 ? 0xf59e0b : 0x3b82f6, label: 'MEM' },
+                    { pct: disk, color: disk > 90 ? 0xef4444 : disk > 70 ? 0xf59e0b : 0x8b5cf6, label: 'DSK' },
+                ];
+                const barW = 0.15, barD = 0.15, maxH = 4.0;
+                const barStartX = x + 1.0;
+                const barZ = -1.3;
+                bars.forEach((b, bi) => {
+                    const h = Math.max(0.1, (b.pct / 100) * maxH);
+                    // Background bar (dark)
+                    const bgGeo = new THREE.BoxGeometry(barW, maxH, barD);
+                    const bgMat = new THREE.MeshPhongMaterial({ color: 0x111118, transparent: true, opacity: 0.5 });
+                    const bg = new THREE.Mesh(bgGeo, bgMat);
+                    bg.position.set(barStartX + bi * 0.3, maxH / 2 + 0.3, barZ);
+                    scene.add(bg);
+                    _topo.extraMeshes.push(bg);
+                    // Fill bar
+                    const fillGeo = new THREE.BoxGeometry(barW + 0.02, h, barD + 0.02);
+                    const fillMat = new THREE.MeshBasicMaterial({ color: b.color });
+                    const fill = new THREE.Mesh(fillGeo, fillMat);
+                    fill.position.set(barStartX + bi * 0.3, h / 2 + 0.3, barZ);
+                    scene.add(fill);
+                    _topo.extraMeshes.push(fill);
+                    // Percentage label
+                    const pctLabel = makeTextSprite(`${b.label} ${b.pct.toFixed(0)}%`, {
+                        fontSize: 16,
+                        color: '#' + b.color.toString(16).padStart(6, '0')
+                    });
+                    pctLabel.position.set(barStartX + bi * 0.3, maxH + 0.8, barZ);
+                    pctLabel.userData = { isLabel: true };
+                    scene.add(pctLabel);
+                    _topo.labelSprites.push(pctLabel);
+                });
+            }
         });
 
         // Cluster name label
@@ -26731,7 +26785,7 @@ function buildTopologyScene() {
     // Centre the scene
     const totalWidth = offsetX - clusterGap;
     const centreOffset = -totalWidth / 2;
-    [..._topo.nodeMeshes, ..._topo.labelSprites, ..._topo.connectionLines].forEach(m => {
+    [..._topo.nodeMeshes, ..._topo.extraMeshes, ..._topo.labelSprites, ..._topo.connectionLines].forEach(m => {
         m.position.x += centreOffset;
     });
     _topo.target.set(0, 3, 0);
@@ -26846,7 +26900,7 @@ function topoRenderFrame(timestamp, xrFrame) {
                     `<div style="font-weight:700;font-size:13px;margin-bottom:6px;">${escapeHtml(n.hostname || n.id)}</div>` +
                     `<div style="color:rgba(255,255,255,0.6);line-height:1.7;">` +
                     `<div>${n.online ? '<span style="color:#22c55e;">&#9679;</span> Online' : '<span style="color:#ef4444;">&#9679;</span> Offline'} &bull; ${escapeHtml(n.address)}</div>` +
-                    `<div>CPU: ${n.metrics?.cpu_percent?.toFixed(0) || '?'}% &bull; Mem: ${n.metrics?.memory_percent?.toFixed(0) || '?'}%</div>` +
+                    `<div>CPU: ${n.metrics?.cpu_usage_percent?.toFixed(0) || '?'}% &bull; Mem: ${n.metrics?.memory_percent?.toFixed(0) || '?'}%</div>` +
                     `<div>${n.docker_count || 0} Docker &bull; ${n.lxc_count || 0} LXC &bull; ${n.vm_count || 0} VMs</div></div>`;
                 tooltip.style.display = 'block';
                 const rect = _topo.container.getBoundingClientRect();
