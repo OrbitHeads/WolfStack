@@ -26482,7 +26482,7 @@ function initTopology3D() {
         animId: null, clock: new THREE.Clock(),
         raycaster: new THREE.Raycaster(), mouse: new THREE.Vector2(),
         isDragging: false, prevMouse: { x: 0, y: 0 },
-        spherical: { radius: 25, theta: Math.PI / 4, phi: Math.PI / 3.5 },
+        spherical: { radius: 25, theta: Math.PI, phi: Math.PI / 3 },
         target: new THREE.Vector3(0, 3, 0),
         vrMoving: false, vrMoveDir: new THREE.Vector3(),
     };
@@ -26719,16 +26719,27 @@ function buildTopologyScene() {
             scene.add(rack);
             _topo.nodeMeshes.push(rack);
 
+            // Server name on the side of the rack — rotated 90 degrees, white text
+            const nameLabel = makeTextSprite(node.hostname || node.id, {
+                fontSize: 28,
+                color: '#ffffff',
+                scale: 0.8
+            });
+            nameLabel.position.set(x + 0.85, 2.8, 0);
+            nameLabel.material.rotation = -Math.PI / 2; // rotate text 90 degrees
+            nameLabel.userData = { isLabel: true, isSideLabel: true };
+            scene.add(nameLabel);
+            _topo.labelSprites.push(nameLabel);
         });
 
-        // Cluster name label above racks
+        // Cluster name label above racks (small)
         const midX = startX + (clusterNodes.length - 1) * rackSpacing / 2;
         const clabel = makeTextSprite(cName, {
-            fontSize: 40,
+            fontSize: 36,
             color: '#' + color.toString(16).padStart(6, '0'),
-            scale: 2.5
+            scale: 1.4
         });
-        clabel.position.set(midX, 7.0, 0);
+        clabel.position.set(midX, 6.5, 0);
         clabel.userData = { isLabel: true, isClusterLabel: true };
         scene.add(clabel);
         _topo.labelSprites.push(clabel);
@@ -26895,10 +26906,12 @@ function topoRenderFrame(timestamp, xrFrame) {
         }
     }
 
-    // Labels face camera
+    // Labels face camera (except side labels which stay rotated)
     _topo.labelSprites.forEach(s => {
         s.visible = _topo.showLabels;
-        if (s.visible) s.lookAt(_topo.camera.getWorldPosition(new THREE.Vector3()));
+        if (s.visible && !s.userData.isSideLabel) {
+            s.lookAt(_topo.camera.getWorldPosition(new THREE.Vector3()));
+        }
     });
 
     _topo.renderer.render(_topo.scene, _topo.camera);
