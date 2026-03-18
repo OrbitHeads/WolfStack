@@ -27129,10 +27129,23 @@ function topoRenderFrame(timestamp, xrFrame) {
         }
     }
 
-    // Show/hide VR lasers based on session
+    // VR-only elements: lasers and selection box
+    const inVR = _topo.renderer.xr.isPresenting;
     if (_topo._vrLasers) {
-        const inVR = _topo.renderer.xr.isPresenting;
         _topo._vrLasers.forEach(l => { l.visible = inVR; });
+    }
+    // Selection box — only in VR
+    if (!inVR && _topo._selectionBox) {
+        _topo.scene.remove(_topo._selectionBox); _topo._selectionBox = null;
+    }
+    if (inVR && _topo.selectedRackId) {
+        if (_topo._selectionBox) { _topo.scene.remove(_topo._selectionBox); _topo._selectionBox = null; }
+        const selRack = _topo.nodeMeshes.find(m => m.userData.id === _topo.selectedRackId);
+        if (selRack) {
+            const box = new THREE.BoxHelper(selRack, 0xdc2626);
+            _topo.scene.add(box);
+            _topo._selectionBox = box;
+        }
     }
 
     // VR locomotion — thumbstick/gamepad-based walking
@@ -27165,16 +27178,8 @@ function topoRenderFrame(timestamp, xrFrame) {
         // Cursor
         _topo.container.style.cursor = hits.length > 0 ? 'pointer' : (_topo.isDragging ? 'grabbing' : 'grab');
 
-        // Highlight selected rack with outline box — VR only
+        // Clean up any selection box from VR mode
         if (_topo._selectionBox) { _topo.scene.remove(_topo._selectionBox); _topo._selectionBox = null; }
-        if (_topo.selectedRackId && _topo.renderer.xr.isPresenting) {
-            const selRack = _topo.nodeMeshes.find(m => m.userData.id === _topo.selectedRackId);
-            if (selRack) {
-                const box = new THREE.BoxHelper(selRack, 0xdc2626);
-                _topo.scene.add(box);
-                _topo._selectionBox = box;
-            }
-        }
 
         // Reposition tooltip (content is set in topoUpdateTooltip, not here)
         if (_topo.selectedRackId && tooltip && tooltip.style.display !== 'none') {
