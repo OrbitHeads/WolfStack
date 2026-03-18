@@ -26631,6 +26631,18 @@ function buildServerRack(node, color) {
         const isMother = (i === 0);
         const unitY = 0.3 + i * (unitH + unitGap);
 
+        // Determine what this unit represents
+        let unitType = '', unitTypeColor = 0x22c55e;
+        if (isMother) {
+            unitType = 'HOST';
+            unitTypeColor = 0x22c55e;
+        } else {
+            const ci = i - 1;
+            if (ci < dockerCount) { unitType = 'DOCKER'; unitTypeColor = 0x3b82f6; }
+            else if (ci < dockerCount + lxcCount) { unitType = 'LXC'; unitTypeColor = 0x10b981; }
+            else { unitType = 'VM'; unitTypeColor = 0xf59e0b; }
+        }
+
         // Server unit body
         const bodyColor = isMother ? (node.online ? 0x2a2a3a : 0x1a1a1a) : (node.online ? 0x1e1e2a : 0x151518);
         const unitGeo = new THREE.BoxGeometry(rackW - 0.16, isMother ? unitH + 0.06 : unitH, rackD - 0.2);
@@ -26640,42 +26652,45 @@ function buildServerRack(node, color) {
         unit.castShadow = true;
         group.add(unit);
 
-        // Front panel — mother is slightly brighter
-        const panelColor = isMother ? 0x333345 : 0x2a2a38;
-        const panelGeo = new THREE.BoxGeometry(rackW - 0.2, (isMother ? unitH + 0.02 : unitH) - 0.04, 0.02);
-        const panel = new THREE.Mesh(panelGeo, new THREE.MeshPhongMaterial({ color: panelColor, shininess: 20 }));
+        // Front panel with tiny text label baked into texture
+        const panelW = rackW - 0.2;
+        const panelH = (isMother ? unitH + 0.02 : unitH) - 0.04;
+        const panelCvs = document.createElement('canvas');
+        panelCvs.width = 256;
+        panelCvs.height = 48;
+        const pCtx = panelCvs.getContext('2d');
+        pCtx.fillStyle = isMother ? '#333345' : '#2a2a38';
+        pCtx.fillRect(0, 0, 256, 48);
+        // Type label text
+        pCtx.font = 'bold 16px Inter, sans-serif';
+        pCtx.fillStyle = '#' + unitTypeColor.toString(16).padStart(6, '0');
+        pCtx.fillText(unitType, 70, 30);
+        // LED dot circles
+        const dotColors = [cpuCol, memCol, dskCol];
+        const dotLabels = ['C', 'M', 'S'];
+        dotColors.forEach((dc, di) => {
+            const dx = 8 + di * 18;
+            pCtx.beginPath();
+            pCtx.arc(dx + 5, 24, 5, 0, Math.PI * 2);
+            pCtx.fillStyle = '#' + dc.toString(16).padStart(6, '0');
+            pCtx.fill();
+        });
+
+        const panelTex = new THREE.CanvasTexture(panelCvs);
+        panelTex.minFilter = THREE.LinearFilter;
+        const panelGeo = new THREE.BoxGeometry(panelW, panelH, 0.02);
+        const panelMat = new THREE.MeshBasicMaterial({ map: panelTex });
+        const panel = new THREE.Mesh(panelGeo, panelMat);
         panel.position.set(0, unitY + unitH / 2, frontZ + 0.12);
         group.add(panel);
 
-        // Mother server accent stripe (cluster color) on front
+        // Mother server accent stripe (cluster color)
         if (isMother) {
             const accentGeo = new THREE.BoxGeometry(rackW - 0.22, 0.03, 0.025);
             const accentMat = new THREE.MeshBasicMaterial({ color });
             const accent = new THREE.Mesh(accentGeo, accentMat);
             accent.position.set(0, unitY + unitH + 0.01, frontZ + 0.12);
             group.add(accent);
-        }
-
-        // 3 status LEDs (CPU, MEM, DSK) — static, no animation
-        if (node.online) {
-            const dotY = unitY + unitH / 2;
-            const dotZ = frontZ + 0.1;
-            [[- rackW/2 + 0.18, cpuCol], [-rackW/2 + 0.28, memCol], [-rackW/2 + 0.38, dskCol]].forEach(([dx, dc]) => {
-                const led = new THREE.Mesh(ledGeo, new THREE.MeshBasicMaterial({ color: dc }));
-                led.position.set(dx, dotY, dotZ);
-                group.add(led);
-            });
-        }
-
-        // Type indicator on right side of front panel for non-mother units
-        if (!isMother && node.online) {
-            const ci = i - 1; // container index
-            const typeColor = ci < dockerCount ? 0x3b82f6 : ci < dockerCount + lxcCount ? 0x10b981 : 0xf59e0b;
-            const indGeo = new THREE.BoxGeometry(0.03, unitH - 0.08, 0.025);
-            const indMat = new THREE.MeshBasicMaterial({ color: typeColor });
-            const ind = new THREE.Mesh(indGeo, indMat);
-            ind.position.set(rackW / 2 - 0.18, unitY + unitH / 2, frontZ + 0.12);
-            group.add(ind);
         }
     }
 
@@ -26748,27 +26763,27 @@ function buildTopologyScene() {
             scene.add(rack);
             _topo.nodeMeshes.push(rack);
 
-            // Server name on the side of the rack — rotated 90 degrees, white text
+            // Server name on the side of the rack — rotated 90 degrees, small white text
             const nameLabel = makeTextSprite(node.hostname || node.id, {
-                fontSize: 28,
-                color: '#ffffff',
-                scale: 0.8
+                fontSize: 24,
+                color: '#ccccdd',
+                scale: 0.5
             });
-            nameLabel.position.set(x + 0.85, 2.8, 0);
-            nameLabel.material.rotation = -Math.PI / 2; // rotate text 90 degrees
+            nameLabel.position.set(x + 0.82, 2.8, 0);
+            nameLabel.material.rotation = -Math.PI / 2;
             nameLabel.userData = { isLabel: true, isSideLabel: true };
             scene.add(nameLabel);
             _topo.labelSprites.push(nameLabel);
         });
 
-        // Cluster name label above racks (small)
+        // Cluster name label above racks
         const midX = startX + (clusterNodes.length - 1) * rackSpacing / 2;
         const clabel = makeTextSprite(cName, {
-            fontSize: 36,
+            fontSize: 32,
             color: '#' + color.toString(16).padStart(6, '0'),
-            scale: 1.4
+            scale: 0.9
         });
-        clabel.position.set(midX, 6.5, 0);
+        clabel.position.set(midX, 6.3, 0);
         clabel.userData = { isLabel: true, isClusterLabel: true };
         scene.add(clabel);
         _topo.labelSprites.push(clabel);
@@ -27024,15 +27039,11 @@ function topologyToggleLabels() { if (_topo) _topo.showLabels = !_topo.showLabel
 function topologyToggleAutoRotate() { if (_topo) _topo.autoRotate = !_topo.autoRotate; }
 
 function topoOpenTerminal(nodeId) {
-    // Set current node context then open terminal
+    // Set current node context and use the existing openConsole function
     currentNodeId = nodeId;
     const node = allNodes.find(n => n.id === nodeId);
     const name = node?.hostname || nodeId;
-    let url = '/console.html?type=host&name=' + encodeURIComponent(name);
-    if (node && !node.is_self) {
-        url += '&node_id=' + encodeURIComponent(nodeId);
-    }
-    window.open(url, 'console_' + name, 'width=960,height=600,menubar=no,toolbar=no');
+    openConsole('host', name);
 }
 
 function topoOpenDashboard(nodeId) {
