@@ -26589,6 +26589,19 @@ function initTopology3D() {
 
     // Render loop — use setAnimationLoop for XR compatibility
     renderer.setAnimationLoop(topoRenderFrame);
+
+    // Refresh container stats every 60 seconds for live LED updates
+    if (_topo._statsInterval) clearInterval(_topo._statsInterval);
+    _topo._statsInterval = setInterval(() => {
+        if (!_topo || _topo.disposed || currentPage !== 'topology') return;
+        // Invalidate cache so next fetch gets fresh stats
+        Object.keys(_topoContainerCache).forEach(k => { _topoContainerCache[k].ts = 0; });
+        _topo._namesLoaded = false;
+        const nodes = allNodes || [];
+        Promise.all(nodes.map(n => topoFetchContainers(n.id))).then(() => {
+            if (_topo && !_topo.disposed) buildTopologyScene();
+        });
+    }, 60000);
 }
 
 // ─── Build server room scene ───
@@ -26667,14 +26680,39 @@ function buildServerRack(node, color) {
         panel.position.set(0, unitY + unitH / 2, frontZ + 0.12);
         group.add(panel);
 
-        // 3 LEDs: CPU, MEM, STORAGE — only when we have real metrics
+        // 3 LEDs: CPU, MEM, STORAGE — per-container when available, host fallback
         const ledR = 0.035;
         const ledGeo2 = new THREE.SphereGeometry(ledR, 10, 10);
         const ledY = unitY + unitH / 2;
         const ledZ = frontZ + 0.13;
-        const hasMetrics = node.online && node.metrics && (node.metrics.cpu_usage_percent !== undefined);
-        if (hasMetrics) {
-            [[0.08, cpuCol], [0.19, memCol], [0.30, dskCol]].forEach(([dx, col]) => {
+
+        // Get per-unit metrics
+        let uCpu, uMem, uDisk;
+        if (isMother) {
+            // Host uses node-level metrics
+            if (node.metrics?.cpu_usage_percent !== undefined) {
+                uCpu = cpu; uMem = mem; uDisk = disk;
+            }
+        } else {
+            // Container — look up individual stats from cache
+            const cc = _topoContainerCache[node.id];
+            let cData;
+            if (ci < dockerCount) cData = cc?.docker?.[ci];
+            else if (ci < dockerCount + lxcCount) cData = cc?.lxc?.[ci - dockerCount];
+            else cData = cc?.vms?.[ci - dockerCount - lxcCount];
+            if (cData) {
+                uCpu = cData.cpu;
+                uMem = cData.mem;
+                uDisk = cData.disk;
+            }
+        }
+
+        const hasData = uCpu !== undefined || uMem !== undefined;
+        if (hasData && node.online) {
+            const cCol = uCpu !== undefined ? (uCpu > 80 ? 0xef4444 : uCpu > 50 ? 0xf59e0b : 0x22c55e) : 0x333344;
+            const mCol = uMem !== undefined ? (uMem > 90 ? 0xef4444 : uMem > 70 ? 0xf59e0b : 0x3b82f6) : 0x333344;
+            const sCol = uDisk !== undefined ? (uDisk > 90 ? 0xef4444 : uDisk > 70 ? 0xf59e0b : 0x8b5cf6) : 0x333344;
+            [[0.08, cCol], [0.19, mCol], [0.30, sCol]].forEach(([dx, col]) => {
                 const led = new THREE.Mesh(ledGeo2, new THREE.MeshBasicMaterial({ color: col }));
                 led.position.set(-panelW/2 + dx, ledY, ledZ);
                 group.add(led);
@@ -26685,7 +26723,7 @@ function buildServerRack(node, color) {
             led.position.set(-panelW/2 + 0.08, ledY, ledZ);
             group.add(led);
         }
-        // No LEDs at all if online but no metrics yet
+        // No LEDs if online but no data yet — they appear after fetch
 
         // Label text — use real container names from cache if available
         const ci = i - 1;
@@ -27143,29 +27181,66 @@ async function topoFetchContainers(nodeId) {
 
     try {
         if (isPve) {
-            // Proxmox VE — use PVE resources endpoint
+            // Proxmox VE — use PVE resources endpoint (includes CPU/mem per guest)
             const resp = await fetch(`/api/nodes/${nodeId}/pve/resources`).catch(() => null);
             const guests = resp?.ok ? await resp.json() : [];
             const arr = Array.isArray(guests) ? guests : [];
             _topoContainerCache[nodeId] = {
                 docker: [],
-                lxc: arr.filter(g => g.guest_type === 'lxc').map(g => ({ name: g.name || ('CT ' + g.vmid), state: g.status || '?' })),
-                vms: arr.filter(g => g.guest_type === 'qemu').map(g => ({ name: g.name || ('VM ' + g.vmid), state: g.status || '?' })),
+                lxc: arr.filter(g => g.guest_type === 'lxc').map(g => ({
+                    name: g.name || ('CT ' + g.vmid), state: g.status || '?',
+                    cpu: g.cpu !== undefined ? g.cpu * 100 : undefined,
+                    mem: (g.mem && g.maxmem) ? (g.mem / g.maxmem) * 100 : undefined,
+                    disk: (g.disk && g.maxdisk) ? (g.disk / g.maxdisk) * 100 : undefined,
+                })),
+                vms: arr.filter(g => g.guest_type === 'qemu').map(g => ({
+                    name: g.name || ('VM ' + g.vmid), state: g.status || '?',
+                    cpu: g.cpu !== undefined ? g.cpu * 100 : undefined,
+                    mem: (g.mem && g.maxmem) ? (g.mem / g.maxmem) * 100 : undefined,
+                    disk: (g.disk && g.maxdisk) ? (g.disk / g.maxdisk) * 100 : undefined,
+                })),
                 ts: Date.now()
             };
         } else {
-            // WolfStack node — fetch Docker, LXC, VMs separately
-            const [dockerResp, lxcResp, vmResp] = await Promise.all([
+            // WolfStack node — fetch containers + stats in parallel
+            const [dockerResp, dockerStatsResp, lxcResp, lxcStatsResp, vmResp] = await Promise.all([
                 fetch(proxyPrefix + 'containers/docker').catch(() => null),
+                fetch(proxyPrefix + 'containers/docker/stats').catch(() => null),
                 fetch(proxyPrefix + 'containers/lxc').catch(() => null),
+                fetch(proxyPrefix + 'containers/lxc/stats').catch(() => null),
                 fetch(proxyPrefix + 'vms').catch(() => null),
             ]);
             const docker = dockerResp?.ok ? await dockerResp.json() : [];
+            const dockerStats = dockerStatsResp?.ok ? await dockerStatsResp.json() : [];
             const lxc = lxcResp?.ok ? await lxcResp.json() : [];
+            const lxcStats = lxcStatsResp?.ok ? await lxcStatsResp.json() : [];
             const vms = vmResp?.ok ? await vmResp.json() : [];
+
+            // Index stats by name
+            const dStatsMap = {};
+            (Array.isArray(dockerStats) ? dockerStats : []).forEach(s => { dStatsMap[s.name] = s; });
+            const lStatsMap = {};
+            (Array.isArray(lxcStats) ? lxcStats : []).forEach(s => { lStatsMap[s.name] = s; });
+
             _topoContainerCache[nodeId] = {
-                docker: (Array.isArray(docker) ? docker : []).map(c => ({ name: c.name || c.Names?.[0] || '?', state: c.state || c.State || '?' })),
-                lxc: (Array.isArray(lxc) ? lxc : []).map(c => ({ name: c.name || '?', state: c.state || '?' })),
+                docker: (Array.isArray(docker) ? docker : []).map(c => {
+                    const nm = c.name || c.Names?.[0] || '?';
+                    const s = dStatsMap[nm] || {};
+                    return {
+                        name: nm, state: c.state || c.State || '?',
+                        cpu: s.cpu_percent,
+                        mem: (s.memory_usage && s.memory_limit) ? (s.memory_usage / s.memory_limit) * 100 : undefined,
+                    };
+                }),
+                lxc: (Array.isArray(lxc) ? lxc : []).map(c => {
+                    const nm = c.name || '?';
+                    const s = lStatsMap[nm] || {};
+                    return {
+                        name: nm, state: c.state || '?',
+                        cpu: s.cpu_percent,
+                        mem: (s.memory_usage && s.memory_limit) ? (s.memory_usage / s.memory_limit) * 100 : undefined,
+                    };
+                }),
                 vms: (Array.isArray(vms) ? vms : []).map(v => ({ name: v.name || '?', state: v.status || v.state || '?' })),
                 ts: Date.now()
             };
