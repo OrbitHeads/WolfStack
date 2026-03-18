@@ -26667,31 +26667,25 @@ function buildServerRack(node, color) {
         panel.position.set(0, unitY + unitH / 2, frontZ + 0.12);
         group.add(panel);
 
-        // 3 LEDs on ALL servers: CPU, MEM, STORAGE
-        // HOST uses real metrics; containers inherit host metrics (shared resources)
+        // 3 LEDs: CPU, MEM, STORAGE — only when we have real metrics
         const ledR = 0.035;
         const ledGeo2 = new THREE.SphereGeometry(ledR, 10, 10);
         const ledY = unitY + unitH / 2;
         const ledZ = frontZ + 0.13;
-        if (node.online) {
-            const leds = [
-                { x: -panelW/2 + 0.08, col: cpuCol },
-                { x: -panelW/2 + 0.19, col: memCol },
-                { x: -panelW/2 + 0.30, col: dskCol },
-            ];
-            leds.forEach(l => {
-                const led = new THREE.Mesh(ledGeo2, new THREE.MeshBasicMaterial({ color: l.col }));
-                led.position.set(l.x, ledY, ledZ);
-                group.add(led);
-            });
-        } else {
-            // Offline: 3 dim red LEDs
-            [0.08, 0.19, 0.30].forEach(dx => {
-                const led = new THREE.Mesh(ledGeo2, new THREE.MeshBasicMaterial({ color: 0x662222 }));
+        const hasMetrics = node.online && node.metrics && (node.metrics.cpu_usage_percent !== undefined);
+        if (hasMetrics) {
+            [[0.08, cpuCol], [0.19, memCol], [0.30, dskCol]].forEach(([dx, col]) => {
+                const led = new THREE.Mesh(ledGeo2, new THREE.MeshBasicMaterial({ color: col }));
                 led.position.set(-panelW/2 + dx, ledY, ledZ);
                 group.add(led);
             });
+        } else if (!node.online) {
+            // Offline: single dim red LED
+            const led = new THREE.Mesh(ledGeo2, new THREE.MeshBasicMaterial({ color: 0x662222 }));
+            led.position.set(-panelW/2 + 0.08, ledY, ledZ);
+            group.add(led);
         }
+        // No LEDs at all if online but no metrics yet
 
         // Label text — use real container names from cache if available
         const ci = i - 1;
@@ -27144,23 +27138,38 @@ async function topoFetchContainers(nodeId) {
     const node = allNodes.find(n => n.id === nodeId);
     if (!node) return;
 
+    const isPve = node.node_type === 'proxmox';
     const proxyPrefix = (node && !node.is_self) ? `/api/nodes/${nodeId}/proxy/` : '/api/';
 
     try {
-        const [dockerResp, lxcResp, vmResp] = await Promise.all([
-            fetch(proxyPrefix + 'containers/docker').catch(() => null),
-            fetch(proxyPrefix + 'containers/lxc').catch(() => null),
-            fetch(proxyPrefix + 'vms').catch(() => null),
-        ]);
-        const docker = dockerResp?.ok ? await dockerResp.json() : [];
-        const lxc = lxcResp?.ok ? await lxcResp.json() : [];
-        const vms = vmResp?.ok ? await vmResp.json() : [];
-        _topoContainerCache[nodeId] = {
-            docker: (Array.isArray(docker) ? docker : []).map(c => ({ name: c.name || c.Names?.[0] || '?', state: c.state || c.State || '?' })),
-            lxc: (Array.isArray(lxc) ? lxc : []).map(c => ({ name: c.name || '?', state: c.state || '?' })),
-            vms: (Array.isArray(vms) ? vms : []).map(v => ({ name: v.name || '?', state: v.status || v.state || '?' })),
-            ts: Date.now()
-        };
+        if (isPve) {
+            // Proxmox VE — use PVE resources endpoint
+            const resp = await fetch(`/api/nodes/${nodeId}/pve/resources`).catch(() => null);
+            const guests = resp?.ok ? await resp.json() : [];
+            const arr = Array.isArray(guests) ? guests : [];
+            _topoContainerCache[nodeId] = {
+                docker: [],
+                lxc: arr.filter(g => g.guest_type === 'lxc').map(g => ({ name: g.name || ('CT ' + g.vmid), state: g.status || '?' })),
+                vms: arr.filter(g => g.guest_type === 'qemu').map(g => ({ name: g.name || ('VM ' + g.vmid), state: g.status || '?' })),
+                ts: Date.now()
+            };
+        } else {
+            // WolfStack node — fetch Docker, LXC, VMs separately
+            const [dockerResp, lxcResp, vmResp] = await Promise.all([
+                fetch(proxyPrefix + 'containers/docker').catch(() => null),
+                fetch(proxyPrefix + 'containers/lxc').catch(() => null),
+                fetch(proxyPrefix + 'vms').catch(() => null),
+            ]);
+            const docker = dockerResp?.ok ? await dockerResp.json() : [];
+            const lxc = lxcResp?.ok ? await lxcResp.json() : [];
+            const vms = vmResp?.ok ? await vmResp.json() : [];
+            _topoContainerCache[nodeId] = {
+                docker: (Array.isArray(docker) ? docker : []).map(c => ({ name: c.name || c.Names?.[0] || '?', state: c.state || c.State || '?' })),
+                lxc: (Array.isArray(lxc) ? lxc : []).map(c => ({ name: c.name || '?', state: c.state || '?' })),
+                vms: (Array.isArray(vms) ? vms : []).map(v => ({ name: v.name || '?', state: v.status || v.state || '?' })),
+                ts: Date.now()
+            };
+        }
     } catch (e) {
         _topoContainerCache[nodeId] = { docker: [], lxc: [], vms: [], ts: Date.now() };
     }
