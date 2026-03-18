@@ -26866,19 +26866,6 @@ function buildTopologyScene() {
         scene.add(clabel);
         _topo.labelSprites.push(clabel);
 
-        // WolfNet cables between racks in same cluster (glowing lines on the floor)
-        for (let i = 0; i < clusterNodes.length - 1; i++) {
-            if (!clusterNodes[i].online || !clusterNodes[i + 1].online) continue;
-            const x1 = startX + i * rackSpacing;
-            const x2 = startX + (i + 1) * rackSpacing;
-            const pts = [new THREE.Vector3(x1, 0.05, 1.2), new THREE.Vector3(x2, 0.05, 1.2)];
-            const lGeo = new THREE.BufferGeometry().setFromPoints(pts);
-            const lMat = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.4 });
-            const line = new THREE.Line(lGeo, lMat);
-            scene.add(line);
-            _topo.connectionLines.push(line);
-        }
-
         offsetX += clusterNodes.length * rackSpacing + clusterGap;
     });
 
@@ -26889,35 +26876,6 @@ function buildTopologyScene() {
         m.position.x += centreOffset;
     });
     _topo.target.set(0, 3, 0);
-
-    // Cross-cluster cables (curved overhead)
-    if (cNames.length > 1) {
-        let cx = centreOffset;
-        const clusterCentres = [];
-        cNames.forEach((c, i) => {
-            const n = clusters[c].length;
-            clusterCentres.push(cx + (n - 1) * rackSpacing / 2);
-            cx += n * rackSpacing + clusterGap;
-        });
-        for (let i = 0; i < clusterCentres.length; i++) {
-            for (let j = i + 1; j < clusterCentres.length; j++) {
-                const curve = new THREE.QuadraticBezierCurve3(
-                    new THREE.Vector3(clusterCentres[i], 6.5, -1),
-                    new THREE.Vector3((clusterCentres[i] + clusterCentres[j]) / 2, 10, -2),
-                    new THREE.Vector3(clusterCentres[j], 6.5, -1)
-                );
-                const cGeo = new THREE.BufferGeometry().setFromPoints(curve.getPoints(40));
-                const cMat = new THREE.LineDashedMaterial({
-                    color: 0xdc2626, transparent: true, opacity: 0.25,
-                    dashSize: 0.4, gapSize: 0.2,
-                });
-                const cLine = new THREE.Line(cGeo, cMat);
-                cLine.computeLineDistances();
-                scene.add(cLine);
-                _topo.connectionLines.push(cLine);
-            }
-        }
-    }
 
     // Update HUD
     const on = nodes.filter(n => n.online).length;
