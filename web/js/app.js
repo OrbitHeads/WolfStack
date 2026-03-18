@@ -26724,23 +26724,26 @@ function buildServerRack(node, color) {
             }
         }
 
-        const hasData = uCpu !== undefined || uMem !== undefined;
-        if (hasData && node.online) {
-            const cCol = uCpu !== undefined ? (uCpu > 80 ? 0xef4444 : uCpu > 50 ? 0xf59e0b : 0x22c55e) : 0x333344;
-            const mCol = uMem !== undefined ? (uMem > 90 ? 0xef4444 : uMem > 70 ? 0xf59e0b : 0x3b82f6) : 0x333344;
-            const sCol = uDisk !== undefined ? (uDisk > 90 ? 0xef4444 : uDisk > 70 ? 0xf59e0b : 0x8b5cf6) : 0x333344;
-            [[0.08, cCol], [0.19, mCol], [0.30, sCol]].forEach(([dx, col]) => {
+        // Only render individual LEDs that have real numeric data
+        if (node.online) {
+            const ledDefs = [
+                { dx: 0.08, val: uCpu, okCol: 0x22c55e, warnCol: 0xf59e0b, critCol: 0xef4444, warnAt: 50, critAt: 80 },
+                { dx: 0.19, val: uMem, okCol: 0x3b82f6, warnCol: 0xf59e0b, critCol: 0xef4444, warnAt: 70, critAt: 90 },
+                { dx: 0.30, val: uDisk, okCol: 0x8b5cf6, warnCol: 0xf59e0b, critCol: 0xef4444, warnAt: 70, critAt: 90 },
+            ];
+            ledDefs.forEach(ld => {
+                if (ld.val === undefined || !isFinite(ld.val)) return; // skip — no data
+                const col = ld.val > ld.critAt ? ld.critCol : ld.val > ld.warnAt ? ld.warnCol : ld.okCol;
                 const led = new THREE.Mesh(ledGeo2, new THREE.MeshBasicMaterial({ color: col }));
-                led.position.set(-panelW/2 + dx, ledY, ledZ);
+                led.position.set(-panelW/2 + ld.dx, ledY, ledZ);
                 group.add(led);
             });
-        } else if (!node.online) {
+        } else {
             // Offline: single dim red LED
             const led = new THREE.Mesh(ledGeo2, new THREE.MeshBasicMaterial({ color: 0x662222 }));
             led.position.set(-panelW/2 + 0.08, ledY, ledZ);
             group.add(led);
         }
-        // No LEDs if online but no data yet — they appear after fetch
 
         // Label text — use real container names from cache if available
         let labelText = '';
@@ -27181,67 +27184,87 @@ async function topoFetchContainers(nodeId) {
 
     try {
         if (isPve) {
-            // Proxmox VE — use PVE resources endpoint (includes CPU/mem per guest)
+            // Proxmox VE — use PVE resources endpoint (same as Global View)
             const resp = await fetch(`/api/nodes/${nodeId}/pve/resources`).catch(() => null);
             const guests = resp?.ok ? await resp.json() : [];
             const arr = Array.isArray(guests) ? guests : [];
+            const mapGuest = g => {
+                const cpuPct = (g.cpu !== undefined && g.cpu > 0) ? g.cpu * 100 : undefined;
+                const memPct = (g.mem > 0 && g.maxmem > 0) ? (g.mem / g.maxmem) * 100 : undefined;
+                const diskPct = (g.disk > 0 && g.maxdisk > 0) ? (g.disk / g.maxdisk) * 100 : undefined;
+                return {
+                    name: g.name || (g.guest_type === 'lxc' ? 'CT ' + g.vmid : 'VM ' + g.vmid),
+                    state: g.status || '?',
+                    cpu: isFinite(cpuPct) ? cpuPct : undefined,
+                    mem: isFinite(memPct) ? memPct : undefined,
+                    disk: isFinite(diskPct) ? diskPct : undefined,
+                };
+            };
             _topoContainerCache[nodeId] = {
                 docker: [],
-                lxc: arr.filter(g => g.guest_type === 'lxc').map(g => ({
-                    name: g.name || ('CT ' + g.vmid), state: g.status || '?',
-                    cpu: g.cpu !== undefined ? g.cpu * 100 : undefined,
-                    mem: (g.mem && g.maxmem) ? (g.mem / g.maxmem) * 100 : undefined,
-                    disk: (g.disk && g.maxdisk) ? (g.disk / g.maxdisk) * 100 : undefined,
-                })),
-                vms: arr.filter(g => g.guest_type === 'qemu').map(g => ({
-                    name: g.name || ('VM ' + g.vmid), state: g.status || '?',
-                    cpu: g.cpu !== undefined ? g.cpu * 100 : undefined,
-                    mem: (g.mem && g.maxmem) ? (g.mem / g.maxmem) * 100 : undefined,
-                    disk: (g.disk && g.maxdisk) ? (g.disk / g.maxdisk) * 100 : undefined,
-                })),
+                lxc: arr.filter(g => g.guest_type === 'lxc').map(mapGuest),
+                vms: arr.filter(g => g.guest_type === 'qemu').map(mapGuest),
                 ts: Date.now()
             };
         } else {
-            // WolfStack node — fetch containers + stats in parallel
+            // WolfStack node — same approach as Global View loadFleetContainers
             const [dockerResp, dockerStatsResp, lxcResp, lxcStatsResp, vmResp] = await Promise.all([
-                fetch(proxyPrefix + 'containers/docker').catch(() => null),
-                fetch(proxyPrefix + 'containers/docker/stats').catch(() => null),
-                fetch(proxyPrefix + 'containers/lxc').catch(() => null),
-                fetch(proxyPrefix + 'containers/lxc/stats').catch(() => null),
-                fetch(proxyPrefix + 'vms').catch(() => null),
+                fetch(proxyPrefix + 'containers/docker', { credentials: 'include' }).catch(() => null),
+                fetch(proxyPrefix + 'containers/docker/stats', { credentials: 'include' }).catch(() => null),
+                fetch(proxyPrefix + 'containers/lxc', { credentials: 'include' }).catch(() => null),
+                fetch(proxyPrefix + 'containers/lxc/stats', { credentials: 'include' }).catch(() => null),
+                fetch(proxyPrefix + 'vms', { credentials: 'include' }).catch(() => null),
             ]);
-            const docker = dockerResp?.ok ? await dockerResp.json() : [];
+            let docker = dockerResp?.ok ? await dockerResp.json() : [];
             const dockerStats = dockerStatsResp?.ok ? await dockerStatsResp.json() : [];
-            const lxc = lxcResp?.ok ? await lxcResp.json() : [];
+            let lxc = lxcResp?.ok ? await lxcResp.json() : [];
             const lxcStats = lxcStatsResp?.ok ? await lxcStatsResp.json() : [];
-            const vms = vmResp?.ok ? await vmResp.json() : [];
+            let vms = vmResp?.ok ? await vmResp.json() : [];
 
-            // Index stats by name
+            // Handle {containers: [...]} wrapper (some endpoints return this)
+            if (docker && !Array.isArray(docker) && docker.containers) docker = docker.containers;
+            if (lxc && !Array.isArray(lxc) && lxc.containers) lxc = lxc.containers;
+            if (vms && !Array.isArray(vms) && vms.vms) vms = vms.vms;
+            if (!Array.isArray(docker)) docker = [];
+            if (!Array.isArray(lxc)) lxc = [];
+            if (!Array.isArray(vms)) vms = [];
+
+            // Index stats by name (same as Global View)
             const dStatsMap = {};
             (Array.isArray(dockerStats) ? dockerStats : []).forEach(s => { dStatsMap[s.name] = s; });
             const lStatsMap = {};
             (Array.isArray(lxcStats) ? lxcStats : []).forEach(s => { lStatsMap[s.name] = s; });
 
             _topoContainerCache[nodeId] = {
-                docker: (Array.isArray(docker) ? docker : []).map(c => {
-                    const nm = c.name || c.Names?.[0] || '?';
+                docker: docker.map(c => {
+                    // Match Global View name extraction: c.names[0] first, then c.name
+                    const nm = ((c.names && c.names[0]) || c.name || c.id || '?').replace(/^\//, '');
                     const s = dStatsMap[nm] || {};
+                    const cpuPct = s.cpu_percent;
+                    const memPct = (s.memory_usage && s.memory_limit) ? (s.memory_usage / s.memory_limit) * 100 : undefined;
+                    const diskPct = (c.disk_usage && c.disk_total) ? (c.disk_usage / c.disk_total) * 100 : undefined;
                     return {
-                        name: nm, state: c.state || c.State || '?',
-                        cpu: s.cpu_percent,
-                        mem: (s.memory_usage && s.memory_limit) ? (s.memory_usage / s.memory_limit) * 100 : undefined,
+                        name: nm, state: c.state || c.status || '?',
+                        cpu: isFinite(cpuPct) ? cpuPct : undefined,
+                        mem: isFinite(memPct) ? memPct : undefined,
+                        disk: isFinite(diskPct) ? diskPct : undefined,
                     };
                 }),
-                lxc: (Array.isArray(lxc) ? lxc : []).map(c => {
-                    const nm = c.name || '?';
+                lxc: lxc.map(c => {
+                    const nm = c.name || c.id || '?';
                     const s = lStatsMap[nm] || {};
+                    const cpuPct = s.cpu_percent;
+                    const memPct = (s.memory_usage && s.memory_limit) ? (s.memory_usage / s.memory_limit) * 100 : undefined;
                     return {
-                        name: nm, state: c.state || '?',
-                        cpu: s.cpu_percent,
-                        mem: (s.memory_usage && s.memory_limit) ? (s.memory_usage / s.memory_limit) * 100 : undefined,
+                        name: nm, state: c.state || c.status || '?',
+                        cpu: isFinite(cpuPct) ? cpuPct : undefined,
+                        mem: isFinite(memPct) ? memPct : undefined,
                     };
                 }),
-                vms: (Array.isArray(vms) ? vms : []).map(v => ({ name: v.name || '?', state: v.status || v.state || '?' })),
+                vms: vms.map(v => ({
+                    name: v.name || v.vmid || v.id || '?',
+                    state: v.state || v.status || (v.running ? 'running' : 'stopped'),
+                })),
                 ts: Date.now()
             };
         }
