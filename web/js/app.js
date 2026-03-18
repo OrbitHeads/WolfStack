@@ -27315,7 +27315,8 @@ function topoUpdateTooltip() {
     if (!_topo.selectedRackId) { tooltip.style.display = 'none'; return; }
 
     const rack = _topo.nodeMeshes.find(m => m.userData.id === _topo.selectedRackId);
-    const n = rack?.userData?.node;
+    // Use LIVE node data, not stale rack snapshot
+    const n = allNodes.find(nd => nd.id === _topo.selectedRackId) || rack?.userData?.node;
     if (!n) { tooltip.style.display = 'none'; return; }
 
     const nodeId = n.id;
@@ -27401,7 +27402,9 @@ function topoUpdateVRPanel() {
     if (!_topo.selectedRackId) return;
 
     const rack = _topo.nodeMeshes.find(m => m.userData.id === _topo.selectedRackId);
-    const n = rack?.userData?.node;
+    if (!rack) return;
+    // Use LIVE node data from allNodes, not stale rack snapshot
+    const n = allNodes.find(nd => nd.id === _topo.selectedRackId) || rack.userData.node;
     if (!n) return;
 
     const ui = _topo.selectedUnitIndex;
@@ -28035,11 +28038,34 @@ function vrTermUpdate() {
             _vrTerm.screenTex.needsUpdate = true;
         }
     } else if (_vrTerm.isIframe) {
-        // Iframe terminal — copy xterm canvas from the hidden iframe
-        if (_vrTerm.iframeCvs && _vrTerm.mirrorCtx) {
-            try {
-                _vrTerm.mirrorCtx.drawImage(_vrTerm.iframeCvs, 0, 0, _vrTerm.mirrorCvs.width, _vrTerm.mirrorCvs.height);
-            } catch(e) {}
+        // Iframe terminal — read text from xterm buffer and render to canvas
+        const ctx = _vrTerm.mirrorCtx;
+        const cvs = _vrTerm.mirrorCvs;
+        let iframeTerm = null;
+        try { iframeTerm = _vrTerm.iframe?.contentWindow?._term; } catch(e) {}
+        if (iframeTerm && ctx) {
+            const buf = iframeTerm.buffer?.active;
+            if (buf) {
+                ctx.fillStyle = '#0a0a0a';
+                ctx.fillRect(0, 0, cvs.width, cvs.height);
+                ctx.font = '13px JetBrains Mono, Courier New, monospace';
+                ctx.fillStyle = '#f0f0f0';
+                const lineH = 18;
+                const rows = Math.min(buf.length, 33);
+                const startRow = Math.max(0, buf.baseY + buf.cursorY - 30);
+                for (let r = 0; r < rows; r++) {
+                    const line = buf.getLine(startRow + r);
+                    if (line) {
+                        const text = line.translateToString(true);
+                        ctx.fillText(text, 6, 16 + r * lineH);
+                    }
+                }
+                // Cursor
+                const cx = buf.cursorX * 7.8 + 6;
+                const cy = (buf.cursorY) * lineH + 4;
+                ctx.fillStyle = '#10b981';
+                ctx.fillRect(cx, cy, 8, lineH);
+            }
         }
         _vrTerm.screenTex.needsUpdate = true;
     } else {
