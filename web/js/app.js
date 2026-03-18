@@ -26395,6 +26395,7 @@ async function k8sSaveSettings() {
 // ═══════════════════════════════════════════════════════════════════════
 
 let _topo = null;
+let _topoContainerCache = {}; // nodeId → { docker: [...], lxc: [...], vms: [...], ts: timestamp }
 
 function initTopology3D() {
     if (typeof THREE === 'undefined') {
@@ -26527,10 +26528,11 @@ function initTopology3D() {
         updateCameraFromSpherical();
     }, { passive: false });
 
-    // Click — toggle stats panel for clicked rack; click empty space to dismiss
+    // Click — select a specific server unit in a rack; click empty = dismiss
     state.selectedRackId = null;
+    state.selectedUnitIndex = -1; // -1 = whole rack overview, 0+ = specific unit
     container.addEventListener('click', e => {
-        if (state.isDragging) return; // don't trigger on drag release
+        if (state.isDragging) return;
         const rect = container.getBoundingClientRect();
         state.mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
         state.mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
@@ -26539,33 +26541,30 @@ function initTopology3D() {
         const hits = state.raycaster.intersectObjects(rackMeshes, true);
         const tooltip = document.getElementById('topology-tooltip');
         if (hits.length > 0) {
-            let obj = hits[0].object;
-            while (obj && !obj.userData.isRack && obj.parent) obj = obj.parent;
-            if (obj?.userData?.id) {
-                // Toggle: click same rack again = deselect
-                if (state.selectedRackId === obj.userData.id) {
+            const hitObj = hits[0].object;
+            // Find which rack this belongs to
+            let rack = hitObj;
+            while (rack && !rack.userData.isRack && rack.parent) rack = rack.parent;
+            if (rack?.userData?.id) {
+                const newRackId = rack.userData.id;
+                const unitData = hitObj.userData;
+                const clickedUnit = unitData.isUnit ? unitData.unitIndex : -1;
+                // If clicking the same rack+unit, deselect
+                if (state.selectedRackId === newRackId && state.selectedUnitIndex === clickedUnit) {
                     state.selectedRackId = null;
+                    state.selectedUnitIndex = -1;
                     if (tooltip) tooltip.style.display = 'none';
                 } else {
-                    state.selectedRackId = obj.userData.id;
+                    state.selectedRackId = newRackId;
+                    state.selectedUnitIndex = clickedUnit;
+                    // Lazy-fetch container names for this node
+                    topoFetchContainers(newRackId);
                 }
             }
         } else {
             state.selectedRackId = null;
+            state.selectedUnitIndex = -1;
             if (tooltip) tooltip.style.display = 'none';
-        }
-    });
-    // Double-click navigates to node dashboard
-    container.addEventListener('dblclick', e => {
-        const rect = container.getBoundingClientRect();
-        state.mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-        state.mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-        state.raycaster.setFromCamera(state.mouse, camera);
-        const hits = state.raycaster.intersectObjects(state.nodeMeshes.filter(m => m.userData.isRack), true);
-        if (hits.length > 0) {
-            let obj = hits[0].object;
-            while (obj && !obj.userData.isRack && obj.parent) obj = obj.parent;
-            if (obj?.userData?.id) selectServerView(obj.userData.id, 'dashboard');
         }
     });
 
@@ -26650,6 +26649,7 @@ function buildServerRack(node, color) {
         const unit = new THREE.Mesh(unitGeo, unitMat);
         unit.position.set(0, unitY + unitH / 2, 0);
         unit.castShadow = true;
+        unit.userData = { isUnit: true, unitIndex: i, unitType, isMother };
         group.add(unit);
 
         // Front panel with tiny text label baked into texture
@@ -26905,36 +26905,86 @@ function topoRenderFrame(timestamp, xrFrame) {
         // Cursor
         _topo.container.style.cursor = hits.length > 0 ? 'pointer' : (_topo.isDragging ? 'grabbing' : 'grab');
 
-        // Show stats panel for selected rack with action buttons
+        // Show info panel for selected rack / unit
         if (_topo.selectedRackId && tooltip) {
             const rack = _topo.nodeMeshes.find(m => m.userData.id === _topo.selectedRackId);
             const n = rack?.userData?.node;
             if (n) {
-                const m = n.metrics || {};
-                const cpu = m.cpu_usage_percent?.toFixed(0) || '?';
-                const mem = m.memory_percent?.toFixed(0) || '?';
-                const root = m.disks?.find(d => d.mount_point === '/') || m.disks?.[0];
-                const dsk = root ? root.usage_percent.toFixed(0) : '?';
-                const nodeId = escapeHtml(n.id);
+                const nodeId = n.id;
+                const esc = s => escapeHtml(s || '');
+                const ui = _topo.selectedUnitIndex;
                 tooltip.style.pointerEvents = 'auto';
-                tooltip.innerHTML =
-                    `<div style="font-weight:700;font-size:14px;margin-bottom:4px;">${escapeHtml(n.hostname || n.id)}</div>` +
-                    `<div style="color:rgba(255,255,255,0.45);font-size:11px;margin-bottom:10px;">${escapeHtml(n.address)}</div>` +
-                    `<div style="color:rgba(255,255,255,0.7);line-height:1.9;font-size:12px;">` +
-                    `<div>${n.online ? '<span style="color:#22c55e;">&#9679;</span> Online' : '<span style="color:#ef4444;">&#9679;</span> Offline'}</div>` +
-                    `<div><span style="color:#22c55e;">&#9679;</span> CPU: ${cpu}%</div>` +
-                    `<div><span style="color:#3b82f6;">&#9679;</span> Memory: ${mem}%</div>` +
-                    `<div><span style="color:#8b5cf6;">&#9679;</span> Disk: ${dsk}%</div>` +
-                    `</div>` +
-                    `<div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.1);font-size:11px;color:rgba(255,255,255,0.5);line-height:1.7;">` +
-                    `<div><span style="color:#3b82f6;">&#9632;</span> ${n.docker_count || 0} Docker containers</div>` +
-                    `<div><span style="color:#10b981;">&#9632;</span> ${n.lxc_count || 0} LXC containers</div>` +
-                    `<div><span style="color:#f59e0b;">&#9632;</span> ${n.vm_count || 0} Virtual machines</div>` +
-                    `</div>` +
-                    `<div style="margin-top:10px;display:flex;gap:6px;">` +
-                    `<button onclick="topoOpenTerminal('${nodeId}')" style="flex:1;padding:7px 0;border:1px solid rgba(255,255,255,0.15);border-radius:6px;background:rgba(255,255,255,0.08);color:#fff;font-size:11px;cursor:pointer;font-family:inherit;">Terminal</button>` +
-                    `<button onclick="topoOpenDashboard('${nodeId}')" style="flex:1;padding:7px 0;border:1px solid rgba(220,38,38,0.3);border-radius:6px;background:rgba(220,38,38,0.15);color:#fff;font-size:11px;cursor:pointer;font-family:inherit;">Dashboard</button>` +
-                    `</div>`;
+
+                if (ui <= 0) {
+                    // Rack overview (mother / whole node)
+                    const m = n.metrics || {};
+                    const cpu = m.cpu_usage_percent?.toFixed(0) || '?';
+                    const mem = m.memory_percent?.toFixed(0) || '?';
+                    const root = m.disks?.find(d => d.mount_point === '/') || m.disks?.[0];
+                    const dsk = root ? root.usage_percent.toFixed(0) : '?';
+                    // Container list from cache
+                    const cc = _topoContainerCache[nodeId];
+                    let listHtml = '';
+                    if (cc) {
+                        const all = [
+                            ...cc.docker.map(c => ({ ...c, rt: 'docker', icon: '&#9632;', clr: '#3b82f6' })),
+                            ...cc.lxc.map(c => ({ ...c, rt: 'lxc', icon: '&#9632;', clr: '#10b981' })),
+                            ...cc.vms.map(v => ({ ...v, rt: 'vm', icon: '&#9632;', clr: '#f59e0b' })),
+                        ];
+                        if (all.length > 0) {
+                            listHtml = '<div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.1);max-height:140px;overflow-y:auto;">';
+                            all.forEach(c => {
+                                const stateClr = (c.state === 'running' || c.state === 'Running') ? '#22c55e' : '#ef4444';
+                                const termBtn = (c.rt === 'docker' || c.rt === 'lxc') ?
+                                    `<button onclick="topoOpenTerminal('${esc(nodeId)}','${c.rt}','${esc(c.name)}')" style="margin-left:auto;padding:2px 6px;border:1px solid rgba(255,255,255,0.15);border-radius:4px;background:rgba(255,255,255,0.06);color:#aaa;font-size:9px;cursor:pointer;font-family:inherit;">Terminal</button>` : '';
+                                listHtml += `<div style="display:flex;align-items:center;gap:6px;font-size:10px;line-height:2;color:rgba(255,255,255,0.6);">` +
+                                    `<span style="color:${c.clr};">${c.icon}</span>` +
+                                    `<span style="color:${stateClr};font-size:8px;">&#9679;</span>` +
+                                    `<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(c.name)}</span>` +
+                                    termBtn + `</div>`;
+                            });
+                            listHtml += '</div>';
+                        }
+                    }
+                    tooltip.innerHTML =
+                        `<div style="font-weight:700;font-size:14px;margin-bottom:4px;">${esc(n.hostname || n.id)}</div>` +
+                        `<div style="color:rgba(255,255,255,0.45);font-size:11px;margin-bottom:8px;">${esc(n.address)}</div>` +
+                        `<div style="color:rgba(255,255,255,0.7);line-height:1.8;font-size:12px;">` +
+                        `<div>${n.online ? '<span style="color:#22c55e;">&#9679;</span> Online' : '<span style="color:#ef4444;">&#9679;</span> Offline'}</div>` +
+                        `<div><span style="color:#22c55e;">&#9679;</span> CPU: ${cpu}%</div>` +
+                        `<div><span style="color:#3b82f6;">&#9679;</span> Memory: ${mem}%</div>` +
+                        `<div><span style="color:#8b5cf6;">&#9679;</span> Disk: ${dsk}%</div>` +
+                        `</div>` +
+                        listHtml +
+                        `<div style="margin-top:10px;display:flex;gap:6px;">` +
+                        `<button onclick="topoOpenTerminal('${esc(nodeId)}')" style="flex:1;padding:7px 0;border:1px solid rgba(255,255,255,0.15);border-radius:6px;background:rgba(255,255,255,0.08);color:#fff;font-size:11px;cursor:pointer;font-family:inherit;">Terminal</button>` +
+                        `<button onclick="topoOpenDashboard('${esc(nodeId)}')" style="flex:1;padding:7px 0;border:1px solid rgba(220,38,38,0.3);border-radius:6px;background:rgba(220,38,38,0.15);color:#fff;font-size:11px;cursor:pointer;font-family:inherit;">Dashboard</button>` +
+                        `</div>`;
+                } else {
+                    // Specific container/VM unit
+                    const info = topoGetUnitInfo(nodeId, ui);
+                    if (info) {
+                        const typeColors = { HOST: '#22c55e', DOCKER: '#3b82f6', LXC: '#10b981', VM: '#f59e0b' };
+                        const tc = typeColors[info.type] || '#888';
+                        const stateText = info.state ? `<div style="margin-top:2px;"><span style="color:${(info.state === 'running' || info.state === 'Running') ? '#22c55e' : '#ef4444'};">&#9679;</span> ${esc(info.state)}</div>` : '';
+                        const termBtn = (info.runtime === 'docker' || info.runtime === 'lxc' || info.runtime === 'host') ?
+                            `<button onclick="topoOpenTerminal('${esc(nodeId)}','${info.runtime}','${esc(info.name)}')" style="flex:1;padding:7px 0;border:1px solid rgba(255,255,255,0.15);border-radius:6px;background:rgba(255,255,255,0.08);color:#fff;font-size:11px;cursor:pointer;font-family:inherit;">Terminal</button>` : '';
+                        tooltip.innerHTML =
+                            `<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">` +
+                            `<span style="background:${tc};color:#fff;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;">${info.type}</span>` +
+                            `<span style="font-weight:700;font-size:13px;">${esc(info.name)}</span>` +
+                            `</div>` +
+                            `<div style="color:rgba(255,255,255,0.6);font-size:11px;line-height:1.7;">` +
+                            `<div>Node: ${esc(n.hostname || n.id)}</div>` +
+                            stateText +
+                            `</div>` +
+                            `<div style="margin-top:10px;display:flex;gap:6px;">` +
+                            termBtn +
+                            `<button onclick="topoOpenDashboard('${esc(nodeId)}')" style="flex:1;padding:7px 0;border:1px solid rgba(220,38,38,0.3);border-radius:6px;background:rgba(220,38,38,0.15);color:#fff;font-size:11px;cursor:pointer;font-family:inherit;">Node Dashboard</button>` +
+                            `</div>`;
+                    }
+                }
+
                 tooltip.style.display = 'block';
                 if (rack) {
                     const pos = rack.position.clone();
@@ -27038,12 +27088,72 @@ function topologyResetCamera() {
 function topologyToggleLabels() { if (_topo) _topo.showLabels = !_topo.showLabels; }
 function topologyToggleAutoRotate() { if (_topo) _topo.autoRotate = !_topo.autoRotate; }
 
-function topoOpenTerminal(nodeId) {
-    // Set current node context and use the existing openConsole function
-    currentNodeId = nodeId;
+// Fetch container names for a node (cached for 30s)
+async function topoFetchContainers(nodeId) {
+    const cached = _topoContainerCache[nodeId];
+    if (cached && Date.now() - cached.ts < 30000) return; // fresh enough
+
     const node = allNodes.find(n => n.id === nodeId);
-    const name = node?.hostname || nodeId;
-    openConsole('host', name);
+    if (!node) return;
+
+    const proxyPrefix = (node && !node.is_self) ? `/api/nodes/${nodeId}/proxy/` : '/api/';
+
+    try {
+        const [dockerResp, lxcResp, vmResp] = await Promise.all([
+            fetch(proxyPrefix + 'containers/docker').catch(() => null),
+            fetch(proxyPrefix + 'containers/lxc').catch(() => null),
+            fetch(proxyPrefix + 'vms').catch(() => null),
+        ]);
+        const docker = dockerResp?.ok ? await dockerResp.json() : [];
+        const lxc = lxcResp?.ok ? await lxcResp.json() : [];
+        const vms = vmResp?.ok ? await vmResp.json() : [];
+        _topoContainerCache[nodeId] = {
+            docker: (Array.isArray(docker) ? docker : []).map(c => ({ name: c.name || c.Names?.[0] || '?', state: c.state || c.State || '?' })),
+            lxc: (Array.isArray(lxc) ? lxc : []).map(c => ({ name: c.name || '?', state: c.state || '?' })),
+            vms: (Array.isArray(vms) ? vms : []).map(v => ({ name: v.name || '?', state: v.status || v.state || '?' })),
+            ts: Date.now()
+        };
+    } catch (e) {
+        _topoContainerCache[nodeId] = { docker: [], lxc: [], vms: [], ts: Date.now() };
+    }
+}
+
+// Get the container info for a specific unit index in a rack
+function topoGetUnitInfo(nodeId, unitIndex) {
+    const node = allNodes.find(n => n.id === nodeId);
+    if (!node) return null;
+    if (unitIndex === 0) return { type: 'HOST', name: node.hostname || nodeId, runtime: 'host' };
+    const cached = _topoContainerCache[nodeId];
+    if (!cached) return { type: '...', name: 'Loading...', runtime: null };
+    const ci = unitIndex - 1;
+    const dc = node.docker_count || 0;
+    const lc = node.lxc_count || 0;
+    if (ci < dc) {
+        const c = cached.docker[ci];
+        return c ? { type: 'DOCKER', name: c.name, state: c.state, runtime: 'docker' } : { type: 'DOCKER', name: `container ${ci+1}`, runtime: 'docker' };
+    } else if (ci < dc + lc) {
+        const c = cached.lxc[ci - dc];
+        return c ? { type: 'LXC', name: c.name, state: c.state, runtime: 'lxc' } : { type: 'LXC', name: `container ${ci-dc+1}`, runtime: 'lxc' };
+    } else {
+        const v = cached.vms[ci - dc - lc];
+        return v ? { type: 'VM', name: v.name, state: v.state, runtime: 'vm' } : { type: 'VM', name: `vm ${ci-dc-lc+1}`, runtime: 'vm' };
+    }
+}
+
+function topoOpenTerminal(nodeId, runtime, containerName) {
+    currentNodeId = nodeId;
+    if (!runtime || runtime === 'host') {
+        const node = allNodes.find(n => n.id === nodeId);
+        openConsole('host', node?.hostname || nodeId);
+    } else if (runtime === 'docker') {
+        openConsole('docker', containerName);
+    } else if (runtime === 'lxc') {
+        openConsole('lxc', containerName);
+    } else {
+        // VM — open VNC or fallback to host
+        const node = allNodes.find(n => n.id === nodeId);
+        openConsole('host', node?.hostname || nodeId);
+    }
 }
 
 function topoOpenDashboard(nodeId) {
