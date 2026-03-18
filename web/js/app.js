@@ -35,8 +35,11 @@ function toggleSidebar() {
         const collapsed = document.body.classList.contains('sidebar-collapsed');
         localStorage.setItem('wolfstack_sidebar_collapsed', collapsed ? '1' : '0');
     }
-    // Invalidate map size after transition
-    setTimeout(() => { if (typeof worldMap !== 'undefined' && worldMap) worldMap.invalidateSize(); }, 350);
+    // Invalidate map size + 3D topology after sidebar transition
+    setTimeout(() => {
+        if (typeof worldMap !== 'undefined' && worldMap) worldMap.invalidateSize();
+        if (_topo && _topo.onResize) _topo.onResize();
+    }, 350);
 }
 
 function closeSidebarMobile() {
