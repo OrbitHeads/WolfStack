@@ -26537,9 +26537,8 @@ function initTopology3D() {
             // Check VR terminal keyboard/close button first
             if (_vrTerm) {
                 const allVRTermObjects = [..._vrTerm.keyMeshes];
-                // Also check close button
-                _vrTerm.group.traverse(child => { if (child.userData.isVRTermClose) allVRTermObjects.push(child); });
-                const termHits = ray.intersectObjects(allVRTermObjects, true);
+                if (_vrTerm.closeBtn) allVRTermObjects.push(_vrTerm.closeBtn);
+                const termHits = ray.intersectObjects(allVRTermObjects, false);
                 if (termHits.length > 0) {
                     const hit = termHits[0].object;
                     if (hit.userData.isVRTermClose) {
@@ -27226,7 +27225,7 @@ function topologyEnterVR() {
             // Position user in front of racks at standing height
             // Position user at -Z facing +Z (toward rack fronts at -Z face)
             // WebXR default: user faces -Z. Rotate dolly PI so user faces +Z
-            _topo.vrDolly.position.set(0, 0, -6);
+            _topo.vrDolly.position.set(0, 2.5, -6);
             _topo.vrDolly.rotation.set(0, Math.PI, 0);
             showToast('Entering VR — use thumbsticks to walk around your server room', 'success');
         })
@@ -27452,11 +27451,9 @@ function topoUpdateVRPanel() {
 
     // Position floating in front of the rack, facing the user at +Z
     const rackPos = rack.position.clone();
-    // Panel between user (at -Z) and rack (at Z~0)
+    // Panel between user (at -Z) and rack (at Z~0), rotated to face user
     panel.position.set(rackPos.x, 3.5, rackPos.z - 2.5);
-    // No rotation — PlaneGeometry faces +Z by default, but user is at -Z
-    // so rotate to face -Z (toward user)
-    // Actually: no rotation needed if user's dolly is rotated PI
+    panel.rotation.y = Math.PI; // face toward -Z (user with dolly rotated PI)
 
     // Store button info for VR trigger detection
     panel.userData = { isVRPanel: true, nodeId: n.id, unitIndex: ui };
@@ -27662,18 +27659,18 @@ function topoOpenVRTerminal(nodeId, runtime, containerName) {
     term.open(termContainer);
     try { fitAddon.fit(); } catch(e) {}
 
-    // Screen plane — create a placeholder canvas until xterm renders
+    // Screen plane — use a 2D mirror canvas that copies from xterm each frame
     const screenW = 2.8, screenH = 1.75;
     const screenGeo = new THREE.PlaneGeometry(screenW, screenH);
-    const placeholderCvs = document.createElement('canvas');
-    placeholderCvs.width = 800; placeholderCvs.height = 500;
-    const pCtx = placeholderCvs.getContext('2d');
-    pCtx.fillStyle = '#0a0a14';
-    pCtx.fillRect(0, 0, 800, 500);
-    pCtx.font = '20px Inter, monospace';
-    pCtx.fillStyle = '#22c55e';
-    pCtx.fillText('Connecting to ' + name + '...', 20, 250);
-    const screenTex = new THREE.CanvasTexture(placeholderCvs);
+    const mirrorCvs = document.createElement('canvas');
+    mirrorCvs.width = 800; mirrorCvs.height = 500;
+    const mirrorCtx = mirrorCvs.getContext('2d');
+    mirrorCtx.fillStyle = '#0a0a14';
+    mirrorCtx.fillRect(0, 0, 800, 500);
+    mirrorCtx.font = '20px Inter, monospace';
+    mirrorCtx.fillStyle = '#22c55e';
+    mirrorCtx.fillText('Connecting to ' + name + '...', 20, 250);
+    const screenTex = new THREE.CanvasTexture(mirrorCvs);
     screenTex.minFilter = THREE.LinearFilter;
     const screenMat = new THREE.MeshBasicMaterial({ map: screenTex, side: THREE.DoubleSide });
     const screen = new THREE.Mesh(screenGeo, screenMat);
@@ -27692,13 +27689,17 @@ function topoOpenVRTerminal(nodeId, runtime, containerName) {
     titleLabel.position.set(0, 1.85, 0.02);
     group.add(titleLabel);
 
-    // Close button (X)
-    const closeGeo = new THREE.BoxGeometry(0.2, 0.2, 0.04);
+    // Close button (X) — large enough to hit with VR laser
+    const closeGeo = new THREE.BoxGeometry(0.35, 0.25, 0.06);
     const closeMat = new THREE.MeshBasicMaterial({ color: 0xef4444 });
     const closeBtn = new THREE.Mesh(closeGeo, closeMat);
-    closeBtn.position.set(screenW / 2 - 0.15, 1.8, 0.02);
+    closeBtn.position.set(screenW / 2 - 0.2, 1.85, 0.05);
     closeBtn.userData = { isVRTermClose: true };
     group.add(closeBtn);
+    // X label on close button
+    const xLabel = makeTextSprite('X', { fontSize: 24, color: '#ffffff', scale: 0.15 });
+    xLabel.position.set(0, 0, 0.04);
+    closeBtn.add(xLabel);
 
     // ── Virtual keyboard ──
     const kbRows = [
@@ -27771,7 +27772,7 @@ function topoOpenVRTerminal(nodeId, runtime, containerName) {
 
     _topo.scene.add(group);
 
-    _vrTerm = { group, term, ws, screenTex, termContainer, keyMeshes, shift: false, caps: false };
+    _vrTerm = { group, term, ws, screenTex, termContainer, keyMeshes, closeBtn, shift: false, caps: false, mirrorCvs, mirrorCtx };
 }
 
 function topoCloseVRTerminal() {
@@ -28004,10 +28005,12 @@ function vrTermUpdate() {
             _vrTerm.screenTex.needsUpdate = true;
         }
     } else {
-        // Terminal — grab xterm canvas
+        // Terminal — copy xterm canvas to our mirror 2D canvas (works even if xterm uses WebGL)
         const xtermCanvas = _vrTerm.termContainer?.querySelector('canvas');
-        if (xtermCanvas && _vrTerm.screenTex.image !== xtermCanvas) {
-            _vrTerm.screenTex.image = xtermCanvas;
+        if (xtermCanvas && _vrTerm.mirrorCtx) {
+            try {
+                _vrTerm.mirrorCtx.drawImage(xtermCanvas, 0, 0, _vrTerm.mirrorCvs.width, _vrTerm.mirrorCvs.height);
+            } catch(e) {} // silently fail if canvas is tainted
         }
         _vrTerm.screenTex.needsUpdate = true;
     }
