@@ -26854,11 +26854,23 @@ function buildTopologyScene() {
     const lc = nodes.reduce((s, n) => s + (n.lxc_count || 0), 0);
     const vc = nodes.reduce((s, n) => s + (n.vm_count || 0), 0);
     const el = document.getElementById('topology-stats');
+    // Check VR capability
+    let vrLine = '';
+    if (navigator.xr) {
+        navigator.xr.isSessionSupported('immersive-vr').then(ok => {
+            const vrEl = document.getElementById('topology-vr-status');
+            if (vrEl) vrEl.innerHTML = ok
+                ? '<span style="color:#22c55e;">&#9679;</span> VR Ready'
+                : '<span style="color:rgba(255,255,255,0.3);">&#9679;</span> No VR headset';
+        }).catch(() => {});
+        vrLine = '<div id="topology-vr-status" style="margin-top:4px;"><span style="color:rgba(255,255,255,0.3);">&#9679;</span> Checking VR...</div>';
+    }
     if (el) el.innerHTML =
         `<div><span style="color:#22c55e;">&#9679;</span> ${on} online / ${nodes.length} nodes</div>` +
         `<div><span style="color:#3b82f6;">&#9679;</span> ${dc} Docker</div>` +
         `<div><span style="color:#10b981;">&#9679;</span> ${lc} LXC</div>` +
         `<div><span style="color:#f59e0b;">&#9679;</span> ${vc} VMs</div>` +
+        vrLine +
         `<div style="margin-top:6px;color:rgba(255,255,255,0.4);font-size:10px;">Drag to orbit &bull; Scroll to zoom &bull; Click rack for stats &bull; Double-click to open</div>`;
 }
 
