@@ -27225,7 +27225,7 @@ function topologyEnterVR() {
             // Position user in front of racks at standing height
             // Position user at -Z facing +Z (toward rack fronts at -Z face)
             // WebXR default: user faces -Z. Rotate dolly PI so user faces +Z
-            _topo.vrDolly.position.set(0, 2.5, -6);
+            _topo.vrDolly.position.set(0, 1, -6);
             _topo.vrDolly.rotation.set(0, Math.PI, 0);
             showToast('Entering VR — use thumbsticks to walk around your server room', 'success');
         })
@@ -27423,25 +27423,42 @@ function topoUpdateVRPanel() {
     const btnLabel = isVM ? '>>> OPEN VNC CONSOLE <<<' : '>>> OPEN TERMINAL <<<';
     lines.push({ text: btnLabel, color: '#dc2626', size: 22, bold: true, isButton: true });
 
-    // Render to canvas
+    // Render to canvas — button at very bottom with clear red background
     const cvs = document.createElement('canvas');
     cvs.width = 512; cvs.height = 400;
     const ctx = cvs.getContext('2d');
     // Background
-    ctx.fillStyle = 'rgba(10, 10, 18, 0.92)';
+    ctx.fillStyle = 'rgba(10, 10, 18, 0.95)';
     ctx.fillRect(0, 0, 512, 400);
     ctx.strokeStyle = '#dc2626';
     ctx.lineWidth = 2;
     ctx.strokeRect(2, 2, 508, 396);
 
+    // Draw info lines at top
     let y = 30;
     lines.forEach(l => {
+        if (l.isButton) return; // draw button separately at bottom
         if (!l.text) { y += l.size || 10; return; }
         ctx.font = (l.bold ? 'bold ' : '') + l.size + 'px Inter, sans-serif';
         ctx.fillStyle = l.color || '#ffffff';
         ctx.fillText(l.text, 20, y + l.size);
         y += l.size + 8;
     });
+
+    // Draw button as a clear red bar at the very bottom
+    const btnLine = lines.find(l => l.isButton);
+    if (btnLine) {
+        ctx.fillStyle = 'rgba(220, 38, 38, 0.3)';
+        ctx.fillRect(10, 340, 492, 50);
+        ctx.strokeStyle = '#dc2626';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(10, 340, 492, 50);
+        ctx.font = 'bold 22px Inter, sans-serif';
+        ctx.fillStyle = '#dc2626';
+        ctx.textAlign = 'center';
+        ctx.fillText(btnLine.text, 256, 372);
+        ctx.textAlign = 'left';
+    }
 
     const tex = new THREE.CanvasTexture(cvs);
     tex.minFilter = THREE.LinearFilter;
@@ -27452,7 +27469,7 @@ function topoUpdateVRPanel() {
     // Position floating in front of the rack, facing the user at +Z
     const rackPos = rack.position.clone();
     // Panel between user (at -Z) and rack (at Z~0), rotated to face user
-    panel.position.set(rackPos.x, 3.5, rackPos.z - 2.5);
+    panel.position.set(rackPos.x, 2.5, rackPos.z - 2.5);
     panel.rotation.y = Math.PI; // face toward -Z (user with dolly rotated PI)
 
     // Store button info for VR trigger detection
@@ -27745,20 +27762,33 @@ function topoOpenVRTerminal(nodeId, runtime, containerName) {
     group.add(kbGroup);
 
     // ── WebSocket connection ──
+    // Show URL on the terminal so we can debug in VR
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    let wsUrl;
+    let wsPath;
     const type = runtime || 'host';
     if (node && !node.is_self) {
-        wsUrl = protocol + '//' + window.location.host + '/ws/remote-console/' + encodeURIComponent(nodeId) + '/' + type + '/' + encodeURIComponent(name);
+        wsPath = '/ws/remote-console/' + encodeURIComponent(nodeId) + '/' + type + '/' + encodeURIComponent(name);
     } else {
-        wsUrl = protocol + '//' + window.location.host + '/ws/console/' + type + '/' + encodeURIComponent(name);
+        wsPath = '/ws/console/' + type + '/' + encodeURIComponent(name);
     }
+    const wsUrl = protocol + '//' + window.location.host + wsPath;
+    term.writeln('\x1b[33mConnecting: ' + wsUrl + '\x1b[0m');
 
-    const ws = new WebSocket(wsUrl);
+    let ws;
+    try {
+        ws = new WebSocket(wsUrl);
+    } catch(e) {
+        term.writeln('\r\n\x1b[31mWebSocket creation failed: ' + e.message + '\x1b[0m');
+        term.writeln('\x1b[31mThis may be a port restriction in VR browsers.\x1b[0m');
+        term.writeln('\x1b[33mTry using a real TLS cert (Let\'s Encrypt) on port 443.\x1b[0m');
+        _vrTerm.ws = null;
+        _topo.scene.add(group);
+        _vrTerm = { group, term, ws: null, screenTex, termContainer, keyMeshes, closeBtn, shift: false, caps: false, mirrorCvs, mirrorCtx };
+        return;
+    }
     ws.binaryType = 'arraybuffer';
     ws.onopen = () => {
-        term.writeln('\x1b[32mConnected to ' + name + '\x1b[0m\r\n');
-        // Send terminal size
+        term.writeln('\x1b[32mConnected!\x1b[0m\r\n');
         const msg = JSON.stringify({ type: 'resize', cols: 100, rows: 30 });
         ws.send(msg);
     };
@@ -27766,8 +27796,16 @@ function topoOpenVRTerminal(nodeId, runtime, containerName) {
         if (typeof e.data === 'string') term.write(e.data);
         else term.write(new Uint8Array(e.data));
     };
-    ws.onclose = () => { term.writeln('\r\n\x1b[31mDisconnected\x1b[0m'); };
-    ws.onerror = () => { term.writeln('\r\n\x1b[31mConnection error\x1b[0m'); };
+    ws.onclose = (e) => {
+        term.writeln('\r\n\x1b[31mConnection closed (code: ' + e.code + ')\x1b[0m');
+        if (e.code === 1006) {
+            term.writeln('\x1b[33mCode 1006 = connection failed. Possible causes:\x1b[0m');
+            term.writeln('\x1b[33m- Self-signed TLS certificate rejected by VR browser\x1b[0m');
+            term.writeln('\x1b[33m- Port ' + window.location.port + ' blocked for WebSocket in VR\x1b[0m');
+            term.writeln('\x1b[33mFix: use a real cert (wolfstack --tls-domain your.domain)\x1b[0m');
+        }
+    };
+    ws.onerror = () => { term.writeln('\r\n\x1b[31mWebSocket error\x1b[0m'); };
     term.onData(data => { if (ws.readyState === WebSocket.OPEN) ws.send(data); });
 
     _topo.scene.add(group);
