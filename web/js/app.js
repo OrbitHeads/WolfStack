@@ -26722,22 +26722,29 @@ function buildServerRack(node, color) {
                 uMem = cData.mem;
                 uDisk = cData.disk;
             }
+            // Containers share host filesystem — fall back to host disk if no per-container disk
+            if ((uDisk === undefined || !isFinite(uDisk)) && node.metrics?.cpu_usage_percent !== undefined) {
+                uDisk = disk;
+            }
         }
 
-        // Only render individual LEDs that have real numeric data
+        // 3 LEDs: CPU, RAM, STORAGE — traffic light colors only (green/amber/red)
+        // All three always render if the node is online and has metrics
         if (node.online) {
-            const ledDefs = [
-                { dx: 0.08, val: uCpu, okCol: 0x22c55e, warnCol: 0xf59e0b, critCol: 0xef4444, warnAt: 50, critAt: 80 },
-                { dx: 0.19, val: uMem, okCol: 0x3b82f6, warnCol: 0xf59e0b, critCol: 0xef4444, warnAt: 70, critAt: 90 },
-                { dx: 0.30, val: uDisk, okCol: 0x8b5cf6, warnCol: 0xf59e0b, critCol: 0xef4444, warnAt: 70, critAt: 90 },
-            ];
-            ledDefs.forEach(ld => {
-                if (ld.val === undefined || !isFinite(ld.val)) return; // skip — no data
-                const col = ld.val > ld.critAt ? ld.critCol : ld.val > ld.warnAt ? ld.warnCol : ld.okCol;
-                const led = new THREE.Mesh(ledGeo2, new THREE.MeshBasicMaterial({ color: col }));
-                led.position.set(-panelW/2 + ld.dx, ledY, ledZ);
-                group.add(led);
-            });
+            const trafficLight = (val, warnAt, critAt) => {
+                if (val === undefined || !isFinite(val)) return null; // no data
+                return val > critAt ? 0xef4444 : val > warnAt ? 0xf59e0b : 0x22c55e;
+            };
+            const cpuLed = trafficLight(uCpu, 50, 80);
+            const memLed = trafficLight(uMem, 70, 90);
+            const dskLed = trafficLight(uDisk, 70, 90);
+
+            // Track if any metric is critical (for ! warning above rack)
+            if (uCpu > 80 || uMem > 90 || uDisk > 90) group.userData._hasCritical = true;
+
+            if (cpuLed !== null) { const l = new THREE.Mesh(ledGeo2, new THREE.MeshBasicMaterial({ color: cpuLed })); l.position.set(-panelW/2 + 0.08, ledY, ledZ); group.add(l); }
+            if (memLed !== null) { const l = new THREE.Mesh(ledGeo2, new THREE.MeshBasicMaterial({ color: memLed })); l.position.set(-panelW/2 + 0.19, ledY, ledZ); group.add(l); }
+            if (dskLed !== null) { const l = new THREE.Mesh(ledGeo2, new THREE.MeshBasicMaterial({ color: dskLed })); l.position.set(-panelW/2 + 0.30, ledY, ledZ); group.add(l); }
         } else {
             // Offline: single dim red LED
             const led = new THREE.Mesh(ledGeo2, new THREE.MeshBasicMaterial({ color: 0x662222 }));
@@ -26843,6 +26850,20 @@ function buildTopologyScene() {
             rack.position.set(x, 0, 0);
             scene.add(rack);
             _topo.nodeMeshes.push(rack);
+
+            // Critical warning ! above rack if any metric is critical
+            if (rack.userData._hasCritical) {
+                const warn = makeTextSprite('!', { fontSize: 48, color: '#ef4444', scale: 0.6 });
+                warn.position.set(x, 6.8, 0);
+                warn.userData = { isLabel: true, isWarning: true };
+                scene.add(warn);
+                _topo.labelSprites.push(warn);
+                // Red glow above rack
+                const warnLight = new THREE.PointLight(0xef4444, 0.5, 8);
+                warnLight.position.set(x, 6.5, -0.5);
+                scene.add(warnLight);
+                _topo.extraMeshes.push(warnLight);
+            }
 
             // Server name on the side of the rack — rotated 90 degrees, small white text
             const nameLabel = makeTextSprite(node.hostname || node.id, {
@@ -27011,9 +27032,17 @@ function topoRenderFrame(timestamp, xrFrame) {
 
     // Labels face camera (except side labels which stay rotated)
     _topo.labelSprites.forEach(s => {
-        s.visible = _topo.showLabels;
-        if (s.visible && !s.userData.isSideLabel) {
+        if (s.userData.isWarning) {
+            // Warning ! always visible, pulses, faces camera
+            s.visible = true;
             s.lookAt(_topo.camera.getWorldPosition(new THREE.Vector3()));
+            const pulse = 0.7 + 0.3 * Math.sin(time * 4);
+            s.material.opacity = pulse;
+        } else {
+            s.visible = _topo.showLabels;
+            if (s.visible && !s.userData.isSideLabel) {
+                s.lookAt(_topo.camera.getWorldPosition(new THREE.Vector3()));
+            }
         }
     });
 
