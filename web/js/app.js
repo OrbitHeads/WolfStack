@@ -977,7 +977,7 @@ function selectView(page) {
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     document.querySelector(`.nav-item[data-page="${page}"]`)?.classList.add('active');
 
-    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube' };
+    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Topology' };
     document.getElementById('page-title').textContent = titles[page] || page;
 
     if (page === 'datacenter') {
@@ -1003,6 +1003,8 @@ function selectView(page) {
         checkIssuesAiBadge();
         checkBetaAccess();
         loadIssueSchedule();
+    } else if (page === 'topology') {
+        initTopology3D();
     }
 }
 
@@ -2727,6 +2729,9 @@ async function fetchNodes() {
             const node = nodes.find(n => n.id === currentNodeId);
             if (node?.metrics) updateDashboard(node.metrics);
         }
+
+        // Update 3D topology if viewing
+        if (typeof topologyCheckUpdate === 'function') topologyCheckUpdate();
     } catch (e) {
         console.error('Failed to fetch nodes:', e);
         // If we're on HTTPS and getting NetworkErrors, the TLS certificate likely
@@ -26373,4 +26378,491 @@ async function k8sSaveSettings() {
         if (idx >= 0 && data.cluster) k8sClusters[idx] = data.cluster;
         showToast('Settings saved', 'success');
     } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 3D Topology View — Three.js cluster visualization
+// ═══════════════════════════════════════════════════════════════════════
+
+let _topo = null; // Topology state
+
+function initTopology3D() {
+    if (typeof THREE === 'undefined') {
+        document.getElementById('topology-container').innerHTML =
+            '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:rgba(255,255,255,0.5);font-size:14px;">Three.js is loading...</div>';
+        setTimeout(initTopology3D, 500);
+        return;
+    }
+
+    const container = document.getElementById('topology-container');
+    const canvas = document.getElementById('topology-canvas');
+    if (!canvas || !container) return;
+
+    // Tear down previous scene
+    if (_topo) {
+        _topo.disposed = true;
+        if (_topo.animId) cancelAnimationFrame(_topo.animId);
+        _topo.renderer.dispose();
+        container.removeEventListener('mousemove', _topo.onMouseMove);
+        container.removeEventListener('click', _topo.onClick);
+        window.removeEventListener('resize', _topo.onResize);
+    }
+
+    const W = container.clientWidth;
+    const H = container.clientHeight;
+
+    // Scene
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a12);
+    scene.fog = new THREE.FogExp2(0x0a0a12, 0.012);
+
+    // Camera
+    const camera = new THREE.PerspectiveCamera(60, W / H, 0.1, 500);
+    camera.position.set(0, 25, 40);
+    camera.lookAt(0, 0, 0);
+
+    // Renderer
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
+    renderer.setSize(W, H);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+    // Lighting
+    const ambient = new THREE.AmbientLight(0x404060, 1.2);
+    scene.add(ambient);
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(20, 30, 20);
+    scene.add(dirLight);
+    const pointLight = new THREE.PointLight(0xdc2626, 0.6, 80);
+    pointLight.position.set(0, 15, 0);
+    scene.add(pointLight);
+
+    // Grid
+    const gridHelper = new THREE.GridHelper(80, 40, 0x1a1a2e, 0x111122);
+    gridHelper.position.y = -0.5;
+    scene.add(gridHelper);
+
+    // State
+    const state = {
+        scene, camera, renderer, canvas, container,
+        nodeMeshes: [], connectionLines: [], labelSprites: [],
+        showLabels: true, autoRotate: true, disposed: false,
+        animId: null, clock: new THREE.Clock(),
+        raycaster: new THREE.Raycaster(), mouse: new THREE.Vector2(),
+        hoveredNode: null, selectedNode: null,
+        // Orbit control state (manual implementation — no import needed)
+        isDragging: false, prevMouse: { x: 0, y: 0 },
+        spherical: { radius: 45, theta: Math.PI / 4, phi: Math.PI / 3 },
+        target: new THREE.Vector3(0, 2, 0),
+    };
+
+    // Camera from spherical
+    function updateCameraFromSpherical() {
+        const s = state.spherical;
+        s.phi = Math.max(0.1, Math.min(Math.PI - 0.1, s.phi));
+        s.radius = Math.max(10, Math.min(120, s.radius));
+        camera.position.set(
+            s.radius * Math.sin(s.phi) * Math.sin(s.theta) + state.target.x,
+            s.radius * Math.cos(s.phi) + state.target.y,
+            s.radius * Math.sin(s.phi) * Math.cos(s.theta) + state.target.z
+        );
+        camera.lookAt(state.target);
+    }
+    updateCameraFromSpherical();
+
+    // Mouse controls
+    container.addEventListener('mousedown', (e) => {
+        state.isDragging = true;
+        state.prevMouse = { x: e.clientX, y: e.clientY };
+    });
+    container.addEventListener('mouseup', () => { state.isDragging = false; });
+    container.addEventListener('mouseleave', () => { state.isDragging = false; });
+    container.addEventListener('mousemove', (e) => {
+        const rect = container.getBoundingClientRect();
+        state.mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        state.mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+        if (state.isDragging) {
+            const dx = e.clientX - state.prevMouse.x;
+            const dy = e.clientY - state.prevMouse.y;
+            state.spherical.theta -= dx * 0.005;
+            state.spherical.phi += dy * 0.005;
+            updateCameraFromSpherical();
+            state.prevMouse = { x: e.clientX, y: e.clientY };
+            state.autoRotate = false;
+        }
+    });
+    state.onMouseMove = () => {}; // placeholder for cleanup
+    container.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        state.spherical.radius += e.deltaY * 0.05;
+        updateCameraFromSpherical();
+    }, { passive: false });
+
+    // Click handler
+    state.onClick = (e) => {
+        const rect = container.getBoundingClientRect();
+        state.mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        state.mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+        state.raycaster.setFromCamera(state.mouse, camera);
+        const hits = state.raycaster.intersectObjects(state.nodeMeshes);
+        if (hits.length > 0) {
+            const nodeData = hits[0].object.userData;
+            if (nodeData && nodeData.id) {
+                selectServerView(nodeData.id, 'dashboard');
+            }
+        }
+    };
+    container.addEventListener('click', state.onClick);
+
+    // Resize
+    state.onResize = () => {
+        if (state.disposed) return;
+        const w = container.clientWidth;
+        const h = container.clientHeight;
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+        renderer.setSize(w, h);
+    };
+    window.addEventListener('resize', state.onResize);
+
+    _topo = state;
+    buildTopologyScene();
+    animateTopology();
+}
+
+function buildTopologyScene() {
+    if (!_topo) return;
+    const { scene } = _topo;
+    const nodes = allNodes || [];
+
+    // Clear existing node meshes, connections, labels
+    _topo.nodeMeshes.forEach(m => scene.remove(m));
+    _topo.connectionLines.forEach(l => scene.remove(l));
+    _topo.labelSprites.forEach(s => scene.remove(s));
+    _topo.nodeMeshes = [];
+    _topo.connectionLines = [];
+    _topo.labelSprites = [];
+
+    if (nodes.length === 0) return;
+
+    // Group nodes by cluster
+    const clusters = {};
+    nodes.forEach(n => {
+        const cName = n.cluster_name || n.pve_cluster_name || 'Default';
+        if (!clusters[cName]) clusters[cName] = [];
+        clusters[cName].push(n);
+    });
+
+    const clusterNames = Object.keys(clusters);
+    const clusterColors = [0xdc2626, 0x3b82f6, 0x10b981, 0xf59e0b, 0x8b5cf6, 0xec4899, 0x06b6d4, 0xf97316];
+    const clusterPositions = {};
+
+    // Layout clusters in a circle
+    clusterNames.forEach((cName, ci) => {
+        const angle = (ci / clusterNames.length) * Math.PI * 2;
+        const clusterRadius = clusterNames.length > 1 ? 18 : 0;
+        const cx = Math.cos(angle) * clusterRadius;
+        const cz = Math.sin(angle) * clusterRadius;
+        clusterPositions[cName] = { x: cx, z: cz };
+        const color = clusterColors[ci % clusterColors.length];
+        const clusterNodes = clusters[cName];
+
+        // Layout nodes in a smaller circle within the cluster
+        clusterNodes.forEach((node, ni) => {
+            const nAngle = (ni / clusterNodes.length) * Math.PI * 2 - Math.PI / 2;
+            const nRadius = Math.max(3, clusterNodes.length * 1.5);
+            const nx = cx + Math.cos(nAngle) * nRadius;
+            const nz = cz + Math.sin(nAngle) * nRadius;
+
+            // Node box
+            const size = node.is_self ? 2.2 : 1.8;
+            const geometry = new THREE.BoxGeometry(size, size * 0.6, size);
+            const meshColor = node.online ? color : 0x444455;
+            const material = new THREE.MeshPhongMaterial({
+                color: meshColor,
+                emissive: node.online ? new THREE.Color(color).multiplyScalar(0.15) : new THREE.Color(0x111111),
+                shininess: 60,
+                transparent: !node.online,
+                opacity: node.online ? 1.0 : 0.5,
+            });
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.position.set(nx, size * 0.3, nz);
+            mesh.userData = { id: node.id, hostname: node.hostname, cluster: cName, online: node.online, node };
+            mesh.castShadow = true;
+            scene.add(mesh);
+            _topo.nodeMeshes.push(mesh);
+
+            // Status light on top
+            const lightGeo = new THREE.SphereGeometry(0.18, 12, 12);
+            const lightMat = new THREE.MeshBasicMaterial({
+                color: node.online ? 0x22c55e : 0xef4444,
+            });
+            const lightMesh = new THREE.Mesh(lightGeo, lightMat);
+            lightMesh.position.set(nx, size * 0.6 + 0.3, nz);
+            scene.add(lightMesh);
+            _topo.nodeMeshes.push(lightMesh); // track for cleanup
+
+            // Container count indicators (small spheres around node)
+            const totalContainers = (node.docker_count || 0) + (node.lxc_count || 0) + (node.vm_count || 0);
+            for (let ci = 0; ci < Math.min(totalContainers, 12); ci++) {
+                const cAngle = (ci / Math.min(totalContainers, 12)) * Math.PI * 2;
+                const cGeo = new THREE.SphereGeometry(0.12, 8, 8);
+                const cColor = ci < (node.docker_count || 0) ? 0x3b82f6 :
+                    ci < (node.docker_count || 0) + (node.lxc_count || 0) ? 0x10b981 : 0xf59e0b;
+                const cMat = new THREE.MeshBasicMaterial({ color: cColor });
+                const cMesh = new THREE.Mesh(cGeo, cMat);
+                cMesh.position.set(
+                    nx + Math.cos(cAngle) * (size * 0.6 + 0.3),
+                    0.3,
+                    nz + Math.sin(cAngle) * (size * 0.6 + 0.3)
+                );
+                cMesh.userData = { isContainer: true, parentId: node.id };
+                scene.add(cMesh);
+                _topo.nodeMeshes.push(cMesh);
+            }
+
+            // Label sprite
+            const label = makeTextSprite(node.hostname || node.id, { fontSize: 28, color: node.online ? '#ffffff' : '#666677' });
+            label.position.set(nx, size * 0.6 + 0.9, nz);
+            label.userData = { isLabel: true };
+            scene.add(label);
+            _topo.labelSprites.push(label);
+        });
+
+        // Connections within cluster (mesh lines)
+        for (let i = 0; i < clusterNodes.length; i++) {
+            for (let j = i + 1; j < clusterNodes.length; j++) {
+                if (!clusterNodes[i].online || !clusterNodes[j].online) continue;
+                const mi = _topo.nodeMeshes.find(m => m.userData.id === clusterNodes[i].id);
+                const mj = _topo.nodeMeshes.find(m => m.userData.id === clusterNodes[j].id);
+                if (!mi || !mj) continue;
+
+                const points = [mi.position.clone(), mj.position.clone()];
+                points[0].y = 0.1;
+                points[1].y = 0.1;
+                const lineGeo = new THREE.BufferGeometry().setFromPoints(points);
+                const lineMat = new THREE.LineBasicMaterial({
+                    color: color, transparent: true, opacity: 0.25,
+                });
+                const line = new THREE.Line(lineGeo, lineMat);
+                scene.add(line);
+                _topo.connectionLines.push(line);
+            }
+        }
+
+        // Cluster ring on ground
+        if (clusterNodes.length > 1) {
+            const ringRadius = Math.max(3, clusterNodes.length * 1.5) + 1.5;
+            const ringGeo = new THREE.RingGeometry(ringRadius - 0.05, ringRadius + 0.05, 64);
+            const ringMat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.15, side: THREE.DoubleSide });
+            const ring = new THREE.Mesh(ringGeo, ringMat);
+            ring.rotation.x = -Math.PI / 2;
+            ring.position.set(cx, 0.01, cz);
+            scene.add(ring);
+            _topo.connectionLines.push(ring);
+        }
+
+        // Cluster label
+        if (clusterNames.length > 1) {
+            const clabel = makeTextSprite(cName, { fontSize: 22, color: '#' + color.toString(16).padStart(6, '0') });
+            const labelY = 4.5;
+            clabel.position.set(cx, labelY, cz);
+            clabel.userData = { isLabel: true };
+            scene.add(clabel);
+            _topo.labelSprites.push(clabel);
+        }
+    });
+
+    // Cross-cluster connections (if multiple clusters with online nodes)
+    if (clusterNames.length > 1) {
+        for (let i = 0; i < clusterNames.length; i++) {
+            for (let j = i + 1; j < clusterNames.length; j++) {
+                const posA = clusterPositions[clusterNames[i]];
+                const posB = clusterPositions[clusterNames[j]];
+                const midY = 3;
+                const curve = new THREE.QuadraticBezierCurve3(
+                    new THREE.Vector3(posA.x, 0.5, posA.z),
+                    new THREE.Vector3((posA.x + posB.x) / 2, midY, (posA.z + posB.z) / 2),
+                    new THREE.Vector3(posB.x, 0.5, posB.z)
+                );
+                const curvePoints = curve.getPoints(30);
+                const curveGeo = new THREE.BufferGeometry().setFromPoints(curvePoints);
+                const curveMat = new THREE.LineDashedMaterial({
+                    color: 0xdc2626, transparent: true, opacity: 0.3,
+                    dashSize: 0.5, gapSize: 0.3,
+                });
+                const curveLine = new THREE.Line(curveGeo, curveMat);
+                curveLine.computeLineDistances();
+                scene.add(curveLine);
+                _topo.connectionLines.push(curveLine);
+            }
+        }
+    }
+
+    // Update HUD stats
+    const onlineCount = nodes.filter(n => n.online).length;
+    const totalDocker = nodes.reduce((s, n) => s + (n.docker_count || 0), 0);
+    const totalLxc = nodes.reduce((s, n) => s + (n.lxc_count || 0), 0);
+    const totalVm = nodes.reduce((s, n) => s + (n.vm_count || 0), 0);
+    const statsEl = document.getElementById('topology-stats');
+    if (statsEl) {
+        statsEl.innerHTML = `
+            <div><span style="color:#22c55e;">&#9679;</span> ${onlineCount} online / ${nodes.length} nodes</div>
+            <div><span style="color:#3b82f6;">&#9679;</span> ${totalDocker} Docker containers</div>
+            <div><span style="color:#10b981;">&#9679;</span> ${totalLxc} LXC containers</div>
+            <div><span style="color:#f59e0b;">&#9679;</span> ${totalVm} VMs</div>
+            <div style="margin-top:6px;color:rgba(255,255,255,0.4);font-size:10px;">Drag to orbit &bull; Scroll to zoom &bull; Click node to open</div>
+        `;
+    }
+}
+
+function animateTopology() {
+    if (!_topo || _topo.disposed) return;
+    _topo.animId = requestAnimationFrame(animateTopology);
+
+    const time = _topo.clock.getElapsedTime();
+
+    // Auto rotate
+    if (_topo.autoRotate && !_topo.isDragging) {
+        _topo.spherical.theta += 0.002;
+        const s = _topo.spherical;
+        _topo.camera.position.set(
+            s.radius * Math.sin(s.phi) * Math.sin(s.theta) + _topo.target.x,
+            s.radius * Math.cos(s.phi) + _topo.target.y,
+            s.radius * Math.sin(s.phi) * Math.cos(s.theta) + _topo.target.z
+        );
+        _topo.camera.lookAt(_topo.target);
+    }
+
+    // Animate node meshes (gentle float)
+    _topo.nodeMeshes.forEach(m => {
+        if (m.userData.id && !m.userData.isContainer) {
+            m.position.y = m.geometry?.parameters?.height * 0.3 + Math.sin(time * 1.2 + m.position.x) * 0.15;
+        }
+        // Orbit container indicators
+        if (m.userData.isContainer) {
+            const parent = _topo.nodeMeshes.find(p => p.userData.id === m.userData.parentId && !p.userData.isContainer);
+            if (parent) {
+                const idx = _topo.nodeMeshes.filter(c => c.userData.isContainer && c.userData.parentId === m.userData.parentId).indexOf(m);
+                const total = _topo.nodeMeshes.filter(c => c.userData.isContainer && c.userData.parentId === m.userData.parentId).length;
+                const a = (idx / total) * Math.PI * 2 + time * 0.5;
+                const r = 1.5;
+                m.position.x = parent.position.x + Math.cos(a) * r;
+                m.position.z = parent.position.z + Math.sin(a) * r;
+                m.position.y = 0.3 + Math.sin(time * 2 + idx) * 0.08;
+            }
+        }
+    });
+
+    // Raycast for hover
+    _topo.raycaster.setFromCamera(_topo.mouse, _topo.camera);
+    const hits = _topo.raycaster.intersectObjects(_topo.nodeMeshes.filter(m => m.userData.id && !m.userData.isContainer));
+    const tooltip = document.getElementById('topology-tooltip');
+    if (hits.length > 0) {
+        const nd = hits[0].object.userData;
+        if (nd.node) {
+            const n = nd.node;
+            const cpu = n.metrics?.cpu_percent?.toFixed(0) || '?';
+            const mem = n.metrics?.memory_percent?.toFixed(0) || '?';
+            tooltip.innerHTML = `
+                <div style="font-weight:700;font-size:13px;margin-bottom:6px;">${escapeHtml(n.hostname || n.id)}</div>
+                <div style="color:rgba(255,255,255,0.6);line-height:1.7;">
+                    <div>${n.online ? '<span style="color:#22c55e;">&#9679;</span> Online' : '<span style="color:#ef4444;">&#9679;</span> Offline'} &bull; ${escapeHtml(n.address)}</div>
+                    <div>CPU: ${cpu}% &bull; Memory: ${mem}%</div>
+                    <div>${n.docker_count || 0} Docker &bull; ${n.lxc_count || 0} LXC &bull; ${n.vm_count || 0} VMs</div>
+                    ${nd.cluster ? '<div style="margin-top:4px;color:rgba(255,255,255,0.4);">Cluster: ' + escapeHtml(nd.cluster) + '</div>' : ''}
+                </div>
+            `;
+            tooltip.style.display = 'block';
+            // Position near cursor
+            const rect = _topo.container.getBoundingClientRect();
+            const mx = ((_topo.mouse.x + 1) / 2) * rect.width;
+            const my = ((-_topo.mouse.y + 1) / 2) * rect.height;
+            tooltip.style.left = (mx + 16) + 'px';
+            tooltip.style.top = (my - 10) + 'px';
+        }
+        _topo.container.style.cursor = 'pointer';
+    } else {
+        tooltip.style.display = 'none';
+        _topo.container.style.cursor = _topo.isDragging ? 'grabbing' : 'grab';
+    }
+
+    // Make labels face camera
+    _topo.labelSprites.forEach(s => {
+        if (_topo.showLabels) {
+            s.visible = true;
+            s.lookAt(_topo.camera.position);
+        } else {
+            s.visible = false;
+        }
+    });
+
+    _topo.renderer.render(_topo.scene, _topo.camera);
+}
+
+function makeTextSprite(text, opts = {}) {
+    const fontSize = opts.fontSize || 24;
+    const color = opts.color || '#ffffff';
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    const font = `${fontSize}px Inter, sans-serif`;
+    ctx.font = font;
+    const textWidth = ctx.measureText(text).width;
+    canvas.width = textWidth + 20;
+    canvas.height = fontSize + 16;
+    ctx.font = font;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    // Background pill
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    const rx = canvas.width / 2, ry = canvas.height / 2;
+    ctx.beginPath();
+    ctx.roundRect(0, 0, canvas.width, canvas.height, canvas.height / 2);
+    ctx.fill();
+    // Text
+    ctx.fillStyle = color;
+    ctx.fillText(text, rx, ry);
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.minFilter = THREE.LinearFilter;
+    const spriteMat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
+    const sprite = new THREE.Sprite(spriteMat);
+    const aspect = canvas.width / canvas.height;
+    sprite.scale.set(aspect * 1.5, 1.5, 1);
+    return sprite;
+}
+
+function topologyResetCamera() {
+    if (!_topo) return;
+    _topo.spherical = { radius: 45, theta: Math.PI / 4, phi: Math.PI / 3 };
+    _topo.target.set(0, 2, 0);
+    _topo.autoRotate = true;
+    const s = _topo.spherical;
+    _topo.camera.position.set(
+        s.radius * Math.sin(s.phi) * Math.sin(s.theta),
+        s.radius * Math.cos(s.phi) + 2,
+        s.radius * Math.sin(s.phi) * Math.cos(s.theta)
+    );
+    _topo.camera.lookAt(_topo.target);
+}
+
+function topologyToggleLabels() {
+    if (!_topo) return;
+    _topo.showLabels = !_topo.showLabels;
+}
+
+function topologyToggleAutoRotate() {
+    if (!_topo) return;
+    _topo.autoRotate = !_topo.autoRotate;
+}
+
+// Rebuild scene when node data changes (called from fetchNodes polling)
+var _topoPrevNodeHash = '';
+function topologyCheckUpdate() {
+    if (!_topo || _topo.disposed || currentPage !== 'topology') return;
+    const hash = (allNodes || []).map(n => n.id + n.online + (n.docker_count||0) + (n.lxc_count||0) + (n.vm_count||0)).join('|');
+    if (hash !== _topoPrevNodeHash) {
+        _topoPrevNodeHash = hash;
+        buildTopologyScene();
+    }
 }
