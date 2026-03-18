@@ -144,6 +144,7 @@
         document.title = `${vmName} — VM Console`;
 
         let rfb = null;
+        window.rfb = null; // expose for VR terminal access
 
         if (wsPath) {
             // WolfStack-proxied VNC (Proxmox VMs via WS bridge)
@@ -170,12 +171,14 @@
                     opts.credentials = { password: ticket };
                 }
                 rfb = new RFB(container, wsUrl, opts);
+                window.rfb = rfb;
 
                 rfb.addEventListener('connect', () => {
                     document.getElementById('status-badge').textContent = 'Connected';
                     document.getElementById('status-badge').className = 'badge';
                     const overlay = document.getElementById('status-overlay');
                     if (overlay) overlay.remove();
+                    window._vncConnected = true;
                 });
 
                 rfb.addEventListener('disconnect', (e) => {
@@ -262,12 +265,14 @@
                     resizeSession: true,
                     clipViewport: true,
                 });
+                window.rfb = rfb;
 
                 rfb.addEventListener('connect', () => {
                     document.getElementById('status-badge').textContent = 'Connected';
                     document.getElementById('status-badge').className = 'badge';
                     const overlay = document.getElementById('status-overlay');
                     if (overlay) overlay.remove();
+                    window._vncConnected = true;
                 });
 
                 rfb.addEventListener('disconnect', (e) => {

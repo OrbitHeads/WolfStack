@@ -26513,6 +26513,144 @@ function initTopology3D() {
     vrDolly.add(camera);
     scene.add(vrDolly);
 
+    // VR controllers with laser pointer
+    const vrController0 = renderer.xr.getController(0);
+    const vrController1 = renderer.xr.getController(1);
+    vrDolly.add(vrController0);
+    vrDolly.add(vrController1);
+    // Laser line on each controller
+    const laserGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -10)]);
+    const laserMat = new THREE.LineBasicMaterial({ color: 0xdc2626, transparent: true, opacity: 0.6 });
+    const laser0 = new THREE.Line(laserGeo, laserMat); vrController0.add(laser0);
+    const laser1 = new THREE.Line(laserGeo.clone(), laserMat.clone()); vrController1.add(laser1);
+    // VR select on trigger
+    [vrController0, vrController1].forEach(ctrl => {
+        ctrl.addEventListener('selectstart', () => {
+            if (!_topo || !_topo.renderer.xr.isPresenting) return;
+            const tempMatrix = new THREE.Matrix4();
+            tempMatrix.identity().extractRotation(ctrl.matrixWorld);
+            const ray = new THREE.Raycaster();
+            ray.ray.origin.setFromMatrixPosition(ctrl.matrixWorld);
+            ray.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
+
+            // Check VR terminal keyboard/close button first
+            if (_vrTerm) {
+                const allVRTermObjects = [..._vrTerm.keyMeshes];
+                // Also check close button
+                _vrTerm.group.traverse(child => { if (child.userData.isVRTermClose) allVRTermObjects.push(child); });
+                const termHits = ray.intersectObjects(allVRTermObjects, true);
+                if (termHits.length > 0) {
+                    const hit = termHits[0].object;
+                    if (hit.userData.isVRTermClose) {
+                        topoCloseVRTerminal();
+                    } else if (hit.userData.isVRKey) {
+                        // Flash key
+                        hit.material.color.setHex(0xdc2626);
+                        setTimeout(() => { hit.material.color.setHex(hit.userData.originalColor || 0x222230); }, 150);
+                        // Route to VNC or terminal handler
+                        if (_vrTerm?.isVnc) vrVncHandleKey(hit.userData.key);
+                        else vrTermHandleKey(hit.userData.key);
+                    }
+                    return;
+                }
+            }
+
+            // Check if pointing at the VR panel first (Terminal / Dashboard buttons)
+            if (_topo._vrPanel) {
+                const panelHits = ray.intersectObject(_topo._vrPanel);
+                if (panelHits.length > 0) {
+                    const uv = panelHits[0].uv;
+                    if (uv && uv.y < 0.15) { // bottom area = buttons
+                        const pd = _topo._vrPanel.userData;
+                        if (uv.x < 0.5) {
+                            // Terminal/Console button (left half)
+                            const info = pd.unitIndex > 0 ? topoGetUnitInfo(pd.nodeId, pd.unitIndex) : null;
+                            if (info && info.runtime === 'vm') {
+                                // VMs need VNC — open in-scene
+                                const node = allNodes.find(n => n.id === pd.nodeId);
+                                if (node?.node_type === 'proxmox') {
+                                    fetch(`/api/nodes/${pd.nodeId}/pve/resources`).then(r => r.json()).then(guests => {
+                                        const g = (Array.isArray(guests) ? guests : []).find(g => g.name === info.name);
+                                        if (g) topoOpenVRVnc(pd.nodeId, g.vmid, info.name);
+                                    }).catch(() => {});
+                                } else {
+                                    topoOpenVRTerminal(pd.nodeId, 'host', null);
+                                }
+                            } else if (info) {
+                                topoOpenVRTerminal(pd.nodeId, info.runtime, info.name);
+                            } else {
+                                topoOpenVRTerminal(pd.nodeId, 'host', null);
+                            }
+                        } else {
+                            // Dashboard button (right half)
+                            topoOpenDashboard(pd.nodeId);
+                        }
+                    }
+                    return;
+                }
+            }
+
+            // Check racks — if pointing at a specific server unit, open terminal directly
+            const rackMeshes = _topo.nodeMeshes.filter(m => m.userData.isRack);
+            const hits = ray.intersectObjects(rackMeshes, true);
+            if (hits.length > 0) {
+                const hitObj = hits[0].object;
+                let rack = hitObj;
+                while (rack && !rack.userData.isRack && rack.parent) rack = rack.parent;
+                if (rack?.userData?.id) {
+                    const nodeId = rack.userData.id;
+                    const unitData = hitObj.userData;
+
+                    if (unitData.isUnit) {
+                        // Pointed at a specific server unit — open terminal/VNC for it
+                        _topo.selectedRackId = nodeId;
+                        _topo.selectedUnitIndex = unitData.unitIndex;
+                        topoUpdateTooltip();
+                        topoFetchContainers(nodeId).then(() => {
+                            const info = topoGetUnitInfo(nodeId, unitData.unitIndex);
+                            if (info && info.runtime === 'vm') {
+                                // VMs need VNC — open in-scene VNC console
+                                const node = allNodes.find(n => n.id === nodeId);
+                                if (node?.node_type === 'proxmox') {
+                                    // Find VMID from cache
+                                    const cc = _topoContainerCache[nodeId];
+                                    const vmIdx = unitData.unitIndex - 1 - (node.docker_count||0) - (node.lxc_count||0);
+                                    const vmData = cc?.vms?.[vmIdx];
+                                    const vmName = vmData?.name || info.name;
+                                    // Need VMID — search PVE resources
+                                    fetch(`/api/nodes/${nodeId}/pve/resources`).then(r => r.json()).then(guests => {
+                                        const g = (Array.isArray(guests) ? guests : []).find(g => g.name === vmName);
+                                        if (g) topoOpenVRVnc(nodeId, g.vmid, vmName);
+                                        else topoOpenVRTerminal(nodeId, 'host', null);
+                                    }).catch(() => topoOpenVRTerminal(nodeId, 'host', null));
+                                } else {
+                                    topoOpenVRTerminal(nodeId, 'host', null);
+                                }
+                            } else if (info) {
+                                topoOpenVRTerminal(nodeId, info.runtime, info.name);
+                            } else {
+                                topoOpenVRTerminal(nodeId, 'host', null);
+                            }
+                        });
+                    } else {
+                        // Pointed at rack frame — show info panel
+                        _topo.selectedRackId = nodeId;
+                        _topo.selectedUnitIndex = -1;
+                        topoFetchContainers(nodeId).then(() => topoUpdateTooltip());
+                        topoUpdateTooltip();
+                    }
+                }
+            } else {
+                // Pointed at nothing — deselect
+                _topo.selectedRackId = null;
+                _topo.selectedUnitIndex = -1;
+                topoUpdateVRPanel();
+                const tt = document.getElementById('topology-tooltip');
+                if (tt) tt.style.display = 'none';
+            }
+        });
+    });
+
     // State
     const state = {
         scene, camera, renderer, canvas, container, vrDolly,
@@ -26962,7 +27100,7 @@ function buildTopologyScene() {
         `<div><span style="color:#10b981;">&#9679;</span> ${lc} LXC</div>` +
         `<div><span style="color:#f59e0b;">&#9679;</span> ${vc} VMs</div>` +
         vrLine +
-        `<div style="margin-top:6px;color:rgba(255,255,255,0.4);font-size:10px;">Drag to orbit &bull; Scroll to zoom &bull; Click rack for stats &bull; Double-click to open</div>`;
+        `<div style="margin-top:6px;color:rgba(255,255,255,0.4);font-size:10px;">Drag to orbit &bull; WASD to walk &bull; Click rack for stats &bull; VR: trigger to select</div>`;
 
     // Lazy-fetch container names + stats for all nodes, rebuild when done
     if (!_topo._fetchingNames) {
@@ -27054,6 +27192,17 @@ function topoRenderFrame(timestamp, xrFrame) {
         // Cursor
         _topo.container.style.cursor = hits.length > 0 ? 'pointer' : (_topo.isDragging ? 'grabbing' : 'grab');
 
+        // Highlight selected rack with a glowing outline box (visible in VR too)
+        if (_topo._selectionBox) { _topo.scene.remove(_topo._selectionBox); _topo._selectionBox = null; }
+        if (_topo.selectedRackId) {
+            const selRack = _topo.nodeMeshes.find(m => m.userData.id === _topo.selectedRackId);
+            if (selRack) {
+                const box = new THREE.BoxHelper(selRack, 0xdc2626);
+                _topo.scene.add(box);
+                _topo._selectionBox = box;
+            }
+        }
+
         // Reposition tooltip (content is set in topoUpdateTooltip, not here)
         if (_topo.selectedRackId && tooltip && tooltip.style.display !== 'none') {
             const rack = _topo.nodeMeshes.find(m => m.userData.id === _topo.selectedRackId);
@@ -27084,6 +27233,9 @@ function topoRenderFrame(timestamp, xrFrame) {
         }
     });
 
+    // Update VR terminal screen texture
+    vrTermUpdate();
+
     _topo.renderer.render(_topo.scene, _topo.camera);
 }
 
@@ -27095,7 +27247,7 @@ function topologyEnterVR() {
         .then(session => {
             _topo.renderer.xr.setSession(session);
             // Position user in front of racks at standing height
-            _topo.vrDolly.position.set(0, 0, 8);
+            _topo.vrDolly.position.set(0, 0, -8);
             showToast('Entering VR — use thumbsticks to walk around your server room', 'success');
         })
         .catch(err => {
@@ -27147,7 +27299,7 @@ function makeTextSprite(text, opts = {}) {
 
 function topologyResetCamera() {
     if (!_topo) return;
-    _topo.spherical = { radius: 25, theta: Math.PI / 4, phi: Math.PI / 3.5 };
+    _topo.spherical = { radius: 25, theta: Math.PI, phi: Math.PI / 3 };
     _topo.autoRotate = true;
     if (_topo.vrDolly) _topo.vrDolly.position.set(0, 0, 0);
     const s = _topo.spherical;
@@ -27236,6 +27388,90 @@ function topoUpdateTooltip() {
         }
     }
     tooltip.style.display = 'block';
+    topoUpdateVRPanel();
+}
+
+// ─── VR 3D HUD Panel ───
+// Creates a canvas-textured plane floating in front of the selected rack
+// with stats info and a "Terminal" / "Dashboard" button zone
+function topoUpdateVRPanel() {
+    if (!_topo) return;
+    // Remove old panel
+    if (_topo._vrPanel) { _topo.scene.remove(_topo._vrPanel); _topo._vrPanel = null; }
+    if (!_topo.selectedRackId) return;
+
+    const rack = _topo.nodeMeshes.find(m => m.userData.id === _topo.selectedRackId);
+    const n = rack?.userData?.node;
+    if (!n) return;
+
+    const ui = _topo.selectedUnitIndex;
+    const m = n.metrics || {};
+    const cpu = m.cpu_usage_percent?.toFixed(0) || '?';
+    const mem = m.memory_percent?.toFixed(0) || '?';
+    const root = m.disks?.find(d => d.mount_point === '/') || m.disks?.[0];
+    const dsk = root ? root.usage_percent.toFixed(0) : '?';
+
+    // Build text lines
+    const lines = [];
+    if (ui <= 0) {
+        lines.push({ text: n.hostname || n.id, color: '#ffffff', size: 28, bold: true });
+        lines.push({ text: n.address || '', color: '#888899', size: 18 });
+        lines.push({ text: '', size: 10 });
+        lines.push({ text: (n.online ? '● Online' : '● Offline'), color: n.online ? '#22c55e' : '#ef4444', size: 20 });
+        lines.push({ text: 'CPU: ' + cpu + '%', color: '#22c55e', size: 20 });
+        lines.push({ text: 'Memory: ' + mem + '%', color: '#22c55e', size: 20 });
+        lines.push({ text: 'Disk: ' + dsk + '%', color: '#22c55e', size: 20 });
+        lines.push({ text: '', size: 10 });
+        lines.push({ text: (n.docker_count||0) + ' Docker  ' + (n.lxc_count||0) + ' LXC  ' + (n.vm_count||0) + ' VMs', color: '#8888aa', size: 16 });
+    } else {
+        const info = topoGetUnitInfo(n.id, ui);
+        if (info) {
+            lines.push({ text: info.type, color: { HOST:'#22c55e',DOCKER:'#3b82f6',LXC:'#10b981',VM:'#f59e0b' }[info.type] || '#fff', size: 22, bold: true });
+            lines.push({ text: info.name || '', color: '#ffffff', size: 24, bold: true });
+            if (info.state) lines.push({ text: info.state, color: (info.state === 'running' || info.state === 'Running') ? '#22c55e' : '#ef4444', size: 18 });
+            lines.push({ text: 'Node: ' + (n.hostname || n.id), color: '#888899', size: 16 });
+        }
+    }
+    lines.push({ text: '', size: 14 });
+    // Button label depends on type — VMs get VNC, everything else gets Terminal
+    const isVM = ui > 0 && (() => { const info = topoGetUnitInfo(n.id, ui); return info && info.runtime === 'vm'; })();
+    const btnLabel = isVM ? '[ VNC CONSOLE ]' : '[ TERMINAL ]';
+    lines.push({ text: btnLabel + '       [ DASHBOARD ]', color: '#dc2626', size: 20, bold: true, isButton: true });
+
+    // Render to canvas
+    const cvs = document.createElement('canvas');
+    cvs.width = 512; cvs.height = 400;
+    const ctx = cvs.getContext('2d');
+    // Background
+    ctx.fillStyle = 'rgba(10, 10, 18, 0.92)';
+    ctx.fillRect(0, 0, 512, 400);
+    ctx.strokeStyle = '#dc2626';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(2, 2, 508, 396);
+
+    let y = 30;
+    lines.forEach(l => {
+        if (!l.text) { y += l.size || 10; return; }
+        ctx.font = (l.bold ? 'bold ' : '') + l.size + 'px Inter, sans-serif';
+        ctx.fillStyle = l.color || '#ffffff';
+        ctx.fillText(l.text, 20, y + l.size);
+        y += l.size + 8;
+    });
+
+    const tex = new THREE.CanvasTexture(cvs);
+    tex.minFilter = THREE.LinearFilter;
+    const panelGeo = new THREE.PlaneGeometry(3, 2.4);
+    const panelMat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide });
+    const panel = new THREE.Mesh(panelGeo, panelMat);
+
+    // Position floating in front of the rack
+    const rackPos = rack.position.clone();
+    panel.position.set(rackPos.x, 4.5, rackPos.z - 2.5);
+
+    // Store button info for VR trigger detection
+    panel.userData = { isVRPanel: true, nodeId: n.id, unitIndex: ui };
+    _topo.scene.add(panel);
+    _topo._vrPanel = panel;
 }
 
 // Fetch container names for a node (cached for 30s)
@@ -27393,4 +27629,396 @@ function topologyCheckUpdate() {
         _topoPrevNodeHash = hash;
         buildTopologyScene();
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// VR Terminal — in-scene terminal with virtual keyboard
+// ═══════════════════════════════════════════════════════════════════════
+
+let _vrTerm = null; // { group, term, ws, screenTex, keys[], shift }
+
+function topoOpenVRTerminal(nodeId, runtime, containerName) {
+    if (!_topo || typeof Terminal === 'undefined') {
+        // Fallback to popup if xterm.js not loaded or not in topology
+        topoOpenTerminal(nodeId, runtime, containerName);
+        return;
+    }
+    // Close existing VR terminal
+    topoCloseVRTerminal();
+
+    const group = new THREE.Group();
+    const node = allNodes.find(n => n.id === nodeId);
+    const name = containerName || node?.hostname || nodeId;
+
+    // Position in front of camera
+    const camPos = _topo.camera.getWorldPosition(new THREE.Vector3());
+    const camDir = _topo.camera.getWorldDirection(new THREE.Vector3());
+    group.position.copy(camPos).addScaledVector(camDir, 3);
+    group.position.y = Math.max(group.position.y, 1.5);
+    group.lookAt(camPos);
+
+    // ── Terminal screen (xterm.js → canvas texture) ──
+    const termContainer = document.createElement('div');
+    termContainer.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:800px;height:500px;';
+    document.body.appendChild(termContainer);
+
+    const term = new Terminal({ cols: 100, rows: 30, fontSize: 14, theme: {
+        background: '#0a0a14', foreground: '#e8e8ed', cursor: '#dc2626',
+        selectionBackground: '#dc262640',
+    }});
+    const fitAddon = new FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(termContainer);
+    try { fitAddon.fit(); } catch(e) {}
+
+    // Screen plane
+    const screenW = 2.8, screenH = 1.75;
+    const screenGeo = new THREE.PlaneGeometry(screenW, screenH);
+    const screenTex = new THREE.CanvasTexture(termContainer.querySelector('canvas') || document.createElement('canvas'));
+    screenTex.minFilter = THREE.LinearFilter;
+    const screenMat = new THREE.MeshBasicMaterial({ map: screenTex, side: THREE.DoubleSide });
+    const screen = new THREE.Mesh(screenGeo, screenMat);
+    screen.position.set(0, 0.9, 0);
+    group.add(screen);
+
+    // Screen frame
+    const frameGeo = new THREE.BoxGeometry(screenW + 0.08, screenH + 0.08, 0.03);
+    const frameMat = new THREE.MeshPhongMaterial({ color: 0x1a1a24, shininess: 30 });
+    const frame = new THREE.Mesh(frameGeo, frameMat);
+    frame.position.set(0, 0.9, -0.02);
+    group.add(frame);
+
+    // Title bar
+    const titleLabel = makeTextSprite((runtime || 'host') + ': ' + name, { fontSize: 20, color: '#22c55e', scale: 0.4 });
+    titleLabel.position.set(0, 1.85, 0.02);
+    group.add(titleLabel);
+
+    // Close button (X)
+    const closeGeo = new THREE.BoxGeometry(0.2, 0.2, 0.04);
+    const closeMat = new THREE.MeshBasicMaterial({ color: 0xef4444 });
+    const closeBtn = new THREE.Mesh(closeGeo, closeMat);
+    closeBtn.position.set(screenW / 2 - 0.15, 1.8, 0.02);
+    closeBtn.userData = { isVRTermClose: true };
+    group.add(closeBtn);
+
+    // ── Virtual keyboard ──
+    const kbRows = [
+        ['`','1','2','3','4','5','6','7','8','9','0','-','=','Bksp'],
+        ['Tab','q','w','e','r','t','y','u','i','o','p','[',']','\\'],
+        ['Caps','a','s','d','f','g','h','j','k','l',';',"'",'Enter'],
+        ['Shift','z','x','c','v','b','n','m',',','.','/','Shift'],
+        ['Ctrl','Alt',' ','Alt','Ctrl','Esc'],
+    ];
+    const kbGroup = new THREE.Group();
+    kbGroup.position.set(0, -0.15, 0.3);
+    kbGroup.rotation.x = -0.5; // tilt toward user
+    const keyMeshes = [];
+    let shift = false;
+
+    const keyW = 0.16, keyH = 0.14, keyGap = 0.02;
+    kbRows.forEach((row, ri) => {
+        let x = -(row.length * (keyW + keyGap)) / 2;
+        row.forEach(key => {
+            let w = keyW;
+            if (key === 'Bksp' || key === 'Tab' || key === 'Enter' || key === 'Caps') w = keyW * 1.8;
+            if (key === 'Shift') w = keyW * 2.2;
+            if (key === ' ') w = keyW * 6;
+            if (key === 'Ctrl' || key === 'Alt' || key === 'Esc') w = keyW * 1.3;
+
+            const geo = new THREE.BoxGeometry(w, keyH, 0.03);
+            const mat = new THREE.MeshPhongMaterial({ color: 0x222230, shininess: 20, specular: 0x333344 });
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.position.set(x + w / 2, -ri * (keyH + keyGap), 0);
+            mesh.userData = { isVRKey: true, key, originalColor: 0x222230 };
+
+            // Key label
+            const label = key === ' ' ? 'SPACE' : key.toUpperCase();
+            const klbl = makeTextSprite(label.length > 3 ? label.substring(0,3) : label, { fontSize: 14, color: '#aaaabb', scale: 0.1 });
+            klbl.position.set(0, 0, 0.02);
+            mesh.add(klbl);
+
+            kbGroup.add(mesh);
+            keyMeshes.push(mesh);
+            x += w + keyGap;
+        });
+    });
+    group.add(kbGroup);
+
+    // ── WebSocket connection ──
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    let wsUrl;
+    const type = runtime || 'host';
+    if (node && !node.is_self) {
+        wsUrl = protocol + '//' + window.location.host + '/ws/remote-console/' + encodeURIComponent(nodeId) + '/' + type + '/' + encodeURIComponent(name);
+    } else {
+        wsUrl = protocol + '//' + window.location.host + '/ws/console/' + type + '/' + encodeURIComponent(name);
+    }
+
+    const ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => {
+        term.writeln('\x1b[32mConnected to ' + name + '\x1b[0m\r\n');
+        // Send terminal size
+        const msg = JSON.stringify({ type: 'resize', cols: 100, rows: 30 });
+        ws.send(msg);
+    };
+    ws.onmessage = (e) => {
+        if (typeof e.data === 'string') term.write(e.data);
+        else term.write(new Uint8Array(e.data));
+    };
+    ws.onclose = () => { term.writeln('\r\n\x1b[31mDisconnected\x1b[0m'); };
+    ws.onerror = () => { term.writeln('\r\n\x1b[31mConnection error\x1b[0m'); };
+    term.onData(data => { if (ws.readyState === WebSocket.OPEN) ws.send(data); });
+
+    _topo.scene.add(group);
+
+    _vrTerm = { group, term, ws, screenTex, termContainer, keyMeshes, shift: false, caps: false };
+}
+
+function topoCloseVRTerminal() {
+    if (!_vrTerm) return;
+    if (_vrTerm.ws && _vrTerm.ws.readyState === WebSocket.OPEN) _vrTerm.ws.close();
+    if (_vrTerm.term) _vrTerm.term.dispose();
+    if (_vrTerm.termContainer?.parentNode) _vrTerm.termContainer.parentNode.removeChild(_vrTerm.termContainer);
+    if (_vrTerm.iframe?.parentNode) _vrTerm.iframe.parentNode.removeChild(_vrTerm.iframe);
+    if (_topo) _topo.scene.remove(_vrTerm.group);
+    _vrTerm = null;
+}
+
+// ─── VR VNC Console (for QEMU/Windows VMs) ───
+// Uses a hidden iframe running vnc.html, captures its canvas as a 3D texture
+
+async function topoOpenVRVnc(nodeId, vmid, displayName) {
+    if (!_topo) return;
+    topoCloseVRTerminal(); // close any existing terminal
+
+    const group = new THREE.Group();
+    const node = allNodes.find(n => n.id === nodeId);
+
+    // Position in front of camera
+    const camPos = _topo.camera.getWorldPosition(new THREE.Vector3());
+    const camDir = _topo.camera.getWorldDirection(new THREE.Vector3());
+    group.position.copy(camPos).addScaledVector(camDir, 3);
+    group.position.y = Math.max(group.position.y, 1.5);
+    group.lookAt(camPos);
+
+    // Get VNC ticket and WS path
+    const oldNodeId = currentNodeId;
+    currentNodeId = nodeId;
+    let wsPath = `/ws/pve-vnc/${vmid}`;
+    if (node && !node.is_self) {
+        wsPath = `/ws/remote-console/${nodeId}/pve-vnc/${vmid}`;
+    }
+    let ticket = '';
+    try {
+        const ticketUrl = apiUrl(`/api/pve-vnc-ticket/${vmid}`);
+        const resp = await fetch(ticketUrl);
+        if (resp.ok) {
+            const data = await resp.json();
+            ticket = data.ticket || '';
+        }
+    } catch(e) {}
+    currentNodeId = oldNodeId;
+
+    // Create hidden iframe with vnc.html
+    const iframe = document.createElement('iframe');
+    iframe.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1024px;height:768px;border:none;';
+    iframe.src = `/vnc.html?ws_path=${encodeURIComponent(wsPath)}&ticket=${encodeURIComponent(ticket)}&name=${encodeURIComponent(displayName || 'VM')}`;
+    document.body.appendChild(iframe);
+
+    // VNC screen plane (larger than terminal — VNC is graphical)
+    const screenW = 3.5, screenH = 2.6;
+    const screenGeo = new THREE.PlaneGeometry(screenW, screenH);
+    // Placeholder texture until iframe canvas is available
+    const placeholderCvs = document.createElement('canvas');
+    placeholderCvs.width = 1024; placeholderCvs.height = 768;
+    const pCtx = placeholderCvs.getContext('2d');
+    pCtx.fillStyle = '#0a0e1a';
+    pCtx.fillRect(0, 0, 1024, 768);
+    pCtx.font = 'bold 24px Inter, sans-serif';
+    pCtx.fillStyle = '#60a5fa';
+    pCtx.textAlign = 'center';
+    pCtx.fillText('Connecting to ' + (displayName || 'VM') + '...', 512, 384);
+
+    const screenTex = new THREE.CanvasTexture(placeholderCvs);
+    screenTex.minFilter = THREE.LinearFilter;
+    const screenMat = new THREE.MeshBasicMaterial({ map: screenTex, side: THREE.DoubleSide });
+    const screen = new THREE.Mesh(screenGeo, screenMat);
+    screen.position.set(0, 1.3, 0);
+    group.add(screen);
+
+    // Frame
+    const frameGeo = new THREE.BoxGeometry(screenW + 0.08, screenH + 0.08, 0.03);
+    const frameMat = new THREE.MeshPhongMaterial({ color: 0x1a1a24, shininess: 30 });
+    const frame = new THREE.Mesh(frameGeo, frameMat);
+    frame.position.set(0, 1.3, -0.02);
+    group.add(frame);
+
+    // Title
+    const titleLabel = makeTextSprite('VNC: ' + (displayName || 'VM'), { fontSize: 20, color: '#60a5fa', scale: 0.4 });
+    titleLabel.position.set(0, 2.7, 0.02);
+    group.add(titleLabel);
+
+    // Close button
+    const closeGeo = new THREE.BoxGeometry(0.2, 0.2, 0.04);
+    const closeMat = new THREE.MeshBasicMaterial({ color: 0xef4444 });
+    const closeBtn = new THREE.Mesh(closeGeo, closeMat);
+    closeBtn.position.set(screenW / 2 - 0.15, 2.65, 0.02);
+    closeBtn.userData = { isVRTermClose: true };
+    group.add(closeBtn);
+
+    // Virtual keyboard (same as terminal)
+    const kbRows = [
+        ['Esc','1','2','3','4','5','6','7','8','9','0','-','=','Bksp'],
+        ['Tab','q','w','e','r','t','y','u','i','o','p','[',']','\\'],
+        ['Caps','a','s','d','f','g','h','j','k','l',';',"'",'Enter'],
+        ['Shift','z','x','c','v','b','n','m',',','.','/','Shift'],
+        ['Ctrl','Alt',' ','Alt','Ctrl'],
+    ];
+    const kbGroup = new THREE.Group();
+    kbGroup.position.set(0, -0.15, 0.3);
+    kbGroup.rotation.x = -0.5;
+    const keyMeshes = [];
+    const keyW = 0.16, keyH = 0.14, keyGap = 0.02;
+    kbRows.forEach((row, ri) => {
+        let x = -(row.length * (keyW + keyGap)) / 2;
+        row.forEach(key => {
+            let w = keyW;
+            if (key === 'Bksp' || key === 'Tab' || key === 'Enter' || key === 'Caps') w = keyW * 1.8;
+            if (key === 'Shift') w = keyW * 2.2;
+            if (key === ' ') w = keyW * 6;
+            if (key === 'Ctrl' || key === 'Alt' || key === 'Esc') w = keyW * 1.3;
+            const geo = new THREE.BoxGeometry(w, keyH, 0.03);
+            const mat = new THREE.MeshPhongMaterial({ color: 0x222230, shininess: 20, specular: 0x333344 });
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.position.set(x + w / 2, -ri * (keyH + keyGap), 0);
+            mesh.userData = { isVRKey: true, key, originalColor: 0x222230 };
+            const label = key === ' ' ? 'SPACE' : key.toUpperCase();
+            const klbl = makeTextSprite(label.length > 3 ? label.substring(0,3) : label, { fontSize: 14, color: '#aaaabb', scale: 0.1 });
+            klbl.position.set(0, 0, 0.02);
+            mesh.add(klbl);
+            kbGroup.add(mesh);
+            keyMeshes.push(mesh);
+            x += w + keyGap;
+        });
+    });
+    group.add(kbGroup);
+
+    _topo.scene.add(group);
+
+    // Store state — reuse _vrTerm structure
+    _vrTerm = {
+        group, term: null, ws: null, screenTex, termContainer: null,
+        keyMeshes, shift: false, caps: false,
+        isVnc: true, iframe, vncCanvas: null
+    };
+
+    // Poll for iframe canvas availability
+    const pollForCanvas = setInterval(() => {
+        if (!_vrTerm || !_vrTerm.isVnc) { clearInterval(pollForCanvas); return; }
+        try {
+            const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
+            if (!iframeDoc) return;
+            const cvs = iframeDoc.querySelector('#vnc-container canvas');
+            if (cvs) {
+                _vrTerm.vncCanvas = cvs;
+                _vrTerm.screenTex.image = cvs;
+                clearInterval(pollForCanvas);
+            }
+        } catch(e) { /* cross-origin error shouldn't happen — same origin */ }
+    }, 500);
+}
+
+// Handle VNC keyboard input via RFB.sendKey
+function vrVncHandleKey(key) {
+    if (!_vrTerm || !_vrTerm.isVnc || !_vrTerm.iframe) return;
+    const rfb = _vrTerm.iframe.contentWindow?.rfb;
+    if (!rfb) return;
+
+    const shift = _vrTerm.shift || _vrTerm.caps;
+
+    if (key === 'Shift') { _vrTerm.shift = !_vrTerm.shift; return; }
+    if (key === 'Caps') { _vrTerm.caps = !_vrTerm.caps; return; }
+    if (key === 'Ctrl') return;
+    if (key === 'Alt') return;
+
+    // Map key names to X11 keysyms
+    const keysymMap = {
+        'Bksp': 0xff08, 'Tab': 0xff09, 'Enter': 0xff0d, 'Esc': 0xff1b,
+        ' ': 0x0020, 'Shift': 0xffe1, 'Ctrl': 0xffe3, 'Alt': 0xffe9,
+    };
+
+    if (keysymMap[key]) {
+        rfb.sendKey(keysymMap[key], undefined, true);
+        rfb.sendKey(keysymMap[key], undefined, false);
+        return;
+    }
+
+    // Single character
+    let ch = key;
+    if (shift && ch.length === 1) {
+        const shiftMap = { '`':'~','1':'!','2':'@','3':'#','4':'$','5':'%','6':'^','7':'&','8':'*','9':'(','0':')','-':'_','=':'+','[':'{',']':'}','\\':'|',';':':', "'":'"',',':'<','.':'>','/':'?' };
+        ch = shiftMap[ch] || ch.toUpperCase();
+    }
+    if (ch.length === 1) {
+        const code = ch.charCodeAt(0);
+        rfb.sendKey(code, undefined, true);
+        rfb.sendKey(code, undefined, false);
+    }
+    if (_vrTerm.shift) _vrTerm.shift = false;
+}
+
+function vrTermHandleKey(key) {
+    if (!_vrTerm || !_vrTerm.ws || _vrTerm.ws.readyState !== WebSocket.OPEN) return;
+    const ws = _vrTerm.ws;
+    const shift = _vrTerm.shift || _vrTerm.caps;
+
+    if (key === 'Shift') { _vrTerm.shift = !_vrTerm.shift; return; }
+    if (key === 'Caps') { _vrTerm.caps = !_vrTerm.caps; return; }
+    if (key === 'Bksp') { ws.send('\x7f'); return; }
+    if (key === 'Tab') { ws.send('\t'); return; }
+    if (key === 'Enter') { ws.send('\r'); return; }
+    if (key === 'Esc') { ws.send('\x1b'); return; }
+    if (key === 'Ctrl') return; // modifier — would need state tracking
+    if (key === 'Alt') return;
+
+    let ch = key;
+    if (shift && ch.length === 1) {
+        const shiftMap = { '`':'~','1':'!','2':'@','3':'#','4':'$','5':'%','6':'^','7':'&','8':'*','9':'(','0':')','-':'_','=':'+','[':'{',']':'}','\\':'|',';':':',"'":'"',',':'<','.':'>','/':'?' };
+        ch = shiftMap[ch] || ch.toUpperCase();
+    }
+    ws.send(ch);
+    if (_vrTerm.shift) _vrTerm.shift = false; // one-shot shift
+}
+
+// Update VR terminal/VNC screen texture each frame
+function vrTermUpdate() {
+    if (!_vrTerm) return;
+
+    if (_vrTerm.isVnc) {
+        // VNC — grab canvas from iframe
+        if (_vrTerm.vncCanvas) {
+            if (_vrTerm.screenTex.image !== _vrTerm.vncCanvas) {
+                _vrTerm.screenTex.image = _vrTerm.vncCanvas;
+            }
+            _vrTerm.screenTex.needsUpdate = true;
+        }
+    } else {
+        // Terminal — grab xterm canvas
+        const xtermCanvas = _vrTerm.termContainer?.querySelector('canvas');
+        if (xtermCanvas && _vrTerm.screenTex.image !== xtermCanvas) {
+            _vrTerm.screenTex.image = xtermCanvas;
+        }
+        _vrTerm.screenTex.needsUpdate = true;
+    }
+
+    // Highlight shift/caps keys
+    _vrTerm.keyMeshes.forEach(km => {
+        if (km.userData.key === 'Shift') {
+            km.material.color.setHex(_vrTerm.shift ? 0xdc2626 : 0x222230);
+        }
+        if (km.userData.key === 'Caps') {
+            km.material.color.setHex(_vrTerm.caps ? 0xdc2626 : 0x222230);
+        }
+    });
 }
