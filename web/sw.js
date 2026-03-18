@@ -6,6 +6,7 @@ const SHELL_ASSETS = [
     '/login.html',
     '/css/style.css',
     '/js/app.js',
+    '/js/vendor/three.min.js',
     '/images/wolfstack-logo.png',
     '/images/wolfstack-icon-192.png',
     '/images/wolfstack-icon-512.png',

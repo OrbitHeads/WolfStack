@@ -26816,8 +26816,23 @@ function makeTextSprite(text, opts = {}) {
     // Background pill
     ctx.fillStyle = 'rgba(0,0,0,0.5)';
     const rx = canvas.width / 2, ry = canvas.height / 2;
+    const rr = canvas.height / 2;
     ctx.beginPath();
-    ctx.roundRect(0, 0, canvas.width, canvas.height, canvas.height / 2);
+    if (ctx.roundRect) {
+        ctx.roundRect(0, 0, canvas.width, canvas.height, rr);
+    } else {
+        // Fallback for browsers without roundRect
+        const w = canvas.width, h = canvas.height;
+        ctx.moveTo(rr, 0);
+        ctx.lineTo(w - rr, 0);
+        ctx.arcTo(w, 0, w, rr, rr);
+        ctx.lineTo(w, h - rr);
+        ctx.arcTo(w, h, w - rr, h, rr);
+        ctx.lineTo(rr, h);
+        ctx.arcTo(0, h, 0, h - rr, rr);
+        ctx.lineTo(0, rr);
+        ctx.arcTo(0, 0, rr, 0, rr);
+    }
     ctx.fill();
     // Text
     ctx.fillStyle = color;
