@@ -27376,7 +27376,8 @@ function topoUpdateTooltip() {
         }
     }
     tooltip.style.display = 'block';
-    topoUpdateVRPanel();
+    // VR panel only in VR mode
+    if (_topo && _topo.renderer.xr.isPresenting) topoUpdateVRPanel();
 }
 
 // ─── VR 3D HUD Panel ───
@@ -27384,6 +27385,11 @@ function topoUpdateTooltip() {
 // with stats info and a "Terminal" / "Dashboard" button zone
 function topoUpdateVRPanel() {
     if (!_topo) return;
+    // VR only — never show 3D panel in desktop mode
+    if (!_topo.renderer.xr.isPresenting) {
+        if (_topo._vrPanel) { _topo.scene.remove(_topo._vrPanel); _topo._vrPanel = null; }
+        return;
+    }
     // Remove old panel
     if (_topo._vrPanel) { _topo.scene.remove(_topo._vrPanel); _topo._vrPanel = null; }
     if (!_topo.selectedRackId) return;
