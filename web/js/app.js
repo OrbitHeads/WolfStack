@@ -26596,7 +26596,7 @@ function initTopology3D() {
         if (!_topo || _topo.disposed || currentPage !== 'topology') return;
         // Invalidate cache so next fetch gets fresh stats
         Object.keys(_topoContainerCache).forEach(k => { _topoContainerCache[k].ts = 0; });
-        _topo._namesLoaded = false;
+        _topo._fetchingNames = false;
         const nodes = allNodes || [];
         Promise.all(nodes.map(n => topoFetchContainers(n.id))).then(() => {
             if (_topo && !_topo.disposed) buildTopologyScene();
@@ -26930,17 +26930,18 @@ function buildTopologyScene() {
         vrLine +
         `<div style="margin-top:6px;color:rgba(255,255,255,0.4);font-size:10px;">Drag to orbit &bull; Scroll to zoom &bull; Click rack for stats &bull; Double-click to open</div>`;
 
-    // Lazy-fetch container names for all nodes in background, rebuild once when done
-    let needsFetch = false;
-    nodes.forEach(n => { if (!_topoContainerCache[n.id]) needsFetch = true; });
-    if (needsFetch) {
-        Promise.all(nodes.map(n => topoFetchContainers(n.id))).then(() => {
-            // Rebuild scene now that we have container names — but only once
-            if (_topo && !_topo._namesLoaded) {
-                _topo._namesLoaded = true;
-                buildTopologyScene();
-            }
-        });
+    // Lazy-fetch container names + stats for all nodes, rebuild when done
+    if (!_topo._fetchingNames) {
+        const uncached = nodes.filter(n => !_topoContainerCache[n.id]);
+        if (uncached.length > 0) {
+            _topo._fetchingNames = true;
+            Promise.all(uncached.map(n => topoFetchContainers(n.id))).then(() => {
+                _topo._fetchingNames = false;
+                if (_topo && !_topo.disposed && currentPage === 'topology') {
+                    buildTopologyScene(); // rebuild with real names + stats for LEDs
+                }
+            }).catch(() => { _topo._fetchingNames = false; });
+        }
     }
 }
 
