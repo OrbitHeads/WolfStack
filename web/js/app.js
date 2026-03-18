@@ -26536,23 +26536,36 @@ function initTopology3D() {
 
             // Check VR terminal keyboard/close button first
             if (_vrTerm) {
-                const allVRTermObjects = [..._vrTerm.keyMeshes];
-                if (_vrTerm.closeBtn) allVRTermObjects.push(_vrTerm.closeBtn);
-                const termHits = ray.intersectObjects(allVRTermObjects, false);
+                // Collect all interactive terminal objects
+                const termObjects = [];
+                _vrTerm.group.traverse(child => {
+                    if (child.isMesh) termObjects.push(child);
+                });
+                const termHits = ray.intersectObjects(termObjects, false);
                 if (termHits.length > 0) {
-                    const hit = termHits[0].object;
-                    if (hit.userData.isVRTermClose) {
+                    // Walk up to find the userData
+                    let hit = termHits[0].object;
+                    // Check if it's the close button or its parent
+                    let isClose = false;
+                    let obj = hit;
+                    while (obj) {
+                        if (obj.userData.isVRTermClose) { isClose = true; break; }
+                        obj = obj.parent;
+                    }
+                    if (isClose) {
                         topoCloseVRTerminal();
                     } else if (hit.userData.isVRKey) {
-                        // Flash key
                         hit.material.color.setHex(0xdc2626);
                         setTimeout(() => { hit.material.color.setHex(hit.userData.originalColor || 0x222230); }, 150);
-                        // Route to VNC or terminal handler
                         if (_vrTerm?.isVnc) vrVncHandleKey(hit.userData.key);
                         else vrTermHandleKey(hit.userData.key);
                     }
+                    // Always consume the click when terminal is open — don't fall through to racks
                     return;
                 }
+                // Terminal is open but ray missed it — close it instead of opening another
+                topoCloseVRTerminal();
+                return;
             }
 
             // Check if pointing at the VR panel — any hit opens terminal/VNC
@@ -27768,30 +27781,46 @@ function topoOpenVRTerminal(nodeId, runtime, containerName) {
     // For remote nodes, build proxy prefix
     const proxyPrefix = (node && !node.is_self) ? `/api/nodes/${encodeURIComponent(nodeId)}/proxy/` : '/api/';
 
-    // Try HTTPS first (same origin), then HTTP on port+1
+    // Try HTTPS first (same origin with cookie), then HTTP on port+1
     const isHttps = window.location.protocol === 'https:';
     const mainPort = parseInt(window.location.port) || (isHttps ? 443 : 80);
-    const httpsBase = window.location.origin;
-    const httpBase = 'http://' + window.location.hostname + ':' + (mainPort + 1);
     const createPath = proxyPrefix + 'vr-terminal/create';
     const createBody = JSON.stringify({ type, name });
 
     term.writeln('\x1b[33mCreating terminal session...\x1b[0m');
 
-    // Try HTTPS, fall back to HTTP
+    // Get session cookie value for explicit auth header
+    const sessionCookie = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('wolfstack_session='));
+    const sessionToken = sessionCookie ? sessionCookie.split('=')[1] : '';
+
     let _vrTermBase = '';
-    function tryCreate(base) {
-        return fetch(base + createPath, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            credentials: 'include',
-            body: createBody,
-        }).then(r => { _vrTermBase = base; return r; });
+    function vrTermFetch(url, opts) {
+        opts = opts || {};
+        opts.credentials = 'include';
+        opts.headers = opts.headers || {};
+        opts.headers['Content-Type'] = 'application/json';
+        // Pass session token explicitly as cookie header backup
+        if (sessionToken) opts.headers['Cookie'] = 'wolfstack_session=' + sessionToken;
+        return fetch(url, opts);
+    }
+    // HTTPS (same origin)
+    function tryHttps() {
+        _vrTermBase = '';
+        return vrTermFetch(createPath, { method: 'POST', body: createBody });
+    }
+    // HTTP fallback on port+1
+    function tryHttp() {
+        const httpBase = 'http://' + window.location.hostname + ':' + (mainPort + 1);
+        _vrTermBase = httpBase;
+        return vrTermFetch(httpBase + createPath, { method: 'POST', body: createBody });
     }
 
-    tryCreate(httpsBase).catch(() => {
-        term.writeln('\x1b[33mHTTPS failed, trying HTTP on port ' + (mainPort + 1) + '...\x1b[0m');
-        return tryCreate(httpBase);
+    tryHttps().then(r => {
+        if (!r.ok) throw new Error('HTTPS ' + r.status);
+        return r;
+    }).catch(err => {
+        term.writeln('\x1b[33mHTTPS failed (' + err.message + '), trying HTTP...\x1b[0m');
+        return tryHttp();
     }).then(r => {
         if (!r.ok) throw new Error('HTTP ' + r.status);
         return r.json();
@@ -27809,7 +27838,7 @@ function topoOpenVRTerminal(nodeId, runtime, containerName) {
                 clearInterval(pollInterval);
                 return;
             }
-            fetch(outputUrl, { credentials: 'include' })
+            vrTermFetch(outputUrl)
                 .then(r => r.ok ? r.json() : null)
                 .then(d => { if (d?.output) term.write(d.output); })
                 .catch(() => {});
@@ -27818,10 +27847,8 @@ function topoOpenVRTerminal(nodeId, runtime, containerName) {
         // Send keystrokes via HTTP POST
         term.onData(input => {
             if (!_vrTerm || _vrTerm._sessionId !== sessionId) return;
-            fetch(inputUrl, {
+            vrTermFetch(inputUrl, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                credentials: 'include',
                 body: JSON.stringify({ data: input }),
             }).catch(() => {});
         });
