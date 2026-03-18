@@ -26692,8 +26692,8 @@ function buildServerRack(node, color) {
     // Cluster color accent strips on sides
     const stripGeo = new THREE.BoxGeometry(0.02, rackH - 0.5, 0.02);
     const stripMat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: node.online ? 0.8 : 0.2 });
-    group.add(Object.assign(new THREE.Mesh(stripGeo, stripMat), { position: new THREE.Vector3(-rackW/2 - 0.02, rackH/2, frontZ) }));
-    group.add(Object.assign(new THREE.Mesh(stripGeo, stripMat.clone()), { position: new THREE.Vector3(rackW/2 + 0.02, rackH/2, frontZ) }));
+    const stripL = new THREE.Mesh(stripGeo, stripMat); stripL.position.set(-rackW/2 - 0.02, rackH/2, frontZ); group.add(stripL);
+    const stripR = new THREE.Mesh(stripGeo, stripMat.clone()); stripR.position.set(rackW/2 + 0.02, rackH/2, frontZ); group.add(stripR);
 
     // Glow
     if (node.online) {
