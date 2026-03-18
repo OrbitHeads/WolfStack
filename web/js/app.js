@@ -26528,6 +26528,20 @@ function initTopology3D() {
         updateCameraFromSpherical();
     }, { passive: false });
 
+    // Keyboard movement — arrow keys / WASD to walk around
+    state.keysDown = {};
+    window.addEventListener('keydown', e => {
+        if (currentPage !== 'topology') return;
+        if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','w','a','s','d','W','A','S','D'].includes(e.key)) {
+            state.keysDown[e.key.toLowerCase()] = true;
+            state.autoRotate = false;
+            e.preventDefault();
+        }
+    });
+    window.addEventListener('keyup', e => {
+        state.keysDown[e.key.toLowerCase()] = false;
+    });
+
     // Stop tooltip clicks from reaching the canvas
     document.getElementById('topology-tooltip')?.addEventListener('click', e => e.stopPropagation());
 
@@ -26963,7 +26977,32 @@ function topoRenderFrame(timestamp, xrFrame) {
         _topo.camera.lookAt(_topo.target);
     }
 
-    // No LED animation — LEDs are static status indicators
+    // Keyboard movement — move the orbit target with arrow keys / WASD
+    if (_topo.keysDown && !_topo.renderer.xr.isPresenting) {
+        const k = _topo.keysDown;
+        const speed = 0.25;
+        // Camera forward direction projected onto XZ plane
+        const forward = new THREE.Vector3();
+        _topo.camera.getWorldDirection(forward);
+        forward.y = 0;
+        forward.normalize();
+        const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 1, 0)).normalize();
+
+        if (k['arrowup'] || k['w']) { _topo.target.addScaledVector(forward, speed); }
+        if (k['arrowdown'] || k['s']) { _topo.target.addScaledVector(forward, -speed); }
+        if (k['arrowleft'] || k['a']) { _topo.target.addScaledVector(right, -speed); }
+        if (k['arrowright'] || k['d']) { _topo.target.addScaledVector(right, speed); }
+
+        if (k['arrowup'] || k['arrowdown'] || k['arrowleft'] || k['arrowright'] || k['w'] || k['a'] || k['s'] || k['d']) {
+            const s = _topo.spherical;
+            _topo.camera.position.set(
+                s.radius * Math.sin(s.phi) * Math.sin(s.theta) + _topo.target.x,
+                s.radius * Math.cos(s.phi) + _topo.target.y,
+                s.radius * Math.sin(s.phi) * Math.cos(s.theta) + _topo.target.z
+            );
+            _topo.camera.lookAt(_topo.target);
+        }
+    }
 
     // VR locomotion — thumbstick/gamepad-based walking
     if (_topo.renderer.xr.isPresenting) {
