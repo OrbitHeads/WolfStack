@@ -26536,6 +26536,8 @@ function initTopology3D() {
 
             // Check VR terminal keyboard/close button first
             if (_vrTerm) {
+                // Force world matrix update so raycasts work on newly added objects
+                _vrTerm.group.updateMatrixWorld(true);
                 // Collect all interactive terminal objects
                 const termObjects = [];
                 _vrTerm.group.traverse(child => {
@@ -27656,12 +27658,12 @@ let _vrTerm = null; // { group, term, ws, screenTex, keys[], shift }
 
 function topoOpenVRTerminal(nodeId, runtime, containerName) {
     if (!_topo || typeof Terminal === 'undefined') {
-        // Fallback to popup if xterm.js not loaded or not in topology
         topoOpenTerminal(nodeId, runtime, containerName);
         return;
     }
-    // Close existing VR terminal
+    // Close existing VR terminal and VR panel
     topoCloseVRTerminal();
+    if (_topo._vrPanel) { _topo.scene.remove(_topo._vrPanel); _topo._vrPanel = null; }
 
     const group = new THREE.Group();
     const node = allNodes.find(n => n.id === nodeId);

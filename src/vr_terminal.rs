@@ -9,15 +9,15 @@ use actix_web::{web, HttpRequest, HttpResponse};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, Duration};
 
 /// A VR terminal session
 struct VrTermSession {
-    reader: Box<dyn Read + Send>,
     writer: Box<dyn Write + Send>,
     _child: Box<dyn portable_pty::Child + Send>,
-    output_buf: Vec<u8>,
+    /// Output buffer filled by background reader thread
+    output: Arc<Mutex<Vec<u8>>>,
     last_poll: Instant,
 }
 
@@ -25,7 +25,6 @@ static VR_SESSIONS: std::sync::LazyLock<Mutex<HashMap<String, VrTermSession>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// POST /api/vr-terminal/create — create a new PTY session
-/// Body: { "type": "host|docker|lxc", "name": "container_name" }
 pub async fn vr_term_create(
     req: HttpRequest,
     state: web::Data<crate::api::AppState>,
@@ -36,12 +35,10 @@ pub async fn vr_term_create(
     let ctype = body.get("type").and_then(|v| v.as_str()).unwrap_or("host");
     let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("shell");
 
-    // Validate name
     if ctype != "host" && !crate::auth::is_safe_name(name) {
         return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Invalid name" }));
     }
 
-    // Build command
     let mut cmd = CommandBuilder::new("sh");
     cmd.arg("-c");
     cmd.env("TERM", "xterm-256color");
@@ -69,16 +66,13 @@ pub async fn vr_term_create(
             ));
         }
         _ => {
-            // host shell
             cmd.arg("if [ -x /bin/bash ]; then exec /bin/bash --login; else exec /bin/sh -l; fi");
         }
     }
 
-    // Create PTY
     let pty_system = native_pty_system();
     let pty_pair = match pty_system.openpty(PtySize {
-        rows: 30, cols: 100,
-        pixel_width: 0, pixel_height: 0,
+        rows: 30, cols: 100, pixel_width: 0, pixel_height: 0,
     }) {
         Ok(pair) => pair,
         Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("PTY error: {}", e) })),
@@ -89,7 +83,7 @@ pub async fn vr_term_create(
         Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Spawn error: {}", e) })),
     };
 
-    let reader = match pty_pair.master.try_clone_reader() {
+    let mut reader = match pty_pair.master.try_clone_reader() {
         Ok(r) => r,
         Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Reader error: {}", e) })),
     };
@@ -99,15 +93,40 @@ pub async fn vr_term_create(
     };
 
     let session_id = format!("vrt-{}", uuid_simple());
+    let output_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Spawn background thread to read from PTY continuously (non-blocking to the HTTP server)
+    let buf_clone = output_buf.clone();
+    let sid_clone = session_id.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    let mut out = buf_clone.lock().unwrap();
+                    out.extend_from_slice(&buf[..n]);
+                    // Cap buffer at 256KB to prevent memory leak
+                    if out.len() > 262144 {
+                        let drain = out.len() - 131072;
+                        out.drain(..drain);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        // Session ended — clean up
+        let mut sessions = VR_SESSIONS.lock().unwrap();
+        sessions.remove(&sid_clone);
+    });
+
     let mut sessions = VR_SESSIONS.lock().unwrap();
-    // Clean up stale sessions (> 30 minutes idle)
     sessions.retain(|_, s| s.last_poll.elapsed() < Duration::from_secs(1800));
 
     sessions.insert(session_id.clone(), VrTermSession {
-        reader,
         writer,
         _child: child,
-        output_buf: Vec::new(),
+        output: output_buf,
         last_poll: Instant::now(),
     });
 
@@ -118,7 +137,7 @@ pub async fn vr_term_create(
     }))
 }
 
-/// GET /api/vr-terminal/{id}/output — get new terminal output
+/// GET /api/vr-terminal/{id}/output — get new terminal output (non-blocking)
 pub async fn vr_term_output(
     req: HttpRequest,
     state: web::Data<crate::api::AppState>,
@@ -135,25 +154,10 @@ pub async fn vr_term_output(
 
     session.last_poll = Instant::now();
 
-    // Read available data from PTY (non-blocking)
-    let mut buf = [0u8; 8192];
-    let mut output = Vec::new();
-
-    // Drain any buffered output first
-    output.append(&mut session.output_buf);
-
-    // Try to read more (non-blocking via timeout)
-    loop {
-        match session.reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                output.extend_from_slice(&buf[..n]);
-                if output.len() > 32768 { break; } // cap at 32KB per poll
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(_) => break,
-        }
-    }
+    // Drain the output buffer (filled by background thread)
+    let mut output_lock = session.output.lock().unwrap();
+    let output: Vec<u8> = output_lock.drain(..).collect();
+    drop(output_lock);
 
     let text = String::from_utf8_lossy(&output).to_string();
     HttpResponse::Ok().json(serde_json::json!({
@@ -203,13 +207,12 @@ pub async fn vr_term_close(
 
     let mut sessions = VR_SESSIONS.lock().unwrap();
     if sessions.remove(&id).is_some() {
-        HttpResponse::Ok().json(serde_json::json!({ "ok": true, "message": "Session closed" }))
+        HttpResponse::Ok().json(serde_json::json!({ "ok": true }))
     } else {
         HttpResponse::NotFound().json(serde_json::json!({ "error": "Session not found" }))
     }
 }
 
-/// Simple UUID-like ID generator
 fn uuid_simple() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
