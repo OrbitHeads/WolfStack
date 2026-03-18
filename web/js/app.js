@@ -26518,11 +26518,12 @@ function initTopology3D() {
     const vrController1 = renderer.xr.getController(1);
     vrDolly.add(vrController0);
     vrDolly.add(vrController1);
-    // Laser line on each controller
+    // Laser line on each controller (hidden until VR session starts)
     const laserGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -10)]);
     const laserMat = new THREE.LineBasicMaterial({ color: 0xdc2626, transparent: true, opacity: 0.6 });
-    const laser0 = new THREE.Line(laserGeo, laserMat); vrController0.add(laser0);
-    const laser1 = new THREE.Line(laserGeo.clone(), laserMat.clone()); vrController1.add(laser1);
+    const laser0 = new THREE.Line(laserGeo, laserMat); laser0.visible = false; vrController0.add(laser0);
+    const laser1 = new THREE.Line(laserGeo.clone(), laserMat.clone()); laser1.visible = false; vrController1.add(laser1);
+    state._vrLasers = [laser0, laser1];
     // VR select on trigger
     [vrController0, vrController1].forEach(ctrl => {
         ctrl.addEventListener('selectstart', () => {
@@ -26590,7 +26591,7 @@ function initTopology3D() {
                 }
             }
 
-            // Check racks — if pointing at a specific server unit, open terminal directly
+            // Check racks — point at any part → show info panel with Console button
             const rackMeshes = _topo.nodeMeshes.filter(m => m.userData.isRack);
             const hits = ray.intersectObjects(rackMeshes, true);
             if (hits.length > 0) {
@@ -26600,45 +26601,10 @@ function initTopology3D() {
                 if (rack?.userData?.id) {
                     const nodeId = rack.userData.id;
                     const unitData = hitObj.userData;
-
-                    if (unitData.isUnit) {
-                        // Pointed at a specific server unit — open terminal/VNC for it
-                        _topo.selectedRackId = nodeId;
-                        _topo.selectedUnitIndex = unitData.unitIndex;
-                        topoUpdateTooltip();
-                        topoFetchContainers(nodeId).then(() => {
-                            const info = topoGetUnitInfo(nodeId, unitData.unitIndex);
-                            if (info && info.runtime === 'vm') {
-                                // VMs need VNC — open in-scene VNC console
-                                const node = allNodes.find(n => n.id === nodeId);
-                                if (node?.node_type === 'proxmox') {
-                                    // Find VMID from cache
-                                    const cc = _topoContainerCache[nodeId];
-                                    const vmIdx = unitData.unitIndex - 1 - (node.docker_count||0) - (node.lxc_count||0);
-                                    const vmData = cc?.vms?.[vmIdx];
-                                    const vmName = vmData?.name || info.name;
-                                    // Need VMID — search PVE resources
-                                    fetch(`/api/nodes/${nodeId}/pve/resources`).then(r => r.json()).then(guests => {
-                                        const g = (Array.isArray(guests) ? guests : []).find(g => g.name === vmName);
-                                        if (g) topoOpenVRVnc(nodeId, g.vmid, vmName);
-                                        else topoOpenVRTerminal(nodeId, 'host', null);
-                                    }).catch(() => topoOpenVRTerminal(nodeId, 'host', null));
-                                } else {
-                                    topoOpenVRTerminal(nodeId, 'host', null);
-                                }
-                            } else if (info) {
-                                topoOpenVRTerminal(nodeId, info.runtime, info.name);
-                            } else {
-                                topoOpenVRTerminal(nodeId, 'host', null);
-                            }
-                        });
-                    } else {
-                        // Pointed at rack frame — show info panel
-                        _topo.selectedRackId = nodeId;
-                        _topo.selectedUnitIndex = -1;
-                        topoFetchContainers(nodeId).then(() => topoUpdateTooltip());
-                        topoUpdateTooltip();
-                    }
+                    _topo.selectedRackId = nodeId;
+                    _topo.selectedUnitIndex = unitData.isUnit ? unitData.unitIndex : -1;
+                    topoFetchContainers(nodeId).then(() => topoUpdateTooltip());
+                    topoUpdateTooltip();
                 }
             } else {
                 // Pointed at nothing — deselect
@@ -26659,7 +26625,7 @@ function initTopology3D() {
         animId: null, clock: new THREE.Clock(),
         raycaster: new THREE.Raycaster(), mouse: new THREE.Vector2(),
         isDragging: false, prevMouse: { x: 0, y: 0 },
-        spherical: { radius: 25, theta: Math.PI, phi: Math.PI / 3 },
+        spherical: { radius: 25, theta: 0, phi: Math.PI / 3 },
         target: new THREE.Vector3(0, 3, 0),
         vrMoving: false, vrMoveDir: new THREE.Vector3(),
     };
@@ -27162,6 +27128,12 @@ function topoRenderFrame(timestamp, xrFrame) {
         }
     }
 
+    // Show/hide VR lasers based on session
+    if (_topo._vrLasers) {
+        const inVR = _topo.renderer.xr.isPresenting;
+        _topo._vrLasers.forEach(l => { l.visible = inVR; });
+    }
+
     // VR locomotion — thumbstick/gamepad-based walking
     if (_topo.renderer.xr.isPresenting) {
         const session = _topo.renderer.xr.getSession();
@@ -27247,7 +27219,7 @@ function topologyEnterVR() {
         .then(session => {
             _topo.renderer.xr.setSession(session);
             // Position user in front of racks at standing height
-            _topo.vrDolly.position.set(0, 0, -8);
+            _topo.vrDolly.position.set(0, 0, 8);
             showToast('Entering VR — use thumbsticks to walk around your server room', 'success');
         })
         .catch(err => {
