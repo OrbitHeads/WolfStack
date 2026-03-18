@@ -2,7 +2,7 @@
 
 The flagship management dashboard from [Wolf Software Systems](https://wolf.uk.com/). Monitor servers, manage virtual machines, Docker and LXC containers, control services, and manage your entire infrastructure from one beautiful web interface.
 
-**[Reddit Community (r/WolfStack)](https://www.reddit.com/r/WolfStack/)** • **[Discord](https://discord.gg/q9qMjHjUQY)** • **[Patreon](https://www.patreon.com/15362110/join)**
+**[Reddit Community (r/WolfStack)](https://www.reddit.com/r/WolfStack/)** • **[Discord](https://discord.gg/q9qMjHjUQY)** • **[GitHub Sponsors](https://github.com/sponsors/wolfsoftwaresystemsltd)**
 
 ![WolfStack Dashboard](https://wolfstack.org/images/screenshot.png)
 
@@ -35,7 +35,7 @@ Full documentation, guides, and API reference are available at:
 
 ## Support
 
-- ❤️ **Patreon:** [Support development](https://www.patreon.com/15362110/join)
+- ❤️ **Sponsor:** [Support development](https://github.com/sponsors/wolfsoftwaresystemsltd)
 - 💬 **Discord:** [Join our community](https://discord.gg/q9qMjHjUQY)
 - 🔥 **Reddit:** [r/WolfStack](https://www.reddit.com/r/WolfStack/)
 - 🌐 **Website:** [wolf.uk.com](https://wolf.uk.com)

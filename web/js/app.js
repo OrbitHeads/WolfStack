@@ -18082,7 +18082,7 @@ function escapeHtml(str) {
 var issuesScanResults = []; // cached for upgrade-all
 var issuesLatestVersion = '0.0.0'; // GitHub-resolved latest, cached after each scan
 
-// Gate the beta channel dropdown based on Patreon tier
+// Gate the beta channel dropdown based on sponsor tier
 async function checkBetaAccess() {
     var sel = document.getElementById('issues-channel-select');
     if (!sel) return;
@@ -18096,7 +18096,7 @@ async function checkBetaAccess() {
                 betaOpt.textContent = 'Beta';
             } else {
                 betaOpt.disabled = true;
-                betaOpt.textContent = 'Beta (Patreon Advanced+ required)';
+                betaOpt.textContent = 'Beta (Sponsor Advanced+ required)';
                 if (sel.value === 'beta') sel.value = 'master';
             }
         }
@@ -20515,22 +20515,22 @@ function switchSettingsTab(tabName) {
         loadAlertingConfig();
     } else if (tabName === 'security') {
         loadClusterSecretStatus();
-    } else if (tabName === 'patreon') {
+    } else if (tabName === 'sponsor') {
         loadPatreonStatus();
     }
 }
 
-// ─── Patreon Integration ───
+// ─── Sponsor Integration ───
 
-// Update the header Patreon badge with the user's tier
-async function loadPatreonHeaderBadge() {
+// Update the header sponsor badge with the user's tier
+async function loadSponsorHeaderBadge() {
     try {
         var resp = await fetch('/api/patreon/status');
         if (!resp.ok) return;
         var data = await resp.json();
-        var textEl = document.getElementById('patreon-header-text');
-        var badgeEl = document.getElementById('patreon-header-badge');
-        var linkEl = document.getElementById('patreon-header-link');
+        var textEl = document.getElementById('sponsor-header-text');
+        var badgeEl = document.getElementById('sponsor-header-badge');
+        var linkEl = document.getElementById('sponsor-header-link');
         if (!badgeEl) return;
         if (data.linked && data.tier && data.tier !== 'none' && data.tier !== 'free') {
             var tierNames = { free: 'Free', basic: 'Basic', advanced: 'Advanced', platinum: 'Platinum', enterprise: 'Enterprise' };
@@ -20543,37 +20543,37 @@ async function loadPatreonHeaderBadge() {
             };
             badgeEl.style.background = tierColors[data.tier] || tierColors.basic;
             badgeEl.textContent = tierNames[data.tier] || data.tier;
-            if (textEl) textEl.textContent = 'Patron \u2014 ' + (data.user_name || 'Linked');
+            if (textEl) textEl.textContent = 'Sponsor \u2014 ' + (data.user_name || 'Linked');
         } else {
             // Not linked or no paid tier — encourage support
             if (!data.linked) {
                 if (linkEl) {
                     linkEl.href = '#';
                     linkEl.removeAttribute('target');
-                    linkEl.onclick = function(e) { e.preventDefault(); selectView('settings'); setTimeout(function(){ switchSettingsTab('patreon'); }, 100); };
+                    linkEl.onclick = function(e) { e.preventDefault(); selectView('settings'); setTimeout(function(){ switchSettingsTab('sponsor'); }, 100); };
                 }
-                if (textEl) textEl.textContent = 'Link your Patreon account';
-                badgeEl.textContent = 'Connect';
+                if (textEl) textEl.textContent = 'Sponsor WolfStack on GitHub';
+                badgeEl.textContent = 'Sponsor';
             }
             // Show support toast once per page load
-            if (!window._wsPatreonToastShown) {
-                window._wsPatreonToastShown = true;
+            if (!window._wsSponsorToastShown) {
+                window._wsSponsorToastShown = true;
                 setTimeout(() => {
-                    showToast('Enjoying WolfStack? <a href="https://www.wolfstack.org/support.php" target="_blank" style="color:#facc15;text-decoration:underline;">Support WolfStack</a> to unlock extra features and help keep it free.', 'info', 10000);
+                    showToast('Enjoying WolfStack? <a href="https://github.com/sponsors/wolfsoftwaresystemsltd" target="_blank" style="color:#facc15;text-decoration:underline;">Sponsor on GitHub</a> to unlock extra features and help keep it free.', 'info', 10000);
                 }, 4000);
             }
         }
     } catch (e) { /* silent */ }
 }
 // Load on page startup
-document.addEventListener('DOMContentLoaded', loadPatreonHeaderBadge);
+document.addEventListener('DOMContentLoaded', loadSponsorHeaderBadge);
 
 async function loadPatreonStatus() {
-    var statusEl = document.getElementById('patreon-link-status');
-    var infoEl = document.getElementById('patreon-linked-info');
-    var connectBtn = document.getElementById('btn-patreon-connect');
-    var syncBtn = document.getElementById('btn-patreon-sync');
-    var disconnectBtn = document.getElementById('btn-patreon-disconnect');
+    var statusEl = document.getElementById('sponsor-link-status');
+    var infoEl = document.getElementById('sponsor-linked-info');
+    var connectBtn = document.getElementById('btn-sponsor-connect');
+    var syncBtn = document.getElementById('btn-sponsor-sync');
+    var disconnectBtn = document.getElementById('btn-sponsor-disconnect');
     if (!statusEl) return;
     statusEl.textContent = 'Loading...';
     try {
@@ -20587,13 +20587,13 @@ async function loadPatreonStatus() {
             statusEl.innerHTML = '<span style="color:#22c55e;">Linked</span>';
             statusEl.style.borderColor = 'rgba(34,197,94,0.3)';
             infoEl.style.display = 'block';
-            document.getElementById('patreon-user-name').textContent = data.user_name || 'Unknown';
-            var tierEl = document.getElementById('patreon-tier');
+            document.getElementById('sponsor-user-name').textContent = data.user_name || 'Unknown';
+            var tierEl = document.getElementById('sponsor-tier');
             tierEl.textContent = tierNames[tier] || tier;
             tierEl.style.color = tierColors[tier] || 'inherit';
-            var betaEl = document.getElementById('patreon-beta-access');
+            var betaEl = document.getElementById('sponsor-beta-access');
             betaEl.innerHTML = data.has_beta_access ? '<span style="color:#22c55e;">Yes</span>' : '<span style="color:var(--text-muted);">No (Advanced+ required)</span>';
-            document.getElementById('patreon-last-checked').textContent = data.last_checked ? new Date(data.last_checked).toLocaleString() : 'Never';
+            document.getElementById('sponsor-last-checked').textContent = data.last_checked ? new Date(data.last_checked).toLocaleString() : 'Never';
             connectBtn.style.display = 'none';
             syncBtn.style.display = '';
             disconnectBtn.style.display = '';
@@ -20614,7 +20614,7 @@ function connectPatreon() {
 }
 
 async function syncPatreon() {
-    var syncBtn = document.getElementById('btn-patreon-sync');
+    var syncBtn = document.getElementById('btn-sponsor-sync');
     if (syncBtn) { syncBtn.textContent = 'Refreshing...'; syncBtn.disabled = true; }
     try {
         var resp = await fetch('/api/patreon/sync', { method: 'POST' });
@@ -20631,7 +20631,7 @@ async function syncPatreon() {
 }
 
 async function disconnectPatreon() {
-    if (!confirm('Disconnect your Patreon account? You will lose beta access if your tier granted it.')) return;
+    if (!confirm('Disconnect your sponsor account? You will lose beta access if your tier granted it.')) return;
     try {
         await fetch('/api/patreon/disconnect', { method: 'POST' });
         loadPatreonStatus();
