@@ -19,6 +19,7 @@ mod monitoring;
 mod installer;
 mod containers;
 mod console;
+mod vr_terminal;
 mod storage;
 mod networking;
 mod backup;

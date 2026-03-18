@@ -13071,6 +13071,11 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // PVE VNC — ticket endpoint + WebSocket bridge for Proxmox VM graphical consoles
         .route("/api/pve-vnc-ticket/{vmid}", web::get().to(pve_console::pve_vnc_ticket))
         .route("/ws/pve-vnc/{vmid}", web::get().to(pve_console::pve_vnc_ws))
+        // VR Terminal — HTTP polling (avoids WebSocket port restrictions in VR headsets)
+        .route("/api/vr-terminal/create", web::post().to(crate::vr_terminal::vr_term_create))
+        .route("/api/vr-terminal/{id}/output", web::get().to(crate::vr_terminal::vr_term_output))
+        .route("/api/vr-terminal/{id}/input", web::post().to(crate::vr_terminal::vr_term_input))
+        .route("/api/vr-terminal/{id}", web::delete().to(crate::vr_terminal::vr_term_close))
         // MySQL Database Editor
         .route("/api/mysql/detect", web::get().to(mysql_detect))
         .route("/api/mysql/detect-containers", web::get().to(mysql_detect_containers))

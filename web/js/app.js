@@ -27761,52 +27761,100 @@ function topoOpenVRTerminal(nodeId, runtime, containerName) {
     });
     group.add(kbGroup);
 
-    // ── WebSocket connection ──
-    // Show URL on the terminal so we can debug in VR
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    let wsPath;
+    // ── Connection: try WebSocket first, fall back to HTTP polling for VR ──
     const type = runtime || 'host';
-    if (node && !node.is_self) {
-        wsPath = '/ws/remote-console/' + encodeURIComponent(nodeId) + '/' + type + '/' + encodeURIComponent(name);
-    } else {
-        wsPath = '/ws/console/' + type + '/' + encodeURIComponent(name);
-    }
-    const wsUrl = protocol + '//' + window.location.host + wsPath;
-    term.writeln('\x1b[33mConnecting: ' + wsUrl + '\x1b[0m');
+    term.writeln('\x1b[33mConnecting to ' + type + ': ' + name + '...\x1b[0m');
 
-    let ws;
-    try {
-        ws = new WebSocket(wsUrl);
-    } catch(e) {
-        term.writeln('\r\n\x1b[31mWebSocket creation failed: ' + e.message + '\x1b[0m');
-        term.writeln('\x1b[31mThis may be a port restriction in VR browsers.\x1b[0m');
-        term.writeln('\x1b[33mTry using a real TLS cert (Let\'s Encrypt) on port 443.\x1b[0m');
-        _vrTerm.ws = null;
-        _topo.scene.add(group);
-        _vrTerm = { group, term, ws: null, screenTex, termContainer, keyMeshes, closeBtn, shift: false, caps: false, mirrorCvs, mirrorCtx };
-        return;
+    // For remote nodes, build proxy prefix
+    const proxyPrefix = (node && !node.is_self) ? `/api/nodes/${encodeURIComponent(nodeId)}/proxy/` : '/api/';
+
+    // Try HTTPS first (same origin), then HTTP on port+1
+    const isHttps = window.location.protocol === 'https:';
+    const mainPort = parseInt(window.location.port) || (isHttps ? 443 : 80);
+    const httpsBase = window.location.origin;
+    const httpBase = 'http://' + window.location.hostname + ':' + (mainPort + 1);
+    const createPath = proxyPrefix + 'vr-terminal/create';
+    const createBody = JSON.stringify({ type, name });
+
+    term.writeln('\x1b[33mCreating terminal session...\x1b[0m');
+
+    // Try HTTPS, fall back to HTTP
+    let _vrTermBase = '';
+    function tryCreate(base) {
+        return fetch(base + createPath, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: createBody,
+        }).then(r => { _vrTermBase = base; return r; });
     }
-    ws.binaryType = 'arraybuffer';
-    ws.onopen = () => {
-        term.writeln('\x1b[32mConnected!\x1b[0m\r\n');
-        const msg = JSON.stringify({ type: 'resize', cols: 100, rows: 30 });
-        ws.send(msg);
-    };
-    ws.onmessage = (e) => {
-        if (typeof e.data === 'string') term.write(e.data);
-        else term.write(new Uint8Array(e.data));
-    };
-    ws.onclose = (e) => {
-        term.writeln('\r\n\x1b[31mConnection closed (code: ' + e.code + ')\x1b[0m');
-        if (e.code === 1006) {
-            term.writeln('\x1b[33mCode 1006 = connection failed. Possible causes:\x1b[0m');
-            term.writeln('\x1b[33m- Self-signed TLS certificate rejected by VR browser\x1b[0m');
-            term.writeln('\x1b[33m- Port ' + window.location.port + ' blocked for WebSocket in VR\x1b[0m');
-            term.writeln('\x1b[33mFix: use a real cert (wolfstack --tls-domain your.domain)\x1b[0m');
+
+    tryCreate(httpsBase).catch(() => {
+        term.writeln('\x1b[33mHTTPS failed, trying HTTP on port ' + (mainPort + 1) + '...\x1b[0m');
+        return tryCreate(httpBase);
+    }).then(r => {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+    }).then(data => {
+        if (!data.session_id) throw new Error(data.error || 'No session ID');
+        term.writeln('\x1b[32mConnected! Session: ' + data.session_id + '\x1b[0m\r\n');
+
+        const sessionId = data.session_id;
+        const outputUrl = _vrTermBase + proxyPrefix + 'vr-terminal/' + sessionId + '/output';
+        const inputUrl = _vrTermBase + proxyPrefix + 'vr-terminal/' + sessionId + '/input';
+
+        // Poll for output every 200ms
+        const pollInterval = setInterval(() => {
+            if (!_vrTerm || _vrTerm._sessionId !== sessionId) {
+                clearInterval(pollInterval);
+                return;
+            }
+            fetch(outputUrl, { credentials: 'include' })
+                .then(r => r.ok ? r.json() : null)
+                .then(d => { if (d?.output) term.write(d.output); })
+                .catch(() => {});
+        }, 200);
+
+        // Send keystrokes via HTTP POST
+        term.onData(input => {
+            if (!_vrTerm || _vrTerm._sessionId !== sessionId) return;
+            fetch(inputUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'include',
+                body: JSON.stringify({ data: input }),
+            }).catch(() => {});
+        });
+
+        if (_vrTerm) {
+            _vrTerm._sessionId = sessionId;
+            _vrTerm._pollInterval = pollInterval;
         }
-    };
-    ws.onerror = () => { term.writeln('\r\n\x1b[31mWebSocket error\x1b[0m'); };
-    term.onData(data => { if (ws.readyState === WebSocket.OPEN) ws.send(data); });
+    }).catch(err => {
+        term.writeln('\r\n\x1b[31mFailed to create terminal: ' + err.message + '\x1b[0m');
+        term.writeln('\x1b[33mFalling back to WebSocket...\x1b[0m');
+        // WebSocket fallback for desktop
+        const wsProtocol = isHttps ? 'wss:' : 'ws:';
+        let wsPath;
+        if (node && !node.is_self) {
+            wsPath = '/ws/remote-console/' + encodeURIComponent(nodeId) + '/' + type + '/' + encodeURIComponent(name);
+        } else {
+            wsPath = '/ws/console/' + type + '/' + encodeURIComponent(name);
+        }
+        const wsUrl = wsProtocol + '//' + window.location.host + wsPath;
+        try {
+            const ws = new WebSocket(wsUrl);
+            ws.binaryType = 'arraybuffer';
+            ws.onopen = () => { term.writeln('\x1b[32mWebSocket connected!\x1b[0m\r\n'); ws.send(JSON.stringify({ type: 'resize', cols: 100, rows: 30 })); };
+            ws.onmessage = (e) => { if (typeof e.data === 'string') term.write(e.data); else term.write(new Uint8Array(e.data)); };
+            ws.onclose = () => { term.writeln('\r\n\x1b[31mDisconnected\x1b[0m'); };
+            ws.onerror = () => { term.writeln('\r\n\x1b[31mWebSocket also failed\x1b[0m'); };
+            term.onData(data => { if (ws.readyState === WebSocket.OPEN) ws.send(data); });
+            if (_vrTerm) _vrTerm.ws = ws;
+        } catch(e) {
+            term.writeln('\r\n\x1b[31mAll connection methods failed\x1b[0m');
+        }
+    });
 
     _topo.scene.add(group);
 
@@ -27815,6 +27863,12 @@ function topoOpenVRTerminal(nodeId, runtime, containerName) {
 
 function topoCloseVRTerminal() {
     if (!_vrTerm) return;
+    if (_vrTerm._pollInterval) clearInterval(_vrTerm._pollInterval);
+    // Close HTTP session
+    if (_vrTerm._sessionId) {
+        const proxyPrefix = '/api/';
+        fetch(proxyPrefix + 'vr-terminal/' + _vrTerm._sessionId, { method: 'DELETE', credentials: 'include' }).catch(() => {});
+    }
     if (_vrTerm.ws && _vrTerm.ws.readyState === WebSocket.OPEN) _vrTerm.ws.close();
     if (_vrTerm.term) _vrTerm.term.dispose();
     if (_vrTerm.termContainer?.parentNode) _vrTerm.termContainer.parentNode.removeChild(_vrTerm.termContainer);
