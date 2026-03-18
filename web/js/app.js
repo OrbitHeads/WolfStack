@@ -26591,85 +26591,114 @@ function initTopology3D() {
 function buildServerRack(node, color) {
     const group = new THREE.Group();
     const rackH = 5.5, rackW = 1.2, rackD = 2.0;
+    const unitH = 0.35, unitGap = 0.05;
+    const frontZ = -rackD / 2;
 
-    // Rack frame (dark metal)
+    // Rack frame
     const frameMat = new THREE.MeshPhongMaterial({ color: 0x1a1a20, shininess: 40, specular: 0x333344 });
     const postGeo = new THREE.BoxGeometry(0.08, rackH, 0.08);
-    [[-rackW/2, rackH/2, -rackD/2], [rackW/2, rackH/2, -rackD/2],
+    [[-rackW/2, rackH/2, frontZ], [rackW/2, rackH/2, frontZ],
      [-rackW/2, rackH/2, rackD/2], [rackW/2, rackH/2, rackD/2]].forEach(p => {
         const post = new THREE.Mesh(postGeo, frameMat);
-        post.position.set(...p);
-        post.castShadow = true;
-        group.add(post);
+        post.position.set(...p); post.castShadow = true; group.add(post);
     });
     const railH = new THREE.BoxGeometry(rackW + 0.08, 0.06, 0.08);
     const railD = new THREE.BoxGeometry(0.08, 0.06, rackD + 0.08);
     [0, rackH].forEach(y => {
-        [[-rackD/2], [rackD/2]].forEach(z => { const r = new THREE.Mesh(railH, frameMat); r.position.set(0, y, z[0]); group.add(r); });
-        [[-rackW/2], [rackW/2]].forEach(x => { const r = new THREE.Mesh(railD, frameMat); r.position.set(x[0], y, 0); group.add(r); });
+        [frontZ, rackD/2].forEach(z => { const r = new THREE.Mesh(railH, frameMat); r.position.set(0, y, z); group.add(r); });
+        [-rackW/2, rackW/2].forEach(x => { const r = new THREE.Mesh(railD, frameMat); r.position.set(x, y, 0); group.add(r); });
     });
 
-    // Server units stacked in rack
-    const unitH = 0.35, unitGap = 0.05;
-    const totalContainers = (node.docker_count || 0) + (node.lxc_count || 0) + (node.vm_count || 0);
-    const unitCount = Math.max(3, Math.min(12, totalContainers + 2));
-    const serverMat = new THREE.MeshPhongMaterial({ color: node.online ? 0x222230 : 0x1a1a1a, shininess: 30, specular: 0x444455 });
-
-    // Get metrics for the status dots
-    const m = node.metrics || {};
-    const cpu = m.cpu_usage_percent || 0;
-    const mem = m.memory_percent || 0;
-    const rootDisk = m.disks?.find(d => d.mount_point === '/') || m.disks?.[0];
+    // Metrics
+    const met = node.metrics || {};
+    const cpu = met.cpu_usage_percent || 0;
+    const mem = met.memory_percent || 0;
+    const rootDisk = met.disks?.find(d => d.mount_point === '/') || met.disks?.[0];
     const disk = rootDisk ? rootDisk.usage_percent : 0;
-    const cpuColor = cpu > 80 ? 0xef4444 : cpu > 50 ? 0xf59e0b : 0x22c55e;
-    const memColor = mem > 90 ? 0xef4444 : mem > 70 ? 0xf59e0b : 0x3b82f6;
-    const diskColor = disk > 90 ? 0xef4444 : disk > 70 ? 0xf59e0b : 0x8b5cf6;
+    const cpuCol = cpu > 80 ? 0xef4444 : cpu > 50 ? 0xf59e0b : 0x22c55e;
+    const memCol = mem > 90 ? 0xef4444 : mem > 70 ? 0xf59e0b : 0x3b82f6;
+    const dskCol = disk > 90 ? 0xef4444 : disk > 70 ? 0xf59e0b : 0x8b5cf6;
+    const ledGeo = new THREE.SphereGeometry(0.025, 8, 8);
 
-    for (let i = 0; i < unitCount; i++) {
+    // Build server list: top = mother server (the host), then one per container/LXC/VM
+    const dockerCount = node.docker_count || 0;
+    const lxcCount = node.lxc_count || 0;
+    const vmCount = node.vm_count || 0;
+    const totalUnits = 1 + dockerCount + lxcCount + vmCount; // 1 for mother
+    const maxUnits = Math.min(totalUnits, Math.floor((rackH - 0.5) / (unitH + unitGap)));
+
+    for (let i = 0; i < maxUnits; i++) {
+        const isMother = (i === 0);
         const unitY = 0.3 + i * (unitH + unitGap);
-        if (unitY + unitH > rackH - 0.2) break;
-        const unitGeo = new THREE.BoxGeometry(rackW - 0.16, unitH, rackD - 0.2);
-        const unit = new THREE.Mesh(unitGeo, serverMat);
+
+        // Server unit body
+        const bodyColor = isMother ? (node.online ? 0x2a2a3a : 0x1a1a1a) : (node.online ? 0x1e1e2a : 0x151518);
+        const unitGeo = new THREE.BoxGeometry(rackW - 0.16, isMother ? unitH + 0.06 : unitH, rackD - 0.2);
+        const unitMat = new THREE.MeshPhongMaterial({ color: bodyColor, shininess: isMother ? 50 : 25, specular: isMother ? 0x555566 : 0x333344 });
+        const unit = new THREE.Mesh(unitGeo, unitMat);
         unit.position.set(0, unitY + unitH / 2, 0);
         unit.castShadow = true;
         group.add(unit);
 
-        // Front panel
-        const panelGeo = new THREE.BoxGeometry(rackW - 0.2, unitH - 0.04, 0.02);
-        const panelMat = new THREE.MeshPhongMaterial({ color: 0x2a2a38, shininess: 20 });
-        const panel = new THREE.Mesh(panelGeo, panelMat);
-        panel.position.set(0, unitY + unitH / 2, -rackD / 2 + 0.12);
+        // Front panel — mother is slightly brighter
+        const panelColor = isMother ? 0x333345 : 0x2a2a38;
+        const panelGeo = new THREE.BoxGeometry(rackW - 0.2, (isMother ? unitH + 0.02 : unitH) - 0.04, 0.02);
+        const panel = new THREE.Mesh(panelGeo, new THREE.MeshPhongMaterial({ color: panelColor, shininess: 20 }));
+        panel.position.set(0, unitY + unitH / 2, frontZ + 0.12);
         group.add(panel);
 
-        // 3 status dots on each server unit: CPU, MEM, DSK
+        // Mother server accent stripe (cluster color) on front
+        if (isMother) {
+            const accentGeo = new THREE.BoxGeometry(rackW - 0.22, 0.03, 0.025);
+            const accentMat = new THREE.MeshBasicMaterial({ color });
+            const accent = new THREE.Mesh(accentGeo, accentMat);
+            accent.position.set(0, unitY + unitH + 0.01, frontZ + 0.12);
+            group.add(accent);
+        }
+
+        // 3 status LEDs (CPU, MEM, DSK) — static, no animation
         if (node.online) {
-            const ledGeo = new THREE.SphereGeometry(0.025, 8, 8);
-            const dotZ = -rackD / 2 + 0.1;
             const dotY = unitY + unitH / 2;
-            const dots = [
-                { x: -rackW/2 + 0.18, color: cpuColor },
-                { x: -rackW/2 + 0.28, color: memColor },
-                { x: -rackW/2 + 0.38, color: diskColor },
-            ];
-            dots.forEach(d => {
-                const led = new THREE.Mesh(ledGeo, new THREE.MeshBasicMaterial({ color: d.color }));
-                led.position.set(d.x, dotY, dotZ);
-                led.userData = { isLed: true };
+            const dotZ = frontZ + 0.1;
+            [[- rackW/2 + 0.18, cpuCol], [-rackW/2 + 0.28, memCol], [-rackW/2 + 0.38, dskCol]].forEach(([dx, dc]) => {
+                const led = new THREE.Mesh(ledGeo, new THREE.MeshBasicMaterial({ color: dc }));
+                led.position.set(dx, dotY, dotZ);
                 group.add(led);
             });
         }
+
+        // Type indicator on right side of front panel for non-mother units
+        if (!isMother && node.online) {
+            const ci = i - 1; // container index
+            const typeColor = ci < dockerCount ? 0x3b82f6 : ci < dockerCount + lxcCount ? 0x10b981 : 0xf59e0b;
+            const indGeo = new THREE.BoxGeometry(0.03, unitH - 0.08, 0.025);
+            const indMat = new THREE.MeshBasicMaterial({ color: typeColor });
+            const ind = new THREE.Mesh(indGeo, indMat);
+            ind.position.set(rackW / 2 - 0.18, unitY + unitH / 2, frontZ + 0.12);
+            group.add(ind);
+        }
     }
 
-    // Cluster color accent strips
+    // If more units than fit, show overflow indicator
+    if (totalUnits > maxUnits) {
+        const overflowY = 0.3 + maxUnits * (unitH + unitGap);
+        const overflowGeo = new THREE.BoxGeometry(rackW - 0.3, 0.04, 0.025);
+        const overflowMat = new THREE.MeshBasicMaterial({ color: 0x666677 });
+        const overflow = new THREE.Mesh(overflowGeo, overflowMat);
+        overflow.position.set(0, overflowY, frontZ + 0.12);
+        group.add(overflow);
+    }
+
+    // Cluster color accent strips on sides
     const stripGeo = new THREE.BoxGeometry(0.02, rackH - 0.5, 0.02);
     const stripMat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: node.online ? 0.8 : 0.2 });
-    const stripL = new THREE.Mesh(stripGeo, stripMat); stripL.position.set(-rackW/2 - 0.02, rackH/2, -rackD/2); group.add(stripL);
-    const stripR = new THREE.Mesh(stripGeo, stripMat); stripR.position.set(rackW/2 + 0.02, rackH/2, -rackD/2); group.add(stripR);
+    group.add(Object.assign(new THREE.Mesh(stripGeo, stripMat), { position: new THREE.Vector3(-rackW/2 - 0.02, rackH/2, frontZ) }));
+    group.add(Object.assign(new THREE.Mesh(stripGeo, stripMat.clone()), { position: new THREE.Vector3(rackW/2 + 0.02, rackH/2, frontZ) }));
 
-    // Glow light
+    // Glow
     if (node.online) {
         const glow = new THREE.PointLight(color, 0.3, 6);
-        glow.position.set(0, 3, -rackD / 2 - 0.5);
+        glow.position.set(0, 3, frontZ - 0.5);
         group.add(glow);
     }
 
@@ -26829,17 +26858,7 @@ function topoRenderFrame(timestamp, xrFrame) {
         _topo.camera.lookAt(_topo.target);
     }
 
-    // Animate LEDs (blink)
-    _topo.nodeMeshes.forEach(rack => {
-        if (!rack.userData.isRack) return;
-        rack.children.forEach(child => {
-            if (child.userData.isLed) {
-                const intensity = 0.5 + 0.5 * Math.sin(time * 3 + child.position.y * 10);
-                child.material.opacity = intensity;
-                child.material.transparent = true;
-            }
-        });
-    });
+    // No LED animation — LEDs are static status indicators
 
     // VR locomotion — thumbstick/gamepad-based walking
     if (_topo.renderer.xr.isPresenting) {
@@ -26871,7 +26890,7 @@ function topoRenderFrame(timestamp, xrFrame) {
         // Cursor
         _topo.container.style.cursor = hits.length > 0 ? 'pointer' : (_topo.isDragging ? 'grabbing' : 'grab');
 
-        // Show stats for selected rack
+        // Show stats panel for selected rack with action buttons
         if (_topo.selectedRackId && tooltip) {
             const rack = _topo.nodeMeshes.find(m => m.userData.id === _topo.selectedRackId);
             const n = rack?.userData?.node;
@@ -26881,28 +26900,40 @@ function topoRenderFrame(timestamp, xrFrame) {
                 const mem = m.memory_percent?.toFixed(0) || '?';
                 const root = m.disks?.find(d => d.mount_point === '/') || m.disks?.[0];
                 const dsk = root ? root.usage_percent.toFixed(0) : '?';
+                const nodeId = escapeHtml(n.id);
+                tooltip.style.pointerEvents = 'auto';
                 tooltip.innerHTML =
-                    `<div style="font-weight:700;font-size:14px;margin-bottom:8px;">${escapeHtml(n.hostname || n.id)}</div>` +
-                    `<div style="color:rgba(255,255,255,0.5);font-size:11px;margin-bottom:8px;">${escapeHtml(n.address)}</div>` +
-                    `<div style="color:rgba(255,255,255,0.7);line-height:2;">` +
+                    `<div style="font-weight:700;font-size:14px;margin-bottom:4px;">${escapeHtml(n.hostname || n.id)}</div>` +
+                    `<div style="color:rgba(255,255,255,0.45);font-size:11px;margin-bottom:10px;">${escapeHtml(n.address)}</div>` +
+                    `<div style="color:rgba(255,255,255,0.7);line-height:1.9;font-size:12px;">` +
                     `<div>${n.online ? '<span style="color:#22c55e;">&#9679;</span> Online' : '<span style="color:#ef4444;">&#9679;</span> Offline'}</div>` +
                     `<div><span style="color:#22c55e;">&#9679;</span> CPU: ${cpu}%</div>` +
                     `<div><span style="color:#3b82f6;">&#9679;</span> Memory: ${mem}%</div>` +
                     `<div><span style="color:#8b5cf6;">&#9679;</span> Disk: ${dsk}%</div>` +
-                    `<div style="margin-top:4px;">${n.docker_count || 0} Docker &bull; ${n.lxc_count || 0} LXC &bull; ${n.vm_count || 0} VMs</div>` +
                     `</div>` +
-                    `<div style="margin-top:8px;color:rgba(255,255,255,0.3);font-size:10px;">Double-click to open dashboard</div>`;
+                    `<div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.1);font-size:11px;color:rgba(255,255,255,0.5);line-height:1.7;">` +
+                    `<div><span style="color:#3b82f6;">&#9632;</span> ${n.docker_count || 0} Docker containers</div>` +
+                    `<div><span style="color:#10b981;">&#9632;</span> ${n.lxc_count || 0} LXC containers</div>` +
+                    `<div><span style="color:#f59e0b;">&#9632;</span> ${n.vm_count || 0} Virtual machines</div>` +
+                    `</div>` +
+                    `<div style="margin-top:10px;display:flex;gap:6px;">` +
+                    `<button onclick="topoOpenTerminal('${nodeId}')" style="flex:1;padding:7px 0;border:1px solid rgba(255,255,255,0.15);border-radius:6px;background:rgba(255,255,255,0.08);color:#fff;font-size:11px;cursor:pointer;font-family:inherit;">Terminal</button>` +
+                    `<button onclick="topoOpenDashboard('${nodeId}')" style="flex:1;padding:7px 0;border:1px solid rgba(220,38,38,0.3);border-radius:6px;background:rgba(220,38,38,0.15);color:#fff;font-size:11px;cursor:pointer;font-family:inherit;">Dashboard</button>` +
+                    `</div>`;
                 tooltip.style.display = 'block';
-                // Position: project rack 3D position to screen
                 if (rack) {
                     const pos = rack.position.clone();
                     pos.y += 6;
                     pos.project(_topo.camera);
                     const rect = _topo.container.getBoundingClientRect();
-                    tooltip.style.left = ((pos.x + 1) / 2 * rect.width + 16) + 'px';
-                    tooltip.style.top = ((-pos.y + 1) / 2 * rect.height - 10) + 'px';
+                    const tx = Math.min((pos.x + 1) / 2 * rect.width + 16, rect.width - 300);
+                    const ty = Math.max((-pos.y + 1) / 2 * rect.height - 10, 10);
+                    tooltip.style.left = tx + 'px';
+                    tooltip.style.top = ty + 'px';
                 }
             }
+        } else if (tooltip) {
+            tooltip.style.pointerEvents = 'none';
         }
     }
 
@@ -26991,6 +27022,25 @@ function topologyResetCamera() {
 
 function topologyToggleLabels() { if (_topo) _topo.showLabels = !_topo.showLabels; }
 function topologyToggleAutoRotate() { if (_topo) _topo.autoRotate = !_topo.autoRotate; }
+
+function topoOpenTerminal(nodeId) {
+    // Set current node context then open terminal
+    currentNodeId = nodeId;
+    const node = allNodes.find(n => n.id === nodeId);
+    const name = node?.hostname || nodeId;
+    let url = '/console.html?type=host&name=' + encodeURIComponent(name);
+    if (node && !node.is_self) {
+        url += '&node_id=' + encodeURIComponent(nodeId);
+    }
+    window.open(url, 'console_' + name, 'width=960,height=600,menubar=no,toolbar=no');
+}
+
+function topoOpenDashboard(nodeId) {
+    if (_topo) _topo.selectedRackId = null;
+    const tooltip = document.getElementById('topology-tooltip');
+    if (tooltip) tooltip.style.display = 'none';
+    selectServerView(nodeId, 'dashboard');
+}
 
 var _topoPrevNodeHash = '';
 function topologyCheckUpdate() {
