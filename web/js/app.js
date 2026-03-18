@@ -27654,58 +27654,48 @@ function topologyCheckUpdate() {
 // VR Terminal — in-scene terminal with virtual keyboard
 // ═══════════════════════════════════════════════════════════════════════
 
-let _vrTerm = null; // { group, term, ws, screenTex, keys[], shift }
+let _vrTerm = null;
 
 function topoOpenVRTerminal(nodeId, runtime, containerName) {
-    if (!_topo || typeof Terminal === 'undefined') {
-        topoOpenTerminal(nodeId, runtime, containerName);
-        return;
-    }
-    // Close existing VR terminal and VR panel
-    topoCloseVRTerminal();
+    if (!_topo) return;
+    // Only one terminal at a time
+    if (_vrTerm) { topoCloseVRTerminal(); return; } // second click = close
     if (_topo._vrPanel) { _topo.scene.remove(_topo._vrPanel); _topo._vrPanel = null; }
 
     const group = new THREE.Group();
     const node = allNodes.find(n => n.id === nodeId);
     const name = containerName || node?.hostname || nodeId;
+    const type = runtime || 'host';
 
-    // Position in front of camera
+    // Position in front of camera, facing user
     const camPos = _topo.camera.getWorldPosition(new THREE.Vector3());
     const camDir = _topo.camera.getWorldDirection(new THREE.Vector3());
     group.position.copy(camPos).addScaledVector(camDir, 3);
     group.position.y = Math.max(group.position.y, 1.5);
-    // Face the camera but stay upright (only rotate on Y axis)
     group.lookAt(camPos.x, group.position.y, camPos.z);
 
-    // ── Terminal screen (xterm.js → canvas texture) ──
-    const termContainer = document.createElement('div');
-    termContainer.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:800px;height:500px;';
-    document.body.appendChild(termContainer);
+    // ── Hidden iframe running console.html (handles WS/auth itself) ──
+    const iframe = document.createElement('iframe');
+    let consoleUrl = '/console.html?type=' + encodeURIComponent(type) + '&name=' + encodeURIComponent(name);
+    if (node && !node.is_self) consoleUrl += '&node_id=' + encodeURIComponent(nodeId);
+    iframe.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:960px;height:600px;border:none;';
+    iframe.src = consoleUrl;
+    document.body.appendChild(iframe);
 
-    const term = new Terminal({ cols: 100, rows: 30, fontSize: 14, theme: {
-        background: '#0a0a14', foreground: '#e8e8ed', cursor: '#dc2626',
-        selectionBackground: '#dc262640',
-    }});
-    const fitAddon = new FitAddon.FitAddon();
-    term.loadAddon(fitAddon);
-    term.open(termContainer);
-    try { fitAddon.fit(); } catch(e) {}
-
-    // Screen plane — use a 2D mirror canvas that copies from xterm each frame
+    // Screen plane — mirror canvas copies from iframe's xterm canvas each frame
     const screenW = 2.8, screenH = 1.75;
-    const screenGeo = new THREE.PlaneGeometry(screenW, screenH);
     const mirrorCvs = document.createElement('canvas');
-    mirrorCvs.width = 800; mirrorCvs.height = 500;
+    mirrorCvs.width = 960; mirrorCvs.height = 600;
     const mirrorCtx = mirrorCvs.getContext('2d');
     mirrorCtx.fillStyle = '#0a0a14';
-    mirrorCtx.fillRect(0, 0, 800, 500);
+    mirrorCtx.fillRect(0, 0, 960, 600);
     mirrorCtx.font = '20px Inter, monospace';
     mirrorCtx.fillStyle = '#22c55e';
-    mirrorCtx.fillText('Connecting to ' + name + '...', 20, 250);
+    mirrorCtx.fillText('Opening ' + type + ': ' + name + '...', 20, 300);
     const screenTex = new THREE.CanvasTexture(mirrorCvs);
     screenTex.minFilter = THREE.LinearFilter;
     const screenMat = new THREE.MeshBasicMaterial({ map: screenTex, side: THREE.DoubleSide });
-    const screen = new THREE.Mesh(screenGeo, screenMat);
+    const screen = new THREE.Mesh(new THREE.PlaneGeometry(screenW, screenH), screenMat);
     screen.position.set(0, 0.9, 0);
     group.add(screen);
 
@@ -27776,118 +27766,26 @@ function topoOpenVRTerminal(nodeId, runtime, containerName) {
     });
     group.add(kbGroup);
 
-    // ── Connection: try WebSocket first, fall back to HTTP polling for VR ──
-    const type = runtime || 'host';
-    term.writeln('\x1b[33mConnecting to ' + type + ': ' + name + '...\x1b[0m');
-
-    // For remote nodes, build proxy prefix
-    const proxyPrefix = (node && !node.is_self) ? `/api/nodes/${encodeURIComponent(nodeId)}/proxy/` : '/api/';
-
-    // Try HTTPS first (same origin with cookie), then HTTP on port+1
-    const isHttps = window.location.protocol === 'https:';
-    const mainPort = parseInt(window.location.port) || (isHttps ? 443 : 80);
-    const createPath = proxyPrefix + 'vr-terminal/create';
-    const createBody = JSON.stringify({ type, name });
-
-    term.writeln('\x1b[33mCreating terminal session...\x1b[0m');
-
-    // Get session cookie value for explicit auth header
-    const sessionCookie = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('wolfstack_session='));
-    const sessionToken = sessionCookie ? sessionCookie.split('=')[1] : '';
-
-    let _vrTermBase = '';
-    function vrTermFetch(url, opts) {
-        opts = opts || {};
-        opts.credentials = 'include';
-        opts.headers = opts.headers || {};
-        opts.headers['Content-Type'] = 'application/json';
-        // Pass session token explicitly as cookie header backup
-        if (sessionToken) opts.headers['Cookie'] = 'wolfstack_session=' + sessionToken;
-        return fetch(url, opts);
-    }
-    // HTTPS (same origin)
-    function tryHttps() {
-        _vrTermBase = '';
-        return vrTermFetch(createPath, { method: 'POST', body: createBody });
-    }
-    // HTTP fallback on port+1
-    function tryHttp() {
-        const httpBase = 'http://' + window.location.hostname + ':' + (mainPort + 1);
-        _vrTermBase = httpBase;
-        return vrTermFetch(httpBase + createPath, { method: 'POST', body: createBody });
-    }
-
-    tryHttps().then(r => {
-        if (!r.ok) throw new Error('HTTPS ' + r.status);
-        return r;
-    }).catch(err => {
-        term.writeln('\x1b[33mHTTPS failed (' + err.message + '), trying HTTP...\x1b[0m');
-        return tryHttp();
-    }).then(r => {
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        return r.json();
-    }).then(data => {
-        if (!data.session_id) throw new Error(data.error || 'No session ID');
-        term.writeln('\x1b[32mConnected! Session: ' + data.session_id + '\x1b[0m\r\n');
-
-        const sessionId = data.session_id;
-        const outputUrl = _vrTermBase + proxyPrefix + 'vr-terminal/' + sessionId + '/output';
-        const inputUrl = _vrTermBase + proxyPrefix + 'vr-terminal/' + sessionId + '/input';
-
-        // Poll for output every 200ms
-        const pollInterval = setInterval(() => {
-            if (!_vrTerm || _vrTerm._sessionId !== sessionId) {
-                clearInterval(pollInterval);
-                return;
-            }
-            vrTermFetch(outputUrl)
-                .then(r => r.ok ? r.json() : null)
-                .then(d => { if (d?.output) term.write(d.output); })
-                .catch(() => {});
-        }, 200);
-
-        // Send keystrokes via HTTP POST
-        term.onData(input => {
-            if (!_vrTerm || _vrTerm._sessionId !== sessionId) return;
-            vrTermFetch(inputUrl, {
-                method: 'POST',
-                body: JSON.stringify({ data: input }),
-            }).catch(() => {});
-        });
-
-        if (_vrTerm) {
-            _vrTerm._sessionId = sessionId;
-            _vrTerm._pollInterval = pollInterval;
-        }
-    }).catch(err => {
-        term.writeln('\r\n\x1b[31mFailed to create terminal: ' + err.message + '\x1b[0m');
-        term.writeln('\x1b[33mFalling back to WebSocket...\x1b[0m');
-        // WebSocket fallback for desktop
-        const wsProtocol = isHttps ? 'wss:' : 'ws:';
-        let wsPath;
-        if (node && !node.is_self) {
-            wsPath = '/ws/remote-console/' + encodeURIComponent(nodeId) + '/' + type + '/' + encodeURIComponent(name);
-        } else {
-            wsPath = '/ws/console/' + type + '/' + encodeURIComponent(name);
-        }
-        const wsUrl = wsProtocol + '//' + window.location.host + wsPath;
-        try {
-            const ws = new WebSocket(wsUrl);
-            ws.binaryType = 'arraybuffer';
-            ws.onopen = () => { term.writeln('\x1b[32mWebSocket connected!\x1b[0m\r\n'); ws.send(JSON.stringify({ type: 'resize', cols: 100, rows: 30 })); };
-            ws.onmessage = (e) => { if (typeof e.data === 'string') term.write(e.data); else term.write(new Uint8Array(e.data)); };
-            ws.onclose = () => { term.writeln('\r\n\x1b[31mDisconnected\x1b[0m'); };
-            ws.onerror = () => { term.writeln('\r\n\x1b[31mWebSocket also failed\x1b[0m'); };
-            term.onData(data => { if (ws.readyState === WebSocket.OPEN) ws.send(data); });
-            if (_vrTerm) _vrTerm.ws = ws;
-        } catch(e) {
-            term.writeln('\r\n\x1b[31mAll connection methods failed\x1b[0m');
-        }
-    });
-
+    // Add to scene and set state
     _topo.scene.add(group);
+    _vrTerm = {
+        group, iframe, screenTex, mirrorCvs, mirrorCtx,
+        keyMeshes, closeBtn,
+        shift: false, caps: false,
+        isIframe: true, iframeCvs: null,
+        term: null, ws: null, termContainer: null,
+    };
 
-    _vrTerm = { group, term, ws, screenTex, termContainer, keyMeshes, closeBtn, shift: false, caps: false, mirrorCvs, mirrorCtx };
+    // Poll for iframe's xterm canvas
+    const pollForCanvas = setInterval(() => {
+        if (!_vrTerm || !_vrTerm.isIframe) { clearInterval(pollForCanvas); return; }
+        try {
+            const iDoc = iframe.contentDocument || iframe.contentWindow?.document;
+            if (!iDoc) return;
+            const cvs = iDoc.querySelector('.xterm canvas') || iDoc.querySelector('canvas');
+            if (cvs) { _vrTerm.iframeCvs = cvs; clearInterval(pollForCanvas); }
+        } catch(e) {}
+    }, 300);
 }
 
 function topoCloseVRTerminal() {
@@ -28091,17 +27989,28 @@ function vrVncHandleKey(key) {
 }
 
 function vrTermHandleKey(key) {
-    if (!_vrTerm || !_vrTerm.ws || _vrTerm.ws.readyState !== WebSocket.OPEN) return;
-    const ws = _vrTerm.ws;
+    if (!_vrTerm) return;
+
+    // Send keystroke to the iframe's WebSocket (console.html manages the WS)
+    let ws = null;
+    if (_vrTerm.isIframe && _vrTerm.iframe) {
+        try { ws = _vrTerm.iframe.contentWindow?.inlineTermWs || _vrTerm.iframe.contentWindow?._ws; } catch(e) {}
+    }
+    if (!ws && _vrTerm.ws) ws = _vrTerm.ws;
+
     const shift = _vrTerm.shift || _vrTerm.caps;
 
     if (key === 'Shift') { _vrTerm.shift = !_vrTerm.shift; return; }
     if (key === 'Caps') { _vrTerm.caps = !_vrTerm.caps; return; }
+
+    // Need a working WS to send data
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
     if (key === 'Bksp') { ws.send('\x7f'); return; }
     if (key === 'Tab') { ws.send('\t'); return; }
     if (key === 'Enter') { ws.send('\r'); return; }
     if (key === 'Esc') { ws.send('\x1b'); return; }
-    if (key === 'Ctrl') return; // modifier — would need state tracking
+    if (key === 'Ctrl') return;
     if (key === 'Alt') return;
 
     let ch = key;
@@ -28110,7 +28019,7 @@ function vrTermHandleKey(key) {
         ch = shiftMap[ch] || ch.toUpperCase();
     }
     ws.send(ch);
-    if (_vrTerm.shift) _vrTerm.shift = false; // one-shot shift
+    if (_vrTerm.shift) _vrTerm.shift = false;
 }
 
 // Update VR terminal/VNC screen texture each frame
@@ -28125,13 +28034,21 @@ function vrTermUpdate() {
             }
             _vrTerm.screenTex.needsUpdate = true;
         }
+    } else if (_vrTerm.isIframe) {
+        // Iframe terminal — copy xterm canvas from the hidden iframe
+        if (_vrTerm.iframeCvs && _vrTerm.mirrorCtx) {
+            try {
+                _vrTerm.mirrorCtx.drawImage(_vrTerm.iframeCvs, 0, 0, _vrTerm.mirrorCvs.width, _vrTerm.mirrorCvs.height);
+            } catch(e) {}
+        }
+        _vrTerm.screenTex.needsUpdate = true;
     } else {
-        // Terminal — copy xterm canvas to our mirror 2D canvas (works even if xterm uses WebGL)
+        // Direct terminal (fallback)
         const xtermCanvas = _vrTerm.termContainer?.querySelector('canvas');
         if (xtermCanvas && _vrTerm.mirrorCtx) {
             try {
                 _vrTerm.mirrorCtx.drawImage(xtermCanvas, 0, 0, _vrTerm.mirrorCvs.width, _vrTerm.mirrorCvs.height);
-            } catch(e) {} // silently fail if canvas is tainted
+            } catch(e) {}
         }
         _vrTerm.screenTex.needsUpdate = true;
     }

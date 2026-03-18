@@ -143,6 +143,7 @@
 
         function connectWebSocket(url) {
             ws = new WebSocket(url);
+            window._ws = ws; // expose for VR terminal iframe access
             ws.binaryType = 'arraybuffer';
             attachWebSocket(ws);
         }
