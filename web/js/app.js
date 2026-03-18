@@ -26556,35 +26556,28 @@ function initTopology3D() {
                 }
             }
 
-            // Check if pointing at the VR panel first (Terminal / Dashboard buttons)
+            // Check if pointing at the VR panel — any hit opens terminal/VNC
             if (_topo._vrPanel) {
                 const panelHits = ray.intersectObject(_topo._vrPanel);
                 if (panelHits.length > 0) {
                     const uv = panelHits[0].uv;
-                    if (uv && uv.y < 0.15) { // bottom area = buttons
+                    if (uv && uv.y < 0.2) { // bottom area = button
                         const pd = _topo._vrPanel.userData;
-                        if (uv.x < 0.5) {
-                            // Terminal/Console button (left half)
-                            const info = pd.unitIndex > 0 ? topoGetUnitInfo(pd.nodeId, pd.unitIndex) : null;
-                            if (info && info.runtime === 'vm') {
-                                // VMs need VNC — open in-scene
-                                const node = allNodes.find(n => n.id === pd.nodeId);
-                                if (node?.node_type === 'proxmox') {
-                                    fetch(`/api/nodes/${pd.nodeId}/pve/resources`).then(r => r.json()).then(guests => {
-                                        const g = (Array.isArray(guests) ? guests : []).find(g => g.name === info.name);
-                                        if (g) topoOpenVRVnc(pd.nodeId, g.vmid, info.name);
-                                    }).catch(() => {});
-                                } else {
-                                    topoOpenVRTerminal(pd.nodeId, 'host', null);
-                                }
-                            } else if (info) {
-                                topoOpenVRTerminal(pd.nodeId, info.runtime, info.name);
+                        const info = pd.unitIndex > 0 ? topoGetUnitInfo(pd.nodeId, pd.unitIndex) : null;
+                        if (info && info.runtime === 'vm') {
+                            const node = allNodes.find(n => n.id === pd.nodeId);
+                            if (node?.node_type === 'proxmox') {
+                                fetch(`/api/nodes/${pd.nodeId}/pve/resources`).then(r => r.json()).then(guests => {
+                                    const g = (Array.isArray(guests) ? guests : []).find(g => g.name === info.name);
+                                    if (g) topoOpenVRVnc(pd.nodeId, g.vmid, info.name);
+                                }).catch(() => {});
                             } else {
                                 topoOpenVRTerminal(pd.nodeId, 'host', null);
                             }
+                        } else if (info) {
+                            topoOpenVRTerminal(pd.nodeId, info.runtime, info.name);
                         } else {
-                            // Dashboard button (right half)
-                            topoOpenDashboard(pd.nodeId);
+                            topoOpenVRTerminal(pd.nodeId, 'host', null);
                         }
                     }
                     return;
@@ -27427,10 +27420,10 @@ function topoUpdateVRPanel() {
         }
     }
     lines.push({ text: '', size: 14 });
-    // Button label depends on type — VMs get VNC, everything else gets Terminal
+    // Button label — VMs get VNC, everything else gets Terminal
     const isVM = ui > 0 && (() => { const info = topoGetUnitInfo(n.id, ui); return info && info.runtime === 'vm'; })();
-    const btnLabel = isVM ? '[ VNC CONSOLE ]' : '[ TERMINAL ]';
-    lines.push({ text: btnLabel + '       [ DASHBOARD ]', color: '#dc2626', size: 20, bold: true, isButton: true });
+    const btnLabel = isVM ? '>>> OPEN VNC CONSOLE <<<' : '>>> OPEN TERMINAL <<<';
+    lines.push({ text: btnLabel, color: '#dc2626', size: 22, bold: true, isButton: true });
 
     // Render to canvas
     const cvs = document.createElement('canvas');
@@ -27458,9 +27451,10 @@ function topoUpdateVRPanel() {
     const panelMat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide });
     const panel = new THREE.Mesh(panelGeo, panelMat);
 
-    // Position floating in front of the rack
+    // Position floating in front of the rack, facing the user at +Z
     const rackPos = rack.position.clone();
-    panel.position.set(rackPos.x, 4.5, rackPos.z + 2.5); // in front of rack (user is at +Z)
+    panel.position.set(rackPos.x, 3.5, rackPos.z + 2.5);
+    panel.rotation.y = Math.PI; // face toward +Z (user)
 
     // Store button info for VR trigger detection
     panel.userData = { isVRPanel: true, nodeId: n.id, unitIndex: ui };
@@ -27649,7 +27643,8 @@ function topoOpenVRTerminal(nodeId, runtime, containerName) {
     const camDir = _topo.camera.getWorldDirection(new THREE.Vector3());
     group.position.copy(camPos).addScaledVector(camDir, 3);
     group.position.y = Math.max(group.position.y, 1.5);
-    group.lookAt(camPos);
+    // Face the camera but stay upright (only rotate on Y axis)
+    group.lookAt(camPos.x, group.position.y, camPos.z);
 
     // ── Terminal screen (xterm.js → canvas texture) ──
     const termContainer = document.createElement('div');
@@ -27794,7 +27789,8 @@ async function topoOpenVRVnc(nodeId, vmid, displayName) {
     const camDir = _topo.camera.getWorldDirection(new THREE.Vector3());
     group.position.copy(camPos).addScaledVector(camDir, 3);
     group.position.y = Math.max(group.position.y, 1.5);
-    group.lookAt(camPos);
+    // Face the camera but stay upright (only rotate on Y axis)
+    group.lookAt(camPos.x, group.position.y, camPos.z);
 
     // Get VNC ticket and WS path
     const oldNodeId = currentNodeId;
