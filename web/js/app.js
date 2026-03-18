@@ -26624,7 +26624,7 @@ function initTopology3D() {
         animId: null, clock: new THREE.Clock(),
         raycaster: new THREE.Raycaster(), mouse: new THREE.Vector2(),
         isDragging: false, prevMouse: { x: 0, y: 0 },
-        spherical: { radius: 25, theta: 0, phi: Math.PI / 3 },
+        spherical: { radius: 25, theta: Math.PI, phi: Math.PI / 3 },
         target: new THREE.Vector3(0, 3, 0),
         vrMoving: false, vrMoveDir: new THREE.Vector3(),
         _vrLasers: _vrLaserRefs,
@@ -27224,11 +27224,10 @@ function topologyEnterVR() {
         .then(session => {
             _topo.renderer.xr.setSession(session);
             // Position user in front of racks at standing height
-            // Position user in front of racks, facing them
-            // Racks face -Z, so user needs to be at +Z looking toward -Z
-            // WebXR default: user faces -Z. So at +Z facing -Z = correct
-            _topo.vrDolly.position.set(0, 0, 6);
-            _topo.vrDolly.rotation.set(0, 0, 0); // no rotation — default WebXR -Z forward
+            // Position user at -Z facing +Z (toward rack fronts at -Z face)
+            // WebXR default: user faces -Z. Rotate dolly PI so user faces +Z
+            _topo.vrDolly.position.set(0, 0, -6);
+            _topo.vrDolly.rotation.set(0, Math.PI, 0);
             showToast('Entering VR — use thumbsticks to walk around your server room', 'success');
         })
         .catch(err => {
@@ -27453,8 +27452,11 @@ function topoUpdateVRPanel() {
 
     // Position floating in front of the rack, facing the user at +Z
     const rackPos = rack.position.clone();
-    panel.position.set(rackPos.x, 3.5, rackPos.z + 2.5);
-    panel.rotation.y = Math.PI; // face toward +Z (user)
+    // Panel between user (at -Z) and rack (at Z~0)
+    panel.position.set(rackPos.x, 3.5, rackPos.z - 2.5);
+    // No rotation — PlaneGeometry faces +Z by default, but user is at -Z
+    // so rotate to face -Z (toward user)
+    // Actually: no rotation needed if user's dolly is rotated PI
 
     // Store button info for VR trigger detection
     panel.userData = { isVRPanel: true, nodeId: n.id, unitIndex: ui };
@@ -27660,10 +27662,18 @@ function topoOpenVRTerminal(nodeId, runtime, containerName) {
     term.open(termContainer);
     try { fitAddon.fit(); } catch(e) {}
 
-    // Screen plane
+    // Screen plane — create a placeholder canvas until xterm renders
     const screenW = 2.8, screenH = 1.75;
     const screenGeo = new THREE.PlaneGeometry(screenW, screenH);
-    const screenTex = new THREE.CanvasTexture(termContainer.querySelector('canvas') || document.createElement('canvas'));
+    const placeholderCvs = document.createElement('canvas');
+    placeholderCvs.width = 800; placeholderCvs.height = 500;
+    const pCtx = placeholderCvs.getContext('2d');
+    pCtx.fillStyle = '#0a0a14';
+    pCtx.fillRect(0, 0, 800, 500);
+    pCtx.font = '20px Inter, monospace';
+    pCtx.fillStyle = '#22c55e';
+    pCtx.fillText('Connecting to ' + name + '...', 20, 250);
+    const screenTex = new THREE.CanvasTexture(placeholderCvs);
     screenTex.minFilter = THREE.LinearFilter;
     const screenMat = new THREE.MeshBasicMaterial({ map: screenTex, side: THREE.DoubleSide });
     const screen = new THREE.Mesh(screenGeo, screenMat);
