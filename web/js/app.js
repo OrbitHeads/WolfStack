@@ -1004,7 +1004,17 @@ function selectView(page) {
         checkBetaAccess();
         loadIssueSchedule();
     } else if (page === 'topology') {
+        // Hide task log and toggle button in immersive 3D view
+        hideTaskLog();
+        const tlBtn = document.getElementById('task-log-toggle-btn');
+        if (tlBtn) tlBtn.style.display = 'none';
         initTopology3D();
+    }
+
+    // Restore task log toggle button when leaving topology
+    if (page !== 'topology') {
+        const tlBtn = document.getElementById('task-log-toggle-btn');
+        if (tlBtn && _taskLogEntries && _taskLogEntries.length > 0) tlBtn.style.display = 'flex';
     }
 }
 
@@ -26381,15 +26391,15 @@ async function k8sSaveSettings() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// 3D Topology View — Three.js cluster visualization
+// 3D Topology — Virtual Server Room with VR support
 // ═══════════════════════════════════════════════════════════════════════
 
-let _topo = null; // Topology state
+let _topo = null;
 
 function initTopology3D() {
     if (typeof THREE === 'undefined') {
-        document.getElementById('topology-container').innerHTML =
-            '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:rgba(255,255,255,0.5);font-size:14px;">Three.js is loading...</div>';
+        const c = document.getElementById('topology-container');
+        if (c) c.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:rgba(255,255,255,0.5);font-size:14px;">Loading 3D engine...</div>';
         setTimeout(initTopology3D, 500);
         return;
     }
@@ -26398,68 +26408,89 @@ function initTopology3D() {
     const canvas = document.getElementById('topology-canvas');
     if (!canvas || !container) return;
 
-    // Tear down previous scene
+    // Tear down previous
     if (_topo) {
         _topo.disposed = true;
+        if (_topo.renderer.xr.isPresenting) _topo.renderer.xr.getSession()?.end();
+        _topo.renderer.setAnimationLoop(null);
         if (_topo.animId) cancelAnimationFrame(_topo.animId);
         _topo.renderer.dispose();
-        container.removeEventListener('mousemove', _topo.onMouseMove);
-        container.removeEventListener('click', _topo.onClick);
         window.removeEventListener('resize', _topo.onResize);
     }
 
-    const W = container.clientWidth;
-    const H = container.clientHeight;
+    const W = container.clientWidth, H = container.clientHeight;
 
-    // Scene
+    // Scene — dark server room
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x0a0a12);
-    scene.fog = new THREE.FogExp2(0x0a0a12, 0.012);
+    scene.background = new THREE.Color(0x080810);
+    scene.fog = new THREE.Fog(0x080810, 30, 100);
 
     // Camera
-    const camera = new THREE.PerspectiveCamera(60, W / H, 0.1, 500);
-    camera.position.set(0, 25, 40);
-    camera.lookAt(0, 0, 0);
+    const camera = new THREE.PerspectiveCamera(65, W / H, 0.1, 500);
+    camera.position.set(0, 8, 20);
+    camera.lookAt(0, 3, 0);
 
-    // Renderer
-    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
+    // Renderer with XR
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
     renderer.setSize(W, H);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.xr.enabled = true;
 
-    // Lighting
-    const ambient = new THREE.AmbientLight(0x404060, 1.2);
-    scene.add(ambient);
-    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
-    dirLight.position.set(20, 30, 20);
-    scene.add(dirLight);
-    const pointLight = new THREE.PointLight(0xdc2626, 0.6, 80);
-    pointLight.position.set(0, 15, 0);
-    scene.add(pointLight);
+    // Lighting — moody server room ambience
+    scene.add(new THREE.AmbientLight(0x1a1a30, 0.4));
+    const ceiling1 = new THREE.SpotLight(0xccddff, 0.6, 60, Math.PI / 4, 0.5);
+    ceiling1.position.set(0, 12, 0);
+    ceiling1.castShadow = true;
+    scene.add(ceiling1);
+    const ceiling2 = new THREE.SpotLight(0xccddff, 0.3, 60, Math.PI / 3, 0.5);
+    ceiling2.position.set(15, 12, -10);
+    scene.add(ceiling2);
 
-    // Grid
-    const gridHelper = new THREE.GridHelper(80, 40, 0x1a1a2e, 0x111122);
-    gridHelper.position.y = -0.5;
-    scene.add(gridHelper);
+    // Floor — dark reflective
+    const floorGeo = new THREE.PlaneGeometry(80, 80);
+    const floorMat = new THREE.MeshPhongMaterial({ color: 0x111118, shininess: 80, specular: 0x222233 });
+    const floor = new THREE.Mesh(floorGeo, floorMat);
+    floor.rotation.x = -Math.PI / 2;
+    floor.receiveShadow = true;
+    scene.add(floor);
+
+    // Subtle floor grid
+    const grid = new THREE.GridHelper(80, 80, 0x1a1a2e, 0x0e0e18);
+    grid.position.y = 0.01;
+    scene.add(grid);
+
+    // VR setup
+    const vrBtn = document.getElementById('topology-vr-btn');
+    if (navigator.xr) {
+        navigator.xr.isSessionSupported('immersive-vr').then(supported => {
+            if (supported && vrBtn) vrBtn.style.display = 'inline-block';
+        }).catch(() => {});
+    }
+
+    // VR dolly (user rig for teleport/walk)
+    const vrDolly = new THREE.Group();
+    vrDolly.add(camera);
+    scene.add(vrDolly);
 
     // State
     const state = {
-        scene, camera, renderer, canvas, container,
-        nodeMeshes: [], connectionLines: [], labelSprites: [],
+        scene, camera, renderer, canvas, container, vrDolly,
+        nodeMeshes: [], extraMeshes: [], connectionLines: [], labelSprites: [],
         showLabels: true, autoRotate: true, disposed: false,
         animId: null, clock: new THREE.Clock(),
         raycaster: new THREE.Raycaster(), mouse: new THREE.Vector2(),
-        hoveredNode: null, selectedNode: null,
-        // Orbit control state (manual implementation — no import needed)
         isDragging: false, prevMouse: { x: 0, y: 0 },
-        spherical: { radius: 45, theta: Math.PI / 4, phi: Math.PI / 3 },
-        target: new THREE.Vector3(0, 2, 0),
+        spherical: { radius: 25, theta: Math.PI / 4, phi: Math.PI / 3.5 },
+        target: new THREE.Vector3(0, 3, 0),
+        vrMoving: false, vrMoveDir: new THREE.Vector3(),
     };
 
-    // Camera from spherical
     function updateCameraFromSpherical() {
         const s = state.spherical;
         s.phi = Math.max(0.1, Math.min(Math.PI - 0.1, s.phi));
-        s.radius = Math.max(10, Math.min(120, s.radius));
+        s.radius = Math.max(5, Math.min(80, s.radius));
         camera.position.set(
             s.radius * Math.sin(s.phi) * Math.sin(s.theta) + state.target.x,
             s.radius * Math.cos(s.phi) + state.target.y,
@@ -26469,56 +26500,44 @@ function initTopology3D() {
     }
     updateCameraFromSpherical();
 
-    // Mouse controls
-    container.addEventListener('mousedown', (e) => {
-        state.isDragging = true;
-        state.prevMouse = { x: e.clientX, y: e.clientY };
-    });
+    // Mouse orbit
+    container.addEventListener('mousedown', e => { state.isDragging = true; state.prevMouse = { x: e.clientX, y: e.clientY }; });
     container.addEventListener('mouseup', () => { state.isDragging = false; });
     container.addEventListener('mouseleave', () => { state.isDragging = false; });
-    container.addEventListener('mousemove', (e) => {
+    container.addEventListener('mousemove', e => {
         const rect = container.getBoundingClientRect();
         state.mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
         state.mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-
         if (state.isDragging) {
-            const dx = e.clientX - state.prevMouse.x;
-            const dy = e.clientY - state.prevMouse.y;
-            state.spherical.theta -= dx * 0.005;
-            state.spherical.phi += dy * 0.005;
+            state.spherical.theta -= (e.clientX - state.prevMouse.x) * 0.005;
+            state.spherical.phi += (e.clientY - state.prevMouse.y) * 0.005;
             updateCameraFromSpherical();
             state.prevMouse = { x: e.clientX, y: e.clientY };
             state.autoRotate = false;
         }
     });
-    state.onMouseMove = () => {}; // placeholder for cleanup
-    container.addEventListener('wheel', (e) => {
+    container.addEventListener('wheel', e => {
         e.preventDefault();
-        state.spherical.radius += e.deltaY * 0.05;
+        state.spherical.radius += e.deltaY * 0.04;
         updateCameraFromSpherical();
     }, { passive: false });
 
-    // Click handler
-    state.onClick = (e) => {
+    // Click
+    container.addEventListener('click', e => {
         const rect = container.getBoundingClientRect();
         state.mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
         state.mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
         state.raycaster.setFromCamera(state.mouse, camera);
-        const hits = state.raycaster.intersectObjects(state.nodeMeshes);
-        if (hits.length > 0) {
-            const nodeData = hits[0].object.userData;
-            if (nodeData && nodeData.id) {
-                selectServerView(nodeData.id, 'dashboard');
-            }
+        const hits = state.raycaster.intersectObjects(state.nodeMeshes.filter(m => m.userData.id && m.userData.isRack));
+        if (hits.length > 0 && hits[0].object.userData.id) {
+            selectServerView(hits[0].object.userData.id, 'dashboard');
         }
-    };
-    container.addEventListener('click', state.onClick);
+    });
 
     // Resize
     state.onResize = () => {
         if (state.disposed) return;
-        const w = container.clientWidth;
-        const h = container.clientHeight;
+        const w = container.clientWidth, h = container.clientHeight;
         camera.aspect = w / h;
         camera.updateProjectionMatrix();
         renderer.setSize(w, h);
@@ -26527,7 +26546,104 @@ function initTopology3D() {
 
     _topo = state;
     buildTopologyScene();
-    animateTopology();
+
+    // Render loop — use setAnimationLoop for XR compatibility
+    renderer.setAnimationLoop(topoRenderFrame);
+}
+
+// ─── Build server room scene ───
+
+function buildServerRack(node, color) {
+    const group = new THREE.Group();
+    const rackH = 5.5, rackW = 1.2, rackD = 2.0;
+
+    // Rack frame (dark metal)
+    const frameMat = new THREE.MeshPhongMaterial({ color: 0x1a1a20, shininess: 40, specular: 0x333344 });
+    // Posts
+    const postGeo = new THREE.BoxGeometry(0.08, rackH, 0.08);
+    [[-rackW/2, rackH/2, -rackD/2], [rackW/2, rackH/2, -rackD/2],
+     [-rackW/2, rackH/2, rackD/2], [rackW/2, rackH/2, rackD/2]].forEach(p => {
+        const post = new THREE.Mesh(postGeo, frameMat);
+        post.position.set(...p);
+        post.castShadow = true;
+        group.add(post);
+    });
+    // Top/bottom rails
+    const railH = new THREE.BoxGeometry(rackW + 0.08, 0.06, 0.08);
+    const railD = new THREE.BoxGeometry(0.08, 0.06, rackD + 0.08);
+    [0, rackH].forEach(y => {
+        [[-rackD/2], [rackD/2]].forEach(z => {
+            const r = new THREE.Mesh(railH, frameMat);
+            r.position.set(0, y, z[0]);
+            group.add(r);
+        });
+        [[-rackW/2], [rackW/2]].forEach(x => {
+            const r = new THREE.Mesh(railD, frameMat);
+            r.position.set(x[0], y, 0);
+            group.add(r);
+        });
+    });
+
+    // Server units — stack them in the rack
+    const unitH = 0.35, unitGap = 0.05;
+    const totalContainers = (node.docker_count || 0) + (node.lxc_count || 0) + (node.vm_count || 0);
+    const unitCount = Math.max(3, Math.min(12, totalContainers + 2));
+    const serverMat = new THREE.MeshPhongMaterial({
+        color: node.online ? 0x222230 : 0x1a1a1a,
+        shininess: 30,
+        specular: 0x444455,
+    });
+
+    for (let i = 0; i < unitCount; i++) {
+        const unitY = 0.3 + i * (unitH + unitGap);
+        if (unitY + unitH > rackH - 0.2) break;
+        const unitGeo = new THREE.BoxGeometry(rackW - 0.16, unitH, rackD - 0.2);
+        const unit = new THREE.Mesh(unitGeo, serverMat);
+        unit.position.set(0, unitY + unitH / 2, 0);
+        unit.castShadow = true;
+        group.add(unit);
+
+        // Front panel detail line
+        const panelGeo = new THREE.BoxGeometry(rackW - 0.2, unitH - 0.04, 0.02);
+        const panelMat = new THREE.MeshPhongMaterial({ color: 0x2a2a38, shininess: 20 });
+        const panel = new THREE.Mesh(panelGeo, panelMat);
+        panel.position.set(0, unitY + unitH / 2, -rackD / 2 + 0.12);
+        group.add(panel);
+
+        // Status LED on front
+        if (node.online) {
+            const ledGeo = new THREE.SphereGeometry(0.03, 8, 8);
+            const isContainer = i >= 2;
+            const ledColor = !isContainer ? 0x22c55e :
+                (i - 2) < (node.docker_count || 0) ? 0x3b82f6 :
+                (i - 2) < (node.docker_count || 0) + (node.lxc_count || 0) ? 0x10b981 : 0xf59e0b;
+            const ledMat = new THREE.MeshBasicMaterial({ color: ledColor });
+            const led = new THREE.Mesh(ledGeo, ledMat);
+            led.position.set(-rackW / 2 + 0.2, unitY + unitH / 2, -rackD / 2 + 0.1);
+            led.userData = { isLed: true, baseColor: ledColor };
+            group.add(led);
+        }
+    }
+
+    // Accent light strip on side (cluster color)
+    const stripGeo = new THREE.BoxGeometry(0.02, rackH - 0.5, 0.02);
+    const stripMat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: node.online ? 0.8 : 0.2 });
+    const stripL = new THREE.Mesh(stripGeo, stripMat);
+    stripL.position.set(-rackW / 2 - 0.02, rackH / 2, -rackD / 2);
+    group.add(stripL);
+    const stripR = new THREE.Mesh(stripGeo, stripMat);
+    stripR.position.set(rackW / 2 + 0.02, rackH / 2, -rackD / 2);
+    group.add(stripR);
+
+    // Point light for online glow
+    if (node.online) {
+        const glow = new THREE.PointLight(color, 0.3, 6);
+        glow.position.set(0, 3, -rackD / 2 - 0.5);
+        group.add(glow);
+    }
+
+    group.userData = { id: node.id, hostname: node.hostname, online: node.online, node, isRack: true };
+    return group;
 }
 
 function buildTopologyScene() {
@@ -26535,196 +26651,143 @@ function buildTopologyScene() {
     const { scene } = _topo;
     const nodes = allNodes || [];
 
-    // Clear existing node meshes, connections, labels
-    _topo.nodeMeshes.forEach(m => scene.remove(m));
-    _topo.connectionLines.forEach(l => scene.remove(l));
-    _topo.labelSprites.forEach(s => scene.remove(s));
+    // Clear
+    [..._topo.nodeMeshes, ..._topo.extraMeshes, ..._topo.connectionLines, ..._topo.labelSprites]
+        .forEach(m => scene.remove(m));
     _topo.nodeMeshes = [];
+    _topo.extraMeshes = [];
     _topo.connectionLines = [];
     _topo.labelSprites = [];
 
     if (nodes.length === 0) return;
 
-    // Group nodes by cluster
+    // Group by cluster
     const clusters = {};
     nodes.forEach(n => {
-        const cName = n.cluster_name || n.pve_cluster_name || 'Default';
-        if (!clusters[cName]) clusters[cName] = [];
-        clusters[cName].push(n);
+        const c = n.cluster_name || n.pve_cluster_name || 'Default';
+        if (!clusters[c]) clusters[c] = [];
+        clusters[c].push(n);
     });
 
-    const clusterNames = Object.keys(clusters);
-    const clusterColors = [0xdc2626, 0x3b82f6, 0x10b981, 0xf59e0b, 0x8b5cf6, 0xec4899, 0x06b6d4, 0xf97316];
-    const clusterPositions = {};
+    const cNames = Object.keys(clusters);
+    const cColors = [0xdc2626, 0x3b82f6, 0x10b981, 0xf59e0b, 0x8b5cf6, 0xec4899, 0x06b6d4, 0xf97316];
+    const rackSpacing = 3.0;
+    const clusterGap = 5.0;
 
-    // Layout clusters in a circle
-    clusterNames.forEach((cName, ci) => {
-        const angle = (ci / clusterNames.length) * Math.PI * 2;
-        const clusterRadius = clusterNames.length > 1 ? 18 : 0;
-        const cx = Math.cos(angle) * clusterRadius;
-        const cz = Math.sin(angle) * clusterRadius;
-        clusterPositions[cName] = { x: cx, z: cz };
-        const color = clusterColors[ci % clusterColors.length];
+    // Lay out racks in rows per cluster
+    let offsetX = 0;
+    cNames.forEach((cName, ci) => {
+        const color = cColors[ci % cColors.length];
         const clusterNodes = clusters[cName];
+        const startX = offsetX;
 
-        // Layout nodes in a smaller circle within the cluster
         clusterNodes.forEach((node, ni) => {
-            const nAngle = (ni / clusterNodes.length) * Math.PI * 2 - Math.PI / 2;
-            const nRadius = Math.max(3, clusterNodes.length * 1.5);
-            const nx = cx + Math.cos(nAngle) * nRadius;
-            const nz = cz + Math.sin(nAngle) * nRadius;
+            const rack = buildServerRack(node, color);
+            const x = offsetX + ni * rackSpacing;
+            rack.position.set(x, 0, 0);
+            scene.add(rack);
+            _topo.nodeMeshes.push(rack);
 
-            // Node box
-            const size = node.is_self ? 2.2 : 1.8;
-            const geometry = new THREE.BoxGeometry(size, size * 0.6, size);
-            const meshColor = node.online ? color : 0x444455;
-            const material = new THREE.MeshPhongMaterial({
-                color: meshColor,
-                emissive: node.online ? new THREE.Color(color).multiplyScalar(0.15) : new THREE.Color(0x111111),
-                shininess: 60,
-                transparent: !node.online,
-                opacity: node.online ? 1.0 : 0.5,
+            // Hostname label above rack
+            const label = makeTextSprite(node.hostname || node.id, {
+                fontSize: 26,
+                color: node.online ? '#ffffff' : '#555566'
             });
-            const mesh = new THREE.Mesh(geometry, material);
-            mesh.position.set(nx, size * 0.3, nz);
-            mesh.userData = { id: node.id, hostname: node.hostname, cluster: cName, online: node.online, node };
-            mesh.castShadow = true;
-            scene.add(mesh);
-            _topo.nodeMeshes.push(mesh);
-
-            // Status light on top
-            const lightGeo = new THREE.SphereGeometry(0.18, 12, 12);
-            const lightMat = new THREE.MeshBasicMaterial({
-                color: node.online ? 0x22c55e : 0xef4444,
-            });
-            const lightMesh = new THREE.Mesh(lightGeo, lightMat);
-            lightMesh.position.set(nx, size * 0.6 + 0.3, nz);
-            scene.add(lightMesh);
-            _topo.nodeMeshes.push(lightMesh); // track for cleanup
-
-            // Container count indicators (small spheres around node)
-            const totalContainers = (node.docker_count || 0) + (node.lxc_count || 0) + (node.vm_count || 0);
-            for (let ci = 0; ci < Math.min(totalContainers, 12); ci++) {
-                const cAngle = (ci / Math.min(totalContainers, 12)) * Math.PI * 2;
-                const cGeo = new THREE.SphereGeometry(0.12, 8, 8);
-                const cColor = ci < (node.docker_count || 0) ? 0x3b82f6 :
-                    ci < (node.docker_count || 0) + (node.lxc_count || 0) ? 0x10b981 : 0xf59e0b;
-                const cMat = new THREE.MeshBasicMaterial({ color: cColor });
-                const cMesh = new THREE.Mesh(cGeo, cMat);
-                cMesh.position.set(
-                    nx + Math.cos(cAngle) * (size * 0.6 + 0.3),
-                    0.3,
-                    nz + Math.sin(cAngle) * (size * 0.6 + 0.3)
-                );
-                cMesh.userData = { isContainer: true, parentId: node.id };
-                scene.add(cMesh);
-                _topo.nodeMeshes.push(cMesh);
-            }
-
-            // Label sprite
-            const label = makeTextSprite(node.hostname || node.id, { fontSize: 28, color: node.online ? '#ffffff' : '#666677' });
-            label.position.set(nx, size * 0.6 + 0.9, nz);
+            label.position.set(x, 6.2, 0);
             label.userData = { isLabel: true };
             scene.add(label);
             _topo.labelSprites.push(label);
         });
 
-        // Connections within cluster (mesh lines)
-        for (let i = 0; i < clusterNodes.length; i++) {
-            for (let j = i + 1; j < clusterNodes.length; j++) {
-                if (!clusterNodes[i].online || !clusterNodes[j].online) continue;
-                const mi = _topo.nodeMeshes.find(m => m.userData.id === clusterNodes[i].id);
-                const mj = _topo.nodeMeshes.find(m => m.userData.id === clusterNodes[j].id);
-                if (!mi || !mj) continue;
-
-                const points = [mi.position.clone(), mj.position.clone()];
-                points[0].y = 0.1;
-                points[1].y = 0.1;
-                const lineGeo = new THREE.BufferGeometry().setFromPoints(points);
-                const lineMat = new THREE.LineBasicMaterial({
-                    color: color, transparent: true, opacity: 0.25,
-                });
-                const line = new THREE.Line(lineGeo, lineMat);
-                scene.add(line);
-                _topo.connectionLines.push(line);
-            }
-        }
-
-        // Cluster ring on ground
-        if (clusterNodes.length > 1) {
-            const ringRadius = Math.max(3, clusterNodes.length * 1.5) + 1.5;
-            const ringGeo = new THREE.RingGeometry(ringRadius - 0.05, ringRadius + 0.05, 64);
-            const ringMat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.15, side: THREE.DoubleSide });
-            const ring = new THREE.Mesh(ringGeo, ringMat);
-            ring.rotation.x = -Math.PI / 2;
-            ring.position.set(cx, 0.01, cz);
-            scene.add(ring);
-            _topo.connectionLines.push(ring);
-        }
-
-        // Cluster label
-        if (clusterNames.length > 1) {
-            const clabel = makeTextSprite(cName, { fontSize: 22, color: '#' + color.toString(16).padStart(6, '0') });
-            const labelY = 4.5;
-            clabel.position.set(cx, labelY, cz);
+        // Cluster name label
+        if (cNames.length > 1) {
+            const midX = startX + (clusterNodes.length - 1) * rackSpacing / 2;
+            const clabel = makeTextSprite(cName, {
+                fontSize: 32,
+                color: '#' + color.toString(16).padStart(6, '0')
+            });
+            clabel.position.set(midX, 7.5, 0);
             clabel.userData = { isLabel: true };
             scene.add(clabel);
             _topo.labelSprites.push(clabel);
         }
+
+        // WolfNet cables between racks in same cluster (glowing lines on the floor)
+        for (let i = 0; i < clusterNodes.length - 1; i++) {
+            if (!clusterNodes[i].online || !clusterNodes[i + 1].online) continue;
+            const x1 = startX + i * rackSpacing;
+            const x2 = startX + (i + 1) * rackSpacing;
+            const pts = [new THREE.Vector3(x1, 0.05, 1.2), new THREE.Vector3(x2, 0.05, 1.2)];
+            const lGeo = new THREE.BufferGeometry().setFromPoints(pts);
+            const lMat = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.4 });
+            const line = new THREE.Line(lGeo, lMat);
+            scene.add(line);
+            _topo.connectionLines.push(line);
+        }
+
+        offsetX += clusterNodes.length * rackSpacing + clusterGap;
     });
 
-    // Cross-cluster connections (if multiple clusters with online nodes)
-    if (clusterNames.length > 1) {
-        for (let i = 0; i < clusterNames.length; i++) {
-            for (let j = i + 1; j < clusterNames.length; j++) {
-                const posA = clusterPositions[clusterNames[i]];
-                const posB = clusterPositions[clusterNames[j]];
-                const midY = 3;
+    // Centre the scene
+    const totalWidth = offsetX - clusterGap;
+    const centreOffset = -totalWidth / 2;
+    [..._topo.nodeMeshes, ..._topo.labelSprites, ..._topo.connectionLines].forEach(m => {
+        m.position.x += centreOffset;
+    });
+    _topo.target.set(0, 3, 0);
+
+    // Cross-cluster cables (curved overhead)
+    if (cNames.length > 1) {
+        let cx = centreOffset;
+        const clusterCentres = [];
+        cNames.forEach((c, i) => {
+            const n = clusters[c].length;
+            clusterCentres.push(cx + (n - 1) * rackSpacing / 2);
+            cx += n * rackSpacing + clusterGap;
+        });
+        for (let i = 0; i < clusterCentres.length; i++) {
+            for (let j = i + 1; j < clusterCentres.length; j++) {
                 const curve = new THREE.QuadraticBezierCurve3(
-                    new THREE.Vector3(posA.x, 0.5, posA.z),
-                    new THREE.Vector3((posA.x + posB.x) / 2, midY, (posA.z + posB.z) / 2),
-                    new THREE.Vector3(posB.x, 0.5, posB.z)
+                    new THREE.Vector3(clusterCentres[i], 6.5, -1),
+                    new THREE.Vector3((clusterCentres[i] + clusterCentres[j]) / 2, 10, -2),
+                    new THREE.Vector3(clusterCentres[j], 6.5, -1)
                 );
-                const curvePoints = curve.getPoints(30);
-                const curveGeo = new THREE.BufferGeometry().setFromPoints(curvePoints);
-                const curveMat = new THREE.LineDashedMaterial({
-                    color: 0xdc2626, transparent: true, opacity: 0.3,
-                    dashSize: 0.5, gapSize: 0.3,
+                const cGeo = new THREE.BufferGeometry().setFromPoints(curve.getPoints(40));
+                const cMat = new THREE.LineDashedMaterial({
+                    color: 0xdc2626, transparent: true, opacity: 0.25,
+                    dashSize: 0.4, gapSize: 0.2,
                 });
-                const curveLine = new THREE.Line(curveGeo, curveMat);
-                curveLine.computeLineDistances();
-                scene.add(curveLine);
-                _topo.connectionLines.push(curveLine);
+                const cLine = new THREE.Line(cGeo, cMat);
+                cLine.computeLineDistances();
+                scene.add(cLine);
+                _topo.connectionLines.push(cLine);
             }
         }
     }
 
-    // Update HUD stats
-    const onlineCount = nodes.filter(n => n.online).length;
-    const totalDocker = nodes.reduce((s, n) => s + (n.docker_count || 0), 0);
-    const totalLxc = nodes.reduce((s, n) => s + (n.lxc_count || 0), 0);
-    const totalVm = nodes.reduce((s, n) => s + (n.vm_count || 0), 0);
-    const statsEl = document.getElementById('topology-stats');
-    if (statsEl) {
-        statsEl.innerHTML = `
-            <div><span style="color:#22c55e;">&#9679;</span> ${onlineCount} online / ${nodes.length} nodes</div>
-            <div><span style="color:#3b82f6;">&#9679;</span> ${totalDocker} Docker containers</div>
-            <div><span style="color:#10b981;">&#9679;</span> ${totalLxc} LXC containers</div>
-            <div><span style="color:#f59e0b;">&#9679;</span> ${totalVm} VMs</div>
-            <div style="margin-top:6px;color:rgba(255,255,255,0.4);font-size:10px;">Drag to orbit &bull; Scroll to zoom &bull; Click node to open</div>
-        `;
-    }
+    // Update HUD
+    const on = nodes.filter(n => n.online).length;
+    const dc = nodes.reduce((s, n) => s + (n.docker_count || 0), 0);
+    const lc = nodes.reduce((s, n) => s + (n.lxc_count || 0), 0);
+    const vc = nodes.reduce((s, n) => s + (n.vm_count || 0), 0);
+    const el = document.getElementById('topology-stats');
+    if (el) el.innerHTML =
+        `<div><span style="color:#22c55e;">&#9679;</span> ${on} online / ${nodes.length} nodes</div>` +
+        `<div><span style="color:#3b82f6;">&#9679;</span> ${dc} Docker</div>` +
+        `<div><span style="color:#10b981;">&#9679;</span> ${lc} LXC</div>` +
+        `<div><span style="color:#f59e0b;">&#9679;</span> ${vc} VMs</div>` +
+        `<div style="margin-top:6px;color:rgba(255,255,255,0.4);font-size:10px;">Drag to orbit &bull; Scroll to zoom &bull; Click rack to open</div>`;
 }
 
-function animateTopology() {
-    if (!_topo || _topo.disposed) return;
-    _topo.animId = requestAnimationFrame(animateTopology);
+// ─── Render loop (XR-compatible) ───
 
+function topoRenderFrame(timestamp, xrFrame) {
+    if (!_topo || _topo.disposed) return;
     const time = _topo.clock.getElapsedTime();
 
-    // Auto rotate
-    if (_topo.autoRotate && !_topo.isDragging) {
-        _topo.spherical.theta += 0.002;
+    // Auto rotate (desktop only, not in VR)
+    if (_topo.autoRotate && !_topo.isDragging && !_topo.renderer.xr.isPresenting) {
+        _topo.spherical.theta += 0.0015;
         const s = _topo.spherical;
         _topo.camera.position.set(
             s.radius * Math.sin(s.phi) * Math.sin(s.theta) + _topo.target.x,
@@ -26734,144 +26797,152 @@ function animateTopology() {
         _topo.camera.lookAt(_topo.target);
     }
 
-    // Animate node meshes (gentle float)
-    _topo.nodeMeshes.forEach(m => {
-        if (m.userData.id && !m.userData.isContainer) {
-            m.position.y = m.geometry?.parameters?.height * 0.3 + Math.sin(time * 1.2 + m.position.x) * 0.15;
-        }
-        // Orbit container indicators
-        if (m.userData.isContainer) {
-            const parent = _topo.nodeMeshes.find(p => p.userData.id === m.userData.parentId && !p.userData.isContainer);
-            if (parent) {
-                const idx = _topo.nodeMeshes.filter(c => c.userData.isContainer && c.userData.parentId === m.userData.parentId).indexOf(m);
-                const total = _topo.nodeMeshes.filter(c => c.userData.isContainer && c.userData.parentId === m.userData.parentId).length;
-                const a = (idx / total) * Math.PI * 2 + time * 0.5;
-                const r = 1.5;
-                m.position.x = parent.position.x + Math.cos(a) * r;
-                m.position.z = parent.position.z + Math.sin(a) * r;
-                m.position.y = 0.3 + Math.sin(time * 2 + idx) * 0.08;
+    // Animate LEDs (blink)
+    _topo.nodeMeshes.forEach(rack => {
+        if (!rack.userData.isRack) return;
+        rack.children.forEach(child => {
+            if (child.userData.isLed) {
+                const intensity = 0.5 + 0.5 * Math.sin(time * 3 + child.position.y * 10);
+                child.material.opacity = intensity;
+                child.material.transparent = true;
             }
-        }
+        });
     });
 
-    // Raycast for hover
-    _topo.raycaster.setFromCamera(_topo.mouse, _topo.camera);
-    const hits = _topo.raycaster.intersectObjects(_topo.nodeMeshes.filter(m => m.userData.id && !m.userData.isContainer));
-    const tooltip = document.getElementById('topology-tooltip');
-    if (hits.length > 0) {
-        const nd = hits[0].object.userData;
-        if (nd.node) {
-            const n = nd.node;
-            const cpu = n.metrics?.cpu_percent?.toFixed(0) || '?';
-            const mem = n.metrics?.memory_percent?.toFixed(0) || '?';
-            tooltip.innerHTML = `
-                <div style="font-weight:700;font-size:13px;margin-bottom:6px;">${escapeHtml(n.hostname || n.id)}</div>
-                <div style="color:rgba(255,255,255,0.6);line-height:1.7;">
-                    <div>${n.online ? '<span style="color:#22c55e;">&#9679;</span> Online' : '<span style="color:#ef4444;">&#9679;</span> Offline'} &bull; ${escapeHtml(n.address)}</div>
-                    <div>CPU: ${cpu}% &bull; Memory: ${mem}%</div>
-                    <div>${n.docker_count || 0} Docker &bull; ${n.lxc_count || 0} LXC &bull; ${n.vm_count || 0} VMs</div>
-                    ${nd.cluster ? '<div style="margin-top:4px;color:rgba(255,255,255,0.4);">Cluster: ' + escapeHtml(nd.cluster) + '</div>' : ''}
-                </div>
-            `;
-            tooltip.style.display = 'block';
-            // Position near cursor
-            const rect = _topo.container.getBoundingClientRect();
-            const mx = ((_topo.mouse.x + 1) / 2) * rect.width;
-            const my = ((-_topo.mouse.y + 1) / 2) * rect.height;
-            tooltip.style.left = (mx + 16) + 'px';
-            tooltip.style.top = (my - 10) + 'px';
+    // VR locomotion — thumbstick/gamepad-based walking
+    if (_topo.renderer.xr.isPresenting) {
+        const session = _topo.renderer.xr.getSession();
+        if (session && session.inputSources) {
+            for (const source of session.inputSources) {
+                if (source.gamepad && source.gamepad.axes.length >= 4) {
+                    const ax = source.gamepad.axes[2] || 0;
+                    const ay = source.gamepad.axes[3] || 0;
+                    if (Math.abs(ax) > 0.1 || Math.abs(ay) > 0.1) {
+                        const speed = 0.06;
+                        const dir = new THREE.Vector3(ax * speed, 0, ay * speed);
+                        dir.applyQuaternion(_topo.camera.quaternion);
+                        dir.y = 0; // keep on ground
+                        _topo.vrDolly.position.add(dir);
+                    }
+                }
+            }
         }
-        _topo.container.style.cursor = 'pointer';
-    } else {
-        tooltip.style.display = 'none';
-        _topo.container.style.cursor = _topo.isDragging ? 'grabbing' : 'grab';
     }
 
-    // Make labels face camera
-    _topo.labelSprites.forEach(s => {
-        if (_topo.showLabels) {
-            s.visible = true;
-            s.lookAt(_topo.camera.position);
+    // Hover tooltip (desktop only)
+    if (!_topo.renderer.xr.isPresenting) {
+        _topo.raycaster.setFromCamera(_topo.mouse, _topo.camera);
+        const rackMeshes = _topo.nodeMeshes.filter(m => m.userData.isRack);
+        const hits = _topo.raycaster.intersectObjects(rackMeshes, true);
+        const tooltip = document.getElementById('topology-tooltip');
+        if (hits.length > 0) {
+            // Walk up to find rack group
+            let obj = hits[0].object;
+            while (obj && !obj.userData.isRack && obj.parent) obj = obj.parent;
+            const nd = obj?.userData;
+            if (nd?.node) {
+                const n = nd.node;
+                tooltip.innerHTML =
+                    `<div style="font-weight:700;font-size:13px;margin-bottom:6px;">${escapeHtml(n.hostname || n.id)}</div>` +
+                    `<div style="color:rgba(255,255,255,0.6);line-height:1.7;">` +
+                    `<div>${n.online ? '<span style="color:#22c55e;">&#9679;</span> Online' : '<span style="color:#ef4444;">&#9679;</span> Offline'} &bull; ${escapeHtml(n.address)}</div>` +
+                    `<div>CPU: ${n.metrics?.cpu_percent?.toFixed(0) || '?'}% &bull; Mem: ${n.metrics?.memory_percent?.toFixed(0) || '?'}%</div>` +
+                    `<div>${n.docker_count || 0} Docker &bull; ${n.lxc_count || 0} LXC &bull; ${n.vm_count || 0} VMs</div></div>`;
+                tooltip.style.display = 'block';
+                const rect = _topo.container.getBoundingClientRect();
+                tooltip.style.left = ((_topo.mouse.x + 1) / 2 * rect.width + 16) + 'px';
+                tooltip.style.top = ((-_topo.mouse.y + 1) / 2 * rect.height - 10) + 'px';
+            }
+            _topo.container.style.cursor = 'pointer';
         } else {
-            s.visible = false;
+            tooltip.style.display = 'none';
+            _topo.container.style.cursor = _topo.isDragging ? 'grabbing' : 'grab';
         }
+    }
+
+    // Labels face camera
+    _topo.labelSprites.forEach(s => {
+        s.visible = _topo.showLabels;
+        if (s.visible) s.lookAt(_topo.camera.getWorldPosition(new THREE.Vector3()));
     });
 
     _topo.renderer.render(_topo.scene, _topo.camera);
 }
 
+// ─── VR entry ───
+
+function topologyEnterVR() {
+    if (!_topo || !navigator.xr) return;
+    navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor', 'bounded-floor'] })
+        .then(session => {
+            _topo.renderer.xr.setSession(session);
+            // Position user in front of racks at standing height
+            _topo.vrDolly.position.set(0, 0, 8);
+            showToast('Entering VR — use thumbsticks to walk around your server room', 'success');
+        })
+        .catch(err => {
+            showToast('VR failed: ' + err.message, 'error');
+        });
+}
+
+// ─── Text sprite helper ───
+
 function makeTextSprite(text, opts = {}) {
     const fontSize = opts.fontSize || 24;
     const color = opts.color || '#ffffff';
-    const canvas = document.createElement('canvas');
-    const ctx = canvas.getContext('2d');
+    const cvs = document.createElement('canvas');
+    const ctx = cvs.getContext('2d');
     const font = `${fontSize}px Inter, sans-serif`;
     ctx.font = font;
-    const textWidth = ctx.measureText(text).width;
-    canvas.width = textWidth + 20;
-    canvas.height = fontSize + 16;
+    const tw = ctx.measureText(text).width;
+    cvs.width = tw + 20;
+    cvs.height = fontSize + 16;
     ctx.font = font;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    // Background pill
     ctx.fillStyle = 'rgba(0,0,0,0.5)';
-    const rx = canvas.width / 2, ry = canvas.height / 2;
-    const rr = canvas.height / 2;
+    const rr = cvs.height / 2;
     ctx.beginPath();
     if (ctx.roundRect) {
-        ctx.roundRect(0, 0, canvas.width, canvas.height, rr);
+        ctx.roundRect(0, 0, cvs.width, cvs.height, rr);
     } else {
-        // Fallback for browsers without roundRect
-        const w = canvas.width, h = canvas.height;
-        ctx.moveTo(rr, 0);
-        ctx.lineTo(w - rr, 0);
-        ctx.arcTo(w, 0, w, rr, rr);
-        ctx.lineTo(w, h - rr);
-        ctx.arcTo(w, h, w - rr, h, rr);
-        ctx.lineTo(rr, h);
-        ctx.arcTo(0, h, 0, h - rr, rr);
-        ctx.lineTo(0, rr);
-        ctx.arcTo(0, 0, rr, 0, rr);
+        const w = cvs.width, h = cvs.height;
+        ctx.moveTo(rr, 0); ctx.lineTo(w - rr, 0); ctx.arcTo(w, 0, w, rr, rr);
+        ctx.lineTo(w, h - rr); ctx.arcTo(w, h, w - rr, h, rr);
+        ctx.lineTo(rr, h); ctx.arcTo(0, h, 0, h - rr, rr);
+        ctx.lineTo(0, rr); ctx.arcTo(0, 0, rr, 0, rr);
     }
     ctx.fill();
-    // Text
     ctx.fillStyle = color;
-    ctx.fillText(text, rx, ry);
+    ctx.fillText(text, cvs.width / 2, cvs.height / 2);
 
-    const texture = new THREE.CanvasTexture(canvas);
-    texture.minFilter = THREE.LinearFilter;
-    const spriteMat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
-    const sprite = new THREE.Sprite(spriteMat);
-    const aspect = canvas.width / canvas.height;
-    sprite.scale.set(aspect * 1.5, 1.5, 1);
+    const tex = new THREE.CanvasTexture(cvs);
+    tex.minFilter = THREE.LinearFilter;
+    const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+    const sprite = new THREE.Sprite(mat);
+    sprite.scale.set((cvs.width / cvs.height) * 1.5, 1.5, 1);
     return sprite;
 }
 
+// ─── Controls ───
+
 function topologyResetCamera() {
     if (!_topo) return;
-    _topo.spherical = { radius: 45, theta: Math.PI / 4, phi: Math.PI / 3 };
-    _topo.target.set(0, 2, 0);
+    _topo.spherical = { radius: 25, theta: Math.PI / 4, phi: Math.PI / 3.5 };
     _topo.autoRotate = true;
+    if (_topo.vrDolly) _topo.vrDolly.position.set(0, 0, 0);
     const s = _topo.spherical;
     _topo.camera.position.set(
-        s.radius * Math.sin(s.phi) * Math.sin(s.theta),
-        s.radius * Math.cos(s.phi) + 2,
-        s.radius * Math.sin(s.phi) * Math.cos(s.theta)
+        s.radius * Math.sin(s.phi) * Math.sin(s.theta) + _topo.target.x,
+        s.radius * Math.cos(s.phi) + _topo.target.y,
+        s.radius * Math.sin(s.phi) * Math.cos(s.theta) + _topo.target.z
     );
     _topo.camera.lookAt(_topo.target);
 }
 
-function topologyToggleLabels() {
-    if (!_topo) return;
-    _topo.showLabels = !_topo.showLabels;
-}
+function topologyToggleLabels() { if (_topo) _topo.showLabels = !_topo.showLabels; }
+function topologyToggleAutoRotate() { if (_topo) _topo.autoRotate = !_topo.autoRotate; }
 
-function topologyToggleAutoRotate() {
-    if (!_topo) return;
-    _topo.autoRotate = !_topo.autoRotate;
-}
-
-// Rebuild scene when node data changes (called from fetchNodes polling)
 var _topoPrevNodeHash = '';
 function topologyCheckUpdate() {
     if (!_topo || _topo.disposed || currentPage !== 'topology') return;
