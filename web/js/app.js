@@ -26680,6 +26680,9 @@ function buildServerRack(node, color) {
         panel.position.set(0, unitY + unitH / 2, frontZ + 0.12);
         group.add(panel);
 
+        // Container index (0-based, skipping mother)
+        const ci = i - 1;
+
         // 3 LEDs: CPU, MEM, STORAGE — per-container when available, host fallback
         const ledR = 0.035;
         const ledGeo2 = new THREE.SphereGeometry(ledR, 10, 10);
@@ -26726,17 +26729,16 @@ function buildServerRack(node, color) {
         // No LEDs if online but no data yet — they appear after fetch
 
         // Label text — use real container names from cache if available
-        const ci = i - 1;
         let labelText = '';
-        const cc = _topoContainerCache[node.id];
+        const ccLabel = _topoContainerCache[node.id];
         if (isMother) {
             labelText = 'HOST';
         } else if (ci < dockerCount) {
-            labelText = cc?.docker?.[ci]?.name || ('Docker ' + (ci + 1));
+            labelText = ccLabel?.docker?.[ci]?.name || ('Docker ' + (ci + 1));
         } else if (ci < dockerCount + lxcCount) {
-            labelText = cc?.lxc?.[ci - dockerCount]?.name || ('LXC ' + (ci - dockerCount + 1));
+            labelText = ccLabel?.lxc?.[ci - dockerCount]?.name || ('LXC ' + (ci - dockerCount + 1));
         } else {
-            labelText = cc?.vms?.[ci - dockerCount - lxcCount]?.name || ('VM ' + (ci - dockerCount - lxcCount + 1));
+            labelText = ccLabel?.vms?.[ci - dockerCount - lxcCount]?.name || ('VM ' + (ci - dockerCount - lxcCount + 1));
         }
         // Truncate long names
         if (labelText.length > 14) labelText = labelText.substring(0, 13) + '..';
