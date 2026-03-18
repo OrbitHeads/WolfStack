@@ -6113,7 +6113,11 @@ async function renderPveResourcesView(nodeId) {
 
     function consoleLink(g) {
         if (g.status !== 'running') return '';
-        return `<button class="btn btn-sm" onclick="openPveConsole('${nodeId}', ${g.vmid}, '${g.name || 'VMID ' + g.vmid}')" style="font-size:11px;padding:3px 10px;">🖥 Console</button>`;
+        if (g.guest_type === 'qemu') {
+            // QEMU VMs (especially Windows) need VNC, not terminal
+            return `<button class="btn btn-sm" onclick="openPveVmVnc('${nodeId}', ${g.vmid}, '${(g.name || 'VM ' + g.vmid).replace(/'/g, "\\'")}')" style="font-size:11px;padding:3px 10px;">🖥 Console</button>`;
+        }
+        return `<button class="btn btn-sm" onclick="openPveConsole('${nodeId}', ${g.vmid}, '${(g.name || 'VMID ' + g.vmid).replace(/'/g, "\\'")}')" style="font-size:11px;padding:3px 10px;">💻 Terminal</button>`;
     }
 
     function guestCard(g) {
@@ -13904,11 +13908,11 @@ function openVmConsole(name) {
 }
 
 async function openPveVmConsole(vmid, displayName) {
-    // For dedicated PVE nodes (added with API token), use PVE console proxy
+    // For dedicated PVE nodes (added with API token), use VNC for QEMU VMs
     if (currentNodeId) {
         const node = allNodes.find(n => n.id === currentNodeId);
         if (node && node.node_type === 'proxmox') {
-            openPveConsole(currentNodeId, vmid, displayName);
+            openPveVmVnc(currentNodeId, vmid, displayName);
             return;
         }
     }
@@ -13945,6 +13949,37 @@ async function openPveVmConsole(vmid, displayName) {
     }
 }
 
+// Open VNC console for QEMU VMs (Windows VMs, graphical console)
+async function openPveVmVnc(nodeId, vmid, displayName) {
+    try {
+        const oldNodeId = currentNodeId;
+        currentNodeId = nodeId;
+        const ticketUrl = apiUrl(`/api/pve-vnc-ticket/${vmid}`);
+        let wsPath = `/ws/pve-vnc/${vmid}`;
+        const node = allNodes.find(n => n.id === nodeId);
+        if (node && !node.is_self) {
+            wsPath = `/ws/remote-console/${nodeId}/pve-vnc/${vmid}`;
+        }
+        const resp = await fetch(ticketUrl);
+        currentNodeId = oldNodeId;
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            showToast(err.error || 'Failed to create VNC proxy', 'error');
+            return;
+        }
+        const data = await resp.json();
+        const ticket = data.ticket || '';
+        window.open(
+            `/vnc.html?ws_path=${encodeURIComponent(wsPath)}&ticket=${encodeURIComponent(ticket)}&name=${encodeURIComponent(displayName || 'VM ' + vmid)}`,
+            'vnc_' + vmid,
+            'width=1024,height=768,menubar=no,toolbar=no'
+        );
+    } catch (e) {
+        showToast('Failed to open VNC: ' + e.message, 'error');
+    }
+}
+
+// Open terminal for LXC containers (text console via termproxy)
 function openPveConsole(nodeId, vmid, displayName) {
     const url = '/console.html?type=pve&name=' + encodeURIComponent(displayName || 'VMID ' + vmid)
         + '&pve_node_id=' + encodeURIComponent(nodeId)
