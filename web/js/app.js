@@ -26523,7 +26523,7 @@ function initTopology3D() {
     const laserMat = new THREE.LineBasicMaterial({ color: 0xdc2626, transparent: true, opacity: 0.6 });
     const laser0 = new THREE.Line(laserGeo, laserMat); laser0.visible = false; vrController0.add(laser0);
     const laser1 = new THREE.Line(laserGeo.clone(), laserMat.clone()); laser1.visible = false; vrController1.add(laser1);
-    state._vrLasers = [laser0, laser1];
+    const _vrLaserRefs = [laser0, laser1]; // assigned to state after state is created
     // VR select on trigger
     [vrController0, vrController1].forEach(ctrl => {
         ctrl.addEventListener('selectstart', () => {
@@ -26628,6 +26628,7 @@ function initTopology3D() {
         spherical: { radius: 25, theta: 0, phi: Math.PI / 3 },
         target: new THREE.Vector3(0, 3, 0),
         vrMoving: false, vrMoveDir: new THREE.Vector3(),
+        _vrLasers: _vrLaserRefs,
     };
 
     function updateCameraFromSpherical() {
