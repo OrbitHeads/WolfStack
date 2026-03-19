@@ -1,0 +1,76 @@
+name: Discord Sponsor Notifications
+
+on:
+  sponsorship:
+    types: [created, cancelled, tier_changed, pending_cancellation]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Discord of sponsor event
+        env:
+          WEBHOOK_URL: ${{ secrets.DISCORD_SPONSORS_WEBHOOK }}
+        run: |
+          ACTION="${{ github.event.action }}"
+          SPONSOR="${{ github.event.sponsorship.sponsor.login }}"
+          SPONSOR_URL="https://github.com/$SPONSOR"
+          SPONSOR_AVATAR="${{ github.event.sponsorship.sponsor.avatar_url }}"
+          TIER="${{ github.event.sponsorship.tier.name }}"
+          MONTHLY="${{ github.event.sponsorship.tier.monthly_price_in_dollars }}"
+          IS_ONETIME="${{ github.event.sponsorship.tier.is_one_time }}"
+
+          if [ "$ACTION" = "created" ]; then
+            TITLE="New Sponsor"
+            EMOJI="🎉"
+            COLOR=3066993
+            if [ "$IS_ONETIME" = "true" ]; then
+              DESC="**${SPONSOR}** made a one-time sponsorship!\n\nTier: **${TIER}** (\$${MONTHLY})"
+            else
+              DESC="**${SPONSOR}** is now sponsoring!\n\nTier: **${TIER}** (\$${MONTHLY}/month)"
+            fi
+          elif [ "$ACTION" = "cancelled" ]; then
+            TITLE="Sponsor Cancelled"
+            EMOJI="😢"
+            COLOR=15158332
+            DESC="**${SPONSOR}** cancelled their sponsorship.\n\nPrevious tier: **${TIER}**\n\n⚠️ Remove their Sponsor role in Discord."
+          elif [ "$ACTION" = "tier_changed" ]; then
+            TITLE="Sponsor Tier Changed"
+            EMOJI="🔄"
+            COLOR=3447003
+            DESC="**${SPONSOR}** changed their tier.\n\nNew tier: **${TIER}** (\$${MONTHLY}/month)"
+          elif [ "$ACTION" = "pending_cancellation" ]; then
+            TITLE="Sponsor Pending Cancellation"
+            EMOJI="⏳"
+            COLOR=16776960
+            DESC="**${SPONSOR}** has scheduled cancellation at the end of their billing period.\n\nCurrent tier: **${TIER}**"
+          else
+            TITLE="Sponsor Event"
+            EMOJI="📢"
+            COLOR=7506394
+            DESC="**${SPONSOR}** — event: ${ACTION}\n\nTier: **${TIER}**"
+          fi
+
+          jq -n \
+            --arg title "${EMOJI} ${TITLE}" \
+            --arg desc "$DESC" \
+            --arg url "$SPONSOR_URL" \
+            --arg avatar "$SPONSOR_AVATAR" \
+            --arg sponsor "$SPONSOR" \
+            --arg footer "GitHub Sponsors • wolfstack" \
+            '{
+              embeds: [{
+                title: $title,
+                description: $desc,
+                url: $url,
+                color: '$COLOR',
+                thumbnail: { url: $avatar },
+                author: { name: $sponsor, url: $url, icon_url: $avatar },
+                footer: { text: $footer },
+                timestamp: (now | todate)
+              }]
+            }' > payload.json
+
+          curl -sf -H "Content-Type: application/json" \
+            -d @payload.json \
+            "$WEBHOOK_URL"
