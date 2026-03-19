@@ -1,8 +1,11 @@
 # 🐺 WolfStack — Server, VM & Container Management Platform
 
-The flagship management dashboard from [Wolf Software Systems](https://wolf.uk.com/). Monitor servers, manage virtual machines, Docker and LXC containers, control services, and manage your entire infrastructure from one beautiful web interface.
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-red?style=for-the-badge&logo=github)](https://github.com/sponsors/wolfsoftwaresystemsltd)
+[![Discord](https://img.shields.io/badge/Discord-Join-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/q9qMjHjUQY)
+[![Reddit](https://img.shields.io/badge/Reddit-r%2FWolfStack-FF4500?style=for-the-badge&logo=reddit&logoColor=white)](https://www.reddit.com/r/WolfStack/)
+[![Docs](https://img.shields.io/badge/Docs-wolfstack.org-blue?style=for-the-badge)](https://wolfstack.org)
 
-**[Reddit Community (r/WolfStack)](https://www.reddit.com/r/WolfStack/)** • **[Discord](https://discord.gg/q9qMjHjUQY)** • **[GitHub Sponsors](https://github.com/sponsors/wolfsoftwaresystemsltd)**
+The flagship management dashboard from [Wolf Software Systems](https://wolf.uk.com/). Monitor servers, manage virtual machines, Docker and LXC containers, control services, and manage your entire infrastructure from one beautiful web interface. **Now with a 3D VR Server Room!**
 
 ![WolfStack Dashboard](https://wolfstack.org/images/screenshot.png)
 
@@ -33,9 +36,17 @@ Full documentation, guides, and API reference are available at:
 | **[WolfProxy](https://wolfstack.org/wolfproxy.html)** | NGINX-compatible reverse proxy with firewall |
 | **[WolfServe](https://wolfstack.org/wolfserve.html)** | Apache2-compatible web server |
 
-## Support
+## Support Development
 
-- ❤️ **Sponsor:** [Support development](https://github.com/sponsors/wolfsoftwaresystemsltd)
+WolfStack is free and open source, funded by the community. If you find it useful, please consider sponsoring:
+
+<a href="https://github.com/sponsors/wolfsoftwaresystemsltd">
+  <img src="https://img.shields.io/badge/Sponsor_WolfStack-%E2%9D%A4-red?style=for-the-badge&logo=github" alt="Sponsor WolfStack">
+</a>
+
+Sponsors get access to the private roadmap, early access builds, and direct developer support on Discord.
+
+- ❤️ **Sponsor:** [github.com/sponsors/wolfsoftwaresystemsltd](https://github.com/sponsors/wolfsoftwaresystemsltd)
 - 💬 **Discord:** [Join our community](https://discord.gg/q9qMjHjUQY)
 - 🔥 **Reddit:** [r/WolfStack](https://www.reddit.com/r/WolfStack/)
 - 🌐 **Website:** [wolf.uk.com](https://wolf.uk.com)
