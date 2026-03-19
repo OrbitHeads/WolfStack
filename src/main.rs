@@ -419,6 +419,7 @@ async fn main() -> std::io::Result<()> {
             let wf_state = wolfflow_state.clone();
             let wf_cluster = cluster.clone();
             let wf_secret = cluster_secret.clone();
+            let wf_ai = app_state.ai_agent.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(60)).await;
@@ -427,8 +428,9 @@ async fn main() -> std::io::Result<()> {
                         let s = wf_state.clone();
                         let c = wf_cluster.clone();
                         let sec = wf_secret.clone();
+                        let ai_cfg = wf_ai.config.lock().unwrap().clone();
                         tokio::spawn(async move {
-                            wolfflow::execute_workflow(&s, &c, &sec, &workflow, "scheduled").await;
+                            wolfflow::execute_workflow(&s, &c, &sec, &workflow, "scheduled", Some(ai_cfg)).await;
                         });
                     }
                 }

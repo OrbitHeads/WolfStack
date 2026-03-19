@@ -7369,6 +7369,14 @@ function updateTaskLogSpinner() {
     updateTaskLogToggleBtn();
 }
 
+function clearTaskLog() {
+    _taskLogEntries.length = 0;
+    updateTaskLogSpinner();
+    renderTaskLog();
+    saveTaskLog();
+    hideTaskLog();
+}
+
 function renderTaskLog() {
     const tbody = document.getElementById('task-log-table');
     const count = document.getElementById('task-log-count');
@@ -18798,7 +18806,11 @@ function _startUpgradeTracking() {
                 return;
             }
 
-            if (!currentNode.online) {
+            if (currentNode.is_self && currentNode.online && elapsed > 10) {
+                // Local node — if we're running, the upgrade is done (we restarted)
+                t.done = true;
+                if (t.taskId) updateTaskLogEntry(t.taskId, { description: t.hostname + ' — upgrade complete (local)', status: 'success' });
+            } else if (!currentNode.online) {
                 t.sawOffline = true;
                 if (t.taskId) updateTaskLogEntry(t.taskId, { description: t.hostname + ' — offline/restarting (' + timeStr + ')', status: 'running' });
                 pending++;

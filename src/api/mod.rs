@@ -8341,8 +8341,9 @@ pub async fn wolfflow_trigger(req: HttpRequest, state: web::Data<AppState>, path
     let wf_state = state.wolfflow.clone();
     let cluster = state.cluster.clone();
     let secret = state.cluster_secret.clone();
+    let ai_config = state.ai_agent.config.lock().unwrap().clone();
     tokio::spawn(async move {
-        crate::wolfflow::execute_workflow(&wf_state, &cluster, &secret, &workflow, "manual").await;
+        crate::wolfflow::execute_workflow(&wf_state, &cluster, &secret, &workflow, "manual", Some(ai_config)).await;
     });
     HttpResponse::Ok().json(serde_json::json!({ "ok": true, "message": "Workflow triggered" }))
 }

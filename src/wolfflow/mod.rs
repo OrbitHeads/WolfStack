@@ -757,6 +757,7 @@ pub async fn execute_workflow(
     cluster_secret: &str,
     workflow: &Workflow,
     trigger: &str,
+    ai_config: Option<crate::ai::AiConfig>,
 ) -> WorkflowRun {
     let run_id = format!("run-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let started_at = Utc::now().to_rfc3339();
@@ -978,8 +979,8 @@ pub async fn execute_workflow(
                 }
                 body.push('\n');
             }
-            // Send email — same method as the daily report
-            let config = crate::ai::AiConfig::load();
+            // Send email — use the in-memory AI config (same as daily report)
+            let config = ai_config.clone().unwrap_or_else(crate::ai::AiConfig::load);
             if config.smtp_host.is_empty() {
                 run.email_status = Some("Failed: no SMTP configured — set up email in Settings → AI Agent".to_string());
             } else {

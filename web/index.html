@@ -5718,6 +5718,7 @@ region = us-east-1"></textarea>
                 <span id="task-log-count" style="font-size:11px; color:var(--text-muted);">(0)</span>
             </div>
             <div style="display:flex; align-items:center; gap:8px;">
+                <button onclick="event.stopPropagation(); clearTaskLog();" style="background:none; border:none; color:var(--text-muted); cursor:pointer; font-size:11px; padding:2px 6px;" title="Clear all tasks">Clear</button>
                 <button onclick="event.stopPropagation(); hideTaskLog();" style="background:none; border:none; color:var(--text-muted); cursor:pointer; font-size:16px; padding:0 4px;" title="Close">✕</button>
             </div>
             </div>
