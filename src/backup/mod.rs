@@ -2025,8 +2025,10 @@ fn retrieve_from_pbs(entry: &BackupEntry, dest: &Path) -> Result<(), String> {
     if !storage.pbs_fingerprint.is_empty() {
         cmd.env("PBS_FINGERPRINT", &storage.pbs_fingerprint);
     }
-    if !storage.pbs_token_secret.is_empty() {
-        cmd.env("PBS_PASSWORD", &storage.pbs_token_secret);
+    let pbs_pw = if !storage.pbs_token_secret.is_empty() { &storage.pbs_token_secret }
+                 else { &storage.pbs_password };
+    if !pbs_pw.is_empty() {
+        cmd.env("PBS_PASSWORD", pbs_pw);
     }
 
     let output = cmd.output()
