@@ -6951,33 +6951,27 @@ async function upgradeNode(nodeId) {
     showToast('Upgrade started for ' + machine, 'info');
 
     // Poll node status to track upgrade progress
-    let pollCount = 0;
     let wasOffline = false;
+    let startTime = Date.now();
     const pollTimer = setInterval(() => {
-        pollCount++;
-        if (pollCount > 120) { // 10 min timeout
-            clearInterval(pollTimer);
-            updateTaskLogEntry(taskId, { description: 'Upgrade timed out (10 min)', status: 'error' });
-            return;
-        }
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+        const mins = Math.floor(elapsed / 60);
+        const secs = elapsed % 60;
+        const timeStr = mins > 0 ? mins + 'm ' + secs + 's' : secs + 's';
         const currentNode = allNodes.find(n => n.id === nodeId);
         if (!currentNode) return;
 
         if (!currentNode.online && !wasOffline) {
             wasOffline = true;
-            updateTaskLogEntry(taskId, { description: 'Node restarting...', status: 'running' });
+            updateTaskLogEntry(taskId, { description: 'Restarting... (' + timeStr + ')', status: 'running' });
         } else if (currentNode.online && wasOffline) {
-            // Node came back online after being offline — upgrade complete
             clearInterval(pollTimer);
             updateTaskLogEntry(taskId, {
-                description: 'Upgrade complete — node back online',
+                description: 'Upgrade complete (' + timeStr + ')',
                 status: 'success',
-                logLines: ['Node went offline for restart and came back online'],
             });
-        } else if (currentNode.online && !wasOffline && pollCount > 6) {
-            // Still online after 30s — might be a local upgrade that didn't restart
-            // or the compile is still running
-            updateTaskLogEntry(taskId, { description: 'Compiling... (' + (pollCount * 5) + 's)', status: 'running' });
+        } else if (currentNode.online && !wasOffline) {
+            updateTaskLogEntry(taskId, { description: 'Compiling... (' + timeStr + ')', status: 'running' });
         }
     }, 5000);
 
@@ -18738,26 +18732,70 @@ async function issuesUpgradeAll() {
     });
 
     var channel = (document.getElementById('issues-channel-select') || {}).value || 'master';
+
+    // Track each node upgrade in the task log
+    var upgradeTrackers = [];
     for (var i = 0; i < targets.length; i++) {
         var r = targets[i];
         var node = allNodes.find(function (n) { return n.id === r.node_id; });
         var safeId = (r.node_id || 'local').replace(/[^a-z0-9_-]/gi, '-');
         var url = (node && !node.is_self) ? '/api/nodes/' + encodeURIComponent(r.node_id) + '/proxy/upgrade?channel=' + channel : '/api/upgrade?channel=' + channel;
+
+        var taskId = addTaskLogEntry({
+            cluster: (node && node.cluster_name) || 'WolfStack',
+            node: r.hostname || r.node_id,
+            description: 'Sending upgrade command...',
+            status: 'running',
+        });
+
         try {
             await fetch(url, { method: 'POST' });
-            modal.updateRow(safeId, true, 'Command sent \u2713');
+            modal.updateRow(safeId, true, 'Upgrading...');
+            updateTaskLogEntry(taskId, { description: 'Compiling...', status: 'running' });
+            upgradeTrackers.push({ nodeId: r.node_id, taskId: taskId, hostname: r.hostname || r.node_id, wasOffline: false });
         } catch (e) {
             modal.updateRow(safeId, false, 'Failed: ' + e.message);
+            updateTaskLogEntry(taskId, { description: 'Failed to send: ' + e.message, status: 'error' });
         }
     }
 
-    modal.setTitle('Upgrades In Progress');
+    modal.setTitle('Upgrades In Progress (' + upgradeTrackers.length + ' nodes)');
     modal.setFooter('<div style="background:rgba(234,179,8,0.1); border:1px solid rgba(234,179,8,0.3); border-radius:10px; padding:16px; text-align:center;">'
         + '<div style="font-size:24px; margin-bottom:8px;">\u23F3</div>'
-        + '<div style="font-weight:600; color:var(--text-primary); font-size:14px; margin-bottom:4px;">Please wait approximately 5 minutes</div>'
-        + '<div style="color:var(--text-secondary); font-size:12px;">All servers are upgrading and will restart automatically.<br>Refresh your browser once complete.</div>'
+        + '<div style="font-weight:600; color:var(--text-primary); font-size:14px; margin-bottom:4px;">Upgrades in progress — tracking in task log</div>'
+        + '<div style="color:var(--text-secondary); font-size:12px;">Raspberry Pi may take up to 50 minutes. You can close this dialog — the task log will update.</div>'
         + '</div>');
     modal.showDone();
+
+    // Poll all upgrading nodes until they come back online
+    if (upgradeTrackers.length > 0) {
+        var completed = 0;
+        var pollTimer = setInterval(function () {
+            for (var t = 0; t < upgradeTrackers.length; t++) {
+                var tracker = upgradeTrackers[t];
+                if (tracker.done) continue;
+                var currentNode = allNodes.find(function (n) { return n.id === tracker.nodeId; });
+                if (!currentNode) continue;
+
+                if (!currentNode.online && !tracker.wasOffline) {
+                    tracker.wasOffline = true;
+                    updateTaskLogEntry(tracker.taskId, { description: tracker.hostname + ' — restarting...', status: 'running' });
+                    var sid = (tracker.nodeId || 'local').replace(/[^a-z0-9_-]/gi, '-');
+                    modal.updateRow(sid, null, 'Restarting...');
+                } else if (currentNode.online && tracker.wasOffline) {
+                    tracker.done = true;
+                    completed++;
+                    updateTaskLogEntry(tracker.taskId, { description: tracker.hostname + ' — upgrade complete', status: 'success' });
+                    var sid2 = (tracker.nodeId || 'local').replace(/[^a-z0-9_-]/gi, '-');
+                    modal.updateRow(sid2, true, 'Done ✓');
+                    if (completed >= upgradeTrackers.length) {
+                        clearInterval(pollTimer);
+                        modal.setTitle('All Upgrades Complete ✓');
+                    }
+                }
+            }
+        }, 5000);
+    }
 }
 
 async function cleanSystem() {
