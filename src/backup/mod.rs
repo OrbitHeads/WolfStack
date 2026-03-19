@@ -1183,7 +1183,19 @@ fn retrieve_from_s3(entry: &BackupEntry, dest: &Path) -> Result<(), String> {
 // ─── Restore Functions ───
 
 /// Restore a Docker container from backup
-pub fn restore_docker(entry: &BackupEntry) -> Result<String, String> {
+pub fn restore_docker(entry: &BackupEntry, overwrite: bool) -> Result<String, String> {
+
+    let container_name = &entry.target.name;
+
+    // Check if a container with this name already exists before downloading
+    let check = Command::new("docker")
+        .args(["container", "inspect", container_name])
+        .output();
+    let exists = check.map(|o| o.status.success()).unwrap_or(false);
+
+    if exists && !overwrite {
+        return Err(format!("CONTAINER_EXISTS:{}", container_name));
+    }
 
     let local_path = retrieve_backup(entry)?;
 
@@ -1208,16 +1220,10 @@ pub fn restore_docker(entry: &BackupEntry) -> Result<String, String> {
         .unwrap_or(&format!("wolfstack-backup/{}", entry.target.name))
         .to_string();
 
-    // Create and start a container from the restored image
-    let container_name = &entry.target.name;
-
-    // Check if a container with this name already exists
-    let check = Command::new("docker")
-        .args(["container", "inspect", container_name])
-        .output();
-    if check.map(|o| o.status.success()).unwrap_or(false) {
-        return Ok(format!("Docker image restored ({}). Container '{}' already exists — image loaded but container not replaced.",
-            image_name, container_name));
+    // If overwriting, stop and remove the existing container
+    if exists {
+        let _ = Command::new("docker").args(["stop", container_name]).output();
+        let _ = Command::new("docker").args(["rm", "-f", container_name]).output();
     }
 
     let create = Command::new("docker")
@@ -1390,9 +1396,9 @@ pub fn restore_config_backup(entry: &BackupEntry) -> Result<String, String> {
 }
 
 /// Restore from a backup entry (auto-detects type)
-pub fn restore_backup(entry: &BackupEntry) -> Result<String, String> {
+pub fn restore_backup(entry: &BackupEntry, overwrite: bool) -> Result<String, String> {
     match entry.target.target_type {
-        BackupTargetType::Docker => restore_docker(entry),
+        BackupTargetType::Docker => restore_docker(entry, overwrite),
         BackupTargetType::Lxc => restore_lxc(entry),
         BackupTargetType::Vm => restore_vm(entry),
         BackupTargetType::Config => restore_config_backup(entry),
@@ -1651,11 +1657,11 @@ pub fn delete_backup(id: &str) -> Result<String, String> {
 }
 
 /// Restore from a backup by ID
-pub fn restore_by_id(id: &str) -> Result<String, String> {
+pub fn restore_by_id(id: &str, overwrite: bool) -> Result<String, String> {
     let config = load_config();
     let entry = config.entries.iter().find(|e| e.id == id)
         .ok_or_else(|| format!("Backup not found: {}", id))?;
-    restore_backup(entry)
+    restore_backup(entry, overwrite)
 }
 
 // ─── Schedule Management ───

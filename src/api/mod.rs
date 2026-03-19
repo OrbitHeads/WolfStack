@@ -5154,10 +5154,20 @@ pub async fn backup_delete(
 pub async fn backup_restore(
     req: HttpRequest, state: web::Data<AppState>,
     path: web::Path<String>,
+    query: web::Query<std::collections::HashMap<String, String>>,
 ) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
-    match backup::restore_by_id(&path.into_inner()) {
+    let overwrite = query.get("overwrite").map(|v| v == "true").unwrap_or(false);
+    match backup::restore_by_id(&path.into_inner(), overwrite) {
         Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+        Err(e) if e.starts_with("CONTAINER_EXISTS:") => {
+            let name = e.strip_prefix("CONTAINER_EXISTS:").unwrap_or("");
+            HttpResponse::Conflict().json(serde_json::json!({
+                "error": "container_exists",
+                "container": name,
+                "message": format!("Container '{}' already exists. Overwrite?", name)
+            }))
+        }
         Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
     }
 }

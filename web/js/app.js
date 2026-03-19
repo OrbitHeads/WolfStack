@@ -14874,8 +14874,8 @@ async function deleteBackup(id) {
     loadBackups();
 }
 
-async function restoreBackup(id) {
-    if (!(await showConfirm('Restore from this backup? This will overwrite existing data for the target.'))) return;
+async function restoreBackup(id, overwrite) {
+    if (!overwrite && !(await showConfirm('Restore from this backup? This will overwrite existing data for the target.'))) return;
     // Find the button and show progress
     const btn = event && event.target;
     const origText = btn ? btn.textContent : '';
@@ -14883,8 +14883,18 @@ async function restoreBackup(id) {
     showToast('🔄 Restore in progress... This may take a while.', 'info');
     const _restoreTaskId = taskLogStart('Restoring backup: ' + id);
     try {
-        const res = await fetch(apiUrl(`/api/backups/${id}/restore`), { method: 'POST' });
+        const url = overwrite ? `/api/backups/${id}/restore?overwrite=true` : `/api/backups/${id}/restore`;
+        const res = await fetch(apiUrl(url), { method: 'POST' });
         const data = await res.json();
+        if (res.status === 409 && data.error === 'container_exists') {
+            // Container exists — ask user if they want to overwrite
+            updateTaskLogEntry(_restoreTaskId, { status: 'failed' });
+            if (btn) { btn.disabled = false; btn.textContent = origText; }
+            if (await showConfirm(`Container '${data.container}' already exists. Stop and replace it with the backup?`)) {
+                return restoreBackup(id, true);
+            }
+            return;
+        }
         if (data.error) { showToast(`Restore failed: ${data.error}`, 'error'); updateTaskLogEntry(_restoreTaskId, { status: 'failed' }); }
         else { showToast(data.message || '✅ Restore completed!', 'success'); updateTaskLogEntry(_restoreTaskId, { status: 'completed', description: 'Restored backup: ' + id }); }
     } catch (e) {
