@@ -2254,11 +2254,10 @@ where
         cmd.env("PBS_PASSWORD", pbs_pw);
     }
 
-    // Don't pipe stderr — proxmox-backup-client suppresses progress when not a TTY.
-    // Instead we monitor directory size growth in a separate thread.
+    // Capture stderr for error reporting — stdout can be null since we monitor dir size
     use std::process::Stdio;
     cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::null());
+    cmd.stderr(Stdio::piped());
 
     let mut child = cmd.spawn()
         .map_err(|e| format!("Failed to start proxmox-backup-client: {}", e))?;
@@ -2287,8 +2286,22 @@ where
         .map_err(|e| format!("PBS restore wait failed: {}", e))?;
 
     if !status.success() {
-        error!("PBS restore failed for snapshot '{}'", snapshot_fixed);
-        return Err("PBS restore failed — check server logs".to_string());
+        // Read stderr for the actual error message
+        let stderr_output = if let Some(stderr) = child.stderr.take() {
+            use std::io::Read;
+            let mut buf = String::new();
+            let mut reader = std::io::BufReader::new(stderr);
+            let _ = reader.read_to_string(&mut buf);
+            buf
+        } else {
+            String::new()
+        };
+        let err_detail = if stderr_output.trim().is_empty() {
+            format!("exit code {}", status.code().unwrap_or(-1))
+        } else {
+            stderr_output.trim().to_string()
+        };
+        return Err(format!("PBS restore failed for '{}': {}", snapshot_fixed, err_detail));
     }
 
     // Post-restore: create LXC config for container restores
