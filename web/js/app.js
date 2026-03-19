@@ -28627,7 +28627,15 @@ function renderWolfFlowProperties(step) {
                     </label>
                 </div>
                 <div id="wf-prop-target-cluster" style="${targetScope === 'cluster' ? '' : 'display:none;'}margin-bottom:8px;">
-                    <input type="text" id="wf-prop-cluster-name" class="form-control" value="${escapeHtml((target && target.cluster_name) || '')}" placeholder="Cluster name" style="font-size:12px;">
+                    <select id="wf-prop-cluster-name" class="form-control" style="font-size:12px;">
+                        ${(() => {
+                            const clusters = new Set();
+                            allNodes.forEach(n => clusters.add(n.cluster_name || n.pve_cluster_name || 'Default'));
+                            return Array.from(clusters).sort().map(c =>
+                                '<option value="' + escapeHtml(c) + '"' + ((target && target.cluster_name) === c ? ' selected' : '') + '>' + escapeHtml(c) + '</option>'
+                            ).join('');
+                        })()}
+                    </select>
                 </div>
                 <div id="wf-prop-target-nodes" style="${targetScope === 'nodes' ? '' : 'display:none;'}max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:8px;background:var(--bg-primary);">
                 </div>
