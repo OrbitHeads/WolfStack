@@ -980,7 +980,7 @@ function selectView(page) {
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     document.querySelector(`.nav-item[data-page="${page}"]`)?.classList.add('active');
 
-    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room' };
+    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow' };
     document.getElementById('page-title').textContent = titles[page] || page;
 
     if (page === 'datacenter') {
@@ -1012,6 +1012,9 @@ function selectView(page) {
         const tlBtn = document.getElementById('task-log-toggle-btn');
         if (tlBtn) tlBtn.style.display = 'none';
         initTopology3D();
+    } else if (page === 'wolfflow') {
+        loadWolfFlowWorkflows();
+        loadWolfFlowRuns();
     }
 
     // Restore task log toggle button when leaving topology
@@ -1222,10 +1225,6 @@ function buildServerTree(nodes) {
                 <a class="nav-item server-child-item wolfrun-cluster-item" data-cluster="${escapedName}" data-view="wolfrun" onclick="showWolfRunPage('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
                     <span class="icon" style="font-size:15px;">🏃</span> <span style="font-weight:600;">WolfRun</span>
                     <span class="wolfrun-svc-count" id="wolfrun-count-${clusterId}" style="margin-left:auto; font-size:10px; padding:1px 6px; background:var(--primary-color,#6366f1); color:#fff; border-radius:10px; display:none;"></span>
-                </a>
-                <a class="nav-item server-child-item wolfflow-cluster-item" data-cluster="${escapedName}" data-view="wolfflow" onclick="showWolfFlowPage('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
-                    <span class="icon" style="font-size:15px;">⚡</span> <span style="font-weight:600;">WolfFlow</span>
-                    <span class="wolfflow-wf-count" id="wolfflow-count-${clusterId}" style="margin-left:auto; font-size:10px; padding:1px 6px; background:#f59e0b; color:#fff; border-radius:10px; display:none;"></span>
                 </a>
                 <a class="nav-item server-child-item cluster-backups-item" data-cluster="${escapedName}" data-view="cluster-backups" onclick="showClusterBackupsPage('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
                     <span class="icon" style="font-size:15px;">💾</span> <span style="font-weight:600;">Backups</span>
@@ -28096,69 +28095,17 @@ function vrTermUpdate() {
 
 // ═══ WolfFlow — Workflow Automation ═══
 
-let wolfflowCurrentCluster = '';
 let wolfflowRefreshTimer = null;
 let wolfflowEditId = null;
 let wolfflowToolboxCache = null;
 let wolfflowSteps = [];
 
-function showWolfFlowPage(clusterName) {
-    closeSidebarMobile();
-    wolfflowCurrentCluster = clusterName;
-    currentPage = 'wolfflow';
-    currentNodeId = null;
-    currentComponent = null;
-
-    // Switch to WolfFlow page
-    document.querySelectorAll('.page-view').forEach(p => p.style.display = 'none');
-    const el = document.getElementById('page-wolfflow');
-    if (el) el.style.display = 'block';
-
-    // Highlight sidebar item
-    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-    const item = document.querySelector(`.wolfflow-cluster-item[data-cluster="${clusterName}"]`);
-    if (item) item.classList.add('active');
-
-    // Update page title
-    document.getElementById('page-title').textContent = `WolfFlow — ${clusterName}`;
-    document.getElementById('wolfflow-cluster-label').textContent = `— ${clusterName}`;
-
-    loadWolfFlowWorkflows();
-    loadWolfFlowRuns();
-
-    // Auto-refresh every 15s
-    if (wolfflowRefreshTimer) clearInterval(wolfflowRefreshTimer);
-    wolfflowRefreshTimer = setInterval(() => {
-        if (currentPage === 'wolfflow') {
-            loadWolfFlowWorkflows();
-            loadWolfFlowRuns();
-        } else {
-            clearInterval(wolfflowRefreshTimer);
-        }
-    }, 15000);
-}
-
-// Build a WolfFlow API URL that proxies through a cluster node when
-// the local server isn't part of the target cluster.
-function wolfflowApiUrl(path) {
-    const localNode = allNodes.find(n => n.is_self);
-    const localCluster = localNode ? (localNode.cluster_name || 'WolfStack') : '';
-    const targetCluster = wolfflowCurrentCluster;
-    if (localCluster === targetCluster) return path;
-    // Proxy through an online node in the target cluster
-    const clusterNode = allNodes.find(n =>
-        n.online && !n.is_self &&
-        (n.cluster_name || 'WolfStack') === targetCluster &&
-        n.node_type !== 'proxmox'
-    );
-    if (!clusterNode) return path; // fallback to local
-    const cleanPath = path.replace(/^\/api\//, '');
-    return `/api/nodes/${clusterNode.id}/proxy/${cleanPath}`;
-}
+// WolfFlow is system-wide — always call local API
+function wolfflowApiUrl(path) { return path; }
 
 async function loadWolfFlowWorkflows() {
     try {
-        const url = wolfflowApiUrl(`/api/wolfflow/workflows?cluster=${encodeURIComponent(wolfflowCurrentCluster)}`);
+        const url = wolfflowApiUrl('/api/wolfflow/workflows');
         const resp = await fetch(url, { credentials: 'include' });
         if (!resp.ok) throw new Error('Failed to load workflows');
         const workflows = await resp.json();
@@ -28190,7 +28137,7 @@ function renderWolfFlowWorkflows(workflows) {
     document.getElementById('wolfflow-stat-scheduled').textContent = scheduled;
 
     // Update sidebar count badge
-    const clusterId = wolfflowCurrentCluster.replace(/[^a-zA-Z0-9]/g, '_');
+    const clusterId = 'wolfflow';
     const badge = document.getElementById(`wolfflow-count-${clusterId}`);
     if (badge) {
         badge.textContent = workflows.length;
@@ -28260,7 +28207,7 @@ function renderWolfFlowWorkflows(workflows) {
 
 async function loadWolfFlowRuns() {
     try {
-        const url = wolfflowApiUrl(`/api/wolfflow/runs?cluster=${encodeURIComponent(wolfflowCurrentCluster)}&limit=50`);
+        const url = wolfflowApiUrl('/api/wolfflow/runs?limit=50');
         const resp = await fetch(url, { credentials: 'include' });
         if (!resp.ok) throw new Error('Failed to load runs');
         const runs = await resp.json();
@@ -28402,16 +28349,26 @@ async function openWolfFlowModal(editId) {
     document.getElementById('wolfflow-steps-container').innerHTML = '';
     document.getElementById('wolfflow-steps-empty').style.display = '';
 
-    // Populate node checkboxes
+    // Populate node checkboxes — ALL nodes from ALL clusters
     const nodeCheckboxes = document.getElementById('wolfflow-node-checkboxes');
-    const clusterNodes = allNodes.filter(n =>
-        (n.cluster_name || 'WolfStack') === wolfflowCurrentCluster && n.node_type !== 'proxmox'
-    );
-    nodeCheckboxes.innerHTML = clusterNodes.map(n =>
-        `<label style="display:flex; align-items:center; gap:8px; padding:4px 0; font-size:12px; cursor:pointer;">
-            <input type="checkbox" class="wolfflow-node-cb" value="${n.id}"> ${escapeHtml(n.hostname || n.id)}
-        </label>`
-    ).join('') || '<span style="color:var(--text-muted); font-size:12px;">No nodes found</span>';
+    const clusters = {};
+    allNodes.forEach(n => {
+        const c = n.cluster_name || n.pve_cluster_name || 'Default';
+        if (!clusters[c]) clusters[c] = [];
+        clusters[c].push(n);
+    });
+    let nodeHtml = '';
+    Object.keys(clusters).sort().forEach(clusterName => {
+        nodeHtml += `<div style="font-size:11px;font-weight:600;color:var(--text-secondary);margin-top:8px;margin-bottom:4px;">${escapeHtml(clusterName)}</div>`;
+        clusters[clusterName].forEach(n => {
+            const label = n.hostname || n.id;
+            const type = n.node_type === 'proxmox' ? ' (PVE)' : '';
+            nodeHtml += `<label style="display:flex; align-items:center; gap:8px; padding:2px 0; font-size:12px; cursor:pointer;">
+                <input type="checkbox" class="wolfflow-node-cb" value="${n.id}"> ${escapeHtml(label)}${type}
+            </label>`;
+        });
+    });
+    nodeCheckboxes.innerHTML = nodeHtml || '<span style="color:var(--text-muted); font-size:12px;">No nodes found</span>';
 
     // Load toolbox
     await loadWolfFlowToolbox();
@@ -28420,7 +28377,7 @@ async function openWolfFlowModal(editId) {
     if (editId) {
         document.getElementById('wolfflow-modal-title').textContent = '✏️ Edit Workflow';
         try {
-            const url = wolfflowApiUrl(`/api/wolfflow/workflows/${editId}?cluster=${encodeURIComponent(wolfflowCurrentCluster)}`);
+            const url = wolfflowApiUrl(`/api/wolfflow/workflows/${editId}`);
             const resp = await fetch(url, { credentials: 'include' });
             if (resp.ok) {
                 const wf = await resp.json();
@@ -28690,7 +28647,7 @@ async function saveWolfFlow() {
     }
 
     const payload = {
-        cluster: wolfflowCurrentCluster,
+        cluster: 'system',
         name,
         description,
         schedule,
@@ -28736,7 +28693,7 @@ async function deleteWolfFlow(id, name) {
     if (!confirm(`Delete workflow "${name}"?\n\nThis cannot be undone.`)) return;
 
     try {
-        const url = wolfflowApiUrl(`/api/wolfflow/workflows/${id}?cluster=${encodeURIComponent(wolfflowCurrentCluster)}`);
+        const url = wolfflowApiUrl(`/api/wolfflow/workflows/${id}`);
         const resp = await fetch(url, { method: 'DELETE', credentials: 'include' });
         if (!resp.ok) throw new Error('Delete failed');
         showToast(`Workflow "${name}" deleted`, 'success');
@@ -28750,7 +28707,7 @@ async function deleteWolfFlow(id, name) {
 
 async function triggerWolfFlow(id) {
     try {
-        const url = wolfflowApiUrl(`/api/wolfflow/workflows/${id}/run?cluster=${encodeURIComponent(wolfflowCurrentCluster)}`);
+        const url = wolfflowApiUrl(`/api/wolfflow/workflows/${id}/run`);
         const resp = await fetch(url, { method: 'POST', credentials: 'include' });
         if (!resp.ok) throw new Error('Trigger failed');
         showToast('Workflow triggered', 'success');
