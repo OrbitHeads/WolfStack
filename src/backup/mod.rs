@@ -2505,6 +2505,89 @@ where
     }
 
 
+    // Post-restore: if the extracted files contain a Docker backup tar.gz, load and create the container
+    if snap_type == "host" {
+        // Look for docker-*.tar.gz files in the restore directory
+        if let Ok(entries) = fs::read_dir(&effective_target) {
+            for entry in entries.flatten() {
+                let fname = entry.file_name().to_string_lossy().to_string();
+                if fname.starts_with("docker-") && fname.ends_with(".tar.gz") {
+                    on_progress(format!("Loading Docker image from {}...", fname), Some(90.0));
+                    let tar_path = entry.path();
+
+                    let output = Command::new("sh")
+                        .args(["-c", &format!("gunzip -c '{}' | docker load", tar_path.display())])
+                        .output();
+
+                    match output {
+                        Ok(o) if o.status.success() => {
+                            let load_result = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                            let image_name = load_result
+                                .lines()
+                                .find_map(|line| line.strip_prefix("Loaded image: "))
+                                .unwrap_or("unknown")
+                                .to_string();
+                            on_progress(format!("Image loaded: {}", image_name), Some(95.0));
+
+                            // Extract container name from filename: docker-{name}-{timestamp}.tar.gz
+                            // Strip "docker-" prefix and ".tar.gz" suffix, then remove the timestamp suffix
+                            let parts: Vec<&str> = fname.strip_prefix("docker-").unwrap_or(&fname)
+                                .strip_suffix(".tar.gz").unwrap_or(&fname)
+                                .rsplitn(3, '-').collect();
+                            let container_name = if parts.len() == 3 { parts[2].to_string() }
+                                else { snap_id.to_string() };
+
+                            if !container_name.is_empty() {
+                                // Check if container already exists
+                                let check = Command::new("docker")
+                                    .args(["container", "inspect", &container_name])
+                                    .output();
+                                let exists = check.map(|o| o.status.success()).unwrap_or(false);
+
+                                if exists && !overwrite {
+                                    on_progress(format!("Container '{}' already exists — image loaded but not replaced", container_name), Some(98.0));
+                                } else {
+                                    if exists {
+                                        on_progress(format!("Replacing existing container '{}'...", container_name), Some(96.0));
+                                        let _ = Command::new("docker").args(["stop", &container_name]).output();
+                                        let _ = Command::new("docker").args(["rm", "-f", &container_name]).output();
+                                    }
+                                    on_progress(format!("Creating container '{}'...", container_name), Some(97.0));
+                                    let create = Command::new("docker")
+                                        .args(["run", "-d", "--name", &container_name, "--restart", "unless-stopped", &image_name])
+                                        .output();
+                                    match create {
+                                        Ok(c) if c.status.success() => {
+                                            on_progress(format!("Docker container '{}' restored and started", container_name), Some(99.0));
+                                        }
+                                        Ok(c) => {
+                                            let err = String::from_utf8_lossy(&c.stderr);
+                                            on_progress(format!("Image loaded but container creation failed: {}", err.trim()), Some(99.0));
+                                        }
+                                        Err(e) => {
+                                            on_progress(format!("Image loaded but failed to create container: {}", e), Some(99.0));
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Clean up the tar.gz
+                            let _ = fs::remove_file(&tar_path);
+                            return Ok(format!("Docker container '{}' restored from PBS", container_name));
+                        }
+                        Ok(o) => {
+                            let err = String::from_utf8_lossy(&o.stderr);
+                            on_progress(format!("Docker load failed: {}", err.trim()), Some(99.0));
+                        }
+                        Err(e) => {
+                            on_progress(format!("Failed to run docker load: {}", e), Some(99.0));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(format!("Restored {} to {}", actual_archive, effective_target))
 }
 
