@@ -633,6 +633,45 @@ function deleteBookmark(index) {
     saveBookmarks(bookmarks);
     renderBookmarks();
 }
+function exportBookmarks() {
+    const bookmarks = loadBookmarks();
+    if (bookmarks.length === 0) { showToast('No bookmarks to export', 'error'); return; }
+    const blob = new Blob([JSON.stringify(bookmarks, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'wolfstack-bookmarks.json';
+    a.click();
+    URL.revokeObjectURL(a.href);
+}
+function importBookmarks() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json,application/json';
+    input.onchange = async () => {
+        const file = input.files[0];
+        if (!file) return;
+        try {
+            const text = await file.text();
+            const imported = JSON.parse(text);
+            if (!Array.isArray(imported)) { showToast('Invalid bookmarks file — expected a JSON array', 'error'); return; }
+            const valid = imported.filter(b => b && typeof b.name === 'string' && typeof b.url === 'string');
+            if (valid.length === 0) { showToast('No valid bookmarks found in file', 'error'); return; }
+            const existing = loadBookmarks();
+            if (existing.length > 0) {
+                if (!(await showConfirm(`You have ${existing.length} existing bookmark${existing.length > 1 ? 's' : ''}. Merge ${valid.length} imported bookmark${valid.length > 1 ? 's' : ''} with them?\n\nClick Cancel to replace all existing bookmarks instead.`))) {
+                    saveBookmarks(valid);
+                } else {
+                    saveBookmarks(existing.concat(valid));
+                }
+            } else {
+                saveBookmarks(valid);
+            }
+            renderBookmarks();
+            showToast(`Imported ${valid.length} bookmark${valid.length > 1 ? 's' : ''}`, 'success');
+        } catch (e) { showToast('Failed to read bookmarks file: ' + e.message, 'error'); }
+    };
+    input.click();
+}
 
 // ─── Dashboard Layout Preferences ───
 let dcLayout = localStorage.getItem('wolfstack_dc_layout') || 'grid';

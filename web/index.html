@@ -272,7 +272,11 @@
                     <div class="card" id="bookmarks-card" style="overflow: hidden;">
                         <div class="card-header">
                             <h3>🔖 Bookmarks</h3>
-                            <button class="btn btn-sm" onclick="showAddBookmarkModal()" style="padding: 2px 10px; font-size: 12px;">+ Add</button>
+                            <div style="display:flex;gap:4px;">
+                                <button class="btn btn-sm" onclick="importBookmarks()" style="padding: 2px 8px; font-size: 11px;" title="Import bookmarks from JSON file">Import</button>
+                                <button class="btn btn-sm" onclick="exportBookmarks()" style="padding: 2px 8px; font-size: 11px;" title="Export bookmarks as JSON file">Export</button>
+                                <button class="btn btn-sm" onclick="showAddBookmarkModal()" style="padding: 2px 10px; font-size: 12px;">+ Add</button>
+                            </div>
                         </div>
                         <div id="bookmarks-list" style="padding: 10px; display: flex; flex-wrap: wrap; gap: 8px; max-height: 220px; overflow-y: auto;">
                         </div>
