@@ -7356,7 +7356,7 @@ function updateTaskLogEntry(id, updates) {
     if (updates.status !== undefined) entry.status = updates.status;
     if (updates.description !== undefined) entry.description = updates.description;
     if (updates.logLine) entry.logLines.push(updates.logLine);
-    if (updates.logLines) entry.logLines.push(...updates.logLines);
+    if (updates.logLines) entry.logLines = updates.logLines;
     updateTaskLogSpinner();
     renderTaskLog();
     saveTaskLog();
