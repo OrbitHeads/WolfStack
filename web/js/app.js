@@ -29162,9 +29162,12 @@ async function triggerWolfFlow(id) {
                     const logLines = (latestRun.steps || []).map(s =>
                         `[${s.status}] ${s.step_name} on ${s.node_hostname} (${s.duration_ms}ms)${s.output ? ': ' + s.output.substring(0, 200) : ''}`
                     );
+                    if (latestRun.email_status) {
+                        logLines.push(`[Email] ${latestRun.email_status}`);
+                    }
                     const status = latestRun.status === 'completed' ? 'success' : 'error';
                     updateTaskLogEntry(taskId, {
-                        description: `${wfName} — ${latestRun.status} (${latestRun.steps?.length || 0} steps)`,
+                        description: `${wfName} — ${latestRun.status} (${latestRun.steps?.length || 0} steps)${latestRun.email_status ? ' | ' + latestRun.email_status : ''}`,
                         status,
                         logLines,
                     });

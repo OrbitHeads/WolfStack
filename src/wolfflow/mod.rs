@@ -200,6 +200,9 @@ pub struct WorkflowRun {
     #[serde(default)]
     pub finished_at: Option<String>,
     pub duration_ms: u64,
+    /// Email delivery status (shown in task log)
+    #[serde(default)]
+    pub email_status: Option<String>,
 }
 
 // ═══════════════════════════════════════════════
@@ -966,19 +969,22 @@ pub async fn execute_workflow(
                 }
                 body.push('\n');
             }
-            // Send via AI module's SMTP config
+            // Send via AI module's SMTP config — store result in run for task log
             let mut config = crate::ai::AiConfig::load();
             if config.smtp_host.is_empty() {
-                warn!("WolfFlow: email requested to {} but no SMTP configured in Settings → AI Agent", email);
+                run.email_status = Some(format!("Failed: no SMTP configured — set up email in Settings → AI Agent"));
             } else {
                 config.email_to = email.clone();
-                info!("WolfFlow: sending results to {} via {}:{}", email, config.smtp_host, config.smtp_port);
-                if let Err(e) = crate::ai::send_alert_email(&config, &subject, &body) {
-                    warn!("WolfFlow: failed to email results to {}: {}", email, e);
-                } else {
-                    info!("WolfFlow: emailed results to {}", email);
+                match crate::ai::send_alert_email(&config, &subject, &body) {
+                    Ok(_) => {
+                        run.email_status = Some(format!("Sent to {}", email));
+                    }
+                    Err(e) => {
+                        run.email_status = Some(format!("Failed to send to {}: {}", email, e));
+                    }
                 }
             }
+            state.update_run(&run_id, run.clone());
         }
     }
 
