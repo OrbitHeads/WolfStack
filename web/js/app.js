@@ -18733,70 +18733,91 @@ async function issuesUpgradeAll() {
 
     var channel = (document.getElementById('issues-channel-select') || {}).value || 'master';
 
-    // Track each node upgrade in the task log
-    var upgradeTrackers = [];
+    // Track each node upgrade — persist to localStorage so tracking survives page reload
+    var trackers = JSON.parse(localStorage.getItem('wolfstack_upgrade_trackers') || '[]');
     for (var i = 0; i < targets.length; i++) {
         var r = targets[i];
         var node = allNodes.find(function (n) { return n.id === r.node_id; });
         var safeId = (r.node_id || 'local').replace(/[^a-z0-9_-]/gi, '-');
         var url = (node && !node.is_self) ? '/api/nodes/' + encodeURIComponent(r.node_id) + '/proxy/upgrade?channel=' + channel : '/api/upgrade?channel=' + channel;
 
-        var taskId = addTaskLogEntry({
-            cluster: (node && node.cluster_name) || 'WolfStack',
-            node: r.hostname || r.node_id,
-            description: 'Sending upgrade command...',
-            status: 'running',
-        });
-
         try {
             await fetch(url, { method: 'POST' });
             modal.updateRow(safeId, true, 'Upgrading...');
-            updateTaskLogEntry(taskId, { description: 'Compiling...', status: 'running' });
-            upgradeTrackers.push({ nodeId: r.node_id, taskId: taskId, hostname: r.hostname || r.node_id, wasOffline: false });
+            trackers.push({ nodeId: r.node_id, hostname: r.hostname || r.node_id, cluster: (node && node.cluster_name) || 'WolfStack', startedAt: Date.now(), done: false });
         } catch (e) {
             modal.updateRow(safeId, false, 'Failed: ' + e.message);
-            updateTaskLogEntry(taskId, { description: 'Failed to send: ' + e.message, status: 'error' });
         }
     }
+    localStorage.setItem('wolfstack_upgrade_trackers', JSON.stringify(trackers));
 
-    modal.setTitle('Upgrades In Progress (' + upgradeTrackers.length + ' nodes)');
+    modal.setTitle('Upgrades In Progress (' + trackers.length + ' nodes)');
     modal.setFooter('<div style="background:rgba(234,179,8,0.1); border:1px solid rgba(234,179,8,0.3); border-radius:10px; padding:16px; text-align:center;">'
         + '<div style="font-size:24px; margin-bottom:8px;">\u23F3</div>'
         + '<div style="font-weight:600; color:var(--text-primary); font-size:14px; margin-bottom:4px;">Upgrades in progress — tracking in task log</div>'
-        + '<div style="color:var(--text-secondary); font-size:12px;">Raspberry Pi may take up to 50 minutes. You can close this dialog — the task log will update.</div>'
+        + '<div style="color:var(--text-secondary); font-size:12px;">Raspberry Pi may take up to 50 minutes. Tracking persists across browser refresh.</div>'
         + '</div>');
     modal.showDone();
 
-    // Poll all upgrading nodes until they come back online
-    if (upgradeTrackers.length > 0) {
-        var completed = 0;
-        var pollTimer = setInterval(function () {
-            for (var t = 0; t < upgradeTrackers.length; t++) {
-                var tracker = upgradeTrackers[t];
-                if (tracker.done) continue;
-                var currentNode = allNodes.find(function (n) { return n.id === tracker.nodeId; });
-                if (!currentNode) continue;
-
-                if (!currentNode.online && !tracker.wasOffline) {
-                    tracker.wasOffline = true;
-                    updateTaskLogEntry(tracker.taskId, { description: tracker.hostname + ' — restarting...', status: 'running' });
-                    var sid = (tracker.nodeId || 'local').replace(/[^a-z0-9_-]/gi, '-');
-                    modal.updateRow(sid, null, 'Restarting...');
-                } else if (currentNode.online && tracker.wasOffline) {
-                    tracker.done = true;
-                    completed++;
-                    updateTaskLogEntry(tracker.taskId, { description: tracker.hostname + ' — upgrade complete', status: 'success' });
-                    var sid2 = (tracker.nodeId || 'local').replace(/[^a-z0-9_-]/gi, '-');
-                    modal.updateRow(sid2, true, 'Done ✓');
-                    if (completed >= upgradeTrackers.length) {
-                        clearInterval(pollTimer);
-                        modal.setTitle('All Upgrades Complete ✓');
-                    }
+    // Start the persistent upgrade tracker
+    _startUpgradeTracking();
                 }
             }
         }, 5000);
     }
 }
+
+// Persistent upgrade tracker — survives page reload
+function _startUpgradeTracking() {
+    var trackers = JSON.parse(localStorage.getItem('wolfstack_upgrade_trackers') || '[]');
+    if (trackers.length === 0) return;
+
+    // Create task log entries for any pending trackers
+    trackers.forEach(function(t) {
+        if (t.done) return;
+        if (!t.taskId) {
+            t.taskId = addTaskLogEntry({
+                cluster: t.cluster || 'WolfStack',
+                node: t.hostname,
+                description: 'Upgrading... (resumed after page reload)',
+                status: 'running',
+            });
+        }
+    });
+
+    var pollTimer = setInterval(function() {
+        var pending = 0;
+        trackers.forEach(function(t) {
+            if (t.done) return;
+            var currentNode = allNodes.find(function(n) { return n.id === t.nodeId; });
+            if (!currentNode) { pending++; return; }
+
+            var elapsed = Math.floor((Date.now() - t.startedAt) / 1000);
+            var timeStr = elapsed >= 60 ? Math.floor(elapsed/60) + 'm ' + (elapsed%60) + 's' : elapsed + 's';
+
+            if (!currentNode.online) {
+                t.wasOffline = true;
+                if (t.taskId) updateTaskLogEntry(t.taskId, { description: t.hostname + ' — restarting... (' + timeStr + ')', status: 'running' });
+                pending++;
+            } else if (currentNode.online && t.wasOffline) {
+                t.done = true;
+                if (t.taskId) updateTaskLogEntry(t.taskId, { description: t.hostname + ' — upgrade complete (' + timeStr + ')', status: 'success' });
+            } else {
+                if (t.taskId) updateTaskLogEntry(t.taskId, { description: t.hostname + ' — compiling... (' + timeStr + ')', status: 'running' });
+                pending++;
+            }
+        });
+
+        localStorage.setItem('wolfstack_upgrade_trackers', JSON.stringify(trackers));
+
+        if (pending === 0) {
+            clearInterval(pollTimer);
+            localStorage.removeItem('wolfstack_upgrade_trackers');
+        }
+    }, 5000);
+}
+// Resume tracking on page load
+setTimeout(function() { _startUpgradeTracking(); }, 3000);
 
 async function cleanSystem() {
     try {

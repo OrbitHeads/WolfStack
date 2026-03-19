@@ -8352,8 +8352,9 @@ pub async fn wolfflow_runs_list(req: HttpRequest, state: web::Data<AppState>, qu
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let wf_id = query.get("workflow_id").map(|s| s.as_str());
     let limit = query.get("limit").and_then(|s| s.parse().ok()).unwrap_or(50);
-    let runs = state.wolfflow.list_runs(wf_id);
-    let runs: Vec<_> = runs.into_iter().take(limit).collect();
+    let mut runs = state.wolfflow.list_runs(wf_id);
+    runs.reverse(); // newest first
+    runs.truncate(limit);
     HttpResponse::Ok().json(runs)
 }
 
