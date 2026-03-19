@@ -28443,9 +28443,15 @@ function renderWolfFlowCanvas() {
 
     let html = '';
     // Workflow-level target badge at top
-    html += `<div onclick="selectWfWorkflowTarget()" style="cursor:pointer;margin-bottom:8px;padding:8px 16px;background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:12px;color:var(--text-secondary);display:inline-flex;align-items:center;gap:8px;"
-        title="Click to edit workflow target">
-        <span style="font-weight:600;">Target:</span> ${escapeHtml(wfTargetLabel(wfEditorTarget))}
+    const hasTarget = wfEditorTarget && wfEditorTarget.scope;
+    const targetLabel = hasTarget ? wfTargetLabel(wfEditorTarget) : 'Not Set';
+    const btnColor = hasTarget ? 'background:var(--bg-card);border-color:var(--border);color:var(--text-primary);' : 'background:rgba(239,68,68,0.15);border-color:#ef4444;color:#ef4444;';
+    html += `<div style="margin-bottom:14px;display:flex;align-items:center;gap:10px;">
+        <span style="font-size:12px;font-weight:600;color:var(--text-secondary);">🎯 Target:</span>
+        <span style="font-size:13px;font-weight:700;color:var(--text-primary);">${escapeHtml(targetLabel)}</span>
+        <button onclick="selectWfWorkflowTarget()" class="btn btn-sm" style="padding:5px 14px;font-size:11px;font-weight:600;border-radius:6px;cursor:pointer;${btnColor}">
+            ${hasTarget ? '✏️ Change' : '⚠️ Set Target'}
+        </button>
     </div>`;
 
     wfSteps.forEach((step, idx) => {
@@ -29046,13 +29052,18 @@ async function saveWolfFlow() {
         return;
     }
 
+    if (!wfEditorTarget || !wfEditorTarget.scope) {
+        showToast('Please set a target — click the target badge in the toolbar to choose where this workflow runs', 'error');
+        return;
+    }
+
     const payload = {
         id: wfEditId || '',
         name,
         description: '',
         cluster: 'system',
         steps,
-        target: wfEditorTarget || { scope: 'local' },
+        target: wfEditorTarget,
         schedule: schedule || null,
         enabled,
         created_at: new Date().toISOString(),
