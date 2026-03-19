@@ -265,6 +265,9 @@ pub struct BackupEntry {
     /// Hostname of the node that performed the backup
     #[serde(default)]
     pub node_hostname: String,
+    /// Docker container config (docker inspect JSON) for restoring with original settings
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub docker_config: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -312,7 +315,8 @@ fn ensure_staging_dir() -> Result<PathBuf, String> {
 }
 
 /// Backup a Docker container — commit + save + gzip
-pub fn backup_docker(name: &str) -> Result<(PathBuf, u64), String> {
+/// Returns (path, size, docker_inspect_json)
+pub fn backup_docker(name: &str) -> Result<(PathBuf, u64, String), String> {
 
     let staging = ensure_staging_dir()?;
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
@@ -321,16 +325,13 @@ pub fn backup_docker(name: &str) -> Result<(PathBuf, u64), String> {
     let temp_image = format!("wolfstack-backup/{}", name);
 
     // Save container config (docker inspect) for restore
-    let config_filename = format!("docker-{}-{}.inspect.json", name, timestamp);
-    let config_path = staging.join(&config_filename);
-    let inspect_output = Command::new("docker")
+    let docker_config = Command::new("docker")
         .args(["inspect", name])
-        .output();
-    if let Ok(ref o) = inspect_output {
-        if o.status.success() {
-            let _ = fs::write(&config_path, &o.stdout);
-        }
-    }
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
 
     // Commit the container to a temp image
     let output = Command::new("docker")
@@ -339,7 +340,6 @@ pub fn backup_docker(name: &str) -> Result<(PathBuf, u64), String> {
         .map_err(|e| format!("Failed to commit container: {}", e))?;
 
     if !output.status.success() {
-        let _ = fs::remove_file(&config_path);
         return Err(format!("Docker commit failed: {}", String::from_utf8_lossy(&output.stderr)));
     }
 
@@ -353,13 +353,12 @@ pub fn backup_docker(name: &str) -> Result<(PathBuf, u64), String> {
     let _ = Command::new("docker").args(["rmi", &temp_image]).output();
 
     if !output.status.success() {
-        let _ = fs::remove_file(&config_path);
         return Err(format!("Docker save failed: {}", String::from_utf8_lossy(&output.stderr)));
     }
 
     let size = fs::metadata(&tar_path).map(|m| m.len()).unwrap_or(0);
 
-    Ok((tar_path, size))
+    Ok((tar_path, size, docker_config))
 }
 
 /// Backup an LXC container — tar rootfs + config
@@ -811,11 +810,16 @@ fn create_backup_entry(target: BackupTarget, storage: &BackupStorage) -> BackupE
     let hostname = local_hostname();
     let comments = backup_comments(&target);
 
-    let result = match target.target_type {
-        BackupTargetType::Docker => backup_docker(&target.name),
-        BackupTargetType::Lxc => backup_lxc(&target.name),
-        BackupTargetType::Vm => backup_vm(&target.name),
-        BackupTargetType::Config => backup_config(),
+    let (result, docker_config) = match target.target_type {
+        BackupTargetType::Docker => {
+            match backup_docker(&target.name) {
+                Ok((path, size, config)) => (Ok((path, size)), config),
+                Err(e) => (Err(e), String::new()),
+            }
+        }
+        BackupTargetType::Lxc => (backup_lxc(&target.name), String::new()),
+        BackupTargetType::Vm => (backup_vm(&target.name), String::new()),
+        BackupTargetType::Config => (backup_config(), String::new()),
     };
 
     match result {
@@ -826,16 +830,6 @@ fn create_backup_entry(target: BackupTarget, storage: &BackupStorage) -> BackupE
                 .unwrap_or_else(|| format!("backup-{}.tar.gz", id));
 
             let pbs_notes = format!("Cluster: {} | Node: {} | {}", local_cluster_name(), hostname, comments);
-
-            // Also store Docker inspect config alongside the backup if it exists
-            if target.target_type == BackupTargetType::Docker {
-                let config_name = filename.replace(".tar.gz", ".inspect.json");
-                let config_path = local_path.with_file_name(&config_name);
-                if config_path.exists() {
-                    let _ = store_backup_with_notes(&config_path, storage, &config_name, None);
-                    let _ = fs::remove_file(&config_path);
-                }
-            }
 
             match store_backup_with_notes(&local_path, storage, &filename, Some(&pbs_notes)) {
                 Ok(_) => {
@@ -853,6 +847,7 @@ fn create_backup_entry(target: BackupTarget, storage: &BackupStorage) -> BackupE
                         schedule_id: String::new(),
                         comments,
                         node_hostname: hostname,
+                        docker_config,
                     }
                 },
                 Err(e) => {
@@ -870,6 +865,7 @@ fn create_backup_entry(target: BackupTarget, storage: &BackupStorage) -> BackupE
                         schedule_id: String::new(),
                         comments,
                         node_hostname: hostname,
+                        docker_config: String::new(),
                     }
                 }
             }
@@ -888,6 +884,7 @@ fn create_backup_entry(target: BackupTarget, storage: &BackupStorage) -> BackupE
                 schedule_id: String::new(),
                 comments,
                 node_hostname: hostname,
+                docker_config: String::new(),
             }
         }
     }
@@ -1389,15 +1386,12 @@ pub fn restore_docker(entry: &BackupEntry, overwrite: bool) -> Result<String, St
         return Err(format!("CONTAINER_EXISTS:{}", container_name));
     }
 
-    // Try to retrieve the inspect config alongside the backup
-    let config_filename = entry.filename.replace(".tar.gz", ".inspect.json");
-    let config_entry = BackupEntry {
-        filename: config_filename.clone(),
-        ..entry.clone()
+    // Use saved docker inspect config from the backup entry
+    let inspect_json = if !entry.docker_config.is_empty() {
+        serde_json::from_str::<serde_json::Value>(&entry.docker_config).ok()
+    } else {
+        None
     };
-    let inspect_json = retrieve_backup(&config_entry).ok()
-        .and_then(|p| fs::read_to_string(&p).ok())
-        .and_then(|s| { serde_json::from_str::<serde_json::Value>(&s).ok() });
 
     let local_path = retrieve_backup(entry)?;
 
@@ -1670,27 +1664,31 @@ pub fn create_backup_with_log(
         let comments = backup_comments_with_cluster(t, &cluster);
 
         // Run the backup with line-by-line output for vzdump
-        let result = match t.target_type {
+        let (result, docker_config) = match t.target_type {
             BackupTargetType::Docker => {
                 let _ = log.send(format!("  Exporting Docker container '{}'...", t.name));
-                backup_docker(&t.name)
+                match backup_docker(&t.name) {
+                    Ok((path, size, config)) => (Ok((path, size)), config),
+                    Err(e) => (Err(e), String::new()),
+                }
             }
             BackupTargetType::Lxc => {
-                if crate::containers::is_proxmox() {
+                let r = if crate::containers::is_proxmox() {
                     let _ = log.send(format!("  Running vzdump for container {}...", t.name));
                     backup_lxc_proxmox_with_log(&t.name, &log)
                 } else {
                     let _ = log.send(format!("  Tarring LXC rootfs for '{}'...", t.name));
                     backup_lxc(&t.name)
-                }
+                };
+                (r, String::new())
             }
             BackupTargetType::Vm => {
                 let _ = log.send(format!("  Backing up VM '{}'...", t.name));
-                backup_vm(&t.name)
+                (backup_vm(&t.name), String::new())
             }
             BackupTargetType::Config => {
                 let _ = log.send("  Archiving WolfStack config files...".to_string());
-                backup_config()
+                (backup_config(), String::new())
             }
         };
 
@@ -1709,18 +1707,7 @@ pub fn create_backup_with_log(
                     .unwrap_or_else(|| format!("backup-{}.tar.gz", id));
 
                 let _ = log.send(format!("  Storing to {}...", storage_label(&storage)));
-                // Build PBS notes with cluster, node, and target details
                 let pbs_notes = format!("Cluster: {} | Node: {} | {}", cluster, hostname, comments);
-
-                // Also store Docker inspect config alongside the backup if it exists
-                if t.target_type == BackupTargetType::Docker {
-                    let config_name = filename.replace(".tar.gz", ".inspect.json");
-                    let config_path = local_path.with_file_name(&config_name);
-                    if config_path.exists() {
-                        let _ = store_backup_with_notes(&config_path, &storage, &config_name, None);
-                        let _ = fs::remove_file(&config_path);
-                    }
-                }
 
                 let store_result = if storage.storage_type == StorageType::Pbs {
                     store_pbs_with_notes_and_log(&local_path, &storage, &filename, Some(&pbs_notes), Some(&log))
@@ -1735,7 +1722,7 @@ pub fn create_backup_with_log(
                             id, target: t.clone(), storage: storage.clone(), filename,
                             size_bytes: size, created_at: now, status: BackupStatus::Completed,
                             error: String::new(), schedule_id: String::new(),
-                            comments, node_hostname: hostname,
+                            comments, node_hostname: hostname, docker_config,
                         }
                     }
                     Err(e) => {
@@ -1745,7 +1732,7 @@ pub fn create_backup_with_log(
                             id, target: t.clone(), storage: storage.clone(), filename,
                             size_bytes: size, created_at: now, status: BackupStatus::Failed,
                             error: e, schedule_id: String::new(),
-                            comments, node_hostname: hostname,
+                            comments, node_hostname: hostname, docker_config: String::new(),
                         }
                     }
                 }
@@ -1757,6 +1744,7 @@ pub fn create_backup_with_log(
                     filename: String::new(), size_bytes: 0, created_at: now,
                     status: BackupStatus::Failed, error: e,
                     schedule_id: String::new(), comments, node_hostname: hostname,
+                    docker_config: String::new(),
                 }
             }
         };
@@ -1922,18 +1910,17 @@ pub fn restore_by_id_with_log(id: &str, overwrite: bool, log: std::sync::mpsc::S
         }
     }
 
-    // Try to retrieve inspect config for Docker restores
-    let inspect_json = if entry.target.target_type == BackupTargetType::Docker {
-        let _ = log.send("Looking for container config...".to_string());
-        let config_filename = entry.filename.replace(".tar.gz", ".inspect.json");
-        let config_entry = BackupEntry { filename: config_filename, ..entry.clone() };
-        let json = retrieve_backup(&config_entry).ok()
-            .and_then(|p| { let r = fs::read_to_string(&p).ok(); let _ = fs::remove_file(&p); r })
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-        if json.is_some() { let _ = log.send("Found original container config".to_string()); }
-        else { let _ = log.send("No saved config found — will use defaults".to_string()); }
+    // Use saved docker inspect config from the backup entry
+    let inspect_json = if entry.target.target_type == BackupTargetType::Docker && !entry.docker_config.is_empty() {
+        let json = serde_json::from_str::<serde_json::Value>(&entry.docker_config).ok();
+        if json.is_some() { let _ = log.send("Found saved container config".to_string()); }
         json
-    } else { None };
+    } else {
+        if entry.target.target_type == BackupTargetType::Docker {
+            let _ = log.send("No saved config — will use defaults".to_string());
+        }
+        None
+    };
 
     let _ = log.send("Downloading backup...".to_string());
     let local_path = retrieve_backup(entry)?;
@@ -2368,6 +2355,7 @@ pub fn import_backup(data: &[u8], filename: &str) -> Result<String, String> {
         schedule_id: String::new(),
         comments: format!("[{}] Imported backup: {}", local_cluster_name(), filename),
         node_hostname: local_hostname(),
+        docker_config: String::new(),
     });
     let _ = save_config(&config);
 
