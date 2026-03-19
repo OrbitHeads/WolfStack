@@ -567,26 +567,24 @@ pub async fn execute_action_local(action: &ActionType) -> Result<String, String>
             let mp = mount_point.as_deref().unwrap_or("all");
 
             if mp == "all" || mp.is_empty() {
-                // Check ALL mount points
-                let output = run_command("df", &["-h", "--output=target,pcent"], 10).await?;
-                let mut results = Vec::new();
-                let mut any_over = false;
+                // Just run df -h and report the output, flag if anything is over threshold
+                let output = run_command("df", &["-h"], 10).await?;
+                // Quick scan for any partition over threshold
+                let mut over = Vec::new();
                 for line in output.lines().skip(1) {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 2 {
-                        let mount = parts[0];
-                        let pct_str = parts[1].trim_end_matches('%');
-                        if let Ok(pct) = pct_str.parse::<u32>() {
-                            let status = if pct > threshold { any_over = true; "OVER" } else { "OK" };
-                            results.push(format!("{}: {}% [{}]", mount, pct, status));
+                    let fields: Vec<&str> = line.split_whitespace().collect();
+                    if fields.len() >= 6 {
+                        if let Ok(pct) = fields[4].trim_end_matches('%').parse::<u32>() {
+                            if pct > threshold {
+                                over.push(format!("{} at {}%", fields[5], pct));
+                            }
                         }
                     }
                 }
-                let summary = results.join("\n");
-                if any_over {
-                    Err(format!("Disk usage exceeds {}% on some mounts:\n{}", threshold, summary))
+                if over.is_empty() {
+                    Ok(output)
                 } else {
-                    Ok(format!("All mounts within {}%:\n{}", threshold, summary))
+                    Err(format!("Over {}%: {}\n\n{}", threshold, over.join(", "), output))
                 }
             } else {
                 // Check specific mount point
@@ -602,9 +600,9 @@ pub async fn execute_action_local(action: &ActionType) -> Result<String, String>
                 let pct_str = fields[4].trim_end_matches('%');
                 let pct: u32 = pct_str.parse().map_err(|_| "Could not parse disk usage".to_string())?;
                 if pct > threshold {
-                    Err(format!("{}: {}% exceeds threshold {}%", mp, pct, threshold))
+                    Err(format!("{}: {}% exceeds threshold {}%\n\n{}", mp, pct, threshold, output))
                 } else {
-                    Ok(format!("{}: {}% within threshold {}%", mp, pct, threshold))
+                    Ok(output)
                 }
             }
         }
@@ -970,8 +968,11 @@ pub async fn execute_workflow(
             }
             // Send via AI module's SMTP config
             let mut config = crate::ai::AiConfig::load();
-            if !config.smtp_host.is_empty() {
+            if config.smtp_host.is_empty() {
+                warn!("WolfFlow: email requested to {} but no SMTP configured in Settings → AI Agent", email);
+            } else {
                 config.email_to = email.clone();
+                info!("WolfFlow: sending results to {} via {}:{}", email, config.smtp_host, config.smtp_port);
                 if let Err(e) = crate::ai::send_alert_email(&config, &subject, &body) {
                     warn!("WolfFlow: failed to email results to {}: {}", email, e);
                 } else {
