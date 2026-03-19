@@ -622,7 +622,7 @@ async fn main() -> std::io::Result<()> {
                             };
 
                             let mut html = String::from(r#"<!DOCTYPE html><html><head><meta charset="utf-8"><style>
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f0f1a;color:#e0e0e0;margin:0;padding:20px;}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f0f1a;color:#e8e8f0;margin:0;padding:20px;}
 .container{max-width:900px;margin:0 auto;background:#1a1a2e;border-radius:12px;padding:24px;border:1px solid #2a2a3e;}
 h1{color:#818cf8;font-size:22px;margin-top:0;}
 h2{color:#a5b4fc;font-size:16px;margin:24px 0 12px;border-bottom:1px solid #2a2a3e;padding-bottom:8px;}
@@ -642,11 +642,11 @@ tr:hover td{background:#1e1e35;}
 .info{background:rgba(59,130,246,0.15);color:#3b82f6;}
 .bar{height:8px;border-radius:4px;overflow:hidden;background:#2a2a3e;min-width:60px;}
 .bar-fill{height:100%;border-radius:4px;}
-.meta{color:#888;font-size:11px;}
+.meta{color:#aaa;font-size:11px;}
 .summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px;}
 .summary-card{background:#16162b;border:1px solid #2a2a3e;border-radius:8px;padding:12px;text-align:center;}
 .summary-value{font-size:24px;font-weight:700;color:#818cf8;}
-.summary-label{font-size:11px;color:#888;text-transform:uppercase;margin-top:4px;}
+.summary-label{font-size:11px;color:#aab;text-transform:uppercase;margin-top:4px;}
 a{color:#eab308;text-decoration:none;}a:hover{text-decoration:underline;}
 .ai-box{background:#16162b;border:1px solid #eab308;border-radius:8px;padding:16px;margin-top:16px;white-space:pre-wrap;font-size:13px;line-height:1.6;color:#f0f0f0;}
 </style></head><body><div class="container">"#);
@@ -654,7 +654,7 @@ a{color:#eab308;text-decoration:none;}a:hover{text-decoration:underline;}
                             // Header
                             html.push_str(&format!(
                                 r#"<h1>WolfStack Daily Report</h1>
-                                <p style="color:#888;margin-top:-8px;">Date: {} &bull; WolfStack v{} &bull; {} node(s) scanned</p>"#,
+                                <p style="color:#aab;margin-top:-8px;">Date: {} &bull; WolfStack v{} &bull; {} node(s) scanned</p>"#,
                                 today, env!("CARGO_PKG_VERSION"), total_nodes
                             ));
 
