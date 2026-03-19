@@ -18761,10 +18761,6 @@ async function issuesUpgradeAll() {
 
     // Start the persistent upgrade tracker
     _startUpgradeTracking();
-                }
-            }
-        }, 5000);
-    }
 }
 
 // Persistent upgrade tracker — survives page reload
