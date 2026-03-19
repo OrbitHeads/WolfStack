@@ -306,6 +306,16 @@ else
     rm -rf "$PBS_TMP"
 fi
 
+# Fix libfuse3 soname mismatch: proxmox-backup-client expects libfuse3.so.3
+# but some distros (CachyOS, newer Arch) ship soname 4 (libfuse3.so.4)
+if command -v proxmox-backup-client >/dev/null 2>&1; then
+    if [ ! -e /usr/lib/libfuse3.so.3 ] && [ -e /usr/lib/libfuse3.so.4 ]; then
+        FUSE3_REAL=$(readlink -f /usr/lib/libfuse3.so.4)
+        ln -sf "$FUSE3_REAL" /usr/lib/libfuse3.so.3
+        echo "✓ Created libfuse3.so.3 symlink (soname compatibility fix)"
+    fi
+fi
+
 # ─── Configure FUSE for storage mounts ──────────────────────────────────────
 # Enable allow_other in FUSE (needed for s3fs mounts accessible by containers)
 if [ -f /etc/fuse.conf ]; then
