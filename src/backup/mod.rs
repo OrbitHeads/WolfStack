@@ -320,6 +320,18 @@ pub fn backup_docker(name: &str) -> Result<(PathBuf, u64), String> {
     let tar_path = staging.join(&filename);
     let temp_image = format!("wolfstack-backup/{}", name);
 
+    // Save container config (docker inspect) for restore
+    let config_filename = format!("docker-{}-{}.inspect.json", name, timestamp);
+    let config_path = staging.join(&config_filename);
+    let inspect_output = Command::new("docker")
+        .args(["inspect", name])
+        .output();
+    if let Ok(ref o) = inspect_output {
+        if o.status.success() {
+            let _ = fs::write(&config_path, &o.stdout);
+        }
+    }
+
     // Commit the container to a temp image
     let output = Command::new("docker")
         .args(["commit", name, &temp_image])
@@ -327,6 +339,7 @@ pub fn backup_docker(name: &str) -> Result<(PathBuf, u64), String> {
         .map_err(|e| format!("Failed to commit container: {}", e))?;
 
     if !output.status.success() {
+        let _ = fs::remove_file(&config_path);
         return Err(format!("Docker commit failed: {}", String::from_utf8_lossy(&output.stderr)));
     }
 
@@ -340,6 +353,7 @@ pub fn backup_docker(name: &str) -> Result<(PathBuf, u64), String> {
     let _ = Command::new("docker").args(["rmi", &temp_image]).output();
 
     if !output.status.success() {
+        let _ = fs::remove_file(&config_path);
         return Err(format!("Docker save failed: {}", String::from_utf8_lossy(&output.stderr)));
     }
 
@@ -812,6 +826,17 @@ fn create_backup_entry(target: BackupTarget, storage: &BackupStorage) -> BackupE
                 .unwrap_or_else(|| format!("backup-{}.tar.gz", id));
 
             let pbs_notes = format!("Cluster: {} | Node: {} | {}", local_cluster_name(), hostname, comments);
+
+            // Also store Docker inspect config alongside the backup if it exists
+            if target.target_type == BackupTargetType::Docker {
+                let config_name = filename.replace(".tar.gz", ".inspect.json");
+                let config_path = local_path.with_file_name(&config_name);
+                if config_path.exists() {
+                    let _ = store_backup_with_notes(&config_path, storage, &config_name, None);
+                    let _ = fs::remove_file(&config_path);
+                }
+            }
+
             match store_backup_with_notes(&local_path, storage, &filename, Some(&pbs_notes)) {
                 Ok(_) => {
                     // Remove staging file after successful store
@@ -1183,6 +1208,129 @@ fn retrieve_from_s3(entry: &BackupEntry, dest: &Path) -> Result<(), String> {
 // ─── Restore Functions ───
 
 /// Restore a Docker container from backup
+/// Build docker run arguments from a docker inspect JSON
+fn docker_run_args_from_inspect(inspect: &serde_json::Value) -> Vec<String> {
+    let mut args = Vec::new();
+    let container = if inspect.is_array() { &inspect[0] } else { inspect };
+    let config = &container["Config"];
+    let host_config = &container["HostConfig"];
+
+    // Port bindings: HostConfig.PortBindings
+    if let Some(bindings) = host_config["PortBindings"].as_object() {
+        for (container_port, host_ports) in bindings {
+            if let Some(arr) = host_ports.as_array() {
+                for hp in arr {
+                    let host_ip = hp["HostIp"].as_str().unwrap_or("");
+                    let host_port = hp["HostPort"].as_str().unwrap_or("");
+                    if !host_port.is_empty() {
+                        let binding = if !host_ip.is_empty() && host_ip != "0.0.0.0" {
+                            format!("{}:{}:{}", host_ip, host_port, container_port)
+                        } else {
+                            format!("{}:{}", host_port, container_port)
+                        };
+                        args.push("-p".to_string());
+                        args.push(binding);
+                    }
+                }
+            }
+        }
+    }
+
+    // Environment variables: Config.Env
+    if let Some(env) = config["Env"].as_array() {
+        for e in env {
+            if let Some(s) = e.as_str() {
+                // Skip common default vars that come from the image
+                if s.starts_with("PATH=") || s.starts_with("HOME=") || s.starts_with("HOSTNAME=") {
+                    continue;
+                }
+                args.push("-e".to_string());
+                args.push(s.to_string());
+            }
+        }
+    }
+
+    // Volume mounts: HostConfig.Binds
+    if let Some(binds) = host_config["Binds"].as_array() {
+        for b in binds {
+            if let Some(s) = b.as_str() {
+                args.push("-v".to_string());
+                args.push(s.to_string());
+            }
+        }
+    }
+
+    // Restart policy: HostConfig.RestartPolicy
+    let restart_name = host_config["RestartPolicy"]["Name"].as_str().unwrap_or("");
+    if !restart_name.is_empty() && restart_name != "no" {
+        let max_retry = host_config["RestartPolicy"]["MaximumRetryCount"].as_u64().unwrap_or(0);
+        if restart_name == "on-failure" && max_retry > 0 {
+            args.push("--restart".to_string());
+            args.push(format!("on-failure:{}", max_retry));
+        } else {
+            args.push("--restart".to_string());
+            args.push(restart_name.to_string());
+        }
+    } else {
+        args.push("--restart".to_string());
+        args.push("unless-stopped".to_string());
+    }
+
+    // Network mode: HostConfig.NetworkMode
+    let network = host_config["NetworkMode"].as_str().unwrap_or("default");
+    if network != "default" && network != "bridge" && !network.is_empty() {
+        args.push("--network".to_string());
+        args.push(network.to_string());
+    }
+
+    // Hostname
+    if let Some(hostname) = config["Hostname"].as_str() {
+        if !hostname.is_empty() {
+            args.push("--hostname".to_string());
+            args.push(hostname.to_string());
+        }
+    }
+
+    // Working dir
+    if let Some(workdir) = config["WorkingDir"].as_str() {
+        if !workdir.is_empty() {
+            args.push("-w".to_string());
+            args.push(workdir.to_string());
+        }
+    }
+
+    // Entrypoint override (only if different from image default)
+    if let Some(ep) = config["Entrypoint"].as_array() {
+        if !ep.is_empty() {
+            args.push("--entrypoint".to_string());
+            args.push(ep[0].as_str().unwrap_or("").to_string());
+        }
+    }
+
+    // Privileged
+    if host_config["Privileged"].as_bool().unwrap_or(false) {
+        args.push("--privileged".to_string());
+    }
+
+    // Memory limit
+    if let Some(mem) = host_config["Memory"].as_u64() {
+        if mem > 0 {
+            args.push("-m".to_string());
+            args.push(format!("{}b", mem));
+        }
+    }
+
+    // CPU quota
+    if let Some(cpus) = host_config["NanoCpus"].as_u64() {
+        if cpus > 0 {
+            args.push("--cpus".to_string());
+            args.push(format!("{:.2}", cpus as f64 / 1_000_000_000.0));
+        }
+    }
+
+    args
+}
+
 pub fn restore_docker(entry: &BackupEntry, overwrite: bool) -> Result<String, String> {
 
     let container_name = &entry.target.name;
@@ -1196,6 +1344,16 @@ pub fn restore_docker(entry: &BackupEntry, overwrite: bool) -> Result<String, St
     if exists && !overwrite {
         return Err(format!("CONTAINER_EXISTS:{}", container_name));
     }
+
+    // Try to retrieve the inspect config alongside the backup
+    let config_filename = entry.filename.replace(".tar.gz", ".inspect.json");
+    let config_entry = BackupEntry {
+        filename: config_filename.clone(),
+        ..entry.clone()
+    };
+    let inspect_json = retrieve_backup(&config_entry).ok()
+        .and_then(|p| fs::read_to_string(&p).ok())
+        .and_then(|s| { serde_json::from_str::<serde_json::Value>(&s).ok() });
 
     let local_path = retrieve_backup(entry)?;
 
@@ -1226,8 +1384,17 @@ pub fn restore_docker(entry: &BackupEntry, overwrite: bool) -> Result<String, St
         let _ = Command::new("docker").args(["rm", "-f", container_name]).output();
     }
 
+    // Build docker run args from inspect config, or use defaults
+    let extra_args = inspect_json.as_ref()
+        .map(|j| docker_run_args_from_inspect(j))
+        .unwrap_or_else(|| vec!["--restart".to_string(), "unless-stopped".to_string()]);
+
+    let mut run_args = vec!["run".to_string(), "-d".to_string(), "--name".to_string(), container_name.to_string()];
+    run_args.extend(extra_args);
+    run_args.push(image_name.clone());
+
     let create = Command::new("docker")
-        .args(["run", "-d", "--name", container_name, "--restart", "unless-stopped", &image_name])
+        .args(&run_args)
         .output()
         .map_err(|e| format!("Image loaded but failed to create container: {}", e))?;
 
@@ -1237,7 +1404,8 @@ pub fn restore_docker(entry: &BackupEntry, overwrite: bool) -> Result<String, St
             image_name, err.trim()));
     }
 
-    Ok(format!("Docker container '{}' restored and started from image {}", container_name, image_name))
+    let config_note = if inspect_json.is_some() { " (with original config)" } else { " (default config)" };
+    Ok(format!("Docker container '{}' restored and started{}", container_name, config_note))
 }
 
 /// Restore an LXC container from backup
@@ -1694,6 +1862,19 @@ pub fn restore_by_id_with_log(id: &str, overwrite: bool, log: std::sync::mpsc::S
         }
     }
 
+    // Try to retrieve inspect config for Docker restores
+    let inspect_json = if entry.target.target_type == BackupTargetType::Docker {
+        let _ = log.send("Looking for container config...".to_string());
+        let config_filename = entry.filename.replace(".tar.gz", ".inspect.json");
+        let config_entry = BackupEntry { filename: config_filename, ..entry.clone() };
+        let json = retrieve_backup(&config_entry).ok()
+            .and_then(|p| { let r = fs::read_to_string(&p).ok(); let _ = fs::remove_file(&p); r })
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+        if json.is_some() { let _ = log.send("Found original container config".to_string()); }
+        else { let _ = log.send("No saved config found — will use defaults".to_string()); }
+        json
+    } else { None };
+
     let _ = log.send("Downloading backup...".to_string());
     let local_path = retrieve_backup(entry)?;
     let _ = log.send("Download complete".to_string());
@@ -1722,10 +1903,19 @@ pub fn restore_by_id_with_log(id: &str, overwrite: bool, log: std::sync::mpsc::S
                 .to_string();
 
             let _ = log.send(format!("Image loaded: {}", image_name));
+
+            let extra_args = inspect_json.as_ref()
+                .map(|j| docker_run_args_from_inspect(j))
+                .unwrap_or_else(|| vec!["--restart".to_string(), "unless-stopped".to_string()]);
+
             let _ = log.send(format!("Creating container '{}'...", entry.target.name));
 
+            let mut run_args = vec!["run".to_string(), "-d".to_string(), "--name".to_string(), entry.target.name.clone()];
+            run_args.extend(extra_args);
+            run_args.push(image_name.clone());
+
             let create = Command::new("docker")
-                .args(["run", "-d", "--name", &entry.target.name, "--restart", "unless-stopped", &image_name])
+                .args(&run_args)
                 .output()
                 .map_err(|e| format!("Failed to create container: {}", e))?;
 
@@ -1736,7 +1926,8 @@ pub fn restore_by_id_with_log(id: &str, overwrite: bool, log: std::sync::mpsc::S
                 return Ok(msg);
             }
 
-            let msg = format!("✅ Docker container '{}' restored and started", entry.target.name);
+            let config_note = if inspect_json.is_some() { " (with original config)" } else { " (default config)" };
+            let msg = format!("✅ Docker container '{}' restored and started{}", entry.target.name, config_note);
             let _ = log.send(msg.clone());
             Ok(msg)
         }
@@ -2538,6 +2729,16 @@ where
                                 else { snap_id.to_string() };
 
                             if !container_name.is_empty() {
+                                // Look for inspect config alongside the tar
+                                let inspect_name = fname.replace(".tar.gz", ".inspect.json");
+                                let inspect_path = Path::new(&effective_target).join(&inspect_name);
+                                let inspect_json = fs::read_to_string(&inspect_path).ok()
+                                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+                                if inspect_json.is_some() {
+                                    on_progress("Found original container config".to_string(), Some(95.5));
+                                }
+                                let _ = fs::remove_file(&inspect_path);
+
                                 // Check if container already exists
                                 let check = Command::new("docker")
                                     .args(["container", "inspect", &container_name])
@@ -2552,9 +2753,17 @@ where
                                         let _ = Command::new("docker").args(["stop", &container_name]).output();
                                         let _ = Command::new("docker").args(["rm", "-f", &container_name]).output();
                                     }
+
+                                    let extra_args = inspect_json.as_ref()
+                                        .map(|j| docker_run_args_from_inspect(j))
+                                        .unwrap_or_else(|| vec!["--restart".to_string(), "unless-stopped".to_string()]);
+
                                     on_progress(format!("Creating container '{}'...", container_name), Some(97.0));
+                                    let mut run_args = vec!["run".to_string(), "-d".to_string(), "--name".to_string(), container_name.clone()];
+                                    run_args.extend(extra_args);
+                                    run_args.push(image_name.clone());
                                     let create = Command::new("docker")
-                                        .args(["run", "-d", "--name", &container_name, "--restart", "unless-stopped", &image_name])
+                                        .args(&run_args)
                                         .output();
                                     match create {
                                         Ok(c) if c.status.success() => {
