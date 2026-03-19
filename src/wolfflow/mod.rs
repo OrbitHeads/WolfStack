@@ -777,7 +777,7 @@ pub async fn execute_workflow(
 
     // Build HTTP client for remote calls
     let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
+        .timeout(std::time::Duration::from_secs(30))
         .danger_accept_invalid_certs(true)
         .build()
         .ok();
