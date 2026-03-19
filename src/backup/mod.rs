@@ -1051,7 +1051,7 @@ fn store_pbs_with_notes_and_log(local_path: &Path, storage: &BackupStorage, file
     // Stream stderr for progress when log channel is available
     if let Some(log_tx) = log {
         use std::process::Stdio;
-        use std::io::{BufRead, BufReader};
+        use std::io::BufReader;
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::piped());
 
@@ -1059,14 +1059,25 @@ fn store_pbs_with_notes_and_log(local_path: &Path, storage: &BackupStorage, file
             .map_err(|e| format!("Failed to start proxmox-backup-client: {}", e))?;
 
         if let Some(stderr) = child.stderr.take() {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    let trimmed = line.trim().to_string();
+            use std::io::Read;
+            let mut reader = BufReader::new(stderr);
+            let mut buf = [0u8; 1];
+            let mut line_buf = String::new();
+            while reader.read(&mut buf).unwrap_or(0) > 0 {
+                let ch = buf[0] as char;
+                if ch == '\n' || ch == '\r' {
+                    let trimmed = line_buf.trim().to_string();
                     if !trimmed.is_empty() {
                         let _ = log_tx.send(format!("  PBS: {}", trimmed));
                     }
+                    line_buf.clear();
+                } else {
+                    line_buf.push(ch);
                 }
+            }
+            let trimmed = line_buf.trim().to_string();
+            if !trimmed.is_empty() {
+                let _ = log_tx.send(format!("  PBS: {}", trimmed));
             }
         }
 
