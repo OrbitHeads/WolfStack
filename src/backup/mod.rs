@@ -1199,9 +1199,39 @@ pub fn restore_docker(entry: &BackupEntry) -> Result<String, String> {
         return Err(format!("Docker load failed: {}", String::from_utf8_lossy(&output.stderr)));
     }
 
-    let result = String::from_utf8_lossy(&output.stdout).to_string();
+    let load_result = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-    Ok(format!("Docker image restored: {}", result.trim()))
+    // Extract the loaded image name from "Loaded image: <name>"
+    let image_name = load_result
+        .lines()
+        .find_map(|line| line.strip_prefix("Loaded image: "))
+        .unwrap_or(&format!("wolfstack-backup/{}", entry.target.name))
+        .to_string();
+
+    // Create and start a container from the restored image
+    let container_name = &entry.target.name;
+
+    // Check if a container with this name already exists
+    let check = Command::new("docker")
+        .args(["container", "inspect", container_name])
+        .output();
+    if check.map(|o| o.status.success()).unwrap_or(false) {
+        return Ok(format!("Docker image restored ({}). Container '{}' already exists — image loaded but container not replaced.",
+            image_name, container_name));
+    }
+
+    let create = Command::new("docker")
+        .args(["run", "-d", "--name", container_name, "--restart", "unless-stopped", &image_name])
+        .output()
+        .map_err(|e| format!("Image loaded but failed to create container: {}", e))?;
+
+    if !create.status.success() {
+        let err = String::from_utf8_lossy(&create.stderr);
+        return Ok(format!("Docker image restored ({}). Could not auto-create container: {}",
+            image_name, err.trim()));
+    }
+
+    Ok(format!("Docker container '{}' restored and started from image {}", container_name, image_name))
 }
 
 /// Restore an LXC container from backup
