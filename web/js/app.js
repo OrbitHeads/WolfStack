@@ -28622,11 +28622,17 @@ function renderWolfFlowProperties(step) {
                     <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
                         <input type="radio" name="wf-prop-target" value="nodes" ${targetScope === 'nodes' ? 'checked' : ''} onchange="wfPropTargetChanged()"> Specific Nodes
                     </label>
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+                        <input type="radio" name="wf-prop-target" value="containers" ${targetScope === 'containers' ? 'checked' : ''} onchange="wfPropTargetChanged()"> Specific Containers/VMs
+                    </label>
                 </div>
                 <div id="wf-prop-target-cluster" style="${targetScope === 'cluster' ? '' : 'display:none;'}margin-bottom:8px;">
                     <input type="text" id="wf-prop-cluster-name" class="form-control" value="${escapeHtml((target && target.cluster_name) || '')}" placeholder="Cluster name" style="font-size:12px;">
                 </div>
-                <div id="wf-prop-target-nodes" style="${targetScope === 'nodes' ? '' : 'display:none;'}max-height:150px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:8px;background:var(--bg-primary);">
+                <div id="wf-prop-target-nodes" style="${targetScope === 'nodes' ? '' : 'display:none;'}max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:8px;background:var(--bg-primary);">
+                </div>
+                <div id="wf-prop-target-containers" style="${targetScope === 'containers' ? '' : 'display:none;'}max-height:300px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:8px;background:var(--bg-primary);">
+                    <div style="color:var(--text-muted);font-size:11px;text-align:center;padding:8px;">Loading infrastructure...</div>
                 </div>
             </div>
         </div>
@@ -28769,8 +28775,70 @@ function wfPropTargetChanged() {
     const scope = selected.value;
     const clusterDiv = document.getElementById('wf-prop-target-cluster');
     const nodesDiv = document.getElementById('wf-prop-target-nodes');
+    const containersDiv = document.getElementById('wf-prop-target-containers');
     if (clusterDiv) clusterDiv.style.display = scope === 'cluster' ? '' : 'none';
     if (nodesDiv) nodesDiv.style.display = scope === 'nodes' ? '' : 'none';
+    if (containersDiv) {
+        containersDiv.style.display = scope === 'containers' ? '' : 'none';
+        if (scope === 'containers') wfLoadInfrastructureTree();
+    }
+}
+
+// Cache for infrastructure tree
+let _wfInfraCache = null;
+async function wfLoadInfrastructureTree() {
+    const div = document.getElementById('wf-prop-target-containers');
+    if (!div) return;
+    if (_wfInfraCache) { wfRenderInfraTree(div, _wfInfraCache); return; }
+    div.innerHTML = '<div style="color:var(--text-muted);font-size:11px;text-align:center;padding:12px;">Loading infrastructure...</div>';
+    try {
+        const resp = await fetch('/api/wolfflow/infrastructure', { credentials: 'include' });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        _wfInfraCache = await resp.json();
+        wfRenderInfraTree(div, _wfInfraCache);
+        // Expire cache after 60s
+        setTimeout(() => { _wfInfraCache = null; }, 60000);
+    } catch(e) {
+        div.innerHTML = '<div style="color:var(--text-muted);font-size:11px;">Failed to load: ' + e.message + '</div>';
+    }
+}
+
+function wfRenderInfraTree(div, infra) {
+    let html = '';
+    Object.keys(infra).sort().forEach(clusterName => {
+        html += `<div style="font-size:11px;font-weight:700;color:var(--text-secondary);margin:8px 0 4px;border-bottom:1px solid var(--border);padding-bottom:2px;">${escapeHtml(clusterName)}</div>`;
+        (infra[clusterName] || []).forEach(node => {
+            const nodeLabel = node.hostname || node.id;
+            const type = node.node_type === 'proxmox' ? ' (PVE)' : '';
+            const dot = node.online ? '<span style="color:#22c55e;">&#9679;</span>' : '<span style="color:#ef4444;">&#9679;</span>';
+            html += `<div style="margin-left:4px;margin-bottom:2px;font-size:11px;color:var(--text-primary);">${dot} <strong>${escapeHtml(nodeLabel)}</strong>${type}</div>`;
+            // Docker containers
+            (node.docker || []).forEach(c => {
+                const stDot = c.state === 'running' ? '<span style="color:#22c55e;font-size:8px;">&#9679;</span>' : '<span style="color:#888;font-size:8px;">&#9679;</span>';
+                html += `<label style="display:flex;align-items:center;gap:5px;margin-left:16px;padding:1px 0;font-size:11px;cursor:pointer;color:var(--text-secondary);">
+                    <input type="checkbox" class="wf-ct-cb" data-node="${node.id}" data-runtime="docker" data-name="${escapeHtml(c.name)}">
+                    ${stDot} <span style="color:#3b82f6;">D</span> ${escapeHtml(c.name)}
+                </label>`;
+            });
+            // LXC containers
+            (node.lxc || []).forEach(c => {
+                const stDot = c.state === 'running' ? '<span style="color:#22c55e;font-size:8px;">&#9679;</span>' : '<span style="color:#888;font-size:8px;">&#9679;</span>';
+                html += `<label style="display:flex;align-items:center;gap:5px;margin-left:16px;padding:1px 0;font-size:11px;cursor:pointer;color:var(--text-secondary);">
+                    <input type="checkbox" class="wf-ct-cb" data-node="${node.id}" data-runtime="lxc" data-name="${escapeHtml(c.name)}">
+                    ${stDot} <span style="color:#10b981;">L</span> ${escapeHtml(c.name)}
+                </label>`;
+            });
+            // VMs
+            (node.vms || []).forEach(v => {
+                const stDot = v.state === 'running' ? '<span style="color:#22c55e;font-size:8px;">&#9679;</span>' : '<span style="color:#888;font-size:8px;">&#9679;</span>';
+                html += `<label style="display:flex;align-items:center;gap:5px;margin-left:16px;padding:1px 0;font-size:11px;cursor:pointer;color:var(--text-secondary);">
+                    <input type="checkbox" class="wf-ct-cb" data-node="${node.id}" data-runtime="vm" data-name="${escapeHtml(v.name)}">
+                    ${stDot} <span style="color:#f59e0b;">V</span> ${escapeHtml(v.name)}
+                </label>`;
+            });
+        });
+    });
+    div.innerHTML = html || '<div style="color:var(--text-muted);font-size:11px;">No infrastructure found</div>';
 }
 
 function updateWolfFlowStepFromPanel() {
@@ -28818,6 +28886,13 @@ function updateWolfFlowStepFromPanel() {
         } else if (scope === 'nodes') {
             const nodeIds = Array.from(document.querySelectorAll('.wf-prop-node-cb:checked')).map(cb => cb.value);
             step.target_override = { scope: 'nodes', node_ids: nodeIds };
+        } else if (scope === 'containers') {
+            const targets = Array.from(document.querySelectorAll('.wf-ct-cb:checked')).map(cb => ({
+                node_id: cb.dataset.node,
+                runtime: cb.dataset.runtime,
+                name: cb.dataset.name,
+            }));
+            step.target_override = { scope: 'containers', targets };
         }
     }
 }

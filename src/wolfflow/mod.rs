@@ -109,6 +109,20 @@ pub enum Target {
     Nodes {
         node_ids: Vec<String>,
     },
+    /// Execute on specific containers/VMs/LXCs
+    /// Each entry is "node_id:runtime:name" e.g. "node-abc:docker:nginx"
+    Containers {
+        #[serde(default)]
+        targets: Vec<ContainerTarget>,
+    },
+}
+
+/// A specific container/VM/LXC target
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerTarget {
+    pub node_id: String,
+    pub runtime: String, // "docker", "lxc", "vm"
+    pub name: String,
 }
 
 /// A single step within a workflow
@@ -665,6 +679,20 @@ fn resolve_targets(
                 .filter(|n| n.online && node_ids.contains(&n.id))
                 .map(|n| (n.id.clone(), n.hostname.clone(), n.address.clone(), n.port, n.is_self))
                 .collect()
+        }
+        Target::Containers { targets } => {
+            // For container targets, resolve to the nodes that host them
+            // The container-specific execution is handled in execute_workflow
+            let mut result = Vec::new();
+            let mut seen_nodes = std::collections::HashSet::new();
+            for ct in targets {
+                if seen_nodes.contains(&ct.node_id) { continue; }
+                if let Some(n) = nodes.iter().find(|n| n.id == ct.node_id && n.online) {
+                    result.push((n.id.clone(), n.hostname.clone(), n.address.clone(), n.port, n.is_self));
+                    seen_nodes.insert(ct.node_id.clone());
+                }
+            }
+            result
         }
     }
 }

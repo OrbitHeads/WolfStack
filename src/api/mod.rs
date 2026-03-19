@@ -8333,6 +8333,127 @@ pub async fn wolfflow_toolbox(req: HttpRequest, state: web::Data<AppState>) -> H
     HttpResponse::Ok().json(crate::wolfflow::toolbox_actions())
 }
 
+/// GET /api/wolfflow/infrastructure — returns the full infrastructure tree for target selection
+/// Clusters → Nodes → Docker containers, LXC containers, VMs
+pub async fn wolfflow_infrastructure(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    let nodes = state.cluster.get_all_nodes();
+    let cluster_secret = state.cluster_secret.clone();
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap_or_default();
+
+    let mut clusters: std::collections::HashMap<String, Vec<serde_json::Value>> = std::collections::HashMap::new();
+
+    for node in &nodes {
+        let cluster_name = node.cluster_name.clone()
+            .or(node.pve_cluster_name.clone())
+            .unwrap_or_else(|| "Default".to_string());
+
+        let mut node_data = serde_json::json!({
+            "id": node.id,
+            "hostname": node.hostname,
+            "address": node.address,
+            "port": node.port,
+            "online": node.online,
+            "node_type": node.node_type,
+            "is_self": node.is_self,
+            "docker": [],
+            "lxc": [],
+            "vms": [],
+        });
+
+        // Fetch containers for online nodes
+        if node.online && node.node_type == "wolfstack" {
+            let urls = build_node_urls(&node.address, node.port, "/api/containers/docker");
+            for url in &urls {
+                if let Ok(resp) = http_client.get(url)
+                    .header("X-WolfStack-Secret", &cluster_secret)
+                    .send().await
+                {
+                    if let Ok(containers) = resp.json::<Vec<serde_json::Value>>().await {
+                        node_data["docker"] = serde_json::json!(containers.iter().map(|c| {
+                            serde_json::json!({
+                                "name": c.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                                "state": c.get("state").and_then(|v| v.as_str()).unwrap_or("?"),
+                            })
+                        }).collect::<Vec<_>>());
+                        break;
+                    }
+                }
+            }
+            let urls = build_node_urls(&node.address, node.port, "/api/containers/lxc");
+            for url in &urls {
+                if let Ok(resp) = http_client.get(url)
+                    .header("X-WolfStack-Secret", &cluster_secret)
+                    .send().await
+                {
+                    if let Ok(containers) = resp.json::<Vec<serde_json::Value>>().await {
+                        node_data["lxc"] = serde_json::json!(containers.iter().map(|c| {
+                            serde_json::json!({
+                                "name": c.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                                "state": c.get("state").and_then(|v| v.as_str()).unwrap_or("?"),
+                            })
+                        }).collect::<Vec<_>>());
+                        break;
+                    }
+                }
+            }
+            let urls = build_node_urls(&node.address, node.port, "/api/vms");
+            for url in &urls {
+                if let Ok(resp) = http_client.get(url)
+                    .header("X-WolfStack-Secret", &cluster_secret)
+                    .send().await
+                {
+                    if let Ok(vms) = resp.json::<Vec<serde_json::Value>>().await {
+                        node_data["vms"] = serde_json::json!(vms.iter().map(|v| {
+                            serde_json::json!({
+                                "name": v.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                                "state": if v.get("running").and_then(|v| v.as_bool()).unwrap_or(false) { "running" } else { "stopped" },
+                            })
+                        }).collect::<Vec<_>>());
+                        break;
+                    }
+                }
+            }
+        } else if node.online && node.node_type == "proxmox" {
+            // PVE nodes — fetch guests
+            // PVE guests fetched via the local /pve/resources endpoint below
+            let pve_url = format!("/api/nodes/{}/pve/resources", node.id);
+            if let Ok(resp) = http_client.get(&format!("https://{}:{}{}", "127.0.0.1", 8553, pve_url))
+                .header("X-WolfStack-Secret", &cluster_secret)
+                .send().await
+            {
+                if let Ok(guests) = resp.json::<Vec<serde_json::Value>>().await {
+                    let lxc: Vec<_> = guests.iter()
+                        .filter(|g| g.get("guest_type").and_then(|v| v.as_str()) == Some("lxc"))
+                        .map(|g| serde_json::json!({
+                            "name": g.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                            "state": g.get("status").and_then(|v| v.as_str()).unwrap_or("?"),
+                        }))
+                        .collect();
+                    let vms: Vec<_> = guests.iter()
+                        .filter(|g| g.get("guest_type").and_then(|v| v.as_str()) == Some("qemu"))
+                        .map(|g| serde_json::json!({
+                            "name": g.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                            "state": g.get("status").and_then(|v| v.as_str()).unwrap_or("?"),
+                        }))
+                        .collect();
+                    node_data["lxc"] = serde_json::json!(lxc);
+                    node_data["vms"] = serde_json::json!(vms);
+                }
+            }
+        }
+
+        clusters.entry(cluster_name).or_default().push(node_data);
+    }
+
+    HttpResponse::Ok().json(clusters)
+}
+
 /// POST /api/wolfflow/exec — execute a single action (used by remote execution)
 pub async fn wolfflow_exec(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
@@ -13199,6 +13320,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/wolfflow/runs/{id}", web::get().to(wolfflow_run_detail))
         .route("/api/wolfflow/toolbox", web::get().to(wolfflow_toolbox))
         .route("/api/wolfflow/exec", web::post().to(wolfflow_exec))
+        .route("/api/wolfflow/infrastructure", web::get().to(wolfflow_infrastructure))
         // VR Terminal
         .route("/api/vr-terminal/create", web::post().to(crate::vr_terminal::vr_term_create))
         .route("/api/vr-terminal/{id}/output", web::get().to(crate::vr_terminal::vr_term_output))
