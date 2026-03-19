@@ -1008,6 +1008,10 @@ fn pbs_repo_string(storage: &BackupStorage) -> String {
 
 /// Store backup to Proxmox Backup Server
 fn store_pbs_with_notes(local_path: &Path, storage: &BackupStorage, filename: &str, notes: Option<&str>) -> Result<(), String> {
+    store_pbs_with_notes_and_log(local_path, storage, filename, notes, None)
+}
+
+fn store_pbs_with_notes_and_log(local_path: &Path, storage: &BackupStorage, filename: &str, notes: Option<&str>, log: Option<&std::sync::mpsc::Sender<String>>) -> Result<(), String> {
     let repo = pbs_repo_string(storage);
 
     // Extract the actual VMID/container name from the filename
@@ -1044,12 +1048,41 @@ fn store_pbs_with_notes(local_path: &Path, storage: &BackupStorage, filename: &s
         cmd.env("PBS_PASSWORD", pbs_pw);
     }
 
-    let output = cmd.output()
-        .map_err(|e| format!("Failed to run proxmox-backup-client: {}", e))?;
+    // Stream stderr for progress when log channel is available
+    if let Some(log_tx) = log {
+        use std::process::Stdio;
+        use std::io::{BufRead, BufReader};
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::piped());
 
-    if !output.status.success() {
-        return Err(format!("PBS backup failed: {}",
-            String::from_utf8_lossy(&output.stderr)));
+        let mut child = cmd.spawn()
+            .map_err(|e| format!("Failed to start proxmox-backup-client: {}", e))?;
+
+        if let Some(stderr) = child.stderr.take() {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    let trimmed = line.trim().to_string();
+                    if !trimmed.is_empty() {
+                        let _ = log_tx.send(format!("  PBS: {}", trimmed));
+                    }
+                }
+            }
+        }
+
+        let status = child.wait()
+            .map_err(|e| format!("PBS backup wait failed: {}", e))?;
+        if !status.success() {
+            return Err("PBS backup failed (see log above)".to_string());
+        }
+    } else {
+        let output = cmd.output()
+            .map_err(|e| format!("Failed to run proxmox-backup-client: {}", e))?;
+
+        if !output.status.success() {
+            return Err(format!("PBS backup failed: {}",
+                String::from_utf8_lossy(&output.stderr)));
+        }
     }
 
     // Set snapshot notes with cluster/node/container metadata for identification
@@ -1667,7 +1700,23 @@ pub fn create_backup_with_log(
                 let _ = log.send(format!("  Storing to {}...", storage_label(&storage)));
                 // Build PBS notes with cluster, node, and target details
                 let pbs_notes = format!("Cluster: {} | Node: {} | {}", cluster, hostname, comments);
-                match store_backup_with_notes(&local_path, &storage, &filename, Some(&pbs_notes)) {
+
+                // Also store Docker inspect config alongside the backup if it exists
+                if t.target_type == BackupTargetType::Docker {
+                    let config_name = filename.replace(".tar.gz", ".inspect.json");
+                    let config_path = local_path.with_file_name(&config_name);
+                    if config_path.exists() {
+                        let _ = store_backup_with_notes(&config_path, &storage, &config_name, None);
+                        let _ = fs::remove_file(&config_path);
+                    }
+                }
+
+                let store_result = if storage.storage_type == StorageType::Pbs {
+                    store_pbs_with_notes_and_log(&local_path, &storage, &filename, Some(&pbs_notes), Some(&log))
+                } else {
+                    store_backup_with_notes(&local_path, &storage, &filename, Some(&pbs_notes))
+                };
+                match store_result {
                     Ok(_) => {
                         let _ = fs::remove_file(&local_path);
                         let _ = log.send(format!("  ✓ {} backup complete ({})", type_name, format_size_human(size)));
