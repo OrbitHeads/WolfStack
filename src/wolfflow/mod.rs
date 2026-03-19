@@ -763,6 +763,7 @@ pub async fn execute_workflow(
         started_at: started_at.clone(),
         finished_at: None,
         duration_ms: 0,
+        email_status: None,
     };
 
     // Persist initial run state
