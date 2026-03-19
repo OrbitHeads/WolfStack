@@ -136,7 +136,7 @@ if [ "$PKG_MANAGER" = "apt" ]; then
     fi
     apt upgrade -y -qq 2>/dev/null || true
 elif [ "$PKG_MANAGER" = "dnf" ]; then
-    dnf upgrade -y --quiet
+    dnf upgrade -y --quiet --skip-broken 2>/dev/null || true
 elif [ "$PKG_MANAGER" = "yum" ]; then
     yum update -y -q
 elif [ "$PKG_MANAGER" = "zypper" ]; then
@@ -851,9 +851,16 @@ echo "Cloning WolfStack repository..."
 if [ -d "$INSTALL_DIR" ]; then
     echo "  Updating existing installation..."
     cd "$INSTALL_DIR"
-    git fetch origin
-    git checkout -B $BRANCH origin/$BRANCH
-    git reset --hard origin/$BRANCH
+    if ! git fetch origin 2>/dev/null; then
+        echo "  ⚠ Git repo corrupted — re-cloning..."
+        cd /
+        rm -rf "$INSTALL_DIR"
+        git clone -b $BRANCH https://github.com/wolfsoftwaresystemsltd/WolfStack.git "$INSTALL_DIR"
+        cd "$INSTALL_DIR"
+    else
+        git checkout -B $BRANCH origin/$BRANCH
+        git reset --hard origin/$BRANCH
+    fi
 else
     git clone -b $BRANCH https://github.com/wolfsoftwaresystemsltd/WolfStack.git "$INSTALL_DIR"
     cd "$INSTALL_DIR"
