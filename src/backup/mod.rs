@@ -2400,14 +2400,21 @@ fn retrieve_from_pbs(entry: &BackupEntry, dest: &Path) -> Result<(), String> {
     let storage = &entry.storage;
     let repo = pbs_repo_string(storage);
 
-    // The filename in the entry tells us what archive to look for
-    let backup_id = entry.filename.split('.').next().unwrap_or(&entry.filename);
-    let snapshot = format!("host/{}/latest", backup_id);
+    // Use the same ID extraction as the backup upload so the snapshot path matches
+    let backup_id = extract_backup_id_from_filename(&entry.filename);
+    let backup_type = if entry.filename.starts_with("vzdump-lxc-") || entry.filename.starts_with("lxc-") {
+        "ct"
+    } else if entry.filename.starts_with("vm-") || entry.filename.starts_with("vzdump-qemu-") {
+        "vm"
+    } else {
+        "host"
+    };
+    let snapshot = format!("{}/{}/latest", backup_type, backup_id);
 
     let mut cmd = Command::new("proxmox-backup-client");
     cmd.arg("restore")
        .arg(&snapshot)
-       .arg(format!("{}.pxar", backup_id))
+       .arg("backup.pxar")
        .arg(dest.parent().unwrap_or(Path::new("/tmp")).to_string_lossy().to_string())
        .arg("--repository").arg(&repo);
 
