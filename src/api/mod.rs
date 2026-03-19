@@ -585,16 +585,42 @@ pub async fn add_node(req: HttpRequest, state: web::Data<AppState>, body: web::J
             }));
         }
 
+        // Block duplicate Proxmox nodes — check if this address+port+node_name already exists
+        let existing_nodes = state.cluster.get_all_nodes();
+        for existing in &existing_nodes {
+            if existing.address == body.address && existing.port == port
+                && existing.pve_node_name.as_deref() == Some(&pve_node_name)
+            {
+                return HttpResponse::Conflict().json(serde_json::json!({
+                    "error": format!(
+                        "Proxmox node '{}' at {}:{} already exists in the cluster (id: '{}'). \
+                         Remove the existing node first if you want to re-add it.",
+                        pve_node_name, body.address, port, existing.id
+                    )
+                }));
+            }
+        }
+
         // Try to discover all nodes in the cluster
         let client = crate::proxmox::PveClient::new(&body.address, port, &token, fingerprint.as_deref(), &pve_node_name);
         let discovered = client.discover_nodes().await.unwrap_or_default();
 
         let mut added_ids = Vec::new();
         let mut added_nodes = Vec::new();
+        let mut skipped_nodes = Vec::new();
 
         if discovered.len() > 1 {
-            // Multi-node cluster — add each discovered node
+            // Multi-node cluster — add each discovered node (skip duplicates)
             for node_name in &discovered {
+                // Skip if this node already exists
+                let already_exists = existing_nodes.iter().any(|n|
+                    n.address == body.address && n.port == port
+                    && n.pve_node_name.as_deref() == Some(node_name)
+                );
+                if already_exists {
+                    skipped_nodes.push(node_name.clone());
+                    continue;
+                }
                 let id = state.cluster.add_proxmox_server(
                     body.address.clone(), port, token.clone(),
                     fingerprint.clone(), node_name.clone(), cluster_name.clone(),
@@ -620,6 +646,7 @@ pub async fn add_node(req: HttpRequest, state: web::Data<AppState>, body: web::J
             "port": port,
             "node_type": "proxmox",
             "nodes_discovered": added_nodes,
+            "nodes_skipped": skipped_nodes,
             "cluster_name": cluster_name,
         }))
     } else {
@@ -735,6 +762,20 @@ pub async fn add_node(req: HttpRequest, state: web::Data<AppState>, body: web::J
                         "Cannot join node: WolfNet IP conflict — {} is already in use in this cluster. \
                          Change the node's IP in /etc/wolfnet/config.toml and restart wolfnet before joining.",
                         conflicts.join(", ")
+                    )
+                }));
+            }
+        }
+
+        // Block duplicate nodes — check if a node with this address:port already exists
+        let existing_nodes = state.cluster.get_all_nodes();
+        for existing in &existing_nodes {
+            if existing.address == body.address && existing.port == port {
+                return HttpResponse::Conflict().json(serde_json::json!({
+                    "error": format!(
+                        "A node at {}:{} already exists in the cluster (hostname: '{}', id: '{}'). \
+                         Remove the existing node first if you want to re-add it.",
+                        body.address, port, existing.hostname, existing.id
                     )
                 }));
             }
