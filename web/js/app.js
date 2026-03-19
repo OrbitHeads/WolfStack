@@ -28361,7 +28361,9 @@ async function openWolfFlowEditor(editId) {
                 document.getElementById('wf-editor-name').value = wf.name || '';
                 document.getElementById('wf-editor-schedule').value = wf.schedule || '';
                 document.getElementById('wf-editor-enabled').checked = wf.enabled !== false;
-                wfEditorTarget = wf.target || { scope: 'local' };
+                const emailEl = document.getElementById('wf-editor-email');
+                if (emailEl) emailEl.value = wf.email_results || '';
+                wfEditorTarget = wf.target || null;
                 wfSteps = (wf.steps || []).map(s => ({
                     name: s.name || '',
                     action: s.action || {},
@@ -29033,6 +29035,7 @@ async function saveWolfFlow() {
 
     const schedule = document.getElementById('wf-editor-schedule').value.trim();
     const enabled = document.getElementById('wf-editor-enabled').checked;
+    const emailResults = document.getElementById('wf-editor-email')?.value?.trim() || null;
 
     // Build steps array matching the Rust struct
     const steps = wfSteps.map(s => {
@@ -29066,6 +29069,7 @@ async function saveWolfFlow() {
         target: wfEditorTarget,
         schedule: schedule || null,
         enabled,
+        email_results: emailResults,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
     };

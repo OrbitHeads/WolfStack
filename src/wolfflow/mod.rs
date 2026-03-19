@@ -63,10 +63,13 @@ pub enum ActionType {
         #[serde(default)]
         max_size_mb: Option<u32>,
     },
-    /// Check disk space on root partition
+    /// Check disk space on specified mount point (defaults to all)
     CheckDiskSpace {
         #[serde(default)]
         warn_threshold_pct: Option<u32>,
+        /// Mount point to check e.g. "/" or "/var" or "all" (default: all)
+        #[serde(default)]
+        mount_point: Option<String>,
     },
     /// Restart a Docker or LXC container
     RestartContainer {
@@ -156,6 +159,9 @@ pub struct Workflow {
     pub updated_at: String,
     #[serde(default)]
     pub last_run: Option<String>,
+    /// Email address to send results to (optional — uses SMTP settings from alerting config)
+    #[serde(default)]
+    pub email_results: Option<String>,
 }
 
 /// Status of a workflow run or individual step
@@ -556,24 +562,50 @@ pub async fn execute_action_local(action: &ActionType) -> Result<String, String>
             run_command("journalctl", &[&arg], 120).await
         }
 
-        ActionType::CheckDiskSpace { warn_threshold_pct } => {
+        ActionType::CheckDiskSpace { warn_threshold_pct, mount_point } => {
             let threshold = warn_threshold_pct.unwrap_or(90);
-            let output = run_command("df", &["-h", "/"], 10).await?;
-            // Parse df output: second line, 5th column is "Use%"
-            let lines: Vec<&str> = output.lines().collect();
-            if lines.len() < 2 {
-                return Err("Could not parse df output".to_string());
-            }
-            let fields: Vec<&str> = lines[1].split_whitespace().collect();
-            if fields.len() < 5 {
-                return Err("Unexpected df output format".to_string());
-            }
-            let pct_str = fields[4].trim_end_matches('%');
-            let pct: u32 = pct_str.parse().map_err(|_| "Could not parse disk usage percentage".to_string())?;
-            if pct > threshold {
-                Err(format!("Disk usage {}% exceeds threshold {}%", pct, threshold))
+            let mp = mount_point.as_deref().unwrap_or("all");
+
+            if mp == "all" || mp.is_empty() {
+                // Check ALL mount points
+                let output = run_command("df", &["-h", "--output=target,pcent"], 10).await?;
+                let mut results = Vec::new();
+                let mut any_over = false;
+                for line in output.lines().skip(1) {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let mount = parts[0];
+                        let pct_str = parts[1].trim_end_matches('%');
+                        if let Ok(pct) = pct_str.parse::<u32>() {
+                            let status = if pct > threshold { any_over = true; "OVER" } else { "OK" };
+                            results.push(format!("{}: {}% [{}]", mount, pct, status));
+                        }
+                    }
+                }
+                let summary = results.join("\n");
+                if any_over {
+                    Err(format!("Disk usage exceeds {}% on some mounts:\n{}", threshold, summary))
+                } else {
+                    Ok(format!("All mounts within {}%:\n{}", threshold, summary))
+                }
             } else {
-                Ok(format!("Disk usage {}% is within threshold {}%", pct, threshold))
+                // Check specific mount point
+                let output = run_command("df", &["-h", mp], 10).await?;
+                let lines: Vec<&str> = output.lines().collect();
+                if lines.len() < 2 {
+                    return Err(format!("Mount point '{}' not found", mp));
+                }
+                let fields: Vec<&str> = lines[1].split_whitespace().collect();
+                if fields.len() < 5 {
+                    return Err("Unexpected df output format".to_string());
+                }
+                let pct_str = fields[4].trim_end_matches('%');
+                let pct: u32 = pct_str.parse().map_err(|_| "Could not parse disk usage".to_string())?;
+                if pct > threshold {
+                    Err(format!("{}: {}% exceeds threshold {}%", mp, pct, threshold))
+                } else {
+                    Ok(format!("{}: {}% within threshold {}%", mp, pct, threshold))
+                }
             }
         }
 
@@ -913,6 +945,42 @@ pub async fn execute_workflow(
         workflow.name, run.status, run.duration_ms, run.steps.len()
     );
 
+    // Send email with results if configured
+    if let Some(ref email) = workflow.email_results {
+        if !email.is_empty() {
+            let subject = format!("[WolfFlow] {} — {:?}", workflow.name, run.status);
+            let mut body = format!(
+                "Workflow: {}\nTrigger: {}\nStatus: {:?}\nDuration: {}ms\nSteps: {}\n\n",
+                workflow.name, trigger, run.status, run.duration_ms, run.steps.len()
+            );
+            for step in &run.steps {
+                body.push_str(&format!(
+                    "Step: {} | Node: {} | Status: {:?} | {}ms\n",
+                    step.step_name, step.node_hostname, step.status, step.duration_ms
+                ));
+                if !step.output.is_empty() {
+                    let output_preview = if step.output.len() > 500 {
+                        format!("{}...", &step.output[..500])
+                    } else {
+                        step.output.clone()
+                    };
+                    body.push_str(&format!("  Output: {}\n", output_preview));
+                }
+                body.push('\n');
+            }
+            // Send via AI module's SMTP config
+            let mut config = crate::ai::AiConfig::load();
+            if !config.smtp_host.is_empty() {
+                config.email_to = email.clone();
+                if let Err(e) = crate::ai::send_alert_email(&config, &subject, &body) {
+                    warn!("WolfFlow: failed to email results to {}: {}", email, e);
+                } else {
+                    info!("WolfFlow: emailed results to {}", email);
+                }
+            }
+        }
+    }
+
     run
 }
 
@@ -1022,10 +1090,11 @@ pub fn toolbox_actions() -> serde_json::Value {
         {
             "action": "check_disk_space",
             "label": "Check Disk Space",
-            "description": "Fail the step if root partition usage exceeds a threshold",
+            "description": "Check disk usage on a specific mount point or all mounts",
             "icon": "fa-hard-drive",
             "fields": [
-                { "name": "warn_threshold_pct", "label": "Threshold (%)", "type": "number", "default": 90, "placeholder": "90" }
+                { "name": "warn_threshold_pct", "label": "Threshold (%)", "type": "number", "default": 90, "placeholder": "90" },
+                { "name": "mount_point", "label": "Mount Point", "type": "text", "placeholder": "/ or /var or all (default: all)" }
             ]
         },
         {
