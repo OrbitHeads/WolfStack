@@ -29262,13 +29262,18 @@ async function triggerWolfFlow(id) {
             const elapsed = Math.floor((Date.now() - startTime) / 1000);
             const timeStr = elapsed >= 60 ? Math.floor(elapsed/60) + 'm ' + (elapsed%60) + 's' : elapsed + 's';
             try {
-                const runsResp = await fetch('/api/wolfflow/runs?limit=10', { credentials: 'include' });
-                if (!runsResp.ok) return;
+                const runsResp = await fetch('/api/wolfflow/runs?limit=50', { credentials: 'include' });
+                if (!runsResp.ok) {
+                    updateTaskLogEntry(taskId, { description: `"${wfName}" — runs API returned ${runsResp.status} (${timeStr})`, status: 'running' });
+                    return;
+                }
                 const runs = await runsResp.json();
                 // Find the most recent run for this workflow
                 const run = runs.find(r => r.workflow_id === id);
                 if (!run) {
-                    updateTaskLogEntry(taskId, { description: `"${wfName}" — waiting for execution to start (${timeStr})...`, status: 'running' });
+                    // Show debug info so we can see what's happening
+                    const runIds = runs.slice(0, 5).map(r => r.workflow_id + ':' + r.status).join(', ');
+                    updateTaskLogEntry(taskId, { description: `"${wfName}" — no matching run found in ${runs.length} runs (looking for ${id}) [${runIds}] (${timeStr})`, status: 'running' });
                     return;
                 }
 
