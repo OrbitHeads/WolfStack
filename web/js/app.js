@@ -15424,6 +15424,7 @@ async function restorePbsSnapshot(snapshot, backupType, overwrite) {
         btn.innerHTML = '<span style="display:inline-block; width:12px; height:12px; border:2px solid rgba(255,255,255,0.3); border-top-color:#fff; border-radius:50%; animation:spin 0.8s linear infinite; vertical-align:middle;"></span> Starting...';
     }
     showToast('🔄 Starting PBS restore... Progress will update live.', 'info');
+    var taskId = taskLogStart('PBS restore: ' + snapshot);
 
     try {
         var res = await fetch(apiUrl('/api/backups/pbs/restore'), {
@@ -15440,10 +15441,12 @@ async function restorePbsSnapshot(snapshot, backupType, overwrite) {
         if (data.error) {
             console.error('PBS restore error:', data.error);
             showToast('PBS restore failed: ' + data.error, 'error');
-            taskLog('PBS restore: ' + snapshot, 'failed');
+            updateTaskLogEntry(taskId, { status: 'failed', description: 'PBS restore failed: ' + data.error });
             if (btn) { btn.disabled = false; btn.innerHTML = origText; }
             return;
         }
+
+        updateTaskLogEntry(taskId, { description: 'Starting restore...' });
 
         // Start polling for progress
         var pollInterval = setInterval(async function () {
@@ -15452,35 +15455,45 @@ async function restorePbsSnapshot(snapshot, backupType, overwrite) {
                 if (!pres.ok) return;
                 var progress = await pres.json();
 
-                // Update button with progress
-                if (btn && progress.active) {
+                // Update task log with live progress
+                if (progress.active) {
                     var label = progress.progress_text || 'Working...';
                     if (progress.percentage != null) {
-                        label = progress.percentage.toFixed(1) + '% — ' + label;
+                        label = progress.percentage.toFixed(0) + '% — ' + label;
+                    }
+                    updateTaskLogEntry(taskId, { description: label });
+                }
+
+                // Update button with progress
+                if (btn && progress.active) {
+                    var btnLabel = progress.progress_text || 'Working...';
+                    if (progress.percentage != null) {
+                        btnLabel = progress.percentage.toFixed(1) + '% — ' + btnLabel;
                     }
                     btn.innerHTML =
                         '<div style="position:relative; min-width:120px; padding:3px 8px; text-align:center;">' +
                         '<span style="position:relative; font-size:11px;">' +
                         '<span style="display:inline-block; width:12px; height:12px; border:2px solid rgba(255,255,255,0.3); border-top-color:#fff; border-radius:50%; animation:spin 0.8s linear infinite; vertical-align:middle; margin-right:6px;"></span>' +
-                        label + '</span></div>';
+                        btnLabel + '</span></div>';
                 }
 
                 if (progress.finished) {
                     clearInterval(pollInterval);
                     if (progress.message === 'TARGET_EXISTS') {
+                        updateTaskLogEntry(taskId, { status: 'failed', description: 'Target files already exist' });
                         if (btn) { btn.disabled = false; btn.innerHTML = origText; }
                         if (await showConfirm('This snapshot was previously restored and files already exist. Overwrite them?')) {
                             return restorePbsSnapshot(snapshot, backupType, true);
                         }
                     } else if (progress.success) {
                         showToast('✅ PBS restore complete: ' + progress.message, 'success');
-                        taskLog('PBS restore: ' + snapshot);
+                        updateTaskLogEntry(taskId, { status: 'completed', description: progress.message });
                         if (typeof loadContainers === 'function') loadContainers();
                         if (typeof loadVMs === 'function') loadVMs();
                         if (btn) { btn.disabled = false; btn.innerHTML = origText; }
                     } else {
                         showToast('❌ PBS restore failed: ' + progress.message, 'error');
-                        taskLog('PBS restore: ' + snapshot, 'failed');
+                        updateTaskLogEntry(taskId, { status: 'failed', description: progress.message });
                         if (btn) { btn.disabled = false; btn.innerHTML = origText; }
                     }
                 }
