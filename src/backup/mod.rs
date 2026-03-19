@@ -1348,6 +1348,14 @@ fn docker_run_args_from_inspect(inspect: &serde_json::Value) -> Vec<String> {
         }
     }
 
+    // TTY and stdin (needed for interactive containers like debian, ubuntu)
+    if config["Tty"].as_bool().unwrap_or(false) {
+        args.push("-t".to_string());
+    }
+    if config["OpenStdin"].as_bool().unwrap_or(false) {
+        args.push("-i".to_string());
+    }
+
     // Privileged
     if host_config["Privileged"].as_bool().unwrap_or(false) {
         args.push("--privileged".to_string());
