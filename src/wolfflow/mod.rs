@@ -979,19 +979,18 @@ pub async fn execute_workflow(
                 }
                 body.push('\n');
             }
-            // Send email — use the in-memory AI config (same as daily report)
-            let config = ai_config.clone().unwrap_or_else(crate::ai::AiConfig::load);
-            if config.smtp_host.is_empty() {
-                run.email_status = Some("Failed: no SMTP configured — set up email in Settings → AI Agent".to_string());
+            // Send email — EXACTLY the same way the daily report does it
+            let mut config = ai_config.clone().unwrap_or_else(crate::ai::AiConfig::load);
+            // Override recipient if workflow specifies one
+            if !email.is_empty() {
+                config.email_to = email.clone();
+            }
+            if config.smtp_host.is_empty() || config.email_to.is_empty() {
+                run.email_status = Some("Failed: SMTP not configured in Settings → AI Agent".to_string());
             } else {
-                let email_to = email.clone();
-                run.email_status = Some(format!("Sending to {}...", email_to));
-                state.update_run(&run_id, run.clone());
-
-                // Build HTML email (same approach as daily report)
                 let html_body = format!(
                     "<html><body style='font-family:sans-serif;'>\
-                    <h2>[WolfFlow] {} — {:?}</h2>\
+                    <h2>[WolfFlow] {} &mdash; {:?}</h2>\
                     <p>Trigger: {} | Duration: {}ms | Steps: {}</p>\
                     <table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-size:13px;'>\
                     <tr><th>Step</th><th>Node</th><th>Status</th><th>Duration</th><th>Output</th></tr>{}</table>\
@@ -1003,18 +1002,10 @@ pub async fn execute_workflow(
                         if s.output.len() > 500 { format!("{}...", &s.output[..500]) } else { s.output.clone() }
                     )).collect::<Vec<_>>().join("")
                 );
-
-                // Override email_to for this send
-                let mut send_config = config;
-                send_config.email_to = email_to.clone();
-
-                let result = tokio::task::spawn_blocking(move || {
-                    crate::ai::send_html_email(&send_config, &subject, &html_body)
-                }).await;
-                match result {
-                    Ok(Ok(_)) => run.email_status = Some(format!("Sent to {}", email_to)),
-                    Ok(Err(e)) => run.email_status = Some(format!("Failed: {}", e)),
-                    Err(e) => run.email_status = Some(format!("Email task error: {}", e)),
+                // Call EXACTLY like the daily report does — no spawn_blocking, just call it
+                match crate::ai::send_html_email(&config, &subject, &html_body) {
+                    Ok(_) => run.email_status = Some(format!("Sent to {}", config.email_to)),
+                    Err(e) => run.email_status = Some(format!("Failed: {}", e)),
                 }
             }
             state.update_run(&run_id, run.clone());
