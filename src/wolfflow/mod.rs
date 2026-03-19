@@ -978,31 +978,32 @@ pub async fn execute_workflow(
                 }
                 body.push('\n');
             }
-            // Send via AI module's SMTP config — run on blocking thread to avoid stalling
+            // Send via AI module's SMTP config — run on blocking thread but await result
             let mut config = crate::ai::AiConfig::load();
             if config.smtp_host.is_empty() {
                 run.email_status = Some("Failed: no SMTP configured — set up email in Settings → AI Agent".to_string());
-                state.update_run(&run_id, run.clone());
             } else {
                 config.email_to = email.clone();
-                let email_subject = subject.clone();
-                let email_body = body.clone();
                 let email_to = email.clone();
-                let state_email = state.clone();
-                let run_id_email = run_id.clone();
-                let mut run_email = run.clone();
-                tokio::task::spawn_blocking(move || {
-                    match crate::ai::send_alert_email(&config, &email_subject, &email_body) {
-                        Ok(_) => {
-                            run_email.email_status = Some(format!("Sent to {}", email_to));
-                        }
-                        Err(e) => {
-                            run_email.email_status = Some(format!("Failed to send to {}: {}", email_to, e));
-                        }
+                run.email_status = Some(format!("Sending to {}...", email_to));
+                state.update_run(&run_id, run.clone());
+                // Run SMTP on blocking thread and wait for it (max 30s)
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::ai::send_alert_email(&config, &subject, &body)
+                }).await;
+                match result {
+                    Ok(Ok(_)) => {
+                        run.email_status = Some(format!("Sent to {}", email_to));
                     }
-                    state_email.update_run(&run_id_email, run_email);
-                });
+                    Ok(Err(e)) => {
+                        run.email_status = Some(format!("Failed: {}", e));
+                    }
+                    Err(e) => {
+                        run.email_status = Some(format!("Email task failed: {}", e));
+                    }
+                }
             }
+            state.update_run(&run_id, run.clone());
         }
     }
 
