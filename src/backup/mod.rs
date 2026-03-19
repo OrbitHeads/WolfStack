@@ -2332,6 +2332,7 @@ pub fn restore_from_pbs_with_progress<F>(
     archive: &str,
     target_dir: &str,
     on_progress: F,
+    overwrite: bool,
 ) -> Result<String, String>
 where
     F: Fn(String, Option<f64>),
@@ -2361,11 +2362,24 @@ where
         (target_dir.to_string(), None)
     };
 
+    // Check if target already has files from a previous restore
+    if Path::new(&effective_target).exists() {
+        let has_files = fs::read_dir(&effective_target)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+        if has_files && !overwrite {
+            return Err("TARGET_EXISTS".to_string());
+        }
+        if has_files && overwrite {
+            on_progress("Cleaning previous restore files...".to_string(), Some(0.2));
+            let _ = fs::remove_dir_all(&effective_target);
+        }
+    }
+
     fs::create_dir_all(&effective_target)
         .map_err(|e| format!("Failed to create target dir: {}", e))?;
 
     let snapshot_fixed = fix_pbs_snapshot_timestamp(snapshot);
-
 
     on_progress("Detecting archive...".to_string(), Some(1.0));
 

@@ -5340,6 +5340,8 @@ pub struct PbsRestoreRequest {
     pub archive: String,
     #[serde(default = "default_pbs_target_dir")]
     pub target_dir: String,
+    #[serde(default)]
+    pub overwrite: bool,
 }
 fn default_pbs_target_dir() -> String { "/var/lib/wolfstack/restored".to_string() }
 
@@ -5372,6 +5374,7 @@ pub async fn pbs_restore(
     let snapshot = body.snapshot.clone();
     let archive = body.archive.clone();
     let target_dir = body.target_dir.clone();
+    let overwrite = body.overwrite;
 
     // Reset progress state
     {
@@ -5396,7 +5399,7 @@ pub async fn pbs_restore(
                 progress.progress_text = text;
                 progress.percentage = pct;
             }
-        }) {
+        }, overwrite) {
             Ok(msg) => {
                 if let Ok(mut progress) = state_clone.pbs_restore_progress.lock() {
                     progress.active = false;
@@ -5405,6 +5408,15 @@ pub async fn pbs_restore(
                     progress.message = msg;
                     progress.percentage = Some(100.0);
                     progress.progress_text = "Restore complete!".to_string();
+                }
+            }
+            Err(ref e) if e == "TARGET_EXISTS" => {
+                if let Ok(mut progress) = state_clone.pbs_restore_progress.lock() {
+                    progress.active = false;
+                    progress.finished = true;
+                    progress.success = Some(false);
+                    progress.message = "TARGET_EXISTS".to_string();
+                    progress.progress_text = "Target already has files from a previous restore".to_string();
                 }
             }
             Err(e) => {

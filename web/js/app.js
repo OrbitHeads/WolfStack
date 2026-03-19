@@ -15369,13 +15369,13 @@ async function loadPbsSnapshots() {
     }
 }
 
-async function restorePbsSnapshot(snapshot, backupType) {
+async function restorePbsSnapshot(snapshot, backupType, overwrite) {
     // Choose sensible restore target based on backup type
     var targetDir = '/var/lib/wolfstack/restored';
     if (backupType === 'ct') targetDir = '/var/lib/lxc';
     else if (backupType === 'vm') targetDir = '/var/lib/wolfstack/vms';
 
-    if (!(await showConfirm('Restore PBS snapshot:\n' + snapshot + '\n\nRestore to: ' + targetDir + '\n\nThis will download and restore the data to this node.'))) return;
+    if (!overwrite && !(await showConfirm('Restore PBS snapshot:\n' + snapshot + '\n\nRestore to: ' + targetDir + '\n\nThis will download and restore the data to this node.'))) return;
 
     // Find the clicked button and show progress
     var btn = event && event.target;
@@ -15394,6 +15394,7 @@ async function restorePbsSnapshot(snapshot, backupType) {
                 snapshot: snapshot,
                 archive: '',
                 target_dir: targetDir,
+                overwrite: !!overwrite,
             }),
         });
         var data = await res.json();
@@ -15427,16 +15428,22 @@ async function restorePbsSnapshot(snapshot, backupType) {
 
                 if (progress.finished) {
                     clearInterval(pollInterval);
-                    if (progress.success) {
+                    if (progress.message === 'TARGET_EXISTS') {
+                        if (btn) { btn.disabled = false; btn.innerHTML = origText; }
+                        if (await showConfirm('This snapshot was previously restored and files already exist. Overwrite them?')) {
+                            return restorePbsSnapshot(snapshot, backupType, true);
+                        }
+                    } else if (progress.success) {
                         showToast('✅ PBS restore complete: ' + progress.message, 'success');
                         taskLog('PBS restore: ' + snapshot);
                         if (typeof loadContainers === 'function') loadContainers();
                         if (typeof loadVMs === 'function') loadVMs();
+                        if (btn) { btn.disabled = false; btn.innerHTML = origText; }
                     } else {
                         showToast('❌ PBS restore failed: ' + progress.message, 'error');
                         taskLog('PBS restore: ' + snapshot, 'failed');
+                        if (btn) { btn.disabled = false; btn.innerHTML = origText; }
                     }
-                    if (btn) { btn.disabled = false; btn.innerHTML = origText; }
                 }
             } catch (e) {
                 // Polling error — keep trying
