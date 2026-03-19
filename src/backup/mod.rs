@@ -2400,7 +2400,6 @@ fn retrieve_from_pbs(entry: &BackupEntry, dest: &Path) -> Result<(), String> {
     let storage = &entry.storage;
     let repo = pbs_repo_string(storage);
 
-    // Use the same ID extraction as the backup upload so the snapshot path matches
     let backup_id = extract_backup_id_from_filename(&entry.filename);
     let backup_type = if entry.filename.starts_with("vzdump-lxc-") || entry.filename.starts_with("lxc-") {
         "ct"
@@ -2409,7 +2408,45 @@ fn retrieve_from_pbs(entry: &BackupEntry, dest: &Path) -> Result<(), String> {
     } else {
         "host"
     };
-    let snapshot = format!("{}/{}/latest", backup_type, backup_id);
+
+    let pbs_pw = if !storage.pbs_token_secret.is_empty() { &storage.pbs_token_secret }
+                 else { &storage.pbs_password };
+
+    // List snapshots to find the latest matching one (PBS needs exact timestamp, not "latest")
+    let mut list_cmd = Command::new("proxmox-backup-client");
+    list_cmd.args(["snapshot", "list", "--output-format", "json", "--repository", &repo]);
+    if !storage.pbs_fingerprint.is_empty() { list_cmd.env("PBS_FINGERPRINT", &storage.pbs_fingerprint); }
+    if !storage.pbs_namespace.is_empty() { list_cmd.arg("--ns").arg(&storage.pbs_namespace); }
+    if !pbs_pw.is_empty() { list_cmd.env("PBS_PASSWORD", pbs_pw); }
+
+    let list_output = list_cmd.output()
+        .map_err(|e| format!("Failed to list PBS snapshots: {}", e))?;
+
+    let snapshot = if list_output.status.success() {
+        let snaps: serde_json::Value = serde_json::from_slice(&list_output.stdout)
+            .unwrap_or(serde_json::Value::Array(vec![]));
+        if let Some(arr) = snaps.as_array() {
+            let mut best_time: i64 = 0;
+            let mut best_snap = String::new();
+            for s in arr {
+                let st = s.get("backup-type").and_then(|v| v.as_str()).unwrap_or("");
+                let si = s.get("backup-id").and_then(|v| v.as_str()).unwrap_or("");
+                let stime = s.get("backup-time").and_then(|v| v.as_i64()).unwrap_or(0);
+                if st == backup_type && si == backup_id && stime > best_time {
+                    best_time = stime;
+                    best_snap = format!("{}/{}/{}", st, si, stime);
+                }
+            }
+            if best_snap.is_empty() {
+                return Err(format!("No PBS snapshot found for {}/{}", backup_type, backup_id));
+            }
+            best_snap
+        } else {
+            return Err("Failed to parse PBS snapshot list".to_string());
+        }
+    } else {
+        return Err(format!("PBS snapshot list failed: {}", String::from_utf8_lossy(&list_output.stderr)));
+    };
 
     let mut cmd = Command::new("proxmox-backup-client");
     cmd.arg("restore")
@@ -2421,8 +2458,9 @@ fn retrieve_from_pbs(entry: &BackupEntry, dest: &Path) -> Result<(), String> {
     if !storage.pbs_fingerprint.is_empty() {
         cmd.env("PBS_FINGERPRINT", &storage.pbs_fingerprint);
     }
-    let pbs_pw = if !storage.pbs_token_secret.is_empty() { &storage.pbs_token_secret }
-                 else { &storage.pbs_password };
+    if !storage.pbs_namespace.is_empty() {
+        cmd.arg("--ns").arg(&storage.pbs_namespace);
+    }
     if !pbs_pw.is_empty() {
         cmd.env("PBS_PASSWORD", pbs_pw);
     }
