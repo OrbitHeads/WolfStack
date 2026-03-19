@@ -570,8 +570,8 @@ pub async fn execute_action_local(action: &ActionType) -> Result<String, String>
             let mp = mount_point.as_deref().unwrap_or("all");
 
             if mp == "all" || mp.is_empty() {
-                // Just run df -h and report the output, flag if anything is over threshold
-                let output = run_command("df", &["-h"], 10).await?;
+                // Run df -h excluding network filesystems (NFS/CIFS can hang)
+                let output = run_command("df", &["-h", "-x", "nfs", "-x", "nfs4", "-x", "cifs", "-x", "sshfs", "-x", "fuse.sshfs"], 10).await?;
                 // Quick scan for any partition over threshold
                 let mut over = Vec::new();
                 for line in output.lines().skip(1) {
@@ -644,16 +644,25 @@ pub async fn execute_action_local(action: &ActionType) -> Result<String, String>
 async fn run_command(cmd: &str, args: &[&str], timeout_secs: u64) -> Result<String, String> {
     use tokio::process::Command;
 
-    let result = tokio::time::timeout(
+    // Use timeout wrapper — kill_on_drop ensures process is cleaned up
+    let child = Command::new(cmd)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("Failed to spawn '{}': {}", cmd, e))?;
+
+    let result = match tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
-        Command::new(cmd)
-            .args(args)
-            .output(),
-    )
-    .await;
+        child.wait_with_output(),
+    ).await {
+        Ok(r) => r,
+        Err(_) => return Err(format!("Command '{}' timed out after {}s", cmd, timeout_secs)),
+    };
 
     match result {
-        Ok(Ok(output)) => {
+        Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             let combined = if stderr.is_empty() {
@@ -674,8 +683,7 @@ async fn run_command(cmd: &str, args: &[&str], timeout_secs: u64) -> Result<Stri
                 ))
             }
         }
-        Ok(Err(e)) => Err(format!("Failed to execute command: {}", e)),
-        Err(_) => Err(format!("Command timed out after {}s", timeout_secs)),
+        Err(e) => Err(format!("Failed to execute command: {}", e)),
     }
 }
 
