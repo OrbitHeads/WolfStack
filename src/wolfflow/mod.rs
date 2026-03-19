@@ -348,6 +348,7 @@ impl WolfFlowState {
     }
 
     /// Rename all cluster references from old_name to new_name.
+    #[allow(dead_code)]
     pub fn rename_cluster(&self, old_name: &str, new_name: &str) -> usize {
         let mut wfs = self.workflows.write().unwrap();
         let mut count = 0;
