@@ -693,10 +693,10 @@ a{color:#eab308;text-decoration:none;}a:hover{text-decoration:underline;}
                                 } else {
                                     ("—".to_string(), "—".to_string())
                                 };
-                                let addr = if n.address.is_empty() { &n.hostname } else { &n.address };
+                                let display_name = if n.hostname.is_empty() { &n.address } else { &n.hostname };
                                 html.push_str(&format!(
-                                    r#"<tr><td><strong>{}</strong><br><span class="meta">{}:{}</span></td><td><span class="badge {}">{}</span></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
-                                    n.hostname, addr, n.port, status_class, status_text, cpu_str, mem_str,
+                                    r#"<tr><td><strong>{}</strong><br><span class="meta">{} &bull; port {}</span></td><td><span class="badge {}">{}</span></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
+                                    display_name, n.address, n.port, status_class, status_text, cpu_str, mem_str,
                                     if n.has_docker { format!("{}", n.docker_count) } else { "—".to_string() },
                                     if n.has_lxc { format!("{}", n.lxc_count) } else { "—".to_string() },
                                     if n.has_kvm { format!("{}", n.vm_count) } else { "—".to_string() },
@@ -718,9 +718,10 @@ a{color:#eab308;text-decoration:none;}a:hover{text-decoration:underline;}
                                 } else {
                                     ("—".to_string(), "—".to_string())
                                 };
+                                let pve_name = if n.hostname.is_empty() { &n.address } else { &n.hostname };
                                 html.push_str(&format!(
-                                    r#"<tr><td><strong>{}</strong> <span class="badge info">PVE</span><br><span class="meta">{}:{}</span></td><td><span class="badge {}">{}</span></td><td>{}</td><td>{}</td><td>—</td><td>{}</td><td>{}</td></tr>"#,
-                                    n.hostname, n.address, n.port, status_class, status_text, cpu_str, mem_str, n.lxc_count, n.vm_count,
+                                    r#"<tr><td><strong>{}</strong> <span class="badge info">PVE</span><br><span class="meta">{} &bull; port {}</span></td><td><span class="badge {}">{}</span></td><td>{}</td><td>{}</td><td>—</td><td>{}</td><td>{}</td></tr>"#,
+                                    pve_name, n.address, n.port, status_class, status_text, cpu_str, mem_str, n.lxc_count, n.vm_count,
                                 ));
                             }
                             html.push_str("</tbody></table>");
