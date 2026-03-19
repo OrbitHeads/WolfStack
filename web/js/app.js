@@ -7380,17 +7380,20 @@ function renderTaskLog() {
     tbody.innerHTML = _taskLogEntries.map(entry => {
         const timeStr = entry.time.toLocaleTimeString();
         const isRunning = entry.status === 'running';
-        const isFailed = entry.status === 'failed';
+        const isSuccess = entry.status === 'success' || entry.status === 'completed';
+        const isFailed = entry.status === 'failed' || entry.status === 'error';
         const spinnerHtml = isRunning
             ? '<span style="display:inline-block; width:12px; height:12px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin 0.8s linear infinite; vertical-align:middle; margin-right:4px;"></span>'
             : '';
-        const statusBadge = entry.status === 'completed'
+        const statusBadge = isSuccess
             ? '<span style="color:#22c55e; font-weight:500;">✓ OK</span>'
             : isFailed
                 ? '<span style="color:#ef4444; font-weight:500;">✗ Failed</span>'
-                : spinnerHtml + '<span style="color:var(--accent);">Running</span>';
+                : isRunning
+                    ? spinnerHtml + '<span style="color:var(--accent);">Running</span>'
+                    : '<span style="color:var(--text-muted);">' + escapeHtml(entry.status) + '</span>';
 
-        const rowBg = isFailed ? 'background:rgba(239,68,68,0.08);' : isRunning ? 'background:rgba(59,130,246,0.05);' : '';
+        const rowBg = isFailed ? 'background:rgba(239,68,68,0.08);' : isRunning ? 'background:rgba(59,130,246,0.05);' : isSuccess ? 'background:rgba(34,197,94,0.05);' : '';
 
         const hasLog = entry.logLines.length > 0;
         const expandBtn = hasLog ? `<span style="cursor:pointer; margin-right:4px; color:var(--text-muted);" onclick="toggleTaskLogExpand('${entry.id}')">${entry.expanded ? '▼' : '▶'}</span>` : '<span style="display:inline-block; width:16px;"></span>';
