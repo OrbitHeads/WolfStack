@@ -287,6 +287,7 @@ async fn main() -> std::io::Result<()> {
 
         // Initialize WolfRun orchestration state
         let wolfrun_state = Arc::new(wolfrun::WolfRunState::new());
+        let wolfflow_state = Arc::new(wolfflow::WolfFlowState::new());
 
         // Initialize Status Page monitoring state
         let statuspage_state = Arc::new(statuspage::StatusPageState::new());
@@ -304,6 +305,7 @@ async fn main() -> std::io::Result<()> {
             ai_agent: ai_agent.clone(),
             cached_status: cached_status.clone(),
             wolfrun: wolfrun_state.clone(),
+            wolfflow: wolfflow_state.clone(),
             statuspage: statuspage_state.clone(),
             tls_enabled,
             login_limiter: Arc::new(auth::LoginRateLimiter::new()),
@@ -411,6 +413,27 @@ async fn main() -> std::io::Result<()> {
                 backup::check_schedules();
             }
         });
+
+        // Background: WolfFlow scheduler (every 60s)
+        {
+            let wf_state = wolfflow_state.clone();
+            let wf_cluster = cluster.clone();
+            let wf_secret = cluster_secret.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    let due = wf_state.get_due_workflows();
+                    for workflow in due {
+                        let s = wf_state.clone();
+                        let c = wf_cluster.clone();
+                        let sec = wf_secret.clone();
+                        tokio::spawn(async move {
+                            wolfflow::execute_workflow(&s, &c, &sec, &workflow, "scheduled").await;
+                        });
+                    }
+                }
+            });
+        }
 
         // Background: Patreon membership sync (every 24h)
         let patreon_state = app_state.patreon.clone();

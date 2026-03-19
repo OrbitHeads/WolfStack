@@ -1318,6 +1318,204 @@
             </div>
         </div>
 
+        <!-- ═══ WolfFlow Page ═══ -->
+        <div id="page-wolfflow" class="page-view" style="display:none;">
+            <!-- Header -->
+            <div class="card"
+                style="margin-bottom:20px; background:linear-gradient(135deg, rgba(245,158,11,0.12), rgba(234,88,12,0.08)); border-color:rgba(245,158,11,0.25);">
+                <div class="card-body"
+                    style="display:flex; align-items:center; justify-content:space-between; padding:28px 32px; flex-wrap:wrap; gap:16px;">
+                    <div style="display:flex; align-items:center; gap:20px;">
+                        <div
+                            style="width:64px; height:64px; background:linear-gradient(135deg,#f59e0b,#ea580c); border-radius:16px; display:flex; align-items:center; justify-content:center; font-size:32px; box-shadow:0 4px 20px rgba(245,158,11,0.3);">
+                            ⚡</div>
+                        <div>
+                            <h2 style="font-size:24px; margin-bottom:4px; color:var(--text-primary); font-weight:700;">
+                                WolfFlow <span id="wolfflow-cluster-label"
+                                    style="font-size:14px; font-weight:400; color:var(--text-secondary);"></span></h2>
+                            <p style="color:var(--text-secondary); font-size:13px; margin:0;">Workflow automation across your cluster</p>
+                        </div>
+                    </div>
+                    <div style="display:flex; gap:10px; align-items:center;">
+                        <button class="btn btn-primary" onclick="openWolfFlowModal()" style="font-weight:600;">
+                            ➕ Create Workflow
+                        </button>
+                        <button class="btn" onclick="loadWolfFlowWorkflows(); loadWolfFlowRuns();"
+                            style="background:var(--bg-secondary); border:1px solid var(--border);">
+                            🔄 Refresh
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Summary Stats -->
+            <div class="stats-grid" style="margin-bottom:20px;">
+                <div class="stat-card">
+                    <div class="stat-header">
+                        <span class="stat-label">Total Workflows</span>
+                        <div class="stat-icon" style="background:rgba(245,158,11,0.15); color:#f59e0b;">📋</div>
+                    </div>
+                    <div class="stat-value" id="wolfflow-stat-total">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-header">
+                        <span class="stat-label">Scheduled</span>
+                        <div class="stat-icon" style="background:rgba(99,102,241,0.15); color:#6366f1;">🕐</div>
+                    </div>
+                    <div class="stat-value" id="wolfflow-stat-scheduled">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-header">
+                        <span class="stat-label">Last Run</span>
+                        <div class="stat-icon" style="background:rgba(16,185,129,0.15); color:#10b981;">✅</div>
+                    </div>
+                    <div class="stat-value" id="wolfflow-stat-lastrun" style="font-size:14px;">—</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-header">
+                        <span class="stat-label">Runs Today</span>
+                        <div class="stat-icon" style="background:rgba(59,130,246,0.15); color:#3b82f6;">🔢</div>
+                    </div>
+                    <div class="stat-value" id="wolfflow-stat-today">0</div>
+                </div>
+            </div>
+
+            <!-- Workflows Table -->
+            <div class="card" style="margin-bottom:20px;">
+                <div class="card-header">
+                    <h3>⚡ Workflows</h3>
+                </div>
+                <div class="card-body" style="overflow-x:auto;">
+                    <table class="data-table" id="wolfflow-workflows-table">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Steps</th>
+                                <th>Schedule</th>
+                                <th>Target</th>
+                                <th>Last Run</th>
+                                <th>Status</th>
+                                <th style="text-align:right;">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="wolfflow-workflows-tbody"></tbody>
+                    </table>
+                    <div id="wolfflow-empty"
+                        style="display:none; padding:48px; text-align:center; color:var(--text-muted);">
+                        <div style="font-size:48px; margin-bottom:12px;">⚡</div>
+                        <p style="font-size:14px; margin:0;">No workflows yet. Click <strong>Create Workflow</strong> to get started.</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Recent Runs -->
+            <div class="card" style="margin-bottom:20px;">
+                <div class="card-header">
+                    <h3>📊 Recent Runs</h3>
+                </div>
+                <div class="card-body" style="overflow-x:auto;">
+                    <table class="data-table" id="wolfflow-runs-table">
+                        <thead>
+                            <tr>
+                                <th>Workflow</th>
+                                <th>Trigger</th>
+                                <th>Started</th>
+                                <th>Duration</th>
+                                <th>Status</th>
+                                <th style="text-align:right;">Details</th>
+                            </tr>
+                        </thead>
+                        <tbody id="wolfflow-runs-tbody"></tbody>
+                    </table>
+                    <div id="wolfflow-runs-empty"
+                        style="display:none; padding:32px; text-align:center; color:var(--text-muted); font-size:13px;">
+                        No workflow runs recorded yet.
+                    </div>
+                </div>
+            </div>
+
+            <!-- Create/Edit Workflow Modal -->
+            <div id="wolfflow-modal" class="modal-overlay">
+                <div class="modal" style="max-width:900px; width:95%;">
+                    <div class="modal-header">
+                        <h3 id="wolfflow-modal-title">➕ Create Workflow</h3>
+                        <button class="modal-close" onclick="closeWolfFlowModal()">&times;</button>
+                    </div>
+                    <div class="modal-body" style="display:flex; gap:20px; flex-wrap:wrap; max-height:70vh; overflow-y:auto;">
+                        <!-- Left side: settings -->
+                        <div style="flex:1; min-width:280px;">
+                            <div style="margin-bottom:16px;">
+                                <label style="font-size:13px; font-weight:600; display:block; margin-bottom:6px;">Workflow Name</label>
+                                <input type="text" id="wolfflow-name" class="form-control" placeholder="e.g. Nightly Cleanup">
+                            </div>
+                            <div style="margin-bottom:16px;">
+                                <label style="font-size:13px; font-weight:600; display:block; margin-bottom:6px;">Description</label>
+                                <textarea id="wolfflow-description" class="form-control" rows="2" placeholder="What does this workflow do?"></textarea>
+                            </div>
+                            <div style="margin-bottom:16px;">
+                                <label style="font-size:13px; font-weight:600; display:block; margin-bottom:10px;">Target</label>
+                                <div style="display:flex; flex-direction:column; gap:8px;">
+                                    <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
+                                        <input type="radio" name="wolfflow-target" value="local" checked onclick="document.getElementById('wolfflow-specific-nodes').style.display='none'"> 🖥️ Local node only
+                                    </label>
+                                    <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
+                                        <input type="radio" name="wolfflow-target" value="all_nodes" onclick="document.getElementById('wolfflow-specific-nodes').style.display='none'"> 🌐 All cluster nodes
+                                    </label>
+                                    <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
+                                        <input type="radio" name="wolfflow-target" value="cluster" onclick="document.getElementById('wolfflow-specific-nodes').style.display='none'"> ☁️ Cluster (leader only)
+                                    </label>
+                                    <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
+                                        <input type="radio" name="wolfflow-target" value="specific" onclick="document.getElementById('wolfflow-specific-nodes').style.display='block'"> 📌 Specific nodes
+                                    </label>
+                                    <div id="wolfflow-specific-nodes" style="display:none; margin-left:28px;">
+                                        <div id="wolfflow-node-checkboxes" style="max-height:120px; overflow-y:auto; border:1px solid var(--border); border-radius:6px; padding:8px; background:var(--bg-secondary);">
+                                            <span style="color:var(--text-muted); font-size:12px;">Loading nodes...</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div style="margin-bottom:16px;">
+                                <label style="font-size:13px; font-weight:600; display:block; margin-bottom:6px;">Schedule</label>
+                                <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px;">
+                                    <button class="btn btn-sm" onclick="document.getElementById('wolfflow-schedule').value='0 3 * * *'" style="font-size:11px; padding:4px 10px; background:var(--bg-secondary); border:1px solid var(--border);">Every day 3am</button>
+                                    <button class="btn btn-sm" onclick="document.getElementById('wolfflow-schedule').value='0 2 * * 0'" style="font-size:11px; padding:4px 10px; background:var(--bg-secondary); border:1px solid var(--border);">Every Sunday 2am</button>
+                                    <button class="btn btn-sm" onclick="document.getElementById('wolfflow-schedule').value='0 * * * *'" style="font-size:11px; padding:4px 10px; background:var(--bg-secondary); border:1px solid var(--border);">Every hour</button>
+                                    <button class="btn btn-sm" onclick="document.getElementById('wolfflow-schedule').value=''" style="font-size:11px; padding:4px 10px; background:var(--bg-secondary); border:1px solid var(--border);">Manual only</button>
+                                </div>
+                                <input type="text" id="wolfflow-schedule" class="form-control" placeholder="Cron expression (leave empty for manual)" style="font-family:'JetBrains Mono',monospace; font-size:12px;">
+                            </div>
+                            <div style="padding:12px 14px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:var(--radius-sm);">
+                                <label style="display:flex; align-items:center; gap:10px; cursor:pointer; font-size:13px; font-weight:600;">
+                                    <input type="checkbox" id="wolfflow-enabled" checked>
+                                    Enabled
+                                </label>
+                                <p style="font-size:11px; color:var(--text-muted); margin:6px 0 0 26px;">
+                                    Disabled workflows won't run on schedule but can still be triggered manually.
+                                </p>
+                            </div>
+                        </div>
+                        <!-- Right side: steps -->
+                        <div style="flex:1; min-width:320px;">
+                            <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px;">
+                                <label style="font-size:13px; font-weight:600;">Steps</label>
+                                <button class="btn btn-sm" onclick="addWolfFlowStep()" style="font-size:12px; padding:4px 12px;">➕ Add Step</button>
+                            </div>
+                            <div id="wolfflow-steps-container" style="display:flex; flex-direction:column; gap:12px;">
+                                <!-- Steps added dynamically -->
+                            </div>
+                            <div id="wolfflow-steps-empty" style="padding:32px; text-align:center; color:var(--text-muted); font-size:13px; border:2px dashed var(--border); border-radius:8px;">
+                                No steps yet. Click <strong>Add Step</strong> to begin.
+                            </div>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button class="btn" onclick="closeWolfFlowModal()">Cancel</button>
+                        <button class="btn btn-primary" onclick="saveWolfFlow()">💾 Save Workflow</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- ═══ Issues Page ═══ -->
         <div id="page-issues" class="page-view" style="display:none; padding-top:0;">
             <!-- Header -->

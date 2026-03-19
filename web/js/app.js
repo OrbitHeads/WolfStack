@@ -1223,6 +1223,10 @@ function buildServerTree(nodes) {
                     <span class="icon" style="font-size:15px;">🏃</span> <span style="font-weight:600;">WolfRun</span>
                     <span class="wolfrun-svc-count" id="wolfrun-count-${clusterId}" style="margin-left:auto; font-size:10px; padding:1px 6px; background:var(--primary-color,#6366f1); color:#fff; border-radius:10px; display:none;"></span>
                 </a>
+                <a class="nav-item server-child-item wolfflow-cluster-item" data-cluster="${escapedName}" data-view="wolfflow" onclick="showWolfFlowPage('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
+                    <span class="icon" style="font-size:15px;">⚡</span> <span style="font-weight:600;">WolfFlow</span>
+                    <span class="wolfflow-wf-count" id="wolfflow-count-${clusterId}" style="margin-left:auto; font-size:10px; padding:1px 6px; background:#f59e0b; color:#fff; border-radius:10px; display:none;"></span>
+                </a>
                 <a class="nav-item server-child-item cluster-backups-item" data-cluster="${escapedName}" data-view="cluster-backups" onclick="showClusterBackupsPage('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
                     <span class="icon" style="font-size:15px;">💾</span> <span style="font-weight:600;">Backups</span>
                 </a>
@@ -28088,4 +28092,676 @@ function vrTermUpdate() {
             km.material.color.setHex(_vrTerm.caps ? 0xdc2626 : 0x222230);
         }
     });
+}
+
+// ═══ WolfFlow — Workflow Automation ═══
+
+let wolfflowCurrentCluster = '';
+let wolfflowRefreshTimer = null;
+let wolfflowEditId = null;
+let wolfflowToolboxCache = null;
+let wolfflowSteps = [];
+
+function showWolfFlowPage(clusterName) {
+    closeSidebarMobile();
+    wolfflowCurrentCluster = clusterName;
+    currentPage = 'wolfflow';
+    currentNodeId = null;
+    currentComponent = null;
+
+    // Switch to WolfFlow page
+    document.querySelectorAll('.page-view').forEach(p => p.style.display = 'none');
+    const el = document.getElementById('page-wolfflow');
+    if (el) el.style.display = 'block';
+
+    // Highlight sidebar item
+    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+    const item = document.querySelector(`.wolfflow-cluster-item[data-cluster="${clusterName}"]`);
+    if (item) item.classList.add('active');
+
+    // Update page title
+    document.getElementById('page-title').textContent = `WolfFlow — ${clusterName}`;
+    document.getElementById('wolfflow-cluster-label').textContent = `— ${clusterName}`;
+
+    loadWolfFlowWorkflows();
+    loadWolfFlowRuns();
+
+    // Auto-refresh every 15s
+    if (wolfflowRefreshTimer) clearInterval(wolfflowRefreshTimer);
+    wolfflowRefreshTimer = setInterval(() => {
+        if (currentPage === 'wolfflow') {
+            loadWolfFlowWorkflows();
+            loadWolfFlowRuns();
+        } else {
+            clearInterval(wolfflowRefreshTimer);
+        }
+    }, 15000);
+}
+
+// Build a WolfFlow API URL that proxies through a cluster node when
+// the local server isn't part of the target cluster.
+function wolfflowApiUrl(path) {
+    const localNode = allNodes.find(n => n.is_self);
+    const localCluster = localNode ? (localNode.cluster_name || 'WolfStack') : '';
+    const targetCluster = wolfflowCurrentCluster;
+    if (localCluster === targetCluster) return path;
+    // Proxy through an online node in the target cluster
+    const clusterNode = allNodes.find(n =>
+        n.online && !n.is_self &&
+        (n.cluster_name || 'WolfStack') === targetCluster &&
+        n.node_type !== 'proxmox'
+    );
+    if (!clusterNode) return path; // fallback to local
+    const cleanPath = path.replace(/^\/api\//, '');
+    return `/api/nodes/${clusterNode.id}/proxy/${cleanPath}`;
+}
+
+async function loadWolfFlowWorkflows() {
+    try {
+        const url = wolfflowApiUrl(`/api/wolfflow/workflows?cluster=${encodeURIComponent(wolfflowCurrentCluster)}`);
+        const resp = await fetch(url, { credentials: 'include' });
+        if (!resp.ok) throw new Error('Failed to load workflows');
+        const workflows = await resp.json();
+        renderWolfFlowWorkflows(workflows);
+    } catch (e) {
+        console.error('WolfFlow load error:', e);
+    }
+}
+
+function renderWolfFlowWorkflows(workflows) {
+    const tbody = document.getElementById('wolfflow-workflows-tbody');
+    const empty = document.getElementById('wolfflow-empty');
+    const table = document.getElementById('wolfflow-workflows-table');
+
+    if (!workflows || workflows.length === 0) {
+        table.style.display = 'none';
+        empty.style.display = 'block';
+        document.getElementById('wolfflow-stat-total').textContent = '0';
+        document.getElementById('wolfflow-stat-scheduled').textContent = '0';
+        return;
+    }
+
+    table.style.display = '';
+    empty.style.display = 'none';
+
+    // Stats
+    const scheduled = workflows.filter(w => w.schedule && w.schedule.trim() !== '').length;
+    document.getElementById('wolfflow-stat-total').textContent = workflows.length;
+    document.getElementById('wolfflow-stat-scheduled').textContent = scheduled;
+
+    // Update sidebar count badge
+    const clusterId = wolfflowCurrentCluster.replace(/[^a-zA-Z0-9]/g, '_');
+    const badge = document.getElementById(`wolfflow-count-${clusterId}`);
+    if (badge) {
+        badge.textContent = workflows.length;
+        badge.style.display = workflows.length > 0 ? '' : 'none';
+    }
+
+    tbody.innerHTML = workflows.map(wf => {
+        const stepsCount = wf.steps ? wf.steps.length : 0;
+        const scheduleDisplay = wf.schedule && wf.schedule.trim() !== ''
+            ? `<code style="font-size:11px; padding:2px 6px; background:var(--bg-secondary); border-radius:4px;">${escapeHtml(wf.schedule)}</code>`
+            : '<span style="color:var(--text-muted); font-size:12px;">Manual</span>';
+
+        // Target display
+        let targetDisplay = 'Local';
+        if (wf.target === 'all_nodes') targetDisplay = '🌐 All Nodes';
+        else if (wf.target === 'cluster') targetDisplay = '☁️ Cluster';
+        else if (wf.target === 'specific') targetDisplay = `📌 ${(wf.target_nodes || []).length} node(s)`;
+        else targetDisplay = '🖥️ Local';
+
+        // Last run time
+        const lastRunDisplay = wf.last_run
+            ? wolfflowFormatTime(wf.last_run)
+            : '<span style="color:var(--text-muted);">Never</span>';
+
+        // Status badge
+        let statusBadge;
+        if (!wf.enabled) {
+            statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(107,114,128,0.15);color:#6b7280;border:1px solid rgba(107,114,128,0.3);">
+                <span style="width:6px;height:6px;border-radius:50%;background:#6b7280;display:inline-block;"></span> Disabled
+            </span>`;
+        } else if (wf.last_status === 'running') {
+            statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(59,130,246,0.15);color:#3b82f6;border:1px solid rgba(59,130,246,0.3);">
+                <span style="width:6px;height:6px;border-radius:50%;background:#3b82f6;display:inline-block;animation:pulse 2s infinite;"></span> Running
+            </span>`;
+        } else if (wf.last_status === 'success') {
+            statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(16,185,129,0.15);color:#10b981;border:1px solid rgba(16,185,129,0.3);">
+                <span style="width:6px;height:6px;border-radius:50%;background:#10b981;display:inline-block;"></span> Success
+            </span>`;
+        } else if (wf.last_status === 'failed') {
+            statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(239,68,68,0.15);color:#ef4444;border:1px solid rgba(239,68,68,0.3);">
+                <span style="width:6px;height:6px;border-radius:50%;background:#ef4444;display:inline-block;"></span> Failed
+            </span>`;
+        } else {
+            statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(245,158,11,0.15);color:#f59e0b;border:1px solid rgba(245,158,11,0.3);">
+                <span style="width:6px;height:6px;border-radius:50%;background:#f59e0b;display:inline-block;"></span> Idle
+            </span>`;
+        }
+
+        return `<tr>
+            <td>
+                <div style="font-weight:600; font-size:13px;">${escapeHtml(wf.name)}</div>
+                ${wf.description ? `<div style="font-size:11px; color:var(--text-muted); margin-top:2px;">${escapeHtml(wf.description)}</div>` : ''}
+            </td>
+            <td style="text-align:center;">${stepsCount}</td>
+            <td>${scheduleDisplay}</td>
+            <td style="font-size:12px;">${targetDisplay}</td>
+            <td style="font-size:12px;">${lastRunDisplay}</td>
+            <td>${statusBadge}</td>
+            <td style="text-align:right; white-space:nowrap;">
+                <button class="btn btn-sm" onclick="triggerWolfFlow('${wf.id}')" title="Run now" style="padding:4px 8px; font-size:12px; color:#10b981;">▶️</button>
+                <button class="btn btn-sm" onclick="openWolfFlowModal('${wf.id}')" title="Edit" style="padding:4px 8px; font-size:12px; color:#818cf8;">✏️</button>
+                <button class="btn btn-sm" onclick="deleteWolfFlow('${wf.id}', '${escapeHtml(wf.name)}')" title="Delete" style="padding:4px 8px; font-size:12px; color:#ef4444;">🗑️</button>
+            </td>
+        </tr>`;
+    }).join('');
+}
+
+async function loadWolfFlowRuns() {
+    try {
+        const url = wolfflowApiUrl(`/api/wolfflow/runs?cluster=${encodeURIComponent(wolfflowCurrentCluster)}&limit=50`);
+        const resp = await fetch(url, { credentials: 'include' });
+        if (!resp.ok) throw new Error('Failed to load runs');
+        const runs = await resp.json();
+        renderWolfFlowRuns(runs);
+    } catch (e) {
+        console.error('WolfFlow runs load error:', e);
+    }
+}
+
+function renderWolfFlowRuns(runs) {
+    const tbody = document.getElementById('wolfflow-runs-tbody');
+    const empty = document.getElementById('wolfflow-runs-empty');
+    const table = document.getElementById('wolfflow-runs-table');
+
+    if (!runs || runs.length === 0) {
+        table.style.display = 'none';
+        empty.style.display = 'block';
+        document.getElementById('wolfflow-stat-lastrun').textContent = '—';
+        document.getElementById('wolfflow-stat-today').textContent = '0';
+        return;
+    }
+
+    table.style.display = '';
+    empty.style.display = 'none';
+
+    // Stats
+    if (runs.length > 0 && runs[0].started_at) {
+        document.getElementById('wolfflow-stat-lastrun').textContent = wolfflowFormatTime(runs[0].started_at);
+    }
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const runsToday = runs.filter(r => r.started_at && r.started_at.slice(0, 10) === todayStr).length;
+    document.getElementById('wolfflow-stat-today').textContent = runsToday;
+
+    tbody.innerHTML = runs.map(run => {
+        const triggerBadge = run.trigger === 'scheduled'
+            ? '<span style="padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; background:rgba(99,102,241,0.15); color:#6366f1;">🕐 Scheduled</span>'
+            : '<span style="padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; background:rgba(107,114,128,0.15); color:#9ca3af;">👤 Manual</span>';
+
+        const startedDisplay = run.started_at ? wolfflowFormatTime(run.started_at) : '—';
+
+        // Duration
+        let durationDisplay = '—';
+        if (run.started_at && run.finished_at) {
+            const ms = new Date(run.finished_at) - new Date(run.started_at);
+            if (ms < 1000) durationDisplay = `${ms}ms`;
+            else if (ms < 60000) durationDisplay = `${(ms / 1000).toFixed(1)}s`;
+            else durationDisplay = `${Math.floor(ms / 60000)}m ${Math.floor((ms % 60000) / 1000)}s`;
+        } else if (run.status === 'running') {
+            durationDisplay = '<span style="color:#3b82f6;">Running...</span>';
+        }
+
+        // Status badge
+        let statusBadge;
+        if (run.status === 'running') {
+            statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(59,130,246,0.15);color:#3b82f6;border:1px solid rgba(59,130,246,0.3);">
+                <span style="width:6px;height:6px;border-radius:50%;background:#3b82f6;display:inline-block;animation:pulse 2s infinite;"></span> Running
+            </span>`;
+        } else if (run.status === 'success') {
+            statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(16,185,129,0.15);color:#10b981;border:1px solid rgba(16,185,129,0.3);">
+                <span style="width:6px;height:6px;border-radius:50%;background:#10b981;display:inline-block;"></span> Success
+            </span>`;
+        } else if (run.status === 'failed') {
+            statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(239,68,68,0.15);color:#ef4444;border:1px solid rgba(239,68,68,0.3);">
+                <span style="width:6px;height:6px;border-radius:50%;background:#ef4444;display:inline-block;"></span> Failed
+            </span>`;
+        } else if (run.status === 'partial') {
+            statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(234,179,8,0.15);color:#eab308;border:1px solid rgba(234,179,8,0.3);">
+                <span style="width:6px;height:6px;border-radius:50%;background:#eab308;display:inline-block;"></span> Partial
+            </span>`;
+        } else {
+            statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(107,114,128,0.15);color:#6b7280;border:1px solid rgba(107,114,128,0.3);">
+                <span style="width:6px;height:6px;border-radius:50%;background:#6b7280;display:inline-block;"></span> ${escapeHtml(run.status || 'Unknown')}
+            </span>`;
+        }
+
+        // Step details (collapsible)
+        const stepsHtml = (run.step_results || []).map((sr, i) => {
+            const stepStatus = sr.success ? '✅' : '❌';
+            const output = sr.output ? escapeHtml(sr.output).replace(/\n/g, '<br>') : '<em style="color:var(--text-muted);">No output</em>';
+            return `<div style="margin-bottom:8px; padding:8px 10px; background:var(--bg-secondary); border-radius:6px; border:1px solid var(--border);">
+                <div style="font-size:12px; font-weight:600; margin-bottom:4px;">${stepStatus} Step ${i + 1}: ${escapeHtml(sr.name || sr.action || 'Unknown')}</div>
+                <div style="font-size:11px; font-family:'JetBrains Mono',monospace; color:var(--text-secondary); max-height:100px; overflow-y:auto;">${output}</div>
+            </div>`;
+        }).join('');
+
+        return `<tr>
+            <td style="font-weight:600; font-size:13px;">${escapeHtml(run.workflow_name || run.workflow_id || '—')}</td>
+            <td>${triggerBadge}</td>
+            <td style="font-size:12px;">${startedDisplay}</td>
+            <td style="font-size:12px; font-family:'JetBrains Mono',monospace;">${durationDisplay}</td>
+            <td>${statusBadge}</td>
+            <td style="text-align:right;">
+                <button class="btn btn-sm" onclick="toggleWolfFlowRunDetail('${run.id}')" style="padding:4px 10px; font-size:11px;">
+                    🔍 Details
+                </button>
+            </td>
+        </tr>
+        <tr id="wolfflow-run-detail-${run.id}" style="display:none;">
+            <td colspan="6" style="padding:12px 16px; background:var(--bg-primary);">
+                ${stepsHtml || '<div style="color:var(--text-muted); font-size:12px;">No step details available.</div>'}
+            </td>
+        </tr>`;
+    }).join('');
+}
+
+function toggleWolfFlowRunDetail(runId) {
+    const row = document.getElementById(`wolfflow-run-detail-${runId}`);
+    if (row) {
+        row.style.display = row.style.display === 'none' ? '' : 'none';
+    }
+}
+
+function wolfflowFormatTime(isoStr) {
+    if (!isoStr) return '—';
+    try {
+        const d = new Date(isoStr);
+        const now = new Date();
+        const diff = now - d;
+        if (diff < 60000) return 'Just now';
+        if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
+        if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
+        return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    } catch (e) {
+        return isoStr;
+    }
+}
+
+async function openWolfFlowModal(editId) {
+    wolfflowEditId = editId || null;
+    wolfflowSteps = [];
+
+    // Reset form
+    document.getElementById('wolfflow-name').value = '';
+    document.getElementById('wolfflow-description').value = '';
+    document.getElementById('wolfflow-schedule').value = '';
+    document.getElementById('wolfflow-enabled').checked = true;
+    document.querySelector('input[name="wolfflow-target"][value="local"]').checked = true;
+    document.getElementById('wolfflow-specific-nodes').style.display = 'none';
+    document.getElementById('wolfflow-steps-container').innerHTML = '';
+    document.getElementById('wolfflow-steps-empty').style.display = '';
+
+    // Populate node checkboxes
+    const nodeCheckboxes = document.getElementById('wolfflow-node-checkboxes');
+    const clusterNodes = allNodes.filter(n =>
+        (n.cluster_name || 'WolfStack') === wolfflowCurrentCluster && n.node_type !== 'proxmox'
+    );
+    nodeCheckboxes.innerHTML = clusterNodes.map(n =>
+        `<label style="display:flex; align-items:center; gap:8px; padding:4px 0; font-size:12px; cursor:pointer;">
+            <input type="checkbox" class="wolfflow-node-cb" value="${n.id}"> ${escapeHtml(n.hostname || n.id)}
+        </label>`
+    ).join('') || '<span style="color:var(--text-muted); font-size:12px;">No nodes found</span>';
+
+    // Load toolbox
+    await loadWolfFlowToolbox();
+
+    // If editing, load existing workflow
+    if (editId) {
+        document.getElementById('wolfflow-modal-title').textContent = '✏️ Edit Workflow';
+        try {
+            const url = wolfflowApiUrl(`/api/wolfflow/workflows/${editId}?cluster=${encodeURIComponent(wolfflowCurrentCluster)}`);
+            const resp = await fetch(url, { credentials: 'include' });
+            if (resp.ok) {
+                const wf = await resp.json();
+                document.getElementById('wolfflow-name').value = wf.name || '';
+                document.getElementById('wolfflow-description').value = wf.description || '';
+                document.getElementById('wolfflow-schedule').value = wf.schedule || '';
+                document.getElementById('wolfflow-enabled').checked = wf.enabled !== false;
+
+                // Target
+                const targetVal = wf.target || 'local';
+                const targetRadio = document.querySelector(`input[name="wolfflow-target"][value="${targetVal}"]`);
+                if (targetRadio) targetRadio.checked = true;
+                if (targetVal === 'specific') {
+                    document.getElementById('wolfflow-specific-nodes').style.display = 'block';
+                    (wf.target_nodes || []).forEach(nid => {
+                        const cb = nodeCheckboxes.querySelector(`input[value="${nid}"]`);
+                        if (cb) cb.checked = true;
+                    });
+                }
+
+                // Steps
+                if (wf.steps && wf.steps.length > 0) {
+                    wf.steps.forEach(step => {
+                        addWolfFlowStep(step);
+                    });
+                }
+            }
+        } catch (e) {
+            console.error('WolfFlow: failed to load workflow for edit:', e);
+        }
+    } else {
+        document.getElementById('wolfflow-modal-title').textContent = '➕ Create Workflow';
+    }
+
+    // Show modal
+    document.getElementById('wolfflow-modal').classList.add('active');
+}
+
+function closeWolfFlowModal() {
+    document.getElementById('wolfflow-modal').classList.remove('active');
+    wolfflowEditId = null;
+    wolfflowSteps = [];
+}
+
+async function loadWolfFlowToolbox() {
+    if (wolfflowToolboxCache) return wolfflowToolboxCache;
+    try {
+        const url = wolfflowApiUrl('/api/wolfflow/toolbox');
+        const resp = await fetch(url, { credentials: 'include' });
+        if (resp.ok) {
+            wolfflowToolboxCache = await resp.json();
+        } else {
+            // Provide sensible defaults if the endpoint doesn't exist yet
+            wolfflowToolboxCache = [
+                { id: 'shell_command', name: 'Run Shell Command', fields: [
+                    { key: 'command', label: 'Command', type: 'text', placeholder: 'e.g. apt update && apt upgrade -y' }
+                ]},
+                { id: 'docker_restart', name: 'Restart Docker Container', fields: [
+                    { key: 'container', label: 'Container Name/ID', type: 'text', placeholder: 'e.g. nginx' }
+                ]},
+                { id: 'docker_pull', name: 'Docker Pull Image', fields: [
+                    { key: 'image', label: 'Image', type: 'text', placeholder: 'e.g. nginx:latest' }
+                ]},
+                { id: 'lxc_restart', name: 'Restart LXC Container', fields: [
+                    { key: 'container', label: 'Container Name', type: 'text', placeholder: 'e.g. web-01' }
+                ]},
+                { id: 'service_restart', name: 'Restart Systemd Service', fields: [
+                    { key: 'service', label: 'Service Name', type: 'text', placeholder: 'e.g. nginx' }
+                ]},
+                { id: 'backup_trigger', name: 'Trigger Backup', fields: [
+                    { key: 'backup_id', label: 'Backup Job ID', type: 'text', placeholder: 'Leave empty for all' }
+                ]},
+                { id: 'http_request', name: 'HTTP Request', fields: [
+                    { key: 'url', label: 'URL', type: 'text', placeholder: 'https://example.com/webhook' },
+                    { key: 'method', label: 'Method', type: 'select', options: ['GET', 'POST', 'PUT', 'DELETE'] }
+                ]},
+                { id: 'wait', name: 'Wait / Delay', fields: [
+                    { key: 'seconds', label: 'Seconds', type: 'number', placeholder: '10' }
+                ]},
+                { id: 'script', name: 'Run Script File', fields: [
+                    { key: 'path', label: 'Script Path', type: 'text', placeholder: '/opt/scripts/cleanup.sh' }
+                ]},
+                { id: 'dns_update', name: 'Update DNS Record', fields: [
+                    { key: 'domain', label: 'Domain', type: 'text', placeholder: 'app.example.com' },
+                    { key: 'record_type', label: 'Type', type: 'select', options: ['A', 'AAAA', 'CNAME'] },
+                    { key: 'value', label: 'Value', type: 'text', placeholder: '10.10.10.5' }
+                ]}
+            ];
+        }
+    } catch (e) {
+        console.error('WolfFlow: toolbox load error:', e);
+        wolfflowToolboxCache = [];
+    }
+    return wolfflowToolboxCache;
+}
+
+function addWolfFlowStep(existingStep) {
+    const idx = wolfflowSteps.length;
+    const step = existingStep || { name: '', action: '', params: {}, on_failure: 'abort' };
+    wolfflowSteps.push(step);
+
+    document.getElementById('wolfflow-steps-empty').style.display = 'none';
+
+    const container = document.getElementById('wolfflow-steps-container');
+    const toolbox = wolfflowToolboxCache || [];
+    const actionOptions = toolbox.map(t =>
+        `<option value="${t.id}" ${step.action === t.id ? 'selected' : ''}>${escapeHtml(t.name)}</option>`
+    ).join('');
+
+    const stepDiv = document.createElement('div');
+    stepDiv.id = `wolfflow-step-${idx}`;
+    stepDiv.style.cssText = 'padding:14px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px;';
+    stepDiv.innerHTML = `
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
+            <span style="font-size:12px; font-weight:700; color:var(--text-secondary);">Step ${idx + 1}</span>
+            <button class="btn btn-sm" onclick="removeWolfFlowStep(${idx})" style="padding:2px 8px; font-size:11px; color:#ef4444;" title="Remove step">✕</button>
+        </div>
+        <div style="margin-bottom:8px;">
+            <label style="font-size:11px; font-weight:600; display:block; margin-bottom:4px;">Step Name</label>
+            <input type="text" class="form-control wolfflow-step-name" data-idx="${idx}" value="${escapeHtml(step.name || '')}" placeholder="e.g. Update packages" style="font-size:12px;">
+        </div>
+        <div style="margin-bottom:8px;">
+            <label style="font-size:11px; font-weight:600; display:block; margin-bottom:4px;">Action</label>
+            <select class="form-control wolfflow-step-action" data-idx="${idx}" onchange="onWolfFlowActionChange(${idx})" style="font-size:12px;">
+                <option value="">— Select action —</option>
+                ${actionOptions}
+            </select>
+        </div>
+        <div class="wolfflow-step-fields" id="wolfflow-step-fields-${idx}"></div>
+        <div style="margin-top:8px;">
+            <label style="font-size:11px; font-weight:600; display:block; margin-bottom:4px;">On Failure</label>
+            <select class="form-control wolfflow-step-onfail" data-idx="${idx}" style="font-size:12px;">
+                <option value="abort" ${step.on_failure === 'abort' ? 'selected' : ''}>🛑 Abort workflow</option>
+                <option value="continue" ${step.on_failure === 'continue' ? 'selected' : ''}>⏭️ Continue to next step</option>
+                <option value="alert" ${step.on_failure === 'alert' ? 'selected' : ''}>🔔 Alert &amp; continue</option>
+            </select>
+        </div>
+    `;
+    container.appendChild(stepDiv);
+
+    // If editing with an existing action, render its fields
+    if (step.action) {
+        onWolfFlowActionChange(idx);
+        // Pre-fill param values
+        if (step.params) {
+            setTimeout(() => {
+                Object.entries(step.params).forEach(([key, val]) => {
+                    const field = document.querySelector(`#wolfflow-step-fields-${idx} [data-param="${key}"]`);
+                    if (field) field.value = val;
+                });
+            }, 0);
+        }
+    }
+}
+
+function removeWolfFlowStep(idx) {
+    wolfflowSteps[idx] = null; // Mark as removed
+    const stepDiv = document.getElementById(`wolfflow-step-${idx}`);
+    if (stepDiv) stepDiv.remove();
+
+    // Check if all steps removed
+    const remaining = wolfflowSteps.filter(s => s !== null);
+    if (remaining.length === 0) {
+        document.getElementById('wolfflow-steps-empty').style.display = '';
+    }
+
+    // Re-number remaining steps
+    const container = document.getElementById('wolfflow-steps-container');
+    let num = 1;
+    container.querySelectorAll('[id^="wolfflow-step-"]').forEach(div => {
+        const label = div.querySelector('span');
+        if (label) label.textContent = `Step ${num++}`;
+    });
+}
+
+function onWolfFlowActionChange(idx) {
+    const select = document.querySelector(`.wolfflow-step-action[data-idx="${idx}"]`);
+    const actionId = select ? select.value : '';
+    const fieldsContainer = document.getElementById(`wolfflow-step-fields-${idx}`);
+    if (!fieldsContainer) return;
+
+    if (!actionId) {
+        fieldsContainer.innerHTML = '';
+        return;
+    }
+
+    const toolbox = wolfflowToolboxCache || [];
+    const action = toolbox.find(t => t.id === actionId);
+    if (!action || !action.fields || action.fields.length === 0) {
+        fieldsContainer.innerHTML = '';
+        return;
+    }
+
+    fieldsContainer.innerHTML = action.fields.map(f => {
+        if (f.type === 'select') {
+            const options = (f.options || []).map(o =>
+                `<option value="${o}">${o}</option>`
+            ).join('');
+            return `<div style="margin-bottom:6px;">
+                <label style="font-size:11px; font-weight:600; display:block; margin-bottom:3px;">${escapeHtml(f.label)}</label>
+                <select class="form-control" data-param="${f.key}" style="font-size:12px;">
+                    ${options}
+                </select>
+            </div>`;
+        } else if (f.type === 'number') {
+            return `<div style="margin-bottom:6px;">
+                <label style="font-size:11px; font-weight:600; display:block; margin-bottom:3px;">${escapeHtml(f.label)}</label>
+                <input type="number" class="form-control" data-param="${f.key}" placeholder="${escapeHtml(f.placeholder || '')}" style="font-size:12px;">
+            </div>`;
+        } else {
+            return `<div style="margin-bottom:6px;">
+                <label style="font-size:11px; font-weight:600; display:block; margin-bottom:3px;">${escapeHtml(f.label)}</label>
+                <input type="text" class="form-control" data-param="${f.key}" placeholder="${escapeHtml(f.placeholder || '')}" style="font-size:12px; font-family:'JetBrains Mono',monospace;">
+            </div>`;
+        }
+    }).join('');
+}
+
+async function saveWolfFlow() {
+    const name = document.getElementById('wolfflow-name').value.trim();
+    if (!name) {
+        showToast('Please enter a workflow name', 'error');
+        return;
+    }
+
+    const description = document.getElementById('wolfflow-description').value.trim();
+    const schedule = document.getElementById('wolfflow-schedule').value.trim();
+    const enabled = document.getElementById('wolfflow-enabled').checked;
+
+    // Target
+    const targetRadio = document.querySelector('input[name="wolfflow-target"]:checked');
+    const target = targetRadio ? targetRadio.value : 'local';
+    let targetNodes = [];
+    if (target === 'specific') {
+        targetNodes = Array.from(document.querySelectorAll('.wolfflow-node-cb:checked')).map(cb => cb.value);
+        if (targetNodes.length === 0) {
+            showToast('Please select at least one target node', 'error');
+            return;
+        }
+    }
+
+    // Collect steps
+    const steps = [];
+    wolfflowSteps.forEach((s, idx) => {
+        if (s === null) return; // removed
+        const stepDiv = document.getElementById(`wolfflow-step-${idx}`);
+        if (!stepDiv) return;
+
+        const stepName = stepDiv.querySelector('.wolfflow-step-name')?.value?.trim() || '';
+        const action = stepDiv.querySelector('.wolfflow-step-action')?.value || '';
+        const onFailure = stepDiv.querySelector('.wolfflow-step-onfail')?.value || 'abort';
+
+        // Collect action params
+        const params = {};
+        stepDiv.querySelectorAll(`#wolfflow-step-fields-${idx} [data-param]`).forEach(el => {
+            params[el.dataset.param] = el.value;
+        });
+
+        if (action) {
+            steps.push({ name: stepName, action, params, on_failure: onFailure });
+        }
+    });
+
+    if (steps.length === 0) {
+        showToast('Please add at least one step', 'error');
+        return;
+    }
+
+    const payload = {
+        cluster: wolfflowCurrentCluster,
+        name,
+        description,
+        schedule,
+        enabled,
+        target,
+        target_nodes: targetNodes,
+        steps
+    };
+
+    try {
+        let url, method;
+        if (wolfflowEditId) {
+            url = wolfflowApiUrl(`/api/wolfflow/workflows/${wolfflowEditId}`);
+            method = 'PUT';
+        } else {
+            url = wolfflowApiUrl('/api/wolfflow/workflows');
+            method = 'POST';
+        }
+
+        const resp = await fetch(url, {
+            method,
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify(payload)
+        });
+
+        if (!resp.ok) {
+            const err = await resp.text();
+            throw new Error(err || 'Failed to save workflow');
+        }
+
+        showToast(wolfflowEditId ? 'Workflow updated' : 'Workflow created', 'success');
+        taskLog('WolfFlow ' + (wolfflowEditId ? 'update' : 'create') + ': ' + name);
+        closeWolfFlowModal();
+        loadWolfFlowWorkflows();
+    } catch (e) {
+        showToast('Failed to save workflow: ' + e.message, 'error');
+        console.error('WolfFlow save error:', e);
+    }
+}
+
+async function deleteWolfFlow(id, name) {
+    if (!confirm(`Delete workflow "${name}"?\n\nThis cannot be undone.`)) return;
+
+    try {
+        const url = wolfflowApiUrl(`/api/wolfflow/workflows/${id}?cluster=${encodeURIComponent(wolfflowCurrentCluster)}`);
+        const resp = await fetch(url, { method: 'DELETE', credentials: 'include' });
+        if (!resp.ok) throw new Error('Delete failed');
+        showToast(`Workflow "${name}" deleted`, 'success');
+        taskLog('WolfFlow delete: ' + name);
+        loadWolfFlowWorkflows();
+    } catch (e) {
+        showToast('Failed to delete workflow: ' + e.message, 'error');
+        console.error('WolfFlow delete error:', e);
+    }
+}
+
+async function triggerWolfFlow(id) {
+    try {
+        const url = wolfflowApiUrl(`/api/wolfflow/workflows/${id}/run?cluster=${encodeURIComponent(wolfflowCurrentCluster)}`);
+        const resp = await fetch(url, { method: 'POST', credentials: 'include' });
+        if (!resp.ok) throw new Error('Trigger failed');
+        showToast('Workflow triggered', 'success');
+        taskLog('WolfFlow run: ' + id);
+        // Refresh after short delay to let the run start
+        setTimeout(() => {
+            loadWolfFlowWorkflows();
+            loadWolfFlowRuns();
+        }, 1500);
+    } catch (e) {
+        showToast('Failed to trigger workflow: ' + e.message, 'error');
+        console.error('WolfFlow trigger error:', e);
+    }
 }

@@ -108,6 +108,7 @@ pub struct AppState {
     pub cached_status: Arc<std::sync::RwLock<Option<serde_json::Value>>>,
     /// WolfRun orchestration state
     pub wolfrun: Arc<crate::wolfrun::WolfRunState>,
+    pub wolfflow: Arc<crate::wolfflow::WolfFlowState>,
     /// Status page monitoring state
     pub statuspage: Arc<crate::statuspage::StatusPageState>,
     /// Whether this server has TLS enabled (HTTPS on main port)
@@ -8231,6 +8232,121 @@ pub async fn system_upgrade(
     }
 }
 
+// ─── WolfFlow Workflow Automation API ───
+
+/// GET /api/wolfflow/workflows — list workflows
+pub async fn wolfflow_list(req: HttpRequest, state: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let cluster = query.get("cluster").map(|s| s.as_str());
+    HttpResponse::Ok().json(state.wolfflow.list_workflows(cluster))
+}
+
+/// POST /api/wolfflow/workflows — create workflow
+pub async fn wolfflow_create(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match serde_json::from_value::<crate::wolfflow::Workflow>(body.into_inner()) {
+        Ok(mut wf) => {
+            if wf.id.is_empty() { wf.id = format!("wf-{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()); }
+            if wf.created_at.is_empty() { wf.created_at = chrono::Utc::now().to_rfc3339(); }
+            wf.updated_at = chrono::Utc::now().to_rfc3339();
+            let created = state.wolfflow.create_workflow(wf);
+            HttpResponse::Ok().json(created)
+        }
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": format!("Invalid workflow: {}", e) })),
+    }
+}
+
+/// GET /api/wolfflow/workflows/{id}
+pub async fn wolfflow_get(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match state.wolfflow.get_workflow(&path.into_inner()) {
+        Some(wf) => HttpResponse::Ok().json(wf),
+        None => HttpResponse::NotFound().json(serde_json::json!({ "error": "Workflow not found" })),
+    }
+}
+
+/// PUT /api/wolfflow/workflows/{id}
+pub async fn wolfflow_update(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match serde_json::from_value::<crate::wolfflow::Workflow>(body.into_inner()) {
+        Ok(mut wf) => {
+            wf.updated_at = chrono::Utc::now().to_rfc3339();
+            match state.wolfflow.update_workflow(&path.into_inner(), wf) {
+                Some(updated) => HttpResponse::Ok().json(updated),
+                None => HttpResponse::NotFound().json(serde_json::json!({ "error": "Workflow not found" })),
+            }
+        }
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": format!("Invalid workflow: {}", e) })),
+    }
+}
+
+/// DELETE /api/wolfflow/workflows/{id}
+pub async fn wolfflow_delete(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match state.wolfflow.delete_workflow(&path.into_inner()) {
+        Some(_) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        None => HttpResponse::NotFound().json(serde_json::json!({ "error": "Workflow not found" })),
+    }
+}
+
+/// POST /api/wolfflow/workflows/{id}/run — manually trigger a workflow
+pub async fn wolfflow_trigger(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let workflow = match state.wolfflow.get_workflow(&id) {
+        Some(wf) => wf,
+        None => return HttpResponse::NotFound().json(serde_json::json!({ "error": "Workflow not found" })),
+    };
+    let wf_state = state.wolfflow.clone();
+    let cluster = state.cluster.clone();
+    let secret = state.cluster_secret.clone();
+    tokio::spawn(async move {
+        crate::wolfflow::execute_workflow(&wf_state, &cluster, &secret, &workflow, "manual").await;
+    });
+    HttpResponse::Ok().json(serde_json::json!({ "ok": true, "message": "Workflow triggered" }))
+}
+
+/// GET /api/wolfflow/runs — list execution history
+pub async fn wolfflow_runs_list(req: HttpRequest, state: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let wf_id = query.get("workflow_id").map(|s| s.as_str());
+    let limit = query.get("limit").and_then(|s| s.parse().ok()).unwrap_or(50);
+    let runs = state.wolfflow.list_runs(wf_id);
+    let runs: Vec<_> = runs.into_iter().take(limit).collect();
+    HttpResponse::Ok().json(runs)
+}
+
+/// GET /api/wolfflow/runs/{id}
+pub async fn wolfflow_run_detail(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let runs = state.wolfflow.list_runs(None);
+    match runs.into_iter().find(|r| r.id == id) {
+        Some(run) => HttpResponse::Ok().json(run),
+        None => HttpResponse::NotFound().json(serde_json::json!({ "error": "Run not found" })),
+    }
+}
+
+/// GET /api/wolfflow/toolbox — list available actions
+pub async fn wolfflow_toolbox(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    HttpResponse::Ok().json(crate::wolfflow::toolbox_actions())
+}
+
+/// POST /api/wolfflow/exec — execute a single action (used by remote execution)
+pub async fn wolfflow_exec(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match serde_json::from_value::<crate::wolfflow::ActionType>(body.into_inner()) {
+        Ok(action) => {
+            match crate::wolfflow::execute_action_local(&action).await {
+                Ok(output) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "output": output })),
+                Err(err) => HttpResponse::Ok().json(serde_json::json!({ "ok": false, "output": err })),
+            }
+        }
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": format!("Invalid action: {}", e) })),
+    }
+}
+
 // ─── MySQL Database Editor API ───
 
 /// GET /api/mysql/detect — check if MySQL is installed on this node
@@ -13072,6 +13188,18 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/pve-vnc-ticket/{vmid}", web::get().to(pve_console::pve_vnc_ticket))
         .route("/ws/pve-vnc/{vmid}", web::get().to(pve_console::pve_vnc_ws))
         // VR Terminal — HTTP polling (avoids WebSocket port restrictions in VR headsets)
+        // WolfFlow — workflow automation
+        .route("/api/wolfflow/workflows", web::get().to(wolfflow_list))
+        .route("/api/wolfflow/workflows", web::post().to(wolfflow_create))
+        .route("/api/wolfflow/workflows/{id}", web::get().to(wolfflow_get))
+        .route("/api/wolfflow/workflows/{id}", web::put().to(wolfflow_update))
+        .route("/api/wolfflow/workflows/{id}", web::delete().to(wolfflow_delete))
+        .route("/api/wolfflow/workflows/{id}/run", web::post().to(wolfflow_trigger))
+        .route("/api/wolfflow/runs", web::get().to(wolfflow_runs_list))
+        .route("/api/wolfflow/runs/{id}", web::get().to(wolfflow_run_detail))
+        .route("/api/wolfflow/toolbox", web::get().to(wolfflow_toolbox))
+        .route("/api/wolfflow/exec", web::post().to(wolfflow_exec))
+        // VR Terminal
         .route("/api/vr-terminal/create", web::post().to(crate::vr_terminal::vr_term_create))
         .route("/api/vr-terminal/{id}/output", web::get().to(crate::vr_terminal::vr_term_output))
         .route("/api/vr-terminal/{id}/input", web::post().to(crate::vr_terminal::vr_term_input))
