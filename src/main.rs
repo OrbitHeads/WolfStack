@@ -36,6 +36,7 @@ mod patreon;
 mod kubernetes;
 mod icons;
 mod tui;
+mod wolfflow;
 
 use actix_web::{web, App, HttpServer, HttpRequest, HttpResponse};
 use actix_files;
@@ -622,39 +623,43 @@ async fn main() -> std::io::Result<()> {
                             };
 
                             let mut html = String::from(r#"<!DOCTYPE html><html><head><meta charset="utf-8"><style>
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f0f1a;color:#e8e8f0;margin:0;padding:20px;}
-.container{max-width:900px;margin:0 auto;background:#1a1a2e;border-radius:12px;padding:24px;border:1px solid #2a2a3e;}
-h1{color:#818cf8;font-size:22px;margin-top:0;}
-h2{color:#a5b4fc;font-size:16px;margin:24px 0 12px;border-bottom:1px solid #2a2a3e;padding-bottom:8px;}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f8f9fa;color:#1a1a2e;margin:0;padding:20px;}
+@media print{body{padding:0;background:#fff;}}
+.container{max-width:900px;margin:0 auto;background:#ffffff;border-radius:12px;padding:24px;border:1px solid #e0e0e8;box-shadow:0 2px 8px rgba(0,0,0,0.06);}
+h1{color:#1a1a2e;font-size:22px;margin-top:0;border-bottom:3px solid #dc2626;padding-bottom:8px;}
+h2{color:#333;font-size:16px;margin:24px 0 12px;border-bottom:2px solid #e8e8ee;padding-bottom:8px;}
 table{width:100%;border-collapse:collapse;font-size:13px;margin-bottom:16px;}
-th{background:#16162b;color:#a5b4fc;text-align:left;padding:8px 12px;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;border-bottom:2px solid #2a2a3e;}
-td{padding:8px 12px;border-bottom:1px solid #1e1e32;}
-tr:hover td{background:#1e1e35;}
+th{background:#f0f1f5;color:#444;text-align:left;padding:8px 12px;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;border-bottom:2px solid #ddd;}
+td{padding:8px 12px;border-bottom:1px solid #eee;color:#333;}
+tr:nth-child(even) td{background:#fafbfc;}
 .badge{display:inline-block;padding:2px 8px;border-radius:8px;font-size:11px;font-weight:600;}
-.online{background:rgba(34,197,94,0.15);color:#22c55e;}
-.offline{background:rgba(239,68,68,0.15);color:#ef4444;}
-.running{background:rgba(34,197,94,0.15);color:#22c55e;}
-.stopped{background:rgba(156,163,175,0.15);color:#9ca3af;}
-.paused{background:rgba(234,179,8,0.15);color:#eab308;}
-.frozen{background:rgba(59,130,246,0.15);color:#3b82f6;}
-.critical{background:rgba(239,68,68,0.15);color:#ef4444;}
-.warning{background:rgba(245,158,11,0.15);color:#f59e0b;}
-.info{background:rgba(59,130,246,0.15);color:#3b82f6;}
-.bar{height:8px;border-radius:4px;overflow:hidden;background:#2a2a3e;min-width:60px;}
+.online{background:#dcfce7;color:#166534;}
+.offline{background:#fee2e2;color:#991b1b;}
+.running{background:#dcfce7;color:#166534;}
+.stopped{background:#f3f4f6;color:#6b7280;}
+.paused{background:#fef9c3;color:#854d0e;}
+.frozen{background:#dbeafe;color:#1e40af;}
+.critical{background:#fee2e2;color:#991b1b;}
+.warning{background:#fef3c7;color:#92400e;}
+.info{background:#dbeafe;color:#1e40af;}
+.bar{height:8px;border-radius:4px;overflow:hidden;background:#e5e7eb;min-width:60px;}
 .bar-fill{height:100%;border-radius:4px;}
-.meta{color:#aaa;font-size:11px;}
+.meta{color:#666;font-size:11px;}
 .summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px;}
-.summary-card{background:#16162b;border:1px solid #2a2a3e;border-radius:8px;padding:12px;text-align:center;}
-.summary-value{font-size:24px;font-weight:700;color:#818cf8;}
-.summary-label{font-size:11px;color:#aab;text-transform:uppercase;margin-top:4px;}
-a{color:#eab308;text-decoration:none;}a:hover{text-decoration:underline;}
-.ai-box{background:#16162b;border:1px solid #eab308;border-radius:8px;padding:16px;margin-top:16px;white-space:pre-wrap;font-size:13px;line-height:1.6;color:#f0f0f0;}
+.summary-card{background:#f8f9fa;border:1px solid #e0e0e8;border-radius:8px;padding:12px;text-align:center;}
+.summary-value{font-size:24px;font-weight:700;color:#1a1a2e;}
+.summary-label{font-size:11px;color:#666;text-transform:uppercase;margin-top:4px;}
+a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
+.ai-box{background:#fffbeb;border:1px solid #f59e0b;border-radius:8px;padding:16px;margin-top:16px;white-space:pre-wrap;font-size:13px;line-height:1.6;color:#1a1a2e;}
+.logo-bar{display:flex;align-items:center;gap:12px;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid #eee;}
+.logo-bar img{height:28px;}
+@media print{.container{box-shadow:none;border:none;} .bar-fill{-webkit-print-color-adjust:exact;print-color-adjust:exact;}}
 </style></head><body><div class="container">"#);
 
                             // Header
                             html.push_str(&format!(
                                 r#"<h1>WolfStack Daily Report</h1>
-                                <p style="color:#aab;margin-top:-8px;">Date: {} &bull; WolfStack v{} &bull; {} node(s) scanned</p>"#,
+                                <p style="color:#666;margin-top:-8px;font-size:13px;">Date: {} &bull; WolfStack v{} &bull; {} node(s) scanned</p>"#,
                                 today, env!("CARGO_PKG_VERSION"), total_nodes
                             ));
 
@@ -667,8 +672,8 @@ a{color:#eab308;text-decoration:none;}a:hover{text-decoration:underline;}
                                 <div class="summary-card"><div class="summary-value" style="color:#3b82f6">{}</div><div class="summary-label">Info</div></div>
                                 </div>"#,
                                 total_nodes,
-                                if critical_count > 0 { "#ef4444" } else { "#22c55e" }, critical_count,
-                                if warning_count > 0 { "#f59e0b" } else { "#22c55e" }, warning_count,
+                                if critical_count > 0 { "#dc2626" } else { "#166534" }, critical_count,
+                                if warning_count > 0 { "#92400e" } else { "#166534" }, warning_count,
                                 info_count
                             ));
 
@@ -684,8 +689,8 @@ a{color:#eab308;text-decoration:none;}a:hover{text-decoration:underline;}
                                     let mem_pct = if m.memory_total_bytes > 0 {
                                         (m.memory_used_bytes as f64 / m.memory_total_bytes as f64 * 100.0) as u64
                                     } else { 0 };
-                                    let cpu_color = if cpu > 80.0 { "#ef4444" } else if cpu > 50.0 { "#f59e0b" } else { "#22c55e" };
-                                    let mem_color = if mem_pct > 90 { "#ef4444" } else if mem_pct > 70 { "#f59e0b" } else { "#22c55e" };
+                                    let cpu_color = if cpu > 80.0 { "#dc2626" } else if cpu > 50.0 { "#d97706" } else { "#16a34a" };
+                                    let mem_color = if mem_pct > 90 { "#dc2626" } else if mem_pct > 70 { "#d97706" } else { "#16a34a" };
                                     (
                                         format!(r#"<div class="bar"><div class="bar-fill" style="width:{}%;background:{}"></div></div><span class="meta">{:.0}%</span>"#, cpu.min(100.0), cpu_color, cpu),
                                         format!(r#"<div class="bar"><div class="bar-fill" style="width:{}%;background:{}"></div></div><span class="meta">{} / {}</span>"#, mem_pct.min(100), mem_color, fmt_bytes(m.memory_used_bytes), fmt_bytes(m.memory_total_bytes)),
@@ -709,8 +714,8 @@ a{color:#eab308;text-decoration:none;}a:hover{text-decoration:underline;}
                                 let (cpu_str, mem_str) = if let Some(ref m) = n.metrics {
                                     let cpu = m.cpu_usage_percent;
                                     let mem_pct = if m.memory_total_bytes > 0 { (m.memory_used_bytes as f64 / m.memory_total_bytes as f64 * 100.0) as u64 } else { 0 };
-                                    let cpu_color = if cpu > 80.0 { "#ef4444" } else if cpu > 50.0 { "#f59e0b" } else { "#22c55e" };
-                                    let mem_color = if mem_pct > 90 { "#ef4444" } else if mem_pct > 70 { "#f59e0b" } else { "#22c55e" };
+                                    let cpu_color = if cpu > 80.0 { "#dc2626" } else if cpu > 50.0 { "#d97706" } else { "#16a34a" };
+                                    let mem_color = if mem_pct > 90 { "#dc2626" } else if mem_pct > 70 { "#d97706" } else { "#16a34a" };
                                     (
                                         format!(r#"<div class="bar"><div class="bar-fill" style="width:{}%;background:{}"></div></div><span class="meta">{:.0}%</span>"#, cpu.min(100.0), cpu_color, cpu),
                                         format!(r#"<div class="bar"><div class="bar-fill" style="width:{}%;background:{}"></div></div><span class="meta">{} / {}</span>"#, mem_pct.min(100), mem_color, fmt_bytes(m.memory_used_bytes), fmt_bytes(m.memory_total_bytes)),
@@ -996,7 +1001,7 @@ a{color:#eab308;text-decoration:none;}a:hover{text-decoration:underline;}
 
                             // Footer
                             html.push_str(&format!(
-                                r#"<p style="color:#555;font-size:11px;text-align:center;margin-top:24px;border-top:1px solid #2a2a3e;padding-top:12px;">WolfStack v{} &bull; Generated {}</p>"#,
+                                r#"<p style="color:#999;font-size:11px;text-align:center;margin-top:24px;border-top:1px solid #e0e0e8;padding-top:12px;">WolfStack v{} &bull; Generated {}</p>"#,
                                 env!("CARGO_PKG_VERSION"), chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
                             ));
                             html.push_str("</div></body></html>");
