@@ -1426,13 +1426,21 @@
                         <span style="font-size:11px; color:var(--text-muted); white-space:nowrap;">Schedule:</span>
                         <input type="text" id="wf-editor-schedule" class="form-control" placeholder="Cron (empty = manual)"
                             style="font-size:12px; font-family:'JetBrains Mono',monospace; width:160px; padding:4px 8px;">
-                        <div style="display:flex; gap:4px;">
-                            <button class="btn btn-sm" onclick="document.getElementById('wf-editor-schedule').value='0 3 * * *'" title="Every day 3am"
-                                style="font-size:10px; padding:3px 6px; background:var(--bg-secondary); border:1px solid var(--border);">3am</button>
-                            <button class="btn btn-sm" onclick="document.getElementById('wf-editor-schedule').value='0 * * * *'" title="Every hour"
-                                style="font-size:10px; padding:3px 6px; background:var(--bg-secondary); border:1px solid var(--border);">1h</button>
-                            <button class="btn btn-sm" onclick="document.getElementById('wf-editor-schedule').value='0 2 * * 0'" title="Every Sunday 2am"
-                                style="font-size:10px; padding:3px 6px; background:var(--bg-secondary); border:1px solid var(--border);">Sun</button>
+                        <div style="display:flex; gap:3px; flex-wrap:wrap;">
+                            <button class="btn btn-sm" onclick="document.getElementById('wf-editor-schedule').value='0 3 * * *'" title="Every day at 3am"
+                                style="font-size:10px; padding:3px 6px; background:var(--bg-secondary); border:1px solid var(--border);">Daily 3am</button>
+                            <button class="btn btn-sm" onclick="document.getElementById('wf-editor-schedule').value='0 0 * * *'" title="Every day at midnight"
+                                style="font-size:10px; padding:3px 6px; background:var(--bg-secondary); border:1px solid var(--border);">Midnight</button>
+                            <button class="btn btn-sm" onclick="document.getElementById('wf-editor-schedule').value='0 * * * *'" title="Every hour on the hour"
+                                style="font-size:10px; padding:3px 6px; background:var(--bg-secondary); border:1px solid var(--border);">Hourly</button>
+                            <button class="btn btn-sm" onclick="document.getElementById('wf-editor-schedule').value='*/15 * * * *'" title="Every 15 minutes"
+                                style="font-size:10px; padding:3px 6px; background:var(--bg-secondary); border:1px solid var(--border);">15min</button>
+                            <button class="btn btn-sm" onclick="document.getElementById('wf-editor-schedule').value='0 2 * * 0'" title="Every Sunday at 2am"
+                                style="font-size:10px; padding:3px 6px; background:var(--bg-secondary); border:1px solid var(--border);">Weekly Sun</button>
+                            <button class="btn btn-sm" onclick="document.getElementById('wf-editor-schedule').value='0 2 1 * *'" title="1st of every month at 2am"
+                                style="font-size:10px; padding:3px 6px; background:var(--bg-secondary); border:1px solid var(--border);">Monthly</button>
+                            <button class="btn btn-sm" onclick="document.getElementById('wf-editor-schedule').value=''" title="No schedule (manual only)"
+                                style="font-size:10px; padding:3px 6px; background:var(--bg-secondary); border:1px solid var(--border);">Manual</button>
                         </div>
                     </div>
                     <div style="width:1px; height:28px; background:var(--border);"></div>

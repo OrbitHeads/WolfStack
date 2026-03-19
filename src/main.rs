@@ -36,6 +36,7 @@ mod patreon;
 mod kubernetes;
 mod icons;
 mod tui;
+mod wolfflow;
 
 use actix_web::{web, App, HttpServer, HttpRequest, HttpResponse};
 use actix_files;

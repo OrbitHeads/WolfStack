@@ -350,12 +350,20 @@ impl WolfFlowState {
     /// Compares the cron expression against the current UTC time.
     pub fn get_due_workflows(&self) -> Vec<Workflow> {
         let now = Utc::now().naive_utc();
+        let now_minute = now.format("%Y-%m-%d %H:%M").to_string();
         let wfs = self.workflows.read().unwrap();
+        let runs = self.runs.read().unwrap();
         wfs.iter()
             .filter(|w| {
-                w.enabled
-                    && w.schedule.is_some()
-                    && cron_matches(w.schedule.as_deref().unwrap(), &now)
+                if !w.enabled || w.schedule.is_none() { return false; }
+                if !cron_matches(w.schedule.as_deref().unwrap(), &now) { return false; }
+                // Skip if already ran in this same minute (prevent duplicate execution)
+                let already_ran = runs.iter().any(|r| {
+                    r.workflow_id == w.id
+                        && r.trigger == "scheduled"
+                        && r.started_at.starts_with(&now_minute)
+                });
+                !already_ran
             })
             .cloned()
             .collect()
