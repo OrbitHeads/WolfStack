@@ -947,45 +947,21 @@ pub async fn execute_workflow(
     run.finished_at = Some(Utc::now().to_rfc3339());
     run.duration_ms = run_start.elapsed().as_millis() as u64;
 
-    // Persist final run state
-    state.update_run(&run_id, run.clone());
-    state.mark_last_run(&workflow.id);
-
     info!(
         "WolfFlow: workflow '{}' finished — status: {:?}, duration: {}ms, steps: {}",
         workflow.name, run.status, run.duration_ms, run.steps.len()
     );
 
-    // Send email with results if configured
+    // Send email with results BEFORE persisting final status — the frontend stops
+    // polling as soon as it sees a non-running status, so email_status must already
+    // be set by the time the run is saved as completed/failed.
     if let Some(ref email) = workflow.email_results {
         if !email.is_empty() {
+            info!("WolfFlow: sending email results to {}", email);
             let subject = format!("[WolfFlow] {} — {:?}", workflow.name, run.status);
-            let mut body = format!(
-                "Workflow: {}\nTrigger: {}\nStatus: {:?}\nDuration: {}ms\nSteps: {}\n\n",
-                workflow.name, trigger, run.status, run.duration_ms, run.steps.len()
-            );
-            for step in &run.steps {
-                body.push_str(&format!(
-                    "Step: {} | Node: {} | Status: {:?} | {}ms\n",
-                    step.step_name, step.node_hostname, step.status, step.duration_ms
-                ));
-                if !step.output.is_empty() {
-                    let output_preview = if step.output.len() > 500 {
-                        format!("{}...", &step.output[..500])
-                    } else {
-                        step.output.clone()
-                    };
-                    body.push_str(&format!("  Output: {}\n", output_preview));
-                }
-                body.push('\n');
-            }
-            // Send email — EXACTLY the same way the daily report does it
             let mut config = ai_config.clone().unwrap_or_else(crate::ai::AiConfig::load);
-            // Override recipient if workflow specifies one
-            if !email.is_empty() {
-                config.email_to = email.clone();
-            }
-            if config.smtp_host.is_empty() || config.email_to.is_empty() {
+            config.email_to = email.clone();
+            if config.smtp_host.is_empty() {
                 run.email_status = Some("Failed: SMTP not configured in Settings → AI Agent".to_string());
             } else {
                 let html_body = format!(
@@ -1002,15 +978,23 @@ pub async fn execute_workflow(
                         if s.output.len() > 500 { format!("{}...", &s.output[..500]) } else { s.output.clone() }
                     )).collect::<Vec<_>>().join("")
                 );
-                // Call EXACTLY like the daily report does — no spawn_blocking, just call it
                 match crate::ai::send_html_email(&config, &subject, &html_body) {
-                    Ok(_) => run.email_status = Some(format!("Sent to {}", config.email_to)),
-                    Err(e) => run.email_status = Some(format!("Failed: {}", e)),
+                    Ok(_) => {
+                        info!("WolfFlow: email sent to {}", config.email_to);
+                        run.email_status = Some(format!("Sent to {}", config.email_to));
+                    }
+                    Err(e) => {
+                        warn!("WolfFlow: email failed: {}", e);
+                        run.email_status = Some(format!("Failed: {}", e));
+                    }
                 }
             }
-            state.update_run(&run_id, run.clone());
         }
     }
+
+    // Persist final run state (with email_status already set)
+    state.update_run(&run_id, run.clone());
+    state.mark_last_run(&workflow.id);
 
     run
 }
