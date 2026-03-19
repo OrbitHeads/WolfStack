@@ -29202,60 +29202,87 @@ async function deleteWolfFlow(id, name) {
 }
 
 async function triggerWolfFlow(id) {
-    // Find workflow name for the task log
+    // Get workflow details
     let wfName = id;
+    let wfTarget = '';
+    let wfStepCount = 0;
     try {
         const wfResp = await fetch(`/api/wolfflow/workflows/${id}`, { credentials: 'include' });
-        if (wfResp.ok) { const wf = await wfResp.json(); wfName = wf.name || id; }
+        if (wfResp.ok) {
+            const wf = await wfResp.json();
+            wfName = wf.name || id;
+            wfStepCount = (wf.steps || []).length;
+            wfTarget = wf.target?.scope === 'all_nodes' ? 'all nodes' :
+                wf.target?.scope === 'local' ? 'local' :
+                wf.target?.scope === 'cluster' ? wf.target.cluster_name :
+                wf.target?.scope === 'nodes' ? (wf.target.node_ids || []).length + ' nodes' :
+                wf.target?.scope || '?';
+        }
     } catch(e) {}
 
     const taskId = addTaskLogEntry({
         cluster: 'WolfFlow',
         node: wfName,
-        description: 'Running workflow...',
+        description: `Starting "${wfName}" (${wfStepCount} step${wfStepCount !== 1 ? 's' : ''}) on ${wfTarget}...`,
         status: 'running',
     });
 
     try {
         const resp = await fetch(`/api/wolfflow/workflows/${id}/run`, { method: 'POST', credentials: 'include' });
-        if (!resp.ok) throw new Error('Trigger failed');
+        if (!resp.ok) {
+            const err = await resp.text();
+            throw new Error(err || 'Trigger failed');
+        }
         showToast('Workflow triggered: ' + wfName, 'success');
 
-        // Poll for run results every 3s
-        let pollCount = 0;
+        // Poll for run results — fetch enough runs to find ours, no timeout
+        const startTime = Date.now();
         const pollTimer = setInterval(async () => {
-            pollCount++;
-            if (pollCount > 60) { clearInterval(pollTimer); return; } // 3 min timeout
+            const elapsed = Math.floor((Date.now() - startTime) / 1000);
+            const timeStr = elapsed >= 60 ? Math.floor(elapsed/60) + 'm ' + (elapsed%60) + 's' : elapsed + 's';
             try {
-                const runsResp = await fetch('/api/wolfflow/runs?limit=1', { credentials: 'include' });
+                const runsResp = await fetch('/api/wolfflow/runs?limit=10', { credentials: 'include' });
                 if (!runsResp.ok) return;
                 const runs = await runsResp.json();
-                const latestRun = runs.find(r => r.workflow_id === id);
-                if (!latestRun) return;
-                if (latestRun.status === 'running') {
-                    const completedSteps = latestRun.steps ? latestRun.steps.filter(s => s.status !== 'running').length : 0;
-                    const totalSteps = latestRun.steps ? latestRun.steps.length : 0;
-                    updateTaskLogEntry(taskId, { description: `Step ${completedSteps}/${totalSteps}...`, status: 'running' });
+                // Find the most recent run for this workflow
+                const run = runs.find(r => r.workflow_id === id);
+                if (!run) {
+                    updateTaskLogEntry(taskId, { description: `"${wfName}" — waiting for execution to start (${timeStr})...`, status: 'running' });
+                    return;
+                }
+
+                if (run.status === 'running') {
+                    // Show detailed step progress
+                    const completedSteps = (run.steps || []).filter(s => s.status !== 'running');
+                    const lastStep = completedSteps.length > 0 ? completedSteps[completedSteps.length - 1] : null;
+                    const detail = lastStep
+                        ? `Step ${completedSteps.length}/${wfStepCount}: "${lastStep.step_name}" on ${lastStep.node_hostname} — ${lastStep.status}`
+                        : `Executing step 1/${wfStepCount} on ${wfTarget}`;
+                    updateTaskLogEntry(taskId, { description: `"${wfName}" — ${detail} (${timeStr})`, status: 'running' });
                 } else {
+                    // Finished
                     clearInterval(pollTimer);
-                    const logLines = (latestRun.steps || []).map(s =>
-                        `[${s.status}] ${s.step_name} on ${s.node_hostname} (${s.duration_ms}ms)${s.output ? ': ' + s.output.substring(0, 200) : ''}`
-                    );
-                    if (latestRun.email_status) {
-                        logLines.push(`[Email] ${latestRun.email_status}`);
-                    }
-                    const status = latestRun.status === 'completed' ? 'success' : 'error';
+                    const logLines = (run.steps || []).map(s => {
+                        const outputPreview = s.output ? s.output.substring(0, 300).replace(/\n/g, ' ') : '';
+                        return `[${s.status}] ${s.step_name} on ${s.node_hostname} (${s.duration_ms}ms)${outputPreview ? '\n    ' + outputPreview : ''}`;
+                    });
+                    if (run.email_status) logLines.push(`[Email] ${run.email_status}`);
+
+                    const statusMap = { completed: 'success', failed: 'error', partial_failure: 'error' };
+                    const statusLabel = run.status === 'completed' ? 'COMPLETED' : run.status === 'failed' ? 'FAILED' : run.status.toUpperCase();
                     updateTaskLogEntry(taskId, {
-                        description: `${wfName} — ${latestRun.status} (${latestRun.steps?.length || 0} steps)${latestRun.email_status ? ' | ' + latestRun.email_status : ''}`,
-                        status,
+                        description: `"${wfName}" — ${statusLabel} (${(run.steps||[]).length} steps, ${timeStr})${run.email_status ? ' | Email: ' + run.email_status : ''}`,
+                        status: statusMap[run.status] || 'error',
                         logLines,
                     });
                     loadWolfFlowList();
                 }
-            } catch(e) {}
-        }, 3000);
+            } catch(e) {
+                updateTaskLogEntry(taskId, { description: `"${wfName}" — polling error: ${e.message} (${timeStr})`, status: 'running' });
+            }
+        }, 2000);
     } catch (e) {
-        updateTaskLogEntry(taskId, { description: 'Failed: ' + e.message, status: 'error' });
+        updateTaskLogEntry(taskId, { description: `"${wfName}" FAILED: ${e.message}`, status: 'error' });
         showToast('Failed to trigger: ' + e.message, 'error');
     }
 }
