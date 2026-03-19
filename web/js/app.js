@@ -29282,7 +29282,8 @@ async function triggerWolfFlow(id) {
                     return;
                 }
 
-                if (run.status === 'running') {
+                const runStatus = (run.status || '').toLowerCase();
+                if (runStatus === 'running') {
                     // Show detailed step progress
                     const completedSteps = (run.steps || []).filter(s => s.status !== 'running');
                     const lastStep = completedSteps.length > 0 ? completedSteps[completedSteps.length - 1] : null;
@@ -29300,10 +29301,10 @@ async function triggerWolfFlow(id) {
                     if (run.email_status) logLines.push(`[Email] ${run.email_status}`);
 
                     const statusMap = { completed: 'success', failed: 'error', partial_failure: 'error' };
-                    const statusLabel = run.status === 'completed' ? 'COMPLETED' : run.status === 'failed' ? 'FAILED' : run.status.toUpperCase();
+                    const statusLabel = runStatus === 'completed' ? 'COMPLETED' : runStatus === 'failed' ? 'FAILED' : runStatus.toUpperCase();
                     updateTaskLogEntry(taskId, {
                         description: `"${wfName}" — ${statusLabel} (${(run.steps||[]).length} steps, ${timeStr})${run.email_status ? ' | Email: ' + run.email_status : ''}`,
-                        status: statusMap[run.status] || 'error',
+                        status: statusMap[runStatus] || 'error',
                         logLines,
                     });
                     loadWolfFlowList();
