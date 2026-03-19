@@ -1013,8 +1013,7 @@ function selectView(page) {
         if (tlBtn) tlBtn.style.display = 'none';
         initTopology3D();
     } else if (page === 'wolfflow') {
-        loadWolfFlowWorkflows();
-        loadWolfFlowRuns();
+        loadWolfFlowList();
     }
 
     // Restore task log toggle button when leaving topology
@@ -28093,552 +28092,870 @@ function vrTermUpdate() {
     });
 }
 
-// ═══ WolfFlow — Workflow Automation ═══
+// ═══ WolfFlow — Visual Workflow Editor ═══
 
-let wolfflowRefreshTimer = null;
-let wolfflowEditId = null;
-let wolfflowToolboxCache = null;
-let wolfflowSteps = [];
+let wfEditId = null;
+let wfToolboxCache = null;
+let wfSteps = [];            // Array of step objects for the editor
+let wfSelectedStepIdx = -1;  // Currently selected step index
+let wfEditorTarget = { scope: 'local' }; // Workflow-level target
 
-// WolfFlow is system-wide — always call local API
-function wolfflowApiUrl(path) { return path; }
+// Color mapping for action types (left border accent)
+const wfActionColors = {
+    update_packages:  '#f59e0b',
+    update_wolfstack: '#8b5cf6',
+    restart_service:  '#3b82f6',
+    run_command:      '#10b981',
+    clean_logs:       '#6366f1',
+    check_disk_space: '#06b6d4',
+    restart_container:'#ec4899',
+    docker_prune:     '#ef4444',
+};
+const wfActionIcons = {
+    update_packages:  '\u{1F4E6}',
+    update_wolfstack: '\u{1F43A}',
+    restart_service:  '\u{1F504}',
+    run_command:      '\u{1F4BB}',
+    clean_logs:       '\u{1F9F9}',
+    check_disk_space: '\u{1F4BF}',
+    restart_container:'\u{1F4E6}',
+    docker_prune:     '\u{1F433}',
+};
 
-async function loadWolfFlowWorkflows() {
+// ─── List View ───
+
+async function loadWolfFlowList() {
     try {
-        const url = wolfflowApiUrl('/api/wolfflow/workflows');
-        const resp = await fetch(url, { credentials: 'include' });
-        if (!resp.ok) throw new Error('Failed to load workflows');
-        const workflows = await resp.json();
-        renderWolfFlowWorkflows(workflows);
+        const [wfResp, runsResp] = await Promise.all([
+            fetch('/api/wolfflow/workflows', { credentials: 'include' }),
+            fetch('/api/wolfflow/runs?limit=50', { credentials: 'include' })
+        ]);
+        if (wfResp.ok) {
+            const workflows = await wfResp.json();
+            renderWfListTable(workflows);
+        }
+        if (runsResp.ok) {
+            const runs = await runsResp.json();
+            renderWfRunsTable(runs);
+        }
     } catch (e) {
-        console.error('WolfFlow load error:', e);
+        console.error('WolfFlow list error:', e);
     }
 }
 
-function renderWolfFlowWorkflows(workflows) {
-    const tbody = document.getElementById('wolfflow-workflows-tbody');
-    const empty = document.getElementById('wolfflow-empty');
-    const table = document.getElementById('wolfflow-workflows-table');
+function renderWfListTable(workflows) {
+    const tbody = document.getElementById('wf-list-tbody');
+    const empty = document.getElementById('wf-list-empty');
+    const table = document.getElementById('wf-list-table');
 
     if (!workflows || workflows.length === 0) {
         table.style.display = 'none';
         empty.style.display = 'block';
-        document.getElementById('wolfflow-stat-total').textContent = '0';
-        document.getElementById('wolfflow-stat-scheduled').textContent = '0';
         return;
     }
-
     table.style.display = '';
     empty.style.display = 'none';
 
-    // Stats
-    const scheduled = workflows.filter(w => w.schedule && w.schedule.trim() !== '').length;
-    document.getElementById('wolfflow-stat-total').textContent = workflows.length;
-    document.getElementById('wolfflow-stat-scheduled').textContent = scheduled;
-
-    // Update sidebar count badge
-    const clusterId = 'wolfflow';
-    const badge = document.getElementById(`wolfflow-count-${clusterId}`);
-    if (badge) {
-        badge.textContent = workflows.length;
-        badge.style.display = workflows.length > 0 ? '' : 'none';
-    }
-
     tbody.innerHTML = workflows.map(wf => {
         const stepsCount = wf.steps ? wf.steps.length : 0;
-        const scheduleDisplay = wf.schedule && wf.schedule.trim() !== ''
-            ? `<code style="font-size:11px; padding:2px 6px; background:var(--bg-secondary); border-radius:4px;">${escapeHtml(wf.schedule)}</code>`
-            : '<span style="color:var(--text-muted); font-size:12px;">Manual</span>';
+        const sched = wf.schedule && wf.schedule.trim()
+            ? `<code style="font-size:11px;padding:2px 6px;background:var(--bg-secondary);border-radius:4px;">${escapeHtml(wf.schedule)}</code>`
+            : '<span style="color:var(--text-muted);font-size:12px;">Manual</span>';
 
-        // Target display
-        let targetDisplay = 'Local';
-        if (wf.target === 'all_nodes') targetDisplay = '🌐 All Nodes';
-        else if (wf.target === 'cluster') targetDisplay = '☁️ Cluster';
-        else if (wf.target === 'specific') targetDisplay = `📌 ${(wf.target_nodes || []).length} node(s)`;
-        else targetDisplay = '🖥️ Local';
-
-        // Last run time
-        const lastRunDisplay = wf.last_run
-            ? wolfflowFormatTime(wf.last_run)
-            : '<span style="color:var(--text-muted);">Never</span>';
-
-        // Status badge
-        let statusBadge;
-        if (!wf.enabled) {
-            statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(107,114,128,0.15);color:#6b7280;border:1px solid rgba(107,114,128,0.3);">
-                <span style="width:6px;height:6px;border-radius:50%;background:#6b7280;display:inline-block;"></span> Disabled
-            </span>`;
-        } else if (wf.last_status === 'running') {
-            statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(59,130,246,0.15);color:#3b82f6;border:1px solid rgba(59,130,246,0.3);">
-                <span style="width:6px;height:6px;border-radius:50%;background:#3b82f6;display:inline-block;animation:pulse 2s infinite;"></span> Running
-            </span>`;
-        } else if (wf.last_status === 'success') {
-            statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(16,185,129,0.15);color:#10b981;border:1px solid rgba(16,185,129,0.3);">
-                <span style="width:6px;height:6px;border-radius:50%;background:#10b981;display:inline-block;"></span> Success
-            </span>`;
-        } else if (wf.last_status === 'failed') {
-            statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(239,68,68,0.15);color:#ef4444;border:1px solid rgba(239,68,68,0.3);">
-                <span style="width:6px;height:6px;border-radius:50%;background:#ef4444;display:inline-block;"></span> Failed
-            </span>`;
-        } else {
-            statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(245,158,11,0.15);color:#f59e0b;border:1px solid rgba(245,158,11,0.3);">
-                <span style="width:6px;height:6px;border-radius:50%;background:#f59e0b;display:inline-block;"></span> Idle
-            </span>`;
-        }
+        const targetLabel = wfTargetLabel(wf.target);
+        const lastRun = wf.last_run ? wfFormatTime(wf.last_run) : '<span style="color:var(--text-muted);">Never</span>';
+        const statusBadge = wfStatusBadge(wf.enabled, wf.last_status);
 
         return `<tr>
             <td>
-                <div style="font-weight:600; font-size:13px;">${escapeHtml(wf.name)}</div>
-                ${wf.description ? `<div style="font-size:11px; color:var(--text-muted); margin-top:2px;">${escapeHtml(wf.description)}</div>` : ''}
+                <div style="font-weight:600;font-size:13px;">${escapeHtml(wf.name)}</div>
+                ${wf.description ? `<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">${escapeHtml(wf.description)}</div>` : ''}
             </td>
             <td style="text-align:center;">${stepsCount}</td>
-            <td>${scheduleDisplay}</td>
-            <td style="font-size:12px;">${targetDisplay}</td>
-            <td style="font-size:12px;">${lastRunDisplay}</td>
+            <td>${sched}</td>
+            <td style="font-size:12px;">${targetLabel}</td>
+            <td style="font-size:12px;">${lastRun}</td>
             <td>${statusBadge}</td>
-            <td style="text-align:right; white-space:nowrap;">
-                <button class="btn btn-sm" onclick="triggerWolfFlow('${wf.id}')" title="Run now" style="padding:4px 8px; font-size:12px; color:#10b981;">▶️</button>
-                <button class="btn btn-sm" onclick="openWolfFlowModal('${wf.id}')" title="Edit" style="padding:4px 8px; font-size:12px; color:#818cf8;">✏️</button>
-                <button class="btn btn-sm" onclick="deleteWolfFlow('${wf.id}', '${escapeHtml(wf.name)}')" title="Delete" style="padding:4px 8px; font-size:12px; color:#ef4444;">🗑️</button>
+            <td style="text-align:right;white-space:nowrap;">
+                <button class="btn btn-sm" onclick="triggerWolfFlow('${wf.id}')" title="Run now" style="padding:4px 8px;font-size:12px;color:#10b981;">&#9654;</button>
+                <button class="btn btn-sm" onclick="openWolfFlowEditor('${wf.id}')" title="Edit" style="padding:4px 8px;font-size:12px;color:#818cf8;">&#9998;</button>
+                <button class="btn btn-sm" onclick="deleteWolfFlow('${wf.id}','${escapeHtml(wf.name).replace(/'/g, "\\'")}')" title="Delete" style="padding:4px 8px;font-size:12px;color:#ef4444;">&#10005;</button>
             </td>
         </tr>`;
     }).join('');
 }
 
-async function loadWolfFlowRuns() {
-    try {
-        const url = wolfflowApiUrl('/api/wolfflow/runs?limit=50');
-        const resp = await fetch(url, { credentials: 'include' });
-        if (!resp.ok) throw new Error('Failed to load runs');
-        const runs = await resp.json();
-        renderWolfFlowRuns(runs);
-    } catch (e) {
-        console.error('WolfFlow runs load error:', e);
-    }
-}
-
-function renderWolfFlowRuns(runs) {
-    const tbody = document.getElementById('wolfflow-runs-tbody');
-    const empty = document.getElementById('wolfflow-runs-empty');
-    const table = document.getElementById('wolfflow-runs-table');
+function renderWfRunsTable(runs) {
+    const tbody = document.getElementById('wf-runs-tbody');
+    const empty = document.getElementById('wf-runs-empty');
+    const table = document.getElementById('wf-runs-table');
 
     if (!runs || runs.length === 0) {
         table.style.display = 'none';
         empty.style.display = 'block';
-        document.getElementById('wolfflow-stat-lastrun').textContent = '—';
-        document.getElementById('wolfflow-stat-today').textContent = '0';
         return;
     }
-
     table.style.display = '';
     empty.style.display = 'none';
 
-    // Stats
-    if (runs.length > 0 && runs[0].started_at) {
-        document.getElementById('wolfflow-stat-lastrun').textContent = wolfflowFormatTime(runs[0].started_at);
-    }
-    const todayStr = new Date().toISOString().slice(0, 10);
-    const runsToday = runs.filter(r => r.started_at && r.started_at.slice(0, 10) === todayStr).length;
-    document.getElementById('wolfflow-stat-today').textContent = runsToday;
-
     tbody.innerHTML = runs.map(run => {
         const triggerBadge = run.trigger === 'scheduled'
-            ? '<span style="padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; background:rgba(99,102,241,0.15); color:#6366f1;">🕐 Scheduled</span>'
-            : '<span style="padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; background:rgba(107,114,128,0.15); color:#9ca3af;">👤 Manual</span>';
-
-        const startedDisplay = run.started_at ? wolfflowFormatTime(run.started_at) : '—';
-
-        // Duration
-        let durationDisplay = '—';
+            ? '<span style="padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;background:rgba(99,102,241,0.15);color:#6366f1;">Scheduled</span>'
+            : '<span style="padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;background:rgba(107,114,128,0.15);color:#9ca3af;">Manual</span>';
+        const started = run.started_at ? wfFormatTime(run.started_at) : '\u2014';
+        let dur = '\u2014';
         if (run.started_at && run.finished_at) {
             const ms = new Date(run.finished_at) - new Date(run.started_at);
-            if (ms < 1000) durationDisplay = `${ms}ms`;
-            else if (ms < 60000) durationDisplay = `${(ms / 1000).toFixed(1)}s`;
-            else durationDisplay = `${Math.floor(ms / 60000)}m ${Math.floor((ms % 60000) / 1000)}s`;
+            dur = ms < 1000 ? `${ms}ms` : ms < 60000 ? `${(ms/1000).toFixed(1)}s` : `${Math.floor(ms/60000)}m ${Math.floor((ms%60000)/1000)}s`;
         } else if (run.status === 'running') {
-            durationDisplay = '<span style="color:#3b82f6;">Running...</span>';
+            dur = '<span style="color:#3b82f6;">Running...</span>';
         }
-
-        // Status badge
-        let statusBadge;
-        if (run.status === 'running') {
-            statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(59,130,246,0.15);color:#3b82f6;border:1px solid rgba(59,130,246,0.3);">
-                <span style="width:6px;height:6px;border-radius:50%;background:#3b82f6;display:inline-block;animation:pulse 2s infinite;"></span> Running
-            </span>`;
-        } else if (run.status === 'success') {
-            statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(16,185,129,0.15);color:#10b981;border:1px solid rgba(16,185,129,0.3);">
-                <span style="width:6px;height:6px;border-radius:50%;background:#10b981;display:inline-block;"></span> Success
-            </span>`;
-        } else if (run.status === 'failed') {
-            statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(239,68,68,0.15);color:#ef4444;border:1px solid rgba(239,68,68,0.3);">
-                <span style="width:6px;height:6px;border-radius:50%;background:#ef4444;display:inline-block;"></span> Failed
-            </span>`;
-        } else if (run.status === 'partial') {
-            statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(234,179,8,0.15);color:#eab308;border:1px solid rgba(234,179,8,0.3);">
-                <span style="width:6px;height:6px;border-radius:50%;background:#eab308;display:inline-block;"></span> Partial
-            </span>`;
-        } else {
-            statusBadge = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:rgba(107,114,128,0.15);color:#6b7280;border:1px solid rgba(107,114,128,0.3);">
-                <span style="width:6px;height:6px;border-radius:50%;background:#6b7280;display:inline-block;"></span> ${escapeHtml(run.status || 'Unknown')}
-            </span>`;
-        }
-
-        // Step details (collapsible)
+        const statusBadge = wfRunStatusBadge(run.status);
         const stepsHtml = (run.step_results || []).map((sr, i) => {
-            const stepStatus = sr.success ? '✅' : '❌';
-            const output = sr.output ? escapeHtml(sr.output).replace(/\n/g, '<br>') : '<em style="color:var(--text-muted);">No output</em>';
-            return `<div style="margin-bottom:8px; padding:8px 10px; background:var(--bg-secondary); border-radius:6px; border:1px solid var(--border);">
-                <div style="font-size:12px; font-weight:600; margin-bottom:4px;">${stepStatus} Step ${i + 1}: ${escapeHtml(sr.name || sr.action || 'Unknown')}</div>
-                <div style="font-size:11px; font-family:'JetBrains Mono',monospace; color:var(--text-secondary); max-height:100px; overflow-y:auto;">${output}</div>
+            const ok = sr.success !== false && sr.status !== 'failed';
+            const out = sr.output ? escapeHtml(sr.output).replace(/\n/g, '<br>') : '<em style="color:var(--text-muted);">No output</em>';
+            return `<div style="margin-bottom:8px;padding:8px 10px;background:var(--bg-secondary);border-radius:6px;border:1px solid var(--border);">
+                <div style="font-size:12px;font-weight:600;margin-bottom:4px;">${ok ? '\u2705' : '\u274C'} Step ${i+1}: ${escapeHtml(sr.step_name || sr.name || sr.action || 'Unknown')}</div>
+                <div style="font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--text-secondary);max-height:100px;overflow-y:auto;">${out}</div>
             </div>`;
         }).join('');
-
         return `<tr>
-            <td style="font-weight:600; font-size:13px;">${escapeHtml(run.workflow_name || run.workflow_id || '—')}</td>
+            <td style="font-weight:600;font-size:13px;">${escapeHtml(run.workflow_name || run.workflow_id || '\u2014')}</td>
             <td>${triggerBadge}</td>
-            <td style="font-size:12px;">${startedDisplay}</td>
-            <td style="font-size:12px; font-family:'JetBrains Mono',monospace;">${durationDisplay}</td>
+            <td style="font-size:12px;">${started}</td>
+            <td style="font-size:12px;font-family:'JetBrains Mono',monospace;">${dur}</td>
             <td>${statusBadge}</td>
             <td style="text-align:right;">
-                <button class="btn btn-sm" onclick="toggleWolfFlowRunDetail('${run.id}')" style="padding:4px 10px; font-size:11px;">
-                    🔍 Details
-                </button>
+                <button class="btn btn-sm" onclick="wfToggleRunDetail('${run.id}')" style="padding:4px 10px;font-size:11px;">Details</button>
             </td>
         </tr>
-        <tr id="wolfflow-run-detail-${run.id}" style="display:none;">
-            <td colspan="6" style="padding:12px 16px; background:var(--bg-primary);">
-                ${stepsHtml || '<div style="color:var(--text-muted); font-size:12px;">No step details available.</div>'}
+        <tr id="wf-run-detail-${run.id}" style="display:none;">
+            <td colspan="6" style="padding:12px 16px;background:var(--bg-primary);">
+                ${stepsHtml || '<div style="color:var(--text-muted);font-size:12px;">No step details available.</div>'}
             </td>
         </tr>`;
     }).join('');
 }
 
-function toggleWolfFlowRunDetail(runId) {
-    const row = document.getElementById(`wolfflow-run-detail-${runId}`);
-    if (row) {
-        row.style.display = row.style.display === 'none' ? '' : 'none';
-    }
+function wfToggleRunDetail(id) {
+    const row = document.getElementById(`wf-run-detail-${id}`);
+    if (row) row.style.display = row.style.display === 'none' ? '' : 'none';
 }
 
-function wolfflowFormatTime(isoStr) {
-    if (!isoStr) return '—';
+// ─── Helper: badges ───
+
+function wfTargetLabel(target) {
+    if (!target) return 'Local';
+    if (typeof target === 'string') {
+        if (target === 'all_nodes') return 'All Nodes';
+        if (target === 'local') return 'Local';
+        return target;
+    }
+    if (target.scope === 'all_nodes') return 'All Nodes';
+    if (target.scope === 'cluster') return 'Cluster: ' + (target.cluster_name || '');
+    if (target.scope === 'nodes') return (target.node_ids || []).length + ' node(s)';
+    return 'Local';
+}
+
+function wfStatusBadge(enabled, lastStatus) {
+    const b = (bg, col, border, label) =>
+        `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:${bg};color:${col};border:1px solid ${border};">
+            <span style="width:6px;height:6px;border-radius:50%;background:${col};display:inline-block;"></span> ${label}
+        </span>`;
+    if (!enabled) return b('rgba(107,114,128,0.15)','#6b7280','rgba(107,114,128,0.3)','Disabled');
+    if (lastStatus === 'running') return b('rgba(59,130,246,0.15)','#3b82f6','rgba(59,130,246,0.3)','Running');
+    if (lastStatus === 'success' || lastStatus === 'completed') return b('rgba(16,185,129,0.15)','#10b981','rgba(16,185,129,0.3)','Success');
+    if (lastStatus === 'failed') return b('rgba(239,68,68,0.15)','#ef4444','rgba(239,68,68,0.3)','Failed');
+    return b('rgba(245,158,11,0.15)','#f59e0b','rgba(245,158,11,0.3)','Idle');
+}
+
+function wfRunStatusBadge(status) {
+    const b = (bg, col, border, label) =>
+        `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:${bg};color:${col};border:1px solid ${border};">
+            <span style="width:6px;height:6px;border-radius:50%;background:${col};display:inline-block;"></span> ${label}
+        </span>`;
+    if (status === 'running') return b('rgba(59,130,246,0.15)','#3b82f6','rgba(59,130,246,0.3)','Running');
+    if (status === 'completed' || status === 'success') return b('rgba(16,185,129,0.15)','#10b981','rgba(16,185,129,0.3)','Success');
+    if (status === 'failed') return b('rgba(239,68,68,0.15)','#ef4444','rgba(239,68,68,0.3)','Failed');
+    if (status === 'partial_failure' || status === 'partial') return b('rgba(234,179,8,0.15)','#eab308','rgba(234,179,8,0.3)','Partial');
+    return b('rgba(107,114,128,0.15)','#6b7280','rgba(107,114,128,0.3)', escapeHtml(status || 'Unknown'));
+}
+
+function wfFormatTime(isoStr) {
+    if (!isoStr) return '\u2014';
     try {
         const d = new Date(isoStr);
         const now = new Date();
         const diff = now - d;
         if (diff < 60000) return 'Just now';
-        if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
-        if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
-        return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        if (diff < 3600000) return `${Math.floor(diff/60000)}m ago`;
+        if (diff < 86400000) return `${Math.floor(diff/3600000)}h ago`;
+        return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
+    } catch (e) { return isoStr; }
+}
+
+// ─── Toolbox Loader ───
+
+async function loadWolfFlowToolbox() {
+    if (wfToolboxCache) return wfToolboxCache;
+    try {
+        const resp = await fetch('/api/wolfflow/toolbox', { credentials: 'include' });
+        if (resp.ok) {
+            wfToolboxCache = await resp.json();
+        }
     } catch (e) {
-        return isoStr;
+        console.error('WolfFlow toolbox error:', e);
+    }
+    if (!wfToolboxCache) {
+        // Fallback definitions matching the backend
+        wfToolboxCache = [
+            { action:'update_packages', label:'Update System Packages', description:'Run package manager update + upgrade', fields:[] },
+            { action:'update_wolfstack', label:'Update WolfStack', description:'Install latest WolfStack build', fields:[
+                { name:'channel', label:'Channel', type:'text', default:'master', placeholder:'master' }
+            ]},
+            { action:'restart_service', label:'Restart Systemd Service', description:'Restart a systemd service by name', fields:[
+                { name:'service_name', label:'Service Name', type:'text', required:true, placeholder:'nginx' }
+            ]},
+            { action:'run_command', label:'Run Shell Command', description:'Execute a shell command with timeout', fields:[
+                { name:'command', label:'Command', type:'textarea', required:true, placeholder:'echo hello' },
+                { name:'timeout_secs', label:'Timeout (seconds)', type:'number', default:300 }
+            ]},
+            { action:'clean_logs', label:'Clean Journal Logs', description:'Vacuum systemd journal logs', fields:[
+                { name:'max_size_mb', label:'Max Size (MB)', type:'number', default:500, placeholder:'500' }
+            ]},
+            { action:'check_disk_space', label:'Check Disk Space', description:'Fail if root disk usage exceeds threshold', fields:[
+                { name:'warn_threshold_pct', label:'Threshold (%)', type:'number', default:90, placeholder:'90' }
+            ]},
+            { action:'restart_container', label:'Restart Container', description:'Restart a Docker or LXC container', fields:[
+                { name:'runtime', label:'Runtime', type:'select', options:['docker','lxc'], required:true },
+                { name:'name', label:'Container Name', type:'text', required:true }
+            ]},
+            { action:'docker_prune', label:'Docker Prune', description:'Remove unused Docker resources', fields:[] }
+        ];
+    }
+    return wfToolboxCache;
+}
+
+// ─── Editor: Open / Close ───
+
+async function openWolfFlowEditor(editId) {
+    wfEditId = editId || null;
+    wfSteps = [];
+    wfSelectedStepIdx = -1;
+    wfEditorTarget = { scope: 'local' };
+
+    // Load toolbox first
+    await loadWolfFlowToolbox();
+
+    // Reset toolbar fields
+    document.getElementById('wf-editor-name').value = '';
+    document.getElementById('wf-editor-schedule').value = '';
+    document.getElementById('wf-editor-enabled').checked = true;
+
+    // If editing, load the workflow
+    if (editId) {
+        try {
+            const resp = await fetch(`/api/wolfflow/workflows/${editId}`, { credentials: 'include' });
+            if (resp.ok) {
+                const wf = await resp.json();
+                document.getElementById('wf-editor-name').value = wf.name || '';
+                document.getElementById('wf-editor-schedule').value = wf.schedule || '';
+                document.getElementById('wf-editor-enabled').checked = wf.enabled !== false;
+                wfEditorTarget = wf.target || { scope: 'local' };
+                wfSteps = (wf.steps || []).map(s => ({
+                    name: s.name || '',
+                    action: s.action || {},
+                    on_failure: s.on_failure || 'abort',
+                    target_override: s.target_override || null
+                }));
+            }
+        } catch (e) {
+            console.error('WolfFlow editor load error:', e);
+        }
+    }
+
+    // Render the toolbox sidebar
+    renderWfToolbox();
+
+    // Switch views
+    document.getElementById('wf-list-view').style.display = 'none';
+    const editorView = document.getElementById('wf-editor-view');
+    editorView.style.display = 'flex';
+
+    // Hide properties panel initially
+    document.getElementById('wf-props-panel').style.display = 'none';
+
+    // Render canvas
+    renderWolfFlowCanvas();
+}
+
+function closeWolfFlowEditor() {
+    document.getElementById('wf-editor-view').style.display = 'none';
+    document.getElementById('wf-list-view').style.display = '';
+    wfEditId = null;
+    wfSteps = [];
+    wfSelectedStepIdx = -1;
+    loadWolfFlowList();
+}
+
+// ─── Toolbox Sidebar ───
+
+function renderWfToolbox() {
+    const container = document.getElementById('wf-toolbox-items');
+    if (!container) return;
+    const toolbox = wfToolboxCache || [];
+    container.innerHTML = toolbox.map(t => {
+        const icon = wfActionIcons[t.action] || '\u2699';
+        const color = wfActionColors[t.action] || '#6b7280';
+        return `<div class="wf-toolbox-card" draggable="true" data-action="${t.action}"
+            ondragstart="event.dataTransfer.setData('text/plain','${t.action}')"
+            onclick="addWolfFlowStepAt(wfSteps.length, '${t.action}')"
+            style="display:flex;align-items:center;gap:10px;padding:10px 12px;background:var(--bg-card);border:1px solid var(--border);border-left:3px solid ${color};border-radius:var(--radius-sm);cursor:pointer;transition:var(--transition);"
+            onmouseover="this.style.borderColor='${color}';this.style.background='var(--bg-card-hover)'"
+            onmouseout="this.style.borderColor='var(--border)';this.style.borderLeftColor='${color}';this.style.background='var(--bg-card)'">
+            <span style="font-size:20px;width:28px;text-align:center;">${icon}</span>
+            <div style="min-width:0;">
+                <div style="font-size:12px;font-weight:600;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(t.label)}</div>
+                <div style="font-size:10px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(t.description || '')}</div>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+// ─── Canvas Rendering ───
+
+function renderWolfFlowCanvas() {
+    const canvas = document.getElementById('wf-canvas');
+    if (!canvas) return;
+
+    if (wfSteps.length === 0) {
+        canvas.innerHTML = `
+            <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;flex:1;min-height:300px;color:var(--text-muted);">
+                <div style="font-size:48px;margin-bottom:16px;">&#9889;</div>
+                <div style="font-size:15px;font-weight:600;margin-bottom:8px;">No steps yet</div>
+                <div style="font-size:13px;margin-bottom:20px;">Drag an action from the toolbox or click one to add it</div>
+                <button class="btn" onclick="addWolfFlowStepAt(0)" style="padding:8px 20px;background:var(--bg-card);border:2px dashed var(--border);border-radius:var(--radius);color:var(--text-secondary);font-size:13px;">
+                    + Add First Step
+                </button>
+            </div>`;
+        return;
+    }
+
+    let html = '';
+    // Workflow-level target badge at top
+    html += `<div onclick="selectWfWorkflowTarget()" style="cursor:pointer;margin-bottom:8px;padding:8px 16px;background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:12px;color:var(--text-secondary);display:inline-flex;align-items:center;gap:8px;"
+        title="Click to edit workflow target">
+        <span style="font-weight:600;">Target:</span> ${escapeHtml(wfTargetLabel(wfEditorTarget))}
+    </div>`;
+
+    wfSteps.forEach((step, idx) => {
+        // Arrow connector before each step (except the first)
+        if (idx > 0) {
+            html += `<div style="display:flex;flex-direction:column;align-items:center;position:relative;">
+                <div style="width:2px;height:20px;background:var(--border);"></div>
+                <button onclick="addWolfFlowStepAt(${idx})" title="Insert step here"
+                    style="width:24px;height:24px;border-radius:50%;background:var(--bg-card);border:2px dashed var(--border);color:var(--text-muted);font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:var(--transition);line-height:1;"
+                    onmouseover="this.style.borderColor='var(--accent)';this.style.color='var(--accent)'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-muted)'">+</button>
+                <div style="width:2px;height:20px;background:var(--border);"></div>
+                <div style="width:0;height:0;border-left:6px solid transparent;border-right:6px solid transparent;border-top:8px solid var(--border);"></div>
+            </div>`;
+        }
+
+        const actionKey = wfGetActionKey(step.action);
+        const icon = wfActionIcons[actionKey] || '\u2699';
+        const color = wfActionColors[actionKey] || '#6b7280';
+        const toolDef = (wfToolboxCache || []).find(t => t.action === actionKey);
+        const actionLabel = toolDef ? toolDef.label : (actionKey || 'No Action');
+        const targetStr = step.target_override ? wfTargetLabel(step.target_override) : '';
+        const isSelected = idx === wfSelectedStepIdx;
+        const selectedStyle = isSelected
+            ? `border-color:var(--accent);box-shadow:0 0 12px rgba(220,38,38,0.25);`
+            : '';
+        const onFailIcon = step.on_failure === 'continue' ? '\u23ED' : step.on_failure === 'alert' ? '\u{1F514}' : '\u{1F6D1}';
+
+        html += `<div class="wf-step-card" data-idx="${idx}" onclick="selectWolfFlowStep(${idx})"
+            style="width:340px;padding:14px 16px;background:var(--bg-card);border:2px solid var(--border);border-left:4px solid ${color};border-radius:var(--radius);cursor:pointer;transition:var(--transition);position:relative;${selectedStyle}"
+            onmouseover="if(${wfSelectedStepIdx}!==${idx})this.style.borderColor='var(--border-light)'"
+            onmouseout="if(${wfSelectedStepIdx}!==${idx})this.style.borderColor='var(--border)'">
+            <div style="display:flex;align-items:center;gap:12px;">
+                <span style="font-size:24px;width:32px;text-align:center;">${icon}</span>
+                <div style="flex:1;min-width:0;">
+                    <div style="font-size:13px;font-weight:700;color:var(--text-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                        ${escapeHtml(step.name || actionLabel)}
+                    </div>
+                    <div style="font-size:11px;color:var(--text-muted);margin-top:2px;display:flex;align-items:center;gap:8px;">
+                        <span>${escapeHtml(actionLabel)}</span>
+                        ${targetStr ? `<span style="padding:1px 6px;background:var(--bg-secondary);border-radius:4px;font-size:10px;">${escapeHtml(targetStr)}</span>` : ''}
+                    </div>
+                </div>
+                <span style="font-size:14px;" title="On failure: ${step.on_failure || 'abort'}">${onFailIcon}</span>
+            </div>
+        </div>`;
+    });
+
+    // "Add step" button at the end
+    html += `<div style="display:flex;flex-direction:column;align-items:center;">
+        <div style="width:2px;height:20px;background:var(--border);"></div>
+        <button onclick="addWolfFlowStepAt(${wfSteps.length})" title="Add step at end"
+            style="width:32px;height:32px;border-radius:50%;background:var(--bg-card);border:2px dashed var(--border);color:var(--text-muted);font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:var(--transition);line-height:1;"
+            onmouseover="this.style.borderColor='var(--accent)';this.style.color='var(--accent)'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-muted)'">+</button>
+    </div>`;
+
+    canvas.innerHTML = html;
+}
+
+// ─── Canvas drag & drop ───
+
+function wfCanvasDrop(event) {
+    event.preventDefault();
+    const actionId = event.dataTransfer.getData('text/plain');
+    if (actionId) {
+        addWolfFlowStepAt(wfSteps.length, actionId);
     }
 }
 
-async function openWolfFlowModal(editId) {
-    wolfflowEditId = editId || null;
-    wolfflowSteps = [];
+// ─── Step Management ───
 
-    // Reset form
-    document.getElementById('wolfflow-name').value = '';
-    document.getElementById('wolfflow-description').value = '';
-    document.getElementById('wolfflow-schedule').value = '';
-    document.getElementById('wolfflow-enabled').checked = true;
-    document.querySelector('input[name="wolfflow-target"][value="local"]').checked = true;
-    document.getElementById('wolfflow-specific-nodes').style.display = 'none';
-    document.getElementById('wolfflow-steps-container').innerHTML = '';
-    document.getElementById('wolfflow-steps-empty').style.display = '';
+function addWolfFlowStepAt(idx, actionId) {
+    const toolbox = wfToolboxCache || [];
+    let action = {};
+    let name = '';
+    if (actionId) {
+        const tool = toolbox.find(t => t.action === actionId);
+        action = { action: actionId };
+        name = tool ? tool.label : actionId;
+        // Apply defaults from toolbox fields
+        if (tool && tool.fields) {
+            tool.fields.forEach(f => {
+                if (f.default !== undefined && f.default !== null) {
+                    action[f.name] = f.default;
+                }
+            });
+        }
+    }
+    const step = { name, action, on_failure: 'abort', target_override: null };
+    wfSteps.splice(idx, 0, step);
+    wfSelectedStepIdx = idx;
+    renderWolfFlowCanvas();
+    renderWolfFlowProperties(step);
+    document.getElementById('wf-props-panel').style.display = '';
+}
 
-    // Populate node checkboxes — ALL nodes from ALL clusters
-    const nodeCheckboxes = document.getElementById('wolfflow-node-checkboxes');
+function removeWolfFlowStep(idx) {
+    if (idx < 0 || idx >= wfSteps.length) return;
+    wfSteps.splice(idx, 1);
+    if (wfSelectedStepIdx === idx) {
+        wfSelectedStepIdx = -1;
+        document.getElementById('wf-props-panel').style.display = 'none';
+    } else if (wfSelectedStepIdx > idx) {
+        wfSelectedStepIdx--;
+    }
+    renderWolfFlowCanvas();
+}
+
+function selectWolfFlowStep(idx) {
+    if (idx < 0 || idx >= wfSteps.length) return;
+    // Save current properties before switching
+    if (wfSelectedStepIdx >= 0 && wfSelectedStepIdx < wfSteps.length) {
+        updateWolfFlowStepFromPanel();
+    }
+    wfSelectedStepIdx = idx;
+    renderWolfFlowCanvas();
+    renderWolfFlowProperties(wfSteps[idx]);
+    document.getElementById('wf-props-panel').style.display = '';
+}
+
+// ─── Properties Panel ───
+
+function renderWolfFlowProperties(step) {
+    const container = document.getElementById('wf-props-content');
+    if (!container) return;
+
+    const toolbox = wfToolboxCache || [];
+    const actionKey = wfGetActionKey(step.action);
+    const actionOptions = toolbox.map(t =>
+        `<option value="${t.action}" ${actionKey === t.action ? 'selected' : ''}>${escapeHtml(t.label)}</option>`
+    ).join('');
+
+    // Target scope
+    const target = step.target_override || wfEditorTarget || { scope: 'local' };
+    const targetScope = typeof target === 'string' ? target : (target.scope || 'local');
+    const hasOverride = step.target_override !== null && step.target_override !== undefined;
+
+    // On failure
+    const onFail = step.on_failure || 'abort';
+
+    let html = `
+        <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--text-muted);margin-bottom:16px;">Step Properties</div>
+
+        <div style="margin-bottom:14px;">
+            <label style="font-size:11px;font-weight:600;display:block;margin-bottom:4px;color:var(--text-secondary);">Step Name</label>
+            <input type="text" id="wf-prop-name" class="form-control" value="${escapeHtml(step.name || '')}" placeholder="Step name" style="font-size:13px;">
+        </div>
+
+        <div style="margin-bottom:14px;">
+            <label style="font-size:11px;font-weight:600;display:block;margin-bottom:4px;color:var(--text-secondary);">Action</label>
+            <select id="wf-prop-action" class="form-control" onchange="wfPropActionChanged()" style="font-size:12px;">
+                <option value="">\u2014 Select action \u2014</option>
+                ${actionOptions}
+            </select>
+        </div>
+
+        <div id="wf-prop-fields" style="margin-bottom:14px;"></div>
+
+        <div style="margin-bottom:14px;">
+            <label style="font-size:11px;font-weight:600;display:block;margin-bottom:6px;color:var(--text-secondary);">Target Override</label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;margin-bottom:8px;">
+                <input type="checkbox" id="wf-prop-target-override" ${hasOverride ? 'checked' : ''} onchange="wfPropTargetOverrideToggle()"> Override workflow target
+            </label>
+            <div id="wf-prop-target-section" style="${hasOverride ? '' : 'display:none;'}">
+                <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px;">
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+                        <input type="radio" name="wf-prop-target" value="local" ${targetScope === 'local' ? 'checked' : ''} onchange="wfPropTargetChanged()"> Local
+                    </label>
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+                        <input type="radio" name="wf-prop-target" value="all_nodes" ${targetScope === 'all_nodes' ? 'checked' : ''} onchange="wfPropTargetChanged()"> All Nodes
+                    </label>
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+                        <input type="radio" name="wf-prop-target" value="cluster" ${targetScope === 'cluster' ? 'checked' : ''} onchange="wfPropTargetChanged()"> Specific Cluster
+                    </label>
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+                        <input type="radio" name="wf-prop-target" value="nodes" ${targetScope === 'nodes' ? 'checked' : ''} onchange="wfPropTargetChanged()"> Specific Nodes
+                    </label>
+                </div>
+                <div id="wf-prop-target-cluster" style="${targetScope === 'cluster' ? '' : 'display:none;'}margin-bottom:8px;">
+                    <input type="text" id="wf-prop-cluster-name" class="form-control" value="${escapeHtml((target && target.cluster_name) || '')}" placeholder="Cluster name" style="font-size:12px;">
+                </div>
+                <div id="wf-prop-target-nodes" style="${targetScope === 'nodes' ? '' : 'display:none;'}max-height:150px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:8px;background:var(--bg-primary);">
+                </div>
+            </div>
+        </div>
+
+        <div style="margin-bottom:14px;">
+            <label style="font-size:11px;font-weight:600;display:block;margin-bottom:4px;color:var(--text-secondary);">On Failure</label>
+            <select id="wf-prop-onfail" class="form-control" style="font-size:12px;">
+                <option value="abort" ${onFail === 'abort' ? 'selected' : ''}>Abort workflow</option>
+                <option value="continue" ${onFail === 'continue' ? 'selected' : ''}>Continue to next step</option>
+                <option value="alert" ${onFail === 'alert' ? 'selected' : ''}>Alert and continue</option>
+            </select>
+        </div>
+
+        <div style="border-top:1px solid var(--border);padding-top:14px;margin-top:16px;">
+            <button class="btn" onclick="removeWolfFlowStep(${wfSelectedStepIdx})" style="width:100%;padding:8px;font-size:12px;background:rgba(239,68,68,0.1);color:#ef4444;border:1px solid rgba(239,68,68,0.3);border-radius:var(--radius-sm);">
+                Delete Step
+            </button>
+        </div>
+    `;
+
+    container.innerHTML = html;
+
+    // Render action-specific fields
+    renderActionFields(actionKey, document.getElementById('wf-prop-fields'), step.action);
+
+    // Populate node checkboxes for target
+    wfPopulateNodeCheckboxes(target);
+}
+
+function renderActionFields(actionKey, container, actionData) {
+    if (!container) return;
+    const toolbox = wfToolboxCache || [];
+    const tool = toolbox.find(t => t.action === actionKey);
+    if (!tool || !tool.fields || tool.fields.length === 0) {
+        container.innerHTML = '';
+        return;
+    }
+
+    container.innerHTML = tool.fields.map(f => {
+        // Get current value from actionData
+        const val = (actionData && actionData[f.name] !== undefined) ? actionData[f.name] : (f.default !== undefined ? f.default : '');
+        if (f.type === 'select') {
+            const options = (f.options || []).map(o =>
+                `<option value="${o}" ${String(val) === String(o) ? 'selected' : ''}>${escapeHtml(o)}</option>`
+            ).join('');
+            return `<div style="margin-bottom:8px;">
+                <label style="font-size:11px;font-weight:600;display:block;margin-bottom:3px;color:var(--text-secondary);">${escapeHtml(f.label)}${f.required ? ' *' : ''}</label>
+                <select class="form-control wf-action-field" data-field="${f.name}" style="font-size:12px;">
+                    ${options}
+                </select>
+            </div>`;
+        } else if (f.type === 'textarea') {
+            return `<div style="margin-bottom:8px;">
+                <label style="font-size:11px;font-weight:600;display:block;margin-bottom:3px;color:var(--text-secondary);">${escapeHtml(f.label)}${f.required ? ' *' : ''}</label>
+                <textarea class="form-control wf-action-field" data-field="${f.name}" placeholder="${escapeHtml(f.placeholder || '')}" rows="3"
+                    style="font-size:12px;font-family:'JetBrains Mono',monospace;resize:vertical;">${escapeHtml(String(val))}</textarea>
+            </div>`;
+        } else if (f.type === 'number') {
+            return `<div style="margin-bottom:8px;">
+                <label style="font-size:11px;font-weight:600;display:block;margin-bottom:3px;color:var(--text-secondary);">${escapeHtml(f.label)}${f.required ? ' *' : ''}</label>
+                <input type="number" class="form-control wf-action-field" data-field="${f.name}" value="${escapeHtml(String(val))}" placeholder="${escapeHtml(f.placeholder || '')}" style="font-size:12px;">
+            </div>`;
+        } else {
+            return `<div style="margin-bottom:8px;">
+                <label style="font-size:11px;font-weight:600;display:block;margin-bottom:3px;color:var(--text-secondary);">${escapeHtml(f.label)}${f.required ? ' *' : ''}</label>
+                <input type="text" class="form-control wf-action-field" data-field="${f.name}" value="${escapeHtml(String(val))}" placeholder="${escapeHtml(f.placeholder || '')}"
+                    style="font-size:12px;font-family:'JetBrains Mono',monospace;">
+            </div>`;
+        }
+    }).join('');
+}
+
+function wfPopulateNodeCheckboxes(target) {
+    const nodesDiv = document.getElementById('wf-prop-target-nodes');
+    if (!nodesDiv) return;
+    const selectedIds = (target && target.node_ids) || [];
     const clusters = {};
     allNodes.forEach(n => {
         const c = n.cluster_name || n.pve_cluster_name || 'Default';
         if (!clusters[c]) clusters[c] = [];
         clusters[c].push(n);
     });
-    let nodeHtml = '';
-    Object.keys(clusters).sort().forEach(clusterName => {
-        nodeHtml += `<div style="font-size:11px;font-weight:600;color:var(--text-secondary);margin-top:8px;margin-bottom:4px;">${escapeHtml(clusterName)}</div>`;
-        clusters[clusterName].forEach(n => {
+    let html = '';
+    Object.keys(clusters).sort().forEach(cn => {
+        html += `<div style="font-size:10px;font-weight:600;color:var(--text-muted);margin-top:6px;margin-bottom:3px;">${escapeHtml(cn)}</div>`;
+        clusters[cn].forEach(n => {
             const label = n.hostname || n.id;
-            const type = n.node_type === 'proxmox' ? ' (PVE)' : '';
-            nodeHtml += `<label style="display:flex; align-items:center; gap:8px; padding:2px 0; font-size:12px; cursor:pointer;">
-                <input type="checkbox" class="wolfflow-node-cb" value="${n.id}"> ${escapeHtml(label)}${type}
+            html += `<label style="display:flex;align-items:center;gap:6px;padding:2px 0;font-size:11px;cursor:pointer;">
+                <input type="checkbox" class="wf-prop-node-cb" value="${n.id}" ${selectedIds.includes(n.id) ? 'checked' : ''}> ${escapeHtml(label)}
             </label>`;
         });
     });
-    nodeCheckboxes.innerHTML = nodeHtml || '<span style="color:var(--text-muted); font-size:12px;">No nodes found</span>';
+    nodesDiv.innerHTML = html || '<span style="color:var(--text-muted);font-size:11px;">No nodes</span>';
+}
 
-    // Load toolbox
-    await loadWolfFlowToolbox();
+// ─── Properties Panel Event Handlers ───
 
-    // If editing, load existing workflow
-    if (editId) {
-        document.getElementById('wolfflow-modal-title').textContent = '✏️ Edit Workflow';
-        try {
-            const url = wolfflowApiUrl(`/api/wolfflow/workflows/${editId}`);
-            const resp = await fetch(url, { credentials: 'include' });
-            if (resp.ok) {
-                const wf = await resp.json();
-                document.getElementById('wolfflow-name').value = wf.name || '';
-                document.getElementById('wolfflow-description').value = wf.description || '';
-                document.getElementById('wolfflow-schedule').value = wf.schedule || '';
-                document.getElementById('wolfflow-enabled').checked = wf.enabled !== false;
+function wfPropActionChanged() {
+    const sel = document.getElementById('wf-prop-action');
+    if (!sel) return;
+    const newActionKey = sel.value;
+    const toolbox = wfToolboxCache || [];
+    const tool = toolbox.find(t => t.action === newActionKey);
 
-                // Target
-                const targetVal = wf.target || 'local';
-                const targetRadio = document.querySelector(`input[name="wolfflow-target"][value="${targetVal}"]`);
-                if (targetRadio) targetRadio.checked = true;
-                if (targetVal === 'specific') {
-                    document.getElementById('wolfflow-specific-nodes').style.display = 'block';
-                    (wf.target_nodes || []).forEach(nid => {
-                        const cb = nodeCheckboxes.querySelector(`input[value="${nid}"]`);
-                        if (cb) cb.checked = true;
-                    });
-                }
-
-                // Steps
-                if (wf.steps && wf.steps.length > 0) {
-                    wf.steps.forEach(step => {
-                        addWolfFlowStep(step);
-                    });
-                }
+    // Build new action object with defaults
+    const newAction = { action: newActionKey };
+    if (tool && tool.fields) {
+        tool.fields.forEach(f => {
+            if (f.default !== undefined && f.default !== null) {
+                newAction[f.name] = f.default;
             }
-        } catch (e) {
-            console.error('WolfFlow: failed to load workflow for edit:', e);
-        }
-    } else {
-        document.getElementById('wolfflow-modal-title').textContent = '➕ Create Workflow';
+        });
     }
 
-    // Show modal
-    document.getElementById('wolfflow-modal').classList.add('active');
-}
-
-function closeWolfFlowModal() {
-    document.getElementById('wolfflow-modal').classList.remove('active');
-    wolfflowEditId = null;
-    wolfflowSteps = [];
-}
-
-async function loadWolfFlowToolbox() {
-    if (wolfflowToolboxCache) return wolfflowToolboxCache;
-    try {
-        const url = wolfflowApiUrl('/api/wolfflow/toolbox');
-        const resp = await fetch(url, { credentials: 'include' });
-        if (resp.ok) {
-            wolfflowToolboxCache = await resp.json();
-        } else {
-            // Provide sensible defaults if the endpoint doesn't exist yet
-            wolfflowToolboxCache = [
-                { id: 'shell_command', name: 'Run Shell Command', fields: [
-                    { key: 'command', label: 'Command', type: 'text', placeholder: 'e.g. apt update && apt upgrade -y' }
-                ]},
-                { id: 'docker_restart', name: 'Restart Docker Container', fields: [
-                    { key: 'container', label: 'Container Name/ID', type: 'text', placeholder: 'e.g. nginx' }
-                ]},
-                { id: 'docker_pull', name: 'Docker Pull Image', fields: [
-                    { key: 'image', label: 'Image', type: 'text', placeholder: 'e.g. nginx:latest' }
-                ]},
-                { id: 'lxc_restart', name: 'Restart LXC Container', fields: [
-                    { key: 'container', label: 'Container Name', type: 'text', placeholder: 'e.g. web-01' }
-                ]},
-                { id: 'service_restart', name: 'Restart Systemd Service', fields: [
-                    { key: 'service', label: 'Service Name', type: 'text', placeholder: 'e.g. nginx' }
-                ]},
-                { id: 'backup_trigger', name: 'Trigger Backup', fields: [
-                    { key: 'backup_id', label: 'Backup Job ID', type: 'text', placeholder: 'Leave empty for all' }
-                ]},
-                { id: 'http_request', name: 'HTTP Request', fields: [
-                    { key: 'url', label: 'URL', type: 'text', placeholder: 'https://example.com/webhook' },
-                    { key: 'method', label: 'Method', type: 'select', options: ['GET', 'POST', 'PUT', 'DELETE'] }
-                ]},
-                { id: 'wait', name: 'Wait / Delay', fields: [
-                    { key: 'seconds', label: 'Seconds', type: 'number', placeholder: '10' }
-                ]},
-                { id: 'script', name: 'Run Script File', fields: [
-                    { key: 'path', label: 'Script Path', type: 'text', placeholder: '/opt/scripts/cleanup.sh' }
-                ]},
-                { id: 'dns_update', name: 'Update DNS Record', fields: [
-                    { key: 'domain', label: 'Domain', type: 'text', placeholder: 'app.example.com' },
-                    { key: 'record_type', label: 'Type', type: 'select', options: ['A', 'AAAA', 'CNAME'] },
-                    { key: 'value', label: 'Value', type: 'text', placeholder: '10.10.10.5' }
-                ]}
-            ];
+    // Update step
+    if (wfSelectedStepIdx >= 0 && wfSelectedStepIdx < wfSteps.length) {
+        wfSteps[wfSelectedStepIdx].action = newAction;
+        if (!wfSteps[wfSelectedStepIdx].name || wfSteps[wfSelectedStepIdx].name === '') {
+            wfSteps[wfSelectedStepIdx].name = tool ? tool.label : newActionKey;
+            const nameInput = document.getElementById('wf-prop-name');
+            if (nameInput) nameInput.value = wfSteps[wfSelectedStepIdx].name;
         }
-    } catch (e) {
-        console.error('WolfFlow: toolbox load error:', e);
-        wolfflowToolboxCache = [];
     }
-    return wolfflowToolboxCache;
+
+    renderActionFields(newActionKey, document.getElementById('wf-prop-fields'), newAction);
+    renderWolfFlowCanvas();
 }
 
-function addWolfFlowStep(existingStep) {
-    const idx = wolfflowSteps.length;
-    const step = existingStep || { name: '', action: '', params: {}, on_failure: 'abort' };
-    wolfflowSteps.push(step);
+function wfPropTargetOverrideToggle() {
+    const cb = document.getElementById('wf-prop-target-override');
+    const section = document.getElementById('wf-prop-target-section');
+    if (cb && section) {
+        section.style.display = cb.checked ? '' : 'none';
+    }
+}
 
-    document.getElementById('wolfflow-steps-empty').style.display = 'none';
+function wfPropTargetChanged() {
+    const selected = document.querySelector('input[name="wf-prop-target"]:checked');
+    if (!selected) return;
+    const scope = selected.value;
+    const clusterDiv = document.getElementById('wf-prop-target-cluster');
+    const nodesDiv = document.getElementById('wf-prop-target-nodes');
+    if (clusterDiv) clusterDiv.style.display = scope === 'cluster' ? '' : 'none';
+    if (nodesDiv) nodesDiv.style.display = scope === 'nodes' ? '' : 'none';
+}
 
-    const container = document.getElementById('wolfflow-steps-container');
-    const toolbox = wolfflowToolboxCache || [];
-    const actionOptions = toolbox.map(t =>
-        `<option value="${t.id}" ${step.action === t.id ? 'selected' : ''}>${escapeHtml(t.name)}</option>`
-    ).join('');
+function updateWolfFlowStepFromPanel() {
+    const idx = wfSelectedStepIdx;
+    if (idx < 0 || idx >= wfSteps.length) return;
+    const step = wfSteps[idx];
 
-    const stepDiv = document.createElement('div');
-    stepDiv.id = `wolfflow-step-${idx}`;
-    stepDiv.style.cssText = 'padding:14px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px;';
-    stepDiv.innerHTML = `
-        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
-            <span style="font-size:12px; font-weight:700; color:var(--text-secondary);">Step ${idx + 1}</span>
-            <button class="btn btn-sm" onclick="removeWolfFlowStep(${idx})" style="padding:2px 8px; font-size:11px; color:#ef4444;" title="Remove step">✕</button>
+    // Name
+    const nameEl = document.getElementById('wf-prop-name');
+    if (nameEl) step.name = nameEl.value.trim();
+
+    // Action + fields
+    const actionSel = document.getElementById('wf-prop-action');
+    if (actionSel && actionSel.value) {
+        const newAction = { action: actionSel.value };
+        document.querySelectorAll('.wf-action-field').forEach(el => {
+            const fieldName = el.dataset.field;
+            if (fieldName) {
+                let val = el.value;
+                if (el.type === 'number' && val !== '') val = Number(val);
+                newAction[fieldName] = val;
+            }
+        });
+        step.action = newAction;
+    }
+
+    // On failure
+    const onFailSel = document.getElementById('wf-prop-onfail');
+    if (onFailSel) step.on_failure = onFailSel.value;
+
+    // Target override
+    const overrideCb = document.getElementById('wf-prop-target-override');
+    if (overrideCb && !overrideCb.checked) {
+        step.target_override = null;
+    } else if (overrideCb && overrideCb.checked) {
+        const targetRadio = document.querySelector('input[name="wf-prop-target"]:checked');
+        const scope = targetRadio ? targetRadio.value : 'local';
+        if (scope === 'local') {
+            step.target_override = { scope: 'local' };
+        } else if (scope === 'all_nodes') {
+            step.target_override = { scope: 'all_nodes' };
+        } else if (scope === 'cluster') {
+            const cn = document.getElementById('wf-prop-cluster-name');
+            step.target_override = { scope: 'cluster', cluster_name: cn ? cn.value.trim() : '' };
+        } else if (scope === 'nodes') {
+            const nodeIds = Array.from(document.querySelectorAll('.wf-prop-node-cb:checked')).map(cb => cb.value);
+            step.target_override = { scope: 'nodes', node_ids: nodeIds };
+        }
+    }
+}
+
+// ─── Workflow-level Target Editor (click on target badge) ───
+
+function selectWfWorkflowTarget() {
+    // Save current step first
+    if (wfSelectedStepIdx >= 0 && wfSelectedStepIdx < wfSteps.length) {
+        updateWolfFlowStepFromPanel();
+    }
+    wfSelectedStepIdx = -1;
+    renderWolfFlowCanvas();
+
+    const container = document.getElementById('wf-props-content');
+    if (!container) return;
+    document.getElementById('wf-props-panel').style.display = '';
+
+    const target = wfEditorTarget || { scope: 'local' };
+    const scope = typeof target === 'string' ? target : (target.scope || 'local');
+
+    let html = `
+        <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--text-muted);margin-bottom:16px;">Workflow Target</div>
+        <p style="font-size:12px;color:var(--text-secondary);margin-bottom:14px;">Choose the default execution target for all steps. Individual steps can override this.</p>
+
+        <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;">
+            <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
+                <input type="radio" name="wf-wftarget" value="local" ${scope === 'local' ? 'checked' : ''} onchange="wfWfTargetChanged()"> Local node only
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
+                <input type="radio" name="wf-wftarget" value="all_nodes" ${scope === 'all_nodes' ? 'checked' : ''} onchange="wfWfTargetChanged()"> All cluster nodes
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
+                <input type="radio" name="wf-wftarget" value="cluster" ${scope === 'cluster' ? 'checked' : ''} onchange="wfWfTargetChanged()"> Specific cluster
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
+                <input type="radio" name="wf-wftarget" value="nodes" ${scope === 'nodes' ? 'checked' : ''} onchange="wfWfTargetChanged()"> Specific nodes
+            </label>
         </div>
-        <div style="margin-bottom:8px;">
-            <label style="font-size:11px; font-weight:600; display:block; margin-bottom:4px;">Step Name</label>
-            <input type="text" class="form-control wolfflow-step-name" data-idx="${idx}" value="${escapeHtml(step.name || '')}" placeholder="e.g. Update packages" style="font-size:12px;">
+        <div id="wf-wftarget-cluster" style="${scope === 'cluster' ? '' : 'display:none;'}margin-bottom:10px;">
+            <input type="text" id="wf-wftarget-cluster-name" class="form-control" value="${escapeHtml((target && target.cluster_name) || '')}" placeholder="Cluster name" style="font-size:12px;">
         </div>
-        <div style="margin-bottom:8px;">
-            <label style="font-size:11px; font-weight:600; display:block; margin-bottom:4px;">Action</label>
-            <select class="form-control wolfflow-step-action" data-idx="${idx}" onchange="onWolfFlowActionChange(${idx})" style="font-size:12px;">
-                <option value="">— Select action —</option>
-                ${actionOptions}
-            </select>
+        <div id="wf-wftarget-nodes" style="${scope === 'nodes' ? '' : 'display:none;'}max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:8px;background:var(--bg-primary);">
         </div>
-        <div class="wolfflow-step-fields" id="wolfflow-step-fields-${idx}"></div>
-        <div style="margin-top:8px;">
-            <label style="font-size:11px; font-weight:600; display:block; margin-bottom:4px;">On Failure</label>
-            <select class="form-control wolfflow-step-onfail" data-idx="${idx}" style="font-size:12px;">
-                <option value="abort" ${step.on_failure === 'abort' ? 'selected' : ''}>🛑 Abort workflow</option>
-                <option value="continue" ${step.on_failure === 'continue' ? 'selected' : ''}>⏭️ Continue to next step</option>
-                <option value="alert" ${step.on_failure === 'alert' ? 'selected' : ''}>🔔 Alert &amp; continue</option>
-            </select>
-        </div>
+        <button class="btn" onclick="wfSaveWorkflowTarget()" style="margin-top:14px;width:100%;padding:8px;font-size:12px;background:var(--accent);color:#fff;border:1px solid var(--accent);border-radius:var(--radius-sm);">
+            Apply Target
+        </button>
     `;
-    container.appendChild(stepDiv);
+    container.innerHTML = html;
 
-    // If editing with an existing action, render its fields
-    if (step.action) {
-        onWolfFlowActionChange(idx);
-        // Pre-fill param values
-        if (step.params) {
-            setTimeout(() => {
-                Object.entries(step.params).forEach(([key, val]) => {
-                    const field = document.querySelector(`#wolfflow-step-fields-${idx} [data-param="${key}"]`);
-                    if (field) field.value = val;
-                });
-            }, 0);
-        }
+    // Populate node checkboxes
+    const nodesDiv = document.getElementById('wf-wftarget-nodes');
+    if (nodesDiv) {
+        const selectedIds = (target && target.node_ids) || [];
+        const clusters = {};
+        allNodes.forEach(n => {
+            const c = n.cluster_name || n.pve_cluster_name || 'Default';
+            if (!clusters[c]) clusters[c] = [];
+            clusters[c].push(n);
+        });
+        let nodeHtml = '';
+        Object.keys(clusters).sort().forEach(cn => {
+            nodeHtml += `<div style="font-size:10px;font-weight:600;color:var(--text-muted);margin-top:6px;margin-bottom:3px;">${escapeHtml(cn)}</div>`;
+            clusters[cn].forEach(n => {
+                const label = n.hostname || n.id;
+                nodeHtml += `<label style="display:flex;align-items:center;gap:6px;padding:2px 0;font-size:11px;cursor:pointer;">
+                    <input type="checkbox" class="wf-wftarget-node-cb" value="${n.id}" ${selectedIds.includes(n.id) ? 'checked' : ''}> ${escapeHtml(label)}
+                </label>`;
+            });
+        });
+        nodesDiv.innerHTML = nodeHtml || '<span style="color:var(--text-muted);font-size:11px;">No nodes</span>';
     }
 }
 
-function removeWolfFlowStep(idx) {
-    wolfflowSteps[idx] = null; // Mark as removed
-    const stepDiv = document.getElementById(`wolfflow-step-${idx}`);
-    if (stepDiv) stepDiv.remove();
-
-    // Check if all steps removed
-    const remaining = wolfflowSteps.filter(s => s !== null);
-    if (remaining.length === 0) {
-        document.getElementById('wolfflow-steps-empty').style.display = '';
-    }
-
-    // Re-number remaining steps
-    const container = document.getElementById('wolfflow-steps-container');
-    let num = 1;
-    container.querySelectorAll('[id^="wolfflow-step-"]').forEach(div => {
-        const label = div.querySelector('span');
-        if (label) label.textContent = `Step ${num++}`;
-    });
+function wfWfTargetChanged() {
+    const sel = document.querySelector('input[name="wf-wftarget"]:checked');
+    if (!sel) return;
+    const scope = sel.value;
+    const cd = document.getElementById('wf-wftarget-cluster');
+    const nd = document.getElementById('wf-wftarget-nodes');
+    if (cd) cd.style.display = scope === 'cluster' ? '' : 'none';
+    if (nd) nd.style.display = scope === 'nodes' ? '' : 'none';
 }
 
-function onWolfFlowActionChange(idx) {
-    const select = document.querySelector(`.wolfflow-step-action[data-idx="${idx}"]`);
-    const actionId = select ? select.value : '';
-    const fieldsContainer = document.getElementById(`wolfflow-step-fields-${idx}`);
-    if (!fieldsContainer) return;
-
-    if (!actionId) {
-        fieldsContainer.innerHTML = '';
-        return;
+function wfSaveWorkflowTarget() {
+    const sel = document.querySelector('input[name="wf-wftarget"]:checked');
+    const scope = sel ? sel.value : 'local';
+    if (scope === 'local') {
+        wfEditorTarget = { scope: 'local' };
+    } else if (scope === 'all_nodes') {
+        wfEditorTarget = { scope: 'all_nodes' };
+    } else if (scope === 'cluster') {
+        const cn = document.getElementById('wf-wftarget-cluster-name');
+        wfEditorTarget = { scope: 'cluster', cluster_name: cn ? cn.value.trim() : '' };
+    } else if (scope === 'nodes') {
+        const nodeIds = Array.from(document.querySelectorAll('.wf-wftarget-node-cb:checked')).map(cb => cb.value);
+        wfEditorTarget = { scope: 'nodes', node_ids: nodeIds };
     }
-
-    const toolbox = wolfflowToolboxCache || [];
-    const action = toolbox.find(t => t.id === actionId);
-    if (!action || !action.fields || action.fields.length === 0) {
-        fieldsContainer.innerHTML = '';
-        return;
-    }
-
-    fieldsContainer.innerHTML = action.fields.map(f => {
-        if (f.type === 'select') {
-            const options = (f.options || []).map(o =>
-                `<option value="${o}">${o}</option>`
-            ).join('');
-            return `<div style="margin-bottom:6px;">
-                <label style="font-size:11px; font-weight:600; display:block; margin-bottom:3px;">${escapeHtml(f.label)}</label>
-                <select class="form-control" data-param="${f.key}" style="font-size:12px;">
-                    ${options}
-                </select>
-            </div>`;
-        } else if (f.type === 'number') {
-            return `<div style="margin-bottom:6px;">
-                <label style="font-size:11px; font-weight:600; display:block; margin-bottom:3px;">${escapeHtml(f.label)}</label>
-                <input type="number" class="form-control" data-param="${f.key}" placeholder="${escapeHtml(f.placeholder || '')}" style="font-size:12px;">
-            </div>`;
-        } else {
-            return `<div style="margin-bottom:6px;">
-                <label style="font-size:11px; font-weight:600; display:block; margin-bottom:3px;">${escapeHtml(f.label)}</label>
-                <input type="text" class="form-control" data-param="${f.key}" placeholder="${escapeHtml(f.placeholder || '')}" style="font-size:12px; font-family:'JetBrains Mono',monospace;">
-            </div>`;
-        }
-    }).join('');
+    showToast('Workflow target updated', 'success');
+    renderWolfFlowCanvas();
 }
+
+// ─── Helpers ───
+
+function wfGetActionKey(action) {
+    if (!action) return '';
+    if (typeof action === 'string') return action;
+    return action.action || '';
+}
+
+// ─── Save / Delete / Trigger ───
 
 async function saveWolfFlow() {
-    const name = document.getElementById('wolfflow-name').value.trim();
+    // Save current step panel changes first
+    if (wfSelectedStepIdx >= 0 && wfSelectedStepIdx < wfSteps.length) {
+        updateWolfFlowStepFromPanel();
+    }
+
+    const name = document.getElementById('wf-editor-name').value.trim();
     if (!name) {
         showToast('Please enter a workflow name', 'error');
         return;
     }
 
-    const description = document.getElementById('wolfflow-description').value.trim();
-    const schedule = document.getElementById('wolfflow-schedule').value.trim();
-    const enabled = document.getElementById('wolfflow-enabled').checked;
+    const schedule = document.getElementById('wf-editor-schedule').value.trim();
+    const enabled = document.getElementById('wf-editor-enabled').checked;
 
-    // Target
-    const targetRadio = document.querySelector('input[name="wolfflow-target"]:checked');
-    const target = targetRadio ? targetRadio.value : 'local';
-    let targetNodes = [];
-    if (target === 'specific') {
-        targetNodes = Array.from(document.querySelectorAll('.wolfflow-node-cb:checked')).map(cb => cb.value);
-        if (targetNodes.length === 0) {
-            showToast('Please select at least one target node', 'error');
-            return;
+    // Build steps array matching the Rust struct
+    const steps = wfSteps.map(s => {
+        const stepObj = {
+            name: s.name || '',
+            action: s.action || { action: '' },
+            on_failure: s.on_failure || 'abort',
+        };
+        if (s.target_override) {
+            stepObj.target_override = s.target_override;
         }
-    }
-
-    // Collect steps
-    const steps = [];
-    wolfflowSteps.forEach((s, idx) => {
-        if (s === null) return; // removed
-        const stepDiv = document.getElementById(`wolfflow-step-${idx}`);
-        if (!stepDiv) return;
-
-        const stepName = stepDiv.querySelector('.wolfflow-step-name')?.value?.trim() || '';
-        const action = stepDiv.querySelector('.wolfflow-step-action')?.value || '';
-        const onFailure = stepDiv.querySelector('.wolfflow-step-onfail')?.value || 'abort';
-
-        // Collect action params
-        const params = {};
-        stepDiv.querySelectorAll(`#wolfflow-step-fields-${idx} [data-param]`).forEach(el => {
-            params[el.dataset.param] = el.value;
-        });
-
-        if (action) {
-            steps.push({ name: stepName, action, params, on_failure: onFailure });
-        }
+        return stepObj;
     });
 
     if (steps.length === 0) {
@@ -28647,23 +28964,25 @@ async function saveWolfFlow() {
     }
 
     const payload = {
-        cluster: 'system',
+        id: wfEditId || '',
         name,
-        description,
-        schedule,
+        description: '',
+        cluster: 'system',
+        steps,
+        target: wfEditorTarget || { scope: 'local' },
+        schedule: schedule || null,
         enabled,
-        target,
-        target_nodes: targetNodes,
-        steps
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
     };
 
     try {
         let url, method;
-        if (wolfflowEditId) {
-            url = wolfflowApiUrl(`/api/wolfflow/workflows/${wolfflowEditId}`);
+        if (wfEditId) {
+            url = `/api/wolfflow/workflows/${wfEditId}`;
             method = 'PUT';
         } else {
-            url = wolfflowApiUrl('/api/wolfflow/workflows');
+            url = '/api/wolfflow/workflows';
             method = 'POST';
         }
 
@@ -28679,46 +28998,48 @@ async function saveWolfFlow() {
             throw new Error(err || 'Failed to save workflow');
         }
 
-        showToast(wolfflowEditId ? 'Workflow updated' : 'Workflow created', 'success');
-        taskLog('WolfFlow ' + (wolfflowEditId ? 'update' : 'create') + ': ' + name);
-        closeWolfFlowModal();
-        loadWolfFlowWorkflows();
+        const result = await resp.json();
+        if (!wfEditId && result && result.id) {
+            wfEditId = result.id;
+        }
+
+        showToast(wfEditId ? 'Workflow saved' : 'Workflow created', 'success');
+        taskLog('WolfFlow ' + (method === 'PUT' ? 'update' : 'create') + ': ' + name);
     } catch (e) {
-        showToast('Failed to save workflow: ' + e.message, 'error');
+        showToast('Failed to save: ' + e.message, 'error');
         console.error('WolfFlow save error:', e);
     }
 }
 
 async function deleteWolfFlow(id, name) {
-    if (!confirm(`Delete workflow "${name}"?\n\nThis cannot be undone.`)) return;
-
+    if (!confirm('Delete workflow "' + name + '"?\n\nThis cannot be undone.')) return;
     try {
-        const url = wolfflowApiUrl(`/api/wolfflow/workflows/${id}`);
-        const resp = await fetch(url, { method: 'DELETE', credentials: 'include' });
+        const resp = await fetch(`/api/wolfflow/workflows/${id}`, { method: 'DELETE', credentials: 'include' });
         if (!resp.ok) throw new Error('Delete failed');
-        showToast(`Workflow "${name}" deleted`, 'success');
+        showToast('Workflow "' + name + '" deleted', 'success');
         taskLog('WolfFlow delete: ' + name);
-        loadWolfFlowWorkflows();
+        loadWolfFlowList();
     } catch (e) {
-        showToast('Failed to delete workflow: ' + e.message, 'error');
-        console.error('WolfFlow delete error:', e);
+        showToast('Failed to delete: ' + e.message, 'error');
     }
 }
 
 async function triggerWolfFlow(id) {
     try {
-        const url = wolfflowApiUrl(`/api/wolfflow/workflows/${id}/run`);
-        const resp = await fetch(url, { method: 'POST', credentials: 'include' });
+        const resp = await fetch(`/api/wolfflow/workflows/${id}/run`, { method: 'POST', credentials: 'include' });
         if (!resp.ok) throw new Error('Trigger failed');
         showToast('Workflow triggered', 'success');
         taskLog('WolfFlow run: ' + id);
-        // Refresh after short delay to let the run start
-        setTimeout(() => {
-            loadWolfFlowWorkflows();
-            loadWolfFlowRuns();
-        }, 1500);
+        setTimeout(() => loadWolfFlowList(), 1500);
     } catch (e) {
-        showToast('Failed to trigger workflow: ' + e.message, 'error');
-        console.error('WolfFlow trigger error:', e);
+        showToast('Failed to trigger: ' + e.message, 'error');
     }
+}
+
+function runWolfFlowFromEditor() {
+    if (!wfEditId) {
+        showToast('Save the workflow first before running it', 'error');
+        return;
+    }
+    triggerWolfFlow(wfEditId);
 }
