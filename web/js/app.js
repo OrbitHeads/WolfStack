@@ -29252,9 +29252,11 @@ async function triggerWolfFlow(id) {
         }
         showToast('Workflow triggered: ' + wfName, 'success');
 
-        // Poll for run results — fetch enough runs to find ours, no timeout
+        // Poll for run results
         const startTime = Date.now();
+        let pollDone = false;
         const pollTimer = setInterval(async () => {
+            if (pollDone) return;
             const elapsed = Math.floor((Date.now() - startTime) / 1000);
             const timeStr = elapsed >= 60 ? Math.floor(elapsed/60) + 'm ' + (elapsed%60) + 's' : elapsed + 's';
             try {
@@ -29292,7 +29294,8 @@ async function triggerWolfFlow(id) {
                         : `Executing step 1/${wfStepCount} on ${wfTarget}`;
                     updateTaskLogEntry(taskId, { description: `"${wfName}" — ${detail} (${timeStr})`, status: 'running' });
                 } else {
-                    // Finished
+                    // Finished — stop polling immediately
+                    pollDone = true;
                     clearInterval(pollTimer);
                     const logLines = (run.steps || []).map(s => {
                         const outputPreview = s.output ? s.output.substring(0, 300).replace(/\n/g, ' ') : '';
