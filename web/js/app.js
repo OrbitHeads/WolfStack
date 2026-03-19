@@ -18789,26 +18789,32 @@ function _startUpgradeTracking() {
         trackers.forEach(function(t) {
             if (t.done) return;
             var currentNode = allNodes.find(function(n) { return n.id === t.nodeId; });
-            if (!currentNode || allNodes.length === 0) { pending++; return; }
-
             var elapsed = Math.floor((Date.now() - t.startedAt) / 1000);
             var timeStr = elapsed >= 60 ? Math.floor(elapsed/60) + 'm ' + (elapsed%60) + 's' : elapsed + 's';
 
-            // Track: must see node online first (seenOnline), then offline, then online again
-            if (currentNode.online && !t.seenOnline) {
-                t.seenOnline = true;
-                if (t.taskId) updateTaskLogEntry(t.taskId, { description: t.hostname + ' — compiling... (' + timeStr + ')', status: 'running' });
+            if (!currentNode || allNodes.length === 0) {
+                if (t.taskId) updateTaskLogEntry(t.taskId, { description: t.hostname + ' — reconnecting... (' + timeStr + ')', status: 'running' });
                 pending++;
-            } else if (!currentNode.online && t.seenOnline) {
-                t.wasOffline = true;
-                if (t.taskId) updateTaskLogEntry(t.taskId, { description: t.hostname + ' — restarting... (' + timeStr + ')', status: 'running' });
+                return;
+            }
+
+            if (!currentNode.online) {
+                t.sawOffline = true;
+                if (t.taskId) updateTaskLogEntry(t.taskId, { description: t.hostname + ' — offline/restarting (' + timeStr + ')', status: 'running' });
                 pending++;
-            } else if (currentNode.online && t.wasOffline) {
+            } else if (t.sawOffline) {
+                // Was offline, now back online = upgrade complete
                 t.done = true;
                 if (t.taskId) updateTaskLogEntry(t.taskId, { description: t.hostname + ' — upgrade complete (' + timeStr + ')', status: 'success' });
             } else {
-                if (t.taskId) updateTaskLogEntry(t.taskId, { description: t.hostname + ' — waiting... (' + timeStr + ')', status: 'running' });
+                // Still online — either compiling or already finished
+                if (t.taskId) updateTaskLogEntry(t.taskId, { description: t.hostname + ' — upgrading... (' + timeStr + ')', status: 'running' });
                 pending++;
+                // After 60 minutes, assume it completed (RPi can take a while)
+                if (elapsed > 3600) {
+                    t.done = true;
+                    if (t.taskId) updateTaskLogEntry(t.taskId, { description: t.hostname + ' — upgrade sent, node online (' + timeStr + ')', status: 'success' });
+                }
             }
         });
 
