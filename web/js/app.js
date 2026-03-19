@@ -6928,7 +6928,10 @@ async function upgradeNode(nodeId) {
     if (!node) return;
 
     const machine = node.is_self ? 'this machine (local)' : (node.hostname + ' (' + node.address + ')');
-    if (!(await showConfirm('⚡ Upgrade WolfStack on ' + machine + '?\n\nThis will run the upgrade script. A terminal window will open so you can monitor progress.\n\nThe service will restart after upgrading — refresh your browser when done.\n\nProceed?'))) return;
+    if (!(await showConfirm('⚡ Upgrade WolfStack on ' + machine + '?\n\nThis will run the upgrade script in the background.\n\nProgress will be tracked in the task log.\n\nProceed?'))) return;
+
+    // Record current version for comparison
+    const oldVersion = node.metrics?.hostname ? (allNodes.find(n => n.id === nodeId)?.metrics?.hostname || '') : '';
 
     // Open console popup with type=upgrade
     let url = '/console.html?type=upgrade&name=wolfstack';
@@ -6937,8 +6940,46 @@ async function upgradeNode(nodeId) {
     }
     window.open(url, 'upgrade_console_' + nodeId, 'width=960,height=600,menubar=no,toolbar=no');
 
-    showToast('Upgrade started — watch the terminal window for progress.', 'info');
-    taskLogStart('Upgrade node: ' + machine);
+    // Track in task log
+    const taskId = addTaskLogEntry({
+        cluster: node.cluster_name || 'WolfStack',
+        node: node.hostname || node.address,
+        description: 'Upgrading WolfStack...',
+        status: 'running',
+    });
+
+    showToast('Upgrade started for ' + machine, 'info');
+
+    // Poll node status to track upgrade progress
+    let pollCount = 0;
+    let wasOffline = false;
+    const pollTimer = setInterval(() => {
+        pollCount++;
+        if (pollCount > 120) { // 10 min timeout
+            clearInterval(pollTimer);
+            updateTaskLogEntry(taskId, { description: 'Upgrade timed out (10 min)', status: 'error' });
+            return;
+        }
+        const currentNode = allNodes.find(n => n.id === nodeId);
+        if (!currentNode) return;
+
+        if (!currentNode.online && !wasOffline) {
+            wasOffline = true;
+            updateTaskLogEntry(taskId, { description: 'Node restarting...', status: 'running' });
+        } else if (currentNode.online && wasOffline) {
+            // Node came back online after being offline — upgrade complete
+            clearInterval(pollTimer);
+            updateTaskLogEntry(taskId, {
+                description: 'Upgrade complete — node back online',
+                status: 'success',
+                logLines: ['Node went offline for restart and came back online'],
+            });
+        } else if (currentNode.online && !wasOffline && pollCount > 6) {
+            // Still online after 30s — might be a local upgrade that didn't restart
+            // or the compile is still running
+            updateTaskLogEntry(taskId, { description: 'Compiling... (' + (pollCount * 5) + 's)', status: 'running' });
+        }
+    }, 5000);
 
     // Close the settings modal
     const modal = document.getElementById('node-settings-modal');
