@@ -5138,6 +5138,67 @@ pub async fn backup_stream(
         .streaming(stream)
 }
 
+/// POST /api/backups/{id}/restore/stream — restore with SSE progress
+pub async fn backup_restore_stream(
+    req: HttpRequest, state: web::Data<AppState>,
+    path: web::Path<String>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let id = path.into_inner();
+    let overwrite = query.get("overwrite").map(|v| v == "true").unwrap_or(false);
+
+    // Check for container existence before streaming (to return 409 synchronously)
+    {
+        let config = backup::load_config();
+        if let Some(entry) = config.entries.iter().find(|e| e.id == id) {
+            if entry.target.target_type == backup::BackupTargetType::Docker && !overwrite {
+                let check = std::process::Command::new("docker")
+                    .args(["container", "inspect", &entry.target.name])
+                    .output();
+                if check.map(|o| o.status.success()).unwrap_or(false) {
+                    return HttpResponse::Conflict().json(serde_json::json!({
+                        "error": "container_exists",
+                        "container": entry.target.name,
+                        "message": format!("Container '{}' already exists. Overwrite?", entry.target.name)
+                    }));
+                }
+            }
+        }
+    }
+
+    let (std_tx, std_rx) = std::sync::mpsc::channel::<String>();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(256);
+
+    std::thread::spawn(move || {
+        let result = backup::restore_by_id_with_log(&id, overwrite, std_tx.clone());
+        match result {
+            Ok(msg) => { let _ = std_tx.send(format!("RESULT:OK:{}", msg)); }
+            Err(e) => { let _ = std_tx.send(format!("RESULT:ERR:{}", e)); }
+        }
+    });
+
+    tokio::task::spawn_blocking(move || {
+        while let Ok(msg) = std_rx.recv() {
+            if tx.blocking_send(msg).is_err() { break; }
+        }
+    });
+
+    let stream = async_stream::stream! {
+        while let Some(msg) = rx.recv().await {
+            let event = format!("data: {}\n\n", msg.replace('\n', "\ndata: "));
+            yield Ok::<_, actix_web::Error>(actix_web::web::Bytes::from(event));
+        }
+    };
+
+    HttpResponse::Ok()
+        .insert_header(("Content-Type", "text/event-stream"))
+        .insert_header(("Cache-Control", "no-cache"))
+        .insert_header(("Connection", "keep-alive"))
+        .insert_header(("X-Accel-Buffering", "no"))
+        .streaming(stream)
+}
+
 /// DELETE /api/backups/{id} — delete a backup entry + file
 pub async fn backup_delete(
     req: HttpRequest, state: web::Data<AppState>,
@@ -13351,6 +13412,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/backups/pbs/config", web::post().to(pbs_config_save))
         // Generic backup {id} routes — after specific routes
         .route("/api/backups/{id}", web::delete().to(backup_delete))
+        .route("/api/backups/{id}/restore/stream", web::post().to(backup_restore_stream))
         .route("/api/backups/{id}/restore", web::post().to(backup_restore))
         // Console WebSocket
         .route("/ws/console/{type}/{name}", web::get().to(crate::console::console_ws))

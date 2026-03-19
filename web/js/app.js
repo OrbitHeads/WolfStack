@@ -14876,30 +14876,67 @@ async function deleteBackup(id) {
 
 async function restoreBackup(id, overwrite) {
     if (!overwrite && !(await showConfirm('Restore from this backup? This will overwrite existing data for the target.'))) return;
-    // Find the button and show progress
     const btn = event && event.target;
     const origText = btn ? btn.textContent : '';
     if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner" style="display:inline-block; width:12px; height:12px; border:2px solid var(--border); border-top-color:#fff; border-radius:50%; animation:spin 0.8s linear infinite; vertical-align:middle;"></span> Restoring...'; }
-    showToast('🔄 Restore in progress... This may take a while.', 'info');
-    const _restoreTaskId = taskLogStart('Restoring backup: ' + id);
+    showToast('🔄 Restore in progress...', 'info');
+    const taskId = taskLogStart('Restoring backup...');
+    let failed = false;
+    let resultMsg = '';
     try {
-        const url = overwrite ? `/api/backups/${id}/restore?overwrite=true` : `/api/backups/${id}/restore`;
+        const url = overwrite ? `/api/backups/${id}/restore/stream?overwrite=true` : `/api/backups/${id}/restore/stream`;
         const res = await fetch(apiUrl(url), { method: 'POST' });
-        const data = await res.json();
-        if (res.status === 409 && data.error === 'container_exists') {
-            // Container exists — ask user if they want to overwrite
-            updateTaskLogEntry(_restoreTaskId, { status: 'failed' });
+
+        if (res.status === 409) {
+            const data = await res.json();
+            updateTaskLogEntry(taskId, { status: 'failed' });
             if (btn) { btn.disabled = false; btn.textContent = origText; }
             if (await showConfirm(`Container '${data.container}' already exists. Stop and replace it with the backup?`)) {
                 return restoreBackup(id, true);
             }
             return;
         }
-        if (data.error) { showToast(`Restore failed: ${data.error}`, 'error'); updateTaskLogEntry(_restoreTaskId, { status: 'failed' }); }
-        else { showToast(data.message || '✅ Restore completed!', 'success'); updateTaskLogEntry(_restoreTaskId, { status: 'completed', description: 'Restored backup: ' + id }); }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    const msg = line.substring(6);
+                    if (msg.startsWith('RESULT:OK:')) {
+                        resultMsg = msg.substring(10);
+                    } else if (msg.startsWith('RESULT:ERR:')) {
+                        resultMsg = msg.substring(11);
+                        failed = true;
+                    } else {
+                        updateTaskLogEntry(taskId, { description: msg, logLine: msg });
+                    }
+                }
+            }
+        }
+        if (buffer.startsWith('data: ')) {
+            const msg = buffer.substring(6);
+            if (msg.startsWith('RESULT:OK:')) { resultMsg = msg.substring(10); }
+            else if (msg.startsWith('RESULT:ERR:')) { resultMsg = msg.substring(11); failed = true; }
+        }
+
+        if (failed) {
+            showToast(`Restore failed: ${resultMsg}`, 'error');
+            updateTaskLogEntry(taskId, { status: 'failed', description: resultMsg });
+        } else {
+            showToast(resultMsg || '✅ Restore completed!', 'success');
+            updateTaskLogEntry(taskId, { status: 'completed', description: resultMsg || 'Restore completed' });
+        }
     } catch (e) {
         showToast(`Restore error: ${e.message}`, 'error');
-        updateTaskLogEntry(_restoreTaskId, { status: 'failed' });
+        updateTaskLogEntry(taskId, { status: 'failed', description: e.message });
     }
     if (btn) { btn.disabled = false; btn.textContent = origText; }
     loadBackups();

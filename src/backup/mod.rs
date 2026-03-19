@@ -1664,6 +1664,112 @@ pub fn restore_by_id(id: &str, overwrite: bool) -> Result<String, String> {
     restore_backup(entry, overwrite)
 }
 
+/// Restore from a backup by ID with streaming log output
+pub fn restore_by_id_with_log(id: &str, overwrite: bool, log: std::sync::mpsc::Sender<String>) -> Result<String, String> {
+    let config = load_config();
+    let entry = config.entries.iter().find(|e| e.id == id)
+        .ok_or_else(|| format!("Backup not found: {}", id))?;
+
+    let type_name = entry.target.target_type.to_string().to_uppercase();
+    let display_name = entry.target.hostname.as_deref()
+        .map(|h| format!("{} ({})", entry.target.name, h))
+        .unwrap_or_else(|| entry.target.name.clone());
+
+    let _ = log.send(format!("Starting {} restore: {}", type_name, display_name));
+
+    // Check for container existence before downloading
+    if entry.target.target_type == BackupTargetType::Docker {
+        let check = Command::new("docker")
+            .args(["container", "inspect", &entry.target.name])
+            .output();
+        let exists = check.map(|o| o.status.success()).unwrap_or(false);
+        if exists && !overwrite {
+            return Err(format!("CONTAINER_EXISTS:{}", entry.target.name));
+        }
+        if exists && overwrite {
+            let _ = log.send(format!("Stopping existing container '{}'...", entry.target.name));
+            let _ = Command::new("docker").args(["stop", &entry.target.name]).output();
+            let _ = Command::new("docker").args(["rm", "-f", &entry.target.name]).output();
+            let _ = log.send("Existing container removed".to_string());
+        }
+    }
+
+    let _ = log.send("Downloading backup...".to_string());
+    let local_path = retrieve_backup(entry)?;
+    let _ = log.send("Download complete".to_string());
+
+    match entry.target.target_type {
+        BackupTargetType::Docker => {
+            let _ = log.send("Loading Docker image...".to_string());
+            let output = Command::new("sh")
+                .args(["-c", &format!("gunzip -c '{}' | docker load", local_path.display())])
+                .output()
+                .map_err(|e| format!("Failed to load Docker image: {}", e))?;
+
+            let _ = fs::remove_file(&local_path);
+
+            if !output.status.success() {
+                let err = format!("Docker load failed: {}", String::from_utf8_lossy(&output.stderr));
+                let _ = log.send(err.clone());
+                return Err(err);
+            }
+
+            let load_result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let image_name = load_result
+                .lines()
+                .find_map(|line| line.strip_prefix("Loaded image: "))
+                .unwrap_or(&format!("wolfstack-backup/{}", entry.target.name))
+                .to_string();
+
+            let _ = log.send(format!("Image loaded: {}", image_name));
+            let _ = log.send(format!("Creating container '{}'...", entry.target.name));
+
+            let create = Command::new("docker")
+                .args(["run", "-d", "--name", &entry.target.name, "--restart", "unless-stopped", &image_name])
+                .output()
+                .map_err(|e| format!("Failed to create container: {}", e))?;
+
+            if !create.status.success() {
+                let err = String::from_utf8_lossy(&create.stderr);
+                let msg = format!("Image restored but container creation failed: {}", err.trim());
+                let _ = log.send(msg.clone());
+                return Ok(msg);
+            }
+
+            let msg = format!("✅ Docker container '{}' restored and started", entry.target.name);
+            let _ = log.send(msg.clone());
+            Ok(msg)
+        }
+        BackupTargetType::Lxc => {
+            let _ = log.send("Restoring LXC container...".to_string());
+            let result = restore_lxc(entry);
+            match &result {
+                Ok(msg) => { let _ = log.send(format!("✅ {}", msg)); }
+                Err(e) => { let _ = log.send(format!("❌ {}", e)); }
+            }
+            result
+        }
+        BackupTargetType::Vm => {
+            let _ = log.send("Restoring VM...".to_string());
+            let result = restore_vm(entry);
+            match &result {
+                Ok(msg) => { let _ = log.send(format!("✅ {}", msg)); }
+                Err(e) => { let _ = log.send(format!("❌ {}", e)); }
+            }
+            result
+        }
+        BackupTargetType::Config => {
+            let _ = log.send("Restoring WolfStack configuration...".to_string());
+            let result = restore_config_backup(entry);
+            match &result {
+                Ok(msg) => { let _ = log.send(format!("✅ {}", msg)); }
+                Err(e) => { let _ = log.send(format!("❌ {}", e)); }
+            }
+            result
+        }
+    }
+}
+
 // ─── Schedule Management ───
 
 /// List all schedules
