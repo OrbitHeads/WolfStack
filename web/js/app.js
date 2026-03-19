@@ -28128,7 +28128,7 @@ async function loadWolfFlowList() {
     try {
         const [wfResp, runsResp] = await Promise.all([
             fetch('/api/wolfflow/workflows', { credentials: 'include' }),
-            fetch('/api/wolfflow/runs?limit=50', { credentials: 'include' })
+            fetch('/api/wolfflow/runs?limit=10', { credentials: 'include' })
         ]);
         if (wfResp.ok) {
             const workflows = await wfResp.json();
