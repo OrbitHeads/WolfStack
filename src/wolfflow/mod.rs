@@ -978,29 +978,42 @@ pub async fn execute_workflow(
                 }
                 body.push('\n');
             }
-            // Send via AI module's SMTP config — run on blocking thread but await result
-            let mut config = crate::ai::AiConfig::load();
+            // Send email — same method as the daily report
+            let config = crate::ai::AiConfig::load();
             if config.smtp_host.is_empty() {
                 run.email_status = Some("Failed: no SMTP configured — set up email in Settings → AI Agent".to_string());
             } else {
-                config.email_to = email.clone();
                 let email_to = email.clone();
                 run.email_status = Some(format!("Sending to {}...", email_to));
                 state.update_run(&run_id, run.clone());
-                // Run SMTP on blocking thread and wait for it (max 30s)
+
+                // Build HTML email (same approach as daily report)
+                let html_body = format!(
+                    "<html><body style='font-family:sans-serif;'>\
+                    <h2>[WolfFlow] {} — {:?}</h2>\
+                    <p>Trigger: {} | Duration: {}ms | Steps: {}</p>\
+                    <table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-size:13px;'>\
+                    <tr><th>Step</th><th>Node</th><th>Status</th><th>Duration</th><th>Output</th></tr>{}</table>\
+                    </body></html>",
+                    workflow.name, run.status, trigger, run.duration_ms, run.steps.len(),
+                    run.steps.iter().map(|s| format!(
+                        "<tr><td>{}</td><td>{}</td><td>{:?}</td><td>{}ms</td><td><pre>{}</pre></td></tr>",
+                        s.step_name, s.node_hostname, s.status, s.duration_ms,
+                        if s.output.len() > 500 { format!("{}...", &s.output[..500]) } else { s.output.clone() }
+                    )).collect::<Vec<_>>().join("")
+                );
+
+                // Override email_to for this send
+                let mut send_config = config;
+                send_config.email_to = email_to.clone();
+
                 let result = tokio::task::spawn_blocking(move || {
-                    crate::ai::send_alert_email(&config, &subject, &body)
+                    crate::ai::send_html_email(&send_config, &subject, &html_body)
                 }).await;
                 match result {
-                    Ok(Ok(_)) => {
-                        run.email_status = Some(format!("Sent to {}", email_to));
-                    }
-                    Ok(Err(e)) => {
-                        run.email_status = Some(format!("Failed: {}", e));
-                    }
-                    Err(e) => {
-                        run.email_status = Some(format!("Email task failed: {}", e));
-                    }
+                    Ok(Ok(_)) => run.email_status = Some(format!("Sent to {}", email_to)),
+                    Ok(Err(e)) => run.email_status = Some(format!("Failed: {}", e)),
+                    Err(e) => run.email_status = Some(format!("Email task error: {}", e)),
                 }
             }
             state.update_run(&run_id, run.clone());
