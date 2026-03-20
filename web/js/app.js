@@ -7192,7 +7192,7 @@ function activityStop() {
 let _taskLogEntries = [];
 let _taskLogVisible = false;
 let _taskLogBodyVisible = true;
-let _taskLogUserClosed = false;
+let _taskLogUserClosed = localStorage.getItem('wolfstack_tasklog_closed') === 'true';
 
 function saveTaskLog() {
     try {
@@ -7231,9 +7231,9 @@ function loadTaskLog() {
                 }));
             }
         }
-        // Always show the task log footer on load
+        // Show the task log footer on load (unless user has closed it)
         loadTaskLogHeight();
-        showTaskLog();
+        if (!_taskLogUserClosed) showTaskLog();
         renderTaskLog();
         // Log the session start
         taskLog('Dashboard loaded');
@@ -7259,9 +7259,11 @@ function hideTaskLog() {
 function toggleTaskLogVisible() {
     if (_taskLogVisible) {
         _taskLogUserClosed = true;
+        localStorage.setItem('wolfstack_tasklog_closed', 'true');
         hideTaskLog();
     } else {
         _taskLogUserClosed = false;
+        localStorage.removeItem('wolfstack_tasklog_closed');
         showTaskLog();
     }
 }
