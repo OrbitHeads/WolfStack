@@ -20991,6 +20991,7 @@ async function disableTotp(username) {
         if (data.success) { showToast('2FA disabled', 'success'); taskLog('2FA disabled: ' + username); loadUsers(); }
         else showToast(data.error || 'Failed', 'error');
     } catch (e) { showToast('Error: ' + e.message, 'error'); }
+}
 
 // ─── File Locations Settings ───
 
