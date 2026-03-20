@@ -16,7 +16,9 @@ use std::time::Instant;
 use tracing::{error, warn};
 
 /// One-time WolfNet networking initialization — called at WolfStack startup.
-/// Sets kernel parameters needed for container traffic to flow through wolfnet0.
+/// Sets kernel parameters and iptables rules needed for container traffic to flow through wolfnet0.
+/// Called once at startup. The reconciliation loop (cleanup_stale_wolfnet_routes) re-applies
+/// iptables rules every 30s to survive Docker restarts that rebuild the FORWARD chain.
 pub fn wolfnet_init() {
     // Check if wolfnet0 exists
     let exists = Command::new("ip").args(["link", "show", "wolfnet0"]).output()
@@ -25,38 +27,60 @@ pub fn wolfnet_init() {
         return;
     }
 
-    // Enable per-interface forwarding (required for routing between wolfnet0 and lxcbr0)
+    setup_wolfnet_forwarding();
+}
+
+/// Core forwarding setup — called from wolfnet_init() and cleanup_stale_wolfnet_routes().
+/// Idempotent — safe to call repeatedly.
+pub fn setup_wolfnet_forwarding() {
+    // ── Kernel parameters ──
+    let _ = Command::new("sysctl").args(["-w", "net.ipv4.ip_forward=1"]).output();
     let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.wolfnet0.forwarding=1"]).output();
-    let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.lxcbr0.forwarding=1"]).output();
-
-    // Disable reverse path filtering on wolfnet0 (packets arrive from tunnel,
-    // source IPs don't match wolfnet0's directly-connected subnet)
     let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.wolfnet0.rp_filter=0"]).output();
-    let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.all.rp_filter=0"]).output();
-
-    // Disable ICMP redirects (we ARE the router for remote containers,
-    // the kernel shouldn't tell peers to "go direct")
     let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.wolfnet0.send_redirects=0"]).output();
-    let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.lxcbr0.send_redirects=0"]).output();
+    let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.wolfnet0.proxy_arp=1"]).output();
+    let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.all.rp_filter=0"]).output();
     let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.all.send_redirects=0"]).output();
 
-    // On firewalld systems (Fedora/RHEL/Nobara), add WolfNet/bridge interfaces
-    // to the trusted zone. firewalld uses nftables with its own table — our
-    // iptables FORWARD rules go into a separate compat table and firewalld's
-    // REJECT rule fires independently, blocking forwarded container traffic.
-    ensure_firewalld_trusted(&["wolfnet0", "lxcbr0", "docker0"]);
-
-    // FORWARD chain: allow traffic between wolfnet0 and lxcbr0 in both directions
-    // (fallback for non-firewalld systems)
-    let check = Command::new("iptables")
-        .args(["-C", "FORWARD", "-i", "wolfnet0", "-o", "lxcbr0", "-j", "ACCEPT"]).output();
-    if check.map(|o| !o.status.success()).unwrap_or(true) {
-        let _ = Command::new("iptables").args(["-I", "FORWARD", "-i", "wolfnet0", "-o", "lxcbr0", "-j", "ACCEPT"]).output();
-        let _ = Command::new("iptables").args(["-I", "FORWARD", "-i", "lxcbr0", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
+    // Enable forwarding on known bridge interfaces
+    for iface in &["docker0", "lxcbr0"] {
+        let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.forwarding=1", iface)]).output();
+        let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.send_redirects=0", iface)]).output();
     }
 
-    // MASQUERADE: traffic from Docker/LXC bridges going out wolfnet0 needs source NAT
-    // so remote WolfNet peers can route replies back (Docker IPs like 172.x aren't routable)
+    // ── firewalld trusted zone ──
+    ensure_firewalld_trusted(&["wolfnet0", "lxcbr0", "docker0"]);
+
+    // ── Blanket FORWARD rules for wolfnet0 ──
+    // Any traffic in/out of wolfnet0 must be allowed — inserted at position 1
+    // so they run before Docker's FORWARD jump to DOCKER-USER → DOCKER-ISOLATION
+    for _ in 0..2 {
+        let _ = Command::new("iptables").args(["-D", "FORWARD", "-i", "wolfnet0", "-j", "ACCEPT"]).output();
+        let _ = Command::new("iptables").args(["-D", "FORWARD", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
+    }
+    let _ = Command::new("iptables").args(["-I", "FORWARD", "1", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
+    let _ = Command::new("iptables").args(["-I", "FORWARD", "1", "-i", "wolfnet0", "-j", "ACCEPT"]).output();
+
+    // ── Docker chains: DOCKER-USER, DOCKER-ISOLATION-STAGE-1/2 ──
+    for chain in &["DOCKER-USER", "DOCKER-ISOLATION-STAGE-1", "DOCKER-ISOLATION-STAGE-2"] {
+        let exists = Command::new("iptables").args(["-L", chain]).output()
+            .map(|o| o.status.success()).unwrap_or(false);
+        if !exists { continue; }
+
+        for _ in 0..2 {
+            let _ = Command::new("iptables").args(["-D", chain, "-i", "wolfnet0", "-j", "ACCEPT"]).output();
+            let _ = Command::new("iptables").args(["-D", chain, "-o", "wolfnet0", "-j", "ACCEPT"]).output();
+            let _ = Command::new("iptables").args(["-D", chain, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"]).output();
+        }
+        let _ = Command::new("iptables").args(["-I", chain, "1", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"]).output();
+        let _ = Command::new("iptables").args(["-I", chain, "1", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
+        let _ = Command::new("iptables").args(["-I", chain, "1", "-i", "wolfnet0", "-j", "ACCEPT"]).output();
+    }
+
+    // ── MASQUERADE for non-WolfNet source IPs going out wolfnet0 ──
+    // Containers without a WolfNet IP (using Docker IPs like 172.x) need source NAT
+    // so remote peers can route replies back. Containers WITH WolfNet IPs are not
+    // masqueraded — they keep their WolfNet IP as source.
     if let Some(pfx) = wolfnet_subnet_prefix() {
         let wn_subnet = format!("{}.0/24", pfx);
         let check = Command::new("iptables").args([
@@ -498,81 +522,16 @@ pub fn cleanup_stale_wolfnet_routes() {
         }
     }
 
-    // Ensure iptables forwarding rules are at the TOP of FORWARD chain
-    // (before DOCKER-USER/DOCKER-FORWARD/DOCKER-ISOLATION which may DROP traffic)
-    // Apply for every bridge device we found (docker0, br-xxx, etc.)
-    if !bridge_devs.is_empty() {
-        let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.wolfnet0.forwarding=1"]).output();
-        let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.wolfnet0.send_redirects=0"]).output();
-        let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.wolfnet0.rp_filter=0"]).output();
-        let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.all.rp_filter=0"]).output();
+    // Re-apply all wolfnet0 forwarding rules (survives Docker iptables rebuilds)
+    setup_wolfnet_forwarding();
 
-        // Blanket FORWARD rules: any traffic involving wolfnet0 should be allowed
-        // This covers all bridge devices without needing per-bridge rules
-        // Remove old blanket rules first
-        let _ = Command::new("iptables").args(["-D", "FORWARD", "-i", "wolfnet0", "-j", "ACCEPT"]).output();
-        let _ = Command::new("iptables").args(["-D", "FORWARD", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
-        let _ = Command::new("iptables").args(["-D", "FORWARD", "-i", "wolfnet0", "-j", "ACCEPT"]).output();
-        let _ = Command::new("iptables").args(["-D", "FORWARD", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
-        // Insert at position 1 — before all Docker chains
-        let _ = Command::new("iptables").args(["-I", "FORWARD", "1", "-i", "wolfnet0", "-j", "ACCEPT"]).output();
-        let _ = Command::new("iptables").args(["-I", "FORWARD", "1", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
-
-        // Insert ACCEPT rules into every Docker chain that might block wolfnet0 traffic
-        for chain in &["DOCKER-USER", "DOCKER-ISOLATION-STAGE-1", "DOCKER-ISOLATION-STAGE-2"] {
-            let exists = Command::new("iptables").args(["-L", chain]).output()
-                .map(|o| o.status.success()).unwrap_or(false);
-            if !exists { continue; }
-
-            // Remove old rules (deduplicate)
-            for _ in 0..2 {
-                let _ = Command::new("iptables").args(["-D", chain, "-i", "wolfnet0", "-j", "ACCEPT"]).output();
-                let _ = Command::new("iptables").args(["-D", chain, "-o", "wolfnet0", "-j", "ACCEPT"]).output();
-            }
-            // Insert at top
-            let _ = Command::new("iptables").args(["-I", chain, "1", "-i", "wolfnet0", "-j", "ACCEPT"]).output();
-            let _ = Command::new("iptables").args(["-I", chain, "1", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
-
-            // Also allow return traffic (ESTABLISHED,RELATED)
-            let _ = Command::new("iptables").args(["-D", chain, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"]).output();
-            let _ = Command::new("iptables").args(["-I", chain, "1", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"]).output();
-        }
-
-        for bd in &bridge_devs {
-            let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.forwarding=1", bd)]).output();
-            let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.send_redirects=0", bd)]).output();
-            let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.rp_filter=0", bd)]).output();
-            let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.proxy_arp=1", bd)]).output();
-
-            // Add to firewalld trusted zone if firewalld is running
-            ensure_firewalld_trusted(&[bd, "wolfnet0"]);
-        }
-
-        // MASQUERADE: containers on Docker bridges reaching WolfNet need their source
-        // IP rewritten to the host's WolfNet IP, otherwise remote peers can't route replies
-        // back to Docker-internal IPs like 172.x.x.x
-        if let Some(ref pfx) = wolfnet_subnet_prefix() {
-            let wn_subnet = format!("{}.0/24", pfx);
-            // Remove any old per-subnet MASQUERADE rules
-            let _ = Command::new("iptables").args([
-                "-t", "nat", "-D", "POSTROUTING",
-                "-s", &wn_subnet, "-o", "wolfnet0",
-                "-j", "MASQUERADE"
-            ]).output();
-            // Single MASQUERADE rule for all traffic going out wolfnet0 from Docker subnets
-            let check = Command::new("iptables").args([
-                "-t", "nat", "-C", "POSTROUTING",
-                "!", "-s", &wn_subnet, "-o", "wolfnet0",
-                "-j", "MASQUERADE"
-            ]).output();
-            if check.map(|o| !o.status.success()).unwrap_or(true) {
-                let _ = Command::new("iptables").args([
-                    "-t", "nat", "-A", "POSTROUTING",
-                    "!", "-s", &wn_subnet, "-o", "wolfnet0",
-                    "-j", "MASQUERADE"
-                ]).output();
-            }
-        }
+    // Enable forwarding and firewalld trust for any custom Docker bridges we found
+    for bd in &bridge_devs {
+        let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.forwarding=1", bd)]).output();
+        let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.send_redirects=0", bd)]).output();
+        let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.rp_filter=0", bd)]).output();
+        let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.proxy_arp=1", bd)]).output();
+        ensure_firewalld_trusted(&[bd, "wolfnet0"]);
     }
 }
 
