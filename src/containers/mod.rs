@@ -491,6 +491,43 @@ pub fn cleanup_stale_wolfnet_routes() {
             let _ = Command::new("nsenter")
                 .args(["--target", &pid_out, "--net", "ip", "route", "replace", &wn_subnet, "via", &gw, "src", &label])
                 .output();
+
+            // For containers on custom Docker networks (not docker0), also set up DNAT
+            // so that traffic arriving at the host for this WolfNet IP gets redirected
+            // to the container's Docker IP on the custom bridge. This ensures Docker's
+            // own connection tracking handles the return path correctly, which is
+            // required for reverse proxies and sustained connections (not just ping/curl).
+            if bridge_dev != "docker0" {
+                // Get the container's Docker IP on its custom network
+                if let Ok(docker_ip_out) = Command::new("docker")
+                    .args(["inspect", "--format",
+                           "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", name])
+                    .output()
+                {
+                    let docker_ip = String::from_utf8_lossy(&docker_ip_out.stdout).trim().to_string();
+                    if !docker_ip.is_empty() && docker_ip != label {
+                        // Remove old DNAT rules for this WolfNet IP (idempotent)
+                        let _ = Command::new("iptables").args([
+                            "-t", "nat", "-D", "PREROUTING",
+                            "-d", &label, "-j", "DNAT", "--to-destination", &docker_ip
+                        ]).output();
+                        // Add DNAT: wolfnet_ip → docker_ip (all ports)
+                        let _ = Command::new("iptables").args([
+                            "-t", "nat", "-A", "PREROUTING",
+                            "-d", &label, "-j", "DNAT", "--to-destination", &docker_ip
+                        ]).output();
+                        // Also handle locally-generated traffic (curl from host)
+                        let _ = Command::new("iptables").args([
+                            "-t", "nat", "-D", "OUTPUT",
+                            "-d", &label, "-j", "DNAT", "--to-destination", &docker_ip
+                        ]).output();
+                        let _ = Command::new("iptables").args([
+                            "-t", "nat", "-A", "OUTPUT",
+                            "-d", &label, "-j", "DNAT", "--to-destination", &docker_ip
+                        ]).output();
+                    }
+                }
+            }
         }
     }
 
