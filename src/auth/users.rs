@@ -184,6 +184,7 @@ pub fn generate_totp_secret() -> String {
 }
 
 /// Generate a TOTP code for the current time
+#[allow(dead_code)]
 pub fn generate_totp(secret_b32: &str, time_step: u64) -> Result<String, String> {
     let secret = data_encoding::BASE32_NOPAD
         .decode(secret_b32.to_uppercase().as_bytes())
