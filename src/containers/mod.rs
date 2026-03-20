@@ -54,6 +54,24 @@ pub fn wolfnet_init() {
         let _ = Command::new("iptables").args(["-I", "FORWARD", "-i", "wolfnet0", "-o", "lxcbr0", "-j", "ACCEPT"]).output();
         let _ = Command::new("iptables").args(["-I", "FORWARD", "-i", "lxcbr0", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
     }
+
+    // MASQUERADE: traffic from Docker/LXC bridges going out wolfnet0 needs source NAT
+    // so remote WolfNet peers can route replies back (Docker IPs like 172.x aren't routable)
+    if let Some(pfx) = wolfnet_subnet_prefix() {
+        let wn_subnet = format!("{}.0/24", pfx);
+        let check = Command::new("iptables").args([
+            "-t", "nat", "-C", "POSTROUTING",
+            "!", "-s", &wn_subnet, "-o", "wolfnet0",
+            "-j", "MASQUERADE"
+        ]).output();
+        if check.map(|o| !o.status.success()).unwrap_or(true) {
+            let _ = Command::new("iptables").args([
+                "-t", "nat", "-A", "POSTROUTING",
+                "!", "-s", &wn_subnet, "-o", "wolfnet0",
+                "-j", "MASQUERADE"
+            ]).output();
+        }
+    }
 }
 
 /// Add interfaces to the firewalld trusted zone (if firewalld is running).
@@ -474,6 +492,42 @@ pub fn cleanup_stale_wolfnet_routes() {
             // Re-insert at position 1 (before DOCKER-USER/DOCKER-FORWARD)
             let _ = Command::new("iptables").args(["-I", "FORWARD", "1", "-i", bd, "-o", "wolfnet0", "-j", "ACCEPT"]).output();
             let _ = Command::new("iptables").args(["-I", "FORWARD", "1", "-i", "wolfnet0", "-o", bd, "-j", "ACCEPT"]).output();
+
+            // Also insert into DOCKER-USER if it exists (Docker checks this chain before DOCKER-ISOLATION)
+            let docker_user_exists = Command::new("iptables").args(["-L", "DOCKER-USER"]).output()
+                .map(|o| o.status.success()).unwrap_or(false);
+            if docker_user_exists {
+                let _ = Command::new("iptables").args(["-D", "DOCKER-USER", "-i", bd, "-o", "wolfnet0", "-j", "ACCEPT"]).output();
+                let _ = Command::new("iptables").args(["-D", "DOCKER-USER", "-i", "wolfnet0", "-o", bd, "-j", "ACCEPT"]).output();
+                let _ = Command::new("iptables").args(["-I", "DOCKER-USER", "1", "-i", bd, "-o", "wolfnet0", "-j", "ACCEPT"]).output();
+                let _ = Command::new("iptables").args(["-I", "DOCKER-USER", "1", "-i", "wolfnet0", "-o", bd, "-j", "ACCEPT"]).output();
+            }
+        }
+
+        // MASQUERADE: containers on Docker bridges reaching WolfNet need their source
+        // IP rewritten to the host's WolfNet IP, otherwise remote peers can't route replies
+        // back to Docker-internal IPs like 172.x.x.x
+        if let Some(ref pfx) = wolfnet_subnet_prefix() {
+            let wn_subnet = format!("{}.0/24", pfx);
+            // Remove any old per-subnet MASQUERADE rules
+            let _ = Command::new("iptables").args([
+                "-t", "nat", "-D", "POSTROUTING",
+                "-s", &wn_subnet, "-o", "wolfnet0",
+                "-j", "MASQUERADE"
+            ]).output();
+            // Single MASQUERADE rule for all traffic going out wolfnet0 from Docker subnets
+            let check = Command::new("iptables").args([
+                "-t", "nat", "-C", "POSTROUTING",
+                "!", "-s", &wn_subnet, "-o", "wolfnet0",
+                "-j", "MASQUERADE"
+            ]).output();
+            if check.map(|o| !o.status.success()).unwrap_or(true) {
+                let _ = Command::new("iptables").args([
+                    "-t", "nat", "-A", "POSTROUTING",
+                    "!", "-s", &wn_subnet, "-o", "wolfnet0",
+                    "-j", "MASQUERADE"
+                ]).output();
+            }
         }
     }
 }
