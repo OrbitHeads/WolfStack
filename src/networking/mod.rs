@@ -1239,7 +1239,7 @@ pub fn set_mtu(interface: &str, mtu: u32) -> Result<String, String> {
 
 // ─── Public IP → WolfNet IP Mapping ───
 
-const IP_MAPPINGS_PATH: &str = "/etc/wolfstack/ip-mappings.json";
+fn ip_mappings_path() -> String { crate::paths::get().ip_mappings }
 
 /// A mapping from a public IP to a WolfNet IP
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1261,19 +1261,20 @@ struct IpMappingConfig {
 }
 
 fn load_ip_mapping_config() -> IpMappingConfig {
-    match std::fs::read_to_string(IP_MAPPINGS_PATH) {
+    match std::fs::read_to_string(&ip_mappings_path()) {
         Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
         Err(_) => IpMappingConfig::default(),
     }
 }
 
 fn save_ip_mapping_config(config: &IpMappingConfig) -> Result<(), String> {
-    let dir = std::path::Path::new(IP_MAPPINGS_PATH).parent().unwrap();
+    let path = ip_mappings_path();
+    let dir = std::path::Path::new(&path).parent().unwrap();
     std::fs::create_dir_all(dir).map_err(|e| format!("Cannot create config dir: {}", e))?;
     let json = serde_json::to_string_pretty(config)
         .map_err(|e| format!("Failed to serialize config: {}", e))?;
-    std::fs::write(IP_MAPPINGS_PATH, json)
-        .map_err(|e| format!("Failed to write {}: {}", IP_MAPPINGS_PATH, e))
+    std::fs::write(&path, json)
+        .map_err(|e| format!("Failed to write {}: {}", path, e))
 }
 
 /// List all IP mappings
@@ -1749,7 +1750,7 @@ fn apply_mapping_rules(m: &IpMapping) -> Result<(), String> {
 /// Resolve a WolfRun VIP to its backend IPs and LB policy.
 /// Returns None if the IP is not a WolfRun service VIP.
 fn resolve_wolfrun_vip(ip: &str) -> Option<(Vec<String>, String)> {
-    let data = std::fs::read_to_string("/etc/wolfstack/wolfrun/services.json").ok()?;
+    let data = std::fs::read_to_string(&crate::paths::get().wolfrun_services).ok()?;
     let services: Vec<serde_json::Value> = serde_json::from_str(&data).ok()?;
     for svc in &services {
         if svc.get("service_ip").and_then(|v| v.as_str()) == Some(ip) {

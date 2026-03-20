@@ -105,9 +105,9 @@ pub struct ClusterState {
 }
 
 impl ClusterState {
-    const NODES_FILE: &'static str = "/etc/wolfstack/nodes.json";
-    const DELETED_FILE: &'static str = "/etc/wolfstack/deleted_nodes.json";
-    const SELF_CLUSTER_FILE: &'static str = "/etc/wolfstack/self_cluster.json";
+    fn nodes_file() -> String { crate::paths::get().nodes_config }
+    fn deleted_file() -> String { crate::paths::get().deleted_nodes_config }
+    fn self_cluster_file() -> String { crate::paths::get().self_cluster_config }
     const SELF_LOGIN_DISABLED_FILE: &'static str = "/etc/wolfstack/login_disabled";
 
     pub fn new(self_id: String, self_address: String, port: u16) -> Self {
@@ -182,7 +182,7 @@ impl ClusterState {
 
     /// Load saved remote nodes from disk
     fn load_nodes(&self) {
-        if let Ok(data) = std::fs::read_to_string(Self::NODES_FILE) {
+        if let Ok(data) = std::fs::read_to_string(&Self::nodes_file()) {
             if let Ok(saved) = serde_json::from_str::<Vec<Node>>(&data) {
                 let mut nodes = self.nodes.write().unwrap();
                 for mut node in saved {
@@ -206,8 +206,11 @@ impl ClusterState {
             .filter(|n| !n.is_self)
             .collect();
         if let Ok(json) = serde_json::to_string_pretty(&remote_nodes) {
-            let _ = std::fs::create_dir_all("/etc/wolfstack");
-            if let Err(e) = std::fs::write(Self::NODES_FILE, json) {
+            let path = Self::nodes_file();
+            if let Some(dir) = std::path::Path::new(&path).parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Err(e) = std::fs::write(&path, json) {
                 warn!("Failed to save nodes: {}", e);
             }
         }
@@ -435,7 +438,7 @@ impl ClusterState {
 
     /// Load tombstoned node IDs from disk
     fn load_deleted_ids(&self) {
-        if let Ok(data) = std::fs::read_to_string(Self::DELETED_FILE) {
+        if let Ok(data) = std::fs::read_to_string(&Self::deleted_file()) {
             if let Ok(ids) = serde_json::from_str::<Vec<String>>(&data) {
                 let mut deleted = self.deleted_ids.write().unwrap();
                 for id in ids {
@@ -451,8 +454,11 @@ impl ClusterState {
         let deleted = self.deleted_ids.read().unwrap();
         let ids: Vec<&String> = deleted.iter().collect();
         if let Ok(json) = serde_json::to_string_pretty(&ids) {
-            let _ = std::fs::create_dir_all("/etc/wolfstack");
-            if let Err(e) = std::fs::write(Self::DELETED_FILE, json) {
+            let path = Self::deleted_file();
+            if let Some(dir) = std::path::Path::new(&path).parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Err(e) = std::fs::write(&path, json) {
                 warn!("Failed to save deleted nodes: {}", e);
             }
         }
@@ -498,7 +504,7 @@ impl ClusterState {
 
     /// Load persisted self cluster_name from disk
     fn load_self_cluster_name() -> Option<String> {
-        if let Ok(data) = std::fs::read_to_string(Self::SELF_CLUSTER_FILE) {
+        if let Ok(data) = std::fs::read_to_string(&Self::self_cluster_file()) {
             if let Ok(name) = serde_json::from_str::<String>(&data) {
                 if !name.is_empty() {
                     return Some(name);
@@ -510,9 +516,12 @@ impl ClusterState {
 
     /// Persist self cluster_name to disk (survives reinstalls)
     pub fn save_self_cluster_name(name: &str) {
-        let _ = std::fs::create_dir_all("/etc/wolfstack");
+        let path = Self::self_cluster_file();
+        if let Some(dir) = std::path::Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         if let Ok(json) = serde_json::to_string(name) {
-            if let Err(e) = std::fs::write(Self::SELF_CLUSTER_FILE, json) {
+            if let Err(e) = std::fs::write(&path, json) {
                 warn!("Failed to save self cluster name: {}", e);
             }
         }

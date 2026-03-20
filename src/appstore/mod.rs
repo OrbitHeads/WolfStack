@@ -106,10 +106,10 @@ pub struct InstalledApp {
 
 // ─── Installed apps persistence ───
 
-const INSTALLED_FILE: &str = "/etc/wolfstack/appstore/installed.json";
+fn installed_file() -> String { crate::paths::get().appstore_installed }
 
 fn load_installed() -> Vec<InstalledApp> {
-    let mut installed: Vec<InstalledApp> = std::fs::read_to_string(INSTALLED_FILE)
+    let mut installed: Vec<InstalledApp> = std::fs::read_to_string(&installed_file())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
@@ -121,8 +121,8 @@ fn load_installed() -> Vec<InstalledApp> {
 }
 
 fn save_installed(apps: &[InstalledApp]) {
-    let _ = std::fs::create_dir_all("/etc/wolfstack/appstore");
-    let _ = std::fs::write(INSTALLED_FILE, serde_json::to_string_pretty(apps).unwrap_or_default());
+    let _ = std::fs::create_dir_all(&crate::paths::get().appstore_dir);
+    let _ = std::fs::write(&installed_file(), serde_json::to_string_pretty(apps).unwrap_or_default());
 }
 
 // ─── Public API ───
@@ -485,12 +485,13 @@ fn shell_escape(s: &str) -> String {
 
 // ─── Pending install registration ───
 
-const PENDING_DIR: &str = "/etc/wolfstack/appstore/pending";
+fn pending_dir() -> String { crate::paths::get().appstore_pending_dir }
 
 /// Merge any pending install registrations into the installed list.
 /// Called automatically by load_installed().
 fn merge_pending_installs(installed: &mut Vec<InstalledApp>) {
-    let pending_dir = std::path::Path::new(PENDING_DIR);
+    let pending_dir_str = pending_dir();
+    let pending_dir = std::path::Path::new(&pending_dir_str);
     if !pending_dir.is_dir() { return; }
 
     let entries: Vec<_> = match std::fs::read_dir(pending_dir) {
@@ -797,12 +798,13 @@ pub fn prepare_install(
     };
     let pending_json = serde_json::to_string_pretty(&installed_app).unwrap_or_default();
 
+    let pdir = pending_dir();
     script.push_str(&format!(
-        "# Register the installation\nmkdir -p {}\n", PENDING_DIR
+        "# Register the installation\nmkdir -p {}\n", pdir
     ));
     script.push_str(&format!(
         "cat > {}/{}.json << 'WOLFSTACK_REGISTER'\n{}\nWOLFSTACK_REGISTER\n\n",
-        PENDING_DIR, session_id, pending_json
+        pdir, session_id, pending_json
     ));
 
     script.push_str("echo ''\n");

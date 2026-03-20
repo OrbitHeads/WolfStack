@@ -38,11 +38,12 @@ pub fn default_cluster_secret() -> &'static str {
 /// Path for user-generated custom cluster secrets (via Settings → Security).
 /// Note: /etc/wolfstack/cluster-secret may contain leftover per-installation
 /// secrets from v11.26.3 — we deliberately use a different path to avoid loading those.
-const CUSTOM_SECRET_PATH: &str = "/etc/wolfstack/custom-cluster-secret";
+fn custom_secret_path() -> String { crate::paths::get().cluster_secret }
 
 /// Load the active cluster secret — custom from file if present, otherwise the built-in default
 pub fn load_cluster_secret() -> String {
-    let path = std::path::Path::new(CUSTOM_SECRET_PATH);
+    let path_str = custom_secret_path();
+    let path = std::path::Path::new(&path_str);
     if let Ok(secret) = std::fs::read_to_string(path) {
         let secret = secret.trim().to_string();
         if !secret.is_empty() {
@@ -69,8 +70,11 @@ pub fn generate_cluster_secret() -> String {
 
 /// Save a cluster secret to the custom secret file
 pub fn save_cluster_secret(secret: &str) -> Result<(), String> {
-    let _ = std::fs::create_dir_all("/etc/wolfstack");
-    std::fs::write(CUSTOM_SECRET_PATH, secret)
+    let path = custom_secret_path();
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&path, secret)
         .map_err(|e| format!("Cannot write custom-cluster-secret: {}", e))
 }
 

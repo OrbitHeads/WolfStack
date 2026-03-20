@@ -3210,6 +3210,7 @@
                         <button class="settings-tab-btn" onclick="switchSettingsTab('ai')">🤖 AI Agent</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('backup')">📦 Config Backup</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('security')">🔐 Security</button>
+                        <button class="settings-tab-btn" onclick="switchSettingsTab('paths')">📂 File Locations</button>
                     </div>
                 </div>
                 <div class="card-body" style="padding:24px;">
@@ -3898,6 +3899,18 @@
                             </div>
                         </div>
                         <div id="cluster-secret-results" style="margin-top:16px;display:none;">
+                        </div>
+                    </div>
+
+                    <!-- ─── File Locations Tab ─── -->
+                    <div id="settings-tab-paths" class="settings-tab-panel">
+                        <h4 style="margin:0 0 8px 0;font-size:16px;font-weight:600;">File Locations</h4>
+                        <p style="font-size:13px;color:var(--text-muted);margin:0 0 20px 0;">
+                            Configure where WolfStack stores configuration, data, backups, and temporary files.
+                            Changes take effect after a restart. Defaults are shown — only change if you know what you're doing.
+                        </p>
+                        <div id="paths-form" style="max-width:700px;">
+                            <div style="color:var(--text-muted);text-align:center;padding:20px;">Loading...</div>
                         </div>
                     </div>
 

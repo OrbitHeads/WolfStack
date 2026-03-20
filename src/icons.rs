@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use tracing::info;
 
 /// Where custom-installed icon packs are stored
-const ICON_PACKS_DIR: &str = "/etc/wolfstack/icon-packs";
+fn icon_packs_dir() -> String { crate::paths::get().icon_packs_dir }
 
 /// Standard system icon theme paths to scan
 const SYSTEM_ICON_DIRS: &[&str] = &[
@@ -368,7 +368,8 @@ pub fn scan_all_packs() -> Vec<IconPack> {
     }
 
     // Custom-installed packs
-    let custom_dir = Path::new(ICON_PACKS_DIR);
+    let icon_packs = icon_packs_dir();
+    let custom_dir = Path::new(&icon_packs);
     if custom_dir.exists() {
         packs.extend(scan_icon_dir(custom_dir, "custom"));
     }
@@ -402,7 +403,7 @@ pub async fn install_from_github(url: &str) -> Result<IconPack, String> {
         .ok_or("Could not parse repository name from URL")?
         .to_string();
 
-    let install_dir = PathBuf::from(ICON_PACKS_DIR);
+    let install_dir = PathBuf::from(icon_packs_dir());
     let dest = install_dir.join(&repo_name);
 
     if dest.exists() {
@@ -513,12 +514,13 @@ pub async fn install_from_github(url: &str) -> Result<IconPack, String> {
 
 /// Remove a custom-installed icon pack
 pub fn remove_pack(pack_id: &str) -> Result<(), String> {
-    let dest = PathBuf::from(ICON_PACKS_DIR).join(pack_id);
+    let icon_packs = icon_packs_dir();
+    let dest = PathBuf::from(&icon_packs).join(pack_id);
     if !dest.exists() {
         return Err(format!("Icon pack '{}' not found", pack_id));
     }
     // Safety: only allow removing from our managed directory
-    if !dest.starts_with(ICON_PACKS_DIR) {
+    if !dest.starts_with(&icon_packs) {
         return Err("Cannot remove system icon themes".into());
     }
     std::fs::remove_dir_all(&dest)

@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::process::Command;
 use tracing::{error, info};
 
-const CONFIG_PATH: &str = "/etc/wolfstack/ceph.json";
+fn config_path() -> String { crate::paths::get().ceph_config }
 
 // ─── Data Types ───
 
@@ -198,7 +198,7 @@ pub struct CephConfig {
 
 #[allow(dead_code)]
 pub fn load_config() -> CephConfig {
-    match std::fs::read_to_string(CONFIG_PATH) {
+    match std::fs::read_to_string(&config_path()) {
         Ok(content) => serde_json::from_str(&content).unwrap_or_else(|e| {
             error!("Failed to parse ceph config: {}", e);
             CephConfig::default()
@@ -208,10 +208,11 @@ pub fn load_config() -> CephConfig {
 }
 
 pub fn save_config(config: &CephConfig) -> Result<(), String> {
-    let dir = std::path::Path::new(CONFIG_PATH).parent().unwrap();
+    let path = config_path();
+    let dir = std::path::Path::new(&path).parent().unwrap();
     std::fs::create_dir_all(dir).map_err(|e| format!("mkdir: {}", e))?;
     let json = serde_json::to_string_pretty(config).map_err(|e| format!("serialize: {}", e))?;
-    std::fs::write(CONFIG_PATH, json).map_err(|e| format!("write: {}", e))?;
+    std::fs::write(&path, json).map_err(|e| format!("write: {}", e))?;
     Ok(())
 }
 

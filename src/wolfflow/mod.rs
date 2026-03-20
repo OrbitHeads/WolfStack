@@ -20,9 +20,9 @@ use crate::agent::ClusterState;
 
 // ─── Constants ───
 
-const WOLFFLOW_DIR: &str = "/etc/wolfstack/wolfflow";
-const WORKFLOWS_FILE: &str = "/etc/wolfstack/wolfflow/workflows.json";
-const RUNS_FILE: &str = "/etc/wolfstack/wolfflow/runs.json";
+fn wolfflow_dir() -> String { crate::paths::get().wolfflow_dir }
+fn workflows_file() -> String { crate::paths::get().wolfflow_workflows }
+fn runs_file() -> String { crate::paths::get().wolfflow_runs }
 
 /// Maximum number of runs to keep in history
 const MAX_RUNS: usize = 500;
@@ -228,7 +228,7 @@ impl WolfFlowState {
     // ─── Persistence ───
 
     fn load_workflows(&self) {
-        if let Ok(data) = std::fs::read_to_string(WORKFLOWS_FILE) {
+        if let Ok(data) = std::fs::read_to_string(&workflows_file()) {
             if let Ok(wfs) = serde_json::from_str::<Vec<Workflow>>(&data) {
                 let mut workflows = self.workflows.write().unwrap();
                 *workflows = wfs;
@@ -239,15 +239,15 @@ impl WolfFlowState {
     fn save_workflows(&self) {
         let wfs = self.workflows.read().unwrap();
         if let Ok(json) = serde_json::to_string_pretty(&*wfs) {
-            let _ = std::fs::create_dir_all(WOLFFLOW_DIR);
-            if let Err(e) = std::fs::write(WORKFLOWS_FILE, json) {
+            let _ = std::fs::create_dir_all(&wolfflow_dir());
+            if let Err(e) = std::fs::write(&workflows_file(), json) {
                 warn!("WolfFlow: failed to save workflows: {}", e);
             }
         }
     }
 
     fn load_runs(&self) {
-        if let Ok(data) = std::fs::read_to_string(RUNS_FILE) {
+        if let Ok(data) = std::fs::read_to_string(&runs_file()) {
             if let Ok(runs) = serde_json::from_str::<Vec<WorkflowRun>>(&data) {
                 let mut r = self.runs.write().unwrap();
                 *r = runs;
@@ -258,8 +258,8 @@ impl WolfFlowState {
     fn save_runs(&self) {
         let runs = self.runs.read().unwrap();
         if let Ok(json) = serde_json::to_string_pretty(&*runs) {
-            let _ = std::fs::create_dir_all(WOLFFLOW_DIR);
-            if let Err(e) = std::fs::write(RUNS_FILE, json) {
+            let _ = std::fs::create_dir_all(&wolfflow_dir());
+            if let Err(e) = std::fs::write(&runs_file(), json) {
                 warn!("WolfFlow: failed to save runs: {}", e);
             }
         }

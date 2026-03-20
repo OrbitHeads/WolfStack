@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 
-const CONFIG_FILE: &str = "/etc/wolfstack/statuspage.json";
+fn config_file() -> String { crate::paths::get().statuspage_config }
+fn uptime_file() -> String { crate::paths::get().statuspage_uptime }
 
 // ═══════════════════════════════════════════════
 // ─── Data Types ───
@@ -183,16 +184,20 @@ impl Default for StatusPageConfig {
 
 impl StatusPageConfig {
     pub fn load() -> Self {
-        match std::fs::read_to_string(CONFIG_FILE) {
+        let path = config_file();
+        match std::fs::read_to_string(&path) {
             Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
             Err(_) => Self::default(),
         }
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let _ = std::fs::create_dir_all("/etc/wolfstack");
+        let path = config_file();
+        if let Some(dir) = std::path::Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(CONFIG_FILE, json).map_err(|e| e.to_string())
+        std::fs::write(&path, json).map_err(|e| e.to_string())
     }
 
     /// Rename all cluster references from old_name to new_name.
@@ -335,14 +340,17 @@ impl StatusPageState {
     }
 
     fn save_daily_uptime_data(data: &HashMap<String, VecDeque<DailyUptime>>) {
-        let _ = std::fs::create_dir_all("/etc/wolfstack");
+        let path = uptime_file();
+        if let Some(dir) = std::path::Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         if let Ok(json) = serde_json::to_string(data) {
-            let _ = std::fs::write("/etc/wolfstack/statuspage-uptime.json", json);
+            let _ = std::fs::write(&path, json);
         }
     }
 
     fn load_daily_uptime() -> HashMap<String, VecDeque<DailyUptime>> {
-        match std::fs::read_to_string("/etc/wolfstack/statuspage-uptime.json") {
+        match std::fs::read_to_string(&uptime_file()) {
             Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
             Err(_) => HashMap::new(),
         }

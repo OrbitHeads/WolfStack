@@ -17,7 +17,7 @@ use tracing::warn;
 use std::process::Command as StdCommand;
 use std::time::Duration;
 
-const AI_CONFIG_PATH: &str = "/etc/wolfstack/ai-config.json";
+fn ai_config_path() -> String { crate::paths::get().ai_config }
 const KNOWLEDGE_DIR: &str = "/opt/wolfscale/web";
 const KNOWLEDGE_DIR_DEV: &str = "../wolfscale/web";
 
@@ -66,17 +66,18 @@ impl Default for AiConfig {
 
 impl AiConfig {
     pub fn load() -> Self {
-        match std::fs::read_to_string(AI_CONFIG_PATH) {
+        match std::fs::read_to_string(&ai_config_path()) {
             Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
             Err(_) => Self::default(),
         }
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let dir = std::path::Path::new(AI_CONFIG_PATH).parent().unwrap();
+        let path = ai_config_path();
+        let dir = std::path::Path::new(&path).parent().unwrap();
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(AI_CONFIG_PATH, json).map_err(|e| e.to_string())
+        std::fs::write(&path, json).map_err(|e| e.to_string())
     }
 
     /// Return config with API keys masked for frontend display

@@ -18,8 +18,8 @@ use tracing::{error, warn};
 use chrono::{Utc, Datelike};
 use uuid::Uuid;
 
-const BACKUP_CONFIG_PATH: &str = "/etc/wolfstack/backups.json";
-const BACKUP_STAGING_DIR: &str = "/tmp/wolfstack-backups";
+fn backup_config_path() -> String { crate::paths::get().backup_config }
+fn backup_staging_dir() -> String { crate::paths::get().backup_staging_dir }
 
 // ─── Data Types ───
 
@@ -290,18 +290,19 @@ impl Default for BackupConfig {
 // ─── Config Persistence ───
 
 pub fn load_config() -> BackupConfig {
-    match fs::read_to_string(BACKUP_CONFIG_PATH) {
+    match fs::read_to_string(&backup_config_path()) {
         Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
         Err(_) => BackupConfig::default(),
     }
 }
 
 pub fn save_config(config: &BackupConfig) -> Result<(), String> {
-    let dir = Path::new(BACKUP_CONFIG_PATH).parent().unwrap();
+    let path = backup_config_path();
+    let dir = Path::new(&path).parent().unwrap();
     fs::create_dir_all(dir).map_err(|e| format!("Failed to create config dir: {}", e))?;
     let json = serde_json::to_string_pretty(config)
         .map_err(|e| format!("Failed to serialize backup config: {}", e))?;
-    fs::write(BACKUP_CONFIG_PATH, json)
+    fs::write(&path, json)
         .map_err(|e| format!("Failed to write backup config: {}", e))
 }
 
@@ -309,7 +310,7 @@ pub fn save_config(config: &BackupConfig) -> Result<(), String> {
 
 /// Create staging directory
 fn ensure_staging_dir() -> Result<PathBuf, String> {
-    let path = PathBuf::from(BACKUP_STAGING_DIR);
+    let path = PathBuf::from(backup_staging_dir());
     fs::create_dir_all(&path).map_err(|e| format!("Failed to create staging dir: {}", e))?;
     Ok(path)
 }
@@ -748,7 +749,7 @@ fn local_hostname() -> String {
 /// Get the local cluster name from /etc/wolfstack/self_cluster.json
 /// Used as fallback when cluster name isn't passed from the API layer
 pub fn local_cluster_name() -> String {
-    std::fs::read_to_string("/etc/wolfstack/self_cluster.json")
+    std::fs::read_to_string(&crate::paths::get().self_cluster_config)
         .ok()
         .and_then(|data| serde_json::from_str::<String>(&data).ok())
         .filter(|s| !s.is_empty())
@@ -2334,11 +2335,11 @@ pub fn check_schedules() {
 
 /// Receive a backup file from a remote node — save to local storage
 pub fn import_backup(data: &[u8], filename: &str) -> Result<String, String> {
-    let dest_dir = "/var/lib/wolfstack/backups/received";
-    fs::create_dir_all(dest_dir)
+    let dest_dir = crate::paths::get().backup_received_dir;
+    fs::create_dir_all(&dest_dir)
         .map_err(|e| format!("Failed to create import dir: {}", e))?;
 
-    let dest = Path::new(dest_dir).join(filename);
+    let dest = Path::new(&dest_dir).join(filename);
     fs::write(&dest, data)
         .map_err(|e| format!("Failed to write imported backup: {}", e))?;
 
@@ -2354,7 +2355,7 @@ pub fn import_backup(data: &[u8], filename: &str) -> Result<String, String> {
             name: extract_name_from_filename(filename),
             hostname: None, state: None, specs: None,
         },
-        storage: BackupStorage::local(dest_dir),
+        storage: BackupStorage::local(&dest_dir),
         filename: filename.to_string(),
         size_bytes: size as u64,
         created_at: Utc::now().to_rfc3339(),

@@ -37,6 +37,7 @@ mod kubernetes;
 mod icons;
 mod tui;
 mod wolfflow;
+mod paths;
 
 use actix_web::{web, App, HttpServer, HttpRequest, HttpResponse};
 use actix_files;
@@ -138,13 +139,15 @@ async fn main() -> std::io::Result<()> {
     }
 
     // Load or generate node ID
-    let node_id_file = "/etc/wolfstack/node_id";
-    let node_id = if let Ok(content) = std::fs::read_to_string(node_id_file) {
+    let node_id_file = paths::get().node_id_file;
+    let node_id = if let Ok(content) = std::fs::read_to_string(&node_id_file) {
         content.trim().to_string()
     } else {
         let id = format!("ws-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-        let _ = std::fs::create_dir_all("/etc/wolfstack");
-        if let Err(e) = std::fs::write(node_id_file, &id) {
+        if let Some(dir) = std::path::Path::new(&node_id_file).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = std::fs::write(&node_id_file, &id) {
             tracing::error!("Failed to persist node ID: {}", e);
         }
         id
@@ -162,7 +165,7 @@ async fn main() -> std::io::Result<()> {
     info!("  (C)Copyright Wolf Software Systems Ltd — https://wolf.uk.com");
     info!("  By Paul Clevett and my mate Claude - I have Autism");
     // Seed LXC storage paths from any mounted storage that has LXC containers
-    if let Ok(entries) = std::fs::read_dir("/mnt/wolfstack") {
+    if let Ok(entries) = std::fs::read_dir(&paths::get().storage_mount_base) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -312,6 +315,7 @@ async fn main() -> std::io::Result<()> {
             wireguard_bridges: Arc::new(std::sync::RwLock::new(networking::load_wireguard_bridges())),
             patreon: Arc::new(patreon::PatreonState::new()),
             migration_tasks: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            alert_log: Arc::new(std::sync::RwLock::new(Vec::new())),
         });
 
         // Background: periodic self-monitoring update
@@ -543,6 +547,32 @@ async fn main() -> std::io::Result<()> {
 
                         // Sort by cluster name, then hostname (alphabetical)
                         all_issues.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+                        // Write critical and warning issues to the alert log (surfaced in frontend Tasks window)
+                        {
+                            let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string();
+                            let mut log = scan_state.alert_log.write().unwrap();
+                            let mut next_id = log.last().map(|e| e.id + 1).unwrap_or(1);
+                            for (cluster, host, issue) in &all_issues {
+                                if issue.severity == "critical" || issue.severity == "warning" {
+                                    log.push(api::AlertLogEntry {
+                                        id: next_id,
+                                        timestamp: now.clone(),
+                                        severity: issue.severity.clone(),
+                                        title: issue.title.clone(),
+                                        detail: issue.detail.clone(),
+                                        hostname: host.clone(),
+                                        cluster: cluster.clone(),
+                                    });
+                                    next_id += 1;
+                                }
+                            }
+                            // Keep only the last 200 entries
+                            if log.len() > 200 {
+                                let drain = log.len() - 200;
+                                log.drain(..drain);
+                            }
+                        }
 
                         let critical_count = all_issues.iter().filter(|(_, _, i)| i.severity == "critical").count();
                         let warning_count = all_issues.iter().filter(|(_, _, i)| i.severity == "warning").count();

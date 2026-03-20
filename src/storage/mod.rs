@@ -21,7 +21,7 @@ use std::process::Command;
 use tracing::{warn, error};
 use chrono::Utc;
 
-const CONFIG_PATH: &str = "/etc/wolfstack/storage.json";
+fn config_path() -> String { crate::paths::get().storage_config }
 const MOUNT_BASE: &str = "/mnt/wolfstack";
 
 // ─── Data Types ───
@@ -93,7 +93,7 @@ impl Default for StorageConfig {
 // ─── Config Persistence ───
 
 pub fn load_config() -> StorageConfig {
-    match fs::read_to_string(CONFIG_PATH) {
+    match fs::read_to_string(&config_path()) {
         Ok(content) => {
             serde_json::from_str(&content).unwrap_or_else(|e| {
                 error!("Failed to parse storage config: {}", e);
@@ -106,12 +106,13 @@ pub fn load_config() -> StorageConfig {
 
 pub fn save_config(config: &StorageConfig) -> Result<(), String> {
     // Ensure directory exists
-    let dir = Path::new(CONFIG_PATH).parent().unwrap();
+    let path = config_path();
+    let dir = Path::new(&path).parent().unwrap();
     fs::create_dir_all(dir).map_err(|e| format!("Failed to create config dir: {}", e))?;
-    
+
     let json = serde_json::to_string_pretty(config)
         .map_err(|e| format!("Failed to serialize config: {}", e))?;
-    fs::write(CONFIG_PATH, json)
+    fs::write(&path, json)
         .map_err(|e| format!("Failed to write config: {}", e))?;
     Ok(())
 }
@@ -448,8 +449,8 @@ fn mount_s3(mount: &StorageMount) -> Result<String, String> {
 /// Mount S3 using s3fs-fuse — fast, native, handles offline endpoints gracefully
 fn mount_s3_via_s3fs(mount: &StorageMount, s3: &S3Config) -> Result<String, String> {
     // Write credentials file: access_key:secret_key
-    let creds_dir = "/etc/wolfstack/s3";
-    fs::create_dir_all(creds_dir)
+    let creds_dir = crate::paths::get().s3_credentials_dir;
+    fs::create_dir_all(&creds_dir)
         .map_err(|e| format!("Failed to create credentials dir: {}", e))?;
     
     let creds_path = format!("{}/{}.passwd", creds_dir, mount.id);

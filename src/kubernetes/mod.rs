@@ -17,7 +17,7 @@ use std::process::Command;
 fn default_true() -> bool { true }
 use tracing::{error, info, warn};
 
-const CONFIG_FILE: &str = "/etc/wolfstack/kubernetes.json";
+fn config_file() -> String { crate::paths::get().kubernetes_config }
 
 // ═══════════════════════════════════════════════
 // ─── Data Types ───
@@ -216,18 +216,19 @@ impl Default for KubernetesConfig {
 // ═══════════════════════════════════════════════
 
 pub fn load_config() -> KubernetesConfig {
-    match fs::read_to_string(CONFIG_FILE) {
+    match fs::read_to_string(&config_file()) {
         Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
         Err(_) => KubernetesConfig::default(),
     }
 }
 
 pub fn save_config(config: &KubernetesConfig) -> Result<(), String> {
-    let dir = Path::new(CONFIG_FILE).parent().unwrap();
+    let path = config_file();
+    let dir = Path::new(&path).parent().unwrap();
     fs::create_dir_all(dir).map_err(|e| format!("Failed to create config dir: {}", e))?;
     let json = serde_json::to_string_pretty(config)
         .map_err(|e| format!("Failed to serialize kubernetes config: {}", e))?;
-    fs::write(CONFIG_FILE, json)
+    fs::write(&path, json)
         .map_err(|e| format!("Failed to write kubernetes config: {}", e))
 }
 
@@ -1422,7 +1423,7 @@ fn find_available_k8s_wolfnet_ip(config: &KubernetesConfig) -> Option<String> {
     }
 
     // WolfRun service VIPs and route cache
-    if let Ok(content) = fs::read_to_string("/etc/wolfstack/wolfrun/services.json") {
+    if let Ok(content) = fs::read_to_string(&crate::paths::get().wolfrun_services) {
         if let Ok(services) = serde_json::from_str::<Vec<serde_json::Value>>(&content) {
             for svc in &services {
                 if let Some(vip) = svc.get("service_ip").and_then(|v| v.as_str()) {
@@ -2289,10 +2290,11 @@ pub fn get_cluster_status(kubeconfig: &str) -> K8sClusterStatus {
     let nodes_total = nodes.len() as u32;
     let nodes_ready = nodes.iter().filter(|n| n.status == "Ready").count() as u32;
 
-    // Get pods
+    // Get pods (exclude Succeeded/Completed — these are finished Jobs/init containers)
     let pods = if insecure { get_pods_insecure(kc, None) } else { get_pods(kc, None) };
-    let pods_total = pods.len() as u32;
-    let pods_running = pods.iter().filter(|p| p.status == "Running").count() as u32;
+    let active_pods: Vec<_> = pods.iter().filter(|p| p.status != "Succeeded").collect();
+    let pods_total = active_pods.len() as u32;
+    let pods_running = active_pods.iter().filter(|p| p.status == "Running").count() as u32;
 
     // Get namespaces
     let namespaces = if insecure {

@@ -150,9 +150,9 @@ fn default_lb_policy() -> String { "round_robin".to_string() }
 
 // ─── State Management ───
 
-const SERVICES_DIR: &str = "/etc/wolfstack/wolfrun";
-const SERVICES_FILE: &str = "/etc/wolfstack/wolfrun/services.json";
-const FAILOVER_EVENTS_FILE: &str = "/etc/wolfstack/wolfrun/failover-events.json";
+fn services_dir() -> String { crate::paths::get().wolfrun_dir }
+fn services_file() -> String { crate::paths::get().wolfrun_services }
+fn failover_events_file() -> String { crate::paths::get().wolfrun_failover_events }
 
 /// Shared WolfRun state
 pub struct WolfRunState {
@@ -173,7 +173,7 @@ impl WolfRunState {
 
     /// Load services from disk
     fn load(&self) {
-        if let Ok(data) = std::fs::read_to_string(SERVICES_FILE) {
+        if let Ok(data) = std::fs::read_to_string(&services_file()) {
             if let Ok(services) = serde_json::from_str::<Vec<WolfRunService>>(&data) {
                 let mut svcs = self.services.write().unwrap();
                 *svcs = services;
@@ -186,8 +186,8 @@ impl WolfRunState {
     fn save(&self) {
         let svcs = self.services.read().unwrap();
         if let Ok(json) = serde_json::to_string_pretty(&*svcs) {
-            let _ = std::fs::create_dir_all(SERVICES_DIR);
-            if let Err(e) = std::fs::write(SERVICES_FILE, json) {
+            let _ = std::fs::create_dir_all(&services_dir());
+            if let Err(e) = std::fs::write(&services_file(), json) {
                 warn!("WolfRun: failed to save services: {}", e);
             }
         }
@@ -195,7 +195,7 @@ impl WolfRunState {
 
     /// Load failover events from disk
     fn load_failover_events(&self) {
-        if let Ok(data) = std::fs::read_to_string(FAILOVER_EVENTS_FILE) {
+        if let Ok(data) = std::fs::read_to_string(&failover_events_file()) {
             if let Ok(events) = serde_json::from_str::<Vec<FailoverEvent>>(&data) {
                 let mut evts = self.failover_events.write().unwrap();
                 *evts = events;
@@ -207,8 +207,8 @@ impl WolfRunState {
     fn save_failover_events(&self) {
         let evts = self.failover_events.read().unwrap();
         if let Ok(json) = serde_json::to_string_pretty(&*evts) {
-            let _ = std::fs::create_dir_all(SERVICES_DIR);
-            if let Err(e) = std::fs::write(FAILOVER_EVENTS_FILE, json) {
+            let _ = std::fs::create_dir_all(&services_dir());
+            if let Err(e) = std::fs::write(&failover_events_file(), json) {
                 warn!("WolfRun: failed to save failover events: {}", e);
             }
         }

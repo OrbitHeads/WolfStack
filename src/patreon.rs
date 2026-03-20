@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 use std::sync::RwLock;
 
-const CONFIG_PATH: &str = "/etc/wolfstack/patreon.json";
+fn config_path() -> String { crate::paths::get().patreon_config }
 
 /// Public client ID — safe to embed (visible in OAuth URLs anyway).
 const PATREON_CLIENT_ID: &str = "NawRwaiiX2WMqOuin7Tp0t8KTsarYTbi4g4e-C2Ab75QrdXjbN_6nx5JN73i6JVN";
@@ -106,17 +106,18 @@ impl Default for PatreonConfig {
 
 impl PatreonConfig {
     pub fn load() -> Self {
-        match std::fs::read_to_string(CONFIG_PATH) {
+        match std::fs::read_to_string(&config_path()) {
             Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
             Err(_) => Self::default(),
         }
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let dir = std::path::Path::new(CONFIG_PATH).parent().unwrap();
+        let path = config_path();
+        let dir = std::path::Path::new(&path).parent().unwrap();
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(CONFIG_PATH, json).map_err(|e| e.to_string())
+        std::fs::write(&path, json).map_err(|e| e.to_string())
     }
 }
 

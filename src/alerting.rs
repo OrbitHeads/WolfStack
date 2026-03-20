@@ -3,7 +3,7 @@ use tracing::warn;
 use std::collections::HashMap;
 use std::time::Instant;
 
-const ALERTS_CONFIG_FILE: &str = "/etc/wolfstack/alerts.json";
+fn alerts_config_file() -> String { crate::paths::get().alerts_config }
 
 /// Cooldown duration — same alert type for the same node won't re-fire within this window
 const ALERT_COOLDOWN_SECS: u64 = 15 * 60; // 15 minutes
@@ -174,7 +174,8 @@ impl Default for AlertConfig {
 impl AlertConfig {
     /// Load config from disk or return defaults
     pub fn load() -> Self {
-        match std::fs::read_to_string(ALERTS_CONFIG_FILE) {
+        let path = alerts_config_file();
+        match std::fs::read_to_string(&path) {
             Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
             Err(_) => Self::default(),
         }
@@ -182,9 +183,12 @@ impl AlertConfig {
 
     /// Save config to disk
     pub fn save(&self) -> Result<(), String> {
-        let _ = std::fs::create_dir_all("/etc/wolfstack");
+        let path = alerts_config_file();
+        if let Some(dir) = std::path::Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(ALERTS_CONFIG_FILE, json).map_err(|e| format!("Failed to write alerts config: {}", e))
+        std::fs::write(&path, json).map_err(|e| format!("Failed to write alerts config: {}", e))
     }
 
     /// Check if any notification channel is configured

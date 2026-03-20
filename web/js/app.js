@@ -8884,6 +8884,32 @@ setInterval(fetchNodes, POLL_INTERVAL);
 // Refresh k8s badge counts every 60 seconds
 setInterval(() => refreshK8sPodBadgeCounts(), 60000);
 
+// ─── Alert Log Polling (surfaces scan alerts to Tasks window) ───
+let _lastAlertId = 0;
+async function pollAlerts() {
+    try {
+        const resp = await fetch('/api/alerts?since=' + _lastAlertId);
+        if (!resp.ok) return;
+        const data = await resp.json();
+        if (data.alerts && data.alerts.length > 0) {
+            for (const alert of data.alerts) {
+                const status = alert.severity === 'critical' ? 'failed' : 'warning';
+                addTaskLogEntry({
+                    cluster: alert.cluster,
+                    node: alert.hostname,
+                    description: alert.title + (alert.detail ? ' — ' + alert.detail : ''),
+                    status: status,
+                    type: alert.severity,
+                });
+                if (alert.id > _lastAlertId) _lastAlertId = alert.id;
+            }
+        }
+    } catch (e) { /* ignore fetch errors */ }
+}
+// Poll every 30 seconds, first poll after 10s
+setTimeout(pollAlerts, 10000);
+setInterval(pollAlerts, 30000);
+
 // ─── Container Management ───
 
 let dockerStats = {};
@@ -20798,6 +20824,108 @@ function switchSettingsTab(tabName) {
         loadAlertingConfig();
     } else if (tabName === 'security') {
         loadClusterSecretStatus();
+    } else if (tabName === 'paths') {
+        loadFileLocations();
+    }
+}
+
+// ─── File Locations Settings ───
+
+const _pathFields = [
+    { key: 'config_dir', label: 'Config Directory', group: 'Core' },
+    { key: 'node_id_file', label: 'Node ID File', group: 'Core' },
+    { key: 'tls_cert', label: 'TLS Certificate', group: 'Core' },
+    { key: 'tls_key', label: 'TLS Private Key', group: 'Core' },
+    { key: 'cluster_secret', label: 'Cluster Secret File', group: 'Core' },
+    { key: 'web_dir', label: 'Web UI Directory', group: 'Core' },
+    { key: 'nodes_config', label: 'Nodes Config', group: 'Cluster' },
+    { key: 'deleted_nodes_config', label: 'Deleted Nodes Config', group: 'Cluster' },
+    { key: 'self_cluster_config', label: 'Self Cluster Config', group: 'Cluster' },
+    { key: 'ip_mappings', label: 'IP Mappings', group: 'Cluster' },
+    { key: 'backup_config', label: 'Backup Config', group: 'Backup' },
+    { key: 'backup_staging_dir', label: 'Backup Staging Directory', group: 'Backup' },
+    { key: 'backup_received_dir', label: 'Backup Received Directory', group: 'Backup' },
+    { key: 'pbs_config', label: 'PBS Config', group: 'Backup' },
+    { key: 'storage_config', label: 'Storage Config', group: 'Storage' },
+    { key: 'storage_mount_base', label: 'Mount Base Directory', group: 'Storage' },
+    { key: 's3_credentials_dir', label: 'S3 Credentials Directory', group: 'Storage' },
+    { key: 's3_cache_dir', label: 'S3 Cache Directory', group: 'Storage' },
+    { key: 'vms_dir', label: 'VMs Directory', group: 'VMs' },
+    { key: 'alerts_config', label: 'Alerts Config', group: 'Monitoring' },
+    { key: 'statuspage_config', label: 'Status Page Config', group: 'Monitoring' },
+    { key: 'statuspage_uptime', label: 'Status Page Uptime Data', group: 'Monitoring' },
+    { key: 'ai_config', label: 'AI Config', group: 'Monitoring' },
+    { key: 'wolfrun_dir', label: 'WolfRun Directory', group: 'Orchestration' },
+    { key: 'wolfrun_services', label: 'WolfRun Services Config', group: 'Orchestration' },
+    { key: 'wolfrun_failover_events', label: 'WolfRun Failover Events', group: 'Orchestration' },
+    { key: 'wolfflow_dir', label: 'WolfFlow Directory', group: 'Automation' },
+    { key: 'wolfflow_workflows', label: 'WolfFlow Workflows', group: 'Automation' },
+    { key: 'wolfflow_runs', label: 'WolfFlow Run History', group: 'Automation' },
+    { key: 'kubernetes_config', label: 'Kubernetes Config', group: 'Kubernetes' },
+    { key: 'appstore_dir', label: 'App Store Directory', group: 'App Store' },
+    { key: 'appstore_installed', label: 'App Store Installed Apps', group: 'App Store' },
+    { key: 'appstore_pending_dir', label: 'App Store Pending Directory', group: 'App Store' },
+    { key: 'ceph_config', label: 'Ceph Config', group: 'Ceph' },
+    { key: 'lxc_paths', label: 'LXC Paths Config', group: 'Containers' },
+    { key: 'cluster_containers_dir', label: 'Cluster Containers Directory', group: 'Containers' },
+    { key: 'icon_packs_dir', label: 'Icon Packs Directory', group: 'UI' },
+    { key: 'patreon_config', label: 'Patreon Config', group: 'UI' },
+];
+
+async function loadFileLocations() {
+    const container = document.getElementById('paths-form');
+    if (!container) return;
+    try {
+        const resp = await fetch('/api/settings/paths');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data = await resp.json();
+
+        let html = '';
+        let currentGroup = '';
+        for (const field of _pathFields) {
+            if (field.group !== currentGroup) {
+                currentGroup = field.group;
+                html += `<div style="margin-top:${html ? '24' : '0'}px;margin-bottom:8px;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-muted);border-bottom:1px solid var(--border);padding-bottom:6px;">${currentGroup}</div>`;
+            }
+            const val = data[field.key] || '';
+            html += `<div style="display:grid;grid-template-columns:200px 1fr;gap:8px;align-items:center;margin-bottom:6px;">
+                <label style="font-size:13px;color:var(--text-secondary);white-space:nowrap;">${field.label}</label>
+                <input type="text" id="path-${field.key}" value="${val.replace(/"/g, '&quot;')}"
+                    style="font-size:13px;padding:6px 10px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:var(--font-mono, monospace);">
+            </div>`;
+        }
+        html += `<div style="margin-top:20px;display:flex;gap:8px;">
+            <button class="btn btn-primary" onclick="saveFileLocations()">Save File Locations</button>
+            <button class="btn" onclick="loadFileLocations()" style="background:var(--bg-tertiary);color:var(--text-primary);border:1px solid var(--border);">Reset</button>
+        </div>
+        <p style="font-size:12px;color:var(--text-muted);margin-top:12px;">Changes require a WolfStack restart to take effect. Existing files are not moved automatically.</p>`;
+        container.innerHTML = html;
+    } catch (e) {
+        container.innerHTML = `<div style="color:var(--danger);padding:20px;">Failed to load file locations: ${e.message}</div>`;
+    }
+}
+
+async function saveFileLocations() {
+    const payload = {};
+    for (const field of _pathFields) {
+        const input = document.getElementById('path-' + field.key);
+        if (input) payload[field.key] = input.value.trim();
+    }
+    try {
+        const resp = await fetch('/api/settings/paths', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+        if (data.success) {
+            showToast('File locations saved. Restart WolfStack for changes to take effect.', 'success');
+            taskLog('File locations updated');
+        } else {
+            showToast('Failed to save: ' + (data.error || 'Unknown error'), 'error');
+        }
+    } catch (e) {
+        showToast('Failed to save file locations: ' + e.message, 'error');
     }
 }
 

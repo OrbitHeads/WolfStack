@@ -121,6 +121,19 @@ pub struct AppState {
     pub patreon: Arc<crate::patreon::PatreonState>,
     /// Migration task progress tracker
     pub migration_tasks: Arc<std::sync::RwLock<std::collections::HashMap<String, MigrationTask>>>,
+    /// Alert log — recent alerts surfaced to the frontend task log
+    pub alert_log: Arc<std::sync::RwLock<Vec<AlertLogEntry>>>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AlertLogEntry {
+    pub id: u64,
+    pub timestamp: String,
+    pub severity: String,
+    pub title: String,
+    pub detail: String,
+    pub hostname: String,
+    pub cluster: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -8145,7 +8158,7 @@ pub async fn config_export(
         }
     }
     // IP mappings
-    if let Some(v) = read_json_file("/etc/wolfstack/ip-mappings.json") {
+    if let Some(v) = read_json_file(&crate::paths::get().ip_mappings) {
         bundle.insert("ip_mappings".into(), v);
     }
     // PBS config
@@ -11301,18 +11314,19 @@ pub fn collect_issues(metrics: &crate::monitoring::SystemMetrics) -> Vec<Issue> 
             }
         }
 
-        // Check for problem pods
+        // Check for problem pods (exclude Succeeded/Completed pods — these are finished Jobs/init containers)
         let pods = crate::kubernetes::get_pods(&cluster.kubeconfig_path, None);
-        let failed = pods.iter().filter(|p| p.status == "Failed" || p.status == "Unknown").count();
-        let pending = pods.iter().filter(|p| p.status == "Pending").count();
-        let high_restarts = pods.iter().filter(|p| p.restarts >= 10).count();
+        let active_pods: Vec<_> = pods.iter().filter(|p| p.status != "Succeeded").collect();
+        let failed = active_pods.iter().filter(|p| p.status == "Failed" || p.status == "Unknown").count();
+        let pending = active_pods.iter().filter(|p| p.status == "Pending").count();
+        let high_restarts = active_pods.iter().filter(|p| p.restarts >= 10).count();
 
         if failed > 0 {
             issues.push(Issue {
                 severity: "critical".into(),
                 category: "kubernetes".into(),
                 title: format!("{} failed pod(s) in cluster '{}'", failed, cluster.name),
-                detail: pods.iter().filter(|p| p.status == "Failed" || p.status == "Unknown")
+                detail: active_pods.iter().filter(|p| p.status == "Failed" || p.status == "Unknown")
                     .take(5).map(|p| format!("{}/{}", p.namespace, p.name)).collect::<Vec<_>>().join(", "),
             });
         }
@@ -11321,7 +11335,7 @@ pub fn collect_issues(metrics: &crate::monitoring::SystemMetrics) -> Vec<Issue> 
                 severity: "warning".into(),
                 category: "kubernetes".into(),
                 title: format!("{} pending pod(s) in cluster '{}'", pending, cluster.name),
-                detail: pods.iter().filter(|p| p.status == "Pending")
+                detail: active_pods.iter().filter(|p| p.status == "Pending")
                     .take(5).map(|p| format!("{}/{}", p.namespace, p.name)).collect::<Vec<_>>().join(", "),
             });
         }
@@ -11330,7 +11344,7 @@ pub fn collect_issues(metrics: &crate::monitoring::SystemMetrics) -> Vec<Issue> 
                 severity: "warning".into(),
                 category: "kubernetes".into(),
                 title: format!("{} pod(s) with high restarts in cluster '{}'", high_restarts, cluster.name),
-                detail: pods.iter().filter(|p| p.restarts >= 10)
+                detail: active_pods.iter().filter(|p| p.restarts >= 10)
                     .take(5).map(|p| format!("{}/{} ({}x)", p.namespace, p.name, p.restarts)).collect::<Vec<_>>().join(", "),
             });
         }
@@ -11469,6 +11483,50 @@ pub async fn scan_issues(
         "issues": issues,
         "ai_analysis": null,
     }))
+}
+
+/// GET /api/alerts?since=ID — get recent alerts for the Tasks window
+pub async fn get_alert_log(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    let since_id: u64 = query.get("since")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let log = state.alert_log.read().unwrap();
+    let new_entries: Vec<&AlertLogEntry> = log.iter()
+        .filter(|e| e.id > since_id)
+        .collect();
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "alerts": new_entries,
+    }))
+}
+
+/// GET /api/settings/paths — get file location configuration
+pub async fn get_file_locations(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    HttpResponse::Ok().json(crate::paths::get())
+}
+
+/// POST /api/settings/paths — update file location configuration
+pub async fn update_file_locations(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<crate::paths::FileLocations>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match crate::paths::update(body.into_inner()) {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({"success": true})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
+    }
 }
 
 /// POST /api/issues/clean — run safe cleanup to free disk space
@@ -13532,6 +13590,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // Issues Scanner
         .route("/api/issues/scan", web::get().to(scan_issues))
         .route("/api/issues/clean", web::post().to(clean_system))
+        .route("/api/alerts", web::get().to(get_alert_log))
+        // File locations
+        .route("/api/settings/paths", web::get().to(get_file_locations))
+        .route("/api/settings/paths", web::post().to(update_file_locations))
         // Security (Fail2ban, iptables, UFW)
         .route("/api/security/status", web::get().to(security_status))
         .route("/api/security/fail2ban/install", web::post().to(security_fail2ban_install))

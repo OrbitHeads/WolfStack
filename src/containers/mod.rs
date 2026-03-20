@@ -294,12 +294,12 @@ pub fn wolfnet_used_ips_cached() -> Vec<String> {
 // Persisted at /etc/wolfstack/lxc-paths.json.
 
 pub const LXC_DEFAULT_PATH: &str = "/var/lib/lxc";
-const LXC_PATHS_FILE: &str = "/etc/wolfstack/lxc-paths.json";
+fn lxc_paths_file() -> String { crate::paths::get().lxc_paths }
 
 pub static LXC_STORAGE_PATHS: std::sync::LazyLock<Mutex<Vec<String>>> =
     std::sync::LazyLock::new(|| {
         let mut paths = vec![LXC_DEFAULT_PATH.to_string()];
-        if let Ok(content) = std::fs::read_to_string(LXC_PATHS_FILE) {
+        if let Ok(content) = std::fs::read_to_string(&lxc_paths_file()) {
             if let Ok(saved) = serde_json::from_str::<Vec<String>>(&content) {
                 for p in saved {
                     if p != LXC_DEFAULT_PATH && !paths.contains(&p) && std::path::Path::new(&p).is_dir() {
@@ -326,7 +326,7 @@ pub fn lxc_register_path(path: &str) -> bool {
         return false;
     }
     paths.push(path.to_string());
-    let _ = std::fs::write(LXC_PATHS_FILE, serde_json::to_string_pretty(&*paths).unwrap_or_default());
+    let _ = std::fs::write(&lxc_paths_file(), serde_json::to_string_pretty(&*paths).unwrap_or_default());
     true
 }
 
@@ -709,7 +709,7 @@ pub fn wolfnet_allocate_ip(host_ip: &str, extra_used: &[u8]) -> String {
     }
 
     // WolfRun service VIPs — reserve these so containers don't collide
-    if let Ok(data) = std::fs::read_to_string("/etc/wolfstack/wolfrun/services.json") {
+    if let Ok(data) = std::fs::read_to_string(&crate::paths::get().wolfrun_services) {
         if let Ok(services) = serde_json::from_str::<Vec<serde_json::Value>>(&data) {
             for svc in &services {
                 if let Some(vip) = svc.get("service_ip").and_then(|v| v.as_str()) {
@@ -820,7 +820,7 @@ pub fn wolfnet_used_ips() -> Vec<String> {
         }
     }
     // WolfRun service VIPs (load-balanced virtual IPs)
-    if let Ok(data) = std::fs::read_to_string("/etc/wolfstack/wolfrun/services.json") {
+    if let Ok(data) = std::fs::read_to_string(&crate::paths::get().wolfrun_services) {
         if let Ok(services) = serde_json::from_str::<Vec<serde_json::Value>>(&data) {
             for svc in &services {
                 if let Some(vip) = svc.get("service_ip").and_then(|v| v.as_str()) {
@@ -833,7 +833,7 @@ pub fn wolfnet_used_ips() -> Vec<String> {
     }
 
     // Kubernetes WolfNet route IPs (k8s deployments with allocated WolfNet addresses)
-    if let Ok(data) = std::fs::read_to_string("/etc/wolfstack/kubernetes.json") {
+    if let Ok(data) = std::fs::read_to_string(&crate::paths::get().kubernetes_config) {
         if let Ok(config) = serde_json::from_str::<serde_json::Value>(&data) {
             if let Some(clusters) = config.get("clusters").and_then(|c| c.as_array()) {
                 for cluster in clusters {
@@ -1704,7 +1704,7 @@ fn find_free_bridge_ip() -> u8 {
 
     // 4. GLOBAL: Scan cluster container cache (all remote nodes' containers)
     //    The heartbeat sync writes container data to /etc/wolfstack/cluster-containers/
-    if let Ok(entries) = std::fs::read_dir("/etc/wolfstack/cluster-containers") {
+    if let Ok(entries) = std::fs::read_dir(&crate::paths::get().cluster_containers_dir) {
         for entry in entries.flatten() {
             if let Ok(content) = std::fs::read_to_string(entry.path()) {
                 if let Ok(containers) = serde_json::from_str::<Vec<serde_json::Value>>(&content) {
@@ -1727,7 +1727,7 @@ fn find_free_bridge_ip() -> u8 {
     }
 
     // 5. GLOBAL: Scan WolfRun services for all instance IPs across the cluster
-    if let Ok(content) = std::fs::read_to_string("/etc/wolfstack/wolfrun/services.json") {
+    if let Ok(content) = std::fs::read_to_string(&crate::paths::get().wolfrun_services) {
         if let Ok(services) = serde_json::from_str::<Vec<serde_json::Value>>(&content) {
             for svc in &services {
                 if let Some(instances) = svc.get("instances").and_then(|v| v.as_array()) {
@@ -1747,7 +1747,7 @@ fn find_free_bridge_ip() -> u8 {
     }
 
     // 6. GLOBAL: Scan IP mappings (port forward destinations may use bridge IPs)
-    if let Ok(content) = std::fs::read_to_string("/etc/wolfstack/ip-mappings.json") {
+    if let Ok(content) = std::fs::read_to_string(&crate::paths::get().ip_mappings) {
         if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(&content) {
             if let Some(mappings) = wrapper.get("mappings").and_then(|v| v.as_array()) {
                 for m in mappings {
@@ -4445,7 +4445,7 @@ pub fn next_available_wolfnet_ip() -> Option<String> {
 
     // Scan WolfRun services for service VIPs and all instance WolfNet IPs
     // This prevents VIP or remote-node container IPs from being re-allocated
-    if let Ok(content) = std::fs::read_to_string("/etc/wolfstack/wolfrun/services.json") {
+    if let Ok(content) = std::fs::read_to_string(&crate::paths::get().wolfrun_services) {
         if let Ok(services) = serde_json::from_str::<Vec<serde_json::Value>>(&content) {
             for svc in &services {
                 // Service VIP
@@ -4469,7 +4469,7 @@ pub fn next_available_wolfnet_ip() -> Option<String> {
     }
 
     // Scan IP mappings to avoid colliding with port-forward destinations
-    if let Ok(content) = std::fs::read_to_string("/etc/wolfstack/ip-mappings.json") {
+    if let Ok(content) = std::fs::read_to_string(&crate::paths::get().ip_mappings) {
         if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(&content) {
             if let Some(mappings) = wrapper.get("mappings").and_then(|v| v.as_array()) {
                 for m in mappings {
