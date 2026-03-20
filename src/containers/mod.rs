@@ -518,16 +518,24 @@ pub fn cleanup_stale_wolfnet_routes() {
         let _ = Command::new("iptables").args(["-I", "FORWARD", "1", "-i", "wolfnet0", "-j", "ACCEPT"]).output();
         let _ = Command::new("iptables").args(["-I", "FORWARD", "1", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
 
-        // Also add to DOCKER-USER (Docker checks this before DOCKER-ISOLATION)
-        let docker_user_exists = Command::new("iptables").args(["-L", "DOCKER-USER"]).output()
-            .map(|o| o.status.success()).unwrap_or(false);
-        if docker_user_exists {
-            let _ = Command::new("iptables").args(["-D", "DOCKER-USER", "-i", "wolfnet0", "-j", "ACCEPT"]).output();
-            let _ = Command::new("iptables").args(["-D", "DOCKER-USER", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
-            let _ = Command::new("iptables").args(["-D", "DOCKER-USER", "-i", "wolfnet0", "-j", "ACCEPT"]).output();
-            let _ = Command::new("iptables").args(["-D", "DOCKER-USER", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
-            let _ = Command::new("iptables").args(["-I", "DOCKER-USER", "1", "-i", "wolfnet0", "-j", "ACCEPT"]).output();
-            let _ = Command::new("iptables").args(["-I", "DOCKER-USER", "1", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
+        // Insert ACCEPT rules into every Docker chain that might block wolfnet0 traffic
+        for chain in &["DOCKER-USER", "DOCKER-ISOLATION-STAGE-1", "DOCKER-ISOLATION-STAGE-2"] {
+            let exists = Command::new("iptables").args(["-L", chain]).output()
+                .map(|o| o.status.success()).unwrap_or(false);
+            if !exists { continue; }
+
+            // Remove old rules (deduplicate)
+            for _ in 0..2 {
+                let _ = Command::new("iptables").args(["-D", chain, "-i", "wolfnet0", "-j", "ACCEPT"]).output();
+                let _ = Command::new("iptables").args(["-D", chain, "-o", "wolfnet0", "-j", "ACCEPT"]).output();
+            }
+            // Insert at top
+            let _ = Command::new("iptables").args(["-I", chain, "1", "-i", "wolfnet0", "-j", "ACCEPT"]).output();
+            let _ = Command::new("iptables").args(["-I", chain, "1", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
+
+            // Also allow return traffic (ESTABLISHED,RELATED)
+            let _ = Command::new("iptables").args(["-D", chain, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"]).output();
+            let _ = Command::new("iptables").args(["-I", chain, "1", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"]).output();
         }
 
         for bd in &bridge_devs {
