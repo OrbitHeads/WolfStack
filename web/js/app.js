@@ -7192,6 +7192,7 @@ function activityStop() {
 let _taskLogEntries = [];
 let _taskLogVisible = false;
 let _taskLogBodyVisible = true;
+let _taskLogUserClosed = false;
 
 function saveTaskLog() {
     try {
@@ -7256,8 +7257,13 @@ function hideTaskLog() {
 }
 
 function toggleTaskLogVisible() {
-    if (_taskLogVisible) hideTaskLog();
-    else showTaskLog();
+    if (_taskLogVisible) {
+        _taskLogUserClosed = true;
+        hideTaskLog();
+    } else {
+        _taskLogUserClosed = false;
+        showTaskLog();
+    }
 }
 
 function updateTaskLogToggleBtn() {
@@ -7382,7 +7388,7 @@ function addTaskLogEntry(opts) {
     };
     _taskLogEntries.unshift(entry);
     if (_taskLogEntries.length > 1000) _taskLogEntries.length = 1000;
-    showTaskLog();
+    if (!_taskLogUserClosed) showTaskLog();
     updateTaskLogSpinner();
     renderTaskLog();
     saveTaskLog();
