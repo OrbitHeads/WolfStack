@@ -3209,6 +3209,7 @@
                         <button class="settings-tab-btn" onclick="switchSettingsTab('alerting')">🔔 Alerting</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('ai')">🤖 AI Agent</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('backup')">📦 Config Backup</button>
+                        <button class="settings-tab-btn" onclick="switchSettingsTab('users')">👤 Users &amp; Auth</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('security')">🔐 Security</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('paths')">📂 File Locations</button>
                     </div>
@@ -3872,6 +3873,79 @@
                                 ⚠️ Does not include: login credentials, join tokens, TLS certificates, or container/VM
                                 data.
                             </p>
+                        </div>
+                    </div>
+
+                    <!-- ─── Users & Auth Tab ─── -->
+                    <div id="settings-tab-users" class="settings-tab-panel">
+                        <h4 style="margin:0 0 8px 0;font-size:16px;font-weight:600;">Authentication Mode</h4>
+                        <p style="font-size:13px;color:var(--text-muted);margin:0 0 16px 0;">
+                            Choose how users log in to WolfStack. You can use Linux system accounts, WolfStack's own user system with optional 2FA, or both.
+                        </p>
+                        <div style="display:flex;gap:8px;margin-bottom:24px;flex-wrap:wrap;" id="auth-mode-buttons">
+                            <button class="btn" onclick="setAuthMode('linux')" id="auth-mode-linux" style="flex:1;min-width:180px;padding:16px;text-align:left;border-radius:10px;border:2px solid var(--border);">
+                                <strong style="display:block;margin-bottom:4px;">Linux System Login</strong>
+                                <span style="font-size:12px;color:var(--text-muted);">Authenticate with /etc/shadow credentials (default)</span>
+                            </button>
+                            <button class="btn" onclick="setAuthMode('wolfstack')" id="auth-mode-wolfstack" style="flex:1;min-width:180px;padding:16px;text-align:left;border-radius:10px;border:2px solid var(--border);">
+                                <strong style="display:block;margin-bottom:4px;">WolfStack Users Only</strong>
+                                <span style="font-size:12px;color:var(--text-muted);">Disable Linux login, use WolfStack accounts with optional 2FA</span>
+                            </button>
+                            <button class="btn" onclick="setAuthMode('both')" id="auth-mode-both" style="flex:1;min-width:180px;padding:16px;text-align:left;border-radius:10px;border:2px solid var(--border);">
+                                <strong style="display:block;margin-bottom:4px;">Both</strong>
+                                <span style="font-size:12px;color:var(--text-muted);">Allow either Linux or WolfStack login</span>
+                            </button>
+                        </div>
+
+                        <div style="border-top:1px solid var(--border);padding-top:20px;">
+                            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+                                <h4 style="margin:0;font-size:16px;font-weight:600;">WolfStack Users</h4>
+                                <button class="btn btn-primary btn-sm" onclick="showCreateUserForm()">+ Add User</button>
+                            </div>
+
+                            <div id="create-user-form" style="display:none;background:var(--bg-input);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:16px;">
+                                <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
+                                    <input type="text" id="new-user-username" placeholder="Username" style="padding:8px 12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-size:13px;">
+                                    <input type="password" id="new-user-password" placeholder="Password" style="padding:8px 12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-size:13px;">
+                                </div>
+                                <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
+                                    <input type="text" id="new-user-display" placeholder="Display name (optional)" style="padding:8px 12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-size:13px;">
+                                    <select id="new-user-role" style="padding:8px 12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-size:13px;">
+                                        <option value="admin">Admin</option>
+                                        <option value="viewer">Viewer</option>
+                                    </select>
+                                </div>
+                                <div style="display:flex;gap:8px;">
+                                    <button class="btn btn-primary btn-sm" onclick="createUser()">Create User</button>
+                                    <button class="btn btn-sm" onclick="document.getElementById('create-user-form').style.display='none'" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);">Cancel</button>
+                                </div>
+                            </div>
+
+                            <div id="users-list" style="min-height:60px;">
+                                <div style="color:var(--text-muted);text-align:center;padding:20px;">Loading...</div>
+                            </div>
+                        </div>
+
+                        <!-- 2FA Setup Modal -->
+                        <div id="totp-setup-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:10000;display:none;align-items:center;justify-content:center;">
+                            <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;max-width:400px;width:90%;">
+                                <h3 style="margin:0 0 12px 0;font-size:16px;">Set Up Two-Factor Authentication</h3>
+                                <p style="font-size:13px;color:var(--text-muted);margin:0 0 16px 0;">
+                                    Scan this QR code with your authenticator app (Google Authenticator, Authy, etc.), then enter the 6-digit code to confirm.
+                                </p>
+                                <div id="totp-qr" style="text-align:center;margin-bottom:16px;"></div>
+                                <div style="margin-bottom:8px;">
+                                    <label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:4px;">Manual entry key:</label>
+                                    <code id="totp-secret-display" style="font-size:13px;word-break:break-all;"></code>
+                                </div>
+                                <div style="margin-bottom:16px;">
+                                    <input type="text" id="totp-confirm-code" placeholder="Enter 6-digit code" maxlength="6" pattern="[0-9]*" inputmode="numeric" style="width:100%;padding:10px 14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-size:18px;text-align:center;letter-spacing:8px;font-family:var(--font-mono, monospace);">
+                                </div>
+                                <div style="display:flex;gap:8px;">
+                                    <button class="btn btn-primary" onclick="confirmTotp()" style="flex:1;">Enable 2FA</button>
+                                    <button class="btn" onclick="closeTotpModal()" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);flex:1;">Cancel</button>
+                                </div>
+                            </div>
                         </div>
                     </div>
 

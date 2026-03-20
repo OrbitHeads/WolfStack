@@ -20826,8 +20826,171 @@ function switchSettingsTab(tabName) {
         loadClusterSecretStatus();
     } else if (tabName === 'paths') {
         loadFileLocations();
+    } else if (tabName === 'users') {
+        loadAuthConfig();
+        loadUsers();
     }
 }
+
+// ─── Users & Auth Settings ───
+
+let _currentAuthMode = 'linux';
+let _totpSetupUser = '';
+let _totpSetupSecret = '';
+
+async function loadAuthConfig() {
+    try {
+        const resp = await fetch('/api/auth/config');
+        if (!resp.ok) return;
+        const config = await resp.json();
+        _currentAuthMode = config.auth_mode || 'linux';
+        highlightAuthMode(_currentAuthMode);
+    } catch (e) {}
+}
+
+function highlightAuthMode(mode) {
+    ['linux', 'wolfstack', 'both'].forEach(m => {
+        const btn = document.getElementById('auth-mode-' + m);
+        if (btn) {
+            btn.style.borderColor = m === mode ? 'var(--accent)' : 'var(--border)';
+            btn.style.background = m === mode ? 'var(--accent-subtle, rgba(220,38,38,0.08))' : 'var(--bg-tertiary)';
+        }
+    });
+}
+
+async function setAuthMode(mode) {
+    if (mode === 'wolfstack') {
+        try {
+            const resp = await fetch('/api/auth/users');
+            const users = await resp.json();
+            if (!users || users.length === 0) {
+                showToast('Create at least one WolfStack user before disabling Linux login', 'warning');
+                return;
+            }
+        } catch (e) {}
+    }
+    try {
+        const resp = await fetch('/api/auth/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ auth_mode: mode, require_2fa_when_configured: true }),
+        });
+        const data = await resp.json();
+        if (data.success) {
+            _currentAuthMode = mode;
+            highlightAuthMode(mode);
+            showToast('Authentication mode set to: ' + mode, 'success');
+            taskLog('Auth mode changed to ' + mode);
+        } else {
+            showToast('Failed: ' + (data.error || 'Unknown error'), 'error');
+        }
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+}
+
+async function loadUsers() {
+    const container = document.getElementById('users-list');
+    if (!container) return;
+    try {
+        const resp = await fetch('/api/auth/users');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const users = await resp.json();
+        if (users.length === 0) {
+            container.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:20px;background:var(--bg-input);border-radius:8px;border:1px solid var(--border);">No WolfStack users created yet. Click <strong>+ Add User</strong> to create one.</div>';
+            return;
+        }
+        let html = '<div style="display:flex;flex-direction:column;gap:8px;">';
+        for (const user of users) {
+            html += '<div style="display:flex;align-items:center;gap:12px;padding:12px 16px;background:var(--bg-input);border:1px solid var(--border);border-radius:8px;">';
+            html += '<div style="flex:1;"><strong style="font-size:14px;">' + escapeHtml(user.username) + '</strong>';
+            if (user.display_name) html += ' <span style="color:var(--text-muted);font-size:12px;">(' + escapeHtml(user.display_name) + ')</span>';
+            html += '<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">';
+            html += '<span style="padding:2px 6px;border-radius:4px;background:var(--bg-tertiary);border:1px solid var(--border);font-size:10px;text-transform:uppercase;font-weight:600;">' + escapeHtml(user.role) + '</span>';
+            if (user.totp_enabled) html += ' <span style="padding:2px 6px;border-radius:4px;background:rgba(34,197,94,0.1);color:var(--success);border:1px solid rgba(34,197,94,0.3);font-size:10px;font-weight:600;">2FA ENABLED</span>';
+            if (user.created_at) html += ' <span style="margin-left:8px;">Created: ' + escapeHtml(user.created_at) + '</span>';
+            html += '</div></div><div style="display:flex;gap:6px;">';
+            if (!user.totp_enabled) html += '<button class="btn btn-sm" onclick="setupTotp(\'' + escapeHtml(user.username) + '\')" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);font-size:11px;">Enable 2FA</button>';
+            else html += '<button class="btn btn-sm" onclick="disableTotp(\'' + escapeHtml(user.username) + '\')" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);font-size:11px;">Disable 2FA</button>';
+            html += '<button class="btn btn-sm" onclick="changePassword(\'' + escapeHtml(user.username) + '\')" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);font-size:11px;">Password</button>';
+            html += '<button class="btn btn-sm" onclick="deleteUser(\'' + escapeHtml(user.username) + '\')" style="background:rgba(220,38,38,0.1);border:1px solid rgba(220,38,38,0.3);color:var(--danger, #ef4444);font-size:11px;">Delete</button>';
+            html += '</div></div>';
+        }
+        container.innerHTML = html + '</div>';
+    } catch (e) { container.innerHTML = '<div style="color:var(--danger);padding:20px;">Failed to load users: ' + e.message + '</div>'; }
+}
+
+function showCreateUserForm() { document.getElementById('create-user-form').style.display = 'block'; document.getElementById('new-user-username').focus(); }
+
+async function createUser() {
+    const username = document.getElementById('new-user-username').value.trim();
+    const password = document.getElementById('new-user-password').value;
+    const display_name = document.getElementById('new-user-display').value.trim();
+    const role = document.getElementById('new-user-role').value;
+    if (!username || !password) { showToast('Username and password required', 'warning'); return; }
+    try {
+        const resp = await fetch('/api/auth/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password, display_name, role }) });
+        const data = await resp.json();
+        if (data.success) { showToast('User created', 'success'); taskLog('Created user: ' + username); document.getElementById('create-user-form').style.display = 'none'; ['new-user-username','new-user-password','new-user-display'].forEach(id => document.getElementById(id).value = ''); loadUsers(); }
+        else showToast(data.error || 'Failed', 'error');
+    } catch (e) { showToast('Error: ' + e.message, 'error'); }
+}
+
+async function deleteUser(username) {
+    if (!confirm('Delete user "' + username + '"?')) return;
+    try {
+        const resp = await fetch('/api/auth/users/' + encodeURIComponent(username), { method: 'DELETE' });
+        const data = await resp.json();
+        if (data.success) { showToast('User deleted', 'success'); taskLog('Deleted user: ' + username); loadUsers(); }
+        else showToast(data.error || 'Failed', 'error');
+    } catch (e) { showToast('Error: ' + e.message, 'error'); }
+}
+
+async function changePassword(username) {
+    const newPass = prompt('New password for "' + username + '":');
+    if (!newPass) return;
+    try {
+        const resp = await fetch('/api/auth/users/' + encodeURIComponent(username) + '/password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: newPass }) });
+        const data = await resp.json();
+        if (data.success) { showToast('Password changed', 'success'); taskLog('Password changed: ' + username); }
+        else showToast(data.error || 'Failed', 'error');
+    } catch (e) { showToast('Error: ' + e.message, 'error'); }
+}
+
+async function setupTotp(username) {
+    try {
+        const resp = await fetch('/api/auth/users/' + encodeURIComponent(username) + '/2fa/setup', { method: 'POST' });
+        const data = await resp.json();
+        if (data.secret) {
+            _totpSetupUser = username;
+            _totpSetupSecret = data.secret;
+            document.getElementById('totp-secret-display').textContent = data.secret;
+            document.getElementById('totp-qr').innerHTML = '<div style="padding:16px;background:#fff;border-radius:8px;display:inline-block;"><img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' + encodeURIComponent(data.uri) + '" alt="QR Code" style="width:200px;height:200px;"></div>';
+            document.getElementById('totp-confirm-code').value = '';
+            document.getElementById('totp-setup-modal').style.display = 'flex';
+        } else showToast(data.error || 'Failed', 'error');
+    } catch (e) { showToast('Error: ' + e.message, 'error'); }
+}
+
+function closeTotpModal() { document.getElementById('totp-setup-modal').style.display = 'none'; _totpSetupUser = ''; _totpSetupSecret = ''; }
+
+async function confirmTotp() {
+    const code = document.getElementById('totp-confirm-code').value.trim();
+    if (!code || code.length !== 6) { showToast('Enter the 6-digit code', 'warning'); return; }
+    try {
+        const resp = await fetch('/api/auth/users/' + encodeURIComponent(_totpSetupUser) + '/2fa/confirm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code, secret: _totpSetupSecret }) });
+        const data = await resp.json();
+        if (data.success) { showToast('2FA enabled', 'success'); taskLog('2FA enabled: ' + _totpSetupUser); closeTotpModal(); loadUsers(); }
+        else showToast(data.error || 'Invalid code', 'error');
+    } catch (e) { showToast('Error: ' + e.message, 'error'); }
+}
+
+async function disableTotp(username) {
+    if (!confirm('Disable 2FA for "' + username + '"?')) return;
+    try {
+        const resp = await fetch('/api/auth/users/' + encodeURIComponent(username) + '/2fa/disable', { method: 'POST' });
+        const data = await resp.json();
+        if (data.success) { showToast('2FA disabled', 'success'); taskLog('2FA disabled: ' + username); loadUsers(); }
+        else showToast(data.error || 'Failed', 'error');
+    } catch (e) { showToast('Error: ' + e.message, 'error'); }
 
 // ─── File Locations Settings ───
 

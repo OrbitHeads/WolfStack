@@ -322,13 +322,19 @@
             <form id="login-form" onsubmit="handleLogin(event)" style="display:none;">
                 <div class="form-group">
                     <label for="username">Username</label>
-                    <input type="text" id="username" name="username" placeholder="Linux system username"
+                    <input type="text" id="username" name="username" placeholder="Username"
                         autocomplete="username" autofocus required>
                 </div>
                 <div class="form-group">
                     <label for="password">Password</label>
                     <input type="password" id="password" name="password" placeholder="Password"
                         autocomplete="current-password" required>
+                </div>
+                <div class="form-group" id="totp-group" style="display:none;">
+                    <label for="totp_code">Two-Factor Code</label>
+                    <input type="text" id="totp_code" name="totp_code" placeholder="6-digit code from authenticator"
+                        autocomplete="one-time-code" inputmode="numeric" maxlength="6" pattern="[0-9]*"
+                        style="text-align:center;letter-spacing:6px;font-size:20px;">
                 </div>
                 <button type="submit" class="login-btn" id="login-btn">
                     Sign In
@@ -337,8 +343,7 @@
 
             <div class="login-info" id="login-info" style="display:none;">
                 <p>
-                    <span class="icon">🔒</span> Authenticates with your Linux system account.<br>
-                    Use your server's username and password.
+                    <span class="icon">🔒</span> Sign in with your credentials.
                 </p>
             </div>
         </div>
@@ -395,6 +400,8 @@
                 }
             });
 
+        let _needs2fa = false;
+
         async function handleLogin(e) {
             e.preventDefault();
             const btn = document.getElementById('login-btn');
@@ -402,9 +409,16 @@
 
             const username = document.getElementById('username').value.trim();
             const password = document.getElementById('password').value;
+            const totp_code = document.getElementById('totp_code') ? document.getElementById('totp_code').value.trim() : '';
 
             if (!username || !password) {
                 showError('Please enter username and password');
+                return;
+            }
+
+            if (_needs2fa && !totp_code) {
+                showError('Please enter the 6-digit code from your authenticator app');
+                document.getElementById('totp_code').focus();
                 return;
             }
 
@@ -416,7 +430,7 @@
                 const resp = await fetch('/api/auth/login', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username, password })
+                    body: JSON.stringify({ username, password, totp_code })
                 });
 
                 const data = await resp.json();
@@ -427,17 +441,30 @@
                     setTimeout(() => {
                         window.location.href = '/index.html?_=' + Date.now();
                     }, 500);
+                } else if (data.requires_2fa) {
+                    // Password correct, need 2FA code
+                    _needs2fa = true;
+                    document.getElementById('totp-group').style.display = 'block';
+                    document.getElementById('totp_code').focus();
+                    btn.disabled = false;
+                    btn.innerHTML = 'Verify & Sign In';
+                    showError('Enter the 6-digit code from your authenticator app');
                 } else {
                     showError(data.error || 'Invalid username or password');
                     btn.disabled = false;
-                    btn.innerHTML = 'Sign In';
-                    document.getElementById('password').value = '';
-                    document.getElementById('password').focus();
+                    btn.innerHTML = _needs2fa ? 'Verify & Sign In' : 'Sign In';
+                    if (_needs2fa) {
+                        document.getElementById('totp_code').value = '';
+                        document.getElementById('totp_code').focus();
+                    } else {
+                        document.getElementById('password').value = '';
+                        document.getElementById('password').focus();
+                    }
                 }
             } catch (err) {
                 showError('Connection failed: ' + err.message);
                 btn.disabled = false;
-                btn.innerHTML = 'Sign In';
+                btn.innerHTML = _needs2fa ? 'Verify & Sign In' : 'Sign In';
             }
         }
 

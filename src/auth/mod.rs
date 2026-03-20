@@ -2,17 +2,14 @@
 // (C)Copyright Wolf Software Systems Ltd
 // https://wolf.uk.com
 
-//! Authentication — Linux system user authentication via crypt()
-//!
-//! Authenticates against /etc/shadow using the system's crypt() function.
-//! WolfStack must run as root to read /etc/shadow.
-//!
-//! Cluster-internal requests are authenticated via a shared secret. By default
-//! all installations share a built-in secret. Users can generate a custom
-//! per-cluster secret via the Settings → Security tab; the custom secret is
-//! stored in /etc/wolfstack/cluster-secret and propagated to all nodes.
-//! The built-in default is always accepted as a fallback so mixed clusters
-//! (some upgraded, some not) continue to work.
+// Written by Paul Clevett
+// (C)Copyright Wolf Software Systems Ltd
+// https://wolf.uk.com
+
+// Authentication — Linux system user authentication via crypt(),
+// with optional WolfStack user accounts and TOTP two-factor authentication.
+
+pub mod users;
 
 use std::collections::HashMap;
 use std::sync::RwLock;

@@ -257,9 +257,11 @@ pub fn require_cluster_auth(req: &HttpRequest, state: &web::Data<AppState>) -> R
 pub struct LoginRequest {
     pub username: String,
     pub password: String,
+    #[serde(default)]
+    pub totp_code: String,
 }
 
-/// POST /api/auth/login — authenticate with Linux credentials
+/// POST /api/auth/login — authenticate with Linux or WolfStack credentials + optional 2FA
 pub async fn login(req: HttpRequest, state: web::Data<AppState>, body: web::Json<LoginRequest>) -> HttpResponse {
     // Rate limiting — extract client IP
     let client_ip = req.connection_info().peer_addr().unwrap_or("unknown").to_string();
@@ -282,32 +284,80 @@ pub async fn login(req: HttpRequest, state: web::Data<AppState>, body: web::Json
             }
         }
     }
-    if crate::auth::authenticate_user(&body.username, &body.password) {
-        state.login_limiter.clear(&client_ip);
-        let token = state.sessions.create_session(&body.username);
-        let mut cookie = Cookie::build("wolfstack_session", &token)
-            .path("/")
-            .http_only(true)
-            .same_site(actix_web::cookie::SameSite::Strict)
-            .max_age(actix_web::cookie::time::Duration::hours(8))
-            .finish();
-        if state.tls_enabled {
-            cookie.set_secure(true);
-        }
 
-        HttpResponse::Ok()
-            .cookie(cookie)
-            .json(serde_json::json!({
-                "success": true,
-                "username": body.username
-            }))
-    } else {
-        state.login_limiter.record_failure(&client_ip);
-        HttpResponse::Unauthorized().json(serde_json::json!({
-            "success": false,
-            "error": "Invalid username or password"
-        }))
+    let auth_config = crate::auth::users::AuthConfig::load();
+    let mode = auth_config.auth_mode.as_str();
+
+    // Try WolfStack users first (if mode is "wolfstack" or "both")
+    if mode == "wolfstack" || mode == "both" {
+        if let Some(user) = crate::auth::users::authenticate_wolfstack_user(&body.username, &body.password) {
+            // Check 2FA if enabled
+            if user.totp_enabled {
+                if body.totp_code.is_empty() {
+                    // Password correct, but 2FA required — tell frontend to prompt
+                    return HttpResponse::Ok().json(serde_json::json!({
+                        "success": false,
+                        "requires_2fa": true,
+                        "message": "Two-factor authentication required"
+                    }));
+                }
+                if !crate::auth::users::verify_totp(&user.totp_secret, &body.totp_code) {
+                    state.login_limiter.record_failure(&client_ip);
+                    return HttpResponse::Unauthorized().json(serde_json::json!({
+                        "success": false,
+                        "error": "Invalid two-factor authentication code"
+                    }));
+                }
+            }
+
+            state.login_limiter.clear(&client_ip);
+            let token = state.sessions.create_session(&body.username);
+            let mut cookie = Cookie::build("wolfstack_session", &token)
+                .path("/")
+                .http_only(true)
+                .same_site(actix_web::cookie::SameSite::Strict)
+                .max_age(actix_web::cookie::time::Duration::hours(8))
+                .finish();
+            if state.tls_enabled {
+                cookie.set_secure(true);
+            }
+            return HttpResponse::Ok()
+                .cookie(cookie)
+                .json(serde_json::json!({
+                    "success": true,
+                    "username": body.username
+                }));
+        }
     }
+
+    // Try Linux system auth (if mode is "linux" or "both")
+    if mode == "linux" || mode == "both" {
+        if crate::auth::authenticate_user(&body.username, &body.password) {
+            state.login_limiter.clear(&client_ip);
+            let token = state.sessions.create_session(&body.username);
+            let mut cookie = Cookie::build("wolfstack_session", &token)
+                .path("/")
+                .http_only(true)
+                .same_site(actix_web::cookie::SameSite::Strict)
+                .max_age(actix_web::cookie::time::Duration::hours(8))
+                .finish();
+            if state.tls_enabled {
+                cookie.set_secure(true);
+            }
+            return HttpResponse::Ok()
+                .cookie(cookie)
+                .json(serde_json::json!({
+                    "success": true,
+                    "username": body.username
+                }));
+        }
+    }
+
+    state.login_limiter.record_failure(&client_ip);
+    HttpResponse::Unauthorized().json(serde_json::json!({
+        "success": false,
+        "error": "Invalid username or password"
+    }))
 }
 
 /// GET /api/settings/login-disabled — check if direct login is disabled (no auth needed)
@@ -361,6 +411,181 @@ pub async fn auth_check(req: HttpRequest, state: web::Data<AppState>) -> HttpRes
         Err(_) => HttpResponse::Ok().json(serde_json::json!({
             "authenticated": false
         })),
+    }
+}
+
+// ─── User Management API ───
+
+/// GET /api/auth/config — get auth configuration
+pub async fn get_auth_config(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    HttpResponse::Ok().json(crate::auth::users::AuthConfig::load())
+}
+
+/// POST /api/auth/config — update auth configuration
+pub async fn save_auth_config(req: HttpRequest, state: web::Data<AppState>, body: web::Json<crate::auth::users::AuthConfig>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match body.into_inner().save() {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({"success": true})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// GET /api/auth/users — list all WolfStack users (hides password hashes and TOTP secrets)
+pub async fn list_users(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let store = crate::auth::users::UserStore::load();
+    let users: Vec<serde_json::Value> = store.users.iter().map(|u| {
+        serde_json::json!({
+            "username": u.username,
+            "role": u.role,
+            "display_name": u.display_name,
+            "totp_enabled": u.totp_enabled,
+            "created_at": u.created_at,
+        })
+    }).collect();
+    HttpResponse::Ok().json(users)
+}
+
+/// POST /api/auth/users — create a new WolfStack user
+pub async fn create_user(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    let username = body["username"].as_str().unwrap_or("").trim().to_string();
+    let password = body["password"].as_str().unwrap_or("");
+    let role = body["role"].as_str().unwrap_or("admin").to_string();
+    let display_name = body["display_name"].as_str().unwrap_or("").to_string();
+
+    if username.is_empty() || password.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "Username and password required"}));
+    }
+    if !crate::auth::is_safe_name(&username) {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "Invalid username — use alphanumeric, dash, underscore only"}));
+    }
+
+    let password_hash = match crate::auth::users::hash_password(password) {
+        Ok(h) => h,
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
+    };
+
+    let user = crate::auth::users::WolfUser {
+        username: username.clone(),
+        password_hash,
+        totp_secret: String::new(),
+        totp_enabled: false,
+        role,
+        display_name,
+        created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+    };
+
+    let mut store = crate::auth::users::UserStore::load();
+    match store.add(user) {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({"success": true, "username": username})),
+        Err(e) => HttpResponse::Conflict().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// DELETE /api/auth/users/{username} — delete a WolfStack user
+pub async fn delete_user(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let username = path.into_inner();
+    let mut store = crate::auth::users::UserStore::load();
+    match store.remove(&username) {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({"success": true})),
+        Err(e) => HttpResponse::NotFound().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// POST /api/auth/users/{username}/password — change password
+pub async fn change_user_password(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let username = path.into_inner();
+    let new_password = body["password"].as_str().unwrap_or("");
+    if new_password.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "Password required"}));
+    }
+
+    let password_hash = match crate::auth::users::hash_password(new_password) {
+        Ok(h) => h,
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
+    };
+
+    let mut store = crate::auth::users::UserStore::load();
+    match store.find_mut(&username) {
+        Some(user) => {
+            user.password_hash = password_hash;
+            match store.save() {
+                Ok(()) => HttpResponse::Ok().json(serde_json::json!({"success": true})),
+                Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
+            }
+        }
+        None => HttpResponse::NotFound().json(serde_json::json!({"error": "User not found"})),
+    }
+}
+
+/// POST /api/auth/users/{username}/2fa/setup — generate a new TOTP secret (not yet confirmed)
+pub async fn setup_2fa(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let username = path.into_inner();
+    let store = crate::auth::users::UserStore::load();
+    if store.find(&username).is_none() {
+        return HttpResponse::NotFound().json(serde_json::json!({"error": "User not found"}));
+    }
+
+    let secret = crate::auth::users::generate_totp_secret();
+    let uri = crate::auth::users::totp_uri(&secret, &username);
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "secret": secret,
+        "uri": uri,
+    }))
+}
+
+/// POST /api/auth/users/{username}/2fa/confirm — verify a TOTP code and enable 2FA
+pub async fn confirm_2fa(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let username = path.into_inner();
+    let code = body["code"].as_str().unwrap_or("");
+    let secret = body["secret"].as_str().unwrap_or("");
+
+    if code.is_empty() || secret.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "Code and secret required"}));
+    }
+
+    // Verify the code matches the secret before enabling
+    if !crate::auth::users::verify_totp(secret, code) {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "Invalid code — check your authenticator app and try again"}));
+    }
+
+    let mut store = crate::auth::users::UserStore::load();
+    match store.find_mut(&username) {
+        Some(user) => {
+            user.totp_secret = secret.to_string();
+            user.totp_enabled = true;
+            match store.save() {
+                Ok(()) => HttpResponse::Ok().json(serde_json::json!({"success": true})),
+                Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
+            }
+        }
+        None => HttpResponse::NotFound().json(serde_json::json!({"error": "User not found"})),
+    }
+}
+
+/// POST /api/auth/users/{username}/2fa/disable — disable 2FA for a user
+pub async fn disable_2fa(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let username = path.into_inner();
+    let mut store = crate::auth::users::UserStore::load();
+    match store.find_mut(&username) {
+        Some(user) => {
+            user.totp_secret.clear();
+            user.totp_enabled = false;
+            match store.save() {
+                Ok(()) => HttpResponse::Ok().json(serde_json::json!({"success": true})),
+                Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
+            }
+        }
+        None => HttpResponse::NotFound().json(serde_json::json!({"error": "User not found"})),
     }
 }
 
@@ -13239,6 +13464,16 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/auth/check", web::get().to(auth_check))
         .route("/api/settings/login-disabled", web::get().to(login_disabled_status))
         .route("/api/settings/login-disabled", web::post().to(set_login_disabled))
+        // User management (auth required)
+        .route("/api/auth/config", web::get().to(get_auth_config))
+        .route("/api/auth/config", web::post().to(save_auth_config))
+        .route("/api/auth/users", web::get().to(list_users))
+        .route("/api/auth/users", web::post().to(create_user))
+        .route("/api/auth/users/{username}", web::delete().to(delete_user))
+        .route("/api/auth/users/{username}/password", web::post().to(change_user_password))
+        .route("/api/auth/users/{username}/2fa/setup", web::post().to(setup_2fa))
+        .route("/api/auth/users/{username}/2fa/confirm", web::post().to(confirm_2fa))
+        .route("/api/auth/users/{username}/2fa/disable", web::post().to(disable_2fa))
         // Dashboard
         .route("/api/metrics", web::get().to(get_metrics))
         .route("/api/metrics/history", web::get().to(get_metrics_history))
