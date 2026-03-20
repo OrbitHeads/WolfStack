@@ -499,37 +499,45 @@ pub fn cleanup_stale_wolfnet_routes() {
     }
 
     // Ensure iptables forwarding rules are at the TOP of FORWARD chain
-    // (before DOCKER-USER/DOCKER-FORWARD which may DROP traffic)
+    // (before DOCKER-USER/DOCKER-FORWARD/DOCKER-ISOLATION which may DROP traffic)
     // Apply for every bridge device we found (docker0, br-xxx, etc.)
     if !bridge_devs.is_empty() {
         let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.wolfnet0.forwarding=1"]).output();
         let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.wolfnet0.send_redirects=0"]).output();
+        let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.wolfnet0.rp_filter=0"]).output();
+        let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.all.rp_filter=0"]).output();
+
+        // Blanket FORWARD rules: any traffic involving wolfnet0 should be allowed
+        // This covers all bridge devices without needing per-bridge rules
+        // Remove old blanket rules first
+        let _ = Command::new("iptables").args(["-D", "FORWARD", "-i", "wolfnet0", "-j", "ACCEPT"]).output();
+        let _ = Command::new("iptables").args(["-D", "FORWARD", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
+        let _ = Command::new("iptables").args(["-D", "FORWARD", "-i", "wolfnet0", "-j", "ACCEPT"]).output();
+        let _ = Command::new("iptables").args(["-D", "FORWARD", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
+        // Insert at position 1 — before all Docker chains
+        let _ = Command::new("iptables").args(["-I", "FORWARD", "1", "-i", "wolfnet0", "-j", "ACCEPT"]).output();
+        let _ = Command::new("iptables").args(["-I", "FORWARD", "1", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
+
+        // Also add to DOCKER-USER (Docker checks this before DOCKER-ISOLATION)
+        let docker_user_exists = Command::new("iptables").args(["-L", "DOCKER-USER"]).output()
+            .map(|o| o.status.success()).unwrap_or(false);
+        if docker_user_exists {
+            let _ = Command::new("iptables").args(["-D", "DOCKER-USER", "-i", "wolfnet0", "-j", "ACCEPT"]).output();
+            let _ = Command::new("iptables").args(["-D", "DOCKER-USER", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
+            let _ = Command::new("iptables").args(["-D", "DOCKER-USER", "-i", "wolfnet0", "-j", "ACCEPT"]).output();
+            let _ = Command::new("iptables").args(["-D", "DOCKER-USER", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
+            let _ = Command::new("iptables").args(["-I", "DOCKER-USER", "1", "-i", "wolfnet0", "-j", "ACCEPT"]).output();
+            let _ = Command::new("iptables").args(["-I", "DOCKER-USER", "1", "-o", "wolfnet0", "-j", "ACCEPT"]).output();
+        }
 
         for bd in &bridge_devs {
             let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.forwarding=1", bd)]).output();
             let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.send_redirects=0", bd)]).output();
+            let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.rp_filter=0", bd)]).output();
             let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.proxy_arp=1", bd)]).output();
 
-            // Remove old rules first (idempotent — ignore errors)
-            let _ = Command::new("iptables").args(["-D", "FORWARD", "-i", "wolfnet0", "-o", bd, "-j", "ACCEPT"]).output();
-            let _ = Command::new("iptables").args(["-D", "FORWARD", "-i", bd, "-o", "wolfnet0", "-j", "ACCEPT"]).output();
-            // Remove duplicates if any
-            let _ = Command::new("iptables").args(["-D", "FORWARD", "-i", "wolfnet0", "-o", bd, "-j", "ACCEPT"]).output();
-            let _ = Command::new("iptables").args(["-D", "FORWARD", "-i", bd, "-o", "wolfnet0", "-j", "ACCEPT"]).output();
-
-            // Re-insert at position 1 (before DOCKER-USER/DOCKER-FORWARD)
-            let _ = Command::new("iptables").args(["-I", "FORWARD", "1", "-i", bd, "-o", "wolfnet0", "-j", "ACCEPT"]).output();
-            let _ = Command::new("iptables").args(["-I", "FORWARD", "1", "-i", "wolfnet0", "-o", bd, "-j", "ACCEPT"]).output();
-
-            // Also insert into DOCKER-USER if it exists (Docker checks this chain before DOCKER-ISOLATION)
-            let docker_user_exists = Command::new("iptables").args(["-L", "DOCKER-USER"]).output()
-                .map(|o| o.status.success()).unwrap_or(false);
-            if docker_user_exists {
-                let _ = Command::new("iptables").args(["-D", "DOCKER-USER", "-i", bd, "-o", "wolfnet0", "-j", "ACCEPT"]).output();
-                let _ = Command::new("iptables").args(["-D", "DOCKER-USER", "-i", "wolfnet0", "-o", bd, "-j", "ACCEPT"]).output();
-                let _ = Command::new("iptables").args(["-I", "DOCKER-USER", "1", "-i", bd, "-o", "wolfnet0", "-j", "ACCEPT"]).output();
-                let _ = Command::new("iptables").args(["-I", "DOCKER-USER", "1", "-i", "wolfnet0", "-o", bd, "-j", "ACCEPT"]).output();
-            }
+            // Add to firewalld trusted zone if firewalld is running
+            ensure_firewalld_trusted(&[bd, "wolfnet0"]);
         }
 
         // MASQUERADE: containers on Docker bridges reaching WolfNet need their source
