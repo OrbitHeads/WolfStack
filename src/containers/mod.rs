@@ -470,6 +470,34 @@ pub fn cleanup_stale_wolfnet_routes() {
         }
     }
 
+    // Inject WolfNet subnet route into ALL running Docker containers (not just ones with WolfNet IPs)
+    // so any container can reach remote WolfNet hosts via the Docker gateway
+    if let Ok(output) = Command::new("docker")
+        .args(["ps", "--format", "{{.Names}}"])
+        .output()
+    {
+        let wn_subnet = format!("{}.0/24", prefix.trim_end_matches('.'));
+        let text = String::from_utf8_lossy(&output.stdout);
+        for name in text.lines().filter(|l| !l.is_empty()) {
+            let pid_out = Command::new("docker")
+                .args(["inspect", "--format", "{{.State.Pid}}", name])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            if pid_out.is_empty() || pid_out == "0" { continue; }
+
+            let (bridge_dev, gw) = docker_bridge_info(name);
+            bridge_devs.insert(bridge_dev);
+
+            // Add route for WolfNet subnet via the Docker gateway (idempotent)
+            // Skip src hint for containers without a WolfNet IP — they'll use their Docker IP
+            // and the host MASQUERADE rule will rewrite it
+            let _ = Command::new("nsenter")
+                .args(["--target", &pid_out, "--net", "ip", "route", "replace", &wn_subnet, "via", &gw])
+                .output();
+        }
+    }
+
     // Ensure iptables forwarding rules are at the TOP of FORWARD chain
     // (before DOCKER-USER/DOCKER-FORWARD which may DROP traffic)
     // Apply for every bridge device we found (docker0, br-xxx, etc.)
