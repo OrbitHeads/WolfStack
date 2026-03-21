@@ -3510,5 +3510,267 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
             user_inputs: vec![],
         },
 
+        // ── Virtual Worlds ──
+
+        AppManifest {
+            id: "opensimngc".into(),
+            name: "OpenSimulator NGC".into(),
+            icon: "🌐".into(),
+            category: "Virtual Worlds".into(),
+            description: "OpenSimulator Next Generation — run your own virtual world grid (Second Life compatible). Includes MariaDB, .NET 8, and full grid configuration.".into(),
+            website: Some("https://github.com/OpenSim-NGC/OpenSim-Tranquillity".into()),
+            docker: None,
+            lxc: Some(LxcTarget {
+                distribution: "debian".into(),
+                release: "bookworm".into(),
+                architecture: "amd64".into(),
+                setup_commands: vec![
+                    // Install dependencies
+                    "apt-get update && apt-get install -y curl git wget mariadb-server libgdiplus screen".into(),
+
+                    // Install .NET 8 SDK
+                    "wget https://dot.net/v1/dotnet-install.sh -O /tmp/dotnet-install.sh && chmod +x /tmp/dotnet-install.sh && /tmp/dotnet-install.sh --channel 8.0 --install-dir /usr/share/dotnet && ln -sf /usr/share/dotnet/dotnet /usr/local/bin/dotnet".into(),
+
+                    // Start and configure MariaDB
+                    "service mariadb start".into(),
+                    "mysql -e \"CREATE DATABASE IF NOT EXISTS opensim CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;\"".into(),
+                    "mysql -e \"CREATE USER IF NOT EXISTS 'opensim'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';\"".into(),
+                    "mysql -e \"GRANT ALL PRIVILEGES ON opensim.* TO 'opensim'@'localhost'; FLUSH PRIVILEGES;\"".into(),
+                    // Enable MariaDB on boot
+                    "systemctl enable mariadb".into(),
+
+                    // Clone and build OpenSimNGC
+                    "git clone https://github.com/OpenSim-NGC/OpenSim-Tranquillity.git /opt/opensim".into(),
+                    "cd /opt/opensim && dotnet restore && dotnet build -c Release -o /opt/opensim/bin".into(),
+
+                    // Generate OpenSim.ini from template
+                    concat!(
+                        "cat > /opt/opensim/bin/OpenSim.ini << 'OSINI'\n",
+                        "[Const]\n",
+                        "    BaseHostname = \"${GRID_HOSTNAME}\"\n",
+                        "    BaseURL = http://${Const|BaseHostname}\n",
+                        "    PublicPort = \"${GRID_PORT}\"\n",
+                        "    PrivURL = ${Const|BaseURL}\n",
+                        "    PrivatePort = \"8003\"\n",
+                        "\n",
+                        "[Startup]\n",
+                        "    ConsolePrompt = \"Region (\\R) \"\n",
+                        "    region_info_source = \"filesystem\"\n",
+                        "    save_crashes = false\n",
+                        "    crash_dir = \"crashes\"\n",
+                        "    PIDFile = \"/opt/opensim/bin/opensim.pid\"\n",
+                        "\n",
+                        "[Map]\n",
+                        "    GenerateMaptiles = true\n",
+                        "    MapImageModule = \"MapImageModule\"\n",
+                        "\n",
+                        "[Network]\n",
+                        "    http_listener_port = ${Const|PublicPort}\n",
+                        "    ExternalHostNameForLSL = ${Const|BaseHostname}\n",
+                        "\n",
+                        "[Architecture]\n",
+                        "    Include-Architecture = \"config-include/Standalone.ini\"\n",
+                        "OSINI"
+                    ).into(),
+
+                    // Generate StandaloneCommon.ini with MariaDB connection
+                    concat!(
+                        "cat > /opt/opensim/bin/config-include/StandaloneCommon.ini << 'SCINI'\n",
+                        "[DatabaseService]\n",
+                        "    StorageProvider = \"OpenSim.Data.MySQL.dll\"\n",
+                        "    ConnectionString = \"Data Source=localhost;Database=opensim;User ID=opensim;Password=${DB_PASSWORD};Old Guids=true;SslMode=None;\"\n",
+                        "\n",
+                        "[Hypergrid]\n",
+                        "    HomeURI = \"${Const|BaseURL}:${Const|PublicPort}\"\n",
+                        "\n",
+                        "[Modules]\n",
+                        "    AssetCaching = \"FlotsamAssetCache\"\n",
+                        "    Include-FlotsamCache = \"config-include/FlotsamCache.ini\"\n",
+                        "\n",
+                        "[AssetService]\n",
+                        "    DefaultAssetLoader = \"OpenSim.Framework.AssetLoader.Filesystem.dll\"\n",
+                        "    AssetLoaderArgs = \"assets/AssetSets.xml\"\n",
+                        "\n",
+                        "[GridService]\n",
+                        "    StorageProvider = \"OpenSim.Data.MySQL.dll:MySqlRegionData\"\n",
+                        "    Region_${REGION_NAME} = \"DefaultRegion, FallbackRegion\"\n",
+                        "\n",
+                        "[LibraryModule]\n",
+                        "    LibrariesXMLFile = \"./inventory/Libraries.xml\"\n",
+                        "\n",
+                        "[LoginService]\n",
+                        "    WelcomeMessage = \"Welcome to ${GRID_NAME}!\"\n",
+                        "    AllowRemoteSetLoginLevel = \"false\"\n",
+                        "\n",
+                        "[MapImageService]\n",
+                        "    TilesStoragePath = \"maptiles\"\n",
+                        "\n",
+                        "[UserProfilesService]\n",
+                        "    Enabled = true\n",
+                        "SCINI"
+                    ).into(),
+
+                    // Generate FlotsamCache.ini
+                    "cp /opt/opensim/bin/config-include/FlotsamCache.ini.example /opt/opensim/bin/config-include/FlotsamCache.ini".into(),
+
+                    // Generate Region UUID if set to 'auto'
+                    "if [ \"${REGION_UUID}\" = 'auto' ] || [ -z \"${REGION_UUID}\" ]; then export REGION_UUID=$(cat /proc/sys/kernel/random/uuid); fi".into(),
+
+                    // Generate Regions.ini
+                    concat!(
+                        "cat > /opt/opensim/bin/Regions/Regions.ini << 'REGINI'\n",
+                        "[${REGION_NAME}]\n",
+                        "RegionUUID = ${REGION_UUID}\n",
+                        "Location = 1000,1000\n",
+                        "InternalAddress = 0.0.0.0\n",
+                        "InternalPort = ${GRID_PORT}\n",
+                        "AllowAlternatePorts = False\n",
+                        "ExternalHostName = ${GRID_HOSTNAME}\n",
+                        "MaxPrims = 15000\n",
+                        "MaxAgents = 100\n",
+                        "REGINI"
+                    ).into(),
+
+                    // Create maptiles directory
+                    "mkdir -p /opt/opensim/bin/maptiles".into(),
+
+                    // Create estate setup script that runs on first launch
+                    concat!(
+                        "cat > /opt/opensim/bin/setup-estate.txt << 'ESTATE'\n",
+                        "create estate ${ESTATE_NAME} ${ESTATE_OWNER_FIRST} ${ESTATE_OWNER_LAST}\n",
+                        "ESTATE"
+                    ).into(),
+
+                    // Create systemd service
+                    concat!(
+                        "cat > /etc/systemd/system/opensim.service << 'SVC'\n",
+                        "[Unit]\n",
+                        "Description=OpenSimulator NGC\n",
+                        "After=network.target mariadb.service\n",
+                        "Wants=mariadb.service\n",
+                        "\n",
+                        "[Service]\n",
+                        "Type=simple\n",
+                        "WorkingDirectory=/opt/opensim/bin\n",
+                        "ExecStart=/usr/local/bin/dotnet OpenSim.dll\n",
+                        "Restart=on-failure\n",
+                        "RestartSec=10\n",
+                        "\n",
+                        "[Install]\n",
+                        "WantedBy=multi-user.target\n",
+                        "SVC"
+                    ).into(),
+                    "systemctl daemon-reload && systemctl enable opensim".into(),
+
+                    // Print connection info
+                    "echo ''".into(),
+                    "echo '========================================='".into(),
+                    "echo '  OpenSimulator NGC Setup Complete!'".into(),
+                    "echo '========================================='".into(),
+                    "echo ''".into(),
+                    "echo '  Grid Name:    ${GRID_NAME}'".into(),
+                    "echo '  Region:       ${REGION_NAME}'".into(),
+                    "echo '  Address:      ${GRID_HOSTNAME}:${GRID_PORT}'".into(),
+                    "echo '  Login URI:    http://${GRID_HOSTNAME}:${GRID_PORT}'".into(),
+                    "echo '  Database:     opensim@localhost (MariaDB)'".into(),
+                    "echo ''".into(),
+                    "echo '  To start:     systemctl start opensim'".into(),
+                    "echo '  To stop:      systemctl stop opensim'".into(),
+                    "echo '  Console:      screen -r opensim'".into(),
+                    "echo ''".into(),
+                    "echo '  On first run you will be asked to create an'".into(),
+                    "echo '  estate owner account (avatar name + password).'".into(),
+                    "echo ''".into(),
+                    "echo '  Connect with a viewer (Firestorm, etc) using:'".into(),
+                    "echo '    Login URI: http://${GRID_HOSTNAME}:${GRID_PORT}'".into(),
+                    "echo '========================================='".into(),
+                ],
+            }),
+            bare_metal: None,
+            user_inputs: vec![
+                UserInput {
+                    id: "GRID_NAME".into(),
+                    label: "Grid Name".into(),
+                    input_type: "text".into(),
+                    default: Some("My Grid".into()),
+                    required: true,
+                    placeholder: Some("Name of your virtual world grid".into()),
+                    options: vec![],
+                },
+                UserInput {
+                    id: "REGION_NAME".into(),
+                    label: "Region Name".into(),
+                    input_type: "text".into(),
+                    default: Some("Welcome".into()),
+                    required: true,
+                    placeholder: Some("Name of the default region".into()),
+                    options: vec![],
+                },
+                UserInput {
+                    id: "GRID_HOSTNAME".into(),
+                    label: "Grid Hostname / IP".into(),
+                    input_type: "text".into(),
+                    default: None,
+                    required: true,
+                    placeholder: Some("Public IP or domain (e.g. grid.example.com)".into()),
+                    options: vec![],
+                },
+                UserInput {
+                    id: "GRID_PORT".into(),
+                    label: "Grid Port".into(),
+                    input_type: "text".into(),
+                    default: Some("9000".into()),
+                    required: true,
+                    placeholder: Some("Main grid port".into()),
+                    options: vec![],
+                },
+                UserInput {
+                    id: "DB_PASSWORD".into(),
+                    label: "Database Password".into(),
+                    input_type: "password".into(),
+                    default: None,
+                    required: true,
+                    placeholder: Some("Password for the opensim MariaDB user".into()),
+                    options: vec![],
+                },
+                UserInput {
+                    id: "ESTATE_NAME".into(),
+                    label: "Estate Name".into(),
+                    input_type: "text".into(),
+                    default: Some("My Estate".into()),
+                    required: true,
+                    placeholder: Some("Name of the default estate".into()),
+                    options: vec![],
+                },
+                UserInput {
+                    id: "ESTATE_OWNER_FIRST".into(),
+                    label: "Estate Owner First Name".into(),
+                    input_type: "text".into(),
+                    default: Some("Admin".into()),
+                    required: true,
+                    placeholder: Some("Avatar first name".into()),
+                    options: vec![],
+                },
+                UserInput {
+                    id: "ESTATE_OWNER_LAST".into(),
+                    label: "Estate Owner Last Name".into(),
+                    input_type: "text".into(),
+                    default: Some("Admin".into()),
+                    required: true,
+                    placeholder: Some("Avatar last name".into()),
+                    options: vec![],
+                },
+                UserInput {
+                    id: "REGION_UUID".into(),
+                    label: "Region UUID".into(),
+                    input_type: "text".into(),
+                    default: Some("auto".into()),
+                    required: false,
+                    placeholder: Some("Leave as 'auto' to generate".into()),
+                    options: vec![],
+                },
+            ],
+        },
+
     ]
 }
