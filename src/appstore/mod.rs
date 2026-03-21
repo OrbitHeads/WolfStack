@@ -3510,13 +3510,13 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
             user_inputs: vec![],
         },
 
-        // ── Virtual Worlds ──
+        // ── Games ──
 
         AppManifest {
             id: "opensimngc".into(),
             name: "OpenSimulator NGC".into(),
             icon: "🌐".into(),
-            category: "Virtual Worlds".into(),
+            category: "Games".into(),
             description: "OpenSimulator Next Generation — run your own virtual world grid (Second Life compatible). Includes MariaDB, .NET 8, and full grid configuration.".into(),
             website: Some("https://github.com/OpenSim-NGC/OpenSim-Tranquillity".into()),
             docker: None,
