@@ -318,6 +318,16 @@ fn install_lxc(
     // Auto-allocate a WolfNet IP
     let wolfnet_ip = crate::containers::next_available_wolfnet_ip();
 
+    // If GRID_HOSTNAME input is empty/missing, use the allocated WolfNet IP
+    let mut inputs = user_inputs.clone();
+    if let Some(ref wn_ip) = wolfnet_ip {
+        let hostname = inputs.get("GRID_HOSTNAME").map(|s| s.trim().to_string()).unwrap_or_default();
+        if hostname.is_empty() {
+            inputs.insert("GRID_HOSTNAME".to_string(), wn_ip.clone());
+        }
+    }
+    let user_inputs = &inputs;
+
 
     // Create the container
 
@@ -3711,8 +3721,8 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
                     label: "Grid Hostname / IP".into(),
                     input_type: "text".into(),
                     default: None,
-                    required: true,
-                    placeholder: Some("Public IP or domain (e.g. grid.example.com)".into()),
+                    required: false,
+                    placeholder: Some("Leave blank to auto-assign a WolfNet IP".into()),
                     options: vec![],
                 },
                 UserInput {
