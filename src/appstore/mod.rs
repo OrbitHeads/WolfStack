@@ -346,6 +346,17 @@ fn install_lxc(
         let _ = std::fs::write(format!("{}/ip", wolfnet_dir), ip);
     }
 
+    // Apps that need extra resources
+    if app.id == "opensimngc" {
+        let settings = crate::containers::LxcSettingsUpdate {
+            memory_limit: Some("4096M".into()),
+            swap_limit: Some("2048M".into()),
+            cpus: Some("2".into()),
+            ..Default::default()
+        };
+        let _ = crate::containers::lxc_update_settings(container_name, &settings);
+    }
+
     // Apps that need special LXC device access
     let needs_tun = matches!(app.id.as_str(), "wolfdisk" | "wireguard" | "tailscale");
     let needs_fuse = matches!(app.id.as_str(), "wolfdisk");
