@@ -700,7 +700,7 @@ impl VmManager {
         // Disk resize (grow only)
         if let Some(new_size) = disk_size_gb {
             if new_size > config.disk_size_gb {
-                let disk_path = self.vm_disk_path(name);
+                let disk_path = self.vm_os_disk_path(&config);
                 let output = Command::new("qemu-img")
                     .args(["resize", &disk_path.to_string_lossy(), &format!("{}G", new_size)])
                     .output()

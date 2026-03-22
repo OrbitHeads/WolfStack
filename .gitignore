@@ -5,3 +5,5 @@ Cargo.lock
 *~
 .idea/
 .vscode/
+.iso-build/
+*.iso
