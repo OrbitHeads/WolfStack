@@ -4471,8 +4471,9 @@ pub fn next_available_wolfnet_ip() -> Option<String> {
         }
     }
 
-    // Also reserve .1 (usually gateway) and .255 (broadcast)
+    // Also reserve .1 (usually gateway), .254 (VM TAP gateway), and .255 (broadcast)
     used.insert(format!("{}.1", prefix));
+    used.insert(format!("{}.254", prefix));
     used.insert(format!("{}.255", prefix));
 
     // Scan live IPs on wolfnet0 interface (catches VIPs, manual assignments)

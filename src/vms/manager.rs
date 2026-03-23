@@ -965,13 +965,20 @@ impl VmManager {
             cmd.arg("-cpu").arg(fallback_cpu);
         }
 
-        // Determine NIC model: virtio-net-pci (Linux), e1000 (Windows), rtl8139
+        // Determine NIC model: virtio-net-pci (Linux), e1000/e1000e (Windows), rtl8139
         let nic_device = match config.net_model.as_str() {
             "e1000" => "e1000",
+            "e1000e" => "e1000e",
             "rtl8139" => "rtl8139",
             _ => "virtio-net-pci",
         };
-        write_log(&format!("NIC model: {}", nic_device));
+        // Build NIC device string with MAC address if available
+        let nic_arg = if let Some(ref mac) = config.mac_address {
+            format!("{},netdev=net0,mac={}", nic_device, mac)
+        } else {
+            format!("{},netdev=net0", nic_device)
+        };
+        write_log(&format!("NIC model: {} (mac: {})", nic_device, config.mac_address.as_deref().unwrap_or("auto")));
 
         // Networking: VMs configure their own IP inside the guest OS.
         // If WolfNet IP is set, try TAP networking for direct L2 access.
