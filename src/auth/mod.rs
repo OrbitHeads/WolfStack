@@ -203,35 +203,56 @@ pub fn authenticate_user(username: &str, password: &str) -> bool {
     false
 }
 
-/// Verify a password against a stored hash (pure Rust, supports $5$ and $6$)
+/// Verify a password against a stored hash.
+/// Uses native C crypt() via dlopen for yescrypt ($y$) and any other format,
+/// with pure-Rust fallback for $5$ and $6$ if libcrypt is unavailable.
 fn verify_password(password: &str, stored_hash: &str) -> bool {
+    // Try native C crypt() first — handles all formats including yescrypt
+    if let Some(result) = native_crypt(password, stored_hash) {
+        return result == stored_hash;
+    }
+    // Fallback: pure Rust for SHA-256/SHA-512 (works on systems without libcrypt)
     if stored_hash.starts_with("$6$") {
         sha_crypt::sha512_check(password, stored_hash).is_ok()
     } else if stored_hash.starts_with("$5$") {
         sha_crypt::sha256_check(password, stored_hash).is_ok()
-    } else if stored_hash.starts_with("$y$") {
-        // yescrypt — no pure-Rust implementation, fall back to system crypt via /usr/bin/mkpasswd
-        verify_via_mkpasswd(password, stored_hash)
     } else {
         false
     }
 }
 
-/// Verify a password by shelling out to mkpasswd (for yescrypt $y$ hashes)
-fn verify_via_mkpasswd(password: &str, stored_hash: &str) -> bool {
-    use std::process::Command;
-    // Extract the salt (everything up to and including the last $ before the hash value)
-    let result = Command::new("mkpasswd")
-        .arg("--method=yescrypt")
-        .arg(format!("--salt={}", stored_hash))
-        .arg(password)
-        .output();
-    match result {
-        Ok(output) if output.status.success() => {
-            let computed = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            computed == stored_hash
+/// Try to call crypt() by dynamically loading libcrypt.so at runtime.
+/// Returns None if libcrypt is not available (e.g. minimal Debian ISO).
+fn native_crypt(password: &str, salt: &str) -> Option<String> {
+    use std::ffi::{CStr, CString};
+    let c_password = CString::new(password).ok()?;
+    let c_salt = CString::new(salt).ok()?;
+    unsafe {
+        // Try libcrypt.so.2 (Arch/Fedora), then libcrypt.so.1 (Debian/Ubuntu)
+        let lib = libc::dlopen(b"libcrypt.so.2\0".as_ptr() as *const _, libc::RTLD_NOW);
+        let lib = if lib.is_null() {
+            libc::dlopen(b"libcrypt.so.1\0".as_ptr() as *const _, libc::RTLD_NOW)
+        } else {
+            lib
+        };
+        if lib.is_null() {
+            return None;
         }
-        _ => false,
+        let sym = libc::dlsym(lib, b"crypt\0".as_ptr() as *const _);
+        if sym.is_null() {
+            libc::dlclose(lib);
+            return None;
+        }
+        let crypt_fn: extern "C" fn(*const libc::c_char, *const libc::c_char) -> *mut libc::c_char =
+            std::mem::transmute(sym);
+        let result = crypt_fn(c_password.as_ptr(), c_salt.as_ptr());
+        let ret = if result.is_null() {
+            None
+        } else {
+            Some(CStr::from_ptr(result).to_string_lossy().to_string())
+        };
+        libc::dlclose(lib);
+        ret
     }
 }
 
