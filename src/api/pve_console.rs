@@ -225,7 +225,8 @@ async fn vnc_tcp_bridge(
 
 /// WebSocket endpoint: /ws/vm-vnc/{name}
 /// Bridges browser noVNC ↔ native QEMU VM's built-in WebSocket VNC.
-/// This allows VNC consoles to work over HTTPS without mixed-content issues.
+/// QEMU's websocket= port speaks WebSocket (not raw TCP), so we connect
+/// as a WebSocket client to QEMU and bridge to the browser's WebSocket.
 pub async fn vm_vnc_ws(
     req: HttpRequest,
     stream: web::Payload,
@@ -249,9 +250,10 @@ pub async fn vm_vnc_ws(
         }))),
     };
 
-    // Connect TCP to QEMU's built-in WebSocket port
-    let tcp_stream = match TcpStream::connect(format!("127.0.0.1:{}", ws_port)).await {
-        Ok(s) => s,
+    // Connect WebSocket to QEMU's built-in WebSocket VNC port
+    let qemu_url = format!("ws://127.0.0.1:{}", ws_port);
+    let (qemu_ws, _) = match tokio_tungstenite::connect_async(&qemu_url).await {
+        Ok(pair) => pair,
         Err(e) => {
             error!("Failed to connect to QEMU VNC WebSocket port {} for VM '{}': {}", ws_port, vm_name, e);
             return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
@@ -263,10 +265,61 @@ pub async fn vm_vnc_ws(
     // Upgrade browser connection to WebSocket
     let (res, session, msg_stream) = actix_ws::handle(&req, stream)?;
 
-    // Bridge WebSocket ↔ TCP (reuses the same bridge as PVE VNC)
-    actix_rt::spawn(vnc_tcp_bridge(session, msg_stream, tcp_stream));
+    // Bridge browser WebSocket ↔ QEMU WebSocket
+    actix_rt::spawn(vnc_ws_bridge(session, msg_stream, qemu_ws));
 
     Ok(res)
+}
+
+/// Bridge browser noVNC WebSocket ↔ QEMU's WebSocket VNC.
+/// Both sides are WebSocket — we just shuttle binary frames between them.
+async fn vnc_ws_bridge(
+    mut browser_session: actix_ws::Session,
+    mut browser_stream: actix_ws::MessageStream,
+    qemu_ws: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+) {
+    use futures::SinkExt;
+    let (mut qemu_tx, mut qemu_rx) = qemu_ws.split();
+
+    loop {
+        tokio::select! {
+            // QEMU → Browser
+            msg = qemu_rx.next() => {
+                match msg {
+                    Some(Ok(tungstenite::Message::Binary(data))) => {
+                        if browser_session.binary(data.to_vec()).await.is_err() { break; }
+                    }
+                    Some(Ok(tungstenite::Message::Text(text))) => {
+                        if browser_session.text(text.to_string()).await.is_err() { break; }
+                    }
+                    Some(Ok(tungstenite::Message::Ping(data))) => {
+                        let _ = qemu_tx.send(tungstenite::Message::Pong(data)).await;
+                    }
+                    Some(Ok(tungstenite::Message::Close(_))) | None => break,
+                    _ => {}
+                }
+            }
+            // Browser → QEMU
+            msg = browser_stream.next() => {
+                match msg {
+                    Some(Ok(Message::Binary(data))) => {
+                        if qemu_tx.send(tungstenite::Message::Binary(data.into())).await.is_err() { break; }
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        if qemu_tx.send(tungstenite::Message::Text(text.to_string().into())).await.is_err() { break; }
+                    }
+                    Some(Ok(Message::Ping(bytes))) => {
+                        let _ = browser_session.pong(&bytes).await;
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let _ = browser_session.close(None).await;
+    let _ = qemu_tx.close().await;
 }
 
 /// WebSocket endpoint: /ws/pve-console/{node_id}/{vmid}
