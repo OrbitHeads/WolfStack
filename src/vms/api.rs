@@ -97,10 +97,10 @@ async fn create_vm(req: HttpRequest, state: web::Data<AppState>, body: web::Json
     );
     config.iso_path = body.iso_path.clone();
 
-    // WolfNet IP: auto-assign if empty, validate no conflicts if provided
+    // WolfNet IP: use provided value, or None if not specified
     config.wolfnet_ip = match &body.wolfnet_ip {
         Some(ip) if !ip.is_empty() => Some(ip.clone()),
-        _ => crate::containers::next_available_wolfnet_ip(),
+        _ => None,
     };
     config.storage_path = body.storage_path.clone();
     config.os_disk_bus = body.os_disk_bus.clone();
