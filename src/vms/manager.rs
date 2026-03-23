@@ -917,6 +917,7 @@ impl VmManager {
            .arg("-drive").arg(format!("file={},format=qcow2,if={},index=0", actual_disk.display(), os_disk_if))
            .arg("-vnc").arg(&vnc_arg)
            .arg("-usb").arg("-device").arg("usb-tablet")
+           .arg("-vga").arg("std")
            .arg("-daemonize");
 
         // ARM64 requires the 'virt' machine type and UEFI firmware (no legacy BIOS)
@@ -1031,8 +1032,7 @@ impl VmManager {
                      // Raw disk image — attach as USB drive for installation
                      write_log(&format!("Boot image (USB): {} (exists)", iso));
                      cmd.arg("-drive").arg(format!("file={},format=raw,if=none,id=usbdisk,readonly=on", iso))
-                        .arg("-device").arg("usb-storage,drive=usbdisk")
-                        .arg("-usb");
+                        .arg("-device").arg("usb-storage,drive=usbdisk");
                  } else {
                      // ISO — attach as CD-ROM
                      write_log(&format!("ISO: {} (exists)", iso));

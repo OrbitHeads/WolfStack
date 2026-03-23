@@ -5676,7 +5676,8 @@ async function vmAction(name, action, btn) {
     if (btn) btn.innerHTML = '<span style="display:inline-block;width:16px;height:16px;border:2px solid rgba(255,255,255,0.2);border-top-color:#fff;border-radius:50%;animation:spin 0.7s linear infinite;"></span>';
 
     try {
-        showToast(`${action}ing VM...`, 'info');
+        const actionVerb = action === 'stop' ? 'Stopping' : action === 'force_stop' ? 'Force stopping' : action.charAt(0).toUpperCase() + action.slice(1) + 'ing';
+        showToast(`${actionVerb} VM...`, 'info');
         const resp = await fetch(apiUrl(`/api/vms/${name}/action`), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -5684,7 +5685,8 @@ async function vmAction(name, action, btn) {
         });
         const data = await resp.json();
         if (resp.ok) {
-            showToast(`VM ${action}ed`, 'success');
+            const pastTense = action === 'stop' ? 'stopped' : action === 'force_stop' ? 'force stopped' : `${action}ed`;
+            showToast(`VM ${pastTense}`, 'success');
             taskLog('VM ' + action + ': ' + name);
             setTimeout(loadVms, 2000);
         } else {
