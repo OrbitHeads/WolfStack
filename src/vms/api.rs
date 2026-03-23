@@ -76,6 +76,8 @@ struct CreateVmRequest {
     net_model: String,
     /// Optional path to VirtIO drivers ISO (for Windows + virtio disk)
     drivers_iso: Option<String>,
+    /// Import a disk image (.img, .qcow2, .vmdk, .vdi) as the OS disk instead of creating an empty one
+    import_image: Option<String>,
     /// Extra disks to create with the VM (Proxmox-style)
     #[serde(default)]
     extra_disks: Vec<CreateVmDisk>,
@@ -99,6 +101,13 @@ async fn create_vm(req: HttpRequest, state: web::Data<AppState>, body: web::Json
     config.os_disk_bus = body.os_disk_bus.clone();
     config.net_model = body.net_model.clone();
     config.drivers_iso = body.drivers_iso.clone();
+
+    // If importing a disk image, set it on the config
+    if let Some(ref img) = body.import_image {
+        if !img.is_empty() {
+            config.import_image = Some(img.clone());
+        }
+    }
 
     // Convert extra disks from request to StorageVolume structs
     for disk in &body.extra_disks {

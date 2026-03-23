@@ -137,33 +137,14 @@ impl UserStore {
     }
 }
 
-// ─── Password Hashing (using system crypt) ───
+// ─── Password Hashing (pure Rust, no libcrypt dependency) ───
 
 /// Hash a password using SHA-512 crypt (same as Linux /etc/shadow)
 pub fn hash_password(password: &str) -> Result<String, String> {
-    // Generate a random salt for SHA-512 ($6$)
-    let mut salt_bytes = [0u8; 16];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        let _ = f.read_exact(&mut salt_bytes);
-    }
-    let salt_b64 = data_encoding::BASE64_NOPAD.encode(&salt_bytes)
-        .replace('+', ".")
-        .chars()
-        .take(16)
-        .collect::<String>();
-    let salt = format!("$6${}", salt_b64);
-
-    let c_password = std::ffi::CString::new(password).map_err(|_| "Invalid password".to_string())?;
-    let c_salt = std::ffi::CString::new(salt.as_str()).map_err(|_| "Invalid salt".to_string())?;
-
-    unsafe {
-        let result = super::crypt(c_password.as_ptr(), c_salt.as_ptr());
-        if result.is_null() {
-            return Err("crypt() failed".to_string());
-        }
-        Ok(std::ffi::CStr::from_ptr(result).to_string_lossy().to_string())
-    }
+    let params = sha_crypt::Sha512Params::new(5000)
+        .map_err(|e| format!("SHA-512 params error: {:?}", e))?;
+    sha_crypt::sha512_simple(password, &params)
+        .map_err(|e| format!("SHA-512 hash error: {:?}", e))
 }
 
 /// Verify a password against a stored hash

@@ -86,11 +86,7 @@ pub fn validate_cluster_secret(provided: &str, expected: &str) -> bool {
             .fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
 }
 
-// Link against libcrypt for password verification
-#[link(name = "crypt")]
-unsafe extern "C" {
-    fn crypt(key: *const libc::c_char, salt: *const libc::c_char) -> *mut libc::c_char;
-}
+// Pure-Rust password hashing (replaces C libcrypt dependency)
 
 /// Active session
 struct Session {
@@ -207,24 +203,35 @@ pub fn authenticate_user(username: &str, password: &str) -> bool {
     false
 }
 
-/// Verify a password against a stored hash using crypt()
+/// Verify a password against a stored hash (pure Rust, supports $5$ and $6$)
 fn verify_password(password: &str, stored_hash: &str) -> bool {
-    let c_password = match std::ffi::CString::new(password) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let c_salt = match std::ffi::CString::new(stored_hash) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
+    if stored_hash.starts_with("$6$") {
+        sha_crypt::sha512_check(password, stored_hash).is_ok()
+    } else if stored_hash.starts_with("$5$") {
+        sha_crypt::sha256_check(password, stored_hash).is_ok()
+    } else if stored_hash.starts_with("$y$") {
+        // yescrypt — no pure-Rust implementation, fall back to system crypt via /usr/bin/mkpasswd
+        verify_via_mkpasswd(password, stored_hash)
+    } else {
+        false
+    }
+}
 
-    unsafe {
-        let result = crypt(c_password.as_ptr(), c_salt.as_ptr());
-        if result.is_null() {
-            return false;
+/// Verify a password by shelling out to mkpasswd (for yescrypt $y$ hashes)
+fn verify_via_mkpasswd(password: &str, stored_hash: &str) -> bool {
+    use std::process::Command;
+    // Extract the salt (everything up to and including the last $ before the hash value)
+    let result = Command::new("mkpasswd")
+        .arg("--method=yescrypt")
+        .arg(format!("--salt={}", stored_hash))
+        .arg(password)
+        .output();
+    match result {
+        Ok(output) if output.status.success() => {
+            let computed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            computed == stored_hash
         }
-        let result_str = std::ffi::CStr::from_ptr(result).to_string_lossy();
-        result_str == stored_hash
+        _ => false,
     }
 }
 

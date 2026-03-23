@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tracing::{error, warn};
+use tracing::{error, warn, info};
 use rand::Rng;
 use crate::containers;
 use crate::networking;
@@ -74,6 +74,9 @@ pub struct VmConfig {
     /// Optional secondary ISO for VirtIO drivers (needed if OS disk is virtio on Windows)
     #[serde(default)]
     pub drivers_iso: Option<String>,
+    /// Import a disk image as the OS disk (not persisted — used only during creation)
+    #[serde(skip)]
+    pub import_image: Option<String>,
     /// Extra disks attached to this VM
     #[serde(default)]
     pub extra_disks: Vec<StorageVolume>,
@@ -102,10 +105,21 @@ impl VmConfig {
             os_disk_bus: "virtio".to_string(),
             net_model: "virtio".to_string(),
             drivers_iso: None,
+            import_image: None,
             extra_disks: Vec::new(),
             vmid: None,
         }
     }
+}
+
+/// Detect disk image format from file extension
+fn detect_image_format(path: &str) -> &str {
+    let lower = path.to_lowercase();
+    if lower.ends_with(".qcow2") { "qcow2" }
+    else if lower.ends_with(".vmdk") { "vmdk" }
+    else if lower.ends_with(".vdi") { "vdi" }
+    else if lower.ends_with(".vhd") || lower.ends_with(".vhdx") { "vpc" }
+    else { "raw" } // .img and anything else treated as raw
 }
 
 fn generate_mac() -> String {
@@ -254,6 +268,7 @@ impl VmManager {
                     os_disk_bus: "virtio".to_string(),
                     net_model: "virtio".to_string(),
                     drivers_iso: None,
+                    import_image: None,
                     extra_disks: Vec::new(),
                     vmid: Some(vmid),
                 })
@@ -334,19 +349,42 @@ impl VmManager {
         }
 
         let disk_path = self.vm_os_disk_path(&config);
-        
-        // Create OS disk
-        let output = Command::new("qemu-img")
-            .arg("create")
-            .arg("-f")
-            .arg("qcow2")
-            .arg(&disk_path)
-            .arg(format!("{}G", config.disk_size_gb))
-            .output()
-            .map_err(|e| e.to_string())?;
-        
-        if !output.status.success() {
-             return Err(String::from_utf8_lossy(&output.stderr).to_string());
+
+        if let Some(ref import_src) = config.import_image {
+            // Import a disk image (.img, .qcow2, .vmdk, .vdi) — convert to qcow2
+            if !std::path::Path::new(import_src).exists() {
+                return Err(format!("Import image not found: {}", import_src));
+            }
+            info!("Importing disk image: {} -> {}", import_src, disk_path.display());
+            let output = Command::new("qemu-img")
+                .arg("convert")
+                .arg("-f").arg(detect_image_format(import_src))
+                .arg("-O").arg("qcow2")
+                .arg(import_src)
+                .arg(&disk_path)
+                .output()
+                .map_err(|e| format!("qemu-img convert failed: {}", e))?;
+            if !output.status.success() {
+                return Err(format!("Failed to import image: {}", String::from_utf8_lossy(&output.stderr)));
+            }
+            // Resize if the imported image is smaller than requested
+            let _ = Command::new("qemu-img")
+                .arg("resize").arg(&disk_path).arg(format!("{}G", config.disk_size_gb))
+                .output();
+        } else {
+            // Create empty OS disk
+            let output = Command::new("qemu-img")
+                .arg("create")
+                .arg("-f")
+                .arg("qcow2")
+                .arg(&disk_path)
+                .arg(format!("{}G", config.disk_size_gb))
+                .output()
+                .map_err(|e| e.to_string())?;
+
+            if !output.status.success() {
+                 return Err(String::from_utf8_lossy(&output.stderr).to_string());
+            }
         }
 
         // Create any extra disks specified at creation time
@@ -917,18 +955,28 @@ impl VmManager {
                .arg("-device").arg(format!("{},netdev=net0", nic_device));
         }
 
-        // CD-ROM: installation ISO
-        let mut has_cdrom = false;
+        // Boot media: ISO (CD-ROM) or .img (USB drive)
+        let mut has_boot_media = false;
         if let Some(iso) = &config.iso_path {
              if !iso.is_empty() {
                  if !std::path::Path::new(iso).exists() {
-                     let msg = format!("ISO file not found: {}", iso);
+                     let msg = format!("Boot media not found: {}", iso);
                      write_log(&msg);
                      return Err(msg);
                  }
-                 write_log(&format!("ISO: {} (exists)", iso));
-                 cmd.arg("-cdrom").arg(iso);
-                 has_cdrom = true;
+                 let lower = iso.to_lowercase();
+                 if lower.ends_with(".img") || lower.ends_with(".raw") {
+                     // Raw disk image — attach as USB drive for installation
+                     write_log(&format!("Boot image (USB): {} (exists)", iso));
+                     cmd.arg("-drive").arg(format!("file={},format=raw,if=none,id=usbdisk,readonly=on", iso))
+                        .arg("-device").arg("usb-storage,drive=usbdisk")
+                        .arg("-usb");
+                 } else {
+                     // ISO — attach as CD-ROM
+                     write_log(&format!("ISO: {} (exists)", iso));
+                     cmd.arg("-cdrom").arg(iso);
+                 }
+                 has_boot_media = true;
              }
         }
 
@@ -944,8 +992,8 @@ impl VmManager {
             }
         }
 
-        // Boot order: CD first (for installation), then disk
-        if has_cdrom {
+        // Boot order: boot media first (for installation), then disk
+        if has_boot_media {
             cmd.arg("-boot").arg("order=dc");
         }
 
