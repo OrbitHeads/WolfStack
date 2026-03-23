@@ -5711,8 +5711,9 @@ region = us-east-1"></textarea>
                         <div class="form-group">
                             <label>Installation ISO (Optional)</label>
                             <input type="text" class="form-control" id="new-vm-iso"
-                                placeholder="/var/lib/wolfstack/isos/ubuntu.iso">
-                            <small style="color:var(--text-muted);">Path to an OS installer ISO on the host</small>
+                                placeholder="/var/lib/wolfstack/isos/ubuntu.iso"
+                                oninput="autoDetectWindowsIso(this.value)">
+                            <small style="color:var(--text-muted);">Path to an OS installer ISO on the host. Windows ISOs are detected automatically.</small>
                         </div>
                         <div class="form-group" style="margin-top:12px;">
                             <label>VirtIO Drivers ISO (Optional)</label>

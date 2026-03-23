@@ -5537,6 +5537,26 @@ async function showVmCreate() {
     document.getElementById('create-vm-modal').classList.add('active');
 }
 
+// Auto-detect Windows ISO and set disk bus to IDE + net model to e1000
+let _windowsAutoDetected = false;
+function autoDetectWindowsIso(isoPath) {
+    const lower = (isoPath || '').toLowerCase();
+    const isWindows = lower.includes('windows') || lower.includes('win10') || lower.includes('win11')
+        || lower.includes('win_') || lower.includes('win-') || /\bwin\d/.test(lower);
+    const busSelect = document.getElementById('new-vm-os-bus');
+    const netSelect = document.getElementById('new-vm-net-model');
+    if (isWindows && !_windowsAutoDetected) {
+        if (busSelect) busSelect.value = 'ide';
+        if (netSelect) netSelect.value = 'e1000';
+        _windowsAutoDetected = true;
+        showToast('Windows detected — disk bus set to IDE, network set to e1000', 'info');
+    } else if (!isWindows && _windowsAutoDetected) {
+        if (busSelect) busSelect.value = 'virtio';
+        if (netSelect) netSelect.value = 'virtio';
+        _windowsAutoDetected = false;
+    }
+}
+
 let currentVmTab = 1;
 
 function switchVmTab(tab) {
