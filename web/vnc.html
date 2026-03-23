@@ -252,9 +252,8 @@
                     doConnectVNC(wsUrl, container);
                 }
             } else {
-                // Local — match page protocol
-                const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-                doConnectVNC(`${wsProtocol}://${host}:${port}`, container);
+                // Local — QEMU's built-in WebSocket does not support TLS, always use ws://
+                doConnectVNC(`ws://${host}:${port}`, container);
             }
         }
 
