@@ -1233,11 +1233,58 @@ impl VmManager {
             }
         }
 
+        // ── DHCP server on the TAP so VMs get their WolfNet IP automatically ──
+        // Assign a gateway IP to the TAP (use .254 in the same /24 as the VM's IP)
+        let parts: Vec<&str> = wolfnet_ip.split('.').collect();
+        if parts.len() == 4 {
+            let gateway_ip = format!("{}.{}.{}.254", parts[0], parts[1], parts[2]);
+            // Assign gateway IP to the TAP interface
+            let _ = Command::new("ip").args(["addr", "flush", "dev", tap]).output();
+            let _ = Command::new("ip")
+                .args(["addr", "add", &format!("{}/24", gateway_ip), "dev", tap])
+                .output();
+            info!("TAP gateway: {} on {}", gateway_ip, tap);
+
+            // Kill any existing dnsmasq on this TAP
+            let _ = Command::new("pkill")
+                .args(["-f", &format!("dnsmasq.*--interface={}", tap)])
+                .output();
+
+            // Start dnsmasq as DHCP server — offers exactly one IP (the VM's WolfNet IP)
+            let dns_server = "8.8.8.8";
+            let dnsmasq_result = Command::new("dnsmasq")
+                .args([
+                    &format!("--interface={}", tap),
+                    "--bind-interfaces",
+                    "--except-interface=lo",
+                    &format!("--dhcp-range={},{},12h", wolfnet_ip, wolfnet_ip),
+                    &format!("--dhcp-option=3,{}", gateway_ip),  // default gateway
+                    &format!("--dhcp-option=6,{}", dns_server),  // DNS server
+                    "--no-resolv",
+                    &format!("--server={}", dns_server),
+                    "--log-facility=-",
+                    &format!("--pid-file=/run/dnsmasq-{}.pid", tap),
+                ])
+                .output();
+
+            match dnsmasq_result {
+                Ok(_) => info!("DHCP server started on {} — offering {} to VM", tap, wolfnet_ip),
+                Err(e) => warn!("Could not start DHCP on {}: {} — VM will need manual IP", tap, e),
+            }
+        }
+
         Ok(())
     }
 
     /// Clean up TAP interface and routes
     fn cleanup_tap(&self, tap: &str) -> Result<(), String> {
+        // Kill dnsmasq for this TAP
+        let _ = Command::new("pkill").args(["-f", &format!("dnsmasq.*--interface={}", tap)]).output();
+        if let Ok(pid) = std::fs::read_to_string(format!("/run/dnsmasq-{}.pid", tap)) {
+            let _ = Command::new("kill").arg(pid.trim()).output();
+            let _ = std::fs::remove_file(format!("/run/dnsmasq-{}.pid", tap));
+        }
+
         let _ = Command::new("ip").args(["link", "set", tap, "down"]).output();
         let _ = Command::new("ip").args(["tuntap", "del", "dev", tap, "mode", "tap"]).output();
         // Clean up iptables FORWARD rules (generic form used since v11.28)
