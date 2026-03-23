@@ -993,7 +993,7 @@ impl VmManager {
                 Ok(_) => {
                     write_log(&format!("TAP '{}' created successfully", tap));
                     cmd.arg("-netdev").arg(format!("tap,id=net0,ifname={},script=no,downscript=no", tap))
-                       .arg("-device").arg(format!("{},netdev=net0", nic_device));
+                       .arg("-device").arg(&nic_arg);
                     
                     if let Err(e) = self.setup_wolfnet_routing(&tap, wolfnet_ip) {
                         write_log(&format!("WolfNet routing warning: {} (VM will still start)", e));
@@ -1014,7 +1014,7 @@ impl VmManager {
         if !using_tap {
             write_log("Networking: user-mode (NAT, VM can access host network)");
             cmd.arg("-netdev").arg("user,id=net0")
-               .arg("-device").arg(format!("{},netdev=net0", nic_device));
+               .arg("-device").arg(&nic_arg);
         }
 
         // Boot media: ISO (CD-ROM) or .img (USB drive)
