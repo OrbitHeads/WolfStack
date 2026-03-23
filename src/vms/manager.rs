@@ -1266,14 +1266,15 @@ impl VmManager {
                     "--bind-interfaces",
                     "--except-interface=lo",
                     &format!("--dhcp-range={},{},12h", wolfnet_ip, wolfnet_ip),
-                    &format!("--dhcp-option=3,{}", gateway_ip),  // default gateway
-                    &format!("--dhcp-option=6,{}", dns_server),  // DNS server
+                    &format!("--dhcp-option=3,{}", gateway_ip),
+                    &format!("--dhcp-option=6,{}", dns_server),
                     "--no-resolv",
                     &format!("--server={}", dns_server),
-                    "--log-facility=-",
                     &format!("--pid-file=/run/dnsmasq-{}.pid", tap),
                 ])
-                .output();
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
 
             match dnsmasq_result {
                 Ok(_) => info!("DHCP server started on {} — offering {} to VM", tap, wolfnet_ip),
