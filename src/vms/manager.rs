@@ -429,9 +429,13 @@ impl VmManager {
             "--serial0".to_string(), "socket".to_string(), // Serial console for qm terminal
         ];
 
-        // ISO (CD-ROM)
+        // Boot media (ISO as CD-ROM, .img not supported as USB on Proxmox)
         if let Some(ref iso) = config.iso_path {
             if !iso.is_empty() {
+                let lower = iso.to_lowercase();
+                if lower.ends_with(".img") || lower.ends_with(".raw") {
+                    return Err("Proxmox does not support booting from .img files directly. Use 'Import Image' to import it as the OS disk instead.".to_string());
+                }
                 // On Proxmox, ISOs are referred to as storage:iso/filename.iso
                 args.push("--ide2".to_string());
                 args.push(format!("{},media=cdrom", iso));
@@ -440,28 +444,78 @@ impl VmManager {
             }
         }
 
-
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let output = Command::new("qm")
             .args(&args_ref)
             .output()
             .map_err(|e| format!("Failed to run qm create: {}", e))?;
 
-        if output.status.success() {
-
-
-            // Also save a WolfStack config for tracking
-            let mut tracked = config.clone();
-            tracked.storage_path = Some(storage.to_string());
-            let json = serde_json::to_string_pretty(&tracked).map_err(|e| e.to_string())?;
-            let _ = fs::write(self.vm_config_path(&config.name), json);
-
-            Ok(())
-        } else {
+        if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
-            Err(format!("qm create failed: {} {}", stderr.trim(), stdout.trim()))
+            return Err(format!("qm create failed: {} {}", stderr.trim(), stdout.trim()));
         }
+
+        // Import disk image if provided (convert and import via qm importdisk)
+        if let Some(ref import_src) = config.import_image {
+            if !import_src.is_empty() {
+                if !std::path::Path::new(import_src).exists() {
+                    return Err(format!("Import image not found: {}", import_src));
+                }
+                info!("Proxmox: importing disk image {} into VM {}", import_src, vmid);
+
+                // Convert to raw first if needed, then importdisk
+                // qm importdisk accepts raw and qcow2 directly
+                let fmt = detect_image_format(import_src);
+                let import_path = if fmt != "raw" && fmt != "qcow2" {
+                    // Convert to qcow2 in /tmp first
+                    let tmp = format!("/tmp/wolfstack-import-{}.qcow2", vmid);
+                    let conv = Command::new("qemu-img")
+                        .arg("convert").arg("-f").arg(fmt).arg("-O").arg("qcow2")
+                        .arg(import_src).arg(&tmp)
+                        .output()
+                        .map_err(|e| format!("qemu-img convert failed: {}", e))?;
+                    if !conv.status.success() {
+                        return Err(format!("Failed to convert image: {}", String::from_utf8_lossy(&conv.stderr)));
+                    }
+                    tmp
+                } else {
+                    import_src.clone()
+                };
+
+                // Import the disk — replaces the empty scsi0 disk
+                let import_output = Command::new("qm")
+                    .args(["importdisk", &vmid.to_string(), &import_path, storage])
+                    .output()
+                    .map_err(|e| format!("qm importdisk failed: {}", e))?;
+                if !import_output.status.success() {
+                    return Err(format!("qm importdisk failed: {}", String::from_utf8_lossy(&import_output.stderr)));
+                }
+
+                // The imported disk shows as unused0 — attach it as scsi0
+                // First detach the empty disk, then attach the imported one
+                let _ = Command::new("qm").args(["set", &vmid.to_string(), "--delete", "scsi0"]).output();
+                let _ = Command::new("qm").args(["set", &vmid.to_string(), "--scsi0", &format!("{}:vm-{}-disk-1", storage, vmid)]).output();
+
+                // Resize to requested size
+                let _ = Command::new("qm")
+                    .args(["resize", &vmid.to_string(), "scsi0", &format!("{}G", config.disk_size_gb)])
+                    .output();
+
+                // Clean up temp file
+                if import_path.starts_with("/tmp/wolfstack-import-") {
+                    let _ = std::fs::remove_file(&import_path);
+                }
+            }
+        }
+
+        // Save a WolfStack config for tracking
+        let mut tracked = config.clone();
+        tracked.storage_path = Some(storage.to_string());
+        let json = serde_json::to_string_pretty(&tracked).map_err(|e| e.to_string())?;
+        let _ = fs::write(self.vm_config_path(&config.name), json);
+
+        Ok(())
     }
 
     /// Create a volume's disk file
