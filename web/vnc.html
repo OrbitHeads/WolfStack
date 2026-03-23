@@ -152,8 +152,10 @@
             const wsUrl = `${wsProtocol}://${window.location.host}${wsPath}`;
             connectProxiedVNC(wsUrl, vncTicket);
         } else if (wsPort) {
-            // Direct VNC (standalone QEMU VMs with their own VNC port)
-            connectVNC(host, wsPort);
+            // Native QEMU VMs — proxy through WolfStack to avoid mixed-content issues
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+            const proxyUrl = `${wsProtocol}://${window.location.host}/ws/vm-vnc/${encodeURIComponent(vmName)}`;
+            connectProxiedVNC(proxyUrl, '');
         } else {
             document.getElementById('status-overlay').innerHTML =
                 '<p style="color:#fca5a5;">No VNC connection parameters specified.<br>The VM may not be running.</p>';

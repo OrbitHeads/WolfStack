@@ -13728,6 +13728,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // PVE VNC — ticket endpoint + WebSocket bridge for Proxmox VM graphical consoles
         .route("/api/pve-vnc-ticket/{vmid}", web::get().to(pve_console::pve_vnc_ticket))
         .route("/ws/pve-vnc/{vmid}", web::get().to(pve_console::pve_vnc_ws))
+        // Native VM VNC — WebSocket proxy for QEMU VM graphical consoles
+        .route("/ws/vm-vnc/{name}", web::get().to(pve_console::vm_vnc_ws))
         // VR Terminal — HTTP polling (avoids WebSocket port restrictions in VR headsets)
         // WolfFlow — workflow automation
         .route("/api/wolfflow/workflows", web::get().to(wolfflow_list))

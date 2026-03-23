@@ -223,6 +223,52 @@ async fn vnc_tcp_bridge(
 }
 
 
+/// WebSocket endpoint: /ws/vm-vnc/{name}
+/// Bridges browser noVNC ↔ native QEMU VM's built-in WebSocket VNC.
+/// This allows VNC consoles to work over HTTPS without mixed-content issues.
+pub async fn vm_vnc_ws(
+    req: HttpRequest,
+    stream: web::Payload,
+    path: web::Path<String>,
+    state: web::Data<AppState>,
+) -> Result<HttpResponse, Error> {
+    if let Err(resp) = super::require_auth(&req, &state) { return Ok(resp); }
+    let vm_name = path.into_inner();
+
+    // Look up the VM's WebSocket port
+    let ws_port = {
+        let manager = state.vms.lock().unwrap();
+        manager.get_vm(&vm_name)
+            .and_then(|vm| vm.vnc_ws_port)
+    };
+
+    let ws_port = match ws_port {
+        Some(p) => p,
+        None => return Ok(HttpResponse::NotFound().json(serde_json::json!({
+            "error": format!("VM '{}' not found or not running", vm_name)
+        }))),
+    };
+
+    // Connect TCP to QEMU's built-in WebSocket port
+    let tcp_stream = match TcpStream::connect(format!("127.0.0.1:{}", ws_port)).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to connect to QEMU VNC WebSocket port {} for VM '{}': {}", ws_port, vm_name, e);
+            return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("Failed to connect to VM console: {}", e)
+            })));
+        }
+    };
+
+    // Upgrade browser connection to WebSocket
+    let (res, session, msg_stream) = actix_ws::handle(&req, stream)?;
+
+    // Bridge WebSocket ↔ TCP (reuses the same bridge as PVE VNC)
+    actix_rt::spawn(vnc_tcp_bridge(session, msg_stream, tcp_stream));
+
+    Ok(res)
+}
+
 /// WebSocket endpoint: /ws/pve-console/{node_id}/{vmid}
 /// Connects to a Proxmox VE terminal through the termproxy API.
 /// vmid=0 means "node shell" (PVE host terminal), vmid>0 means guest console.
