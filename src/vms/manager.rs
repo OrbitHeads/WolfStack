@@ -916,6 +916,7 @@ impl VmManager {
            .arg("-smp").arg(format!("{}", config.cpus))
            .arg("-drive").arg(format!("file={},format=qcow2,if={},index=0", actual_disk.display(), os_disk_if))
            .arg("-vnc").arg(&vnc_arg)
+           .arg("-usb").arg("-device").arg("usb-tablet")
            .arg("-daemonize");
 
         // ARM64 requires the 'virt' machine type and UEFI firmware (no legacy BIOS)
