@@ -62,6 +62,18 @@ for cmd in xorriso unsquashfs mksquashfs wget; do
     fi
 done
 
+# ── Clean up stale mounts from any previous failed build ──
+cleanup_mounts() {
+    local FS="$BUILD_DIR/squashfs-root"
+    umount "$FS/tmp" 2>/dev/null || true
+    umount "$FS/sys" 2>/dev/null || true
+    umount "$FS/proc" 2>/dev/null || true
+    umount "$FS/dev/pts" 2>/dev/null || true
+    umount "$FS/dev" 2>/dev/null || true
+}
+trap cleanup_mounts EXIT
+cleanup_mounts
+
 # ── Prepare build directory ──
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
@@ -183,9 +195,6 @@ apt install -y --no-install-recommends s3fs-fuse 2>/dev/null || \
 apt clean
 rm -rf /var/lib/apt/lists/*
 
-# Create default login user (needs /dev mounted for chpasswd)
-useradd -m -s /bin/bash wolfstack 2>/dev/null || true
-echo "wolfstack:wolfstack" | chpasswd
 ' 2>&1 | tail -20
 
 umount "$FS/tmp"
@@ -194,7 +203,8 @@ umount "$FS/proc"
 umount "$FS/dev/pts"
 umount "$FS/dev"
 echo "  ✓ Runtime packages installed"
-echo "  ✓ Default user: wolfstack / wolfstack"
+
+# User creation handled by wolfstack-live-setup at boot (step 1/7)
 
 # --- WolfNet configuration ---
 mkdir -p "$FS/etc/wolfnet" "$FS/var/run/wolfnet"
@@ -287,48 +297,84 @@ ln -sf /lib/systemd/system/lxc-net.service "$FS/etc/systemd/system/multi-user.ta
 cat > "$FS/usr/local/bin/wolfstack-live-setup" << 'SETUPEOF'
 #!/bin/bash
 # WolfStack Live USB — boot-time init
-# Everything is pre-installed. This just handles runtime-only tasks:
-# - Ensure /dev/net/tun exists
-# - Generate WolfNet key if missing
-# - Assign WolfNet IP based on actual network
 
 SETUP_DONE="/var/run/wolfstack-setup-done"
 [ -f "$SETUP_DONE" ] && exit 0
 
+echo ""
+echo "  ======================================"
+echo "  WolfStack Live USB — Starting up"
+echo "  ======================================"
+echo ""
+
+# Create the wolfstack login user
+echo "  [1/7] Creating wolfstack user..."
+if ! id wolfstack &>/dev/null; then
+    adduser --disabled-password --gecos "WolfStack" wolfstack 2>/dev/null
+    echo "wolfstack:wolfstack" | chpasswd -c SHA512
+fi
+echo "         Done."
+
 # Ensure /dev/net/tun
+echo "  [2/7] Setting up TUN device..."
 if [ ! -e /dev/net/tun ]; then
     mkdir -p /dev/net
     mknod /dev/net/tun c 10 200 2>/dev/null || true
     chmod 666 /dev/net/tun 2>/dev/null || true
 fi
 modprobe tun 2>/dev/null || true
+echo "         Done."
 
 # Generate WolfNet key if not present
+echo "  [3/7] Generating WolfNet encryption key..."
 if [ ! -f /etc/wolfnet/private.key ]; then
     mkdir -p /etc/wolfnet
     if command -v wolfnet >/dev/null 2>&1; then
         wolfnet genkey --output /etc/wolfnet/private.key 2>/dev/null || true
     fi
 fi
+echo "         Done."
 
 # Auto-assign WolfNet IP based on host network
+echo "  [4/7] Detecting network configuration..."
 HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 LAST_OCTET=$(echo "$HOST_IP" | awk -F. '{print $4}')
 if [ -n "$LAST_OCTET" ] && [ "$LAST_OCTET" -ge 1 ] 2>/dev/null && [ "$LAST_OCTET" -le 254 ] 2>/dev/null; then
     sed -i "s/address = \"10.10.10.1\"/address = \"10.10.10.${LAST_OCTET}\"/" /etc/wolfnet/config.toml 2>/dev/null || true
+    echo "         IP address: $HOST_IP — WolfNet: 10.10.10.${LAST_OCTET}"
+else
+    echo "         No network detected — using default WolfNet IP"
 fi
 
-# Ensure services are started (systemd ordering handles the rest,
-# but explicit start ensures they're up even if ordering races)
+# Start Docker
+echo "  [5/7] Starting Docker..."
 systemctl daemon-reload
+systemctl start docker 2>/dev/null || true
+echo "         Done."
+
+# Start WolfNet
+echo "  [6/7] Starting WolfNet..."
 systemctl start wolfnet 2>/dev/null || true
 sleep 2
+echo "         Done."
+
+# Start WolfStack
+echo "  [7/7] Starting WolfStack dashboard..."
 systemctl start wolfstack 2>/dev/null || true
+
+# Wait for WolfStack to respond (up to 30 seconds)
+for i in $(seq 1 30); do
+    if curl -sSf http://127.0.0.1:8553/api/settings/login-disabled >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+echo "         Done."
 
 touch "$SETUP_DONE"
 echo ""
 echo "  ======================================"
-echo "  WolfStack is running!"
+echo "  WolfStack is ready!"
 echo "  ======================================"
 echo ""
 echo "  Dashboard: http://127.0.0.1:8553"
@@ -365,7 +411,7 @@ EOF
 mkdir -p "$FS/etc/systemd/system/multi-user.target.wants"
 ln -sf /etc/systemd/system/wolfstack-setup.service "$FS/etc/systemd/system/multi-user.target.wants/wolfstack-setup.service"
 
-# --- Landing page (shown in Firefox while services start) ---
+# --- Landing page (static HTML — no API calls, no CORS issues) ---
 mkdir -p "$FS/opt/wolfstack/landing"
 cat > "$FS/opt/wolfstack/landing/index.html" << 'LANDING'
 <!DOCTYPE html>
@@ -373,88 +419,94 @@ cat > "$FS/opt/wolfstack/landing/index.html" << 'LANDING'
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>WolfStack — Starting</title>
+<title>WolfStack — Getting Ready</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
-    background: #0a0e17; color: #c9d1d9; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    display: flex; align-items: center; justify-content: center; min-height: 100vh;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #0a0e17; color: #c9d1d9;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh;
   }
-  .container { text-align: center; max-width: 600px; padding: 2rem; }
-  .logo { font-size: 3rem; margin-bottom: 1rem; }
-  h1 { font-size: 1.8rem; color: #e6edf3; margin-bottom: 0.5rem; }
-  .subtitle { color: #8b949e; font-size: 1.1rem; margin-bottom: 2rem; }
-  .status-box {
-    background: #161b22; border: 1px solid #30363d; border-radius: 12px;
-    padding: 2rem; margin-bottom: 2rem;
+  .card {
+    background: rgba(17,24,43,0.85); border: 1px solid rgba(220,38,38,0.15);
+    border-radius: 16px; padding: 48px 40px; max-width: 480px; width: 90vw;
+    box-shadow: 0 25px 50px rgba(0,0,0,0.4); text-align: center;
   }
-  .spinner {
-    width: 48px; height: 48px; border: 4px solid #30363d; border-top-color: #58a6ff;
-    border-radius: 50%; animation: spin 1s linear infinite; margin: 0 auto 1.5rem;
+  h1 { font-size: 22px; color: #f87171; margin: 12px 0 4px; }
+  .sub { color: #64748b; font-size: 14px; margin-bottom: 28px; }
+
+  .steps {
+    text-align: left; background: rgba(15,23,42,0.6);
+    border: 1px solid rgba(220,38,38,0.15); border-radius: 10px;
+    padding: 20px 24px; margin-bottom: 24px;
   }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  .status-text { font-size: 1.1rem; color: #58a6ff; }
-  .ready { display: none; }
-  .ready h2 { color: #3fb950; font-size: 1.5rem; margin-bottom: 1rem; }
-  .ready a {
-    display: inline-block; background: #238636; color: #fff; text-decoration: none;
-    padding: 0.75rem 2rem; border-radius: 8px; font-size: 1.1rem; font-weight: 600;
-  }
-  .ready a:hover { background: #2ea043; }
+  .steps h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: #64748b; margin-bottom: 14px; }
+  .step { display: flex; gap: 10px; padding: 6px 0; font-size: 14px; color: #94a3b8; }
+  .step-num { color: #f87171; font-weight: 600; min-width: 18px; }
+
   .creds {
-    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
-    padding: 1rem; margin: 1rem 0; text-align: left;
+    text-align: left; background: rgba(15,23,42,0.6);
+    border: 1px solid rgba(220,38,38,0.15); border-radius: 10px;
+    padding: 16px 24px; margin-bottom: 24px;
   }
+  .creds h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: #64748b; margin-bottom: 10px; }
+  .cred-row { display: flex; justify-content: space-between; padding: 4px 0; font-size: 14px; }
+  .cred-label { color: #94a3b8; }
+  .cred-value {
+    font-family: 'Courier New', monospace; font-weight: 600;
+    color: #e2e8f0; background: rgba(220,38,38,0.1);
+    padding: 2px 10px; border-radius: 6px;
+  }
+  .cred-warn { font-size: 12px; color: #f59e0b; margin-top: 8px; }
+
+  .go-btn {
+    display: block; width: 100%; padding: 14px; text-align: center;
+    background: linear-gradient(135deg, #dc2626, #b91c1c);
+    border: none; border-radius: 10px; color: white;
+    font-size: 15px; font-weight: 600; cursor: pointer;
+    text-decoration: none; transition: all 0.25s;
+  }
+  .go-btn:hover { transform: translateY(-1px); box-shadow: 0 8px 25px rgba(220,38,38,0.35); }
+
+  .hint { font-size: 12px; color: #64748b; margin-top: 16px; line-height: 1.5; }
+
+  .footer { text-align: center; margin-top: 20px; font-size: 12px; color: #64748b; }
+  .footer a { color: #f87171; text-decoration: none; }
 </style>
 </head>
 <body>
-<div class="container">
-  <div class="logo">&#x1F43A;</div>
+<div class="card">
+  <img src="http://127.0.0.1:8553/images/wolfstack-logo.png" alt="" style="height:40px;" onerror="this.style.display='none'">
   <h1>WolfStack Live USB</h1>
-  <p class="subtitle">Server Management Platform</p>
+  <p class="sub">Server Management Platform</p>
 
-  <div class="status-box" id="setupBox">
-    <div class="spinner" id="spinner"></div>
-    <div class="status-text" id="statusText">Starting WolfStack services...</div>
+  <div class="steps">
+    <h2>What's happening</h2>
+    <div class="step"><span class="step-num">1.</span> WolfStack is setting up services in the background</div>
+    <div class="step"><span class="step-num">2.</span> You can watch the progress in the terminal window behind this page</div>
+    <div class="step"><span class="step-num">3.</span> When the terminal says "WolfStack is ready!", click the button below</div>
   </div>
 
-  <div class="ready" id="readyBox">
-    <h2>&#10003; WolfStack is Ready!</h2>
-    <p style="margin-bottom:0.5rem;color:#8b949e">Redirecting to dashboard...</p>
-    <div class="creds">
-      <p style="color:#8b949e;margin-bottom:0.5rem;font-size:0.9rem">Default login credentials:</p>
-      <p style="color:#e6edf3;margin:0"><b>Username:</b> wolfstack &nbsp; <b>Password:</b> wolfstack</p>
-      <p style="color:#f0883e;font-size:0.85rem;margin-top:0.5rem">Change your password after first login!</p>
-    </div>
-    <a href="http://127.0.0.1:8553">Open Dashboard</a>
+  <div class="creds">
+    <h2>Login Credentials</h2>
+    <div class="cred-row"><span class="cred-label">Username</span><span class="cred-value">wolfstack</span></div>
+    <div class="cred-row"><span class="cred-label">Password</span><span class="cred-value">wolfstack</span></div>
+    <p class="cred-warn">Change your password after first login.</p>
   </div>
+
+  <a href="http://127.0.0.1:8553" class="go-btn">Open Dashboard</a>
+
+  <p class="hint">
+    If the dashboard doesn't load yet, just wait a moment and try again.<br>
+    Services typically take 30-60 seconds to start.
+  </p>
 </div>
-<script>
-(function() {
-  const status = document.getElementById('statusText');
-  async function poll() {
-    try {
-      const r = await fetch('http://127.0.0.1:8553/api/version', {cache:'no-store'});
-      if (r.ok) {
-        status.textContent = 'WolfStack is running!';
-        status.style.color = '#3fb950';
-        document.getElementById('spinner').style.display = 'none';
-        document.getElementById('setupBox').style.display = 'none';
-        document.getElementById('readyBox').style.display = 'block';
-        setTimeout(() => { window.location.href = 'http://127.0.0.1:8553'; }, 3000);
-        return;
-      }
-    } catch(e) {}
-    setTimeout(poll, 2000);
-  }
-  poll();
-})();
-</script>
+<div class="footer">&copy; 2026 <a href="https://wolf.uk.com/">Wolf Software Systems Ltd</a></div>
 </body>
 </html>
 LANDING
 
-# --- Firefox ESR homepage policy (points to local landing page) ---
+# --- Firefox ESR homepage policy ---
 mkdir -p "$FS/usr/lib/firefox-esr/distribution"
 cat > "$FS/usr/lib/firefox-esr/distribution/policies.json" << 'EOF'
 {
@@ -476,7 +528,7 @@ cat > "$FS/etc/xdg/autostart/wolfstack-setup-terminal.desktop" << 'EOF'
 [Desktop Entry]
 Type=Application
 Name=WolfStack Services
-Exec=bash -c 'sleep 3 && xfce4-terminal --title="WolfStack Services" -e "sudo bash -c \"echo WolfStack Live USB && echo =================== && echo && echo Dashboard: http://127.0.0.1:8553 && echo Login: wolfstack / wolfstack && echo && echo Service logs: && journalctl -u wolfstack -u wolfnet -f --no-hostname\""'
+Exec=bash -c 'sleep 3 && xfce4-terminal --title="WolfStack — Starting Up" -e "sudo journalctl -u wolfstack-setup -u wolfstack -u wolfnet -u docker -f --no-hostname -o cat"'
 Hidden=false
 NoDisplay=true
 X-GNOME-Autostart-enabled=true
@@ -661,7 +713,7 @@ HOSTS
 
 echo "85"
 echo "# Setting root password..."
-echo "root:${PASS1}" | chroot /mnt/wolfstack-target chpasswd 2>/dev/null
+echo "root:${PASS1}" | chroot /mnt/wolfstack-target chpasswd -c SHA512 2>/dev/null
 
 echo "87"
 echo "# Binding filesystems for grub install..."
