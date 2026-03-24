@@ -148,26 +148,29 @@
 
         if (wsPath) {
             // WolfStack-proxied VNC (Proxmox VMs via WS bridge)
+            // Disable resizeSession for Proxmox VMs — Windows 11 applies display
+            // scaling (125%+) after a resize, causing mouse coordinate mismatch.
             const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
             const wsUrl = `${wsProtocol}://${window.location.host}${wsPath}`;
-            connectProxiedVNC(wsUrl, vncTicket);
+            connectProxiedVNC(wsUrl, vncTicket, false);
         } else if (wsPort) {
             // Native QEMU VMs — proxy through WolfStack to avoid mixed-content issues
             const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
             const proxyUrl = `${wsProtocol}://${window.location.host}/ws/vm-vnc/${encodeURIComponent(vmName)}`;
-            connectProxiedVNC(proxyUrl, '');
+            connectProxiedVNC(proxyUrl, '', true);
         } else {
             document.getElementById('status-overlay').innerHTML =
                 '<p style="color:#fca5a5;">No VNC connection parameters specified.<br>The VM may not be running.</p>';
         }
 
-        function connectProxiedVNC(wsUrl, ticket) {
+        function connectProxiedVNC(wsUrl, ticket, resizeSession) {
             const container = document.getElementById('vnc-container');
             try {
                 const opts = {
                     scaleViewport: true,
-                    resizeSession: true,
+                    resizeSession: resizeSession,
                     clipViewport: true,
+                    showDotCursor: true,
                 };
                 if (ticket) {
                     opts.credentials = { password: ticket };
