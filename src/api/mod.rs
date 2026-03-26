@@ -123,6 +123,8 @@ pub struct AppState {
     pub migration_tasks: Arc<std::sync::RwLock<std::collections::HashMap<String, MigrationTask>>>,
     /// Alert log — recent alerts surfaced to the frontend task log
     pub alert_log: Arc<std::sync::RwLock<Vec<AlertLogEntry>>>,
+    /// Password reset tokens (in-memory, 30-minute expiry)
+    pub password_reset_tokens: Arc<crate::auth::PasswordResetTokens>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -414,6 +416,106 @@ pub async fn auth_check(req: HttpRequest, state: web::Data<AppState>) -> HttpRes
     }
 }
 
+// ─── Password Reset API (no auth required) ───
+
+/// GET /api/auth/smtp-configured — check if SMTP is configured (controls "Lost Password" visibility)
+pub async fn smtp_configured() -> HttpResponse {
+    let config = crate::ai::AiConfig::load();
+    let configured = !config.smtp_host.is_empty() && !config.smtp_user.is_empty() && !config.smtp_pass.is_empty();
+    HttpResponse::Ok().json(serde_json::json!({ "smtp_configured": configured }))
+}
+
+/// POST /api/auth/forgot-password — send a password reset email
+pub async fn forgot_password(state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    let username = body["username"].as_str().unwrap_or("").trim();
+    if username.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "Username is required"}));
+    }
+
+    // Rate limit by IP is already handled at the login level, but let's not leak user existence.
+    // Always return success to prevent user enumeration.
+    let generic_ok = HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "message": "If an account with that username exists and has an email address, a reset link has been sent."
+    }));
+
+    // Look up the WolfStack user
+    let store = crate::auth::users::UserStore::load();
+    let user = match store.find(username) {
+        Some(u) => u.clone(),
+        None => return generic_ok,
+    };
+
+    if user.email.is_empty() {
+        return generic_ok;
+    }
+
+    // Check SMTP is configured
+    let config = crate::ai::AiConfig::load();
+    if config.smtp_host.is_empty() || config.smtp_user.is_empty() || config.smtp_pass.is_empty() {
+        return generic_ok;
+    }
+
+    // Create reset token
+    let token = state.password_reset_tokens.create(username);
+
+    // Send the email
+    let subject = "WolfStack — Password Reset";
+    let body_text = format!(
+        "A password reset was requested for your WolfStack account '{}'.\n\n\
+         Your reset code is:\n\n    {}\n\n\
+         Enter this code on the login page to set a new password.\n\
+         This code expires in 30 minutes.\n\n\
+         If you did not request this, you can safely ignore this email.",
+        username, token
+    );
+
+    match crate::ai::send_alert_email(&config, subject, &body_text) {
+        Ok(()) => generic_ok,
+        Err(e) => {
+            tracing::warn!("Failed to send password reset email: {}", e);
+            generic_ok // Don't leak SMTP errors
+        }
+    }
+}
+
+/// POST /api/auth/reset-password — validate reset token and set new password
+pub async fn reset_password(state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    let token = body["token"].as_str().unwrap_or("").trim();
+    let new_password = body["password"].as_str().unwrap_or("");
+
+    if token.is_empty() || new_password.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "Token and new password are required"}));
+    }
+
+    if new_password.len() < 6 {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "Password must be at least 6 characters"}));
+    }
+
+    // Validate and consume the token
+    let username = match state.password_reset_tokens.validate_and_consume(token) {
+        Some(u) => u,
+        None => return HttpResponse::BadRequest().json(serde_json::json!({"error": "Invalid or expired reset code"})),
+    };
+
+    // Hash the new password and update the user
+    let password_hash = match crate::auth::users::hash_password(new_password) {
+        Ok(h) => h,
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
+    };
+
+    let mut store = crate::auth::users::UserStore::load();
+    if let Some(user) = store.find_mut(&username) {
+        user.password_hash = password_hash;
+        if let Err(e) = store.save() {
+            return HttpResponse::InternalServerError().json(serde_json::json!({"error": e}));
+        }
+        HttpResponse::Ok().json(serde_json::json!({"success": true, "message": "Password has been reset. You can now log in."}))
+    } else {
+        HttpResponse::BadRequest().json(serde_json::json!({"error": "User no longer exists"}))
+    }
+}
+
 // ─── User Management API ───
 
 /// GET /api/auth/config — get auth configuration
@@ -440,6 +542,7 @@ pub async fn list_users(req: HttpRequest, state: web::Data<AppState>) -> HttpRes
             "username": u.username,
             "role": u.role,
             "display_name": u.display_name,
+            "email": u.email,
             "totp_enabled": u.totp_enabled,
             "created_at": u.created_at,
         })
@@ -468,6 +571,8 @@ pub async fn create_user(req: HttpRequest, state: web::Data<AppState>, body: web
         Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
     };
 
+    let email = body["email"].as_str().unwrap_or("").trim().to_string();
+
     let user = crate::auth::users::WolfUser {
         username: username.clone(),
         password_hash,
@@ -475,6 +580,7 @@ pub async fn create_user(req: HttpRequest, state: web::Data<AppState>, body: web
         totp_enabled: false,
         role,
         display_name,
+        email,
         created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string(),
     };
 
@@ -13464,6 +13570,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/auth/check", web::get().to(auth_check))
         .route("/api/settings/login-disabled", web::get().to(login_disabled_status))
         .route("/api/settings/login-disabled", web::post().to(set_login_disabled))
+        .route("/api/auth/smtp-configured", web::get().to(smtp_configured))
+        .route("/api/auth/forgot-password", web::post().to(forgot_password))
+        .route("/api/auth/reset-password", web::post().to(reset_password))
         // User management (auth required)
         .route("/api/auth/config", web::get().to(get_auth_config))
         .route("/api/auth/config", web::post().to(save_auth_config))

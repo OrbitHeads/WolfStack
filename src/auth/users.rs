@@ -82,6 +82,9 @@ pub struct WolfUser {
     /// Display name (optional)
     #[serde(default)]
     pub display_name: String,
+    /// Email address (used for password reset)
+    #[serde(default)]
+    pub email: String,
     /// When the user was created
     #[serde(default)]
     pub created_at: String,

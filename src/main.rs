@@ -316,6 +316,7 @@ async fn main() -> std::io::Result<()> {
             patreon: Arc::new(patreon::PatreonState::new()),
             migration_tasks: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             alert_log: Arc::new(std::sync::RwLock::new(Vec::new())),
+            password_reset_tokens: Arc::new(auth::PasswordResetTokens::new()),
         });
 
         // Background: periodic self-monitoring update
@@ -399,14 +400,16 @@ async fn main() -> std::io::Result<()> {
             }
         });
 
-        // Background: session + login rate limiter cleanup
+        // Background: session + login rate limiter + reset token cleanup
         let sessions_cleanup = sessions.clone();
         let login_limiter_cleanup = app_state.login_limiter.clone();
+        let reset_tokens_cleanup = app_state.password_reset_tokens.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(300)).await;
                 sessions_cleanup.cleanup();
                 login_limiter_cleanup.cleanup();
+                reset_tokens_cleanup.cleanup();
             }
         });
 

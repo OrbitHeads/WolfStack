@@ -308,6 +308,56 @@ impl LoginRateLimiter {
     }
 }
 
+// ─── Password Reset Tokens ───
+
+/// In-memory storage for password reset tokens (30-minute expiry)
+pub struct PasswordResetTokens {
+    tokens: RwLock<HashMap<String, ResetToken>>,
+}
+
+struct ResetToken {
+    username: String,
+    created: Instant,
+}
+
+const RESET_TOKEN_LIFETIME: Duration = Duration::from_secs(30 * 60); // 30 minutes
+
+impl PasswordResetTokens {
+    pub fn new() -> Self {
+        Self { tokens: RwLock::new(HashMap::new()) }
+    }
+
+    /// Create a reset token for a user. Returns the token string.
+    pub fn create(&self, username: &str) -> String {
+        let token = uuid::Uuid::new_v4().to_string();
+        let mut tokens = self.tokens.write().unwrap();
+        // Remove any existing tokens for this user
+        tokens.retain(|_, t| t.username != username);
+        tokens.insert(token.clone(), ResetToken {
+            username: username.to_string(),
+            created: Instant::now(),
+        });
+        token
+    }
+
+    /// Validate and consume a reset token. Returns the username if valid.
+    pub fn validate_and_consume(&self, token: &str) -> Option<String> {
+        let mut tokens = self.tokens.write().unwrap();
+        if let Some(rt) = tokens.remove(token) {
+            if rt.created.elapsed() < RESET_TOKEN_LIFETIME {
+                return Some(rt.username);
+            }
+        }
+        None
+    }
+
+    /// Clean up expired tokens
+    pub fn cleanup(&self) {
+        let mut tokens = self.tokens.write().unwrap();
+        tokens.retain(|_, t| t.created.elapsed() < RESET_TOKEN_LIFETIME);
+    }
+}
+
 /// Validate a container/VM name — only allow safe characters (alphanumeric, dash, underscore, dot)
 pub fn is_safe_name(name: &str) -> bool {
     !name.is_empty()
