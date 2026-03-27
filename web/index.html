@@ -2847,6 +2847,155 @@
             </div>
         </div>
 
+        <!-- ═══ Docker Compose Page ═══ -->
+        <div id="page-compose" class="page-view" style="display:none;">
+            <div class="card" style="margin-bottom: 20px;">
+                <div class="card-body" style="display: flex; align-items: center; justify-content: space-between;">
+                    <div>
+                        <span style="font-size: 20px;">📋</span>
+                        <strong>Docker Compose</strong>
+                        <span id="compose-stack-count" style="color: var(--text-muted); margin-left: 8px;"></span>
+                    </div>
+                    <div style="display:flex; gap:8px;">
+                        <button class="btn btn-sm" onclick="selectServerView(currentNodeId, 'secrets')" style="font-size:12px;">🔑 Secrets</button>
+                        <button class="btn btn-sm btn-primary" onclick="showComposeCreate()" style="font-size:12px;">+ New Stack</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
+                    <h3>Compose Stacks</h3>
+                </div>
+                <div class="card-body">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Status</th>
+                                <th>Services</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="compose-stacks-table"></tbody>
+                    </table>
+                    <p id="compose-empty" style="display:none; text-align:center; padding:20px; color: var(--text-muted);">
+                        No compose stacks found. Click <strong>+ New Stack</strong> to create one.
+                    </p>
+                </div>
+            </div>
+        </div>
+
+        <!-- ═══ Secrets Manager Page ═══ -->
+        <div id="page-secrets" class="page-view" style="display:none;">
+            <div class="card" style="margin-bottom: 20px;">
+                <div class="card-body" style="display: flex; align-items: center; justify-content: space-between;">
+                    <div>
+                        <span style="font-size: 20px;">🔑</span>
+                        <strong>Secrets Manager</strong>
+                        <span id="secrets-count" style="color: var(--text-muted); margin-left: 8px;"></span>
+                    </div>
+                    <div style="display:flex; gap:8px;">
+                        <button class="btn btn-sm" onclick="selectServerView(currentNodeId, 'compose')" style="font-size:12px;">← Back to Compose</button>
+                        <button class="btn btn-sm btn-primary" onclick="showSecretCreate()" style="font-size:12px;">+ Add Secret</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-body">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Key</th>
+                                <th>Value</th>
+                                <th>Description</th>
+                                <th>Updated</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="secrets-table"></tbody>
+                    </table>
+                    <p id="secrets-empty" style="display:none; text-align:center; padding:20px; color: var(--text-muted);">
+                        No secrets stored. Click <strong>+ Add Secret</strong> to create one.
+                    </p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Compose Editor Modal -->
+        <div id="compose-editor-modal" class="modal-overlay">
+            <div class="modal" style="max-width:1100px; width:95%;">
+                <div class="modal-header">
+                    <h3 id="compose-editor-title">Edit Stack</h3>
+                    <button class="modal-close" onclick="closeComposeEditor()">&times;</button>
+                </div>
+                <div class="modal-body" style="padding:0;">
+                    <div style="display:flex; border-bottom:1px solid var(--border);">
+                        <button id="compose-tab-yaml" class="btn btn-sm" onclick="switchComposeTab('yaml')" style="border-radius:0; border-bottom:2px solid var(--primary-color, #6366f1); font-weight:600;">docker-compose.yml</button>
+                        <button id="compose-tab-env" class="btn btn-sm" onclick="switchComposeTab('env')" style="border-radius:0; opacity:0.6;">.env</button>
+                    </div>
+                    <div id="compose-tab-yaml-content">
+                        <textarea id="compose-yaml-editor" style="width:100%; height:60vh; margin:0; padding:12px 16px; border:none; background:var(--bg-primary); color:var(--text-primary); font-family:var(--font-mono); font-size:13px; line-height:1.5; resize:vertical; tab-size:2; white-space:pre; overflow-wrap:normal; overflow-x:auto;" spellcheck="false" placeholder="# docker-compose.yml"></textarea>
+                    </div>
+                    <div id="compose-tab-env-content" style="display:none;">
+                        <textarea id="compose-env-editor" style="width:100%; height:60vh; margin:0; padding:12px 16px; border:none; background:var(--bg-primary); color:var(--text-primary); font-family:var(--font-mono); font-size:13px; line-height:1.5; resize:vertical; tab-size:2; white-space:pre; overflow-wrap:normal; overflow-x:auto;" spellcheck="false" placeholder="# Environment variables&#10;KEY=value"></textarea>
+                    </div>
+                </div>
+                <div class="modal-footer" style="display:flex; justify-content:space-between;">
+                    <div>
+                        <button class="btn btn-sm" onclick="validateComposeYaml()" style="font-size:12px;">Validate</button>
+                        <span id="compose-validate-result" style="margin-left:8px; font-size:12px;"></span>
+                    </div>
+                    <div style="display:flex; gap:8px;">
+                        <button class="btn" onclick="closeComposeEditor()">Cancel</button>
+                        <button class="btn btn-primary" onclick="saveComposeFiles()">Save</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Compose Logs Modal -->
+        <div id="compose-logs-modal" class="modal-overlay">
+            <div class="modal" style="max-width:900px; width:95%;">
+                <div class="modal-header">
+                    <h3 id="compose-logs-title">Stack Logs</h3>
+                    <button class="modal-close" onclick="document.getElementById('compose-logs-modal').classList.remove('active')">&times;</button>
+                </div>
+                <div class="modal-body" style="padding:0;">
+                    <pre id="compose-logs-content" style="margin:0; padding:12px 16px; background:var(--bg-primary); color:var(--text-primary); font-family:var(--font-mono); font-size:12px; line-height:1.4; max-height:70vh; overflow:auto; white-space:pre-wrap;"></pre>
+                </div>
+            </div>
+        </div>
+
+        <!-- Secret Edit Modal -->
+        <div id="secret-edit-modal" class="modal-overlay">
+            <div class="modal" style="max-width:500px; width:90%;">
+                <div class="modal-header">
+                    <h3 id="secret-edit-title">Add Secret</h3>
+                    <button class="modal-close" onclick="document.getElementById('secret-edit-modal').classList.remove('active')">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <div style="margin-bottom:12px;">
+                        <label style="display:block; margin-bottom:4px; font-weight:600; font-size:13px;">Key</label>
+                        <input id="secret-edit-key" type="text" placeholder="MY_SECRET_KEY" style="width:100%; padding:8px 12px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary); font-family:var(--font-mono);">
+                    </div>
+                    <div style="margin-bottom:12px;">
+                        <label style="display:block; margin-bottom:4px; font-weight:600; font-size:13px;">Value</label>
+                        <textarea id="secret-edit-value" rows="3" placeholder="secret value..." style="width:100%; padding:8px 12px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary); font-family:var(--font-mono); resize:vertical;"></textarea>
+                    </div>
+                    <div style="margin-bottom:12px;">
+                        <label style="display:block; margin-bottom:4px; font-weight:600; font-size:13px;">Description (optional)</label>
+                        <input id="secret-edit-desc" type="text" placeholder="What this secret is for" style="width:100%; padding:8px 12px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary);">
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn" onclick="document.getElementById('secret-edit-modal').classList.remove('active')">Cancel</button>
+                    <button class="btn btn-primary" onclick="saveSecret()">Save</button>
+                </div>
+            </div>
+        </div>
+
         <!-- ═══ LXC Containers Page ═══ -->
         <div id="page-lxc" class="page-view" style="display:none;">
             <!-- LXC Runtime Status -->

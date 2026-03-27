@@ -391,6 +391,7 @@
         <div class="copyright">
             &copy; 2026 <a href="https://wolf.uk.com/" target="_blank" rel="noopener">Wolf Software Systems Ltd</a>
         </div>
+        <div id="login-version" style="text-align:center;font-size:10px;color:rgba(255,255,255,0.25);margin-top:6px;"></div>
     </div>
 
     <script>
@@ -519,6 +520,9 @@
             .then(data => {
                 if (data.smtp_configured) {
                     document.getElementById('forgot-link').style.display = '';
+                }
+                if (data.version) {
+                    document.getElementById('login-version').textContent = 'v' + data.version;
                 }
             })
             .catch(() => {});

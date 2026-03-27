@@ -2505,6 +2505,318 @@ pub fn docker_update_config(container: &str, autostart: Option<bool>, memory_mb:
     Ok(messages.join("; "))
 }
 
+/// Recreate a Docker container with updated environment variables.
+/// Uses rename-based safe approach: renames old container, creates new one,
+/// and only removes the old one on success. On failure, renames back.
+pub fn docker_recreate_with_env(container: &str, new_env: &[String]) -> Result<String, String> {
+    // Validate env vars before doing anything destructive
+    for e in new_env {
+        if !e.contains('=') {
+            return Err(format!("Invalid env var (missing '='): '{}'", e));
+        }
+        let key = &e[..e.find('=').unwrap()];
+        if key.is_empty() {
+            return Err(format!("Invalid env var (empty key): '{}'", e));
+        }
+        if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || key.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(true) {
+            return Err(format!("Invalid env var key '{}' — must match [A-Za-z_][A-Za-z0-9_]*", key));
+        }
+    }
+
+    // 1. Inspect the current container to capture its full config
+    let inspect = docker_inspect(container)?;
+
+    let image = inspect.pointer("/Config/Image")
+        .and_then(|v| v.as_str())
+        .ok_or("Cannot determine container image")?
+        .to_string();
+
+    let name = inspect.pointer("/Name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(container)
+        .trim_start_matches('/')
+        .to_string();
+
+    // Extract restart policy (with retry count for on-failure)
+    let restart_name = inspect.pointer("/HostConfig/RestartPolicy/Name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("no")
+        .to_string();
+    let restart_retries = inspect.pointer("/HostConfig/RestartPolicy/MaximumRetryCount")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let restart_policy = if restart_name == "on-failure" && restart_retries > 0 {
+        format!("on-failure:{}", restart_retries)
+    } else {
+        restart_name
+    };
+
+    // Extract TTY and stdin settings
+    let tty = inspect.pointer("/Config/Tty").and_then(|v| v.as_bool()).unwrap_or(false);
+    let open_stdin = inspect.pointer("/Config/OpenStdin").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // Extract entrypoint, cmd, user, workdir
+    let entrypoint: Vec<String> = inspect.pointer("/Config/Entrypoint")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+
+    let cmd: Vec<String> = inspect.pointer("/Config/Cmd")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+
+    let user = inspect.pointer("/Config/User")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let workdir = inspect.pointer("/Config/WorkingDir")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Extract port bindings
+    let mut ports = Vec::new();
+    if let Some(bindings) = inspect.pointer("/HostConfig/PortBindings").and_then(|v| v.as_object()) {
+        for (container_port, host_list) in bindings {
+            if let Some(arr) = host_list.as_array() {
+                for binding in arr {
+                    let host_ip = binding.get("HostIp").and_then(|v| v.as_str()).unwrap_or("");
+                    let host_port = binding.get("HostPort").and_then(|v| v.as_str()).unwrap_or("");
+                    if !host_port.is_empty() {
+                        if host_ip.is_empty() || host_ip == "0.0.0.0" {
+                            ports.push(format!("{}:{}", host_port, container_port));
+                        } else {
+                            ports.push(format!("{}:{}:{}", host_ip, host_port, container_port));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Extract volume mounts: HostConfig.Binds
+    let volumes: Vec<String> = inspect.pointer("/HostConfig/Binds")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+
+    // Extract named volumes from Mounts (type=volume)
+    let mut named_volumes: Vec<String> = Vec::new();
+    if let Some(mounts) = inspect.pointer("/Mounts").and_then(|v| v.as_array()) {
+        for mount in mounts {
+            if mount.get("Type").and_then(|v| v.as_str()) != Some("volume") { continue; }
+            let vol_name = mount.get("Name").and_then(|v| v.as_str()).unwrap_or("");
+            let destination = mount.get("Destination").and_then(|v| v.as_str()).unwrap_or("");
+            let rw = mount.get("RW").and_then(|v| v.as_bool()).unwrap_or(true);
+            if !vol_name.is_empty() && !destination.is_empty() {
+                let mode = if rw { "" } else { ":ro" };
+                let spec = format!("{}:{}{}", vol_name, destination, mode);
+                if !volumes.iter().any(|v| v.starts_with(&format!("{}:", vol_name))) {
+                    named_volumes.push(spec);
+                }
+            }
+        }
+    }
+
+    // Extract labels
+    let labels: Vec<(String, String)> = inspect.pointer("/Config/Labels")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect())
+        .unwrap_or_default();
+
+    // Extract resource limits
+    let memory = inspect.pointer("/HostConfig/Memory")
+        .and_then(|v| v.as_i64())
+        .filter(|&m| m > 0)
+        .map(|m| format!("{}m", m / 1048576));
+
+    let cpus = inspect.pointer("/HostConfig/NanoCpus")
+        .and_then(|v| v.as_i64())
+        .filter(|&c| c > 0)
+        .map(|c| format!("{:.1}", c as f64 / 1e9));
+
+    // Extract network mode
+    let network_mode = inspect.pointer("/HostConfig/NetworkMode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default")
+        .to_string();
+
+    // Extract capabilities
+    let cap_add: Vec<String> = inspect.pointer("/HostConfig/CapAdd")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let cap_drop: Vec<String> = inspect.pointer("/HostConfig/CapDrop")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+
+    // Extract devices
+    let devices: Vec<String> = inspect.pointer("/HostConfig/Devices")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|dev| {
+            let host = dev.get("PathOnHost").and_then(|v| v.as_str())?;
+            let container = dev.get("PathInContainer").and_then(|v| v.as_str())?;
+            Some(format!("{}:{}", host, container))
+        }).collect())
+        .unwrap_or_default();
+
+    // Extract shm size
+    let shm_size = inspect.pointer("/HostConfig/ShmSize")
+        .and_then(|v| v.as_i64())
+        .filter(|&s| s > 0 && s != 67108864); // 64MB is docker default
+
+    // Check if container was running
+    let was_running = inspect.pointer("/State/Running")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // 2. Stop the container and rename it (safe approach — don't delete yet)
+    if was_running {
+        let stop = Command::new("docker").args(["stop", container]).output()
+            .map_err(|e| format!("Failed to stop container: {}", e))?;
+        if !stop.status.success() {
+            return Err(format!("Failed to stop container: {}", String::from_utf8_lossy(&stop.stderr).trim()));
+        }
+    }
+
+    let backup_name = format!("{}_wolfstack_old", name);
+    // Clean up any stale backup from a previous failed recreate
+    let _ = Command::new("docker").args(["rm", "-f", &backup_name]).output();
+
+    let rename = Command::new("docker").args(["rename", container, &backup_name]).output()
+        .map_err(|e| format!("Failed to rename container: {}", e))?;
+    if !rename.status.success() {
+        // Try to restart if it was running
+        if was_running { let _ = Command::new("docker").args(["start", container]).output(); }
+        return Err(format!("Failed to rename container: {}", String::from_utf8_lossy(&rename.stderr).trim()));
+    }
+
+    // 3. Build create command with same config + new env
+    let mut args = vec![
+        "create".to_string(),
+        "--name".to_string(), name.clone(),
+    ];
+
+    if tty { args.push("-t".to_string()); }
+    if open_stdin { args.push("-i".to_string()); }
+
+    args.push("--restart".to_string());
+    args.push(restart_policy);
+
+    if network_mode != "default" {
+        args.push("--network".to_string());
+        args.push(network_mode);
+    }
+
+    if let Some(ref mem) = memory {
+        args.push("--memory".to_string());
+        args.push(mem.clone());
+    }
+    if let Some(ref cpu) = cpus {
+        args.push("--cpus".to_string());
+        args.push(cpu.clone());
+    }
+
+    if !user.is_empty() {
+        args.push("--user".to_string());
+        args.push(user);
+    }
+    if !workdir.is_empty() {
+        args.push("--workdir".to_string());
+        args.push(workdir);
+    }
+
+    for cap in &cap_add {
+        args.push("--cap-add".to_string());
+        args.push(cap.clone());
+    }
+    for cap in &cap_drop {
+        args.push("--cap-drop".to_string());
+        args.push(cap.clone());
+    }
+    for dev in &devices {
+        args.push("--device".to_string());
+        args.push(dev.clone());
+    }
+    if let Some(shm) = shm_size {
+        args.push("--shm-size".to_string());
+        args.push(format!("{}", shm));
+    }
+
+    for vol in &volumes {
+        args.push("-v".to_string());
+        args.push(vol.clone());
+    }
+    for vol in &named_volumes {
+        args.push("-v".to_string());
+        args.push(vol.clone());
+    }
+
+    for (k, v) in &labels {
+        args.push("--label".to_string());
+        args.push(format!("{}={}", k, v));
+    }
+
+    for port in &ports {
+        args.push("-p".to_string());
+        args.push(port.clone());
+    }
+
+    for e in new_env {
+        if !e.is_empty() {
+            args.push("-e".to_string());
+            args.push(e.clone());
+        }
+    }
+
+    // Entrypoint (must come before image — only accepts the executable)
+    if !entrypoint.is_empty() {
+        args.push("--entrypoint".to_string());
+        args.push(entrypoint[0].clone());
+    }
+
+    args.push(image);
+
+    // Entrypoint args beyond [0] must be prepended to cmd
+    // e.g. entrypoint=["/bin/sh","-c"] cmd=["echo hi"] → docker create --entrypoint /bin/sh IMAGE -c "echo hi"
+    for ep_arg in entrypoint.iter().skip(1) {
+        args.push(ep_arg.clone());
+    }
+    // Cmd args (come after image + entrypoint extra args)
+    for c in &cmd {
+        args.push(c.clone());
+    }
+
+    let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let output = Command::new("docker")
+        .args(&args_ref)
+        .output()
+        .map_err(|e| format!("Failed to create container: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        // Rollback: rename the backup back to the original name
+        warn!("Recreate failed, rolling back: {}", stderr);
+        let _ = Command::new("docker").args(["rename", &backup_name, &name]).output();
+        if was_running { let _ = Command::new("docker").args(["start", &name]).output(); }
+        return Err(format!("Recreate failed (rolled back): {}", stderr));
+    }
+
+    // 4. Success — remove the old renamed container
+    let _ = Command::new("docker").args(["rm", &backup_name]).output();
+
+    // 5. Start the container if it was running before
+    if was_running {
+        docker_start(&name)?;
+    }
+
+    Ok(format!("Container '{}' recreated with updated environment variables{}", name,
+        if was_running { " and started" } else { "" }))
+}
+
 /// Inspect a Docker container and return raw JSON
 pub fn docker_inspect(container: &str) -> Result<serde_json::Value, String> {
     let output = Command::new("docker")

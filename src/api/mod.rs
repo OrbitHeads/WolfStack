@@ -422,7 +422,7 @@ pub async fn auth_check(req: HttpRequest, state: web::Data<AppState>) -> HttpRes
 pub async fn smtp_configured() -> HttpResponse {
     let config = crate::ai::AiConfig::load();
     let configured = !config.smtp_host.is_empty() && !config.smtp_user.is_empty() && !config.smtp_pass.is_empty();
-    HttpResponse::Ok().json(serde_json::json!({ "smtp_configured": configured }))
+    HttpResponse::Ok().json(serde_json::json!({ "smtp_configured": configured, "version": env!("CARGO_PKG_VERSION") }))
 }
 
 /// POST /api/auth/forgot-password — send a password reset email
@@ -4148,6 +4148,30 @@ pub async fn docker_update_config(
     match containers::docker_update_config(&id, body.autostart, body.memory_mb, body.cpus, body.wolfnet_ip.clone()) {
          Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
          Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// POST /api/containers/docker/{id}/env — update environment variables (recreates container)
+pub async fn docker_update_env(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<serde_json::Value>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+
+    let env: Vec<String> = match body.get("env").and_then(|v| v.as_array()) {
+        Some(arr) => arr.iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .filter(|s| !s.is_empty())
+            .collect(),
+        None => return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Missing 'env' array" })),
+    };
+
+    match containers::docker_recreate_with_env(&id, &env) {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
     }
 }
 
@@ -13559,6 +13583,645 @@ async fn icon_packs_preview(req: HttpRequest, state: web::Data<AppState>, path: 
     }))
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Docker Compose Management
+// ═══════════════════════════════════════════════════════════════════
+
+const COMPOSE_DIR: &str = "/etc/wolfstack/compose";
+const SECRETS_FILE: &str = "/etc/wolfstack/secrets.json";
+
+#[derive(Deserialize)]
+struct ComposeCreateRequest {
+    name: String,
+    #[serde(default)]
+    compose_yaml: String,
+    #[serde(default)]
+    env_content: String,
+}
+
+#[derive(Deserialize)]
+struct ComposeFileRequest {
+    content: String,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+struct SecretEntry {
+    key: String,
+    value: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    created: String,
+    #[serde(default)]
+    updated: String,
+}
+
+#[derive(Deserialize)]
+struct SecretRequest {
+    key: String,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+fn compose_project_dir(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(COMPOSE_DIR).join(name)
+}
+
+/// Validate compose stack name — alphanumeric, dash, underscore only
+fn is_safe_compose_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && !name.starts_with('-')
+}
+
+/// Validate a name from a URL path parameter; returns Err(HttpResponse) on failure
+fn require_safe_compose_name(name: &str) -> Result<(), HttpResponse> {
+    if !is_safe_compose_name(name) {
+        Err(HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "Invalid stack name — only alphanumeric, dash, and underscore allowed"
+        })))
+    } else {
+        Ok(())
+    }
+}
+
+/// GET /api/compose/stacks — list all compose projects
+async fn compose_list_stacks(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+
+    let dir = std::path::Path::new(COMPOSE_DIR);
+    if !dir.exists() {
+        return HttpResponse::Ok().json(serde_json::json!({ "stacks": [] }));
+    }
+
+    let mut stacks = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() { continue; }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let compose_file = path.join("docker-compose.yml");
+            let env_file = path.join(".env");
+            if !compose_file.exists() { continue; }
+
+            // Get stack status via docker compose ps
+            let status = Command::new("docker")
+                .args(["compose", "-f", &compose_file.to_string_lossy(), "ps", "--format", "json"])
+                .current_dir(&path)
+                .output();
+
+            let mut services = Vec::new();
+            let mut running = 0u32;
+            let mut total = 0u32;
+            if let Ok(out) = &status {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                for line in stdout.lines() {
+                    if let Ok(svc) = serde_json::from_str::<serde_json::Value>(line) {
+                        total += 1;
+                        let state = svc.get("State").and_then(|s| s.as_str()).unwrap_or("unknown");
+                        if state == "running" { running += 1; }
+                        services.push(serde_json::json!({
+                            "name": svc.get("Service").and_then(|s| s.as_str()).unwrap_or(""),
+                            "state": state,
+                            "status": svc.get("Status").and_then(|s| s.as_str()).unwrap_or(""),
+                            "image": svc.get("Image").and_then(|s| s.as_str()).unwrap_or(""),
+                            "ports": svc.get("Publishers").unwrap_or(&serde_json::Value::Null),
+                        }));
+                    }
+                }
+            }
+
+            let has_env = env_file.exists();
+            stacks.push(serde_json::json!({
+                "name": name,
+                "path": path.to_string_lossy(),
+                "running": running,
+                "total": total,
+                "services": services,
+                "has_env": has_env,
+                "status": if total == 0 { "stopped" } else if running == total { "running" } else { "partial" },
+            }));
+        }
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({ "stacks": stacks }))
+}
+
+/// POST /api/compose/stacks — create a new compose project
+async fn compose_create_stack(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<ComposeCreateRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+
+    let name = body.name.trim();
+    if let Err(e) = require_safe_compose_name(name) { return e; }
+
+    let dir = compose_project_dir(name);
+    if dir.exists() {
+        return HttpResponse::Conflict().json(serde_json::json!({ "error": "Stack already exists" }));
+    }
+
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Failed to create directory: {}", e) }));
+    }
+
+    let yaml = if body.compose_yaml.is_empty() {
+        format!("# Docker Compose for {}\nservices:\n  app:\n    image: nginx:latest\n    ports:\n      - \"8080:80\"\n    restart: unless-stopped\n", name)
+    } else {
+        body.compose_yaml.clone()
+    };
+
+    if let Err(e) = std::fs::write(dir.join("docker-compose.yml"), &yaml) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Failed to write compose file: {}", e) }));
+    }
+
+    if !body.env_content.is_empty() {
+        if let Err(e) = std::fs::write(dir.join(".env"), &body.env_content) {
+            return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Failed to write .env: {}", e) }));
+        }
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({ "message": "Stack created", "name": name }))
+}
+
+/// DELETE /api/compose/stacks/{name} — delete a compose project (runs down first)
+async fn compose_delete_stack(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+
+    let name = path.into_inner();
+    if let Err(e) = require_safe_compose_name(&name) { return e; }
+    let dir = compose_project_dir(&name);
+    if !dir.exists() {
+        return HttpResponse::NotFound().json(serde_json::json!({ "error": "Stack not found" }));
+    }
+
+    // Run docker compose down first
+    let compose_file = dir.join("docker-compose.yml");
+    match Command::new("docker")
+        .args(["compose", "-f", &compose_file.to_string_lossy(), "down", "--remove-orphans"])
+        .current_dir(&dir)
+        .output()
+    {
+        Ok(out) if !out.status.success() => {
+            warn!("compose down failed for '{}': {}", name, String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Err(e) => {
+            warn!("compose down failed for '{}': {}", name, e);
+        }
+        _ => {}
+    }
+
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Failed to delete: {}", e) }));
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({ "message": "Stack deleted" }))
+}
+
+/// GET /api/compose/stacks/{name}/compose — read docker-compose.yml
+async fn compose_read_yaml(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+
+    let name = path.into_inner();
+    if let Err(e) = require_safe_compose_name(&name) { return e; }
+    let file = compose_project_dir(&name).join("docker-compose.yml");
+    match std::fs::read_to_string(&file) {
+        Ok(content) => HttpResponse::Ok().json(serde_json::json!({ "content": content })),
+        Err(e) => HttpResponse::NotFound().json(serde_json::json!({ "error": format!("{}", e) })),
+    }
+}
+
+/// POST /api/compose/stacks/{name}/compose — write docker-compose.yml
+async fn compose_write_yaml(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<ComposeFileRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+
+    let name = path.into_inner();
+    if let Err(e) = require_safe_compose_name(&name) { return e; }
+    let file = compose_project_dir(&name).join("docker-compose.yml");
+    match std::fs::write(&file, &body.content) {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "message": "Saved" })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
+    }
+}
+
+/// GET /api/compose/stacks/{name}/env — read .env file
+async fn compose_read_env(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+
+    let name = path.into_inner();
+    if let Err(e) = require_safe_compose_name(&name) { return e; }
+    let file = compose_project_dir(&name).join(".env");
+    let content = std::fs::read_to_string(&file).unwrap_or_default();
+    HttpResponse::Ok().json(serde_json::json!({ "content": content }))
+}
+
+/// POST /api/compose/stacks/{name}/env — write .env file
+async fn compose_write_env(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<ComposeFileRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+
+    let name = path.into_inner();
+    if let Err(e) = require_safe_compose_name(&name) { return e; }
+    let file = compose_project_dir(&name).join(".env");
+    match std::fs::write(&file, &body.content) {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "message": "Saved" })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
+    }
+}
+
+/// POST /api/compose/stacks/{name}/up — docker compose up -d
+async fn compose_up(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+
+    let name = path.into_inner();
+    if let Err(e) = require_safe_compose_name(&name) { return e; }
+    let dir = compose_project_dir(&name);
+    let compose_file = dir.join("docker-compose.yml");
+    if !compose_file.exists() {
+        return HttpResponse::NotFound().json(serde_json::json!({ "error": "Stack not found" }));
+    }
+
+    let output = Command::new("docker")
+        .args(["compose", "-f", &compose_file.to_string_lossy(), "up", "-d", "--remove-orphans"])
+        .current_dir(&dir)
+        .output();
+
+    match output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            if out.status.success() {
+                HttpResponse::Ok().json(serde_json::json!({ "message": "Stack started", "output": format!("{}{}", stdout, stderr) }))
+            } else {
+                HttpResponse::BadRequest().json(serde_json::json!({ "error": stderr, "output": stdout }))
+            }
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
+    }
+}
+
+/// POST /api/compose/stacks/{name}/down — docker compose down
+async fn compose_down(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+
+    let name = path.into_inner();
+    if let Err(e) = require_safe_compose_name(&name) { return e; }
+    let dir = compose_project_dir(&name);
+    let compose_file = dir.join("docker-compose.yml");
+    if !compose_file.exists() {
+        return HttpResponse::NotFound().json(serde_json::json!({ "error": "Stack not found" }));
+    }
+
+    let output = Command::new("docker")
+        .args(["compose", "-f", &compose_file.to_string_lossy(), "down", "--remove-orphans"])
+        .current_dir(&dir)
+        .output();
+
+    match output {
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            if out.status.success() {
+                HttpResponse::Ok().json(serde_json::json!({ "message": "Stack stopped", "output": stderr }))
+            } else {
+                HttpResponse::BadRequest().json(serde_json::json!({ "error": stderr }))
+            }
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
+    }
+}
+
+/// POST /api/compose/stacks/{name}/pull — docker compose pull
+async fn compose_pull(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+
+    let name = path.into_inner();
+    if let Err(e) = require_safe_compose_name(&name) { return e; }
+    let dir = compose_project_dir(&name);
+    let compose_file = dir.join("docker-compose.yml");
+    if !compose_file.exists() {
+        return HttpResponse::NotFound().json(serde_json::json!({ "error": "Stack not found" }));
+    }
+
+    let output = Command::new("docker")
+        .args(["compose", "-f", &compose_file.to_string_lossy(), "pull"])
+        .current_dir(&dir)
+        .output();
+
+    match output {
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            if out.status.success() {
+                HttpResponse::Ok().json(serde_json::json!({ "message": "Images pulled", "output": stderr }))
+            } else {
+                HttpResponse::BadRequest().json(serde_json::json!({ "error": stderr }))
+            }
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
+    }
+}
+
+/// POST /api/compose/stacks/{name}/restart — docker compose restart
+async fn compose_restart(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+
+    let name = path.into_inner();
+    if let Err(e) = require_safe_compose_name(&name) { return e; }
+    let dir = compose_project_dir(&name);
+    let compose_file = dir.join("docker-compose.yml");
+    if !compose_file.exists() {
+        return HttpResponse::NotFound().json(serde_json::json!({ "error": "Stack not found" }));
+    }
+
+    let output = Command::new("docker")
+        .args(["compose", "-f", &compose_file.to_string_lossy(), "restart"])
+        .current_dir(&dir)
+        .output();
+
+    match output {
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            if out.status.success() {
+                HttpResponse::Ok().json(serde_json::json!({ "message": "Stack restarted", "output": stderr }))
+            } else {
+                HttpResponse::BadRequest().json(serde_json::json!({ "error": stderr }))
+            }
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
+    }
+}
+
+/// GET /api/compose/stacks/{name}/logs — docker compose logs (last 200 lines)
+async fn compose_logs(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+
+    let name = path.into_inner();
+    if let Err(e) = require_safe_compose_name(&name) { return e; }
+    let dir = compose_project_dir(&name);
+    let compose_file = dir.join("docker-compose.yml");
+    if !compose_file.exists() {
+        return HttpResponse::NotFound().json(serde_json::json!({ "error": "Stack not found" }));
+    }
+
+    let lines = query.get("lines").and_then(|l| l.parse::<u32>().ok()).unwrap_or(200).min(5000);
+    let file_str = compose_file.to_string_lossy().into_owned();
+    let lines_str = lines.to_string();
+    let mut cmd_args = vec!["compose", "-f", &file_str, "logs", "--no-color", "--tail", &lines_str];
+
+    // Validate service name to prevent argument injection
+    let service_owned: String;
+    if let Some(service) = query.get("service") {
+        if !service.is_empty() {
+            if !service.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Invalid service name" }));
+            }
+            service_owned = service.clone();
+            cmd_args.push(&service_owned);
+        }
+    }
+
+    let output = Command::new("docker")
+        .args(&cmd_args)
+        .current_dir(&dir)
+        .output();
+
+    match output {
+        Ok(out) => {
+            let logs = String::from_utf8_lossy(&out.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            HttpResponse::Ok().json(serde_json::json!({ "logs": format!("{}{}", logs, stderr) }))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
+    }
+}
+
+/// POST /api/compose/stacks/{name}/validate — validate docker-compose.yml
+async fn compose_validate(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+
+    let name = path.into_inner();
+    if let Err(e) = require_safe_compose_name(&name) { return e; }
+    let dir = compose_project_dir(&name);
+    let compose_file = dir.join("docker-compose.yml");
+    if !compose_file.exists() {
+        return HttpResponse::NotFound().json(serde_json::json!({ "error": "Stack not found" }));
+    }
+
+    let file_str = compose_file.to_string_lossy().into_owned();
+    let output = Command::new("docker")
+        .args(["compose", "-f", &file_str, "config", "--quiet"])
+        .current_dir(&dir)
+        .output();
+
+    match output {
+        Ok(out) => {
+            if out.status.success() {
+                HttpResponse::Ok().json(serde_json::json!({ "valid": true }))
+            } else {
+                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                HttpResponse::Ok().json(serde_json::json!({ "valid": false, "error": stderr }))
+            }
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Secrets Manager
+// ═══════════════════════════════════════════════════════════════════
+
+fn load_secrets() -> Vec<SecretEntry> {
+    let path = std::path::Path::new(SECRETS_FILE);
+    if !path.exists() { return Vec::new(); }
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_secrets(secrets: &[SecretEntry]) -> Result<(), String> {
+    let dir = std::path::Path::new(SECRETS_FILE).parent().unwrap();
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}", e))?;
+    let json = serde_json::to_string_pretty(secrets).map_err(|e| format!("{}", e))?;
+
+    // Atomic write: write to temp file with restricted permissions, then rename
+    let tmp = format!("{}.tmp.{}.{}", SECRETS_FILE, std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+    std::fs::write(&tmp, &json).map_err(|e| format!("{}", e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, SECRETS_FILE).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}", e)
+    })?;
+    Ok(())
+}
+
+fn now_iso() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string()
+}
+
+/// GET /api/secrets — list all secrets (values masked)
+async fn secrets_list(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+
+    let secrets = load_secrets();
+    let masked: Vec<serde_json::Value> = secrets.iter().map(|s| {
+        let masked_val = if s.value.len() > 4 {
+            format!("****{}", &s.value[s.value.len()-4..])
+        } else {
+            "****".to_string()
+        };
+        serde_json::json!({
+            "key": s.key,
+            "value_masked": masked_val,
+            "description": s.description,
+            "created": s.created,
+            "updated": s.updated,
+        })
+    }).collect();
+
+    HttpResponse::Ok().json(serde_json::json!({ "secrets": masked }))
+}
+
+/// GET /api/secrets/{key} — get a single secret (full value)
+async fn secrets_get(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+
+    let key = path.into_inner();
+    let secrets = load_secrets();
+    match secrets.iter().find(|s| s.key == key) {
+        Some(s) => HttpResponse::Ok().json(serde_json::json!({
+            "key": s.key,
+            "value": s.value,
+            "description": s.description,
+            "created": s.created,
+            "updated": s.updated,
+        })),
+        None => HttpResponse::NotFound().json(serde_json::json!({ "error": "Secret not found" })),
+    }
+}
+
+/// POST /api/secrets — create or update a secret
+async fn secrets_save(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<SecretRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+
+    let key = body.key.trim().to_string();
+    if key.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Key is required" }));
+    }
+
+    let mut secrets = load_secrets();
+    let now = now_iso();
+
+    if let Some(existing) = secrets.iter_mut().find(|s| s.key == key) {
+        if let Some(ref v) = body.value { existing.value = v.clone(); }
+        if let Some(ref d) = body.description { existing.description = d.clone(); }
+        existing.updated = now;
+    } else {
+        secrets.push(SecretEntry {
+            key: key.clone(),
+            value: body.value.clone().unwrap_or_default(),
+            description: body.description.clone().unwrap_or_default(),
+            created: now.clone(),
+            updated: now,
+        });
+    }
+
+    match save_secrets(&secrets) {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "message": "Secret saved", "key": key })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// DELETE /api/secrets/{key} — delete a secret
+async fn secrets_delete(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+
+    let key = path.into_inner();
+    let mut secrets = load_secrets();
+    let len = secrets.len();
+    secrets.retain(|s| s.key != key);
+    if secrets.len() == len {
+        return HttpResponse::NotFound().json(serde_json::json!({ "error": "Secret not found" }));
+    }
+
+    match save_secrets(&secrets) {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "message": "Secret deleted" })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
 /// Configure all API routes
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg
@@ -13647,6 +14310,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/containers/docker/{id}/volumes", web::get().to(docker_volumes))
         .route("/api/containers/docker/import", web::post().to(docker_import))
         .route("/api/containers/docker/{id}/config", web::post().to(docker_update_config))
+        .route("/api/containers/docker/{id}/env", web::post().to(docker_update_env))
         .route("/api/containers/docker/{id}/inspect", web::get().to(docker_inspect))
         // LXC
         .route("/api/containers/lxc", web::get().to(lxc_list))
@@ -14004,6 +14668,25 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/configurator/apache/error-log", web::get().to(apache_error_log))
         .route("/api/configurator/apache/generate", web::post().to(apache_generate_config))
         .route("/api/configurator/apache/bootstrap", web::post().to(apache_bootstrap))
+        // Docker Compose
+        .route("/api/compose/stacks", web::get().to(compose_list_stacks))
+        .route("/api/compose/stacks", web::post().to(compose_create_stack))
+        .route("/api/compose/stacks/{name}", web::delete().to(compose_delete_stack))
+        .route("/api/compose/stacks/{name}/compose", web::get().to(compose_read_yaml))
+        .route("/api/compose/stacks/{name}/compose", web::post().to(compose_write_yaml))
+        .route("/api/compose/stacks/{name}/env", web::get().to(compose_read_env))
+        .route("/api/compose/stacks/{name}/env", web::post().to(compose_write_env))
+        .route("/api/compose/stacks/{name}/up", web::post().to(compose_up))
+        .route("/api/compose/stacks/{name}/down", web::post().to(compose_down))
+        .route("/api/compose/stacks/{name}/pull", web::post().to(compose_pull))
+        .route("/api/compose/stacks/{name}/restart", web::post().to(compose_restart))
+        .route("/api/compose/stacks/{name}/logs", web::get().to(compose_logs))
+        .route("/api/compose/stacks/{name}/validate", web::post().to(compose_validate))
+        // Secrets Manager
+        .route("/api/secrets", web::get().to(secrets_list))
+        .route("/api/secrets", web::post().to(secrets_save))
+        .route("/api/secrets/{key}", web::get().to(secrets_get))
+        .route("/api/secrets/{key}", web::delete().to(secrets_delete))
         // TOML Editors (WolfDisk, WolfScale)
         .route("/api/configurator/toml/{component}/structured", web::get().to(toml_get_structured))
         .route("/api/configurator/toml/{component}/structured", web::post().to(toml_save_structured))

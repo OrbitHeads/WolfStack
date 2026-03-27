@@ -1084,6 +1084,8 @@ function selectServerView(nodeId, view) {
         components: 'Components',
         services: 'Services',
         containers: 'Docker',
+        compose: 'Compose',
+        secrets: 'Secrets',
         lxc: 'LXC',
         storage: 'Storage',
         files: 'File Manager',
@@ -1118,7 +1120,7 @@ function selectServerView(nodeId, view) {
 
     // Load data for the view
     // Show a modern loading overlay for views that fetch data asynchronously
-    const asyncViews = ['components', 'services', 'containers', 'lxc', 'vms', 'storage', 'networking', 'backups', 'wolfnet', 'certificates', 'cron', 'pve-resources', 'mysql-editor', 'security', 'ceph', 'wolfkube'];
+    const asyncViews = ['components', 'services', 'containers', 'compose', 'secrets', 'lxc', 'vms', 'storage', 'networking', 'backups', 'wolfnet', 'certificates', 'cron', 'pve-resources', 'mysql-editor', 'security', 'ceph', 'wolfkube'];
     if (asyncViews.includes(view) && el) {
         // Clear table bodies to prevent stale data showing
         el.querySelectorAll('tbody').forEach(tb => { tb.innerHTML = ''; });
@@ -1155,6 +1157,8 @@ function selectServerView(nodeId, view) {
     }
     if (view === 'components' || view === 'services') loadComponents().finally(() => hidePageLoadingOverlay(el));
     if (view === 'containers') loadDockerContainers().finally(() => hidePageLoadingOverlay(el));
+    if (view === 'compose') loadComposeStacks().finally(() => hidePageLoadingOverlay(el));
+    if (view === 'secrets') loadSecrets().finally(() => hidePageLoadingOverlay(el));
     if (view === 'lxc') loadLxcContainers().finally(() => hidePageLoadingOverlay(el));
 
     if (view === 'terminal') {
@@ -1299,6 +1303,9 @@ function buildServerTree(nodes) {
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="containers" onclick="selectServerView('${node.id}', 'containers')">
                             <span class="icon">🐳</span> Docker
                             ${node.docker_count ? `<span class="badge" style="font-size:10px; padding:1px 6px;">${node.docker_count}</span>` : ''}
+                        </a>
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="compose" onclick="selectServerView('${node.id}', 'compose')">
+                            <span class="icon">📋</span> Compose
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="lxc" onclick="selectServerView('${node.id}', 'lxc')">
                             <span class="icon">📦</span> LXC
@@ -10800,6 +10807,7 @@ async function openDockerSettings(name) {
     body.innerHTML = '<p style="color:var(--text-muted);text-align:center;padding:40px;">Loading config...</p>';
     modal.classList.add('active');
     _dockerSettingsTab = 1;
+    window._dockerSystemEnv = []; // Clear stale system env from previous modal open
 
     try {
         const resp = await fetch(apiUrl(`/api/containers/docker/${encodeURIComponent(name)}/inspect`));
@@ -10861,15 +10869,26 @@ async function openDockerSettings(name) {
         }
         if (!networkRows) networkRows = '<div style="color:var(--text-muted);font-size:12px;padding:8px;">No networks connected</div>';
 
-        // Format env vars for display
-        var envRows = env.filter(e => !e.startsWith('PATH=')).slice(0, 20).map(e => {
-            const [key, ...val] = e.split('=');
-            return `<div style="display:flex;align-items:center;gap:8px;padding:4px 8px;margin-bottom:2px;background:var(--bg-primary);border-radius:4px;">
-                <code style="font-size:11px;color:var(--accent);min-width:120px;">${escapeHtml(key)}</code>
-                <code style="font-size:11px;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(val.join('='))}</code>
+        // Separate system env vars (PATH, HOME, etc.) from user-editable ones
+        const systemEnvPrefixes = ['PATH=', 'HOME=', 'HOSTNAME=', 'TERM='];
+        const systemEnv = env.filter(e => systemEnvPrefixes.some(p => e.startsWith(p)));
+        const userEnv = env.filter(e => !systemEnvPrefixes.some(p => e.startsWith(p)));
+        // Store system env vars so we can preserve them on save
+        window._dockerSystemEnv = systemEnv;
+        var envRows = userEnv.map((e, i) => {
+            const eqIdx = e.indexOf('=');
+            const key = eqIdx >= 0 ? e.substring(0, eqIdx) : e;
+            const val = eqIdx >= 0 ? e.substring(eqIdx + 1) : '';
+            return `<div class="docker-env-row" style="display:flex;align-items:center;gap:6px;padding:4px 0;margin-bottom:2px;">
+                <input type="text" class="docker-env-key" value="${escapeHtml(key)}" placeholder="KEY"
+                    style="width:180px;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--bg-primary);color:var(--accent);font-family:var(--font-mono);font-size:11px;">
+                <span style="color:var(--text-muted);">=</span>
+                <input type="text" class="docker-env-val" value="${escapeHtml(val)}" placeholder="value"
+                    style="flex:1;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--bg-primary);color:var(--text-primary);font-family:var(--font-mono);font-size:11px;">
+                <button class="btn btn-sm" onclick="this.closest('.docker-env-row').remove()" style="font-size:14px;padding:2px 6px;color:var(--danger-color,#ef4444);" title="Remove">&times;</button>
             </div>`;
         }).join('');
-        if (!envRows) envRows = '<div style="color:var(--text-muted);font-size:12px;padding:8px;">No environment variables</div>';
+        if (!envRows) envRows = '<div id="docker-env-empty" style="color:var(--text-muted);font-size:12px;padding:8px;">No environment variables</div>';
 
         // WolfNet IP from labels
         const labels = cfg.Config?.Labels || {};
@@ -10925,11 +10944,17 @@ async function openDockerSettings(name) {
                 </div>
 
                 <div style="margin-top:12px;padding:12px;background:var(--bg-tertiary);border-radius:8px;border:1px solid var(--border);">
-                    <h4 style="margin:0 0 8px 0;font-size:13px;color:var(--text-primary);">📦 Environment Variables (${env.filter(e => !e.startsWith('PATH=')).length})</h4>
-                    <div style="max-height:160px;overflow-y:auto;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                        <h4 style="margin:0;font-size:13px;color:var(--text-primary);">📦 Environment Variables (${userEnv.length})</h4>
+                        <button class="btn btn-sm" onclick="addDockerEnvRow()" style="font-size:11px;padding:2px 8px;">+ Add</button>
+                    </div>
+                    <div id="docker-env-list" style="max-height:240px;overflow-y:auto;">
                         ${envRows}
                     </div>
-                    <div style="font-size:11px;color:var(--text-muted);margin-top:6px;">⚠️ Environment variables can only be changed by recreating the container.</div>
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;">
+                        <div style="font-size:11px;color:var(--text-muted);">Saving env changes will recreate the container (volumes and settings preserved).</div>
+                        <button class="btn btn-sm btn-primary" onclick="saveDockerEnv('${escapeHtml(name)}')" style="font-size:11px;padding:4px 12px;">💾 Save Env</button>
+                    </div>
                 </div>
             </div>
 
@@ -11053,6 +11078,75 @@ async function saveDockerSettings(name) {
         }
     } catch (e) {
         showToast('Error saving settings: ' + e.message, 'error');
+    }
+}
+
+function addDockerEnvRow() {
+    const list = document.getElementById('docker-env-list');
+    if (!list) return;
+    // Remove the "no env vars" placeholder if present
+    const empty = document.getElementById('docker-env-empty');
+    if (empty) empty.remove();
+    const row = document.createElement('div');
+    row.className = 'docker-env-row';
+    row.style.cssText = 'display:flex;align-items:center;gap:6px;padding:4px 0;margin-bottom:2px;';
+    row.innerHTML = `
+        <input type="text" class="docker-env-key" value="" placeholder="KEY"
+            style="width:180px;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--bg-primary);color:var(--accent);font-family:var(--font-mono);font-size:11px;">
+        <span style="color:var(--text-muted);">=</span>
+        <input type="text" class="docker-env-val" value="" placeholder="value"
+            style="flex:1;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--bg-primary);color:var(--text-primary);font-family:var(--font-mono);font-size:11px;">
+        <button class="btn btn-sm" onclick="this.closest('.docker-env-row').remove()" style="font-size:14px;padding:2px 6px;color:var(--danger-color,#ef4444);" title="Remove">&times;</button>`;
+    list.appendChild(row);
+    row.querySelector('.docker-env-key').focus();
+}
+
+async function saveDockerEnv(name) {
+    const rows = document.querySelectorAll('#docker-env-list .docker-env-row');
+    const userVars = [];
+    const keyPattern = /^[A-Za-z_][A-Za-z0-9_]*$/;
+    for (const row of rows) {
+        const key = row.querySelector('.docker-env-key').value.trim();
+        const val = row.querySelector('.docker-env-val').value;
+        if (key) {
+            if (!keyPattern.test(key)) {
+                showToast(`Invalid env key "${key}" — must match [A-Za-z_][A-Za-z0-9_]*`, 'error');
+                row.querySelector('.docker-env-key').focus();
+                return;
+            }
+            userVars.push(`${key}=${val}`);
+        }
+    }
+
+    // Preserve system env vars (PATH, HOME, etc.)
+    const systemVars = window._dockerSystemEnv || [];
+    const env = [...systemVars, ...userVars];
+
+    if (!await showConfirm(
+        `This will recreate the container "${name}" with the updated environment variables. ` +
+        `Volumes, ports, and other settings will be preserved. ` +
+        `${userVars.length === 0 ? 'All user environment variables will be removed.' : `${userVars.length} user variable${userVars.length !== 1 ? 's' : ''} will be set.`}` +
+        `${systemVars.length ? ` (${systemVars.length} system variables preserved)` : ''}\n\nContinue?`,
+        'Update Environment'
+    )) return;
+
+    try {
+        showToast(`Recreating "${name}" with updated env...`, 'info');
+        const resp = await fetch(apiUrl(`/api/containers/docker/${encodeURIComponent(name)}/env`), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ env }),
+        });
+        const data = await resp.json();
+        if (resp.ok) {
+            showToast(data.message || 'Environment updated', 'success');
+            closeContainerDetail();
+            if (typeof loadDockerContainers === 'function') loadDockerContainers();
+        } else {
+            showToast(data.error || 'Failed to update environment', 'error');
+        }
+    } catch (e) {
+        showToast('Error updating environment: ' + e.message, 'error');
     }
 }
 
@@ -18815,7 +18909,7 @@ function showProgressModal(icon, title) {
         + '<div class="pm-list" style="max-height:350px; overflow-y:auto;"></div>'
         + '<div class="pm-footer" style="display:none; margin-top:16px;"></div>'
         + '<div class="pm-actions" style="display:none; margin-top:20px; text-align:center;">'
-        + '<button class="pm-done" style="padding:10px 28px; background:var(--accent-primary); color:#fff; border:none; border-radius:8px; cursor:pointer; font-weight:600; font-size:14px;">Done</button>'
+        + '<button class="pm-done" style="padding:10px 28px; background:var(--accent-primary); color:#fff; border:none; border-radius:8px; cursor:pointer; font-weight:600; font-size:14px;">Close</button>'
         + '</div></div>';
     document.body.appendChild(overlay);
     overlay.querySelector('.pm-done').onclick = function () { overlay.remove(); };
@@ -29782,4 +29876,428 @@ function runWolfFlowFromEditor() {
         return;
     }
     triggerWolfFlow(wfEditId);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Docker Compose Management
+// ═══════════════════════════════════════════════════════════════════
+
+let composeEditingStack = null;
+
+// Tab key support for compose editors — insert 2 spaces instead of losing focus
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Tab' && (e.target.id === 'compose-yaml-editor' || e.target.id === 'compose-env-editor')) {
+        e.preventDefault();
+        const ta = e.target;
+        const start = ta.selectionStart;
+        const end = ta.selectionEnd;
+        ta.value = ta.value.substring(0, start) + '  ' + ta.value.substring(end);
+        ta.selectionStart = ta.selectionEnd = start + 2;
+    }
+});
+
+async function loadComposeStacks() {
+    try {
+        const resp = await fetch(apiUrl('/api/compose/stacks'));
+        const data = await resp.json();
+        const stacks = data.stacks || [];
+        const countEl = document.getElementById('compose-stack-count');
+        if (countEl) countEl.textContent = stacks.length ? `${stacks.length} stack${stacks.length !== 1 ? 's' : ''}` : '';
+
+        const tbody = document.getElementById('compose-stacks-table');
+        const empty = document.getElementById('compose-empty');
+        if (!stacks.length) {
+            tbody.innerHTML = '';
+            if (empty) empty.style.display = 'block';
+            return;
+        }
+        if (empty) empty.style.display = 'none';
+
+        tbody.innerHTML = stacks.map(s => {
+            const statusBadge = s.status === 'running'
+                ? '<span class="badge" style="background:#22c55e; color:#fff;">Running</span>'
+                : s.status === 'partial'
+                ? '<span class="badge" style="background:#f59e0b; color:#fff;">Partial</span>'
+                : '<span class="badge" style="background:var(--text-muted); color:#fff;">Stopped</span>';
+
+            const servicesList = s.services.length
+                ? s.services.map(svc => {
+                    const dot = svc.state === 'running' ? '🟢' : '🔴';
+                    return `<span style="font-size:12px; margin-right:6px;" title="${svc.image}">${dot} ${svc.name}</span>`;
+                }).join('')
+                : '<span style="color:var(--text-muted); font-size:12px;">No services</span>';
+
+            return `<tr>
+                <td><strong>${escapeHtml(s.name)}</strong></td>
+                <td>${statusBadge} <span style="color:var(--text-muted); font-size:11px; margin-left:4px;">${s.running}/${s.total}</span></td>
+                <td>${servicesList}</td>
+                <td>
+                    <div style="display:flex; gap:4px; flex-wrap:wrap;">
+                        ${s.status === 'stopped'
+                            ? `<button class="btn btn-sm btn-primary" onclick="composeAction('${escapeHtml(s.name)}', 'up')" style="font-size:11px; padding:2px 8px;">▶ Up</button>`
+                            : `<button class="btn btn-sm" onclick="composeAction('${escapeHtml(s.name)}', 'down')" style="font-size:11px; padding:2px 8px;">⏹ Down</button>
+                               <button class="btn btn-sm" onclick="composeAction('${escapeHtml(s.name)}', 'restart')" style="font-size:11px; padding:2px 8px;">🔄 Restart</button>`}
+                        <button class="btn btn-sm" onclick="composeAction('${escapeHtml(s.name)}', 'pull')" style="font-size:11px; padding:2px 8px;">⬇ Pull</button>
+                        <button class="btn btn-sm" onclick="openComposeEditor('${escapeHtml(s.name)}')" style="font-size:11px; padding:2px 8px;">✏️ Edit</button>
+                        <button class="btn btn-sm" onclick="showComposeLogs('${escapeHtml(s.name)}')" style="font-size:11px; padding:2px 8px;">📄 Logs</button>
+                        <button class="btn btn-sm" onclick="deleteComposeStack('${escapeHtml(s.name)}')" style="font-size:11px; padding:2px 8px; color:var(--danger-color, #ef4444);">🗑</button>
+                    </div>
+                </td>
+            </tr>`;
+        }).join('');
+    } catch (e) {
+        showToast('Failed to load compose stacks: ' + e.message, 'error');
+    }
+}
+
+function showComposeCreate() {
+    composeEditingStack = null;
+    document.getElementById('compose-editor-title').textContent = 'Create New Stack';
+    document.getElementById('compose-yaml-editor').value = '# Docker Compose\nservices:\n  app:\n    image: nginx:latest\n    ports:\n      - "8080:80"\n    restart: unless-stopped\n';
+    document.getElementById('compose-env-editor').value = '# Environment variables\n# KEY=value\n';
+    document.getElementById('compose-validate-result').textContent = '';
+    switchComposeTab('yaml');
+
+    // Add name input above editor
+    const modal = document.getElementById('compose-editor-modal');
+    let nameRow = document.getElementById('compose-name-row');
+    if (!nameRow) {
+        nameRow = document.createElement('div');
+        nameRow.id = 'compose-name-row';
+        nameRow.style.cssText = 'padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:8px;';
+        nameRow.innerHTML = '<label style="font-weight:600; font-size:13px; white-space:nowrap;">Stack Name:</label><input id="compose-create-name" type="text" placeholder="my-app" style="flex:1; padding:6px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary); font-family:var(--font-mono);">';
+        const body = modal.querySelector('.modal-body');
+        body.insertBefore(nameRow, body.firstChild);
+    }
+    nameRow.style.display = 'flex';
+    document.getElementById('compose-create-name').value = '';
+
+    modal.classList.add('active');
+}
+
+async function openComposeEditor(name) {
+    composeEditingStack = name;
+    document.getElementById('compose-editor-title').textContent = `Edit: ${name}`;
+    document.getElementById('compose-validate-result').textContent = '';
+
+    // Hide name input for edit mode
+    const nameRow = document.getElementById('compose-name-row');
+    if (nameRow) nameRow.style.display = 'none';
+
+    try {
+        const [yamlResp, envResp] = await Promise.all([
+            fetch(apiUrl(`/api/compose/stacks/${encodeURIComponent(name)}/compose`)),
+            fetch(apiUrl(`/api/compose/stacks/${encodeURIComponent(name)}/env`)),
+        ]);
+        const yamlData = await yamlResp.json();
+        const envData = await envResp.json();
+        document.getElementById('compose-yaml-editor').value = yamlData.content || '';
+        document.getElementById('compose-env-editor').value = envData.content || '';
+    } catch (e) {
+        showToast('Failed to load stack files: ' + e.message, 'error');
+    }
+
+    switchComposeTab('yaml');
+    document.getElementById('compose-editor-modal').classList.add('active');
+}
+
+function closeComposeEditor() {
+    document.getElementById('compose-editor-modal').classList.remove('active');
+}
+
+function switchComposeTab(tab) {
+    const yamlTab = document.getElementById('compose-tab-yaml');
+    const envTab = document.getElementById('compose-tab-env');
+    const yamlContent = document.getElementById('compose-tab-yaml-content');
+    const envContent = document.getElementById('compose-tab-env-content');
+
+    if (tab === 'yaml') {
+        yamlTab.style.borderBottom = '2px solid var(--primary-color, #6366f1)';
+        yamlTab.style.opacity = '1';
+        envTab.style.borderBottom = 'none';
+        envTab.style.opacity = '0.6';
+        yamlContent.style.display = 'block';
+        envContent.style.display = 'none';
+    } else {
+        envTab.style.borderBottom = '2px solid var(--primary-color, #6366f1)';
+        envTab.style.opacity = '1';
+        yamlTab.style.borderBottom = 'none';
+        yamlTab.style.opacity = '0.6';
+        envContent.style.display = 'block';
+        yamlContent.style.display = 'none';
+    }
+}
+
+async function saveComposeFiles() {
+    const yaml = document.getElementById('compose-yaml-editor').value;
+    const env = document.getElementById('compose-env-editor').value;
+
+    try {
+        if (composeEditingStack) {
+            // Update existing stack
+            const name = composeEditingStack;
+            await Promise.all([
+                fetch(apiUrl(`/api/compose/stacks/${encodeURIComponent(name)}/compose`), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name, content: yaml }),
+                }),
+                fetch(apiUrl(`/api/compose/stacks/${encodeURIComponent(name)}/env`), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name, content: env }),
+                }),
+            ]);
+            showToast(`Stack "${name}" saved`, 'success');
+        } else {
+            // Create new stack
+            const name = document.getElementById('compose-create-name').value.trim();
+            if (!name) {
+                showToast('Stack name is required', 'error');
+                return;
+            }
+            const resp = await fetch(apiUrl('/api/compose/stacks'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, compose_yaml: yaml, env_content: env }),
+            });
+            const data = await resp.json();
+            if (!resp.ok) {
+                showToast(data.error || 'Failed to create stack', 'error');
+                return;
+            }
+            showToast(`Stack "${name}" created`, 'success');
+        }
+        closeComposeEditor();
+        loadComposeStacks();
+    } catch (e) {
+        showToast('Failed to save: ' + e.message, 'error');
+    }
+}
+
+async function validateComposeYaml() {
+    const name = composeEditingStack;
+    const resultEl = document.getElementById('compose-validate-result');
+    if (!name) {
+        resultEl.innerHTML = '<span style="color:var(--text-muted);">Save the stack first to validate</span>';
+        return;
+    }
+
+    // Save first, then validate
+    const yaml = document.getElementById('compose-yaml-editor').value;
+    await fetch(apiUrl(`/api/compose/stacks/${encodeURIComponent(name)}/compose`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, content: yaml }),
+    });
+
+    try {
+        const resp = await fetch(apiUrl(`/api/compose/stacks/${encodeURIComponent(name)}/validate`), { method: 'POST' });
+        const data = await resp.json();
+        if (data.valid) {
+            resultEl.innerHTML = '<span style="color:#22c55e;">✓ Valid</span>';
+        } else {
+            resultEl.innerHTML = `<span style="color:var(--danger-color, #ef4444);">✗ ${escapeHtml(data.error || 'Invalid')}</span>`;
+        }
+    } catch (e) {
+        resultEl.innerHTML = `<span style="color:var(--danger-color, #ef4444);">Error: ${escapeHtml(e.message)}</span>`;
+    }
+}
+
+async function composeAction(name, action) {
+    const actionLabels = { up: 'Starting', down: 'Stopping', pull: 'Pulling images for', restart: 'Restarting' };
+    showToast(`${actionLabels[action] || action} "${name}"...`, 'info');
+
+    try {
+        const resp = await fetch(apiUrl(`/api/compose/stacks/${encodeURIComponent(name)}/${action}`), { method: 'POST' });
+        const data = await resp.json();
+        if (resp.ok) {
+            showToast(data.message || `${action} complete`, 'success');
+        } else {
+            showToast(data.error || `${action} failed`, 'error');
+        }
+        loadComposeStacks();
+    } catch (e) {
+        showToast(`${action} failed: ${e.message}`, 'error');
+    }
+}
+
+async function showComposeLogs(name) {
+    document.getElementById('compose-logs-title').textContent = `Logs: ${name}`;
+    document.getElementById('compose-logs-content').textContent = 'Loading...';
+    document.getElementById('compose-logs-modal').classList.add('active');
+
+    try {
+        const resp = await fetch(apiUrl(`/api/compose/stacks/${encodeURIComponent(name)}/logs?lines=300`));
+        const data = await resp.json();
+        document.getElementById('compose-logs-content').textContent = data.logs || '(no logs)';
+        // Auto-scroll to bottom
+        const pre = document.getElementById('compose-logs-content');
+        pre.scrollTop = pre.scrollHeight;
+    } catch (e) {
+        document.getElementById('compose-logs-content').textContent = 'Failed to load logs: ' + e.message;
+    }
+}
+
+async function deleteComposeStack(name) {
+    if (!await showConfirm(`Delete compose stack "${name}"? This will stop all services and remove the project files.`, 'Delete Stack')) return;
+
+    try {
+        const resp = await fetch(apiUrl(`/api/compose/stacks/${encodeURIComponent(name)}`), { method: 'DELETE' });
+        const data = await resp.json();
+        if (resp.ok) {
+            showToast(`Stack "${name}" deleted`, 'success');
+        } else {
+            showToast(data.error || 'Delete failed', 'error');
+        }
+        loadComposeStacks();
+    } catch (e) {
+        showToast('Delete failed: ' + e.message, 'error');
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Secrets Manager
+// ═══════════════════════════════════════════════════════════════════
+
+let secretEditingKey = null;
+
+async function loadSecrets() {
+    try {
+        const resp = await fetch(apiUrl('/api/secrets'));
+        const data = await resp.json();
+        const secrets = data.secrets || [];
+        const countEl = document.getElementById('secrets-count');
+        if (countEl) countEl.textContent = secrets.length ? `${secrets.length} secret${secrets.length !== 1 ? 's' : ''}` : '';
+
+        const tbody = document.getElementById('secrets-table');
+        const empty = document.getElementById('secrets-empty');
+        if (!secrets.length) {
+            tbody.innerHTML = '';
+            if (empty) empty.style.display = 'block';
+            return;
+        }
+        if (empty) empty.style.display = 'none';
+
+        tbody.innerHTML = secrets.map(s => {
+            const safeKey = s.key.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+            return `<tr data-secret-key="${safeKey}">
+            <td><code style="background:var(--bg-secondary); padding:2px 6px; border-radius:4px; font-size:12px;">${escapeHtml(s.key)}</code></td>
+            <td><span style="font-family:var(--font-mono); font-size:12px; color:var(--text-muted);">${escapeHtml(s.value_masked)}</span>
+                <button class="btn btn-sm secret-reveal-btn" style="font-size:10px; padding:1px 6px; margin-left:4px;">👁</button></td>
+            <td style="font-size:12px; color:var(--text-muted);">${escapeHtml(s.description || '—')}</td>
+            <td style="font-size:11px; color:var(--text-muted);">${escapeHtml(s.updated || s.created || '—')}</td>
+            <td>
+                <button class="btn btn-sm secret-edit-btn" style="font-size:11px; padding:2px 8px;">✏️</button>
+                <button class="btn btn-sm secret-delete-btn" style="font-size:11px; padding:2px 8px; color:var(--danger-color, #ef4444);">🗑</button>
+            </td>
+        </tr>`;
+        }).join('');
+
+        // Event delegation for secret actions
+        tbody.addEventListener('click', function(e) {
+            const row = e.target.closest('tr[data-secret-key]');
+            if (!row) return;
+            const key = row.dataset.secretKey;
+            if (e.target.closest('.secret-reveal-btn')) revealSecret(key, e.target.closest('.secret-reveal-btn'));
+            else if (e.target.closest('.secret-edit-btn')) editSecret(key);
+            else if (e.target.closest('.secret-delete-btn')) deleteSecret(key);
+        });
+    } catch (e) {
+        showToast('Failed to load secrets: ' + e.message, 'error');
+    }
+}
+
+function showSecretCreate() {
+    secretEditingKey = null;
+    document.getElementById('secret-edit-title').textContent = 'Add Secret';
+    document.getElementById('secret-edit-key').value = '';
+    document.getElementById('secret-edit-key').disabled = false;
+    document.getElementById('secret-edit-value').value = '';
+    document.getElementById('secret-edit-desc').value = '';
+    document.getElementById('secret-edit-modal').classList.add('active');
+}
+
+async function editSecret(key) {
+    secretEditingKey = key;
+    document.getElementById('secret-edit-title').textContent = `Edit: ${key}`;
+    document.getElementById('secret-edit-key').value = key;
+    document.getElementById('secret-edit-key').disabled = true;
+
+    try {
+        const resp = await fetch(apiUrl(`/api/secrets/${encodeURIComponent(key)}`));
+        const data = await resp.json();
+        document.getElementById('secret-edit-value').value = data.value || '';
+        document.getElementById('secret-edit-desc').value = data.description || '';
+    } catch (e) {
+        document.getElementById('secret-edit-value').value = '';
+        document.getElementById('secret-edit-desc').value = '';
+    }
+    document.getElementById('secret-edit-modal').classList.add('active');
+}
+
+async function saveSecret() {
+    const key = document.getElementById('secret-edit-key').value.trim();
+    const value = document.getElementById('secret-edit-value').value;
+    const description = document.getElementById('secret-edit-desc').value.trim();
+
+    if (!key) {
+        showToast('Key is required', 'error');
+        return;
+    }
+
+    try {
+        const resp = await fetch(apiUrl('/api/secrets'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key, value, description }),
+        });
+        const data = await resp.json();
+        if (resp.ok) {
+            showToast(data.message || 'Secret saved', 'success');
+            document.getElementById('secret-edit-modal').classList.remove('active');
+            loadSecrets();
+        } else {
+            showToast(data.error || 'Save failed', 'error');
+        }
+    } catch (e) {
+        showToast('Save failed: ' + e.message, 'error');
+    }
+}
+
+async function deleteSecret(key) {
+    if (!await showConfirm(`Delete secret "${key}"?`, 'Delete Secret')) return;
+
+    try {
+        const resp = await fetch(apiUrl(`/api/secrets/${encodeURIComponent(key)}`), { method: 'DELETE' });
+        const data = await resp.json();
+        if (resp.ok) {
+            showToast('Secret deleted', 'success');
+        } else {
+            showToast(data.error || 'Delete failed', 'error');
+        }
+        loadSecrets();
+    } catch (e) {
+        showToast('Delete failed: ' + e.message, 'error');
+    }
+}
+
+async function revealSecret(key, btn) {
+    try {
+        const resp = await fetch(apiUrl(`/api/secrets/${encodeURIComponent(key)}`));
+        const data = await resp.json();
+        const td = btn.parentElement;
+        const span = td.querySelector('span');
+        if (span.dataset.revealed === 'true') {
+            span.textContent = data.value.length > 4 ? data.value.substring(0, 4) + '****' : '****';
+            span.dataset.revealed = 'false';
+            btn.textContent = '👁';
+        } else {
+            span.textContent = data.value;
+            span.dataset.revealed = 'true';
+            btn.textContent = '🙈';
+        }
+    } catch (e) {
+        showToast('Failed to reveal secret', 'error');
+    }
 }
