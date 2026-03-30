@@ -83,9 +83,13 @@ pub struct VmConfig {
     /// Proxmox VMID (only set when running on Proxmox VE)
     #[serde(default)]
     pub vmid: Option<u32>,
+    /// BIOS type: "seabios" (legacy) or "ovmf" (UEFI/EFI)
+    #[serde(default = "default_bios_type")]
+    pub bios_type: String,
 }
 
 fn default_net_model() -> String { "virtio".to_string() }
+fn default_bios_type() -> String { "seabios".to_string() }
 
 impl VmConfig {
     pub fn new(name: String, cpus: u32, memory_mb: u32, disk_size_gb: u32) -> Self {
@@ -108,6 +112,7 @@ impl VmConfig {
             import_image: None,
             extra_disks: Vec::new(),
             vmid: None,
+            bios_type: "seabios".to_string(),
         }
     }
 }
@@ -271,6 +276,7 @@ impl VmManager {
                     import_image: None,
                     extra_disks: Vec::new(),
                     vmid: Some(vmid),
+                    bios_type: "seabios".to_string(),
                 })
             })
             .collect()
@@ -303,6 +309,15 @@ impl VmManager {
             Path::new(sp).join(format!("{}.qcow2", config.name))
         } else {
             self.vm_disk_path(&config.name)
+        }
+    }
+
+    /// Get the per-VM EFI variables file path (for OVMF boot)
+    fn vm_efivars_path(&self, config: &VmConfig) -> PathBuf {
+        if let Some(ref sp) = config.storage_path {
+            Path::new(sp).join(format!("{}_VARS.fd", config.name))
+        } else {
+            self.base_dir.join(format!("{}_VARS.fd", config.name))
         }
     }
 
@@ -392,10 +407,30 @@ impl VmManager {
             self.create_volume_file(vol)?;
         }
 
+        // For OVMF (EFI) boot, create a per-VM copy of the EFI vars file
+        if config.bios_type == "ovmf" {
+            let vars_dest = self.vm_efivars_path(&config);
+            if !vars_dest.exists() {
+                let vars_sources = [
+                    "/usr/share/OVMF/OVMF_VARS.fd",
+                    "/usr/share/edk2/x64/OVMF_VARS.fd",
+                    "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd",
+                    "/usr/share/qemu/OVMF_VARS.fd",
+                    "/usr/share/OVMF/OVMF_VARS.pure-efi.fd",
+                ];
+                if let Some(src) = vars_sources.iter().find(|p| std::path::Path::new(p).exists()) {
+                    fs::copy(src, &vars_dest)
+                        .map_err(|e| format!("Failed to copy EFI vars: {}", e))?;
+                } else {
+                    return Err("OVMF EFI firmware not found. Install OVMF: apt install ovmf (Debian/Ubuntu) or pacman -S edk2-ovmf (Arch)".to_string());
+                }
+            }
+        }
+
         // Save config
         let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
         fs::write(self.vm_config_path(&config.name), json).map_err(|e| e.to_string())?;
-        
+
 
         Ok(())
     }
@@ -709,7 +744,8 @@ impl VmManager {
                      iso_path: Option<String>, wolfnet_ip: Option<String>,
                      disk_size_gb: Option<u32>,
                      os_disk_bus: Option<String>, net_model: Option<String>,
-                     drivers_iso: Option<String>, auto_start: Option<bool>) -> Result<(), String> {
+                     drivers_iso: Option<String>, auto_start: Option<bool>,
+                     bios_type: Option<String>) -> Result<(), String> {
         // On Proxmox, delegate to qm set
         if containers::is_proxmox() {
             let vmid = self.qm_vmid_by_name(name)
@@ -787,6 +823,9 @@ impl VmManager {
             } else {
                 config.drivers_iso = Some(drv.clone());
             }
+        }
+        if let Some(ref bt) = bios_type {
+            if !bt.is_empty() { config.bios_type = bt.clone(); }
         }
 
         // Disk resize (grow only)
@@ -935,6 +974,53 @@ impl VmManager {
             } else {
                 write_log("WARNING: No UEFI firmware found for ARM64. Install qemu-efi-aarch64 (apt install qemu-efi-aarch64)");
             }
+        } else if config.bios_type == "ovmf" {
+            // x86_64 UEFI boot via OVMF — use q35 machine type for full UEFI compatibility
+            cmd.arg("-machine").arg("q35");
+            write_log("BIOS: OVMF (UEFI) with q35 machine type");
+
+            // OVMF firmware code (read-only)
+            let code_paths = [
+                "/usr/share/OVMF/OVMF_CODE.fd",
+                "/usr/share/edk2/x64/OVMF_CODE.fd",
+                "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd",
+                "/usr/share/qemu/OVMF_CODE.fd",
+                "/usr/share/OVMF/OVMF_CODE.pure-efi.fd",
+            ];
+            if let Some(code) = code_paths.iter().find(|p| std::path::Path::new(p).exists()) {
+                cmd.arg("-drive").arg(format!("if=pflash,format=raw,readonly=on,file={}", code));
+                write_log(&format!("OVMF CODE: {}", code));
+            } else {
+                let msg = "OVMF firmware not found. Install: apt install ovmf (Debian/Ubuntu) or pacman -S edk2-ovmf (Arch)";
+                write_log(msg);
+                return Err(msg.to_string());
+            }
+
+            // Per-VM EFI vars file (writable — stores boot entries, secure boot state, etc.)
+            let vars_path = self.vm_efivars_path(&config);
+            if !vars_path.exists() {
+                // Create vars file on first boot if it wasn't created during VM creation
+                let vars_sources = [
+                    "/usr/share/OVMF/OVMF_VARS.fd",
+                    "/usr/share/edk2/x64/OVMF_VARS.fd",
+                    "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd",
+                    "/usr/share/qemu/OVMF_VARS.fd",
+                    "/usr/share/OVMF/OVMF_VARS.pure-efi.fd",
+                ];
+                if let Some(src) = vars_sources.iter().find(|p| std::path::Path::new(p).exists()) {
+                    fs::copy(src, &vars_path).map_err(|e| {
+                        let msg = format!("Failed to copy EFI vars: {}", e);
+                        write_log(&msg); msg
+                    })?;
+                    write_log(&format!("Created EFI vars from {}", src));
+                } else {
+                    let msg = "OVMF_VARS.fd not found. Install: apt install ovmf (Debian/Ubuntu) or pacman -S edk2-ovmf (Arch)";
+                    write_log(msg);
+                    return Err(msg.to_string());
+                }
+            }
+            cmd.arg("-drive").arg(format!("if=pflash,format=raw,file={}", vars_path.display()));
+            write_log(&format!("OVMF VARS: {}", vars_path.display()));
         }
 
         // Attach extra storage volumes

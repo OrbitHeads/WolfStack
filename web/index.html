@@ -5858,6 +5858,14 @@ region = us-east-1"></textarea>
                     <!-- ═══ Tab 3: Network & Boot ═══ -->
                     <div class="vm-tab-page" id="vm-tab-3" style="display:none;">
                         <div class="form-group">
+                            <label>BIOS Type</label>
+                            <select id="new-vm-bios-type" class="form-control" style="font-size:13px;">
+                                <option value="seabios">SeaBIOS (Legacy)</option>
+                                <option value="ovmf">OVMF (UEFI/EFI)</option>
+                            </select>
+                            <small style="color:var(--text-muted);">UEFI required for modern OSes, GPT disks, and Secure Boot. Legacy BIOS for older systems.</small>
+                        </div>
+                        <div class="form-group" style="margin-top:12px;">
                             <label>Installation ISO (Optional)</label>
                             <input type="text" class="form-control" id="new-vm-iso"
                                 placeholder="/var/lib/wolfstack/isos/ubuntu.iso"

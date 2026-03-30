@@ -5622,6 +5622,7 @@ async function createVm() {
     const osDiskBus = document.getElementById('new-vm-os-bus').value || 'virtio';
     const netModel = document.getElementById('new-vm-net-model').value || 'virtio';
     const driversIso = document.getElementById('new-vm-drivers-iso').value.trim() || null;
+    const biosType = document.getElementById('new-vm-bios-type').value || 'seabios';
 
     if (!name) { showToast('Enter VM name', 'error'); return; }
 
@@ -5655,6 +5656,7 @@ async function createVm() {
                 os_disk_bus: osDiskBus,
                 net_model: netModel,
                 drivers_iso: driversIso,
+                bios_type: biosType,
                 extra_disks: extraDisks
             })
         });
@@ -14451,6 +14453,14 @@ async function showVmSettings(name) {
                             <option value="sata"${vm.os_disk_bus === 'sata' ? ' selected' : ''}>SATA</option>
                         </select>
                     </div>
+                    <div class="form-group" style="margin-top:12px;">
+                        <label>BIOS Type</label>
+                        <select class="form-control" id="edit-vm-bios-type" style="font-size:13px;">
+                            <option value="seabios"${(vm.bios_type || 'seabios') === 'seabios' ? ' selected' : ''}>SeaBIOS (Legacy)</option>
+                            <option value="ovmf"${vm.bios_type === 'ovmf' ? ' selected' : ''}>OVMF (UEFI/EFI)</option>
+                        </select>
+                        <small style="color:var(--text-muted);">Changing BIOS type on an existing VM requires reinstalling the OS</small>
+                    </div>
                 </div>
             </div>
 
@@ -14559,6 +14569,7 @@ async function saveVmSettings(name) {
     const osDiskBus = document.getElementById('edit-vm-os-bus')?.value || undefined;
     const netModel = document.getElementById('edit-vm-net-model')?.value || undefined;
     const driversIso = document.getElementById('edit-vm-drivers-iso')?.value.trim() ?? undefined;
+    const biosType = document.getElementById('edit-vm-bios-type')?.value || undefined;
 
     try {
         const resp = await fetch(apiUrl(`/api/vms/${name}`), {
@@ -14573,6 +14584,7 @@ async function saveVmSettings(name) {
                 os_disk_bus: osDiskBus,
                 net_model: netModel,
                 drivers_iso: driversIso,
+                bios_type: biosType,
             })
         });
         const data = await resp.json();

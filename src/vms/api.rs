@@ -81,7 +81,12 @@ struct CreateVmRequest {
     /// Extra disks to create with the VM (Proxmox-style)
     #[serde(default)]
     extra_disks: Vec<CreateVmDisk>,
+    /// BIOS type: "seabios" (legacy) or "ovmf" (UEFI/EFI)
+    #[serde(default = "default_bios_type")]
+    bios_type: String,
 }
+
+fn default_bios_type() -> String { "seabios".to_string() }
 
 fn default_os_bus() -> String { "virtio".to_string() }
 
@@ -106,6 +111,7 @@ async fn create_vm(req: HttpRequest, state: web::Data<AppState>, body: web::Json
     config.os_disk_bus = body.os_disk_bus.clone();
     config.net_model = body.net_model.clone();
     config.drivers_iso = body.drivers_iso.clone();
+    config.bios_type = body.bios_type.clone();
 
     // If importing a disk image, set it on the config
     if let Some(ref img) = body.import_image {
@@ -142,6 +148,7 @@ struct UpdateVmRequest {
     net_model: Option<String>,
     drivers_iso: Option<String>,
     auto_start: Option<bool>,
+    bios_type: Option<String>,
 }
 
 async fn update_vm(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<UpdateVmRequest>) -> HttpResponse {
@@ -149,10 +156,11 @@ async fn update_vm(req: HttpRequest, state: web::Data<AppState>, path: web::Path
     let name = path.into_inner();
     let manager = state.vms.lock().unwrap();
     
-    match manager.update_vm(&name, body.cpus, body.memory_mb, body.iso_path.clone(), 
+    match manager.update_vm(&name, body.cpus, body.memory_mb, body.iso_path.clone(),
                             body.wolfnet_ip.clone(), body.disk_size_gb,
                             body.os_disk_bus.clone(), body.net_model.clone(),
-                            body.drivers_iso.clone(), body.auto_start) {
+                            body.drivers_iso.clone(), body.auto_start,
+                            body.bios_type.clone()) {
         Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "success": true })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
     }
