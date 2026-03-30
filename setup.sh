@@ -67,13 +67,15 @@ download_prebuilt() {
     fi
     local url="https://github.com/${repo}/releases/latest/download/${binary}-${BINARY_ARCH}"
     echo "  Downloading prebuilt ${binary} for ${BINARY_ARCH}..."
-    if curl -fSL --connect-timeout 10 --max-time 120 -o "$dest" "$url" 2>/dev/null; then
+    local tmpfile="${dest}.download"
+    if curl -fSL --connect-timeout 15 --max-time 300 --retry 2 -o "$tmpfile" "$url" 2>&1; then
+        mv "$tmpfile" "$dest"
         chmod +x "$dest"
         echo "  ✓ Downloaded prebuilt ${binary} (${BINARY_ARCH})"
         return 0
     else
         echo "  ⚠ Prebuilt binary not available — will build from source"
-        rm -f "$dest"
+        rm -f "$tmpfile"
         return 1
     fi
 }
