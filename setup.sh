@@ -49,6 +49,35 @@ export GIT_CONFIG_COUNT=1
 export GIT_CONFIG_KEY_0=safe.directory
 export GIT_CONFIG_VALUE_0="*"
 
+# ─── Architecture detection for prebuilt binaries ──────────────────────────
+HOST_ARCH=$(uname -m)
+case "$HOST_ARCH" in
+    x86_64)  BINARY_ARCH="x86_64" ;;
+    aarch64) BINARY_ARCH="aarch64" ;;
+    *)       BINARY_ARCH="" ;;  # unsupported — will build from source
+esac
+
+# Download a prebuilt binary from GitHub Releases.
+# Usage: download_prebuilt <repo> <binary_name> <dest_path>
+# Returns 0 on success, 1 on failure (caller should fall back to source build)
+download_prebuilt() {
+    local repo="$1" binary="$2" dest="$3"
+    if [ -z "$BINARY_ARCH" ]; then
+        return 1
+    fi
+    local url="https://github.com/${repo}/releases/latest/download/${binary}-${BINARY_ARCH}"
+    echo "  Downloading prebuilt ${binary} for ${BINARY_ARCH}..."
+    if curl -fSL --connect-timeout 10 --max-time 120 -o "$dest" "$url" 2>/dev/null; then
+        chmod +x "$dest"
+        echo "  ✓ Downloaded prebuilt ${binary} (${BINARY_ARCH})"
+        return 0
+    else
+        echo "  ⚠ Prebuilt binary not available — will build from source"
+        rm -f "$dest"
+        return 1
+    fi
+}
+
 # ─── Custom install directory (for low-disk devices like Raspberry Pi) ───────
 if [ -n "$CUSTOM_INSTALL_DIR" ]; then
     # If given a block device, mount it
@@ -451,6 +480,58 @@ else
 fi
 
 # ─── Install WolfNet (cluster network layer) ────────────────────────────────
+
+# Helper: download prebuilt WolfNet binaries or build from source.
+# Sets WOLFNET_BUILT=true on success.
+# Requires WOLFNET_SRC_DIR to be set if building from source.
+build_or_download_wolfnet() {
+    # Try prebuilt first
+    if download_prebuilt "wolfsoftwaresystemsltd/WolfNet" "wolfnet" "/usr/local/bin/wolfnet"; then
+        download_prebuilt "wolfsoftwaresystemsltd/WolfNet" "wolfnetctl" "/usr/local/bin/wolfnetctl" || true
+        WOLFNET_BUILT=true
+        return 0
+    fi
+
+    # Fall back to source build
+    if [ -z "$WOLFNET_SRC_DIR" ] || [ ! -d "$WOLFNET_SRC_DIR" ]; then
+        echo "  ✗ WolfNet source not available and no prebuilt binary — skipping"
+        WOLFNET_BUILT=false
+        return 1
+    fi
+
+    export PATH="${CARGO_HOME:-$REAL_HOME/.cargo}/bin:/usr/local/bin:/usr/bin:$PATH"
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "  ⚠ Cargo not found — skipping WolfNet rebuild"
+        WOLFNET_BUILT=false
+        return 1
+    fi
+
+    echo "  Building WolfNet from source..."
+    cd "$WOLFNET_SRC_DIR"
+    if [ -n "$CUSTOM_INSTALL_DIR" ]; then
+        chown -R "$REAL_USER:$REAL_USER" "$WOLFNET_SRC_DIR" "$CARGO_HOME" "$RUSTUP_HOME" "$TMPDIR" 2>/dev/null || true
+        if [ "$REAL_USER" != "root" ]; then
+            su - "$REAL_USER" -c "export CARGO_HOME='$CARGO_HOME' RUSTUP_HOME='$RUSTUP_HOME' TMPDIR='$TMPDIR' PATH='$CARGO_HOME/bin:/usr/local/bin:/usr/bin:\$PATH' && cd $WOLFNET_SRC_DIR && cargo build --release"
+        else
+            cargo build --release
+        fi
+    elif [ "$REAL_USER" != "root" ] && [ -f "$REAL_HOME/.cargo/bin/cargo" ]; then
+        chown -R "$REAL_USER:$REAL_USER" "$WOLFNET_SRC_DIR"
+        su - "$REAL_USER" -c "cd $WOLFNET_SRC_DIR && $REAL_HOME/.cargo/bin/cargo build --release"
+    else
+        cargo build --release
+    fi
+
+    cp "$WOLFNET_SRC_DIR/target/release/wolfnet" /usr/local/bin/wolfnet
+    chmod +x /usr/local/bin/wolfnet
+    if [ -f "$WOLFNET_SRC_DIR/target/release/wolfnetctl" ]; then
+        cp "$WOLFNET_SRC_DIR/target/release/wolfnetctl" /usr/local/bin/wolfnetctl
+        chmod +x /usr/local/bin/wolfnetctl
+    fi
+    WOLFNET_BUILT=true
+    return 0
+}
+
 echo ""
 echo "Checking WolfNet (cluster networking)..."
 
@@ -484,36 +565,13 @@ if command -v wolfnet >/dev/null 2>&1 && systemctl is-active --quiet wolfnet 2>/
         git config --global --add safe.directory "$WOLFNET_SRC_DIR" 2>/dev/null || true
     fi
 
-    # Rebuild
-    export PATH="${CARGO_HOME:-$REAL_HOME/.cargo}/bin:/usr/local/bin:/usr/bin:$PATH"
-    if command -v cargo >/dev/null 2>&1; then
-        cd "$WOLFNET_SRC_DIR"
-        if [ -n "$CUSTOM_INSTALL_DIR" ]; then
-            chown -R "$REAL_USER:$REAL_USER" "$WOLFNET_SRC_DIR" "$CARGO_HOME" "$RUSTUP_HOME" "$TMPDIR" 2>/dev/null || true
-            if [ "$REAL_USER" != "root" ]; then
-                su - "$REAL_USER" -c "export CARGO_HOME='$CARGO_HOME' RUSTUP_HOME='$RUSTUP_HOME' TMPDIR='$TMPDIR' PATH='$CARGO_HOME/bin:/usr/local/bin:/usr/bin:\$PATH' && cd $WOLFNET_SRC_DIR && cargo build --release"
-            else
-                cargo build --release
-            fi
-        elif [ "$REAL_USER" != "root" ] && [ -f "$REAL_HOME/.cargo/bin/cargo" ]; then
-            chown -R "$REAL_USER:$REAL_USER" "$WOLFNET_SRC_DIR"
-            su - "$REAL_USER" -c "cd $WOLFNET_SRC_DIR && $REAL_HOME/.cargo/bin/cargo build --release"
-        else
-            cargo build --release
-        fi
-
-        # Install updated binaries
-        systemctl stop wolfnet 2>/dev/null || true
-        cp "$WOLFNET_SRC_DIR/target/release/wolfnet" /usr/local/bin/wolfnet
-        chmod +x /usr/local/bin/wolfnet
-        if [ -f "$WOLFNET_SRC_DIR/target/release/wolfnetctl" ]; then
-            cp "$WOLFNET_SRC_DIR/target/release/wolfnetctl" /usr/local/bin/wolfnetctl
-            chmod +x /usr/local/bin/wolfnetctl
-        fi
+    # Update binaries (prebuilt or source)
+    systemctl stop wolfnet 2>/dev/null || true
+    if build_or_download_wolfnet; then
         systemctl start wolfnet 2>/dev/null || true
         echo "  ✓ WolfNet updated and restarted"
     else
-        echo "  ⚠ Cargo not found — skipping WolfNet rebuild"
+        systemctl start wolfnet 2>/dev/null || true
     fi
 
 elif command -v wolfnet >/dev/null 2>&1 && [ -f "/etc/systemd/system/wolfnet.service" ]; then
@@ -542,31 +600,8 @@ elif command -v wolfnet >/dev/null 2>&1 && [ -f "/etc/systemd/system/wolfnet.ser
         git config --global --add safe.directory "$WOLFNET_SRC_DIR" 2>/dev/null || true
     fi
 
-    export PATH="${CARGO_HOME:-$REAL_HOME/.cargo}/bin:/usr/local/bin:/usr/bin:$PATH"
-    if command -v cargo >/dev/null 2>&1; then
-        cd "$WOLFNET_SRC_DIR"
-        if [ -n "$CUSTOM_INSTALL_DIR" ]; then
-            chown -R "$REAL_USER:$REAL_USER" "$WOLFNET_SRC_DIR" "$CARGO_HOME" "$RUSTUP_HOME" "$TMPDIR" 2>/dev/null || true
-            if [ "$REAL_USER" != "root" ]; then
-                su - "$REAL_USER" -c "export CARGO_HOME='$CARGO_HOME' RUSTUP_HOME='$RUSTUP_HOME' TMPDIR='$TMPDIR' PATH='$CARGO_HOME/bin:/usr/local/bin:/usr/bin:\$PATH' && cd $WOLFNET_SRC_DIR && cargo build --release"
-            else
-                cargo build --release
-            fi
-        elif [ "$REAL_USER" != "root" ] && [ -f "$REAL_HOME/.cargo/bin/cargo" ]; then
-            chown -R "$REAL_USER:$REAL_USER" "$WOLFNET_SRC_DIR"
-            su - "$REAL_USER" -c "cd $WOLFNET_SRC_DIR && $REAL_HOME/.cargo/bin/cargo build --release"
-        else
-            cargo build --release
-        fi
-        cp "$WOLFNET_SRC_DIR/target/release/wolfnet" /usr/local/bin/wolfnet
-        chmod +x /usr/local/bin/wolfnet
-        if [ -f "$WOLFNET_SRC_DIR/target/release/wolfnetctl" ]; then
-            cp "$WOLFNET_SRC_DIR/target/release/wolfnetctl" /usr/local/bin/wolfnetctl
-            chmod +x /usr/local/bin/wolfnetctl
-        fi
+    if build_or_download_wolfnet; then
         echo "  ✓ WolfNet updated"
-    else
-        echo "  ⚠ Cargo not found — skipping WolfNet rebuild"
     fi
 
     echo "  Starting WolfNet..."
@@ -617,54 +652,34 @@ else
         exit 1
     fi
 
-    # Download WolfNet source
-    echo "  Downloading WolfNet..."
+    # Try prebuilt binary first, fall back to source build
     WOLFNET_SRC_DIR="${CUSTOM_INSTALL_DIR:-/opt}/wolfnet-src"
-    if [ -d "$WOLFNET_SRC_DIR" ]; then
-        git config --global --add safe.directory "$WOLFNET_SRC_DIR" 2>/dev/null || true
-        cd "$WOLFNET_SRC_DIR" && git fetch origin && git reset --hard origin/main
-    else
-        git clone https://github.com/wolfsoftwaresystemsltd/WolfNet.git "$WOLFNET_SRC_DIR"
-        git config --global --add safe.directory "$WOLFNET_SRC_DIR" 2>/dev/null || true
-        cd "$WOLFNET_SRC_DIR"
-    fi
-
-    # Ensure Rust is available for building WolfNet
-    export PATH="${CARGO_HOME:-$REAL_HOME/.cargo}/bin:/usr/local/bin:/usr/bin:$PATH"
-
-    if ! command -v cargo >/dev/null 2>&1; then
-        echo "  Installing Rust first..."
-        if [ -n "$CUSTOM_INSTALL_DIR" ] || [ "$REAL_USER" = "root" ]; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    if ! build_or_download_wolfnet; then
+        # Prebuilt failed and source wasn't available yet — clone and retry
+        echo "  Downloading WolfNet source..."
+        if [ -d "$WOLFNET_SRC_DIR" ]; then
+            git config --global --add safe.directory "$WOLFNET_SRC_DIR" 2>/dev/null || true
+            cd "$WOLFNET_SRC_DIR" && git fetch origin && git reset --hard origin/main
         else
-            su - "$REAL_USER" -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
+            git clone https://github.com/wolfsoftwaresystemsltd/WolfNet.git "$WOLFNET_SRC_DIR"
+            git config --global --add safe.directory "$WOLFNET_SRC_DIR" 2>/dev/null || true
+            cd "$WOLFNET_SRC_DIR"
         fi
-        export PATH="${CARGO_HOME:-$REAL_HOME/.cargo}/bin:$PATH"
-    fi
 
-    # Build WolfNet
-    echo "  Building WolfNet..."
-    cd "$WOLFNET_SRC_DIR"
-    if [ -n "$CUSTOM_INSTALL_DIR" ]; then
-        chown -R "$REAL_USER:$REAL_USER" "$WOLFNET_SRC_DIR" "$CARGO_HOME" "$RUSTUP_HOME" "$TMPDIR" 2>/dev/null || true
-        if [ "$REAL_USER" != "root" ]; then
-            su - "$REAL_USER" -c "export CARGO_HOME='$CARGO_HOME' RUSTUP_HOME='$RUSTUP_HOME' TMPDIR='$TMPDIR' PATH='$CARGO_HOME/bin:/usr/local/bin:/usr/bin:\$PATH' && cd $WOLFNET_SRC_DIR && cargo build --release"
-        else
-            cargo build --release
+        # Ensure Rust is available for building WolfNet
+        export PATH="${CARGO_HOME:-$REAL_HOME/.cargo}/bin:/usr/local/bin:/usr/bin:$PATH"
+
+        if ! command -v cargo >/dev/null 2>&1; then
+            echo "  Installing Rust first..."
+            if [ -n "$CUSTOM_INSTALL_DIR" ] || [ "$REAL_USER" = "root" ]; then
+                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            else
+                su - "$REAL_USER" -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
+            fi
+            export PATH="${CARGO_HOME:-$REAL_HOME/.cargo}/bin:$PATH"
         fi
-    elif [ "$REAL_USER" != "root" ] && [ -f "$REAL_HOME/.cargo/bin/cargo" ]; then
-        chown -R "$REAL_USER:$REAL_USER" "$WOLFNET_SRC_DIR"
-        su - "$REAL_USER" -c "cd $WOLFNET_SRC_DIR && $REAL_HOME/.cargo/bin/cargo build --release"
-    else
-        cargo build --release
-    fi
 
-    # Install binaries
-    cp "$WOLFNET_SRC_DIR/target/release/wolfnet" /usr/local/bin/wolfnet
-    chmod +x /usr/local/bin/wolfnet
-    if [ -f "$WOLFNET_SRC_DIR/target/release/wolfnetctl" ]; then
-        cp "$WOLFNET_SRC_DIR/target/release/wolfnetctl" /usr/local/bin/wolfnetctl
-        chmod +x /usr/local/bin/wolfnetctl
+        build_or_download_wolfnet
     fi
     echo "  ✓ WolfNet binary installed"
 
@@ -881,89 +896,93 @@ BUILT_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 echo "✓ Repository ready ($INSTALL_DIR)"
 echo "  Branch: $BRANCH | Version: $BUILT_VERSION"
 
-# Force full rebuild to ensure the new version takes effect
-echo "  Cleaning previous build..."
-CLEAN_TARGET="${CARGO_TARGET_DIR:-$INSTALL_DIR/target}"
-rm -rf "$CLEAN_TARGET/release/wolfstack" "$CLEAN_TARGET/release/.fingerprint/wolfstack-"*
-
-# ─── Build WolfStack ────────────────────────────────────────────────────────
+# ─── Build or download WolfStack ───────────────────────────────────────────
 echo ""
-echo "Building WolfStack (this may take a few minutes)..."
 
-# Low-memory systems (< 4GB): create swap and limit parallelism to avoid OOM
-TOTAL_MEM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-TOTAL_SWAP_KB=$(grep SwapTotal /proc/meminfo | awk '{print $2}')
-TOTAL_AVAILABLE_KB=$((TOTAL_MEM_KB + TOTAL_SWAP_KB))
-CARGO_JOBS=""
-CREATED_SWAP=""
-
-if [ "$TOTAL_AVAILABLE_KB" -lt 4000000 ]; then
-    echo "  Low memory detected ($(( TOTAL_MEM_KB / 1024 ))MB RAM + $(( TOTAL_SWAP_KB / 1024 ))MB swap)"
-    CARGO_JOBS="-j 1"
-
-    # Create a temporary swap file if total memory + swap < 4GB
-    SWAP_DIR="${CUSTOM_INSTALL_DIR:-/var}"
-    SWAP_FILE="$SWAP_DIR/.wolfstack-build-swap"
-    NEEDED_SWAP_MB=$(( (4000000 - TOTAL_AVAILABLE_KB) / 1024 + 512 ))
-    if [ "$NEEDED_SWAP_MB" -gt 4096 ]; then
-        NEEDED_SWAP_MB=4096
-    fi
-
-    echo "  Creating ${NEEDED_SWAP_MB}MB temporary swap file for build..."
-    dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$NEEDED_SWAP_MB" status=none 2>/dev/null && \
-    chmod 600 "$SWAP_FILE" && \
-    mkswap "$SWAP_FILE" >/dev/null 2>&1 && \
-    swapon "$SWAP_FILE" 2>/dev/null && \
-    CREATED_SWAP="$SWAP_FILE" && \
-    echo "  ✓ Temporary swap enabled" || \
-    echo "  ⚠ Could not create swap file (build may be slow or fail)"
-fi
-
-if [ -n "$CUSTOM_INSTALL_DIR" ]; then
-    # Custom install dir — all build I/O goes to external drive
-    chown -R "$REAL_USER:$REAL_USER" "$INSTALL_DIR" "$CARGO_HOME" "$RUSTUP_HOME" "$TMPDIR" "$CARGO_TARGET_DIR" 2>/dev/null || true
-    if [ "$REAL_USER" != "root" ]; then
-        su - "$REAL_USER" -c "export CARGO_HOME='$CARGO_HOME' RUSTUP_HOME='$RUSTUP_HOME' TMPDIR='$TMPDIR' CARGO_TARGET_DIR='$CARGO_TARGET_DIR' PATH='$CARGO_HOME/bin:/usr/local/bin:/usr/bin:\$PATH' && cd $INSTALL_DIR && cargo build --release $CARGO_JOBS"
-    else
-        cargo build --release $CARGO_JOBS
-    fi
-elif [ "$REAL_USER" != "root" ] && [ -f "$REAL_HOME/.cargo/bin/cargo" ]; then
-    chown -R "$REAL_USER:$REAL_USER" "$INSTALL_DIR"
-    su - "$REAL_USER" -c "cd $INSTALL_DIR && $REAL_HOME/.cargo/bin/cargo build --release $CARGO_JOBS"
-else
-    cargo build --release $CARGO_JOBS
-fi
-
-# Clean up temporary swap file
-if [ -n "$CREATED_SWAP" ]; then
-    swapoff "$CREATED_SWAP" 2>/dev/null
-    rm -f "$CREATED_SWAP"
-    echo "  ✓ Temporary swap removed"
-fi
-
-echo "✓ Build complete"
-
-# ─── Flag restart if service is running (for upgrades) ───────────────────────
+# Flag restart if service is running (for upgrades)
 if systemctl is-active --quiet wolfstack 2>/dev/null; then
-    echo ""
     echo "WolfStack service is running — will restart after upgrade."
     RESTART_SERVICE=true
 else
     RESTART_SERVICE=false
 fi
 
-# ─── Install binary ─────────────────────────────────────────────────────────
 echo ""
 if [ -f "/usr/local/bin/wolfstack" ]; then
     echo "Upgrading WolfStack..."
-    rm -f /usr/local/bin/wolfstack
 else
     echo "Installing WolfStack..."
 fi
 
-BUILD_TARGET_DIR="${CARGO_TARGET_DIR:-$INSTALL_DIR/target}"
-cp "$BUILD_TARGET_DIR/release/wolfstack" /usr/local/bin/wolfstack
-chmod +x /usr/local/bin/wolfstack
+# Try prebuilt binary first — saves disk space, memory, and build time
+WOLFSTACK_PREBUILT=false
+if download_prebuilt "wolfsoftwaresystemsltd/WolfStack" "wolfstack" "/usr/local/bin/wolfstack"; then
+    WOLFSTACK_PREBUILT=true
+else
+    # Fall back to building from source
+    echo "Building WolfStack from source (this may take a few minutes)..."
+
+    # Force full rebuild to ensure the new version takes effect
+    echo "  Cleaning previous build..."
+    CLEAN_TARGET="${CARGO_TARGET_DIR:-$INSTALL_DIR/target}"
+    rm -rf "$CLEAN_TARGET/release/wolfstack" "$CLEAN_TARGET/release/.fingerprint/wolfstack-"*
+
+    # Low-memory systems (< 4GB): create swap and limit parallelism to avoid OOM
+    TOTAL_MEM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    TOTAL_SWAP_KB=$(grep SwapTotal /proc/meminfo | awk '{print $2}')
+    TOTAL_AVAILABLE_KB=$((TOTAL_MEM_KB + TOTAL_SWAP_KB))
+    CARGO_JOBS=""
+    CREATED_SWAP=""
+
+    if [ "$TOTAL_AVAILABLE_KB" -lt 4000000 ]; then
+        echo "  Low memory detected ($(( TOTAL_MEM_KB / 1024 ))MB RAM + $(( TOTAL_SWAP_KB / 1024 ))MB swap)"
+        CARGO_JOBS="-j 1"
+
+        # Create a temporary swap file if total memory + swap < 4GB
+        SWAP_DIR="${CUSTOM_INSTALL_DIR:-/var}"
+        SWAP_FILE="$SWAP_DIR/.wolfstack-build-swap"
+        NEEDED_SWAP_MB=$(( (4000000 - TOTAL_AVAILABLE_KB) / 1024 + 512 ))
+        if [ "$NEEDED_SWAP_MB" -gt 4096 ]; then
+            NEEDED_SWAP_MB=4096
+        fi
+
+        echo "  Creating ${NEEDED_SWAP_MB}MB temporary swap file for build..."
+        dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$NEEDED_SWAP_MB" status=none 2>/dev/null && \
+        chmod 600 "$SWAP_FILE" && \
+        mkswap "$SWAP_FILE" >/dev/null 2>&1 && \
+        swapon "$SWAP_FILE" 2>/dev/null && \
+        CREATED_SWAP="$SWAP_FILE" && \
+        echo "  ✓ Temporary swap enabled" || \
+        echo "  ⚠ Could not create swap file (build may be slow or fail)"
+    fi
+
+    if [ -n "$CUSTOM_INSTALL_DIR" ]; then
+        # Custom install dir — all build I/O goes to external drive
+        chown -R "$REAL_USER:$REAL_USER" "$INSTALL_DIR" "$CARGO_HOME" "$RUSTUP_HOME" "$TMPDIR" "$CARGO_TARGET_DIR" 2>/dev/null || true
+        if [ "$REAL_USER" != "root" ]; then
+            su - "$REAL_USER" -c "export CARGO_HOME='$CARGO_HOME' RUSTUP_HOME='$RUSTUP_HOME' TMPDIR='$TMPDIR' CARGO_TARGET_DIR='$CARGO_TARGET_DIR' PATH='$CARGO_HOME/bin:/usr/local/bin:/usr/bin:\$PATH' && cd $INSTALL_DIR && cargo build --release $CARGO_JOBS"
+        else
+            cargo build --release $CARGO_JOBS
+        fi
+    elif [ "$REAL_USER" != "root" ] && [ -f "$REAL_HOME/.cargo/bin/cargo" ]; then
+        chown -R "$REAL_USER:$REAL_USER" "$INSTALL_DIR"
+        su - "$REAL_USER" -c "cd $INSTALL_DIR && $REAL_HOME/.cargo/bin/cargo build --release $CARGO_JOBS"
+    else
+        cargo build --release $CARGO_JOBS
+    fi
+
+    # Clean up temporary swap file
+    if [ -n "$CREATED_SWAP" ]; then
+        swapoff "$CREATED_SWAP" 2>/dev/null
+        rm -f "$CREATED_SWAP"
+        echo "  ✓ Temporary swap removed"
+    fi
+
+    BUILD_TARGET_DIR="${CARGO_TARGET_DIR:-$INSTALL_DIR/target}"
+    cp "$BUILD_TARGET_DIR/release/wolfstack" /usr/local/bin/wolfstack
+    chmod +x /usr/local/bin/wolfstack
+fi
+
 echo "✓ wolfstack installed to /usr/local/bin/wolfstack"
 
 # ─── Install web UI ─────────────────────────────────────────────────────────
