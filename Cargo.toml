@@ -16,7 +16,7 @@ actix-ws = "0.3"
 actix-multipart = "0.7"
 portable-pty = "0.8"
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
-native-tls = "0.2"
+native-tls = { version = "0.2", features = ["vendored"] }
 futures = "0.3"
 
 # Serialization
@@ -31,7 +31,7 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "multipart", "stream"], default-features = false }
 
 # TLS
-openssl = "0.10"
+openssl = { version = "0.10", features = ["vendored"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 webpki-roots = "0.26"
 
