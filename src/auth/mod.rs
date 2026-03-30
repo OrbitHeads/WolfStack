@@ -204,15 +204,19 @@ pub fn authenticate_user(username: &str, password: &str) -> bool {
 }
 
 /// Verify a password against a stored hash.
-/// Uses native C crypt() via dlopen for yescrypt ($y$) and any other format,
-/// with pure-Rust fallback for $5$ and $6$ if libcrypt is unavailable.
+/// Uses native C crypt() via dlopen when available, with pure-Rust fallback
+/// for yescrypt ($y$), SHA-512 ($6$), and SHA-256 ($5$).
 fn verify_password(password: &str, stored_hash: &str) -> bool {
-    // Try native C crypt() first — handles all formats including yescrypt
+    // Try native C crypt() first — handles all formats
     if let Some(result) = native_crypt(password, stored_hash) {
         return result == stored_hash;
     }
-    // Fallback: pure Rust for SHA-256/SHA-512 (works on systems without libcrypt)
-    if stored_hash.starts_with("$6$") {
+    // Fallback: pure Rust (needed for statically-linked / musl builds)
+    if stored_hash.starts_with("$y$") {
+        use yescrypt::Yescrypt;
+        use yescrypt::password_hash::PasswordVerifier;
+        return Yescrypt::default().verify_password(password.as_bytes(), stored_hash).is_ok();
+    } else if stored_hash.starts_with("$6$") {
         sha_crypt::sha512_check(password, stored_hash).is_ok()
     } else if stored_hash.starts_with("$5$") {
         sha_crypt::sha256_check(password, stored_hash).is_ok()
