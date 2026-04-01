@@ -4259,7 +4259,10 @@
                             </div>
 
                             <!-- Recent Notes Browser -->
-                            <h4 style="margin:0 0 12px 0;font-size:15px;font-weight:600;">Recent Notes</h4>
+                            <div style="display:flex;align-items:center;justify-content:space-between;margin:0 0 12px 0;">
+                                <h4 style="margin:0;font-size:15px;font-weight:600;">Recent Notes</h4>
+                                <button class="btn btn-sm" onclick="loadWolfNoteNotes();loadWolfNoteFolders();" style="background:var(--bg-tertiary);color:var(--text-primary);border:1px solid var(--border);font-size:11px;">Refresh</button>
+                            </div>
                             <div id="wolfnote-notes-list" style="display:flex;flex-direction:column;gap:6px;">
                                 <div style="color:var(--text-muted);text-align:center;padding:20px;">Loading...</div>
                             </div>

@@ -21108,6 +21108,22 @@ async function loadWolfNoteFolders() {
         if (data.error) return;
 
         const folders = Array.isArray(data) ? data : [];
+
+        // Build parent lookup and full path names (e.g. "WolfStack/Backups")
+        const byId = {};
+        folders.forEach(f => { byId[f.id] = f; });
+        function folderPath(f) {
+            const parts = [f.name];
+            let cur = f;
+            while (cur.parent_id && byId[cur.parent_id]) {
+                cur = byId[cur.parent_id];
+                parts.unshift(cur.name);
+            }
+            return parts.join('/');
+        }
+        const sorted = folders.map(f => ({ id: f.id, path: folderPath(f) }))
+            .sort((a, b) => a.path.localeCompare(b.path));
+
         const selectors = [
             'wolfnote-quick-folder',
             'wolfnote-folder-ai',
@@ -21120,10 +21136,10 @@ async function loadWolfNoteFolders() {
             const sel = document.getElementById(id);
             if (!sel) return;
             sel.innerHTML = '<option value="">No folder</option>';
-            folders.forEach(f => {
+            sorted.forEach(f => {
                 const opt = document.createElement('option');
                 opt.value = f.id;
-                opt.textContent = f.name;
+                opt.textContent = f.path;
                 sel.appendChild(opt);
             });
         });
