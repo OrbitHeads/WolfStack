@@ -8911,6 +8911,7 @@ const POLL_INTERVAL = isMobileView() ? 30000 : 10000;
 fetchNodes();
 fetchMetricsHistory(); // Initial history load
 loadTaskLog(); // Restore task log from localStorage
+checkWolfNoteTopBar(); // Show WolfNote button if connected
 setInterval(fetchNodes, POLL_INTERVAL);
 // Load k8s cluster data for sidebar badges (non-blocking)
 (async () => {
@@ -21010,6 +21011,9 @@ async function loadWolfNoteConfig() {
             // Load folders and notes
             loadWolfNoteFolders();
             loadWolfNoteNotes();
+            // Show top bar button
+            const tbBtn = document.getElementById('wolfnote-topbar-btn');
+            if (tbBtn) tbBtn.style.display = 'flex';
         } else {
             badge.textContent = 'Not Connected';
             badge.style.background = 'var(--bg-tertiary)';
@@ -21018,6 +21022,9 @@ async function loadWolfNoteConfig() {
             connectedSection.style.display = 'none';
             if (data.url) document.getElementById('wolfnote-url').value = data.url;
             if (data.company) document.getElementById('wolfnote-company').value = data.company;
+            // Hide top bar button
+            const tbBtn = document.getElementById('wolfnote-topbar-btn');
+            if (tbBtn) tbBtn.style.display = 'none';
         }
     } catch (e) {
         console.error('Failed to load WolfNote config:', e);
@@ -21251,6 +21258,59 @@ async function wolfnoteCreateFolder() {
         }
     } catch (e) {
         console.error('Failed to create folder:', e);
+    }
+}
+
+// ─── WolfNote Top Bar Button ───
+
+async function checkWolfNoteTopBar() {
+    try {
+        const resp = await fetch('/api/wolfnote/config');
+        if (!resp.ok) return;
+        const data = await resp.json();
+        const btn = document.getElementById('wolfnote-topbar-btn');
+        if (btn) btn.style.display = data.connected ? 'flex' : 'none';
+    } catch (_) {}
+}
+
+async function wolfnoteFromCurrentView() {
+    // Find the currently visible page-view
+    const visible = document.querySelector('.page-view[style*="display: block"], .page-view[style*="display:block"]');
+    if (!visible) return;
+
+    const pageTitle = document.getElementById('page-title')?.textContent || 'WolfStack';
+    const timestamp = new Date().toLocaleString();
+    const title = `${pageTitle} — ${timestamp}`;
+
+    // Clone the visible content and extract meaningful HTML
+    const clone = visible.cloneNode(true);
+    // Remove scripts, hidden elements, and buttons to clean up
+    clone.querySelectorAll('script, style, .modal-overlay, button, .btn').forEach(el => el.remove());
+
+    // Get the HTML content, wrapped with margins
+    const content = `<div style="margin: 16px 20px;"><h2>${escapeHtml(pageTitle)}</h2><p style="color:#888;font-size:12px;">Captured from WolfStack on ${escapeHtml(timestamp)}</p><hr style="border:none;border-top:1px solid #333;margin:12px 0;">${clone.innerHTML}</div>`;
+
+    try {
+        const resp = await fetch('/api/wolfnote/notes', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ title, content }),
+        });
+        const data = await resp.json();
+        if (data.error) {
+            alert('WolfNote error: ' + data.error);
+        } else {
+            // Brief visual feedback on the button
+            const btn = document.getElementById('wolfnote-topbar-btn');
+            if (btn) {
+                const orig = btn.textContent;
+                btn.textContent = '\u2714';
+                btn.style.color = 'var(--success)';
+                setTimeout(() => { btn.textContent = orig; btn.style.color = ''; }, 1500);
+            }
+        }
+    } catch (e) {
+        alert('Failed to save to WolfNote: ' + e.message);
     }
 }
 
