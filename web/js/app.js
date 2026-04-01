@@ -21303,62 +21303,116 @@ async function wolfnoteFromCurrentView() {
     // Extract clean data from the page
     const sections = [];
 
-    // Extract card contents — each .card is a section
+    // Helper: extract a table element into clean constrained HTML
+    function extractTable(tbl) {
+        const rows = [];
+        tbl.querySelectorAll('thead tr').forEach(tr => {
+            const cells = [];
+            tr.querySelectorAll('th').forEach(th => {
+                const text = th.textContent.trim();
+                if (text && text !== 'Actions') cells.push(`<th style="padding:8px 10px;text-align:left;border-bottom:2px solid #d0d5dd;font-weight:600;font-size:12px;color:#1e293b;white-space:nowrap;">${escapeHtml(text)}</th>`);
+            });
+            if (cells.length) rows.push(`<tr style="background:#f1f5f9;">${cells.join('')}</tr>`);
+        });
+        tbl.querySelectorAll('tbody tr').forEach(tr => {
+            const cells = [];
+            tr.querySelectorAll('td').forEach((td, i) => {
+                const headerRow = tbl.querySelector('thead tr');
+                const ths = headerRow ? headerRow.querySelectorAll('th') : [];
+                if (ths[i] && ths[i].textContent.trim() === 'Actions') return;
+                const text = td.textContent.trim();
+                cells.push(`<td style="padding:5px 10px;border-bottom:1px solid #e2e8f0;font-size:12px;color:#334155;word-break:break-word;">${escapeHtml(text)}</td>`);
+            });
+            if (cells.length) rows.push(`<tr>${cells.join('')}</tr>`);
+        });
+        if (rows.length) {
+            return `<div style="overflow-x:auto;margin:8px 0 16px 0;"><table style="width:100%;max-width:100%;border-collapse:collapse;table-layout:auto;">${rows.join('')}</table></div>`;
+        }
+        return null;
+    }
+
+    // Helper: extract stat cards (label/value pairs in grid or flex layouts)
+    function extractStatCards(container) {
+        const items = [];
+        container.querySelectorAll('.stat-card, .stat-item').forEach(card => {
+            const label = card.querySelector('.stat-label');
+            const value = card.querySelector('.stat-value');
+            if (label && value) {
+                items.push({ label: label.textContent.trim(), value: value.textContent.trim() });
+            }
+        });
+        if (items.length === 0) return null;
+        // Render as a compact grid of key-value boxes
+        const cells = items.map(it =>
+            `<div style="padding:10px 14px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;">
+                <div style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:0.3px;margin-bottom:2px;">${escapeHtml(it.label)}</div>
+                <div style="font-size:18px;font-weight:700;color:#0f172a;">${escapeHtml(it.value)}</div>
+            </div>`
+        ).join('');
+        return `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;margin:8px 0 16px 0;">${cells}</div>`;
+    }
+
+    // Helper: extract div-based flex/grid layouts with visible children
+    function extractDivLayout(container) {
+        const items = [];
+        // Look for immediate child divs that have text content (grid/flex items)
+        container.querySelectorAll(':scope > div, :scope > a').forEach(child => {
+            // Skip modals, buttons, hidden elements
+            if (child.classList.contains('modal-overlay') || child.style.display === 'none') return;
+            const computed = getComputedStyle(child);
+            if (computed.display === 'none') return;
+            const text = child.innerText.trim();
+            if (text && text.length > 2 && text.length < 500) {
+                items.push(text);
+            }
+        });
+        if (items.length === 0) return null;
+        return `<ul style="margin:8px 0 16px 0;padding-left:20px;line-height:1.8;color:#334155;">${items.map(t => `<li>${escapeHtml(t)}</li>`).join('')}</ul>`;
+    }
+
+    // 1. Extract stat grids at page level (outside cards)
+    visible.querySelectorAll('.stats-grid').forEach(grid => {
+        const html = extractStatCards(grid);
+        if (html) sections.push({ heading: '', html });
+    });
+
+    // 2. Extract card contents
     visible.querySelectorAll('.card').forEach(card => {
         const header = card.querySelector('.card-header h3, .card-header h4');
         const heading = header ? header.textContent.trim() : '';
 
-        // Extract tables as clean HTML tables
+        // Tables
         const tables = card.querySelectorAll('table.data-table, table');
+        let foundContent = false;
         tables.forEach(tbl => {
-            const rows = [];
-            tbl.querySelectorAll('thead tr').forEach(tr => {
-                const cells = [];
-                tr.querySelectorAll('th').forEach(th => {
-                    const text = th.textContent.trim();
-                    if (text && text !== 'Actions') cells.push(`<th style="padding:8px 12px;text-align:left;border-bottom:2px solid #d0d5dd;font-weight:600;font-size:13px;color:#1e293b;">${escapeHtml(text)}</th>`);
-                });
-                if (cells.length) rows.push(`<tr style="background:#f1f5f9;">${cells.join('')}</tr>`);
-            });
-            tbl.querySelectorAll('tbody tr').forEach(tr => {
-                const cells = [];
-                tr.querySelectorAll('td').forEach((td, i) => {
-                    const headerRow = tbl.querySelector('thead tr');
-                    const ths = headerRow ? headerRow.querySelectorAll('th') : [];
-                    if (ths[i] && ths[i].textContent.trim() === 'Actions') return;
-                    const text = td.textContent.trim();
-                    cells.push(`<td style="padding:6px 12px;border-bottom:1px solid #e2e8f0;font-size:13px;color:#334155;">${escapeHtml(text)}</td>`);
-                });
-                if (cells.length) rows.push(`<tr>${cells.join('')}</tr>`);
-            });
-            if (rows.length) {
-                sections.push({ heading, html: `<table style="width:100%;border-collapse:collapse;margin:8px 0 16px 0;">${rows.join('')}</table>` });
-            }
+            const html = extractTable(tbl);
+            if (html) { sections.push({ heading: foundContent ? '' : heading, html }); foundContent = true; }
         });
 
-        // If no tables, extract key-value pairs and text content
-        if (tables.length === 0) {
-            const body = card.querySelector('.card-body');
-            if (body) {
-                const items = [];
-                body.querySelectorAll('.stat-item, [class*="stat"], [class*="metric"]').forEach(el => {
-                    const label = el.querySelector('.stat-label, [class*="label"]');
-                    const value = el.querySelector('.stat-value, [class*="value"]');
-                    if (label && value) items.push(`<li style="color:#334155;"><strong>${escapeHtml(label.textContent.trim())}</strong>: ${escapeHtml(value.textContent.trim())}</li>`);
-                });
-                if (items.length) {
-                    sections.push({ heading, html: `<ul style="margin:8px 0 16px 0;padding-left:20px;line-height:1.8;">${items.join('')}</ul>` });
-                } else {
-                    const text = body.innerText.trim();
-                    if (text && text.length > 5) {
-                        sections.push({ heading, html: `<p style="margin:8px 0 16px 0;line-height:1.7;white-space:pre-wrap;color:#334155;">${escapeHtml(text.substring(0, 3000))}</p>` });
-                    }
+        if (!foundContent) {
+            const body = card.querySelector('.card-body') || card;
+
+            // Stat cards inside this card
+            const statsHtml = extractStatCards(body);
+            if (statsHtml) { sections.push({ heading, html: statsHtml }); foundContent = true; }
+
+            // Flex/grid div layouts (e.g. container lists, node cards)
+            if (!foundContent) {
+                const divHtml = extractDivLayout(body);
+                if (divHtml) { sections.push({ heading, html: divHtml }); foundContent = true; }
+            }
+
+            // Fallback: plain text
+            if (!foundContent) {
+                const text = body.innerText.trim();
+                if (text && text.length > 5) {
+                    sections.push({ heading, html: `<p style="margin:8px 0 16px 0;line-height:1.7;white-space:pre-wrap;color:#334155;">${escapeHtml(text.substring(0, 3000))}</p>` });
                 }
             }
         }
     });
 
-    // If no cards found, extract raw text as fallback
+    // 3. If no cards or stats found, extract raw text as fallback
     if (sections.length === 0) {
         const text = visible.innerText.trim();
         if (text) sections.push({ heading: '', html: `<p style="line-height:1.7;white-space:pre-wrap;color:#334155;">${escapeHtml(text.substring(0, 5000))}</p>` });
@@ -21371,7 +21425,7 @@ async function wolfnoteFromCurrentView() {
         (i < sectionCount - 1 ? '<div style="border-bottom:1px solid #e2e8f0;margin:16px 0;"></div>' : '')
     ).join('');
 
-    const content = `<div style="max-width:800px;margin:0 auto;padding:36px 44px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#334155;background:#ffffff;border-radius:8px;line-height:1.6;border:1px solid #e2e8f0;">
+    const content = `<div style="max-width:800px;margin:0 auto;padding:36px 44px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#334155;background:#ffffff;border-radius:8px;line-height:1.6;border:1px solid #e2e8f0;overflow:hidden;box-sizing:border-box;word-wrap:break-word;">
     <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px;">
         <div style="width:40px;height:40px;border-radius:8px;background:linear-gradient(135deg,#6366f1,#8b5cf6);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0;color:#fff;font-weight:700;">W</div>
         <div>
