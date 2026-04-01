@@ -4167,41 +4167,56 @@
                             <!-- Feature Toggles -->
                             <h4 style="margin:0 0 12px 0;font-size:15px;font-weight:600;">Features</h4>
                             <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:24px;">
-                                <label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:8px 12px;background:var(--bg-tertiary);border-radius:6px;">
+                                <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--bg-tertiary);border-radius:6px;">
                                     <input type="checkbox" id="wolfnote-feat-ai" onchange="wolfnoteSaveFeatures()" checked>
-                                    <div>
+                                    <div style="flex:1;">
                                         <div style="font-weight:600;font-size:13px;">AI Note Creation</div>
                                         <div style="font-size:11px;color:var(--text-muted);">Allow the AI chat assistant to create WolfNote notes on your behalf</div>
                                     </div>
-                                </label>
-                                <label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:8px 12px;background:var(--bg-tertiary);border-radius:6px;">
+                                    <select id="wolfnote-folder-ai" class="form-control" onchange="wolfnoteSaveFeatures()" style="width:160px;font-size:12px;">
+                                        <option value="">No folder</option>
+                                    </select>
+                                </div>
+                                <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--bg-tertiary);border-radius:6px;">
                                     <input type="checkbox" id="wolfnote-feat-events" onchange="wolfnoteSaveFeatures()">
-                                    <div>
+                                    <div style="flex:1;">
                                         <div style="font-weight:600;font-size:13px;">Server Event Logging</div>
                                         <div style="font-size:11px;color:var(--text-muted);">Auto-log container and VM lifecycle events (create, destroy, start, stop)</div>
                                     </div>
-                                </label>
-                                <label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:8px 12px;background:var(--bg-tertiary);border-radius:6px;">
+                                    <select id="wolfnote-folder-events" class="form-control" onchange="wolfnoteSaveFeatures()" style="width:160px;font-size:12px;">
+                                        <option value="">No folder</option>
+                                    </select>
+                                </div>
+                                <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--bg-tertiary);border-radius:6px;">
                                     <input type="checkbox" id="wolfnote-feat-incidents" onchange="wolfnoteSaveFeatures()">
-                                    <div>
+                                    <div style="flex:1;">
                                         <div style="font-weight:600;font-size:13px;">Incident Notes</div>
                                         <div style="font-size:11px;color:var(--text-muted);">Create a note when status page incidents are opened or resolved</div>
                                     </div>
-                                </label>
-                                <label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:8px 12px;background:var(--bg-tertiary);border-radius:6px;">
+                                    <select id="wolfnote-folder-incidents" class="form-control" onchange="wolfnoteSaveFeatures()" style="width:160px;font-size:12px;">
+                                        <option value="">No folder</option>
+                                    </select>
+                                </div>
+                                <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--bg-tertiary);border-radius:6px;">
                                     <input type="checkbox" id="wolfnote-feat-backups" onchange="wolfnoteSaveFeatures()">
-                                    <div>
+                                    <div style="flex:1;">
                                         <div style="font-weight:600;font-size:13px;">Backup Reports</div>
                                         <div style="font-size:11px;color:var(--text-muted);">Log backup success/failure reports as notes</div>
                                     </div>
-                                </label>
-                                <label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:8px 12px;background:var(--bg-tertiary);border-radius:6px;">
+                                    <select id="wolfnote-folder-backups" class="form-control" onchange="wolfnoteSaveFeatures()" style="width:160px;font-size:12px;">
+                                        <option value="">No folder</option>
+                                    </select>
+                                </div>
+                                <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--bg-tertiary);border-radius:6px;">
                                     <input type="checkbox" id="wolfnote-feat-alerts" onchange="wolfnoteSaveFeatures()">
-                                    <div>
+                                    <div style="flex:1;">
                                         <div style="font-weight:600;font-size:13px;">Alert Notes</div>
                                         <div style="font-size:11px;color:var(--text-muted);">Log fired alerts (CPU/RAM/disk thresholds) as notes</div>
                                     </div>
-                                </label>
+                                    <select id="wolfnote-folder-alerts" class="form-control" onchange="wolfnoteSaveFeatures()" style="width:160px;font-size:12px;">
+                                        <option value="">No folder</option>
+                                    </select>
+                                </div>
                             </div>
 
                             <!-- Quick Note Creator -->

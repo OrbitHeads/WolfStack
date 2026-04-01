@@ -20998,6 +20998,15 @@ async function loadWolfNoteConfig() {
             document.getElementById('wolfnote-feat-backups').checked = data.features?.backup_notes ?? false;
             document.getElementById('wolfnote-feat-alerts').checked = data.features?.alert_notes ?? false;
 
+            // Store folder selections to apply after folders load
+            window._wolfnoteFolderSelections = {
+                ai: data.features?.ai_folder_id || '',
+                events: data.features?.events_folder_id || '',
+                incidents: data.features?.incidents_folder_id || '',
+                backups: data.features?.backups_folder_id || '',
+                alerts: data.features?.alerts_folder_id || '',
+            };
+
             // Load folders and notes
             loadWolfNoteFolders();
             loadWolfNoteNotes();
@@ -21071,10 +21080,15 @@ async function wolfnoteDisconnect() {
 async function wolfnoteSaveFeatures() {
     const features = {
         ai_create_notes: document.getElementById('wolfnote-feat-ai').checked,
+        ai_folder_id: document.getElementById('wolfnote-folder-ai').value,
         auto_log_events: document.getElementById('wolfnote-feat-events').checked,
+        events_folder_id: document.getElementById('wolfnote-folder-events').value,
         incident_notes: document.getElementById('wolfnote-feat-incidents').checked,
+        incidents_folder_id: document.getElementById('wolfnote-folder-incidents').value,
         backup_notes: document.getElementById('wolfnote-feat-backups').checked,
+        backups_folder_id: document.getElementById('wolfnote-folder-backups').value,
         alert_notes: document.getElementById('wolfnote-feat-alerts').checked,
+        alerts_folder_id: document.getElementById('wolfnote-folder-alerts').value,
     };
     try {
         await fetch('/api/wolfnote/config', {
@@ -21093,14 +21107,36 @@ async function loadWolfNoteFolders() {
         const data = await resp.json();
         if (data.error) return;
 
-        const select = document.getElementById('wolfnote-quick-folder');
-        select.innerHTML = '<option value="">No folder</option>';
-        (Array.isArray(data) ? data : []).forEach(f => {
-            const opt = document.createElement('option');
-            opt.value = f.id;
-            opt.textContent = f.name;
-            select.appendChild(opt);
+        const folders = Array.isArray(data) ? data : [];
+        const selectors = [
+            'wolfnote-quick-folder',
+            'wolfnote-folder-ai',
+            'wolfnote-folder-events',
+            'wolfnote-folder-incidents',
+            'wolfnote-folder-backups',
+            'wolfnote-folder-alerts',
+        ];
+        selectors.forEach(id => {
+            const sel = document.getElementById(id);
+            if (!sel) return;
+            sel.innerHTML = '<option value="">No folder</option>';
+            folders.forEach(f => {
+                const opt = document.createElement('option');
+                opt.value = f.id;
+                opt.textContent = f.name;
+                sel.appendChild(opt);
+            });
         });
+
+        // Restore saved folder selections
+        const s = window._wolfnoteFolderSelections;
+        if (s) {
+            document.getElementById('wolfnote-folder-ai').value = s.ai;
+            document.getElementById('wolfnote-folder-events').value = s.events;
+            document.getElementById('wolfnote-folder-incidents').value = s.incidents;
+            document.getElementById('wolfnote-folder-backups').value = s.backups;
+            document.getElementById('wolfnote-folder-alerts').value = s.alerts;
+        }
     } catch (e) {
         console.error('Failed to load WolfNote folders:', e);
     }

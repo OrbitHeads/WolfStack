@@ -832,10 +832,19 @@ async fn execute_wolfnote_tags(response: &str) -> String {
         let title = extract_attr(tag_header, "title").unwrap_or_else(|| "Untitled Note".to_string());
 
         // Content is between the closing ] of the opening tag and [/WOLFNOTE]
-        let content = result[tag_header_end + 1..end_tag].trim().to_string();
+        let raw_content = result[tag_header_end + 1..end_tag].trim().to_string();
+        // Wrap with margins for readable formatting in WolfNote
+        let content = format!("<div style=\"margin: 16px 20px;\">{}</div>", raw_content);
+
+        // Use the configured AI folder
+        let folder_id = if config.features.ai_folder_id.is_empty() {
+            None
+        } else {
+            Some(config.features.ai_folder_id.as_str())
+        };
 
         // Create the note
-        let replacement = match client.create_note(&title, &content, None).await {
+        let replacement = match client.create_note(&title, &content, folder_id).await {
             Ok(note) => format!("*Note \"{}\" saved to WolfNote (ID: {})*", title, note.id),
             Err(e) => format!("*Failed to save note: {}*", e),
         };

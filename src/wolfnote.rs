@@ -39,28 +39,43 @@ pub struct WolfNoteFeatures {
     /// Allow AI chat to create notes
     #[serde(default = "default_true")]
     pub ai_create_notes: bool,
+    #[serde(default)]
+    pub ai_folder_id: String,
     /// Auto-log server events as notes
     #[serde(default)]
     pub auto_log_events: bool,
+    #[serde(default)]
+    pub events_folder_id: String,
     /// Auto-create incident notes from status page incidents
     #[serde(default)]
     pub incident_notes: bool,
+    #[serde(default)]
+    pub incidents_folder_id: String,
     /// Auto-log backup results as notes
     #[serde(default)]
     pub backup_notes: bool,
+    #[serde(default)]
+    pub backups_folder_id: String,
     /// Auto-log alert events as notes
     #[serde(default)]
     pub alert_notes: bool,
+    #[serde(default)]
+    pub alerts_folder_id: String,
 }
 
 impl Default for WolfNoteFeatures {
     fn default() -> Self {
         Self {
             ai_create_notes: true,
+            ai_folder_id: String::new(),
             auto_log_events: false,
+            events_folder_id: String::new(),
             incident_notes: false,
+            incidents_folder_id: String::new(),
             backup_notes: false,
+            backups_folder_id: String::new(),
             alert_notes: false,
+            alerts_folder_id: String::new(),
         }
     }
 }
