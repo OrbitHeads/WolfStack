@@ -14222,6 +14222,189 @@ async fn secrets_delete(
     }
 }
 
+// ─── WolfNote Integration ───
+
+/// POST /api/wolfnote/login — login to WolfNote and store the token
+#[derive(Deserialize)]
+pub struct WolfNoteLoginRequest {
+    pub username: String,
+    pub password: String,
+    #[serde(default)]
+    pub company: String,
+    #[serde(default = "wolfnote_default_url")]
+    pub url: String,
+}
+fn wolfnote_default_url() -> String { "https://app.wolfnote.org".to_string() }
+
+pub async fn wolfnote_login(
+    req: HttpRequest, state: web::Data<AppState>,
+    body: web::Json<WolfNoteLoginRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    let base_url = if body.url.is_empty() { "https://app.wolfnote.org" } else { &body.url };
+
+    match crate::wolfnote::WolfNoteClient::login(base_url, &body.username, &body.password, &body.company).await {
+        Ok(login_resp) => {
+            // Save token and config
+            let mut config = crate::wolfnote::WolfNoteConfig::load();
+            config.url = base_url.to_string();
+            config.token = login_resp.token;
+            config.username = login_resp.user.username.clone();
+            config.company = body.company.clone();
+            if let Err(e) = config.save() {
+                return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+            }
+            HttpResponse::Ok().json(serde_json::json!({
+                "connected": true,
+                "username": login_resp.user.username,
+            }))
+        }
+        Err(e) => HttpResponse::Ok().json(serde_json::json!({
+            "connected": false,
+            "error": e,
+        })),
+    }
+}
+
+/// POST /api/wolfnote/disconnect — clear the stored token
+pub async fn wolfnote_disconnect(
+    req: HttpRequest, state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let mut config = crate::wolfnote::WolfNoteConfig::load();
+    config.token.clear();
+    config.username.clear();
+    if let Err(e) = config.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+    HttpResponse::Ok().json(serde_json::json!({ "disconnected": true }))
+}
+
+/// GET /api/wolfnote/config — get current WolfNote config (token masked)
+pub async fn wolfnote_config_get(
+    req: HttpRequest, state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let config = crate::wolfnote::WolfNoteConfig::load();
+    HttpResponse::Ok().json(serde_json::json!({
+        "url": config.url,
+        "connected": config.is_connected(),
+        "username": config.username,
+        "company": config.company,
+        "features": config.features,
+    }))
+}
+
+/// POST /api/wolfnote/config — save feature toggles
+pub async fn wolfnote_config_save(
+    req: HttpRequest, state: web::Data<AppState>,
+    body: web::Json<serde_json::Value>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let mut config = crate::wolfnote::WolfNoteConfig::load();
+
+    if let Some(features) = body.get("features") {
+        if let Ok(f) = serde_json::from_value::<crate::wolfnote::WolfNoteFeatures>(features.clone()) {
+            config.features = f;
+        }
+    }
+    if let Some(url) = body.get("url").and_then(|v| v.as_str()) {
+        if !url.is_empty() {
+            config.url = url.to_string();
+        }
+    }
+
+    match config.save() {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "saved": true })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// GET /api/wolfnote/folders — list folders from WolfNote
+pub async fn wolfnote_folders_list(
+    req: HttpRequest, state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let config = crate::wolfnote::WolfNoteConfig::load();
+    if !config.is_connected() {
+        return HttpResponse::Ok().json(serde_json::json!({ "error": "Not connected to WolfNote" }));
+    }
+    let client = crate::wolfnote::WolfNoteClient::new(&config.url, &config.token);
+    match client.list_folders().await {
+        Ok(folders) => HttpResponse::Ok().json(folders),
+        Err(e) => HttpResponse::Ok().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// POST /api/wolfnote/folders — create a folder in WolfNote
+#[derive(Deserialize)]
+pub struct WolfNoteCreateFolderRequest {
+    pub name: String,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub color: Option<String>,
+}
+
+pub async fn wolfnote_folders_create(
+    req: HttpRequest, state: web::Data<AppState>,
+    body: web::Json<WolfNoteCreateFolderRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let config = crate::wolfnote::WolfNoteConfig::load();
+    if !config.is_connected() {
+        return HttpResponse::Ok().json(serde_json::json!({ "error": "Not connected to WolfNote" }));
+    }
+    let client = crate::wolfnote::WolfNoteClient::new(&config.url, &config.token);
+    match client.create_folder(&body.name, body.parent_id.as_deref(), body.color.as_deref()).await {
+        Ok(folder) => HttpResponse::Ok().json(folder),
+        Err(e) => HttpResponse::Ok().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// GET /api/wolfnote/notes — list notes from WolfNote
+pub async fn wolfnote_notes_list(
+    req: HttpRequest, state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let config = crate::wolfnote::WolfNoteConfig::load();
+    if !config.is_connected() {
+        return HttpResponse::Ok().json(serde_json::json!({ "error": "Not connected to WolfNote" }));
+    }
+    let client = crate::wolfnote::WolfNoteClient::new(&config.url, &config.token);
+    match client.list_notes().await {
+        Ok(notes) => HttpResponse::Ok().json(notes),
+        Err(e) => HttpResponse::Ok().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// POST /api/wolfnote/notes — create a note in WolfNote
+#[derive(Deserialize)]
+pub struct WolfNoteCreateNoteRequest {
+    pub title: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub folder_id: Option<String>,
+}
+
+pub async fn wolfnote_notes_create(
+    req: HttpRequest, state: web::Data<AppState>,
+    body: web::Json<WolfNoteCreateNoteRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let config = crate::wolfnote::WolfNoteConfig::load();
+    if !config.is_connected() {
+        return HttpResponse::Ok().json(serde_json::json!({ "error": "Not connected to WolfNote" }));
+    }
+    let client = crate::wolfnote::WolfNoteClient::new(&config.url, &config.token);
+    match client.create_note(&body.title, &body.content, body.folder_id.as_deref()).await {
+        Ok(note) => HttpResponse::Ok().json(note),
+        Err(e) => HttpResponse::Ok().json(serde_json::json!({ "error": e })),
+    }
+}
+
 /// Configure all API routes
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg
@@ -14724,6 +14907,15 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/icon-packs/{pack_id}", web::delete().to(icon_packs_remove))
         .route("/api/icon-packs/{pack_id}/icon/{icon_name}", web::get().to(icon_packs_serve))
         .route("/api/icon-packs/{pack_id}/preview", web::get().to(icon_packs_preview))
+        // WolfNote integration
+        .route("/api/wolfnote/login", web::post().to(wolfnote_login))
+        .route("/api/wolfnote/disconnect", web::post().to(wolfnote_disconnect))
+        .route("/api/wolfnote/config", web::get().to(wolfnote_config_get))
+        .route("/api/wolfnote/config", web::post().to(wolfnote_config_save))
+        .route("/api/wolfnote/folders", web::get().to(wolfnote_folders_list))
+        .route("/api/wolfnote/folders", web::post().to(wolfnote_folders_create))
+        .route("/api/wolfnote/notes", web::get().to(wolfnote_notes_list))
+        .route("/api/wolfnote/notes", web::post().to(wolfnote_notes_create))
         // Status Page (public — NO auth)
         .route("/status", web::get().to(statuspage_public_index))
         .route("/status/{slug}", web::get().to(statuspage_public_page));

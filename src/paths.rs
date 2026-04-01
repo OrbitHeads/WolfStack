@@ -130,6 +130,10 @@ pub struct FileLocations {
     #[serde(default = "default_pbs_config")]
     pub pbs_config: String,
 
+    // ── WolfNote ───────────────────────────────────
+    #[serde(default = "default_wolfnote_config")]
+    pub wolfnote_config: String,
+
     // ── Web UI ────────────────────────────────────
     #[serde(default = "default_web_dir")]
     pub web_dir: String,
@@ -194,6 +198,8 @@ fn default_cluster_containers_dir() -> String { "/etc/wolfstack/cluster-containe
 fn default_icon_packs_dir() -> String { "/etc/wolfstack/icon-packs".into() }
 
 fn default_pbs_config() -> String { "/etc/wolfstack/pbs/config.json".into() }
+
+fn default_wolfnote_config() -> String { "/etc/wolfstack/wolfnote.json".into() }
 
 fn default_web_dir() -> String { "/opt/wolfstack/web".into() }
 

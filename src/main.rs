@@ -37,6 +37,7 @@ mod kubernetes;
 mod icons;
 mod tui;
 mod wolfflow;
+mod wolfnote;
 mod paths;
 
 use actix_web::{web, App, HttpServer, HttpRequest, HttpResponse};

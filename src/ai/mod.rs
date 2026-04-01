@@ -203,13 +203,18 @@ impl AiAgent {
                 }
             };
 
-            // Check for [EXEC] or [EXEC_ALL] tags
+            // Check for [EXEC], [EXEC_ALL], or [WOLFNOTE] tags
             let has_exec = response.contains("[EXEC]") && response.contains("[/EXEC]");
             let has_exec_all = response.contains("[EXEC_ALL]") && response.contains("[/EXEC_ALL]");
+            let has_wolfnote = response.contains("[WOLFNOTE") && response.contains("[/WOLFNOTE]");
 
             if !has_exec && !has_exec_all {
-                // No commands requested — this is the final response
-                final_response = response;
+                // Handle [WOLFNOTE] tags if present (fire-and-forget, no multi-turn needed)
+                if has_wolfnote {
+                    final_response = execute_wolfnote_tags(&response).await;
+                } else {
+                    final_response = response;
+                }
                 break;
             }
 
@@ -785,6 +790,71 @@ pub fn execute_safe_command(cmd: &str) -> Result<String, String> {
     }
 }
 
+// ─── WolfNote Tag Handler ───
+
+/// Parse and execute [WOLFNOTE title="..."]content[/WOLFNOTE] tags in an AI response.
+/// Returns the response with tags replaced by confirmation text.
+async fn execute_wolfnote_tags(response: &str) -> String {
+    let config = crate::wolfnote::WolfNoteConfig::load();
+    if !config.is_connected() || !config.features.ai_create_notes {
+        // Strip tags and return as-is with a note about not being connected
+        let mut result = response.to_string();
+        while let Some(start) = result.find("[WOLFNOTE") {
+            if let Some(end) = result[start..].find("[/WOLFNOTE]") {
+                result.replace_range(start..start + end + 11, "*[WolfNote not connected — note not saved]*");
+            } else {
+                break;
+            }
+        }
+        return result;
+    }
+
+    let client = crate::wolfnote::WolfNoteClient::new(&config.url, &config.token);
+    let mut result = response.to_string();
+
+    // Process tags iteratively (can't mutate while finding)
+    loop {
+        let start_idx = match result.find("[WOLFNOTE") {
+            Some(i) => i,
+            None => break,
+        };
+        let end_tag = match result[start_idx..].find("[/WOLFNOTE]") {
+            Some(i) => start_idx + i,
+            None => break,
+        };
+
+        // Extract title from attributes: [WOLFNOTE title="..."]
+        let tag_header_end = match result[start_idx..].find(']') {
+            Some(i) => start_idx + i,
+            None => break,
+        };
+        let tag_header = &result[start_idx..tag_header_end + 1];
+        let title = extract_attr(tag_header, "title").unwrap_or_else(|| "Untitled Note".to_string());
+
+        // Content is between the closing ] of the opening tag and [/WOLFNOTE]
+        let content = result[tag_header_end + 1..end_tag].trim().to_string();
+
+        // Create the note
+        let replacement = match client.create_note(&title, &content, None).await {
+            Ok(note) => format!("*Note \"{}\" saved to WolfNote (ID: {})*", title, note.id),
+            Err(e) => format!("*Failed to save note: {}*", e),
+        };
+
+        result.replace_range(start_idx..end_tag + 11, &replacement);
+    }
+
+    result
+}
+
+/// Extract an attribute value from a tag like `[WOLFNOTE title="value"]`
+fn extract_attr(tag: &str, attr_name: &str) -> Option<String> {
+    let pattern = format!("{}=\"", attr_name);
+    let start = tag.find(&pattern)?;
+    let value_start = start + pattern.len();
+    let value_end = tag[value_start..].find('"')?;
+    Some(tag[value_start..value_start + value_end].to_string())
+}
+
 // ─── System Prompt Builder ───
 
 fn build_system_prompt(knowledge: &str, server_context: &str) -> String {
@@ -819,6 +889,18 @@ fn build_system_prompt(knowledge: &str, server_context: &str) -> String {
          - You CANNOT execute commands on Proxmox nodes (they don't run WolfStack agents)\n\
          - Proxmox data is shown in the server state below; use it to answer questions about the infrastructure\n\
          - When reporting on the full infrastructure, include Proxmox node health data (CPU, RAM, disk)\n\n\
+         ## WolfNote Integration\n\
+         You can create notes in the user's WolfNote account using this tag:\n\
+         `[WOLFNOTE title=\"Note Title\"]Note content here (plain text or HTML)[/WOLFNOTE]`\n\n\
+         Use this when the user asks you to:\n\
+         - Create a note, save something, write it down, or document something\n\
+         - Log an event, create a report, or save findings\n\
+         - \"Remember this\" or \"note this down\"\n\n\
+         Rules:\n\
+         - Always include a descriptive title\n\
+         - Content can be plain text or simple HTML (paragraphs, lists, bold, etc.)\n\
+         - After creating, confirm to the user what was saved\n\
+         - Only use this tag when the user explicitly asks to create/save a note\n\n\
          ## Current Server State\n{}\n\n\
          ## Wolf Software Knowledge Base\n\
          Below is comprehensive documentation about the Wolf software suite:\n{}",

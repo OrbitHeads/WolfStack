@@ -20965,6 +20965,240 @@ function switchSettingsTab(tabName) {
     } else if (tabName === 'users') {
         loadAuthConfig();
         loadUsers();
+    } else if (tabName === 'wolfnote') {
+        loadWolfNoteConfig();
+    }
+}
+
+// ─── WolfNote Integration ───
+
+async function loadWolfNoteConfig() {
+    try {
+        const resp = await fetch('/api/wolfnote/config');
+        if (!resp.ok) return;
+        const data = await resp.json();
+
+        const badge = document.getElementById('wolfnote-status-badge');
+        const loginSection = document.getElementById('wolfnote-login-section');
+        const connectedSection = document.getElementById('wolfnote-connected-section');
+
+        if (data.connected) {
+            badge.textContent = 'Connected';
+            badge.style.background = 'var(--success)';
+            badge.style.color = '#fff';
+            loginSection.style.display = 'none';
+            connectedSection.style.display = 'block';
+            document.getElementById('wolfnote-connected-user').textContent = data.username;
+            document.getElementById('wolfnote-connected-url').textContent = data.url;
+
+            // Set feature toggles
+            document.getElementById('wolfnote-feat-ai').checked = data.features?.ai_create_notes ?? true;
+            document.getElementById('wolfnote-feat-events').checked = data.features?.auto_log_events ?? false;
+            document.getElementById('wolfnote-feat-incidents').checked = data.features?.incident_notes ?? false;
+            document.getElementById('wolfnote-feat-backups').checked = data.features?.backup_notes ?? false;
+            document.getElementById('wolfnote-feat-alerts').checked = data.features?.alert_notes ?? false;
+
+            // Load folders and notes
+            loadWolfNoteFolders();
+            loadWolfNoteNotes();
+        } else {
+            badge.textContent = 'Not Connected';
+            badge.style.background = 'var(--bg-tertiary)';
+            badge.style.color = 'var(--text-muted)';
+            loginSection.style.display = 'block';
+            connectedSection.style.display = 'none';
+            if (data.url) document.getElementById('wolfnote-url').value = data.url;
+            if (data.company) document.getElementById('wolfnote-company').value = data.company;
+        }
+    } catch (e) {
+        console.error('Failed to load WolfNote config:', e);
+    }
+}
+
+async function wolfnoteLogin() {
+    const url = document.getElementById('wolfnote-url').value.trim();
+    const company = document.getElementById('wolfnote-company').value.trim();
+    const username = document.getElementById('wolfnote-username').value.trim();
+    const password = document.getElementById('wolfnote-password').value;
+    const status = document.getElementById('wolfnote-login-status');
+
+    if (!username || !password) {
+        status.textContent = 'Username and password are required';
+        status.style.color = 'var(--danger)';
+        return;
+    }
+    if (!company) {
+        status.textContent = 'Company / workspace is required';
+        status.style.color = 'var(--danger)';
+        return;
+    }
+
+    status.textContent = 'Connecting...';
+    status.style.color = 'var(--text-muted)';
+
+    try {
+        const resp = await fetch('/api/wolfnote/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url, company, username, password }),
+        });
+        const data = await resp.json();
+        if (data.connected) {
+            status.textContent = 'Connected!';
+            status.style.color = 'var(--success)';
+            document.getElementById('wolfnote-password').value = '';
+            loadWolfNoteConfig();
+        } else {
+            status.textContent = data.error || 'Login failed';
+            status.style.color = 'var(--danger)';
+        }
+    } catch (e) {
+        status.textContent = 'Connection error: ' + e.message;
+        status.style.color = 'var(--danger)';
+    }
+}
+
+async function wolfnoteDisconnect() {
+    if (!confirm('Disconnect from WolfNote?')) return;
+    try {
+        await fetch('/api/wolfnote/disconnect', { method: 'POST' });
+        loadWolfNoteConfig();
+    } catch (e) {
+        console.error('Failed to disconnect:', e);
+    }
+}
+
+async function wolfnoteSaveFeatures() {
+    const features = {
+        ai_create_notes: document.getElementById('wolfnote-feat-ai').checked,
+        auto_log_events: document.getElementById('wolfnote-feat-events').checked,
+        incident_notes: document.getElementById('wolfnote-feat-incidents').checked,
+        backup_notes: document.getElementById('wolfnote-feat-backups').checked,
+        alert_notes: document.getElementById('wolfnote-feat-alerts').checked,
+    };
+    try {
+        await fetch('/api/wolfnote/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ features }),
+        });
+    } catch (e) {
+        console.error('Failed to save WolfNote features:', e);
+    }
+}
+
+async function loadWolfNoteFolders() {
+    try {
+        const resp = await fetch('/api/wolfnote/folders');
+        const data = await resp.json();
+        if (data.error) return;
+
+        const select = document.getElementById('wolfnote-quick-folder');
+        select.innerHTML = '<option value="">No folder</option>';
+        (Array.isArray(data) ? data : []).forEach(f => {
+            const opt = document.createElement('option');
+            opt.value = f.id;
+            opt.textContent = f.name;
+            select.appendChild(opt);
+        });
+    } catch (e) {
+        console.error('Failed to load WolfNote folders:', e);
+    }
+}
+
+async function loadWolfNoteNotes() {
+    const container = document.getElementById('wolfnote-notes-list');
+    try {
+        const resp = await fetch('/api/wolfnote/notes');
+        const data = await resp.json();
+        if (data.error) {
+            container.innerHTML = `<div style="color:var(--danger);text-align:center;padding:12px;">${data.error}</div>`;
+            return;
+        }
+
+        const notes = Array.isArray(data) ? data : [];
+        if (notes.length === 0) {
+            container.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:20px;">No notes yet</div>';
+            return;
+        }
+
+        // Show most recent 20 notes
+        container.innerHTML = notes.slice(0, 20).map(n => {
+            const date = n.updated_at ? new Date(n.updated_at).toLocaleString() : '';
+            const preview = (n.content || '').replace(/<[^>]*>/g, '').substring(0, 120);
+            return `<div style="padding:10px 14px;background:var(--bg-tertiary);border-radius:6px;cursor:pointer;" onclick="window.open('https://app.wolfnote.org/#/note/${n.id}','_blank')">
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <span style="font-weight:600;font-size:13px;">${escapeHtml(n.title || 'Untitled')}</span>
+                    <span style="font-size:11px;color:var(--text-muted);">${date}</span>
+                </div>
+                ${preview ? `<div style="font-size:12px;color:var(--text-muted);margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(preview)}</div>` : ''}
+            </div>`;
+        }).join('');
+    } catch (e) {
+        container.innerHTML = '<div style="color:var(--danger);text-align:center;padding:12px;">Failed to load notes</div>';
+    }
+}
+
+async function wolfnoteCreateQuickNote() {
+    const title = document.getElementById('wolfnote-quick-title').value.trim();
+    const content = document.getElementById('wolfnote-quick-content').value.trim();
+    const folderId = document.getElementById('wolfnote-quick-folder').value;
+    const status = document.getElementById('wolfnote-quick-status');
+
+    if (!title) {
+        status.textContent = 'Title is required';
+        status.style.color = 'var(--danger)';
+        return;
+    }
+
+    status.textContent = 'Creating...';
+    status.style.color = 'var(--text-muted)';
+
+    try {
+        const body = { title, content };
+        if (folderId) body.folder_id = folderId;
+
+        const resp = await fetch('/api/wolfnote/notes', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        const data = await resp.json();
+        if (data.error) {
+            status.textContent = data.error;
+            status.style.color = 'var(--danger)';
+        } else {
+            status.textContent = 'Note created!';
+            status.style.color = 'var(--success)';
+            document.getElementById('wolfnote-quick-title').value = '';
+            document.getElementById('wolfnote-quick-content').value = '';
+            loadWolfNoteNotes();
+        }
+    } catch (e) {
+        status.textContent = 'Error: ' + e.message;
+        status.style.color = 'var(--danger)';
+    }
+}
+
+async function wolfnoteCreateFolder() {
+    const name = document.getElementById('wolfnote-new-folder-name').value.trim();
+    const color = document.getElementById('wolfnote-new-folder-color').value;
+
+    if (!name) return;
+
+    try {
+        const resp = await fetch('/api/wolfnote/folders', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, color }),
+        });
+        const data = await resp.json();
+        if (!data.error) {
+            document.getElementById('wolfnote-new-folder-name').value = '';
+            loadWolfNoteFolders();
+        }
+    } catch (e) {
+        console.error('Failed to create folder:', e);
     }
 }
 
