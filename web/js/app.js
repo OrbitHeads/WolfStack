@@ -21408,10 +21408,9 @@ async function wolfnoteFromCurrentView() {
         } else {
             const btn = document.getElementById('wolfnote-topbar-btn');
             if (btn) {
-                const orig = btn.textContent;
                 btn.textContent = '\u2714';
                 btn.style.color = 'var(--success)';
-                setTimeout(() => { btn.textContent = orig; btn.style.color = ''; }, 1500);
+                setTimeout(() => { btn.textContent = '\uD83D\uDCDD'; btn.style.color = ''; }, 1500);
             }
         }
     } catch (e) {
