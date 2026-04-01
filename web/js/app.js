@@ -23362,6 +23362,8 @@ async function deleteStatusPage(id) {
 // ═══════════════════════════════════════════════
 
 let spAllIncidents = [];
+let spIncidentPage = 0;
+const SP_INCIDENTS_PER_PAGE = 10;
 
 function renderIncidentsList() {
     const el = document.getElementById('sp-incidents-list');
@@ -23378,10 +23380,16 @@ function renderIncidentsList() {
         return;
     }
 
+    const totalPages = Math.ceil(spAllIncidents.length / SP_INCIDENTS_PER_PAGE);
+    if (spIncidentPage >= totalPages) spIncidentPage = totalPages - 1;
+    if (spIncidentPage < 0) spIncidentPage = 0;
+    const start = spIncidentPage * SP_INCIDENTS_PER_PAGE;
+    const pageIncidents = spAllIncidents.slice(start, start + SP_INCIDENTS_PER_PAGE);
+
     const impactColors = { none: '#6b7280', minor: '#eab308', major: '#f97316', critical: '#ef4444' };
     const statusIcons = { investigating: '🔍', identified: '🎯', monitoring: '👀', resolved: '✅' };
 
-    el.innerHTML = spAllIncidents.map(inc => {
+    const cardsHtml = pageIncidents.map(inc => {
         const impact = inc.impact || 'none';
         const status = inc.status || 'investigating';
         const created = inc.created_at ? new Date(inc.created_at).toLocaleString() : 'Unknown';
@@ -23421,6 +23429,19 @@ function renderIncidentsList() {
             ` : ''}
         </div>`;
     }).join('');
+
+    let paginationHtml = '';
+    if (totalPages > 1) {
+        paginationHtml = `<div style="display:flex; justify-content:center; align-items:center; gap:8px; margin-top:16px;">
+            <button class="btn btn-sm" onclick="spIncidentPage=0; renderIncidentsList();" ${spIncidentPage === 0 ? 'disabled' : ''} style="font-size:11px;">First</button>
+            <button class="btn btn-sm" onclick="spIncidentPage--; renderIncidentsList();" ${spIncidentPage === 0 ? 'disabled' : ''} style="font-size:11px;">Prev</button>
+            <span style="font-size:12px; color:var(--text-muted);">Page ${spIncidentPage + 1} of ${totalPages} (${spAllIncidents.length} total)</span>
+            <button class="btn btn-sm" onclick="spIncidentPage++; renderIncidentsList();" ${spIncidentPage >= totalPages - 1 ? 'disabled' : ''} style="font-size:11px;">Next</button>
+            <button class="btn btn-sm" onclick="spIncidentPage=${totalPages - 1}; renderIncidentsList();" ${spIncidentPage >= totalPages - 1 ? 'disabled' : ''} style="font-size:11px;">Last</button>
+        </div>`;
+    }
+
+    el.innerHTML = cardsHtml + paginationHtml;
 }
 
 function showIncidentForm(existing, forPageId) {

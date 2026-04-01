@@ -1013,24 +1013,18 @@ pub fn render_public_page_inner(state: &Arc<StatusPageState>, page: &StatusPage)
         }
     }
 
-    // Build incidents HTML (last 14 days)
+    // Build incidents HTML — all incidents for this page, newest first
     let mut incidents_html = String::new();
-    let cutoff = chrono::Utc::now() - chrono::Duration::days(14);
-    
-    let mut recent_incidents: Vec<&Incident> = config.incidents.iter()
-        .filter(|i| page.incident_ids.contains(&i.id))
-        .filter(|i| {
-            chrono::DateTime::parse_from_rfc3339(&format!("{}+00:00", i.created_at.replace('Z', "")))
-                .map(|dt| dt > cutoff)
-                .unwrap_or(true)
-        })
-        .collect();
-    recent_incidents.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
-    if recent_incidents.is_empty() {
-        incidents_html.push_str(r#"<p class="no-incidents">No incidents reported in the last 14 days.</p>"#);
+    let mut all_incidents: Vec<&Incident> = config.incidents.iter()
+        .filter(|i| page.incident_ids.contains(&i.id))
+        .collect();
+    all_incidents.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    if all_incidents.is_empty() {
+        incidents_html.push_str(r#"<p class="no-incidents">No incidents reported.</p>"#);
     } else {
-        for incident in &recent_incidents {
+        for incident in &all_incidents {
             let status_badge = match incident.status {
                 IncidentStatus::Investigating => r#"<span class="badge badge-red">Investigating</span>"#,
                 IncidentStatus::Identified => r#"<span class="badge badge-orange">Identified</span>"#,
@@ -1045,20 +1039,23 @@ pub fn render_public_page_inner(state: &Arc<StatusPageState>, page: &StatusPage)
                 _ => "",
             };
 
+            let formatted_date = format_iso_date(&incident.created_at);
+
             let mut updates_html = String::new();
             for update in incident.updates.iter().rev() {
+                let formatted_update_time = format_iso_date(&update.timestamp);
                 updates_html.push_str(&format!(
                     r#"<div class="incident-update">
                         <div class="update-time">{}</div>
                         <div class="update-msg">{}</div>
                     </div>"#,
-                    html_escape(&update.timestamp),
+                    html_escape(&formatted_update_time),
                     html_escape(&update.message),
                 ));
             }
 
             incidents_html.push_str(&format!(
-                r#"<div class="incident">
+                r#"<div class="incident" data-incident>
                     <div class="incident-header">
                         <div class="incident-title">{title}</div>
                         <div>{badge}{impact}</div>
@@ -1069,7 +1066,7 @@ pub fn render_public_page_inner(state: &Arc<StatusPageState>, page: &StatusPage)
                 title = html_escape(&incident.title),
                 badge = status_badge,
                 impact = impact_badge,
-                date = html_escape(&incident.created_at),
+                date = html_escape(&formatted_date),
                 updates = updates_html,
             ));
         }
@@ -1148,6 +1145,15 @@ pub fn render_public_page_inner(state: &Arc<StatusPageState>, page: &StatusPage)
         .footer {{ text-align: center; margin-top: 3rem; padding-top: 1.5rem;
             border-top: 1px solid {divider}; font-size: 0.75rem; color: {muted}; }}
         .footer a {{ color: {secondary}; text-decoration: underline; }}
+        .incident-pagination {{ display: flex; justify-content: center; align-items: center; gap: 8px; margin-top: 1rem; }}
+        .incident-pagination button {{
+            background: {card_bg}; border: 1px solid {card_border}; color: {secondary};
+            padding: 6px 14px; border-radius: 6px; font-size: 0.8rem; cursor: pointer;
+            font-family: inherit;
+        }}
+        .incident-pagination button:hover:not(:disabled) {{ background: {card_border}; }}
+        .incident-pagination button:disabled {{ opacity: 0.4; cursor: default; }}
+        .incident-pagination .page-info {{ font-size: 0.8rem; color: {muted}; }}
     </style>
 </head>
 <body>
@@ -1161,12 +1167,36 @@ pub fn render_public_page_inner(state: &Arc<StatusPageState>, page: &StatusPage)
         {services}
         <div class="incidents-section">
             <div class="section-title">Recent Incidents</div>
-            {incidents}
+            <div id="incidents-container">{incidents}</div>
+            <div class="incident-pagination" id="incident-pagination"></div>
         </div>
         <div class="footer">
             <p>{footer} &bull; <a href="https://wolfscale.org" target="_blank">wolfscale.org</a></p>
         </div>
     </div>
+    <script>
+    (function() {{
+        var perPage = 10;
+        var items = document.querySelectorAll('[data-incident]');
+        if (items.length <= perPage) return;
+        var page = 0;
+        var totalPages = Math.ceil(items.length / perPage);
+        var pag = document.getElementById('incident-pagination');
+        function show() {{
+            for (var i = 0; i < items.length; i++) {{
+                items[i].style.display = (i >= page * perPage && i < (page + 1) * perPage) ? '' : 'none';
+            }}
+            pag.innerHTML = '<button id="ip-prev">&larr; Prev</button>' +
+                '<span class="page-info">Page ' + (page + 1) + ' of ' + totalPages + ' (' + items.length + ' incidents)</span>' +
+                '<button id="ip-next">Next &rarr;</button>';
+            document.getElementById('ip-prev').disabled = page === 0;
+            document.getElementById('ip-next').disabled = page >= totalPages - 1;
+            document.getElementById('ip-prev').onclick = function() {{ if (page > 0) {{ page--; show(); }} }};
+            document.getElementById('ip-next').onclick = function() {{ if (page < totalPages - 1) {{ page++; show(); }} }};
+        }}
+        show();
+    }})();
+    </script>
 </body>
 </html>"#,
         title = html_escape(&page.title),
@@ -1311,6 +1341,23 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+/// Format an ISO 8601 timestamp into a human-readable date/time string.
+/// e.g. "2025-03-15T14:30:00Z" → "15 Mar 2025, 14:30 UTC"
+fn format_iso_date(iso: &str) -> String {
+    // Try parsing with timezone suffix
+    let normalized = if iso.ends_with('Z') {
+        format!("{}+00:00", &iso[..iso.len() - 1])
+    } else if iso.contains('+') || iso.matches('-').count() > 2 {
+        iso.to_string()
+    } else {
+        format!("{}+00:00", iso)
+    };
+    match chrono::DateTime::parse_from_rfc3339(&normalized) {
+        Ok(dt) => dt.format("%d %b %Y, %H:%M UTC").to_string(),
+        Err(_) => iso.to_string(), // fallback to raw string
+    }
 }
 
 #[cfg(test)]
