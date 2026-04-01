@@ -21274,8 +21274,15 @@ async function checkWolfNoteTopBar() {
 }
 
 async function wolfnoteFromCurrentView() {
-    // Find the currently visible page-view
-    const visible = document.querySelector('.page-view[style*="display: block"], .page-view[style*="display:block"]');
+    // Find the currently visible page-view by checking computed display
+    let visible = null;
+    document.querySelectorAll('.page-view').forEach(p => {
+        if (p.style.display === 'block' || (!p.style.display && getComputedStyle(p).display !== 'none')) visible = p;
+    });
+    if (!visible) {
+        // Fallback: try the page matching currentPage
+        visible = document.getElementById(`page-${currentPage}`);
+    }
     if (!visible) return;
 
     const pageTitle = document.getElementById('page-title')?.textContent || 'WolfStack';
@@ -21283,7 +21290,17 @@ async function wolfnoteFromCurrentView() {
     const timestamp = new Date().toLocaleString();
     const title = `${pageTitle} — ${timestamp}`;
 
-    // Extract clean data from the page instead of raw HTML
+    // Get the configured folder for AI notes (shared with top bar)
+    let folderId = null;
+    try {
+        const cfgResp = await fetch('/api/wolfnote/config');
+        if (cfgResp.ok) {
+            const cfg = await cfgResp.json();
+            if (cfg.features?.ai_folder_id) folderId = cfg.features.ai_folder_id;
+        }
+    } catch (_) {}
+
+    // Extract clean data from the page
     const sections = [];
 
     // Extract card contents — each .card is a section
@@ -21299,19 +21316,18 @@ async function wolfnoteFromCurrentView() {
                 const cells = [];
                 tr.querySelectorAll('th').forEach(th => {
                     const text = th.textContent.trim();
-                    if (text && text !== 'Actions') cells.push(`<th style="padding:8px 12px;text-align:left;border-bottom:2px solid #444;font-weight:600;font-size:13px;">${escapeHtml(text)}</th>`);
+                    if (text && text !== 'Actions') cells.push(`<th style="padding:8px 12px;text-align:left;border-bottom:2px solid #d0d5dd;font-weight:600;font-size:13px;color:#1e293b;">${escapeHtml(text)}</th>`);
                 });
-                if (cells.length) rows.push(`<tr style="background:#2a2a3a;">${cells.join('')}</tr>`);
+                if (cells.length) rows.push(`<tr style="background:#f1f5f9;">${cells.join('')}</tr>`);
             });
             tbl.querySelectorAll('tbody tr').forEach(tr => {
                 const cells = [];
                 tr.querySelectorAll('td').forEach((td, i) => {
-                    // Skip the last column if it's Actions
                     const headerRow = tbl.querySelector('thead tr');
                     const ths = headerRow ? headerRow.querySelectorAll('th') : [];
                     if (ths[i] && ths[i].textContent.trim() === 'Actions') return;
                     const text = td.textContent.trim();
-                    cells.push(`<td style="padding:6px 12px;border-bottom:1px solid #333;font-size:13px;">${escapeHtml(text)}</td>`);
+                    cells.push(`<td style="padding:6px 12px;border-bottom:1px solid #e2e8f0;font-size:13px;color:#334155;">${escapeHtml(text)}</td>`);
                 });
                 if (cells.length) rows.push(`<tr>${cells.join('')}</tr>`);
             });
@@ -21324,20 +21340,18 @@ async function wolfnoteFromCurrentView() {
         if (tables.length === 0) {
             const body = card.querySelector('.card-body');
             if (body) {
-                // Look for stat items, grid items, or just text
                 const items = [];
                 body.querySelectorAll('.stat-item, [class*="stat"], [class*="metric"]').forEach(el => {
                     const label = el.querySelector('.stat-label, [class*="label"]');
                     const value = el.querySelector('.stat-value, [class*="value"]');
-                    if (label && value) items.push(`<li><strong>${escapeHtml(label.textContent.trim())}</strong>: ${escapeHtml(value.textContent.trim())}</li>`);
+                    if (label && value) items.push(`<li style="color:#334155;"><strong>${escapeHtml(label.textContent.trim())}</strong>: ${escapeHtml(value.textContent.trim())}</li>`);
                 });
                 if (items.length) {
                     sections.push({ heading, html: `<ul style="margin:8px 0 16px 0;padding-left:20px;line-height:1.8;">${items.join('')}</ul>` });
                 } else {
-                    // Fallback: extract visible text content
                     const text = body.innerText.trim();
                     if (text && text.length > 5) {
-                        sections.push({ heading, html: `<p style="margin:8px 0 16px 0;line-height:1.7;white-space:pre-wrap;">${escapeHtml(text.substring(0, 3000))}</p>` });
+                        sections.push({ heading, html: `<p style="margin:8px 0 16px 0;line-height:1.7;white-space:pre-wrap;color:#334155;">${escapeHtml(text.substring(0, 3000))}</p>` });
                     }
                 }
             }
@@ -21347,50 +21361,51 @@ async function wolfnoteFromCurrentView() {
     // If no cards found, extract raw text as fallback
     if (sections.length === 0) {
         const text = visible.innerText.trim();
-        if (text) sections.push({ heading: '', html: `<p style="line-height:1.7;white-space:pre-wrap;">${escapeHtml(text.substring(0, 5000))}</p>` });
+        if (text) sections.push({ heading: '', html: `<p style="line-height:1.7;white-space:pre-wrap;color:#334155;">${escapeHtml(text.substring(0, 5000))}</p>` });
     }
 
-    // Build a professional sysadmin report document
+    // Build a professional light-themed sysadmin report (print-friendly)
     const sectionCount = sections.length;
     const body = sections.map((s, i) =>
-        (s.heading ? `<h3 style="margin:28px 0 10px 0;font-size:15px;font-weight:600;color:#e2e8f0;letter-spacing:0.3px;text-transform:uppercase;border-left:3px solid #6366f1;padding-left:12px;">${escapeHtml(s.heading)}</h3>` : '') + s.html +
-        (i < sectionCount - 1 ? '<div style="border-bottom:1px solid #1e293b;margin:16px 0;"></div>' : '')
+        (s.heading ? `<h3 style="margin:28px 0 10px 0;font-size:14px;font-weight:600;color:#1e293b;letter-spacing:0.3px;text-transform:uppercase;border-left:3px solid #6366f1;padding-left:12px;">${escapeHtml(s.heading)}</h3>` : '') + s.html +
+        (i < sectionCount - 1 ? '<div style="border-bottom:1px solid #e2e8f0;margin:16px 0;"></div>' : '')
     ).join('');
 
-    const content = `<div style="max-width:800px;margin:0 auto;padding:36px 44px;font-family:'SF Mono',SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#cbd5e1;background:#0f172a;border-radius:12px;line-height:1.6;border:1px solid #1e293b;">
+    const content = `<div style="max-width:800px;margin:0 auto;padding:36px 44px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#334155;background:#ffffff;border-radius:8px;line-height:1.6;border:1px solid #e2e8f0;">
     <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px;">
-        <div style="width:40px;height:40px;border-radius:8px;background:linear-gradient(135deg,#6366f1,#8b5cf6);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;">&#128058;</div>
+        <div style="width:40px;height:40px;border-radius:8px;background:linear-gradient(135deg,#6366f1,#8b5cf6);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0;color:#fff;font-weight:700;">W</div>
         <div>
-            <h1 style="margin:0;font-size:20px;font-weight:700;color:#f1f5f9;letter-spacing:-0.3px;">WolfStack &mdash; ${escapeHtml(pageTitle)}</h1>
-            <p style="margin:2px 0 0 0;font-size:12px;color:#64748b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">Infrastructure Report${hostname ? ' &mdash; ' + escapeHtml(hostname) : ''}</p>
+            <h1 style="margin:0;font-size:20px;font-weight:700;color:#0f172a;letter-spacing:-0.3px;">WolfStack &mdash; ${escapeHtml(pageTitle)}</h1>
+            <p style="margin:2px 0 0 0;font-size:12px;color:#94a3b8;">Infrastructure Report${hostname ? ' &mdash; ' + escapeHtml(hostname) : ''}</p>
         </div>
     </div>
-    <table style="width:100%;border-collapse:collapse;margin:0 0 24px 0;font-size:12px;color:#94a3b8;">
+    <table style="width:100%;border-collapse:collapse;margin:0 0 24px 0;font-size:12px;color:#64748b;">
         <tr>
-            <td style="padding:6px 0;border-bottom:1px solid #1e293b;"><strong style="color:#cbd5e1;">Generated</strong></td>
-            <td style="padding:6px 0;border-bottom:1px solid #1e293b;">${escapeHtml(timestamp)}</td>
-            <td style="padding:6px 0;border-bottom:1px solid #1e293b;"><strong style="color:#cbd5e1;">View</strong></td>
-            <td style="padding:6px 0;border-bottom:1px solid #1e293b;">${escapeHtml(pageTitle)}</td>
+            <td style="padding:6px 0;border-bottom:1px solid #e2e8f0;width:80px;"><strong style="color:#1e293b;">Generated</strong></td>
+            <td style="padding:6px 0;border-bottom:1px solid #e2e8f0;">${escapeHtml(timestamp)}</td>
+            <td style="padding:6px 0;border-bottom:1px solid #e2e8f0;width:50px;"><strong style="color:#1e293b;">View</strong></td>
+            <td style="padding:6px 0;border-bottom:1px solid #e2e8f0;">${escapeHtml(pageTitle)}</td>
         </tr>
     </table>
     ${body}
-    <div style="margin-top:32px;padding-top:16px;border-top:1px solid #1e293b;display:flex;justify-content:space-between;align-items:center;">
-        <span style="font-size:11px;color:#475569;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">This report was auto-generated by WolfStack. Data reflects the state at the time of capture.</span>
+    <div style="margin-top:32px;padding-top:16px;border-top:1px solid #e2e8f0;display:flex;justify-content:space-between;align-items:center;">
+        <span style="font-size:11px;color:#94a3b8;">This report was auto-generated by WolfStack. Data reflects the state at the time of capture.</span>
         <span style="font-size:11px;color:#6366f1;font-weight:600;">wolfstack.org</span>
     </div>
 </div>`;
 
     try {
+        const reqBody = { title, content };
+        if (folderId) reqBody.folder_id = folderId;
         const resp = await fetch('/api/wolfnote/notes', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title, content }),
+            body: JSON.stringify(reqBody),
         });
         const data = await resp.json();
         if (data.error) {
             alert('WolfNote error: ' + data.error);
         } else {
-            // Brief visual feedback on the button
             const btn = document.getElementById('wolfnote-topbar-btn');
             if (btn) {
                 const orig = btn.textContent;
