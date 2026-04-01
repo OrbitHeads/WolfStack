@@ -412,6 +412,7 @@ impl VmManager {
             let vars_dest = self.vm_efivars_path(&config);
             if !vars_dest.exists() {
                 let vars_sources = [
+                    "/usr/share/OVMF/OVMF_VARS_4M.fd",
                     "/usr/share/OVMF/OVMF_VARS.fd",
                     "/usr/share/edk2/x64/OVMF_VARS.fd",
                     "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd",
@@ -981,6 +982,7 @@ impl VmManager {
 
             // OVMF firmware code (read-only)
             let code_paths = [
+                "/usr/share/OVMF/OVMF_CODE_4M.fd",
                 "/usr/share/OVMF/OVMF_CODE.fd",
                 "/usr/share/edk2/x64/OVMF_CODE.fd",
                 "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd",
@@ -1001,6 +1003,7 @@ impl VmManager {
             if !vars_path.exists() {
                 // Create vars file on first boot if it wasn't created during VM creation
                 let vars_sources = [
+                    "/usr/share/OVMF/OVMF_VARS_4M.fd",
                     "/usr/share/OVMF/OVMF_VARS.fd",
                     "/usr/share/edk2/x64/OVMF_VARS.fd",
                     "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd",
