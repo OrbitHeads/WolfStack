@@ -661,8 +661,9 @@ async fn main() -> std::io::Result<()> {
                                 });
                             }
                             let wn_title = subject.clone();
+                            let wn_body = body.clone();
                             tokio::spawn(async move {
-                                wolfnote::log_alert_to_wolfnote(&wn_title).await;
+                                wolfnote::log_alert_to_wolfnote(&wn_title, &wn_body).await;
                             });
                         }
 
@@ -1264,8 +1265,9 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                                         alerting::send_alert(&cfg, &t, &b).await;
                                     });
                                     let wn_title = title.clone();
+                                    let wn_body = body.clone();
                                     tokio::spawn(async move {
-                                        wolfnote::log_alert_to_wolfnote(&wn_title).await;
+                                        wolfnote::log_alert_to_wolfnote(&wn_title, &wn_body).await;
                                     });
                                     alerting::record_alert(&mut cooldowns, &node.id, &alert.alert_type);
                                 }
@@ -1313,8 +1315,9 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                                         alerting::send_alert(&cfg, &t, &b).await;
                                     });
                                     let wn_title = title.clone();
+                                    let wn_body = body.clone();
                                     tokio::spawn(async move {
-                                        wolfnote::log_alert_to_wolfnote(&wn_title).await;
+                                        wolfnote::log_alert_to_wolfnote(&wn_title, &wn_body).await;
                                     });
                                     alerting::clear_cooldown(&mut cooldowns, &node.id, check_type);
                                 }
@@ -1367,8 +1370,9 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                                         alerting::send_alert(&cfg, &t, &b).await;
                                     });
                                     let wn_title = title.clone();
+                                    let wn_body = body.clone();
                                     tokio::spawn(async move {
-                                        wolfnote::log_alert_to_wolfnote(&wn_title).await;
+                                        wolfnote::log_alert_to_wolfnote(&wn_title, &wn_body).await;
                                     });
                                     // Use a long cooldown (1 hour) so we don't re-alert for the same reboot
                                     cooldowns.insert(reboot_key, std::time::Instant::now());
@@ -1436,8 +1440,9 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                                     alerting::send_alert(&cfg, &t, &b).await;
                                 });
                                 let wn_title = title.clone();
+                                let wn_body = body.clone();
                                 tokio::spawn(async move {
-                                    wolfnote::log_alert_to_wolfnote(&wn_title).await;
+                                    wolfnote::log_alert_to_wolfnote(&wn_title, &wn_body).await;
                                 });
                                 alerting::record_alert(&mut cooldowns, &cooldown_key, "memory");
                             }
@@ -1484,8 +1489,9 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                                             alerting::send_alert(&cfg, &t, &b).await;
                                         });
                                         let wn_title = title.clone();
+                                        let wn_body = body.clone();
                                         tokio::spawn(async move {
-                                            wolfnote::log_alert_to_wolfnote(&wn_title).await;
+                                            wolfnote::log_alert_to_wolfnote(&wn_title, &wn_body).await;
                                         });
                                     }
                                     alerting::clear_cooldown(&mut cooldowns, &cooldown_key, "memory");

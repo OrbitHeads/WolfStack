@@ -306,7 +306,8 @@ impl WolfNoteClient {
 
     /// Add an alert as a todo item to the "Alerts" tasklist in the given folder.
     /// Creates the tasklist if it doesn't exist yet.
-    pub async fn add_alert_todo(&self, alert_title: &str, folder_id: Option<&str>) -> Result<(), String> {
+    /// `alert_title` is the summary line, `alert_body` contains the full details.
+    pub async fn add_alert_todo(&self, alert_title: &str, alert_body: &str, folder_id: Option<&str>) -> Result<(), String> {
         // 1. List notes to find an existing "Alerts" tasklist in the folder
         let notes = self.list_notes().await?;
         let existing = notes.iter().find(|n| {
@@ -316,9 +317,18 @@ impl WolfNoteClient {
         });
 
         let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
+        // Build detail lines from body — convert newlines to <br> for HTML
+        let detail_html = if alert_body.is_empty() {
+            String::new()
+        } else {
+            format!(
+                r#"<div class="task-detail" style="font-size:0.85em;color:#888;margin-top:4px;white-space:pre-wrap;">{}</div>"#,
+                html_escape(alert_body)
+            )
+        };
         let new_item = format!(
-            r#"<div class="task-item"><div class="task-check"></div><div class="task-text">{} — {}</div></div>"#,
-            html_escape(alert_title), timestamp
+            r#"<div class="task-item"><div class="task-check"></div><div class="task-text">{} — {}{}</div></div>"#,
+            html_escape(alert_title), timestamp, detail_html
         );
 
         if let Some(note) = existing {
@@ -390,7 +400,8 @@ fn html_escape(s: &str) -> String {
 
 /// Log an alert to WolfNote as a todo item if alert_notes is enabled.
 /// Call from background tasks — failures are logged and swallowed.
-pub async fn log_alert_to_wolfnote(title: &str) {
+/// `body` contains the full alert details (hostname, metric values, AI recommendations, etc.)
+pub async fn log_alert_to_wolfnote(title: &str, body: &str) {
     let config = WolfNoteConfig::load();
     if !config.is_connected() || !config.features.alert_notes {
         return;
@@ -401,7 +412,7 @@ pub async fn log_alert_to_wolfnote(title: &str) {
         Some(config.features.alerts_folder_id.as_str())
     };
     let client = WolfNoteClient::new(&config.url, &config.token);
-    if let Err(e) = client.add_alert_todo(title, folder_id).await {
+    if let Err(e) = client.add_alert_todo(title, body, folder_id).await {
         tracing::warn!("WolfNote alert todo failed: {}", e);
     }
 }
