@@ -270,6 +270,91 @@ impl WolfNoteClient {
         resp.json().await.map_err(|e| format!("Invalid response: {}", e))
     }
 
+    /// Get a single note by ID (returns full content)
+    pub async fn get_note(&self, note_id: &str) -> Result<WolfNoteNote, String> {
+        let url = format!("{}/api/notes/{}", self.base_url, note_id);
+        let resp = self.client.get(&url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .map_err(|e| format!("WolfNote request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("WolfNote error: {}", resp.status()));
+        }
+
+        resp.json().await.map_err(|e| format!("Invalid response: {}", e))
+    }
+
+    /// Update a note (any combination of title, content, folder_id, note_type)
+    pub async fn update_note(&self, note_id: &str, body: &serde_json::Value) -> Result<(), String> {
+        let url = format!("{}/api/notes/{}", self.base_url, note_id);
+        let resp = self.client.put(&url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| format!("WolfNote request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("WolfNote error ({}): {}", status, body));
+        }
+        Ok(())
+    }
+
+    /// Add an alert as a todo item to the "Alerts" tasklist in the given folder.
+    /// Creates the tasklist if it doesn't exist yet.
+    pub async fn add_alert_todo(&self, alert_title: &str, folder_id: Option<&str>) -> Result<(), String> {
+        // 1. List notes to find an existing "Alerts" tasklist in the folder
+        let notes = self.list_notes().await?;
+        let existing = notes.iter().find(|n| {
+            n.title == "Alerts"
+                && n.note_type.as_deref() == Some("tasklist")
+                && n.folder_id.as_deref() == folder_id
+        });
+
+        let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
+        let new_item = format!(
+            r#"<div class="task-item"><div class="task-check"></div><div class="task-text">{} — {}</div></div>"#,
+            html_escape(alert_title), timestamp
+        );
+
+        if let Some(note) = existing {
+            // 2a. Append to existing tasklist
+            let full = self.get_note(&note.id).await?;
+            let updated_content = format!("{}{}", full.content, new_item);
+            self.update_note(&note.id, &serde_json::json!({
+                "content": updated_content,
+            })).await
+        } else {
+            // 2b. Create new "Alerts" tasklist
+            let url = format!("{}/api/notes", self.base_url);
+            let mut body = serde_json::json!({
+                "title": "Alerts",
+                "content": new_item,
+                "note_type": "tasklist",
+            });
+            if let Some(fid) = folder_id {
+                body["folder_id"] = serde_json::Value::String(fid.to_string());
+            }
+            let resp = self.client.post(&url)
+                .header("Authorization", format!("Bearer {}", self.token))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("WolfNote request failed: {}", e))?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(format!("WolfNote error ({}): {}", status, body));
+            }
+            Ok(())
+        }
+    }
+
     /// Create a folder
     pub async fn create_folder(&self, name: &str, parent_id: Option<&str>, color: Option<&str>) -> Result<WolfNoteFolder, String> {
         let url = format!("{}/api/folders", self.base_url);
@@ -295,5 +380,28 @@ impl WolfNoteClient {
         }
 
         resp.json().await.map_err(|e| format!("Invalid response: {}", e))
+    }
+}
+
+/// Minimal HTML escaping for alert text inserted into task items
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// Log an alert to WolfNote as a todo item if alert_notes is enabled.
+/// Call from background tasks — failures are logged and swallowed.
+pub async fn log_alert_to_wolfnote(title: &str) {
+    let config = WolfNoteConfig::load();
+    if !config.is_connected() || !config.features.alert_notes {
+        return;
+    }
+    let folder_id = if config.features.alerts_folder_id.is_empty() {
+        None
+    } else {
+        Some(config.features.alerts_folder_id.as_str())
+    };
+    let client = WolfNoteClient::new(&config.url, &config.token);
+    if let Err(e) = client.add_alert_todo(title, folder_id).await {
+        tracing::warn!("WolfNote alert todo failed: {}", e);
     }
 }

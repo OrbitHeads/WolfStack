@@ -660,6 +660,10 @@ async fn main() -> std::io::Result<()> {
                                     crate::alerting::send_alert(&alert_config, &s, &b).await;
                                 });
                             }
+                            let wn_title = subject.clone();
+                            tokio::spawn(async move {
+                                wolfnote::log_alert_to_wolfnote(&wn_title).await;
+                            });
                         }
 
                         // Daily summary — send once per day (first check after midnight UTC)
@@ -1259,6 +1263,10 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                                     tokio::spawn(async move {
                                         alerting::send_alert(&cfg, &t, &b).await;
                                     });
+                                    let wn_title = title.clone();
+                                    tokio::spawn(async move {
+                                        wolfnote::log_alert_to_wolfnote(&wn_title).await;
+                                    });
                                     alerting::record_alert(&mut cooldowns, &node.id, &alert.alert_type);
                                 }
                             }
@@ -1303,6 +1311,10 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                                     let b = body.clone();
                                     tokio::spawn(async move {
                                         alerting::send_alert(&cfg, &t, &b).await;
+                                    });
+                                    let wn_title = title.clone();
+                                    tokio::spawn(async move {
+                                        wolfnote::log_alert_to_wolfnote(&wn_title).await;
                                     });
                                     alerting::clear_cooldown(&mut cooldowns, &node.id, check_type);
                                 }
@@ -1353,6 +1365,10 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                                     let b = body.clone();
                                     tokio::spawn(async move {
                                         alerting::send_alert(&cfg, &t, &b).await;
+                                    });
+                                    let wn_title = title.clone();
+                                    tokio::spawn(async move {
+                                        wolfnote::log_alert_to_wolfnote(&wn_title).await;
                                     });
                                     // Use a long cooldown (1 hour) so we don't re-alert for the same reboot
                                     cooldowns.insert(reboot_key, std::time::Instant::now());
@@ -1419,6 +1435,10 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                                 tokio::spawn(async move {
                                     alerting::send_alert(&cfg, &t, &b).await;
                                 });
+                                let wn_title = title.clone();
+                                tokio::spawn(async move {
+                                    wolfnote::log_alert_to_wolfnote(&wn_title).await;
+                                });
                                 alerting::record_alert(&mut cooldowns, &cooldown_key, "memory");
                             }
                         }
@@ -1462,6 +1482,10 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                                         let b = body.clone();
                                         tokio::spawn(async move {
                                             alerting::send_alert(&cfg, &t, &b).await;
+                                        });
+                                        let wn_title = title.clone();
+                                        tokio::spawn(async move {
+                                            wolfnote::log_alert_to_wolfnote(&wn_title).await;
                                         });
                                     }
                                     alerting::clear_cooldown(&mut cooldowns, &cooldown_key, "memory");
