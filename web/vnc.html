@@ -121,8 +121,12 @@
         <span id="status-badge" class="badge disconnected">Connecting...</span>
         <div class="spacer"></div>
         <button onclick="sendCtrlAltDel()" class="ctrl-alt-del" title="Send Ctrl+Alt+Del">Ctrl+Alt+Del</button>
+        <button onclick="toggleKeyboard()" id="kb-btn" title="Show on-screen keyboard">Keyboard</button>
         <button onclick="toggleFullscreen()">Fullscreen</button>
     </div>
+    <!-- Hidden textarea to trigger iOS/mobile soft keyboard -->
+    <textarea id="mobile-kb-input" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"
+        style="position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;opacity:0;font-size:16px;"></textarea>
     <div id="vnc-container" style="position: relative;">
         <div class="status-overlay" id="status-overlay">
             <div class="spinner"></div>
@@ -325,6 +329,62 @@
                 document.exitFullscreen();
             }
         };
+
+        // Mobile soft keyboard support (iOS/Android)
+        const kbInput = document.getElementById('mobile-kb-input');
+        let kbOpen = false;
+
+        window.toggleKeyboard = function () {
+            if (kbOpen) {
+                kbInput.blur();
+                kbOpen = false;
+                document.getElementById('kb-btn').style.background = '';
+            } else {
+                kbInput.focus();
+                kbOpen = true;
+                document.getElementById('kb-btn').style.background = '#065f46';
+            }
+        };
+
+        kbInput.addEventListener('blur', () => {
+            kbOpen = false;
+            document.getElementById('kb-btn').style.background = '';
+        });
+
+        // Forward key events from the hidden textarea to noVNC
+        kbInput.addEventListener('keydown', (e) => {
+            if (!rfb) return;
+            // Let noVNC handle the key via its own canvas focus for special keys
+            const key = e.key;
+            if (key === 'Enter') rfb.sendKey(0xFF0D);
+            else if (key === 'Backspace') rfb.sendKey(0xFF08);
+            else if (key === 'Tab') rfb.sendKey(0xFF09);
+            else if (key === 'Escape') rfb.sendKey(0xFF1B);
+            else if (key === 'ArrowLeft') rfb.sendKey(0xFF51);
+            else if (key === 'ArrowUp') rfb.sendKey(0xFF52);
+            else if (key === 'ArrowRight') rfb.sendKey(0xFF53);
+            else if (key === 'ArrowDown') rfb.sendKey(0xFF54);
+            else if (key === 'Delete') rfb.sendKey(0xFFFF);
+            else if (key === 'Home') rfb.sendKey(0xFF50);
+            else if (key === 'End') rfb.sendKey(0xFF57);
+            else return; // printable chars handled via input event
+            e.preventDefault();
+        });
+
+        // Capture printable characters via input event (works on iOS)
+        kbInput.addEventListener('input', (e) => {
+            if (!rfb) return;
+            const data = e.data;
+            if (data) {
+                for (const ch of data) {
+                    const code = ch.codePointAt(0);
+                    rfb.sendKey(code, null, true);  // press
+                    rfb.sendKey(code, null, false);  // release
+                }
+            }
+            // Clear the textarea so it stays ready for more input
+            kbInput.value = '';
+        });
     </script>
 </body>
 
