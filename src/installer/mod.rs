@@ -206,7 +206,14 @@ pub fn get_component_version(component: Component) -> Option<String> {
         .and_then(|o| {
             if o.status.success() {
                 String::from_utf8(o.stdout).ok()
-                    .map(|s| s.trim().to_string())
+                    .map(|s| {
+                        let trimmed = s.trim();
+                        // Extract just the version number (e.g. "wolfdisk 2.7.4" → "2.7.4")
+                        trimmed.split_whitespace()
+                            .find(|w| w.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))
+                            .unwrap_or(trimmed)
+                            .to_string()
+                    })
             } else {
                 None
             }
