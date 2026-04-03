@@ -23277,9 +23277,9 @@ function wdApiUrl(mid, path) {
 }
 
 function wdTypeBadge(memberType) {
-    var colors = { host: '#6b7280', docker: '#2496ed', lxc: '#e95420' };
+    var colors = { host: 'var(--text-muted)', docker: '#2496ed', lxc: '#e95420' };
     var labels = { host: 'Host', docker: 'Docker', lxc: 'LXC' };
-    var c = colors[memberType] || '#6b7280';
+    var c = colors[memberType] || 'var(--text-muted)';
     var l = labels[memberType] || memberType || 'Host';
     return '<span style="background:' + c + '; color:#fff; padding:1px 6px; border-radius:8px; font-size:10px; font-weight:600;">' + l + '</span>';
 }
@@ -23481,10 +23481,10 @@ function renderWolfDiskPage(data) {
     const totalMounts = data.reduce((s, n) => s + n.mounts.filter(m => m.status === 'mounted').length, 0);
 
     statsEl.innerHTML =
-        wdStatCard('Installed', installedNodes + '/' + totalNodes, installedNodes === totalNodes ? '#10b981' : '#f59e0b') +
-        wdStatCard('Running', runningNodes + '/' + installedNodes, installedNodes > 0 && runningNodes === installedNodes ? '#10b981' : installedNodes === 0 ? '#6b7280' : '#ef4444') +
-        wdStatCard('Clusters', '' + clusterCount, '#8b5cf6') +
-        wdStatCard('Mounts', '' + totalMounts, '#3b82f6');
+        wdStatCard('Installed', installedNodes + '/' + totalNodes, installedNodes === totalNodes ? 'var(--success)' : 'var(--warning)') +
+        wdStatCard('Running', runningNodes + '/' + installedNodes, installedNodes > 0 && runningNodes === installedNodes ? 'var(--success)' : installedNodes === 0 ? 'var(--text-muted)' : 'var(--danger)') +
+        wdStatCard('Clusters', '' + clusterCount, 'var(--accent)') +
+        wdStatCard('Mounts', '' + totalMounts, 'var(--accent)');
 
     // Render cluster sections
     var html = '';
@@ -23605,9 +23605,9 @@ function renderWolfDiskUnassignedSection(nodes) {
             for (var ci = 0; ci < clusterNames.length; ci++) {
                 var cn = clusterNames[ci];
                 var cnLabel = cn === 'default' ? 'Default Cluster' : cn;
-                html += '<button class="btn btn-sm" style="font-size:11px; color:#10b981; border-color:#10b981;" onclick="wdJoinCluster(\'' + wdMemberId(n) + '\',\'' + cn.replace(/'/g, "\\'") + '\')">Join ' + cnLabel + '</button>';
+                html += '<button class="btn btn-sm btn-success" style="font-size:11px;" onclick="wdJoinCluster(\'' + wdMemberId(n) + '\',\'' + cn.replace(/'/g, "\\'") + '\')">Join ' + cnLabel + '</button>';
             }
-            html += '<button class="btn btn-sm" style="font-size:11px; color:#a78bfa;" onclick="wdOpenConfig(\'' + wdMemberId(n) + '\')">Configure</button>';
+            html += '<button class="btn btn-sm" style="font-size:11px;" onclick="wdOpenConfig(\'' + wdMemberId(n) + '\')">Configure</button>';
         }
         html += '</td></tr>';
     }
@@ -23617,7 +23617,7 @@ function renderWolfDiskUnassignedSection(nodes) {
 
 function renderWolfDiskNodeRow(node) {
     var n = node;
-    var roleColors = { leader: '#f59e0b', follower: '#3b82f6', client: '#8b5cf6', auto: '#6b7280' };
+    var roleColors = { leader: 'var(--warning)', follower: 'var(--accent)', client: 'var(--text-muted)', auto: 'var(--text-muted)' };
     var roleLabels = { leader: 'Leader', follower: 'Follower', client: 'Client', auto: 'Auto' };
     var role = n.info ? n.info.role : 'unknown';
     var statusDot = n.status === 'running' ? '\ud83d\udfe2' : n.status === 'stopped' ? '\ud83d\udd34' : n.status === 'failed' ? '\u26a0\ufe0f' : '\u26ab';
@@ -23633,12 +23633,12 @@ function renderWolfDiskNodeRow(node) {
     html += '<td style="padding:10px 12px;"><span style="background:' + (roleColors[role] || '#6b7280') + '; color:#fff; padding:1px 8px; border-radius:10px; font-size:11px; font-weight:600;">' + (roleLabels[role] || role) + '</span></td>';
     html += '<td style="padding:10px 16px; text-align:right;" onclick="event.stopPropagation();">';
     if (n.status === 'running') {
-        html += '<button class="btn btn-sm" style="font-size:10px; color:#ef4444; padding:2px 8px;" onclick="wdAction(\'' + mid + '\',\'stop\')" title="Stop">\u23f9</button> ';
-        html += '<button class="btn btn-sm" style="font-size:10px; color:#3b82f6; padding:2px 8px;" onclick="wdAction(\'' + mid + '\',\'restart\')" title="Restart">\ud83d\udd04</button> ';
+        html += '<button class="btn btn-sm btn-danger" style="font-size:10px; padding:2px 8px;" onclick="wdAction(\'' + mid + '\',\'stop\')" title="Stop">\u23f9</button> ';
+        html += '<button class="btn btn-sm" style="font-size:10px; padding:2px 8px;" onclick="wdAction(\'' + mid + '\',\'restart\')" title="Restart">\ud83d\udd04</button> ';
     } else if (n.status === 'stopped') {
-        html += '<button class="btn btn-sm" style="font-size:10px; color:#10b981; padding:2px 8px;" onclick="wdAction(\'' + mid + '\',\'start\')" title="Start">\u25b6</button> ';
+        html += '<button class="btn btn-sm btn-primary" style="font-size:10px; padding:2px 8px;" onclick="wdAction(\'' + mid + '\',\'start\')" title="Start">\u25b6</button> ';
     }
-    html += '<button class="btn btn-sm" style="font-size:10px; color:#a78bfa; padding:2px 8px;" onclick="wdOpenConfig(\'' + mid + '\')" title="Configure">\u2699\ufe0f</button>';
+    html += '<button class="btn btn-sm" style="font-size:10px; padding:2px 8px;" onclick="wdOpenConfig(\'' + mid + '\')" title="Configure">\u2699\ufe0f</button>';
     html += '</td></tr>';
 
     // Expandable detail row
@@ -23683,9 +23683,9 @@ function renderWolfDiskNodeDetail(n) {
             html += '<span style="flex:1; color:var(--text-primary);">' + (m.mount_point || m.name) + '</span>';
             html += '<span style="color:var(--text-muted); font-size:11px;">' + m.status + '</span>';
             if (m.status === 'mounted') {
-                html += ' <button class="btn btn-sm" style="font-size:10px; padding:1px 6px; color:#ef4444;" onclick="wdMountAction(\'' + n.nodeId + '\',\'' + m.id + '\',\'unmount\')">Unmount</button>';
+                html += ' <button class="btn btn-sm btn-danger" style="font-size:10px; padding:1px 6px;" onclick="wdMountAction(\'' + n.nodeId + '\',\'' + m.id + '\',\'unmount\')">Unmount</button>';
             } else {
-                html += ' <button class="btn btn-sm" style="font-size:10px; padding:1px 6px; color:#10b981;" onclick="wdMountAction(\'' + n.nodeId + '\',\'' + m.id + '\',\'mount\')">Mount</button>';
+                html += ' <button class="btn btn-sm btn-primary" style="font-size:10px; padding:1px 6px;" onclick="wdMountAction(\'' + n.nodeId + '\',\'' + m.id + '\',\'mount\')">Mount</button>';
             }
             html += '</div>';
         }
@@ -23873,7 +23873,7 @@ async function wdOpenConfig(mid) {
             nodeIdEl.value = name;
         }
     } catch (e) {
-        bodyEl.innerHTML = '<div style="color:#ef4444;">Failed to load config: ' + e.message + '</div>';
+        bodyEl.innerHTML = '<div style="color:var(--danger);">Failed to load config: ' + e.message + '</div>';
     }
 }
 
