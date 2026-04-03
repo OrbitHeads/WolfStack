@@ -23803,10 +23803,8 @@ async function wdDiagnose() {
         }
     }
 
-    // Hint about common runtime failures
-    if (issues.length === 0) {
-        warnings.push('If the service still fails to start, check: (1) FUSE is installed (apt install fuse3), (2) /dev/fuse exists, (3) no stale mount at ' + (mountPath || '/mnt/wolfdisk') + ' (run: fusermount -u ' + (mountPath || '/mnt/wolfdisk') + ')');
-    }
+    // Note: FUSE and stale mounts are now handled automatically by the backend
+    // on start/restart, so we don't need to warn about them here
 
     // Render report
     var html = '<div style="border:1px solid var(--border); border-radius:8px; padding:16px; margin-bottom:16px; background:var(--bg-secondary);">';

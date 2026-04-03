@@ -1222,19 +1222,29 @@ pub fn provider_action(name: &str, action: &str) -> Result<String, String> {
         if !Path::new(config_path).exists() {
             return Err("WolfDisk config not found at /etc/wolfdisk/config.toml — configure WolfDisk first".to_string());
         }
-        // Check FUSE is available
+        // Check FUSE is available — auto-install if missing
         if !Path::new("/dev/fuse").exists() {
-            // Try loading the module
+            let _ = Command::new("modprobe").arg("fuse").output();
+        }
+        if !Path::new("/dev/fuse").exists() {
+            // Try installing fuse package
+            let distro = crate::installer::detect_distro();
+            let (pkg_mgr, pkg) = match distro {
+                crate::installer::DistroFamily::Debian => ("apt-get", "fuse3"),
+                crate::installer::DistroFamily::RedHat => ("dnf", "fuse3"),
+                crate::installer::DistroFamily::Suse => ("zypper", "fuse3"),
+                crate::installer::DistroFamily::Unknown => ("apt-get", "fuse3"),
+            };
+            let _ = Command::new(pkg_mgr).args(["install", "-y", pkg]).output();
             let _ = Command::new("modprobe").arg("fuse").output();
             if !Path::new("/dev/fuse").exists() {
-                return Err("FUSE is not available (/dev/fuse missing). Install fuse: apt install fuse3 or modprobe fuse".to_string());
+                return Err("FUSE is not available (/dev/fuse missing). Automatic install of fuse3 failed — install manually and try again.".to_string());
             }
         }
-        // Ensure user_allow_other in /etc/fuse.conf
-        if let Ok(fuse_conf) = std::fs::read_to_string("/etc/fuse.conf") {
-            if !fuse_conf.lines().any(|l| l.trim() == "user_allow_other") {
-                let _ = std::fs::write("/etc/fuse.conf", format!("{}\nuser_allow_other\n", fuse_conf.trim()));
-            }
+        // Ensure /etc/fuse.conf exists and has user_allow_other
+        let fuse_conf = std::fs::read_to_string("/etc/fuse.conf").unwrap_or_default();
+        if !fuse_conf.lines().any(|l| l.trim() == "user_allow_other") {
+            let _ = std::fs::write("/etc/fuse.conf", format!("{}\nuser_allow_other\n", fuse_conf.trim()));
         }
         // Read mount path from config and ensure directory exists
         if let Ok(content) = std::fs::read_to_string(config_path) {
@@ -1264,6 +1274,19 @@ pub fn provider_action(name: &str, action: &str) -> Result<String, String> {
                 .output()
                 .map_err(|e| format!("Failed to {} {}: {}", action, service_name, e))?;
             if output.status.success() {
+                // For start/restart, verify the service is actually running after a brief wait
+                if (action == "start" || action == "restart") && name == "wolfdisk" {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let status = service_status(service_name);
+                    if status != "running" {
+                        let journal = Command::new("journalctl")
+                            .args(["-u", service_name, "-n", "10", "--no-pager", "-o", "cat"])
+                            .output()
+                            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                            .unwrap_or_default();
+                        return Err(format!("WolfDisk exited shortly after starting (status: {}). Journal:\n{}", status, journal));
+                    }
+                }
                 Ok(format!("{} {} successful", service_name, action))
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
