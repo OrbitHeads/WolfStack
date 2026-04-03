@@ -23243,6 +23243,7 @@ let wdClusterData = [];
 let wdExpandedNodes = new Set();
 let wdConfigNodeId = null;
 let wdInstallMode = null; // set when install button was clicked — config saves then launches terminal
+let wdLatestVersion = null; // latest version from GitHub
 
 // Encode a unique member ID: "nodeId" for hosts, "nodeId:runtime:containerName" for containers
 function wdMemberId(n) {
@@ -23309,6 +23310,17 @@ async function loadWolfDiskCluster() {
     if (loading) loading.style.display = 'block';
     if (container) container.innerHTML = '';
     if (statsEl) statsEl.innerHTML = '';
+
+    // Fetch latest WolfDisk version from GitHub (in parallel with node scans)
+    if (!wdLatestVersion) {
+        fetch('https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfScale/main/wolfdisk/Cargo.toml')
+            .then(r => r.ok ? r.text() : '')
+            .then(text => {
+                var m = text.match(/^version\s*=\s*"([^"]+)"/m);
+                if (m) wdLatestVersion = m[1];
+            })
+            .catch(() => {});
+    }
 
     const nodes = getClusterNodes(wdCurrentCluster);
     const results = await Promise.allSettled(
@@ -23411,6 +23423,7 @@ async function loadWolfDiskCluster() {
                     wdClusterName: wdProvider && wdProvider.wolfdisk_info ? wdProvider.wolfdisk_info.cluster_name : null,
                     memberType: 'host',
                     wolfnetIp: wnInfo ? (wnInfo.address || null) : null,
+                    version: wdProvider ? (wdProvider.version || null) : null,
                     nodeAddress: node.address || null,
                     mounts: wdMounts,
                     containers: wdContainers,
@@ -23628,7 +23641,9 @@ function renderWolfDiskNodeRow(node) {
     var html = '<tr style="border-bottom:1px solid var(--border); cursor:pointer;" onclick="toggleWolfDiskNode(\'' + mid + '\')">';
     html += '<td style="padding:10px 16px; font-weight:600;"><span style="font-size:10px; margin-right:4px; color:var(--text-muted);">' + (isExpanded ? '\u25BC' : '\u25B6') + '</span> ' + n.nodeName + hostLabel + '</td>';
     html += '<td style="padding:10px 12px;">' + wdTypeBadge(n.memberType) + '</td>';
-    html += '<td style="padding:10px 12px;">' + statusDot + ' ' + statusLabel + '</td>';
+    var verTag = n.version ? ' <span style="font-size:10px; color:var(--text-muted);">v' + n.version + '</span>' : '';
+    var upgradeTag = (n.version && wdLatestVersion && n.version !== wdLatestVersion) ? ' <span style="font-size:9px; color:var(--warning);" title="Latest: ' + wdLatestVersion + '">update</span>' : '';
+    html += '<td style="padding:10px 12px;">' + statusDot + ' ' + statusLabel + verTag + upgradeTag + '</td>';
     html += '<td style="padding:10px 12px;"><span style="background:' + (roleColors[role] || '#6b7280') + '; color:#fff; padding:1px 8px; border-radius:10px; font-size:11px; font-weight:600;">' + (roleLabels[role] || role) + '</span></td>';
     html += '<td style="padding:10px 16px; text-align:right;" onclick="event.stopPropagation();">';
     if (n.status === 'running') {
@@ -23661,6 +23676,10 @@ function renderWolfDiskNodeDetail(n) {
     if (info) {
         // Config summary grid
         html += '<div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(200px,1fr)); gap:8px 20px; margin-bottom:14px;">';
+        if (n.version) {
+            var needsUpgrade = wdLatestVersion && n.version !== wdLatestVersion;
+            html += wdDetailItem('Version', n.version + (needsUpgrade ? ' (latest: ' + wdLatestVersion + ')' : ''));
+        }
         html += wdDetailItem('Data Directory', info.data_dir);
         html += wdDetailItem('Mount Path', info.mount_path);
         html += wdDetailItem('Bind Address', info.bind);
@@ -23669,6 +23688,10 @@ function renderWolfDiskNodeDetail(n) {
         if (info.peers && info.peers.length) html += wdDetailItem('Peers', info.peers.join(', '));
         if (info.s3_enabled) html += wdDetailItem('S3 API', 'Enabled on ' + (info.s3_bind || ':9878'));
         html += '</div>';
+        // Upgrade button if version mismatch
+        if (n.version && wdLatestVersion && n.version !== wdLatestVersion) {
+            html += '<div style="margin-bottom:10px;"><button class="btn btn-sm btn-primary" style="font-size:11px;" onclick="event.stopPropagation(); wdUpgrade(\'' + wdMemberId(n) + '\')">Upgrade to ' + wdLatestVersion + '</button></div>';
+        }
     }
 
     // Mounts section
@@ -23862,6 +23885,17 @@ function wdCollectPeers() {
 
 function wdDetailItem(label, value) {
     return '<div><span style="color:var(--text-muted);">' + label + ':</span> <strong style="color:var(--text-primary);">' + value + '</strong></div>';
+}
+
+async function wdUpgrade(mid) {
+    var node = wdFindMember(mid);
+    var name = node ? node.nodeName : mid;
+    if (!await showConfirm('Upgrade WolfDisk on ' + name + ' to v' + (wdLatestVersion || 'latest') + '?\n\nThe install script will run in upgrade mode (config preserved).', 'Upgrade WolfDisk')) return;
+    var p = wdParseMemberId(mid);
+    var consoleName = 'wolfdisk';
+    if (p.runtime && p.container) consoleName = 'wolfdisk@' + p.runtime + ':' + p.container;
+    wdOpenConsole(p.nodeId, 'install', consoleName);
+    showToast('Upgrade terminal opened for ' + name, 'success');
 }
 
 function wdOpenConsole(nodeId, type, consoleName) {

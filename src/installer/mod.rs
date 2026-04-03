@@ -188,7 +188,7 @@ fn binary_exists(name: &str) -> bool {
 }
 
 /// Get version of a component
-fn get_version(component: Component) -> Option<String> {
+pub fn get_component_version(component: Component) -> Option<String> {
     let (cmd, args): (&str, &[&str]) = match component {
         Component::MariaDB => ("mariadb", &["--version"]),
         Component::Certbot => ("certbot", &["--version"]),
@@ -223,7 +223,7 @@ pub fn get_all_status() -> Vec<ComponentStatus> {
             installed: installed || bin_exists,
             running,
             enabled,
-            version: get_version(*comp),
+            version: get_component_version(*comp),
         }
     }).collect()
 }
