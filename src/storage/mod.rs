@@ -813,9 +813,13 @@ fn has_nfs() -> bool {
 }
 
 fn has_wolfdisk() -> bool {
-    Path::new("/usr/local/bin/wolfdisk").exists()
+    let has_binary = Path::new("/usr/local/bin/wolfdisk").exists()
         || Path::new("/opt/wolfdisk/wolfdisk").exists()
-        || Command::new("which").arg("wolfdisk").output().map(|o| o.status.success()).unwrap_or(false)
+        || Command::new("which").arg("wolfdisk").output().map(|o| o.status.success()).unwrap_or(false);
+    // Require both the binary AND the systemd service to consider it properly installed
+    let has_service = Path::new("/etc/systemd/system/wolfdisk.service").exists()
+        || Path::new("/usr/lib/systemd/system/wolfdisk.service").exists();
+    has_binary && has_service
 }
 
 /// Read WolfDisk configuration and return a summary
