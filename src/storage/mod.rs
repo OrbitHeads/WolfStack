@@ -818,6 +818,37 @@ fn has_wolfdisk() -> bool {
         || Command::new("which").arg("wolfdisk").output().map(|o| o.status.success()).unwrap_or(false)
 }
 
+/// Read WolfDisk configuration and return a summary
+fn read_wolfdisk_info() -> Option<WolfDiskInfo> {
+    let content = std::fs::read_to_string("/etc/wolfdisk/config.toml").ok()?;
+    let config: toml::Value = toml::from_str(&content).ok()?;
+
+    let node = config.get("node")?;
+    let cluster = config.get("cluster");
+    let replication = config.get("replication");
+    let mount = config.get("mount");
+    let s3 = config.get("s3");
+
+    let peers: Vec<String> = cluster
+        .and_then(|c| c.get("peers"))
+        .and_then(|p| p.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    Some(WolfDiskInfo {
+        node_id: node.get("id").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
+        role: node.get("role").and_then(|v| v.as_str()).unwrap_or("auto").to_string(),
+        replication_mode: replication.and_then(|r| r.get("mode")).and_then(|v| v.as_str()).unwrap_or("shared").to_string(),
+        replication_factor: replication.and_then(|r| r.get("factor")).and_then(|v| v.as_integer()).unwrap_or(3) as usize,
+        data_dir: node.get("data_dir").and_then(|v| v.as_str()).unwrap_or("/var/lib/wolfdisk").to_string(),
+        mount_path: mount.and_then(|m| m.get("path")).and_then(|v| v.as_str()).unwrap_or("/mnt/wolfdisk").to_string(),
+        bind: node.get("bind").and_then(|v| v.as_str()).unwrap_or("0.0.0.0:9500").to_string(),
+        peers,
+        s3_enabled: s3.and_then(|s| s.get("enabled")).and_then(|v| v.as_bool()).unwrap_or(false),
+        s3_bind: s3.and_then(|s| s.get("bind")).and_then(|v| v.as_str()).map(String::from),
+    })
+}
+
 fn install_s3fs() -> Result<(), String> {
 
     let distro = crate::installer::detect_distro();
@@ -1064,6 +1095,23 @@ pub struct StorageProvider {
     pub status: String,
     /// Path to config file (if applicable)
     pub config_path: Option<String>,
+    /// WolfDisk-specific configuration summary (only set for wolfdisk provider)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wolfdisk_info: Option<WolfDiskInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WolfDiskInfo {
+    pub node_id: String,
+    pub role: String,
+    pub replication_mode: String,
+    pub replication_factor: usize,
+    pub data_dir: String,
+    pub mount_path: String,
+    pub bind: String,
+    pub peers: Vec<String>,
+    pub s3_enabled: bool,
+    pub s3_bind: Option<String>,
 }
 
 fn service_status(service_name: &str) -> String {
@@ -1099,6 +1147,7 @@ pub fn list_providers() -> Vec<StorageProvider> {
                 service: svc,
                 status,
                 config_path: Some("/etc/exports".to_string()),
+                wolfdisk_info: None,
             }
         },
         {
@@ -1113,6 +1162,7 @@ pub fn list_providers() -> Vec<StorageProvider> {
                 service: None,
                 status: if installed { "no-service".to_string() } else { "not-installed".to_string() },
                 config_path: Some("/etc/fuse.conf".to_string()),
+                wolfdisk_info: None,
             }
         },
         {
@@ -1127,6 +1177,7 @@ pub fn list_providers() -> Vec<StorageProvider> {
                 service: None,
                 status: if installed { "no-service".to_string() } else { "not-installed".to_string() },
                 config_path: Some("/etc/passwd-s3fs".to_string()),
+                wolfdisk_info: None,
             }
         },
         {
@@ -1134,6 +1185,7 @@ pub fn list_providers() -> Vec<StorageProvider> {
             let svc = if installed { Some("wolfdisk".to_string()) } else { None };
             let status = if !installed { "not-installed".to_string() }
                 else { service_status("wolfdisk") };
+            let wolfdisk_info = if installed { read_wolfdisk_info() } else { None };
             StorageProvider {
                 name: "wolfdisk".to_string(),
                 label: "WolfDisk".to_string(),
@@ -1144,6 +1196,7 @@ pub fn list_providers() -> Vec<StorageProvider> {
                 service: svc,
                 status,
                 config_path: Some("/etc/wolfdisk/config.toml".to_string()),
+                wolfdisk_info,
             }
         },
     ]
