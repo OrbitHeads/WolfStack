@@ -22,7 +22,7 @@ struct ApachePaths {
 
 fn apache_paths(target: &ExecTarget) -> ApachePaths {
     match target.detect_distro() {
-        DistroFamily::Debian | DistroFamily::Unknown => ApachePaths {
+        DistroFamily::Debian | DistroFamily::Arch | DistroFamily::Unknown => ApachePaths {
             sites_available: "/etc/apache2/sites-available",
             sites_enabled: "/etc/apache2/sites-enabled",
             mods_available: Some("/etc/apache2/mods-available"),

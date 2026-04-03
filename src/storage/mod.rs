@@ -662,6 +662,7 @@ fn mount_nfs(mount: &StorageMount) -> Result<String, String> {
             crate::installer::DistroFamily::Debian => ("apt-get", "nfs-common"),
             crate::installer::DistroFamily::RedHat => ("dnf", "nfs-utils"),
             crate::installer::DistroFamily::Suse => ("zypper", "nfs-client"),
+            crate::installer::DistroFamily::Arch => ("pacman", "nfs-utils"),
             crate::installer::DistroFamily::Unknown => ("apt-get", "nfs-common"),
         };
         let install = Command::new(pkg_mgr)
@@ -795,6 +796,7 @@ fn install_sshfs() -> Result<(), String> {
         crate::installer::DistroFamily::Debian => ("apt-get", "sshfs"),
         crate::installer::DistroFamily::RedHat => ("dnf", "fuse-sshfs"),
         crate::installer::DistroFamily::Suse => ("zypper", "sshfs"),
+        crate::installer::DistroFamily::Arch => ("pacman", "sshfs"),
         crate::installer::DistroFamily::Unknown => ("apt-get", "sshfs"),
     };
     let output = Command::new(pkg_mgr)
@@ -861,6 +863,7 @@ fn install_s3fs() -> Result<(), String> {
         crate::installer::DistroFamily::Debian => ("apt-get", "s3fs"),
         crate::installer::DistroFamily::RedHat => ("dnf", "s3fs-fuse"),
         crate::installer::DistroFamily::Suse => ("zypper", "s3fs"),
+        crate::installer::DistroFamily::Arch => ("pacman", "s3fs-fuse"),
         crate::installer::DistroFamily::Unknown => ("apt-get", "s3fs"),
     };
     // RHEL/CentOS may need EPEL for s3fs-fuse
@@ -1227,15 +1230,20 @@ pub fn provider_action(name: &str, action: &str) -> Result<String, String> {
             let _ = Command::new("modprobe").arg("fuse").output();
         }
         if !Path::new("/dev/fuse").exists() {
-            // Try installing fuse package
+            // Try installing fuse package — detect distro for correct package manager
             let distro = crate::installer::detect_distro();
-            let (pkg_mgr, pkg) = match distro {
-                crate::installer::DistroFamily::Debian => ("apt-get", "fuse3"),
-                crate::installer::DistroFamily::RedHat => ("dnf", "fuse3"),
-                crate::installer::DistroFamily::Suse => ("zypper", "fuse3"),
-                crate::installer::DistroFamily::Unknown => ("apt-get", "fuse3"),
+            let install_result = match distro {
+                crate::installer::DistroFamily::Debian => Command::new("apt-get").args(["install", "-y", "fuse3"]).output(),
+                crate::installer::DistroFamily::RedHat => Command::new("dnf").args(["install", "-y", "fuse3"]).output(),
+                crate::installer::DistroFamily::Suse => Command::new("zypper").args(["install", "-y", "fuse3"]).output(),
+                crate::installer::DistroFamily::Arch => Command::new("pacman").args(["-S", "--noconfirm", "fuse3"]).output(),
+                crate::installer::DistroFamily::Unknown => Command::new("apt-get").args(["install", "-y", "fuse3"]).output(),
             };
-            let _ = Command::new(pkg_mgr).args(["install", "-y", pkg]).output();
+            if let Ok(o) = &install_result {
+                if !o.status.success() {
+                    eprintln!("fuse3 install failed: {}", String::from_utf8_lossy(&o.stderr));
+                }
+            }
             let _ = Command::new("modprobe").arg("fuse").output();
             if !Path::new("/dev/fuse").exists() {
                 return Err("FUSE is not available (/dev/fuse missing). Automatic install of fuse3 failed — install manually and try again.".to_string());

@@ -799,6 +799,17 @@ pub fn install_ceph() -> Result<String, String> {
             }
             Ok("Ceph packages installed successfully via zypper".to_string())
         }
+        crate::installer::DistroFamily::Arch => {
+            let output = Command::new("pacman")
+                .args(["-S", "--noconfirm", "ceph"])
+                .output()
+                .map_err(|e| format!("Failed to run pacman: {}", e))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("pacman install failed: {} — Ceph may need to be installed from AUR", stderr.trim()));
+            }
+            Ok("Ceph packages installed successfully via pacman".to_string())
+        }
         crate::installer::DistroFamily::Unknown => {
             Err("Unsupported distro — cannot auto-install. Please install Ceph packages manually.".to_string())
         }

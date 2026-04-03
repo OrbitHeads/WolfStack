@@ -101,12 +101,17 @@ pub enum DistroFamily {
     Debian,  // Debian, Ubuntu, etc.
     RedHat,  // RHEL, Fedora, CentOS, etc.
     Suse,    // SLES, openSUSE (IBM Power SLES)
+    Arch,    // Arch, Manjaro, EndeavourOS, CachyOS, etc.
     Unknown,
 }
 
 /// Detect the current distro family
 pub fn detect_distro() -> DistroFamily {
-    if std::path::Path::new("/etc/debian_version").exists() {
+    if std::path::Path::new("/etc/arch-release").exists()
+        || std::path::Path::new("/usr/bin/pacman").exists()
+    {
+        DistroFamily::Arch
+    } else if std::path::Path::new("/etc/debian_version").exists() {
         DistroFamily::Debian
     } else if std::path::Path::new("/etc/redhat-release").exists()
         || std::path::Path::new("/etc/fedora-release").exists()
@@ -121,6 +126,9 @@ pub fn detect_distro() -> DistroFamily {
         // Try os-release as final fallback
         if let Ok(content) = std::fs::read_to_string("/etc/os-release") {
             let lower = content.to_lowercase();
+            if lower.contains("arch") || lower.contains("manjaro") || lower.contains("endeavour") || lower.contains("cachyos") {
+                return DistroFamily::Arch;
+            }
             if lower.contains("suse") || lower.contains("sles") {
                 return DistroFamily::Suse;
             }
@@ -138,6 +146,7 @@ pub fn pkg_install_cmd(distro: DistroFamily) -> (&'static str, &'static str) {
         DistroFamily::Debian => ("apt-get", "install -y"),
         DistroFamily::RedHat => ("dnf", "install -y"),
         DistroFamily::Suse => ("zypper", "install -y"),
+        DistroFamily::Arch => ("pacman", "-S --noconfirm"),
         DistroFamily::Unknown => ("apt-get", "install -y"),
     }
 }
@@ -256,6 +265,7 @@ fn install_mariadb(distro: DistroFamily) -> Result<String, String> {
         DistroFamily::Debian => "mariadb-server",
         DistroFamily::RedHat => "mariadb-server",
         DistroFamily::Suse => "mariadb",
+        DistroFamily::Arch => "mariadb",
         DistroFamily::Unknown => "mariadb-server",
     };
 

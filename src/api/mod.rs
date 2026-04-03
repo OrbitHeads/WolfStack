@@ -2601,12 +2601,14 @@ pub async fn install_runtime(
             installer::DistroFamily::Debian => "lxc lxc-templates",
             installer::DistroFamily::RedHat => "lxc lxc-templates lxc-extra",
             installer::DistroFamily::Suse => "lxc",
+            installer::DistroFamily::Arch => "lxc",
             _ => "lxc",
         },
         "kvm" => match distro {
             installer::DistroFamily::Debian => "qemu-system-x86 qemu-utils libvirt-daemon-system virtinst ovmf",
             installer::DistroFamily::RedHat => "qemu-kvm libvirt virt-install",
             installer::DistroFamily::Suse => "qemu-kvm libvirt virt-install",
+            installer::DistroFamily::Arch => "qemu-full libvirt virt-install edk2-ovmf",
             _ => "qemu-system-x86",
         },
         _ => {

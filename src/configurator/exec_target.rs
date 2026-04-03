@@ -238,7 +238,11 @@ impl ExecTarget {
         match self {
             ExecTarget::Host => crate::installer::detect_distro(),
             _ => {
-                if self.path_exists("/etc/debian_version").unwrap_or(false) {
+                if self.path_exists("/etc/arch-release").unwrap_or(false)
+                    || self.path_exists("/usr/bin/pacman").unwrap_or(false)
+                {
+                    DistroFamily::Arch
+                } else if self.path_exists("/etc/debian_version").unwrap_or(false) {
                     DistroFamily::Debian
                 } else if self.path_exists("/etc/redhat-release").unwrap_or(false)
                     || self.path_exists("/etc/fedora-release").unwrap_or(false)
