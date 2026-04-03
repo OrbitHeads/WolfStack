@@ -23879,7 +23879,10 @@ async function wdOpenConfig(mid) {
             html += '<div style="display:grid; grid-template-columns:1fr 1fr; gap:10px 16px;">';
             for (var fi = 0; fi < section.fields.length; fi++) {
                 var f = section.fields[fi];
-                var val = config[section.key] && config[section.key][f.key] !== undefined ? config[section.key][f.key] : (f.default !== undefined ? f.default : '');
+                var raw = config[section.key] ? config[section.key][f.key] : undefined;
+                // For strings/selects, treat empty string same as missing — use default
+                var val = (raw !== undefined && raw !== null && (f.type === 'boolean' || f.type === 'number' || raw !== ''))
+                    ? raw : (f.default !== undefined ? f.default : '');
                 var inputId = 'wd-cfg-' + section.key + '-' + f.key;
                 html += '<div' + (f.type === 'array' ? ' style="grid-column:span 2;"' : '') + '>';
                 html += '<label style="font-size:11px; color:var(--text-muted); display:block; margin-bottom:3px;">' + f.label + '</label>';
