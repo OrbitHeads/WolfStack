@@ -23242,6 +23242,7 @@ let wdCurrentCluster = '';
 let wdClusterData = [];
 let wdExpandedNodes = new Set();
 let wdConfigNodeId = null;
+let wdInstallMode = null; // set when install button was clicked — config saves then launches terminal
 
 // Encode a unique member ID: "nodeId" for hosts, "nodeId:runtime:containerName" for containers
 function wdMemberId(n) {
@@ -23725,11 +23726,19 @@ function wdOpenConsole(nodeId, type, consoleName) {
 }
 
 async function wdInstall(nodeId) {
-    var node = wdClusterData.find(n => n.nodeId === nodeId);
-    var name = node ? node.nodeName : nodeId;
-    if (!await showConfirm('Install WolfDisk on ' + name + '?\n\nA terminal will open showing the installation progress.', 'Install WolfDisk')) return;
-    wdOpenConsole(nodeId, 'install', 'wolfdisk');
-    showToast('Installation terminal opened for ' + name + '. Refresh this page when complete.', 'success');
+    // Open config dialog first — user sets up cluster/peers/settings, then we install
+    wdInstallMode = { nodeId: nodeId, memberType: 'host' };
+    var existingClusters = {};
+    for (var i = 0; i < wdClusterData.length; i++) {
+        var nd = wdClusterData[i];
+        if (nd.wdClusterName && nd.installed && nd.info) existingClusters[nd.wdClusterName] = true;
+    }
+    var cNames = Object.keys(existingClusters);
+    if (cNames.length === 1) {
+        await wdJoinCluster(nodeId, cNames[0]);
+    } else {
+        await wdOpenConfig(nodeId);
+    }
 }
 
 async function wdAction(mid, action) {
@@ -23755,9 +23764,20 @@ async function wdAction(mid, action) {
 }
 
 async function wdInstallContainer(hostNodeId, runtime, containerName) {
-    if (!await showConfirm('Install WolfDisk in ' + runtime.toUpperCase() + ' container "' + containerName + '"?\n\nA terminal will open showing the installation progress.', 'Install WolfDisk')) return;
-    wdOpenConsole(hostNodeId, 'install', 'wolfdisk@' + runtime + ':' + containerName);
-    showToast('Installation terminal opened for ' + containerName + '. Refresh this page when complete.', 'success');
+    // Open config dialog first — user sets up cluster/peers/settings, then we install
+    var mid = hostNodeId + ':' + runtime + ':' + containerName;
+    wdInstallMode = { nodeId: hostNodeId, memberType: runtime, containerName: containerName, mid: mid };
+    var existingClusters = {};
+    for (var i = 0; i < wdClusterData.length; i++) {
+        var nd = wdClusterData[i];
+        if (nd.wdClusterName && nd.installed && nd.info) existingClusters[nd.wdClusterName] = true;
+    }
+    var cNames = Object.keys(existingClusters);
+    if (cNames.length === 1) {
+        await wdJoinCluster(mid, cNames[0]);
+    } else {
+        await wdOpenConfig(mid);
+    }
 }
 
 async function wdJoinCluster(mid, clusterName) {
@@ -23821,9 +23841,23 @@ async function wdOpenConfig(mid) {
     var modal = document.getElementById('wd-config-modal');
     var p = wdParseMemberId(mid);
     var typeLabel = p.runtime ? ' (' + p.runtime.toUpperCase() + ')' : '';
-    titleEl.textContent = 'WolfDisk Configuration \u2014 ' + name + typeLabel;
+    var isInstall = !!wdInstallMode;
+    titleEl.textContent = (isInstall ? 'Install WolfDisk \u2014 ' : 'WolfDisk Configuration \u2014 ') + name + typeLabel;
     bodyEl.innerHTML = '<div style="text-align:center; padding:20px; color:var(--text-muted);">Loading configuration...</div>';
     modal.style.display = 'flex';
+
+    // Update modal buttons based on mode
+    var btnContainer = modal.querySelector('[style*="justify-content:flex-end"]');
+    if (btnContainer) {
+        if (isInstall) {
+            btnContainer.innerHTML = '<button class="btn btn-sm" onclick="wdCloseConfig()">Cancel</button>' +
+                '<button class="btn btn-sm btn-primary" onclick="wdSaveAndInstall()">Save & Install</button>';
+        } else {
+            btnContainer.innerHTML = '<button class="btn btn-sm" onclick="wdCloseConfig()">Cancel</button>' +
+                '<button class="btn btn-sm" onclick="wdSaveConfig(false)" style="border-color:var(--accent); color:var(--accent);">Save Only</button>' +
+                '<button class="btn btn-sm btn-primary" onclick="wdSaveConfig(true)">Save & Start</button>';
+        }
+    }
 
     try {
         var resp = await fetch(wdApiUrl(mid, '/api/configurator/toml/wolfdisk/structured'));
@@ -23878,8 +23912,67 @@ async function wdOpenConfig(mid) {
 function wdCloseConfig() {
     document.getElementById('wd-config-modal').style.display = 'none';
     wdConfigNodeId = null;
+    wdInstallMode = null;
     // Always refresh after closing config modal (install/save may have changed state)
     if (currentPage === 'wolfdisk-cluster') loadWolfDiskCluster();
+}
+
+async function wdSaveAndInstall() {
+    // Save the config first (creates /etc/wolfdisk/config.toml), then run the install terminal
+    // The install script will skip interactive prompts since config already exists
+    if (!wdConfigNodeId || !wdInstallMode) return;
+    var savedMid = wdConfigNodeId;
+    var mode = wdInstallMode;
+
+    // Collect config from form
+    var schema = getTomlSchema('wolfdisk');
+    var config = {};
+    for (var si = 0; si < schema.length; si++) {
+        var section = schema[si];
+        config[section.key] = {};
+        for (var fi = 0; fi < section.fields.length; fi++) {
+            var f = section.fields[fi];
+            var el = document.getElementById('wd-cfg-' + section.key + '-' + f.key);
+            if (!el) continue;
+            if (f.type === 'boolean') config[section.key][f.key] = el.checked;
+            else if (f.type === 'number') config[section.key][f.key] = el.value ? Number(el.value) : (f.default || 0);
+            else if (f.type === 'array') config[section.key][f.key] = el.value.split('\n').map(s => s.trim()).filter(s => s);
+            else config[section.key][f.key] = el.value;
+        }
+    }
+
+    // First bootstrap the config directory on the target, then save config
+    try {
+        await fetch(wdApiUrl(savedMid, '/api/configurator/toml/wolfdisk/bootstrap'), { method: 'POST' });
+    } catch (_) {}
+    try {
+        var resp = await fetch(wdApiUrl(savedMid, '/api/configurator/toml/wolfdisk/structured'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(config),
+        });
+        if (!resp.ok) {
+            var data = await resp.json();
+            showToast(data.error || 'Failed to save config', 'error');
+            return;
+        }
+    } catch (e) {
+        showToast('Failed to save config: ' + e.message, 'error');
+        return;
+    }
+
+    // Close modal
+    document.getElementById('wd-config-modal').style.display = 'none';
+    wdConfigNodeId = null;
+    wdInstallMode = null;
+
+    // Open install terminal
+    var consoleName = 'wolfdisk';
+    if (mode.memberType && mode.memberType !== 'host' && mode.containerName) {
+        consoleName = 'wolfdisk@' + mode.memberType + ':' + mode.containerName;
+    }
+    wdOpenConsole(mode.nodeId, 'install', consoleName);
+    showToast('Config saved. Installation terminal opened — refresh this page when complete.', 'success');
 }
 
 async function wdSaveConfig(startAfter) {
