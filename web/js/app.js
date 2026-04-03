@@ -23723,6 +23723,12 @@ function wdOpenConsole(nodeId, type, consoleName) {
         url += '&node_id=' + encodeURIComponent(nodeId);
     }
     window.open(url, 'wd_install_' + consoleName, 'width=960,height=600,menubar=no,toolbar=no,scrollbars=yes,resizable=yes');
+    // Auto-refresh the WolfDisk page when the user returns to this window
+    var refreshOnFocus = function() {
+        window.removeEventListener('focus', refreshOnFocus);
+        if (currentPage === 'wolfdisk-cluster') loadWolfDiskCluster();
+    };
+    window.addEventListener('focus', refreshOnFocus);
 }
 
 async function wdInstall(nodeId) {
@@ -23873,7 +23879,7 @@ async function wdOpenConfig(mid) {
             html += '<div style="display:grid; grid-template-columns:1fr 1fr; gap:10px 16px;">';
             for (var fi = 0; fi < section.fields.length; fi++) {
                 var f = section.fields[fi];
-                var val = config[section.key] ? (config[section.key][f.key] !== undefined ? config[section.key][f.key] : '') : '';
+                var val = config[section.key] && config[section.key][f.key] !== undefined ? config[section.key][f.key] : (f.default !== undefined ? f.default : '');
                 var inputId = 'wd-cfg-' + section.key + '-' + f.key;
                 html += '<div' + (f.type === 'array' ? ' style="grid-column:span 2;"' : '') + '>';
                 html += '<label style="font-size:11px; color:var(--text-muted); display:block; margin-bottom:3px;">' + f.label + '</label>';
