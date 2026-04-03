@@ -4501,6 +4501,38 @@ async fn install_component_in_container(
     }
 }
 
+/// GET /api/containers/component-version?runtime=lxc&target=name&component=wolfdisk
+async fn container_component_version(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let runtime = query.get("runtime").cloned().unwrap_or_default();
+    let target = query.get("target").cloned().unwrap_or_default();
+    let component = query.get("component").cloned().unwrap_or_default();
+    if runtime.is_empty() || target.is_empty() || component.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "runtime, target, and component are required"}));
+    }
+    let exec_target = match runtime.as_str() {
+        "docker" => crate::configurator::ExecTarget::Docker(target),
+        "lxc" => crate::configurator::ExecTarget::Lxc(target),
+        _ => return HttpResponse::BadRequest().json(serde_json::json!({"error": "runtime must be docker or lxc"})),
+    };
+    let cmd = format!("{} --version 2>/dev/null | head -1", component);
+    let result = web::block(move || exec_target.exec(&cmd)).await;
+    match result {
+        Ok(Ok(output)) => {
+            let version = output.trim().split_whitespace()
+                .find(|w| w.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))
+                .unwrap_or("")
+                .to_string();
+            HttpResponse::Ok().json(serde_json::json!({"version": version}))
+        }
+        _ => HttpResponse::Ok().json(serde_json::json!({"version": serde_json::Value::Null})),
+    }
+}
+
 /// GET /api/containers/running — list all running containers for component install UI
 async fn list_running_containers(
     req: HttpRequest,
@@ -14483,6 +14515,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/containers/install", web::post().to(install_container_runtime))
         .route("/api/containers/install-component", web::post().to(install_component_in_container))
         .route("/api/containers/running", web::get().to(list_running_containers))
+        .route("/api/containers/component-version", web::get().to(container_component_version))
         // Docker
         .route("/api/containers/docker", web::get().to(docker_list))
         .route("/api/containers/docker/search", web::get().to(docker_search))

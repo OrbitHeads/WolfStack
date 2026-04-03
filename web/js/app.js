@@ -23364,8 +23364,13 @@ async function loadWolfDiskCluster() {
                 var ctName = ct.name || ct.names || '';
                 var ctRuntime = ct._type;
                 try {
-                    var cfgResp = await fetch(nodeApiUrl(node.id, '/api/configurator/toml/wolfdisk/structured?runtime=' + ctRuntime + '&target=' + encodeURIComponent(ctName)));
+                    var [cfgResp, verResp] = await Promise.all([
+                        fetch(nodeApiUrl(node.id, '/api/configurator/toml/wolfdisk/structured?runtime=' + ctRuntime + '&target=' + encodeURIComponent(ctName))),
+                        fetch(nodeApiUrl(node.id, '/api/containers/component-version?runtime=' + ctRuntime + '&target=' + encodeURIComponent(ctName) + '&component=wolfdisk')).catch(function() { return { ok: false }; }),
+                    ]);
                     var ctConfig = cfgResp.ok ? await cfgResp.json() : {};
+                    var ctVer = null;
+                    try { var vd = verResp.ok ? await verResp.json() : {}; ctVer = vd.version || null; } catch(_) {}
                     containerEntries.push({
                         nodeId: node.id,
                         nodeName: ctName,
@@ -23373,6 +23378,7 @@ async function loadWolfDiskCluster() {
                         online: true,
                         installed: true,
                         status: wdSvc(ct),
+                        version: ctVer,
                         memberType: ctRuntime,
                         containerName: ctName,
                         info: ctConfig.node ? {
@@ -23395,7 +23401,7 @@ async function loadWolfDiskCluster() {
                 } catch (_) {
                     containerEntries.push({
                         nodeId: node.id, nodeName: ctName, hostName: node.hostname || node.name || node.id,
-                        online: true, installed: true, status: wdSvc(ct),
+                        online: true, installed: true, status: wdSvc(ct), version: null,
                         memberType: ctRuntime, containerName: ctName,
                         info: null, wdClusterName: null, mounts: [], containers: [],
                     });
