@@ -23794,6 +23794,20 @@ async function wdDiagnose() {
         if (bPort === 8553) issues.push('Port 8553 is used by WolfStack — pick a different port');
     }
 
+    // Check discovery port conflicts
+    if (discovery) {
+        var dPort = discovery.match(/:(\d+)$/);
+        if (dPort) {
+            var dp = parseInt(dPort[1]);
+            if (dp === 9501) issues.push('Discovery port 9501 conflicts with MinIO — use 8551 instead');
+        }
+    }
+
+    // Hint about common runtime failures
+    if (issues.length === 0) {
+        warnings.push('If the service still fails to start, check: (1) FUSE is installed (apt install fuse3), (2) /dev/fuse exists, (3) no stale mount at ' + (mountPath || '/mnt/wolfdisk') + ' (run: fusermount -u ' + (mountPath || '/mnt/wolfdisk') + ')');
+    }
+
     // Render report
     var html = '<div style="border:1px solid var(--border); border-radius:8px; padding:16px; margin-bottom:16px; background:var(--bg-secondary);">';
     html += '<div style="font-size:14px; font-weight:600; color:var(--text-primary); margin-bottom:12px;">Diagnosis Report</div>';
@@ -23819,10 +23833,11 @@ async function wdDiagnose() {
     if (issues.length === 0 && warnings.length === 0) {
         html += '<div style="font-size:13px; color:var(--success); font-weight:600;">Everything looks good!</div>';
     }
-    html += '<div style="margin-top:10px; text-align:right;"><button class="btn btn-sm" onclick="this.closest(\'div[style*=border-radius\\:8px]\').remove()">Close</button></div>';
+    html += '<div style="margin-top:10px; text-align:right;"><button class="btn btn-sm" onclick="document.getElementById(\'wd-diagnose-area\').innerHTML=\'\'">Dismiss</button></div>';
     html += '</div>';
 
-    bodyEl.insertAdjacentHTML('afterbegin', html);
+    var diagArea = document.getElementById('wd-diagnose-area');
+    if (diagArea) diagArea.innerHTML = html;
 }
 
 // Collect peers from the picker (checkboxes + manual textarea)
@@ -23995,6 +24010,8 @@ async function wdOpenConfig(mid) {
     var isInstall = !!wdInstallMode;
     titleEl.textContent = (isInstall ? 'Install WolfDisk \u2014 ' : 'WolfDisk Configuration \u2014 ') + name + typeLabel;
     bodyEl.innerHTML = '<div style="text-align:center; padding:20px; color:var(--text-muted);">Loading configuration...</div>';
+    var diagArea = document.getElementById('wd-diagnose-area');
+    if (diagArea) diagArea.innerHTML = '';
     modal.style.display = 'flex';
 
     // Update modal buttons based on mode
@@ -24022,7 +24039,7 @@ async function wdOpenConfig(mid) {
             html += '<div style="margin-bottom:16px;">';
             html += '<div style="font-size:13px; font-weight:600; color:var(--text-primary); margin-bottom:4px;">' + section.label + '</div>';
             if (section.description) html += '<div style="font-size:11px; color:var(--text-muted); margin-bottom:10px;">' + section.description + '</div>';
-            html += '<div style="display:grid; grid-template-columns:1fr 1fr; gap:10px 16px;">';
+            html += '<div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(220px, 1fr)); gap:10px 16px;">';
             for (var fi = 0; fi < section.fields.length; fi++) {
                 var f = section.fields[fi];
                 var raw = config[section.key] ? config[section.key][f.key] : undefined;

@@ -1222,6 +1222,20 @@ pub fn provider_action(name: &str, action: &str) -> Result<String, String> {
         if !Path::new(config_path).exists() {
             return Err("WolfDisk config not found at /etc/wolfdisk/config.toml — configure WolfDisk first".to_string());
         }
+        // Check FUSE is available
+        if !Path::new("/dev/fuse").exists() {
+            // Try loading the module
+            let _ = Command::new("modprobe").arg("fuse").output();
+            if !Path::new("/dev/fuse").exists() {
+                return Err("FUSE is not available (/dev/fuse missing). Install fuse: apt install fuse3 or modprobe fuse".to_string());
+            }
+        }
+        // Ensure user_allow_other in /etc/fuse.conf
+        if let Ok(fuse_conf) = std::fs::read_to_string("/etc/fuse.conf") {
+            if !fuse_conf.lines().any(|l| l.trim() == "user_allow_other") {
+                let _ = std::fs::write("/etc/fuse.conf", format!("{}\nuser_allow_other\n", fuse_conf.trim()));
+            }
+        }
         // Read mount path from config and ensure directory exists
         if let Ok(content) = std::fs::read_to_string(config_path) {
             if let Ok(config) = content.parse::<toml::Value>() {
@@ -1230,6 +1244,8 @@ pub fn provider_action(name: &str, action: &str) -> Result<String, String> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("/mnt/wolfdisk");
                 let _ = std::fs::create_dir_all(mount_path);
+                // Clean up stale FUSE mount if present
+                let _ = Command::new("fusermount").args(["-u", mount_path]).output();
                 let data_dir = config.get("node")
                     .and_then(|n| n.get("data_dir"))
                     .and_then(|v| v.as_str())
