@@ -5258,6 +5258,9 @@ pub struct PveStorage {
     pub available_bytes: u64,
     /// Which content types are allowed (e.g. "images", "rootdir", "vztmpl", "iso")
     pub content: Vec<String>,
+    /// Filesystem path for this storage (resolved from /etc/pve/storage.cfg)
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 /// List available Proxmox storage via `pvesm status`
@@ -5285,7 +5288,8 @@ pub fn pvesm_list_storage() -> Vec<PveStorage> {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
-            Some(PveStorage { id, storage_type, status, total_bytes: total, used_bytes: used, available_bytes: avail, content })
+            let path = pvesm_resolve_path(&id);
+            Some(PveStorage { id, storage_type, status, total_bytes: total, used_bytes: used, available_bytes: avail, content, path })
         }).collect();
     }
 
@@ -5312,7 +5316,8 @@ fn pvesm_list_storage_text() -> Vec<PveStorage> {
 
         // Get content types from `pvesm show <storage>`
         let content = pvesm_get_content(&id);
-        Some(PveStorage { id, storage_type, status, total_bytes: total, used_bytes: used, available_bytes: avail, content })
+        let path = pvesm_resolve_path(&id);
+        Some(PveStorage { id, storage_type, status, total_bytes: total, used_bytes: used, available_bytes: avail, content, path })
     }).collect()
 }
 
@@ -5337,6 +5342,81 @@ fn pvesm_get_content(storage_id: &str) -> Vec<String> {
         }
     }
     vec![]
+}
+
+/// Resolve a Proxmox storage ID to its filesystem path from /etc/pve/storage.cfg.
+/// For ZFS pools, the path is /<pool-name> (the ZFS mountpoint).
+/// For dir-type storage, the path is read from the config.
+/// The built-in "local" storage is always at /var/lib/vz.
+pub fn pvesm_resolve_path(storage_id: &str) -> Option<String> {
+    if storage_id == "local" {
+        return Some("/var/lib/vz".to_string());
+    }
+    if let Ok(cfg) = std::fs::read_to_string("/etc/pve/storage.cfg") {
+        let mut in_section = false;
+        let mut section_type = String::new();
+        let mut found_path: Option<String> = None;
+        let mut found_pool: Option<String> = None;
+        for line in cfg.lines() {
+            let trimmed = line.trim();
+            if !trimmed.starts_with('#') && trimmed.contains(':') && !trimmed.starts_with('\t') && !trimmed.starts_with(' ') {
+                // Emit result for previous section if it was ours
+                if in_section {
+                    break;
+                }
+                let parts: Vec<&str> = trimmed.splitn(2, ':').collect();
+                section_type = parts[0].trim().to_string();
+                in_section = parts.get(1).map(|s| s.trim()) == Some(storage_id);
+                found_path = None;
+                found_pool = None;
+            } else if in_section {
+                if let Some(val) = trimmed.strip_prefix("path") {
+                    found_path = Some(val.trim().to_string());
+                } else if let Some(val) = trimmed.strip_prefix("pool") {
+                    found_pool = Some(val.trim().to_string());
+                }
+            }
+        }
+        if in_section {
+            // dir-type storages have an explicit path
+            if let Some(p) = found_path {
+                return Some(p);
+            }
+            // ZFS storages: the pool name is the ZFS dataset, mountpoint is /<pool>
+            if section_type == "zfspool" || section_type == "zfs" {
+                if let Some(pool) = found_pool {
+                    // Try to get the actual mountpoint from `zfs get mountpoint`
+                    if let Ok(output) = Command::new("zfs")
+                        .args(["get", "-H", "-o", "value", "mountpoint", &pool])
+                        .output()
+                    {
+                        if output.status.success() {
+                            let mp = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                            if !mp.is_empty() && mp.starts_with('/') {
+                                return Some(mp);
+                            }
+                        }
+                    }
+                    // Fallback: ZFS default mountpoint is /<pool>
+                    return Some(format!("/{}", pool));
+                }
+                // No pool specified — storage ID is likely the pool name
+                if let Ok(output) = Command::new("zfs")
+                    .args(["get", "-H", "-o", "value", "mountpoint", storage_id])
+                    .output()
+                {
+                    if output.status.success() {
+                        let mp = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        if !mp.is_empty() && mp.starts_with('/') {
+                            return Some(mp);
+                        }
+                    }
+                }
+                return Some(format!("/{}", storage_id));
+            }
+        }
+    }
+    None
 }
 
 /// Get next available VMID from Proxmox

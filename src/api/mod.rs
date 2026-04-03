@@ -3129,6 +3129,7 @@ pub async fn storage_list(req: HttpRequest, state: web::Data<AppState>) -> HttpR
                 "used_bytes": s.used_bytes,
                 "available_bytes": s.available_bytes,
                 "content": s.content,
+                "path": s.path,
             })
         }).collect();
         HttpResponse::Ok().json(serde_json::json!({

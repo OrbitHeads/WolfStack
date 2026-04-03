@@ -597,8 +597,19 @@ pub fn prepare_install(
 
             let wolfnet_ip = crate::containers::next_available_wolfnet_ip();
 
-            // Compute storage base for volume remapping
-            let vol_base = storage_path.map(|sp| format!("{}/appstore/{}", sp.trim_end_matches('/'), container_name));
+            // Compute storage base for volume remapping.
+            // On Proxmox, storage_path may be a storage ID (e.g. "R1-SDD") — resolve to filesystem path.
+            let vol_base = storage_path.map(|sp| {
+                let resolved = if sp.starts_with('/') {
+                    sp.to_string()
+                } else if crate::containers::is_proxmox() {
+                    crate::containers::pvesm_resolve_path(sp)
+                        .unwrap_or_else(|| format!("/{}", sp))
+                } else {
+                    format!("/{}", sp)
+                };
+                format!("{}/appstore/{}", resolved.trim_end_matches('/'), container_name)
+            });
 
             script.push_str(&format!(
                 "echo -e '\\033[1;36m━━━ Installing {} via Docker ━━━\\033[0m'\n\n",
