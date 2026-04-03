@@ -86,13 +86,13 @@ pub fn bootstrap_config(target: &ExecTarget, component: &str) -> Result<String, 
 [node]
 id = "node-1"
 role = "auto"
-bind = "0.0.0.0:9500"
+bind = "0.0.0.0:8550"
 data_dir = "/var/lib/wolfdisk"
 
 [cluster]
 name = "default"
 peers = []
-discovery = "udp://0.0.0.0:9501"
+discovery = "udp://0.0.0.0:8551"
 
 [replication]
 mode = "shared"

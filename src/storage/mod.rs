@@ -847,7 +847,7 @@ fn read_wolfdisk_info() -> Option<WolfDiskInfo> {
         replication_factor: replication.and_then(|r| r.get("factor")).and_then(|v| v.as_integer()).unwrap_or(3) as usize,
         data_dir: node.get("data_dir").and_then(|v| v.as_str()).unwrap_or("/var/lib/wolfdisk").to_string(),
         mount_path: mount.and_then(|m| m.get("path")).and_then(|v| v.as_str()).unwrap_or("/mnt/wolfdisk").to_string(),
-        bind: node.get("bind").and_then(|v| v.as_str()).unwrap_or("0.0.0.0:9500").to_string(),
+        bind: node.get("bind").and_then(|v| v.as_str()).unwrap_or("0.0.0.0:8550").to_string(),
         peers,
         s3_enabled: s3.and_then(|s| s.get("enabled")).and_then(|v| v.as_bool()).unwrap_or(false),
         s3_bind: s3.and_then(|s| s.get("bind")).and_then(|v| v.as_str()).map(String::from),

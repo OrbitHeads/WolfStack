@@ -8612,13 +8612,13 @@ function getTomlSchema(component) {
             { key: 'node', label: 'Node', description: 'Identity and network settings for this WolfDisk node in the cluster.', fields: [
                 { key: 'id', label: 'Node ID', type: 'string', default: '', placeholder: 'node-1', help: 'Unique name for this node — must be different on each server in the cluster' },
                 { key: 'role', label: 'Role', type: 'select', default: 'auto', options: ['auto', 'leader', 'follower', 'client'], help: 'auto: automatically elect leader/follower roles. leader: force this node as leader. follower: read-only replica. client: mount-only, no local storage' },
-                { key: 'bind', label: 'Bind Address', type: 'string', default: '0.0.0.0:9500', placeholder: '0.0.0.0:9500', help: 'IP and port this node listens on. Use 0.0.0.0 to listen on all interfaces, or a specific IP to restrict access' },
+                { key: 'bind', label: 'Bind Address', type: 'string', default: '0.0.0.0:8550', placeholder: '0.0.0.0:8550', help: 'IP and port this node listens on. Use 0.0.0.0 to listen on all interfaces, or a specific IP to restrict access' },
                 { key: 'data_dir', label: 'Data Directory', type: 'string', default: '/var/lib/wolfdisk', placeholder: '/var/lib/wolfdisk', help: 'Where WolfDisk stores its chunk data, index, and WAL files on disk' },
             ]},
             { key: 'cluster', label: 'Cluster', description: 'How this node discovers and connects to other WolfDisk nodes.', fields: [
                 { key: 'name', label: 'Cluster Name', type: 'string', default: 'default', placeholder: 'default', help: 'Name for this WolfDisk cluster. Nodes with the same cluster name form a storage pool together. Use different names to create separate WolfDisk clusters (e.g. "fast-nvme", "bulk-hdd")' },
-                { key: 'peers', label: 'Cluster Peers', type: 'array', help: 'List of other WolfDisk nodes to connect to (one host:port per line, e.g. 192.168.1.10:9500). Leave empty if using auto-discovery' },
-                { key: 'discovery', label: 'Discovery Address', type: 'string', default: 'udp://0.0.0.0:9501', placeholder: 'udp://0.0.0.0:9501', help: 'UDP multicast address for automatic peer discovery on the local network. Nodes on the same subnet will find each other automatically' },
+                { key: 'peers', label: 'Cluster Peers', type: 'array', help: 'List of other WolfDisk nodes to connect to (one host:port per line, e.g. 192.168.1.10:8550). Leave empty if using auto-discovery' },
+                { key: 'discovery', label: 'Discovery Address', type: 'string', default: 'udp://0.0.0.0:8551', placeholder: 'udp://0.0.0.0:8551', help: 'UDP multicast address for automatic peer discovery on the local network. Nodes on the same subnet will find each other automatically' },
             ]},
             { key: 'replication', label: 'Replication', description: 'Controls how data is replicated and split across nodes for redundancy and performance.', fields: [
                 { key: 'mode', label: 'Replication Mode', type: 'select', default: 'shared', options: ['shared', 'replicated'], help: 'shared: chunks are distributed across nodes (more space, less redundancy). replicated: every node has a full copy (more redundancy, uses more disk)' },
@@ -23371,7 +23371,7 @@ async function loadWolfDiskCluster() {
                             replication_factor: ctConfig.replication ? (ctConfig.replication.factor || 3) : 3,
                             data_dir: ctConfig.node.data_dir || '/var/lib/wolfdisk',
                             mount_path: ctConfig.mount ? (ctConfig.mount.path || '/mnt/wolfdisk') : '/mnt/wolfdisk',
-                            bind: ctConfig.node.bind || '0.0.0.0:9500',
+                            bind: ctConfig.node.bind || '0.0.0.0:8550',
                             peers: ctConfig.cluster ? (ctConfig.cluster.peers || []) : [],
                             s3_enabled: ctConfig.s3 ? (ctConfig.s3.enabled || false) : false,
                             s3_bind: ctConfig.s3 ? ctConfig.s3.bind : null,
@@ -23792,7 +23792,7 @@ async function wdJoinCluster(mid, clusterName) {
     for (var i = 0; i < wdClusterData.length; i++) {
         var nd = wdClusterData[i];
         if (nd.wdClusterName === clusterName && nd.installed && nd.info && nd.info.bind) {
-            var bindPort = nd.info.bind.split(':').pop() || '9500';
+            var bindPort = nd.info.bind.split(':').pop() || '8550';
             if (nd.wolfnetIp) {
                 // Prefer WolfNet IP with the WolfDisk port
                 peers.push(nd.wolfnetIp + ':' + bindPort);
