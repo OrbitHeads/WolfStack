@@ -23880,7 +23880,8 @@ function wdCollectPeers() {
             }
         }
     }
-    return peers;
+    // Filter out 0.0.0.0 entries — these are useless as peer addresses
+    return peers.filter(function(p) { return !p.startsWith('0.0.0.0'); });
 }
 
 function wdDetailItem(label, value) {
@@ -23975,12 +23976,15 @@ async function wdJoinCluster(mid, clusterName) {
         var nd = wdClusterData[i];
         if (nd.wdClusterName === clusterName && nd.installed && nd.info && nd.info.bind) {
             var bindPort = nd.info.bind.split(':').pop() || '8550';
+            var peerAddr = null;
             if (nd.wolfnetIp) {
-                // Prefer WolfNet IP with the WolfDisk port
-                peers.push(nd.wolfnetIp + ':' + bindPort);
-            } else {
-                peers.push(nd.info.bind);
+                peerAddr = nd.wolfnetIp + ':' + bindPort;
+            } else if (nd.nodeAddress && nd.nodeAddress !== '0.0.0.0') {
+                peerAddr = nd.nodeAddress + ':' + bindPort;
+            } else if (!nd.info.bind.startsWith('0.0.0.0')) {
+                peerAddr = nd.info.bind;
             }
+            if (peerAddr) peers.push(peerAddr);
         }
     }
     // Get replication settings from the first node in the cluster
@@ -24098,7 +24102,18 @@ async function wdOpenConfig(mid) {
                     for (var ki = 0; ki < wdClusterData.length; ki++) {
                         var kn = wdClusterData[ki];
                         if (!kn.online) continue;
-                        var addr = kn.wolfnetIp ? (kn.wolfnetIp + ':8550') : (kn.info ? kn.info.bind : (kn.nodeAddress ? kn.nodeAddress + ':8550' : null));
+                        // Build peer address: prefer WolfNet IP, then node's real IP, never use 0.0.0.0
+                        var bindPort = kn.info ? (kn.info.bind || '').split(':').pop() || '8550' : '8550';
+                        var addr;
+                        if (kn.wolfnetIp) {
+                            addr = kn.wolfnetIp + ':' + bindPort;
+                        } else if (kn.nodeAddress && kn.nodeAddress !== '0.0.0.0') {
+                            addr = kn.nodeAddress + ':' + bindPort;
+                        } else if (kn.info && kn.info.bind && !kn.info.bind.startsWith('0.0.0.0')) {
+                            addr = kn.info.bind;
+                        } else {
+                            addr = null; // skip — can't determine a real address
+                        }
                         if (!addr) continue;
                         // Don't show self in peer list
                         if (kn.nodeId === wdParseMemberId(mid).nodeId && kn.memberType === 'host') continue;
