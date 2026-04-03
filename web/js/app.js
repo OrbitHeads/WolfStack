@@ -23712,6 +23712,141 @@ function renderWolfDiskNodeDetail(n) {
     return html;
 }
 
+// Diagnose WolfDisk config for common issues
+async function wdDiagnose() {
+    if (!wdConfigNodeId) return;
+    var mid = wdConfigNodeId;
+    var bodyEl = document.getElementById('wd-config-modal-body');
+
+    // Read current form values
+    var bind = (document.getElementById('wd-cfg-node-bind') || {}).value || '';
+    var dataDir = (document.getElementById('wd-cfg-node-data_dir') || {}).value || '';
+    var mountPath = (document.getElementById('wd-cfg-mount-path') || {}).value || '';
+    var nodeId = (document.getElementById('wd-cfg-node-id') || {}).value || '';
+    var discovery = (document.getElementById('wd-cfg-cluster-discovery') || {}).value || '';
+    var peers = wdCollectPeers();
+    var allowOther = document.getElementById('wd-cfg-mount-allow_other');
+
+    var issues = [];
+    var warnings = [];
+    var ok = [];
+
+    // Check node ID
+    if (!nodeId) issues.push('Node ID is empty — each node needs a unique ID');
+    else ok.push('Node ID: ' + nodeId);
+
+    // Check bind address format
+    if (!bind) {
+        issues.push('Bind address is empty — WolfDisk needs an address:port to listen on');
+    } else if (bind.indexOf(':') < 0) {
+        issues.push('Bind address "' + bind + '" is missing the port — use format like 0.0.0.0:8550');
+    } else {
+        var port = parseInt(bind.split(':').pop());
+        if (isNaN(port) || port < 1 || port > 65535) issues.push('Bind port is invalid: ' + bind);
+        else ok.push('Bind address: ' + bind);
+    }
+
+    // Check data dir
+    if (!dataDir) issues.push('Data directory is empty');
+    else ok.push('Data directory: ' + dataDir);
+
+    // Check mount path
+    if (!mountPath) issues.push('Mount path is empty');
+    else ok.push('Mount path: ' + mountPath);
+
+    // Check peers format
+    for (var i = 0; i < peers.length; i++) {
+        var p = peers[i];
+        if (p.indexOf(':') < 0) {
+            issues.push('Peer "' + p + '" is missing the port — should be host:8550');
+        }
+    }
+    if (peers.length > 0) ok.push(peers.length + ' peer(s) configured');
+    else warnings.push('No peers configured — this node will run standalone unless discovery finds others');
+
+    // Check allow_other
+    if (allowOther && !allowOther.checked) {
+        warnings.push('Allow Other Users is off — containers and non-root apps won\'t be able to access the mount');
+    }
+
+    // Remote checks — try to query the target node for runtime issues
+    try {
+        var statusResp = await fetch(wdApiUrl(mid, '/api/storage/providers'));
+        if (statusResp.ok) {
+            var providers = await statusResp.json();
+            var wd = (Array.isArray(providers) ? providers : []).find(function(p) { return p.name === 'wolfdisk'; });
+            if (wd) {
+                if (!wd.installed) warnings.push('WolfDisk binary is not installed on this node');
+                else ok.push('WolfDisk binary: installed');
+                if (wd.status === 'running') ok.push('Service: running');
+                else if (wd.status === 'stopped') warnings.push('Service is stopped');
+                else if (wd.status === 'failed') issues.push('Service has failed — check journal: journalctl -u wolfdisk -n 20');
+            }
+        }
+    } catch (_) {
+        warnings.push('Could not reach node to check service status');
+    }
+
+    // Check if bind port conflicts with known services
+    if (bind) {
+        var bPort = parseInt(bind.split(':').pop());
+        if (bPort === 9500 || bPort === 9501) issues.push('Port ' + bPort + ' conflicts with MinIO — use 8550/8551 instead');
+        if (bPort === 8553) issues.push('Port 8553 is used by WolfStack — pick a different port');
+    }
+
+    // Render report
+    var html = '<div style="border:1px solid var(--border); border-radius:8px; padding:16px; margin-bottom:16px; background:var(--bg-secondary);">';
+    html += '<div style="font-size:14px; font-weight:600; color:var(--text-primary); margin-bottom:12px;">Diagnosis Report</div>';
+
+    if (issues.length > 0) {
+        html += '<div style="margin-bottom:10px;"><span style="font-weight:600; color:var(--danger);">Issues (' + issues.length + ')</span></div>';
+        for (var i = 0; i < issues.length; i++) {
+            html += '<div style="padding:4px 8px; margin-bottom:4px; border-radius:4px; font-size:12px; background:rgba(239,68,68,0.1); color:var(--danger);">\u2716 ' + issues[i] + '</div>';
+        }
+    }
+    if (warnings.length > 0) {
+        html += '<div style="margin-bottom:10px; margin-top:8px;"><span style="font-weight:600; color:var(--warning);">Warnings (' + warnings.length + ')</span></div>';
+        for (var i = 0; i < warnings.length; i++) {
+            html += '<div style="padding:4px 8px; margin-bottom:4px; border-radius:4px; font-size:12px; background:rgba(245,158,11,0.1); color:var(--warning);">\u26a0 ' + warnings[i] + '</div>';
+        }
+    }
+    if (ok.length > 0) {
+        html += '<div style="margin-bottom:10px; margin-top:8px;"><span style="font-weight:600; color:var(--success);">OK (' + ok.length + ')</span></div>';
+        for (var i = 0; i < ok.length; i++) {
+            html += '<div style="padding:4px 8px; margin-bottom:4px; border-radius:4px; font-size:12px; color:var(--success);">\u2714 ' + ok[i] + '</div>';
+        }
+    }
+    if (issues.length === 0 && warnings.length === 0) {
+        html += '<div style="font-size:13px; color:var(--success); font-weight:600;">Everything looks good!</div>';
+    }
+    html += '<div style="margin-top:10px; text-align:right;"><button class="btn btn-sm" onclick="this.closest(\'div[style*=border-radius\\:8px]\').remove()">Close</button></div>';
+    html += '</div>';
+
+    bodyEl.insertAdjacentHTML('afterbegin', html);
+}
+
+// Collect peers from the picker (checkboxes + manual textarea)
+function wdCollectPeers() {
+    var peers = [];
+    var checks = document.querySelectorAll('.wd-peer-checkbox:checked');
+    for (var i = 0; i < checks.length; i++) {
+        peers.push(checks[i].getAttribute('data-addr'));
+    }
+    var manual = document.getElementById('wd-cfg-cluster-peers-manual');
+    if (manual && manual.value.trim()) {
+        var lines = manual.value.split('\n');
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i].trim();
+            if (line) {
+                // Auto-add default port if missing
+                if (line.indexOf(':') < 0) line += ':8550';
+                peers.push(line);
+            }
+        }
+    }
+    return peers;
+}
+
 function wdDetailItem(label, value) {
     return '<div><span style="color:var(--text-muted);">' + label + ':</span> <strong style="color:var(--text-primary);">' + value + '</strong></div>';
 }
@@ -23812,9 +23947,19 @@ async function wdJoinCluster(mid, clusterName) {
     // Pre-fill cluster name
     var nameEl = document.getElementById('wd-cfg-cluster-name');
     if (nameEl) nameEl.value = clusterName;
-    // Pre-fill peers
-    var peersEl = document.getElementById('wd-cfg-cluster-peers');
-    if (peersEl) peersEl.value = peers.join('\n');
+    // Pre-fill peers — check matching checkboxes and put rest in manual field
+    var checkboxes = document.querySelectorAll('.wd-peer-checkbox');
+    var checkedAddrs = [];
+    for (var ci = 0; ci < checkboxes.length; ci++) {
+        var cbAddr = checkboxes[ci].getAttribute('data-addr');
+        if (peers.indexOf(cbAddr) >= 0) {
+            checkboxes[ci].checked = true;
+            checkedAddrs.push(cbAddr);
+        }
+    }
+    var manualPeers = peers.filter(function(p) { return checkedAddrs.indexOf(p) < 0; });
+    var manualEl = document.getElementById('wd-cfg-cluster-peers-manual');
+    if (manualEl && manualPeers.length > 0) manualEl.value = manualPeers.join('\n');
     // Pre-fill replication to match
     var modeEl = document.getElementById('wd-cfg-replication-mode');
     if (modeEl) modeEl.value = repMode;
@@ -23859,7 +24004,8 @@ async function wdOpenConfig(mid) {
             btnContainer.innerHTML = '<button class="btn btn-sm" onclick="wdCloseConfig()">Cancel</button>' +
                 '<button class="btn btn-sm btn-primary" onclick="wdSaveAndInstall()">Save & Install</button>';
         } else {
-            btnContainer.innerHTML = '<button class="btn btn-sm" onclick="wdCloseConfig()">Cancel</button>' +
+            btnContainer.innerHTML = '<button class="btn btn-sm" onclick="wdDiagnose()" style="margin-right:auto;">Diagnose</button>' +
+                '<button class="btn btn-sm" onclick="wdCloseConfig()">Cancel</button>' +
                 '<button class="btn btn-sm" onclick="wdSaveConfig(false)" style="border-color:var(--accent); color:var(--accent);">Save Only</button>' +
                 '<button class="btn btn-sm btn-primary" onclick="wdSaveConfig(true)">Save & Start</button>';
         }
@@ -23894,6 +24040,45 @@ async function wdOpenConfig(mid) {
                     html += '</select>';
                 } else if (f.type === 'boolean') {
                     html += '<label style="display:flex; align-items:center; gap:6px; cursor:pointer;"><input type="checkbox" id="' + inputId + '"' + (val ? ' checked' : '') + '> <span style="font-size:12px; color:var(--text-primary);">Enabled</span></label>';
+                } else if (f.type === 'array' && f.key === 'peers') {
+                    // Peer picker: show known cluster nodes as checkboxes + manual entry
+                    var currentPeers = Array.isArray(val) ? val : (val ? val.split('\n').filter(function(s){return s.trim();}) : []);
+                    html += '<div id="' + inputId + '-picker" style="border:1px solid var(--border); border-radius:6px; padding:8px; max-height:160px; overflow-y:auto; background:var(--bg-input);">';
+                    // Gather all known nodes with their addresses
+                    var knownNodes = [];
+                    for (var ki = 0; ki < wdClusterData.length; ki++) {
+                        var kn = wdClusterData[ki];
+                        if (!kn.online) continue;
+                        var addr = kn.wolfnetIp ? (kn.wolfnetIp + ':8550') : (kn.info ? kn.info.bind : (kn.nodeAddress ? kn.nodeAddress + ':8550' : null));
+                        if (!addr) continue;
+                        // Don't show self in peer list
+                        if (kn.nodeId === wdParseMemberId(mid).nodeId && kn.memberType === 'host') continue;
+                        knownNodes.push({ name: kn.nodeName, addr: addr, wolfnet: !!kn.wolfnetIp, type: kn.memberType || 'host' });
+                    }
+                    if (knownNodes.length > 0) {
+                        for (var ki = 0; ki < knownNodes.length; ki++) {
+                            var kn = knownNodes[ki];
+                            var checked = currentPeers.some(function(p){ return p.trim() === kn.addr; }) ? ' checked' : '';
+                            var wnTag = kn.wolfnet ? ' <span style="font-size:9px; color:var(--success);">WolfNet</span>' : '';
+                            html += '<label style="display:flex; align-items:center; gap:6px; padding:3px 4px; cursor:pointer; font-size:12px;">';
+                            html += '<input type="checkbox" class="wd-peer-checkbox" data-addr="' + kn.addr + '"' + checked + '>';
+                            html += '<span style="color:var(--text-primary);">' + kn.name + '</span>';
+                            html += '<span style="color:var(--text-muted); font-family:monospace; font-size:11px;">' + kn.addr + '</span>' + wnTag;
+                            html += '</label>';
+                        }
+                    } else {
+                        html += '<div style="font-size:11px; color:var(--text-muted); padding:4px;">No other online nodes found in this cluster.</div>';
+                    }
+                    // Manual entry for external peers
+                    html += '<div style="margin-top:6px; border-top:1px solid var(--border); padding-top:6px;">';
+                    html += '<label style="font-size:10px; color:var(--text-muted); display:block; margin-bottom:2px;">Additional peers (one per line, host:port)</label>';
+                    // Filter out known addresses from manual field
+                    var knownAddrs = knownNodes.map(function(k){ return k.addr; });
+                    var manualPeers = currentPeers.filter(function(p){ return p.trim() && knownAddrs.indexOf(p.trim()) < 0; });
+                    html += '<textarea id="' + inputId + '-manual" class="form-control" rows="2" style="font-size:11px; font-family:monospace;" placeholder="e.g. 192.168.1.10:8550">' + manualPeers.join('\n') + '</textarea>';
+                    html += '</div></div>';
+                    // Hidden field to collect final value
+                    html += '<input type="hidden" id="' + inputId + '">';
                 } else if (f.type === 'array') {
                     html += '<textarea id="' + inputId + '" class="form-control" rows="3" style="font-size:12px; font-family:monospace;" placeholder="One per line">' + (Array.isArray(val) ? val.join('\n') : (val || '')) + '</textarea>';
                 } else if (f.type === 'number') {
@@ -23945,6 +24130,7 @@ async function wdSaveAndInstall() {
             if (!el) continue;
             if (f.type === 'boolean') config[section.key][f.key] = el.checked;
             else if (f.type === 'number') config[section.key][f.key] = el.value ? Number(el.value) : (f.default || 0);
+            else if (f.type === 'array' && f.key === 'peers') config[section.key][f.key] = wdCollectPeers();
             else if (f.type === 'array') config[section.key][f.key] = el.value.split('\n').map(s => s.trim()).filter(s => s);
             else config[section.key][f.key] = el.value || f.default || '';
         }
@@ -23998,6 +24184,7 @@ async function wdSaveConfig(startAfter) {
             if (!el) continue;
             if (f.type === 'boolean') config[section.key][f.key] = el.checked;
             else if (f.type === 'number') config[section.key][f.key] = el.value ? Number(el.value) : (f.default || 0);
+            else if (f.type === 'array' && f.key === 'peers') config[section.key][f.key] = wdCollectPeers();
             else if (f.type === 'array') {
                 config[section.key][f.key] = el.value.split('\n').map(s => s.trim()).filter(s => s);
             } else {
