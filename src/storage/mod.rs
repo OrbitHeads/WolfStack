@@ -1225,7 +1225,7 @@ pub fn install_provider(name: &str) -> Result<String, String> {
             _ => ("apt-get", "s3fs"),
         },
         "wolfdisk" => {
-            return Err("WolfDisk must be installed separately. See https://wolf.uk.com/wolfdisk".to_string());
+            return crate::installer::install_component(crate::installer::Component::WolfDisk);
         },
         _ => return Err(format!("Unknown provider: {}", name)),
     };
