@@ -23110,13 +23110,13 @@ async function loadStorageProviders() {
                 <div style="background:var(--bg-tertiary, rgba(0,0,0,0.15)); border-radius:6px; padding:8px 10px; margin-bottom:10px; font-size:12px;">
                     <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
                         <span style="background:${roleColors[wd.role] || '#6b7280'}; color:#fff; padding:1px 8px; border-radius:10px; font-size:11px; font-weight:600;">${roleLabels[wd.role] || wd.role}</span>
-                        <span style="color:var(--text-muted);">Node: <strong style="color:var(--text)">${wd.node_id}</strong></span>
+                        <span style="color:var(--text-muted);">Node: <strong style="color:var(--text-primary)">${wd.node_id}</strong></span>
                     </div>
                     <div style="display:flex; flex-wrap:wrap; gap:6px 16px; color:var(--text-muted); font-size:11px; margin-top:4px;">
                         ${features.length ? `<span>${features.join(' · ')}</span>` : ''}
-                        <span>Mount: <strong style="color:var(--text)">${wd.mount_path}</strong></span>
-                        <span>Data: <strong style="color:var(--text)">${wd.data_dir}</strong></span>
-                        <span>Bind: <strong style="color:var(--text)">${wd.bind}</strong></span>
+                        <span>Mount: <strong style="color:var(--text-primary)">${wd.mount_path}</strong></span>
+                        <span>Data: <strong style="color:var(--text-primary)">${wd.data_dir}</strong></span>
+                        <span>Bind: <strong style="color:var(--text-primary)">${wd.bind}</strong></span>
                     </div>
                 </div>`;
             }
@@ -23524,15 +23524,15 @@ function renderWolfDiskClusterSection(name, nodes) {
     // Section header
     html += '<div style="padding:16px 20px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:12px; flex-wrap:wrap;">';
     html += '<span style="font-size:18px;">🐺</span>';
-    html += '<span style="font-size:16px; font-weight:700; color:var(--text);">' + (name === 'default' ? 'Default Cluster' : name) + '</span>';
+    html += '<span style="font-size:16px; font-weight:700; color:var(--text-primary);">' + (name === 'default' ? 'Default Cluster' : name) + '</span>';
     html += '<span style="font-size:12px; color:var(--text-muted); margin-left:4px;">' + topoParts.join(' \u00b7 ') + '</span>';
     html += '</div>';
 
     // Topology bar
     html += '<div style="padding:10px 20px; background:var(--bg-tertiary, rgba(0,0,0,0.1)); font-size:11px; color:var(--text-muted); display:flex; flex-wrap:wrap; gap:12px;">';
-    if (leader) html += '<span>\u{1f451} Leader: <strong style="color:var(--text);">' + leader.nodeName + '</strong> (' + leader.info.bind + ')</span>';
-    if (followers.length) html += '<span>\u{1f4e6} Followers: <strong style="color:var(--text);">' + followers.map(f => f.nodeName).join(', ') + '</strong></span>';
-    if (clients.length) html += '<span>\u{1f4bb} Clients: <strong style="color:var(--text);">' + clients.map(c => c.nodeName).join(', ') + '</strong></span>';
+    if (leader) html += '<span>\u{1f451} Leader: <strong style="color:var(--text-primary);">' + leader.nodeName + '</strong> (' + leader.info.bind + ')</span>';
+    if (followers.length) html += '<span>\u{1f4e6} Followers: <strong style="color:var(--text-primary);">' + followers.map(f => f.nodeName).join(', ') + '</strong></span>';
+    if (clients.length) html += '<span>\u{1f4bb} Clients: <strong style="color:var(--text-primary);">' + clients.map(c => c.nodeName).join(', ') + '</strong></span>';
     html += '</div>';
 
     // Node table
@@ -23567,7 +23567,7 @@ function renderWolfDiskUnassignedSection(nodes) {
     var html = '<div class="card" style="margin-bottom:16px;">';
     html += '<div style="padding:16px 20px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:12px;">';
     html += '<span style="font-size:18px;">📦</span>';
-    html += '<span style="font-size:16px; font-weight:700; color:var(--text);">Not in a WolfDisk cluster</span>';
+    html += '<span style="font-size:16px; font-weight:700; color:var(--text-primary);">Not in a WolfDisk cluster</span>';
     html += '<span style="font-size:12px; color:var(--text-muted);">' + nodes.length + ' member' + (nodes.length !== 1 ? 's' : '') + '</span>';
     html += '</div>';
 
@@ -23668,13 +23668,13 @@ function renderWolfDiskNodeDetail(n) {
 
     // Mounts section
     if (n.mounts.length > 0) {
-        html += '<div style="margin-bottom:10px;"><strong style="color:var(--text); font-size:11px; text-transform:uppercase; letter-spacing:0.5px;">Mounts</strong></div>';
+        html += '<div style="margin-bottom:10px;"><strong style="color:var(--text-primary); font-size:11px; text-transform:uppercase; letter-spacing:0.5px;">Mounts</strong></div>';
         for (var i = 0; i < n.mounts.length; i++) {
             var m = n.mounts[i];
             var mIcon = m.status === 'mounted' ? '\u2705' : '\u26ab';
             html += '<div style="display:flex; align-items:center; gap:8px; margin-bottom:4px; padding:4px 8px; background:var(--bg-secondary); border-radius:4px;">';
             html += '<span>' + mIcon + '</span>';
-            html += '<span style="flex:1; color:var(--text);">' + (m.mount_point || m.name) + '</span>';
+            html += '<span style="flex:1; color:var(--text-primary);">' + (m.mount_point || m.name) + '</span>';
             html += '<span style="color:var(--text-muted); font-size:11px;">' + m.status + '</span>';
             if (m.status === 'mounted') {
                 html += ' <button class="btn btn-sm" style="font-size:10px; padding:1px 6px; color:#ef4444;" onclick="wdMountAction(\'' + n.nodeId + '\',\'' + m.id + '\',\'unmount\')">Unmount</button>';
@@ -23687,13 +23687,13 @@ function renderWolfDiskNodeDetail(n) {
 
     // Containers section (only show for host-type members)
     if (n.memberType === 'host' && n.containers && n.containers.length > 0) {
-        html += '<div style="margin-top:10px; margin-bottom:6px;"><strong style="color:var(--text); font-size:11px; text-transform:uppercase; letter-spacing:0.5px;">Containers with WolfDisk</strong></div>';
+        html += '<div style="margin-top:10px; margin-bottom:6px;"><strong style="color:var(--text-primary); font-size:11px; text-transform:uppercase; letter-spacing:0.5px;">Containers with WolfDisk</strong></div>';
         for (var i = 0; i < n.containers.length; i++) {
             var c = n.containers[i];
             var cStatus = c.state || c.status || 'unknown';
             html += '<div style="display:flex; align-items:center; gap:8px; margin-bottom:4px; padding:4px 8px; background:var(--bg-secondary); border-radius:4px;">';
             html += '<span style="font-size:11px; background:' + (c._type === 'docker' ? '#2496ed' : '#e95420') + '; color:#fff; padding:1px 6px; border-radius:8px;">' + c._type.toUpperCase() + '</span>';
-            html += '<span style="color:var(--text);">' + (c.name || c.names || 'unnamed') + '</span>';
+            html += '<span style="color:var(--text-primary);">' + (c.name || c.names || 'unnamed') + '</span>';
             html += '<span style="color:var(--text-muted); font-size:11px; margin-left:auto;">' + cStatus + '</span>';
             html += '</div>';
         }
@@ -23708,7 +23708,7 @@ function renderWolfDiskNodeDetail(n) {
 }
 
 function wdDetailItem(label, value) {
-    return '<div><span style="color:var(--text-muted);">' + label + ':</span> <strong style="color:var(--text);">' + value + '</strong></div>';
+    return '<div><span style="color:var(--text-muted);">' + label + ':</span> <strong style="color:var(--text-primary);">' + value + '</strong></div>';
 }
 
 async function wdInstall(nodeId) {
@@ -23866,7 +23866,7 @@ async function wdOpenConfig(mid) {
         for (var si = 0; si < schema.length; si++) {
             var section = schema[si];
             html += '<div style="margin-bottom:16px;">';
-            html += '<div style="font-size:13px; font-weight:600; color:var(--text); margin-bottom:4px;">' + section.label + '</div>';
+            html += '<div style="font-size:13px; font-weight:600; color:var(--text-primary); margin-bottom:4px;">' + section.label + '</div>';
             if (section.description) html += '<div style="font-size:11px; color:var(--text-muted); margin-bottom:10px;">' + section.description + '</div>';
             html += '<div style="display:grid; grid-template-columns:1fr 1fr; gap:10px 16px;">';
             for (var fi = 0; fi < section.fields.length; fi++) {
@@ -23876,19 +23876,19 @@ async function wdOpenConfig(mid) {
                 html += '<div' + (f.type === 'array' ? ' style="grid-column:span 2;"' : '') + '>';
                 html += '<label style="font-size:11px; color:var(--text-muted); display:block; margin-bottom:3px;">' + f.label + '</label>';
                 if (f.type === 'select') {
-                    html += '<select id="' + inputId + '" class="form-input" style="width:100%; font-size:12px; padding:6px 8px;">';
+                    html += '<select id="' + inputId + '" class="form-control" style="font-size:12px;">';
                     for (var oi = 0; oi < f.options.length; oi++) {
                         html += '<option value="' + f.options[oi] + '"' + (val === f.options[oi] ? ' selected' : '') + '>' + f.options[oi] + '</option>';
                     }
                     html += '</select>';
                 } else if (f.type === 'boolean') {
-                    html += '<label style="display:flex; align-items:center; gap:6px; cursor:pointer;"><input type="checkbox" id="' + inputId + '"' + (val ? ' checked' : '') + '> <span style="font-size:12px; color:var(--text);">Enabled</span></label>';
+                    html += '<label style="display:flex; align-items:center; gap:6px; cursor:pointer;"><input type="checkbox" id="' + inputId + '"' + (val ? ' checked' : '') + '> <span style="font-size:12px; color:var(--text-primary);">Enabled</span></label>';
                 } else if (f.type === 'array') {
-                    html += '<textarea id="' + inputId + '" class="form-input" rows="3" style="width:100%; font-size:12px; padding:6px 8px; font-family:monospace;" placeholder="One per line">' + (Array.isArray(val) ? val.join('\n') : (val || '')) + '</textarea>';
+                    html += '<textarea id="' + inputId + '" class="form-control" rows="3" style="font-size:12px; font-family:monospace;" placeholder="One per line">' + (Array.isArray(val) ? val.join('\n') : (val || '')) + '</textarea>';
                 } else if (f.type === 'number') {
-                    html += '<input type="number" id="' + inputId + '" class="form-input" value="' + (val || f.default || '') + '" style="width:100%; font-size:12px; padding:6px 8px;">';
+                    html += '<input type="number" id="' + inputId + '" class="form-control" value="' + (val || f.default || '') + '" style="font-size:12px;">';
                 } else {
-                    html += '<input type="text" id="' + inputId + '" class="form-input" value="' + (val || '') + '" placeholder="' + (f.placeholder || '') + '" style="width:100%; font-size:12px; padding:6px 8px;">';
+                    html += '<input type="text" id="' + inputId + '" class="form-control" value="' + (val || '') + '" placeholder="' + (f.placeholder || '') + '" style="font-size:12px;">';
                 }
                 if (f.help) html += '<div style="font-size:10px; color:var(--text-muted); margin-top:2px;">' + f.help + '</div>';
                 html += '</div>';
