@@ -1216,6 +1216,31 @@ pub fn provider_action(name: &str, action: &str) -> Result<String, String> {
         _ => return Err(format!("Provider '{}' has no manageable service", name)),
     };
 
+    // For wolfdisk start/restart, ensure config exists and mount dir is ready
+    if name == "wolfdisk" && (action == "start" || action == "restart") {
+        let config_path = "/etc/wolfdisk/config.toml";
+        if !Path::new(config_path).exists() {
+            return Err("WolfDisk config not found at /etc/wolfdisk/config.toml — configure WolfDisk first".to_string());
+        }
+        // Read mount path from config and ensure directory exists
+        if let Ok(content) = std::fs::read_to_string(config_path) {
+            if let Ok(config) = content.parse::<toml::Value>() {
+                let mount_path = config.get("mount")
+                    .and_then(|m| m.get("path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("/mnt/wolfdisk");
+                let _ = std::fs::create_dir_all(mount_path);
+                let data_dir = config.get("node")
+                    .and_then(|n| n.get("data_dir"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("/var/lib/wolfdisk");
+                let _ = std::fs::create_dir_all(data_dir);
+            }
+        }
+        // Regenerate the service file from current config to keep paths in sync
+        regenerate_wolfdisk_service();
+    }
+
     match action {
         "start" | "stop" | "restart" | "enable" | "disable" => {
             let output = Command::new("systemctl")
@@ -1225,10 +1250,62 @@ pub fn provider_action(name: &str, action: &str) -> Result<String, String> {
             if output.status.success() {
                 Ok(format!("{} {} successful", service_name, action))
             } else {
-                Err(format!("{} failed: {}", action, String::from_utf8_lossy(&output.stderr)))
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                // Also grab journal for more context on failure
+                let journal = Command::new("journalctl")
+                    .args(["-u", service_name, "-n", "5", "--no-pager", "-o", "cat"])
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_default();
+                let detail = if journal.is_empty() { stderr } else { format!("{}\n{}", stderr, journal) };
+                Err(format!("{} failed: {}", action, detail))
             }
         }
         _ => Err(format!("Unknown action: {}", action)),
+    }
+}
+
+/// Regenerate the wolfdisk.service file from the current config to keep paths in sync
+fn regenerate_wolfdisk_service() {
+    let config_path = "/etc/wolfdisk/config.toml";
+    let content = match std::fs::read_to_string(config_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let config: toml::Value = match content.parse() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let mount_path = config.get("mount")
+        .and_then(|m| m.get("path"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("/mnt/wolfdisk");
+
+    let service = format!(
+        "[Unit]\n\
+         Description=WolfDisk Distributed File System\n\
+         After=network.target\n\
+         Wants=network-online.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart=/usr/local/bin/wolfdisk --config {} mount --mountpoint {}\n\
+         ExecStop=/usr/local/bin/wolfdisk unmount --mountpoint {}\n\
+         Restart=on-failure\n\
+         RestartSec=5\n\
+         StandardOutput=journal\n\
+         StandardError=journal\n\
+         NoNewPrivileges=false\n\
+         ProtectSystem=false\n\
+         PrivateTmp=false\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        config_path, mount_path, mount_path
+    );
+
+    if std::fs::write("/etc/systemd/system/wolfdisk.service", &service).is_ok() {
+        let _ = Command::new("systemctl").arg("daemon-reload").output();
     }
 }
 

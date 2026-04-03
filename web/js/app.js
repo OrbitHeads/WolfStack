@@ -23277,11 +23277,9 @@ function wdApiUrl(mid, path) {
 }
 
 function wdTypeBadge(memberType) {
-    var colors = { host: 'var(--text-muted)', docker: '#2496ed', lxc: '#e95420' };
     var labels = { host: 'Host', docker: 'Docker', lxc: 'LXC' };
-    var c = colors[memberType] || 'var(--text-muted)';
     var l = labels[memberType] || memberType || 'Host';
-    return '<span style="background:' + c + '; color:#fff; padding:1px 6px; border-radius:8px; font-size:10px; font-weight:600;">' + l + '</span>';
+    return '<span style="border:1px solid var(--border); color:var(--text-secondary); padding:1px 6px; border-radius:8px; font-size:10px; font-weight:600;">' + l + '</span>';
 }
 
 function showWolfDiskPage(clusterName) {
@@ -23535,9 +23533,9 @@ function renderWolfDiskClusterSection(name, nodes) {
 
     // Topology bar
     html += '<div style="padding:10px 20px; background:var(--bg-tertiary, rgba(0,0,0,0.1)); font-size:11px; color:var(--text-muted); display:flex; flex-wrap:wrap; gap:12px;">';
-    if (leader) html += '<span>\u{1f451} Leader: <strong style="color:var(--text-primary);">' + leader.nodeName + '</strong> (' + (leader.wolfnetIp || leader.info.bind) + (leader.wolfnetIp ? ' \ud83d\udd17 WolfNet' : '') + ')</span>';
-    if (followers.length) html += '<span>\u{1f4e6} Followers: <strong style="color:var(--text-primary);">' + followers.map(f => f.nodeName).join(', ') + '</strong></span>';
-    if (clients.length) html += '<span>\u{1f4bb} Clients: <strong style="color:var(--text-primary);">' + clients.map(c => c.nodeName).join(', ') + '</strong></span>';
+    if (leader) html += '<span>Leader: <strong style="color:var(--text-primary);">' + leader.nodeName + '</strong> (' + (leader.wolfnetIp || leader.info.bind) + (leader.wolfnetIp ? ' via WolfNet' : '') + ')</span>';
+    if (followers.length) html += '<span>Followers: <strong style="color:var(--text-primary);">' + followers.map(f => f.nodeName).join(', ') + '</strong></span>';
+    if (clients.length) html += '<span>Clients: <strong style="color:var(--text-primary);">' + clients.map(c => c.nodeName).join(', ') + '</strong></span>';
     html += '</div>';
 
     // Node table
@@ -23586,7 +23584,7 @@ function renderWolfDiskUnassignedSection(nodes) {
     html += '</tr></thead><tbody>';
     for (var i = 0; i < nodes.length; i++) {
         var n = nodes[i];
-        var statusLabel = !n.online ? '\u26ab Offline' : n.status === 'error' ? '\u26a0\ufe0f Unreachable' : !n.installed ? '\u2b55 Not Installed' : '\u2705 Installed';
+        var statusLabel = !n.online ? '<span style="color:var(--text-muted);">\u25CF Offline</span>' : n.status === 'error' ? '<span style="color:var(--warning);">\u25CF Unreachable</span>' : !n.installed ? '<span style="color:var(--text-muted);">\u25CB Not Installed</span>' : '<span style="color:var(--success);">\u25CF Installed</span>';
         var typeBadge = wdTypeBadge(n.memberType);
         var hostLabel = n.hostName ? ' <span style="font-size:10px; color:var(--text-muted);">on ' + n.hostName + '</span>' : '';
         html += '<tr style="border-bottom:1px solid var(--border);">';
@@ -23620,7 +23618,7 @@ function renderWolfDiskNodeRow(node) {
     var roleColors = { leader: 'var(--warning)', follower: 'var(--accent)', client: 'var(--text-muted)', auto: 'var(--text-muted)' };
     var roleLabels = { leader: 'Leader', follower: 'Follower', client: 'Client', auto: 'Auto' };
     var role = n.info ? n.info.role : 'unknown';
-    var statusDot = n.status === 'running' ? '\ud83d\udfe2' : n.status === 'stopped' ? '\ud83d\udd34' : n.status === 'failed' ? '\u26a0\ufe0f' : '\u26ab';
+    var statusDot = n.status === 'running' ? '<span style="color:var(--success);">\u25CF</span>' : n.status === 'stopped' ? '<span style="color:var(--danger);">\u25CF</span>' : n.status === 'failed' ? '<span style="color:var(--warning);">\u25CF</span>' : '<span style="color:var(--text-muted);">\u25CF</span>';
     var statusLabel = n.status === 'running' ? 'Running' : n.status === 'stopped' ? 'Stopped' : n.status === 'failed' ? 'Failed' : n.online ? 'Unknown' : 'Offline';
     var mid = wdMemberId(n);
     var hostLabel = n.hostName ? ' <span style="font-size:10px; color:var(--text-muted);">on ' + n.hostName + '</span>' : '';
@@ -23665,7 +23663,7 @@ function renderWolfDiskNodeDetail(n) {
         html += wdDetailItem('Data Directory', info.data_dir);
         html += wdDetailItem('Mount Path', info.mount_path);
         html += wdDetailItem('Bind Address', info.bind);
-        if (n.wolfnetIp) html += wdDetailItem('WolfNet IP', n.wolfnetIp + ' \ud83d\udd17');
+        if (n.wolfnetIp) html += wdDetailItem('WolfNet', n.wolfnetIp);
         html += wdDetailItem('Replication', info.replication_mode === 'replicated' ? 'Replicated ' + info.replication_factor + 'x' : 'Shared');
         if (info.peers && info.peers.length) html += wdDetailItem('Peers', info.peers.join(', '));
         if (info.s3_enabled) html += wdDetailItem('S3 API', 'Enabled on ' + (info.s3_bind || ':9878'));
@@ -23698,7 +23696,7 @@ function renderWolfDiskNodeDetail(n) {
             var c = n.containers[i];
             var cStatus = c.state || c.status || 'unknown';
             html += '<div style="display:flex; align-items:center; gap:8px; margin-bottom:4px; padding:4px 8px; background:var(--bg-secondary); border-radius:4px;">';
-            html += '<span style="font-size:11px; background:' + (c._type === 'docker' ? '#2496ed' : '#e95420') + '; color:#fff; padding:1px 6px; border-radius:8px;">' + c._type.toUpperCase() + '</span>';
+            html += '<span style="font-size:11px; border:1px solid var(--border); color:var(--text-secondary); padding:1px 6px; border-radius:8px;">' + c._type.toUpperCase() + '</span>';
             html += '<span style="color:var(--text-primary);">' + (c.name || c.names || 'unnamed') + '</span>';
             html += '<span style="color:var(--text-muted); font-size:11px; margin-left:auto;">' + cStatus + '</span>';
             html += '</div>';
