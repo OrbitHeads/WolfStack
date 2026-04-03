@@ -8610,23 +8610,23 @@ function getTomlSchema(component) {
     if (component === 'wolfdisk') {
         return [
             { key: 'node', label: 'Node', description: 'Identity and network settings for this WolfDisk node in the cluster.', fields: [
-                { key: 'id', label: 'Node ID', type: 'string', placeholder: 'node-1', help: 'Unique name for this node — must be different on each server in the cluster' },
-                { key: 'role', label: 'Role', type: 'select', options: ['auto', 'leader', 'follower', 'client'], help: 'auto: automatically elect leader/follower roles. leader: force this node as leader. follower: read-only replica. client: mount-only, no local storage' },
-                { key: 'bind', label: 'Bind Address', type: 'string', placeholder: '0.0.0.0:9500', help: 'IP and port this node listens on. Use 0.0.0.0 to listen on all interfaces, or a specific IP to restrict access' },
-                { key: 'data_dir', label: 'Data Directory', type: 'string', placeholder: '/var/lib/wolfdisk', help: 'Where WolfDisk stores its chunk data, index, and WAL files on disk' },
+                { key: 'id', label: 'Node ID', type: 'string', default: '', placeholder: 'node-1', help: 'Unique name for this node — must be different on each server in the cluster' },
+                { key: 'role', label: 'Role', type: 'select', default: 'auto', options: ['auto', 'leader', 'follower', 'client'], help: 'auto: automatically elect leader/follower roles. leader: force this node as leader. follower: read-only replica. client: mount-only, no local storage' },
+                { key: 'bind', label: 'Bind Address', type: 'string', default: '0.0.0.0:9500', placeholder: '0.0.0.0:9500', help: 'IP and port this node listens on. Use 0.0.0.0 to listen on all interfaces, or a specific IP to restrict access' },
+                { key: 'data_dir', label: 'Data Directory', type: 'string', default: '/var/lib/wolfdisk', placeholder: '/var/lib/wolfdisk', help: 'Where WolfDisk stores its chunk data, index, and WAL files on disk' },
             ]},
             { key: 'cluster', label: 'Cluster', description: 'How this node discovers and connects to other WolfDisk nodes.', fields: [
-                { key: 'name', label: 'Cluster Name', type: 'string', placeholder: 'default', help: 'Name for this WolfDisk cluster. Nodes with the same cluster name form a storage pool together. Use different names to create separate WolfDisk clusters (e.g. "fast-nvme", "bulk-hdd")' },
+                { key: 'name', label: 'Cluster Name', type: 'string', default: 'default', placeholder: 'default', help: 'Name for this WolfDisk cluster. Nodes with the same cluster name form a storage pool together. Use different names to create separate WolfDisk clusters (e.g. "fast-nvme", "bulk-hdd")' },
                 { key: 'peers', label: 'Cluster Peers', type: 'array', help: 'List of other WolfDisk nodes to connect to (one host:port per line, e.g. 192.168.1.10:9500). Leave empty if using auto-discovery' },
-                { key: 'discovery', label: 'Discovery Address', type: 'string', placeholder: 'udp://0.0.0.0:9501', help: 'UDP multicast address for automatic peer discovery on the local network. Nodes on the same subnet will find each other automatically' },
+                { key: 'discovery', label: 'Discovery Address', type: 'string', default: 'udp://0.0.0.0:9501', placeholder: 'udp://0.0.0.0:9501', help: 'UDP multicast address for automatic peer discovery on the local network. Nodes on the same subnet will find each other automatically' },
             ]},
             { key: 'replication', label: 'Replication', description: 'Controls how data is replicated and split across nodes for redundancy and performance.', fields: [
-                { key: 'mode', label: 'Replication Mode', type: 'select', options: ['shared', 'replicated'], help: 'shared: chunks are distributed across nodes (more space, less redundancy). replicated: every node has a full copy (more redundancy, uses more disk)' },
+                { key: 'mode', label: 'Replication Mode', type: 'select', default: 'shared', options: ['shared', 'replicated'], help: 'shared: chunks are distributed across nodes (more space, less redundancy). replicated: every node has a full copy (more redundancy, uses more disk)' },
                 { key: 'factor', label: 'Replication Factor', type: 'number', default: 3, help: 'How many copies of each chunk to keep across the cluster. Higher = more fault tolerance but uses more disk space' },
                 { key: 'chunk_size', label: 'Chunk Size (bytes)', type: 'number', default: 4194304, help: 'Size of each data chunk in bytes. Default 4MB (4194304). Larger chunks = fewer metadata lookups, smaller chunks = less wasted space' },
             ]},
             { key: 'mount', label: 'Mount', description: 'FUSE mount settings — this is where the distributed filesystem appears as a local directory.', fields: [
-                { key: 'path', label: 'Mount Path', type: 'string', placeholder: '/mnt/wolfdisk', help: 'Local directory where WolfDisk will be mounted. Applications read/write files here as if it were a normal folder' },
+                { key: 'path', label: 'Mount Path', type: 'string', default: '/mnt/wolfdisk', placeholder: '/mnt/wolfdisk', help: 'Local directory where WolfDisk will be mounted. Applications read/write files here as if it were a normal folder' },
                 { key: 'allow_other', label: 'Allow Other Users', type: 'boolean', default: true, help: 'Allow users other than root to access the mount. Required for most applications and containers to use the filesystem' },
             ]},
         ];
@@ -23943,7 +23943,7 @@ async function wdSaveAndInstall() {
             if (f.type === 'boolean') config[section.key][f.key] = el.checked;
             else if (f.type === 'number') config[section.key][f.key] = el.value ? Number(el.value) : (f.default || 0);
             else if (f.type === 'array') config[section.key][f.key] = el.value.split('\n').map(s => s.trim()).filter(s => s);
-            else config[section.key][f.key] = el.value;
+            else config[section.key][f.key] = el.value || f.default || '';
         }
     }
 
@@ -23998,7 +23998,7 @@ async function wdSaveConfig(startAfter) {
             else if (f.type === 'array') {
                 config[section.key][f.key] = el.value.split('\n').map(s => s.trim()).filter(s => s);
             } else {
-                config[section.key][f.key] = el.value;
+                config[section.key][f.key] = el.value || f.default || '';
             }
         }
     }
