@@ -6402,16 +6402,19 @@ pub async fn storage_install_provider(
 }
 
 /// POST /api/storage/providers/{name}/action — start/stop/restart a provider service
+/// Supports ?runtime=docker|lxc&target=containerName to manage inside containers
 pub async fn storage_provider_action(
     req: HttpRequest,
     state: web::Data<AppState>,
     path: web::Path<String>,
     body: web::Json<serde_json::Value>,
+    query: web::Query<ConfiguratorTarget>,
 ) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
+    let target = match parse_exec_target(&query) { Ok(t) => t, Err(r) => return r };
     let name = path.into_inner();
     let action = body.get("action").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let result = web::block(move || storage::provider_action(&name, &action)).await;
+    let result = web::block(move || storage::provider_action_targeted(&name, &action, &target)).await;
     match result {
         Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
         Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),

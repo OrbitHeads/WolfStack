@@ -90,6 +90,7 @@ bind = "0.0.0.0:9500"
 data_dir = "/var/lib/wolfdisk"
 
 [cluster]
+name = "default"
 peers = []
 discovery = "udp://0.0.0.0:9501"
 

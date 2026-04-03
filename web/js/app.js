@@ -1275,6 +1275,9 @@ function buildServerTree(nodes) {
                 <a class="nav-item server-child-item k8s-cluster-item" data-cluster="${escapedName}" data-view="kubernetes" onclick="showK8sClusterPage('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
                     <span class="icon" style="font-size:15px;">&#9784;</span> <span style="font-weight:600;">WolfKube</span>
                     <span class="k8s-cluster-count" id="k8s-count-${clusterId}" style="margin-left:auto; font-size:10px; padding:1px 6px; background:#326ce5; color:#fff; border-radius:10px; display:none;"></span>
+                </a>
+                <a class="nav-item server-child-item wolfdisk-cluster-item" data-cluster="${escapedName}" data-view="wolfdisk-cluster" onclick="showWolfDiskPage('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
+                    <span class="icon" style="font-size:15px;">🐺</span> <span style="font-weight:600;">WolfDisk</span>
                 </a>`;
 
         // Each node within the cluster
@@ -8613,6 +8616,7 @@ function getTomlSchema(component) {
                 { key: 'data_dir', label: 'Data Directory', type: 'string', placeholder: '/var/lib/wolfdisk', help: 'Where WolfDisk stores its chunk data, index, and WAL files on disk' },
             ]},
             { key: 'cluster', label: 'Cluster', description: 'How this node discovers and connects to other WolfDisk nodes.', fields: [
+                { key: 'name', label: 'Cluster Name', type: 'string', placeholder: 'default', help: 'Name for this WolfDisk cluster. Nodes with the same cluster name form a storage pool together. Use different names to create separate WolfDisk clusters (e.g. "fast-nvme", "bulk-hdd")' },
                 { key: 'peers', label: 'Cluster Peers', type: 'array', help: 'List of other WolfDisk nodes to connect to (one host:port per line, e.g. 192.168.1.10:9500). Leave empty if using auto-discovery' },
                 { key: 'discovery', label: 'Discovery Address', type: 'string', placeholder: 'udp://0.0.0.0:9501', help: 'UDP multicast address for automatic peer discovery on the local network. Nodes on the same subnet will find each other automatically' },
             ]},
@@ -23091,6 +23095,31 @@ async function loadStorageProviders() {
             const statusColor = p.status === 'running' ? '#10b981' : p.status === 'stopped' ? '#ef4444' : p.status === 'failed' ? '#ef4444' : '#6b7280';
             const statusLabel = p.status === 'running' ? '🟢 Running' : p.status === 'stopped' ? '🔴 Stopped' : p.status === 'failed' ? '⚠️ Failed' : p.status === 'no-service' ? '✅ Installed' : '⭕ Not Installed';
             const hasService = p.service && p.status !== 'not-installed' && p.status !== 'no-service';
+            const wd = p.wolfdisk_info;
+            let wdHtml = '';
+            if (wd) {
+                const roleLabels = { leader: 'Server (Leader)', follower: 'Server (Follower)', client: 'Client Only', auto: 'Auto' };
+                const roleColors = { leader: '#f59e0b', follower: '#3b82f6', client: '#8b5cf6', auto: '#6b7280' };
+                const modeLabel = wd.replication_mode === 'replicated'
+                    ? `Replicated (${wd.replication_factor}x)` : 'Shared';
+                const features = [];
+                if (wd.role !== 'client') features.push(`${modeLabel}`);
+                if (wd.peers.length > 0) features.push(`${wd.peers.length} peer${wd.peers.length !== 1 ? 's' : ''}`);
+                if (wd.s3_enabled) features.push(`S3 API on ${wd.s3_bind || ':9878'}`);
+                wdHtml = `
+                <div style="background:var(--bg-tertiary, rgba(0,0,0,0.15)); border-radius:6px; padding:8px 10px; margin-bottom:10px; font-size:12px;">
+                    <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
+                        <span style="background:${roleColors[wd.role] || '#6b7280'}; color:#fff; padding:1px 8px; border-radius:10px; font-size:11px; font-weight:600;">${roleLabels[wd.role] || wd.role}</span>
+                        <span style="color:var(--text-muted);">Node: <strong style="color:var(--text)">${wd.node_id}</strong></span>
+                    </div>
+                    <div style="display:flex; flex-wrap:wrap; gap:6px 16px; color:var(--text-muted); font-size:11px; margin-top:4px;">
+                        ${features.length ? `<span>${features.join(' · ')}</span>` : ''}
+                        <span>Mount: <strong style="color:var(--text)">${wd.mount_path}</strong></span>
+                        <span>Data: <strong style="color:var(--text)">${wd.data_dir}</strong></span>
+                        <span>Bind: <strong style="color:var(--text)">${wd.bind}</strong></span>
+                    </div>
+                </div>`;
+            }
             return `
             <div style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px; padding:14px;">
                 <div style="display:flex; align-items:center; gap:12px; margin-bottom:10px;">
@@ -23100,6 +23129,7 @@ async function loadStorageProviders() {
                         <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">${p.description}</div>
                     </div>
                 </div>
+                ${wdHtml}
                 <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;">
                     <span style="font-size:12px; font-weight:600; color:${statusColor};">${statusLabel}</span>
                     <div style="display:flex; gap:4px; flex-wrap:wrap;">
@@ -23125,10 +23155,14 @@ async function installProvider(name) {
         const data = await resp.json();
         if (resp.ok) {
             showToast(data.message || `${name} installed`, 'success');
+            await loadStorageProviders();
+            if (name === 'wolfdisk') {
+                openProviderSettings('wolfdisk', '💾', 'WolfDisk', '/etc/wolfdisk/config.toml');
+            }
         } else {
             showToast(data.error || 'Install failed', 'error');
+            loadStorageProviders();
         }
-        loadStorageProviders();
     } catch (e) {
         showToast('Error: ' + e.message, 'error');
     }
@@ -23194,6 +23228,738 @@ async function saveProviderConfig() {
         const data = await resp.json();
         if (resp.ok) {
             showToast(data.message || 'Config saved', 'success');
+        } else {
+            showToast(data.error || 'Save failed', 'error');
+        }
+    } catch (e) {
+        showToast('Error: ' + e.message, 'error');
+    }
+}
+
+// ─── WolfDisk Cluster Management ───
+
+let wdCurrentCluster = '';
+let wdClusterData = [];
+let wdExpandedNodes = new Set();
+let wdConfigNodeId = null;
+
+// Encode a unique member ID: "nodeId" for hosts, "nodeId:runtime:containerName" for containers
+function wdMemberId(n) {
+    if (n.memberType && n.memberType !== 'host' && n.containerName) {
+        return n.nodeId + ':' + n.memberType + ':' + n.containerName;
+    }
+    return n.nodeId;
+}
+
+// Parse a member ID back to {nodeId, runtime, container}
+function wdParseMemberId(mid) {
+    var parts = mid.split(':');
+    if (parts.length >= 3) {
+        return { nodeId: parts[0], runtime: parts[1], container: parts.slice(2).join(':') };
+    }
+    return { nodeId: mid, runtime: null, container: null };
+}
+
+// Find a member entry in wdClusterData by member ID
+function wdFindMember(mid) {
+    return wdClusterData.find(function(n) { return wdMemberId(n) === mid; });
+}
+
+// Build API URL with optional container targeting query params
+function wdApiUrl(mid, path) {
+    var p = wdParseMemberId(mid);
+    var url = nodeApiUrl(p.nodeId, path);
+    if (p.runtime && p.container) {
+        var sep = url.indexOf('?') >= 0 ? '&' : '?';
+        url += sep + 'runtime=' + encodeURIComponent(p.runtime) + '&target=' + encodeURIComponent(p.container);
+    }
+    return url;
+}
+
+function wdTypeBadge(memberType) {
+    var colors = { host: '#6b7280', docker: '#2496ed', lxc: '#e95420' };
+    var labels = { host: 'Host', docker: 'Docker', lxc: 'LXC' };
+    var c = colors[memberType] || '#6b7280';
+    var l = labels[memberType] || memberType || 'Host';
+    return '<span style="background:' + c + '; color:#fff; padding:1px 6px; border-radius:8px; font-size:10px; font-weight:600;">' + l + '</span>';
+}
+
+function showWolfDiskPage(clusterName) {
+    closeSidebarMobile();
+    wdCurrentCluster = clusterName;
+    currentPage = 'wolfdisk-cluster';
+    currentNodeId = null;
+    wdExpandedNodes.clear();
+
+    document.querySelectorAll('.page-view').forEach(p => p.style.display = 'none');
+    const el = document.getElementById('page-wolfdisk-cluster');
+    if (el) el.style.display = 'block';
+    document.getElementById('page-title').textContent = 'WolfDisk \u2014 ' + clusterName;
+
+    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+    const item = document.querySelector('.wolfdisk-cluster-item[data-cluster="' + CSS.escape(clusterName) + '"]');
+    if (item) item.classList.add('active');
+
+    loadWolfDiskCluster();
+}
+
+async function loadWolfDiskCluster() {
+    const loading = document.getElementById('wd-loading');
+    const container = document.getElementById('wd-clusters-container');
+    const statsEl = document.getElementById('wd-summary-stats');
+    if (loading) loading.style.display = 'block';
+    if (container) container.innerHTML = '';
+    if (statsEl) statsEl.innerHTML = '';
+
+    const nodes = getClusterNodes(wdCurrentCluster);
+    const results = await Promise.allSettled(
+        nodes.filter(n => n.online).map(async (node) => {
+            const [provResp, mountsResp, dockerResp, lxcResp] = await Promise.all([
+                fetch(nodeApiUrl(node.id, '/api/storage/providers')),
+                fetch(nodeApiUrl(node.id, '/api/storage/mounts')),
+                fetch(nodeApiUrl(node.id, '/api/containers/docker')).catch(() => ({ json: () => [] })),
+                fetch(nodeApiUrl(node.id, '/api/containers/lxc')).catch(() => ({ json: () => [] })),
+            ]);
+            const providers = provResp.ok ? await provResp.json() : [];
+            const wdProvider = (Array.isArray(providers) ? providers : []).find(p => p.name === 'wolfdisk');
+            const allMounts = mountsResp.ok ? await mountsResp.json() : [];
+            const wdMounts = (Array.isArray(allMounts) ? allMounts : []).filter(m => m.mount_type === 'wolfdisk');
+            let docker = [], lxc = [];
+            try { docker = dockerResp.ok ? await dockerResp.json() : []; } catch(_) {}
+            try { lxc = lxcResp.ok ? await lxcResp.json() : []; } catch(_) {}
+            if (!Array.isArray(docker)) docker = [];
+            if (!Array.isArray(lxc)) lxc = [];
+            // Detect containers with wolfdisk
+            var hasWd = function(c) { return c.services && c.services.some(function(s) { return (typeof s === 'string' ? s : s.name) === 'wolfdisk'; }); };
+            var wdSvc = function(c) { var s = (c.services || []).find(function(s) { return (typeof s === 'string' ? s : s.name) === 'wolfdisk'; }); return s ? (typeof s === 'string' ? 'running' : s.status) : 'unknown'; };
+            const wdContainers = [
+                ...docker.filter(hasWd).map(c => Object.assign({}, c, { _type: 'docker' })),
+                ...lxc.filter(hasWd).map(c => Object.assign({}, c, { _type: 'lxc' })),
+            ];
+
+            // All containers (for showing installable ones)
+            const allContainers = [
+                ...docker.filter(c => c.state === 'running' || c.status === 'running').map(c => Object.assign({}, c, { _type: 'docker' })),
+                ...lxc.filter(c => c.state === 'running' || c.status === 'RUNNING').map(c => Object.assign({}, c, { _type: 'lxc' })),
+            ];
+
+            // Fetch WolfDisk config from each container that has it
+            var containerEntries = [];
+            for (var ci = 0; ci < wdContainers.length; ci++) {
+                var ct = wdContainers[ci];
+                var ctName = ct.name || ct.names || '';
+                var ctRuntime = ct._type;
+                try {
+                    var cfgResp = await fetch(nodeApiUrl(node.id, '/api/configurator/toml/wolfdisk/structured?runtime=' + ctRuntime + '&target=' + encodeURIComponent(ctName)));
+                    var ctConfig = cfgResp.ok ? await cfgResp.json() : {};
+                    containerEntries.push({
+                        nodeId: node.id,
+                        nodeName: ctName,
+                        hostName: node.hostname || node.name || node.id,
+                        online: true,
+                        installed: true,
+                        status: wdSvc(ct),
+                        memberType: ctRuntime,
+                        containerName: ctName,
+                        info: ctConfig.node ? {
+                            cluster_name: ctConfig.cluster ? (ctConfig.cluster.name || 'default') : 'default',
+                            node_id: ctConfig.node.id || ctName,
+                            role: ctConfig.node.role || 'auto',
+                            replication_mode: ctConfig.replication ? (ctConfig.replication.mode || 'shared') : 'shared',
+                            replication_factor: ctConfig.replication ? (ctConfig.replication.factor || 3) : 3,
+                            data_dir: ctConfig.node.data_dir || '/var/lib/wolfdisk',
+                            mount_path: ctConfig.mount ? (ctConfig.mount.path || '/mnt/wolfdisk') : '/mnt/wolfdisk',
+                            bind: ctConfig.node.bind || '0.0.0.0:9500',
+                            peers: ctConfig.cluster ? (ctConfig.cluster.peers || []) : [],
+                            s3_enabled: ctConfig.s3 ? (ctConfig.s3.enabled || false) : false,
+                            s3_bind: ctConfig.s3 ? ctConfig.s3.bind : null,
+                        } : null,
+                        wdClusterName: ctConfig.cluster ? (ctConfig.cluster.name || null) : null,
+                        mounts: [],
+                        containers: [],
+                    });
+                } catch (_) {
+                    containerEntries.push({
+                        nodeId: node.id, nodeName: ctName, hostName: node.hostname || node.name || node.id,
+                        online: true, installed: true, status: wdSvc(ct),
+                        memberType: ctRuntime, containerName: ctName,
+                        info: null, wdClusterName: null, mounts: [], containers: [],
+                    });
+                }
+            }
+
+            // Containers without wolfdisk (installable)
+            var installableContainers = allContainers.filter(function(c) { return !hasWd(c); }).map(function(c) {
+                return {
+                    nodeId: node.id, nodeName: c.name || c.names || '', hostName: node.hostname || node.name || node.id,
+                    online: true, installed: false, status: 'not-installed',
+                    memberType: c._type, containerName: c.name || c.names || '',
+                    info: null, wdClusterName: null, mounts: [], containers: [],
+                };
+            });
+
+            return {
+                hostEntry: {
+                    nodeId: node.id,
+                    nodeName: node.hostname || node.name || node.id,
+                    online: true,
+                    installed: wdProvider ? wdProvider.installed : false,
+                    status: wdProvider ? wdProvider.status : 'not-installed',
+                    info: wdProvider ? wdProvider.wolfdisk_info : null,
+                    wdClusterName: wdProvider && wdProvider.wolfdisk_info ? wdProvider.wolfdisk_info.cluster_name : null,
+                    memberType: 'host',
+                    mounts: wdMounts,
+                    containers: wdContainers,
+                },
+                containerEntries: containerEntries,
+                installableContainers: installableContainers,
+            };
+        })
+    );
+
+    const onlineNodes = nodes.filter(n => n.online);
+    const offlineNodes = nodes.filter(n => !n.online).map(n => ({
+        nodeId: n.id, nodeName: n.hostname || n.name || n.id, online: false,
+        installed: false, status: 'offline', info: null, wdClusterName: null, memberType: 'host', mounts: [], containers: [],
+    }));
+    const erroredNodes = results
+        .map((r, i) => r.status === 'rejected' ? onlineNodes[i] : null)
+        .filter(Boolean)
+        .map(n => ({
+            nodeId: n.id, nodeName: n.hostname || n.name || n.id, online: true,
+            installed: false, status: 'error', info: null, wdClusterName: null, memberType: 'host', mounts: [], containers: [],
+        }));
+
+    // Flatten host entries + container entries from successful results
+    var fulfilled = results.filter(r => r.status === 'fulfilled').map(r => r.value);
+    var allEntries = [];
+    for (var fi = 0; fi < fulfilled.length; fi++) {
+        allEntries.push(fulfilled[fi].hostEntry);
+        allEntries.push.apply(allEntries, fulfilled[fi].containerEntries);
+        allEntries.push.apply(allEntries, fulfilled[fi].installableContainers);
+    }
+
+    wdClusterData = [
+        ...allEntries,
+        ...erroredNodes,
+        ...offlineNodes,
+    ];
+
+    if (loading) loading.style.display = 'none';
+    renderWolfDiskPage(wdClusterData);
+}
+
+function renderWolfDiskPage(data) {
+    const statsEl = document.getElementById('wd-summary-stats');
+    const container = document.getElementById('wd-clusters-container');
+
+    // Group by WolfDisk cluster name
+    const groups = {};
+    const unassigned = [];
+    for (const node of data) {
+        if (node.wdClusterName && node.wdClusterName !== 'default' && node.installed) {
+            if (!groups[node.wdClusterName]) groups[node.wdClusterName] = [];
+            groups[node.wdClusterName].push(node);
+        } else if (node.wdClusterName === 'default' && node.installed) {
+            if (!groups['default']) groups['default'] = [];
+            groups['default'].push(node);
+        } else {
+            unassigned.push(node);
+        }
+    }
+
+    // Summary stats
+    const totalNodes = data.length;
+    const installedNodes = data.filter(n => n.installed).length;
+    const runningNodes = data.filter(n => n.status === 'running').length;
+    const clusterCount = Object.keys(groups).length;
+    const totalMounts = data.reduce((s, n) => s + n.mounts.filter(m => m.status === 'mounted').length, 0);
+
+    statsEl.innerHTML =
+        wdStatCard('Installed', installedNodes + '/' + totalNodes, installedNodes === totalNodes ? '#10b981' : '#f59e0b') +
+        wdStatCard('Running', runningNodes + '/' + installedNodes, installedNodes > 0 && runningNodes === installedNodes ? '#10b981' : installedNodes === 0 ? '#6b7280' : '#ef4444') +
+        wdStatCard('Clusters', '' + clusterCount, '#8b5cf6') +
+        wdStatCard('Mounts', '' + totalMounts, '#3b82f6');
+
+    // Render cluster sections
+    var html = '';
+    var clusterNames = Object.keys(groups).sort();
+    for (var i = 0; i < clusterNames.length; i++) {
+        html += renderWolfDiskClusterSection(clusterNames[i], groups[clusterNames[i]]);
+    }
+    if (unassigned.length > 0) {
+        html += renderWolfDiskUnassignedSection(unassigned);
+    }
+    if (data.length === 0) {
+        html += '<div class="card" style="padding:40px; text-align:center; color:var(--text-muted);">' +
+            '<div style="font-size:48px; margin-bottom:12px;">🐺</div>' +
+            '<div style="font-size:15px; font-weight:600; margin-bottom:4px;">No nodes in this cluster</div>' +
+            '<div style="font-size:12px;">Add nodes to your WolfStack cluster to get started with WolfDisk.</div></div>';
+    }
+    container.innerHTML = html;
+}
+
+function wdStatCard(label, value, color) {
+    return '<div style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px; padding:14px 16px; text-align:center;">' +
+        '<div style="font-size:22px; font-weight:700; color:' + color + ';">' + value + '</div>' +
+        '<div style="font-size:11px; color:var(--text-muted); margin-top:2px;">' + label + '</div></div>';
+}
+
+function renderWolfDiskClusterSection(name, nodes) {
+    // Find leader and compute topology info
+    var leader = nodes.find(n => n.info && n.info.role === 'leader');
+    var followers = nodes.filter(n => n.info && n.info.role === 'follower');
+    var clients = nodes.filter(n => n.info && n.info.role === 'client');
+    var repMode = leader ? leader.info.replication_mode : (nodes[0] && nodes[0].info ? nodes[0].info.replication_mode : 'shared');
+    var repFactor = leader ? leader.info.replication_factor : (nodes[0] && nodes[0].info ? nodes[0].info.replication_factor : 0);
+    var s3Nodes = nodes.filter(n => n.info && n.info.s3_enabled);
+
+    var topoParts = [];
+    topoParts.push(nodes.length + ' node' + (nodes.length !== 1 ? 's' : ''));
+    if (repMode === 'replicated') topoParts.push('Replicated ' + repFactor + 'x');
+    else topoParts.push('Shared');
+    if (s3Nodes.length > 0) topoParts.push('S3 on ' + s3Nodes.map(n => n.nodeName + ' (' + (n.info.s3_bind || ':9878') + ')').join(', '));
+
+    var html = '<div class="card" style="margin-bottom:16px;">';
+    // Section header
+    html += '<div style="padding:16px 20px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:12px; flex-wrap:wrap;">';
+    html += '<span style="font-size:18px;">🐺</span>';
+    html += '<span style="font-size:16px; font-weight:700; color:var(--text);">' + (name === 'default' ? 'Default Cluster' : name) + '</span>';
+    html += '<span style="font-size:12px; color:var(--text-muted); margin-left:4px;">' + topoParts.join(' \u00b7 ') + '</span>';
+    html += '</div>';
+
+    // Topology bar
+    html += '<div style="padding:10px 20px; background:var(--bg-tertiary, rgba(0,0,0,0.1)); font-size:11px; color:var(--text-muted); display:flex; flex-wrap:wrap; gap:12px;">';
+    if (leader) html += '<span>\u{1f451} Leader: <strong style="color:var(--text);">' + leader.nodeName + '</strong> (' + leader.info.bind + ')</span>';
+    if (followers.length) html += '<span>\u{1f4e6} Followers: <strong style="color:var(--text);">' + followers.map(f => f.nodeName).join(', ') + '</strong></span>';
+    if (clients.length) html += '<span>\u{1f4bb} Clients: <strong style="color:var(--text);">' + clients.map(c => c.nodeName).join(', ') + '</strong></span>';
+    html += '</div>';
+
+    // Node table
+    html += '<div style="overflow-x:auto;">';
+    html += '<table style="width:100%; border-collapse:collapse; font-size:13px;">';
+    html += '<thead><tr style="border-bottom:1px solid var(--border); color:var(--text-muted); font-size:11px; text-transform:uppercase; letter-spacing:0.5px;">';
+    html += '<th style="padding:10px 16px; text-align:left;">Member</th>';
+    html += '<th style="padding:10px 12px; text-align:left;">Type</th>';
+    html += '<th style="padding:10px 12px; text-align:left;">Status</th>';
+    html += '<th style="padding:10px 12px; text-align:left;">Role</th>';
+    html += '<th style="padding:10px 16px; text-align:right;">Actions</th>';
+    html += '</tr></thead><tbody>';
+    for (var i = 0; i < nodes.length; i++) {
+        html += renderWolfDiskNodeRow(nodes[i]);
+    }
+    html += '</tbody></table></div></div>';
+    return html;
+}
+
+function renderWolfDiskUnassignedSection(nodes) {
+    // Collect existing WolfDisk cluster names + their peer addresses for quick-join
+    var existingClusters = {};
+    for (var i = 0; i < wdClusterData.length; i++) {
+        var nd = wdClusterData[i];
+        if (nd.wdClusterName && nd.installed && nd.info) {
+            if (!existingClusters[nd.wdClusterName]) existingClusters[nd.wdClusterName] = [];
+            existingClusters[nd.wdClusterName].push(nd.info.bind);
+        }
+    }
+    var clusterNames = Object.keys(existingClusters);
+
+    var html = '<div class="card" style="margin-bottom:16px;">';
+    html += '<div style="padding:16px 20px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:12px;">';
+    html += '<span style="font-size:18px;">📦</span>';
+    html += '<span style="font-size:16px; font-weight:700; color:var(--text);">Not in a WolfDisk cluster</span>';
+    html += '<span style="font-size:12px; color:var(--text-muted);">' + nodes.length + ' member' + (nodes.length !== 1 ? 's' : '') + '</span>';
+    html += '</div>';
+
+    html += '<div style="overflow-x:auto;">';
+    html += '<table style="width:100%; border-collapse:collapse; font-size:13px;">';
+    html += '<thead><tr style="border-bottom:1px solid var(--border); color:var(--text-muted); font-size:11px; text-transform:uppercase; letter-spacing:0.5px;">';
+    html += '<th style="padding:10px 16px; text-align:left;">Name</th>';
+    html += '<th style="padding:10px 12px; text-align:left;">Type</th>';
+    html += '<th style="padding:10px 12px; text-align:left;">Status</th>';
+    html += '<th style="padding:10px 16px; text-align:right;">Actions</th>';
+    html += '</tr></thead><tbody>';
+    for (var i = 0; i < nodes.length; i++) {
+        var n = nodes[i];
+        var statusLabel = !n.online ? '\u26ab Offline' : n.status === 'error' ? '\u26a0\ufe0f Unreachable' : !n.installed ? '\u2b55 Not Installed' : '\u2705 Installed';
+        var typeBadge = wdTypeBadge(n.memberType);
+        var hostLabel = n.hostName ? ' <span style="font-size:10px; color:var(--text-muted);">on ' + n.hostName + '</span>' : '';
+        html += '<tr style="border-bottom:1px solid var(--border);">';
+        html += '<td style="padding:10px 16px; font-weight:600;">' + n.nodeName + hostLabel + '</td>';
+        html += '<td style="padding:10px 12px;">' + typeBadge + '</td>';
+        html += '<td style="padding:10px 12px;">' + statusLabel + '</td>';
+        html += '<td style="padding:10px 16px; text-align:right; display:flex; flex-wrap:wrap; gap:4px; justify-content:flex-end;">';
+        if (n.online && !n.installed) {
+            if (n.memberType === 'host') {
+                html += '<button class="btn btn-sm btn-primary" style="font-size:11px;" onclick="wdInstall(\'' + n.nodeId + '\')">Install</button>';
+            } else {
+                html += '<button class="btn btn-sm btn-primary" style="font-size:11px;" onclick="wdInstallContainer(\'' + n.nodeId + '\',\'' + n.memberType + '\',\'' + (n.containerName || '').replace(/'/g, "\\'") + '\')">Install</button>';
+            }
+        } else if (n.online && n.installed) {
+            // Quick-join buttons for each existing cluster
+            for (var ci = 0; ci < clusterNames.length; ci++) {
+                var cn = clusterNames[ci];
+                var cnLabel = cn === 'default' ? 'Default Cluster' : cn;
+                html += '<button class="btn btn-sm" style="font-size:11px; color:#10b981; border-color:#10b981;" onclick="wdJoinCluster(\'' + wdMemberId(n) + '\',\'' + cn.replace(/'/g, "\\'") + '\')">Join ' + cnLabel + '</button>';
+            }
+            html += '<button class="btn btn-sm" style="font-size:11px; color:#a78bfa;" onclick="wdOpenConfig(\'' + wdMemberId(n) + '\')">Configure</button>';
+        }
+        html += '</td></tr>';
+    }
+    html += '</tbody></table></div></div>';
+    return html;
+}
+
+function renderWolfDiskNodeRow(node) {
+    var n = node;
+    var roleColors = { leader: '#f59e0b', follower: '#3b82f6', client: '#8b5cf6', auto: '#6b7280' };
+    var roleLabels = { leader: 'Leader', follower: 'Follower', client: 'Client', auto: 'Auto' };
+    var role = n.info ? n.info.role : 'unknown';
+    var statusDot = n.status === 'running' ? '\ud83d\udfe2' : n.status === 'stopped' ? '\ud83d\udd34' : n.status === 'failed' ? '\u26a0\ufe0f' : '\u26ab';
+    var statusLabel = n.status === 'running' ? 'Running' : n.status === 'stopped' ? 'Stopped' : n.status === 'failed' ? 'Failed' : n.online ? 'Unknown' : 'Offline';
+    var mid = wdMemberId(n);
+    var hostLabel = n.hostName ? ' <span style="font-size:10px; color:var(--text-muted);">on ' + n.hostName + '</span>' : '';
+
+    var isExpanded = wdExpandedNodes.has(mid);
+    var html = '<tr style="border-bottom:1px solid var(--border); cursor:pointer;" onclick="toggleWolfDiskNode(\'' + mid + '\')">';
+    html += '<td style="padding:10px 16px; font-weight:600;"><span style="font-size:10px; margin-right:4px; color:var(--text-muted);">' + (isExpanded ? '\u25BC' : '\u25B6') + '</span> ' + n.nodeName + hostLabel + '</td>';
+    html += '<td style="padding:10px 12px;">' + wdTypeBadge(n.memberType) + '</td>';
+    html += '<td style="padding:10px 12px;">' + statusDot + ' ' + statusLabel + '</td>';
+    html += '<td style="padding:10px 12px;"><span style="background:' + (roleColors[role] || '#6b7280') + '; color:#fff; padding:1px 8px; border-radius:10px; font-size:11px; font-weight:600;">' + (roleLabels[role] || role) + '</span></td>';
+    html += '<td style="padding:10px 16px; text-align:right;" onclick="event.stopPropagation();">';
+    if (n.status === 'running') {
+        html += '<button class="btn btn-sm" style="font-size:10px; color:#ef4444; padding:2px 8px;" onclick="wdAction(\'' + mid + '\',\'stop\')" title="Stop">\u23f9</button> ';
+        html += '<button class="btn btn-sm" style="font-size:10px; color:#3b82f6; padding:2px 8px;" onclick="wdAction(\'' + mid + '\',\'restart\')" title="Restart">\ud83d\udd04</button> ';
+    } else if (n.status === 'stopped') {
+        html += '<button class="btn btn-sm" style="font-size:10px; color:#10b981; padding:2px 8px;" onclick="wdAction(\'' + mid + '\',\'start\')" title="Start">\u25b6</button> ';
+    }
+    html += '<button class="btn btn-sm" style="font-size:10px; color:#a78bfa; padding:2px 8px;" onclick="wdOpenConfig(\'' + mid + '\')" title="Configure">\u2699\ufe0f</button>';
+    html += '</td></tr>';
+
+    // Expandable detail row
+    if (isExpanded) {
+        html += renderWolfDiskNodeDetail(n);
+    }
+    return html;
+}
+
+function toggleWolfDiskNode(mid) {
+    if (wdExpandedNodes.has(mid)) wdExpandedNodes.delete(mid);
+    else wdExpandedNodes.add(mid);
+    renderWolfDiskPage(wdClusterData);
+}
+
+function renderWolfDiskNodeDetail(n) {
+    var info = n.info;
+    var html = '<tr><td colspan="5" style="padding:0; background:var(--bg-tertiary, rgba(0,0,0,0.08));">';
+    html += '<div style="padding:16px 24px; font-size:12px;">';
+
+    if (info) {
+        // Config summary grid
+        html += '<div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(200px,1fr)); gap:8px 20px; margin-bottom:14px;">';
+        html += wdDetailItem('Data Directory', info.data_dir);
+        html += wdDetailItem('Mount Path', info.mount_path);
+        html += wdDetailItem('Bind Address', info.bind);
+        html += wdDetailItem('Replication', info.replication_mode === 'replicated' ? 'Replicated ' + info.replication_factor + 'x' : 'Shared');
+        if (info.peers && info.peers.length) html += wdDetailItem('Peers', info.peers.join(', '));
+        if (info.s3_enabled) html += wdDetailItem('S3 API', 'Enabled on ' + (info.s3_bind || ':9878'));
+        html += '</div>';
+    }
+
+    // Mounts section
+    if (n.mounts.length > 0) {
+        html += '<div style="margin-bottom:10px;"><strong style="color:var(--text); font-size:11px; text-transform:uppercase; letter-spacing:0.5px;">Mounts</strong></div>';
+        for (var i = 0; i < n.mounts.length; i++) {
+            var m = n.mounts[i];
+            var mIcon = m.status === 'mounted' ? '\u2705' : '\u26ab';
+            html += '<div style="display:flex; align-items:center; gap:8px; margin-bottom:4px; padding:4px 8px; background:var(--bg-secondary); border-radius:4px;">';
+            html += '<span>' + mIcon + '</span>';
+            html += '<span style="flex:1; color:var(--text);">' + (m.mount_point || m.name) + '</span>';
+            html += '<span style="color:var(--text-muted); font-size:11px;">' + m.status + '</span>';
+            if (m.status === 'mounted') {
+                html += ' <button class="btn btn-sm" style="font-size:10px; padding:1px 6px; color:#ef4444;" onclick="wdMountAction(\'' + n.nodeId + '\',\'' + m.id + '\',\'unmount\')">Unmount</button>';
+            } else {
+                html += ' <button class="btn btn-sm" style="font-size:10px; padding:1px 6px; color:#10b981;" onclick="wdMountAction(\'' + n.nodeId + '\',\'' + m.id + '\',\'mount\')">Mount</button>';
+            }
+            html += '</div>';
+        }
+    }
+
+    // Containers section (only show for host-type members)
+    if (n.memberType === 'host' && n.containers && n.containers.length > 0) {
+        html += '<div style="margin-top:10px; margin-bottom:6px;"><strong style="color:var(--text); font-size:11px; text-transform:uppercase; letter-spacing:0.5px;">Containers with WolfDisk</strong></div>';
+        for (var i = 0; i < n.containers.length; i++) {
+            var c = n.containers[i];
+            var cStatus = c.state || c.status || 'unknown';
+            html += '<div style="display:flex; align-items:center; gap:8px; margin-bottom:4px; padding:4px 8px; background:var(--bg-secondary); border-radius:4px;">';
+            html += '<span style="font-size:11px; background:' + (c._type === 'docker' ? '#2496ed' : '#e95420') + '; color:#fff; padding:1px 6px; border-radius:8px;">' + c._type.toUpperCase() + '</span>';
+            html += '<span style="color:var(--text);">' + (c.name || c.names || 'unnamed') + '</span>';
+            html += '<span style="color:var(--text-muted); font-size:11px; margin-left:auto;">' + cStatus + '</span>';
+            html += '</div>';
+        }
+    }
+
+    if (!info && n.installed) {
+        html += '<div style="color:var(--text-muted); font-style:italic;">Configuration not available \u2014 config file may be missing.</div>';
+    }
+
+    html += '</div></td></tr>';
+    return html;
+}
+
+function wdDetailItem(label, value) {
+    return '<div><span style="color:var(--text-muted);">' + label + ':</span> <strong style="color:var(--text);">' + value + '</strong></div>';
+}
+
+async function wdInstall(nodeId) {
+    var node = wdClusterData.find(n => n.nodeId === nodeId);
+    var name = node ? node.nodeName : nodeId;
+    if (!await showConfirm('Install WolfDisk on ' + name + '? This will download and set up the WolfDisk distributed filesystem.', 'Install WolfDisk')) return;
+    showToast('Installing WolfDisk on ' + name + '...', 'info');
+    try {
+        var resp = await fetch(nodeApiUrl(nodeId, '/api/storage/providers/wolfdisk/install'), { method: 'POST' });
+        var data = await resp.json();
+        if (resp.ok) {
+            showToast('WolfDisk installed on ' + name + '! Opening configuration...', 'success');
+            // If there's exactly one existing WolfDisk cluster, pre-fill join settings
+            var existingClusters = {};
+            for (var i = 0; i < wdClusterData.length; i++) {
+                var nd = wdClusterData[i];
+                if (nd.wdClusterName && nd.installed && nd.info) {
+                    existingClusters[nd.wdClusterName] = true;
+                }
+            }
+            var clusterNames = Object.keys(existingClusters);
+            if (clusterNames.length === 1) {
+                await wdJoinCluster(nodeId, clusterNames[0]);
+            } else {
+                await wdOpenConfig(nodeId);
+            }
+        } else {
+            showToast(data.error || 'Install failed', 'error');
+        }
+    } catch (e) {
+        showToast('Error: ' + e.message, 'error');
+    }
+}
+
+async function wdAction(mid, action) {
+    var node = wdFindMember(mid);
+    var name = node ? node.nodeName : mid;
+    showToast(action.charAt(0).toUpperCase() + action.slice(1) + 'ing WolfDisk on ' + name + '...', 'info');
+    try {
+        var resp = await fetch(wdApiUrl(mid, '/api/storage/providers/wolfdisk/action'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: action }),
+        });
+        var data = await resp.json();
+        if (resp.ok) {
+            showToast('WolfDisk ' + action + ' on ' + name + ' \u2014 ' + (data.message || 'OK'), 'success');
+        } else {
+            showToast(data.error || action + ' failed', 'error');
+        }
+    } catch (e) {
+        showToast('Error: ' + e.message, 'error');
+    }
+    loadWolfDiskCluster();
+}
+
+async function wdInstallContainer(hostNodeId, runtime, containerName) {
+    if (!await showConfirm('Install WolfDisk in ' + runtime.toUpperCase() + ' container "' + containerName + '"?', 'Install WolfDisk')) return;
+    showToast('Installing WolfDisk in ' + containerName + '...', 'info');
+    try {
+        var resp = await fetch(nodeApiUrl(hostNodeId, '/api/containers/install-component'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ runtime: runtime, container: containerName, component: 'wolfdisk' }),
+        });
+        var data = await resp.json();
+        if (resp.ok) {
+            showToast('WolfDisk installed in ' + containerName + '!', 'success');
+            var mid = hostNodeId + ':' + runtime + ':' + containerName;
+            // Check for existing clusters to auto-join
+            var existingClusters = {};
+            for (var i = 0; i < wdClusterData.length; i++) {
+                var nd = wdClusterData[i];
+                if (nd.wdClusterName && nd.installed && nd.info) existingClusters[nd.wdClusterName] = true;
+            }
+            var cNames = Object.keys(existingClusters);
+            if (cNames.length === 1) {
+                await wdJoinCluster(mid, cNames[0]);
+            } else {
+                await wdOpenConfig(mid);
+            }
+        } else {
+            showToast(data.error || 'Install failed', 'error');
+        }
+    } catch (e) {
+        showToast('Error: ' + e.message, 'error');
+    }
+}
+
+async function wdJoinCluster(mid, clusterName) {
+    // Collect peer addresses from existing nodes in that WolfDisk cluster
+    var peers = [];
+    for (var i = 0; i < wdClusterData.length; i++) {
+        var nd = wdClusterData[i];
+        if (nd.wdClusterName === clusterName && nd.installed && nd.info && nd.info.bind) {
+            peers.push(nd.info.bind);
+        }
+    }
+    // Get replication settings from the first node in the cluster
+    var templateNode = wdClusterData.find(n => n.wdClusterName === clusterName && n.info);
+    var repMode = templateNode ? templateNode.info.replication_mode : 'shared';
+    var repFactor = templateNode ? templateNode.info.replication_factor : 3;
+
+    // Open config editor pre-populated with cluster settings
+    await wdOpenConfig(mid);
+
+    // Pre-fill cluster name
+    var nameEl = document.getElementById('wd-cfg-cluster-name');
+    if (nameEl) nameEl.value = clusterName;
+    // Pre-fill peers
+    var peersEl = document.getElementById('wd-cfg-cluster-peers');
+    if (peersEl) peersEl.value = peers.join('\n');
+    // Pre-fill replication to match
+    var modeEl = document.getElementById('wd-cfg-replication-mode');
+    if (modeEl) modeEl.value = repMode;
+    var factorEl = document.getElementById('wd-cfg-replication-factor');
+    if (factorEl) factorEl.value = repFactor;
+}
+
+async function wdMountAction(nodeId, mountId, action) {
+    showToast(action.charAt(0).toUpperCase() + action.slice(1) + 'ing...', 'info');
+    try {
+        var resp = await fetch(nodeApiUrl(nodeId, '/api/storage/mounts/' + mountId + '/' + action), { method: 'POST' });
+        var data = await resp.json();
+        if (resp.ok) {
+            showToast(action + ' successful', 'success');
+        } else {
+            showToast(data.error || action + ' failed', 'error');
+        }
+    } catch (e) {
+        showToast('Error: ' + e.message, 'error');
+    }
+    loadWolfDiskCluster();
+}
+
+async function wdOpenConfig(mid) {
+    wdConfigNodeId = mid;
+    var node = wdFindMember(mid);
+    var name = node ? node.nodeName : mid;
+    var titleEl = document.getElementById('wd-config-modal-title');
+    var bodyEl = document.getElementById('wd-config-modal-body');
+    var modal = document.getElementById('wd-config-modal');
+    var p = wdParseMemberId(mid);
+    var typeLabel = p.runtime ? ' (' + p.runtime.toUpperCase() + ')' : '';
+    titleEl.textContent = 'WolfDisk Configuration \u2014 ' + name + typeLabel;
+    bodyEl.innerHTML = '<div style="text-align:center; padding:20px; color:var(--text-muted);">Loading configuration...</div>';
+    modal.style.display = 'flex';
+
+    try {
+        var resp = await fetch(wdApiUrl(mid, '/api/configurator/toml/wolfdisk/structured'));
+        var config = resp.ok ? await resp.json() : {};
+
+        var schema = getTomlSchema('wolfdisk');
+        var html = '';
+        for (var si = 0; si < schema.length; si++) {
+            var section = schema[si];
+            html += '<div style="margin-bottom:16px;">';
+            html += '<div style="font-size:13px; font-weight:600; color:var(--text); margin-bottom:4px;">' + section.label + '</div>';
+            if (section.description) html += '<div style="font-size:11px; color:var(--text-muted); margin-bottom:10px;">' + section.description + '</div>';
+            html += '<div style="display:grid; grid-template-columns:1fr 1fr; gap:10px 16px;">';
+            for (var fi = 0; fi < section.fields.length; fi++) {
+                var f = section.fields[fi];
+                var val = config[section.key] ? (config[section.key][f.key] !== undefined ? config[section.key][f.key] : '') : '';
+                var inputId = 'wd-cfg-' + section.key + '-' + f.key;
+                html += '<div' + (f.type === 'array' ? ' style="grid-column:span 2;"' : '') + '>';
+                html += '<label style="font-size:11px; color:var(--text-muted); display:block; margin-bottom:3px;">' + f.label + '</label>';
+                if (f.type === 'select') {
+                    html += '<select id="' + inputId + '" class="form-input" style="width:100%; font-size:12px; padding:6px 8px;">';
+                    for (var oi = 0; oi < f.options.length; oi++) {
+                        html += '<option value="' + f.options[oi] + '"' + (val === f.options[oi] ? ' selected' : '') + '>' + f.options[oi] + '</option>';
+                    }
+                    html += '</select>';
+                } else if (f.type === 'boolean') {
+                    html += '<label style="display:flex; align-items:center; gap:6px; cursor:pointer;"><input type="checkbox" id="' + inputId + '"' + (val ? ' checked' : '') + '> <span style="font-size:12px; color:var(--text);">Enabled</span></label>';
+                } else if (f.type === 'array') {
+                    html += '<textarea id="' + inputId + '" class="form-input" rows="3" style="width:100%; font-size:12px; padding:6px 8px; font-family:monospace;" placeholder="One per line">' + (Array.isArray(val) ? val.join('\n') : (val || '')) + '</textarea>';
+                } else if (f.type === 'number') {
+                    html += '<input type="number" id="' + inputId + '" class="form-input" value="' + (val || f.default || '') + '" style="width:100%; font-size:12px; padding:6px 8px;">';
+                } else {
+                    html += '<input type="text" id="' + inputId + '" class="form-input" value="' + (val || '') + '" placeholder="' + (f.placeholder || '') + '" style="width:100%; font-size:12px; padding:6px 8px;">';
+                }
+                if (f.help) html += '<div style="font-size:10px; color:var(--text-muted); margin-top:2px;">' + f.help + '</div>';
+                html += '</div>';
+            }
+            html += '</div></div>';
+        }
+        bodyEl.innerHTML = html;
+
+        // Auto-suggest hostname as node ID if still set to default
+        var nodeIdEl = document.getElementById('wd-cfg-node-id');
+        if (nodeIdEl && (!nodeIdEl.value || nodeIdEl.value === 'node-1')) {
+            nodeIdEl.value = name;
+        }
+    } catch (e) {
+        bodyEl.innerHTML = '<div style="color:#ef4444;">Failed to load config: ' + e.message + '</div>';
+    }
+}
+
+function wdCloseConfig() {
+    document.getElementById('wd-config-modal').style.display = 'none';
+    wdConfigNodeId = null;
+    // Always refresh after closing config modal (install/save may have changed state)
+    if (currentPage === 'wolfdisk-cluster') loadWolfDiskCluster();
+}
+
+async function wdSaveConfig(startAfter) {
+    if (!wdConfigNodeId) return;
+    var savedMid = wdConfigNodeId;
+    var schema = getTomlSchema('wolfdisk');
+    var config = {};
+    for (var si = 0; si < schema.length; si++) {
+        var section = schema[si];
+        config[section.key] = {};
+        for (var fi = 0; fi < section.fields.length; fi++) {
+            var f = section.fields[fi];
+            var el = document.getElementById('wd-cfg-' + section.key + '-' + f.key);
+            if (!el) continue;
+            if (f.type === 'boolean') config[section.key][f.key] = el.checked;
+            else if (f.type === 'number') config[section.key][f.key] = el.value ? Number(el.value) : (f.default || 0);
+            else if (f.type === 'array') {
+                config[section.key][f.key] = el.value.split('\n').map(s => s.trim()).filter(s => s);
+            } else {
+                config[section.key][f.key] = el.value;
+            }
+        }
+    }
+
+    try {
+        var resp = await fetch(wdApiUrl(savedMid, '/api/configurator/toml/wolfdisk/structured'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(config),
+        });
+        var data = await resp.json();
+        if (resp.ok) {
+            if (startAfter) {
+                showToast('Configuration saved. Starting WolfDisk...', 'success');
+                try {
+                    await fetch(wdApiUrl(savedMid, '/api/storage/providers/wolfdisk/action'), {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ action: 'restart' }),
+                    });
+                    showToast('WolfDisk started successfully', 'success');
+                } catch (_) {
+                    showToast('Config saved but failed to start service', 'error');
+                }
+            } else {
+                showToast('Configuration saved. Restart WolfDisk to apply changes.', 'success');
+            }
+            wdCloseConfig();
         } else {
             showToast(data.error || 'Save failed', 'error');
         }

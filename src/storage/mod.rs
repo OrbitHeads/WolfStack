@@ -836,6 +836,7 @@ fn read_wolfdisk_info() -> Option<WolfDiskInfo> {
         .unwrap_or_default();
 
     Some(WolfDiskInfo {
+        cluster_name: cluster.and_then(|c| c.get("name")).and_then(|v| v.as_str()).unwrap_or("default").to_string(),
         node_id: node.get("id").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
         role: node.get("role").and_then(|v| v.as_str()).unwrap_or("auto").to_string(),
         replication_mode: replication.and_then(|r| r.get("mode")).and_then(|v| v.as_str()).unwrap_or("shared").to_string(),
@@ -1102,6 +1103,7 @@ pub struct StorageProvider {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WolfDiskInfo {
+    pub cluster_name: String,
     pub node_id: String,
     pub role: String,
     pub replication_mode: String,
@@ -1220,6 +1222,29 @@ pub fn provider_action(name: &str, action: &str) -> Result<String, String> {
                 Ok(format!("{} {} successful", service_name, action))
             } else {
                 Err(format!("{} failed: {}", action, String::from_utf8_lossy(&output.stderr)))
+            }
+        }
+        _ => Err(format!("Unknown action: {}", action)),
+    }
+}
+
+/// Perform an action on a storage provider service, optionally inside a container
+pub fn provider_action_targeted(name: &str, action: &str, target: &crate::configurator::ExecTarget) -> Result<String, String> {
+    use crate::configurator::ExecTarget;
+    let service_name = match name {
+        "nfs" => "nfs-server",
+        "wolfdisk" => "wolfdisk",
+        _ => return Err(format!("Provider '{}' has no manageable service", name)),
+    };
+
+    match action {
+        "start" | "stop" | "restart" | "enable" | "disable" => {
+            match target {
+                ExecTarget::Host => provider_action(name, action),
+                _ => {
+                    let cmd = format!("systemctl {} {}", action, service_name);
+                    target.exec(&cmd).map(|_| format!("{} {} successful", service_name, action))
+                }
             }
         }
         _ => Err(format!("Unknown action: {}", action)),
