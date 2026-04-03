@@ -10,7 +10,7 @@
 //! - SSHFS mounts via sshfs
 //! - NFS storage via mount -t nfs
 //! - Local directory bind mounts
-//! - WolfDisk mounts via wolfdiskctl
+//! - WolfDisk mounts via wolfdisk CLI
 //! - Global mounts replicated across the cluster
 //! - Import of S3 configs from rclone.conf
 
@@ -212,7 +212,7 @@ pub fn unmount_storage(id: &str) -> Result<String, String> {
         return Ok("Not mounted".to_string());
     }
     
-    // For S3 mounts, try fusermount first (for s3fs), then regular umount (for rust-s3 bind mounts)
+    // Type-specific unmount handling
     let output = if config.mounts[idx].mount_type == MountType::S3 {
         // Try fusermount first (s3fs), fall back to regular umount (rust-s3 bind mount)
         let fuse_result = Command::new("fusermount")
@@ -222,6 +222,17 @@ pub fn unmount_storage(id: &str) -> Result<String, String> {
             Ok(o) if o.status.success() => fuse_result,
             _ => Command::new("umount")
                 .arg(&config.mounts[idx].mount_point)
+                .output(),
+        }
+    } else if config.mounts[idx].mount_type == MountType::Wolfdisk {
+        // WolfDisk uses FUSE — try wolfdisk unmount, fall back to fusermount
+        let wd_result = Command::new("wolfdisk")
+            .args(["unmount", "--mountpoint", &config.mounts[idx].mount_point])
+            .output();
+        match &wd_result {
+            Ok(o) if o.status.success() => wd_result,
+            _ => Command::new("fusermount")
+                .args(["-u", &config.mounts[idx].mount_point])
                 .output(),
         }
     } else {
@@ -695,17 +706,23 @@ fn mount_directory(mount: &StorageMount) -> Result<String, String> {
 }
 
 fn mount_wolfdisk(mount: &StorageMount) -> Result<String, String> {
-    // Check if wolfdiskctl exists
-    if !Path::new("/usr/local/bin/wolfdiskctl").exists() 
-        && !Path::new("/opt/wolfdisk/wolfdiskctl").exists() {
+    // Check if wolfdisk binary exists (wolfdisk has mount, wolfdiskctl is monitoring only)
+    if !has_wolfdisk() {
         return Err("WolfDisk is not installed. Install it first via Components.".to_string());
     }
-    
-    let output = Command::new("wolfdiskctl")
-        .args(["mount", &mount.source, &mount.mount_point])
+
+    // --config is a top-level arg (before subcommand), --mountpoint is on the mount subcommand
+    let mut args: Vec<&str> = Vec::new();
+    if !mount.source.is_empty() {
+        args.extend(["--config", &mount.source]);
+    }
+    args.extend(["mount", "--mountpoint", &mount.mount_point]);
+
+    let output = Command::new("wolfdisk")
+        .args(&args)
         .output()
-        .map_err(|e| format!("Failed to run wolfdiskctl: {}", e))?;
-    
+        .map_err(|e| format!("Failed to run wolfdisk: {}", e))?;
+
     if output.status.success() {
         Ok("WolfDisk storage mounted".to_string())
     } else {
@@ -796,9 +813,9 @@ fn has_nfs() -> bool {
 }
 
 fn has_wolfdisk() -> bool {
-    Path::new("/usr/local/bin/wolfdiskctl").exists()
-        || Path::new("/opt/wolfdisk/wolfdiskctl").exists()
-        || Command::new("which").arg("wolfdiskctl").output().map(|o| o.status.success()).unwrap_or(false)
+    Path::new("/usr/local/bin/wolfdisk").exists()
+        || Path::new("/opt/wolfdisk/wolfdisk").exists()
+        || Command::new("which").arg("wolfdisk").output().map(|o| o.status.success()).unwrap_or(false)
 }
 
 fn install_s3fs() -> Result<(), String> {
