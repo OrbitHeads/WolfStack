@@ -23314,13 +23314,16 @@ async function loadWolfDiskCluster() {
     const nodes = getClusterNodes(wdCurrentCluster);
     const results = await Promise.allSettled(
         nodes.filter(n => n.online).map(async (node) => {
-            const [provResp, mountsResp, dockerResp, lxcResp] = await Promise.all([
+            const [provResp, mountsResp, dockerResp, lxcResp, wnResp] = await Promise.all([
                 fetch(nodeApiUrl(node.id, '/api/storage/providers')),
                 fetch(nodeApiUrl(node.id, '/api/storage/mounts')),
                 fetch(nodeApiUrl(node.id, '/api/containers/docker')).catch(() => ({ json: () => [] })),
                 fetch(nodeApiUrl(node.id, '/api/containers/lxc')).catch(() => ({ json: () => [] })),
+                fetch(nodeApiUrl(node.id, '/api/networking/wolfnet/local-info')).catch(() => ({ ok: false })),
             ]);
             const providers = provResp.ok ? await provResp.json() : [];
+            var wnInfo = null;
+            try { wnInfo = wnResp.ok ? await wnResp.json() : null; } catch(_) {}
             const wdProvider = (Array.isArray(providers) ? providers : []).find(p => p.name === 'wolfdisk');
             const allMounts = mountsResp.ok ? await mountsResp.json() : [];
             const wdMounts = (Array.isArray(allMounts) ? allMounts : []).filter(m => m.mount_type === 'wolfdisk');
@@ -23408,6 +23411,8 @@ async function loadWolfDiskCluster() {
                     info: wdProvider ? wdProvider.wolfdisk_info : null,
                     wdClusterName: wdProvider && wdProvider.wolfdisk_info ? wdProvider.wolfdisk_info.cluster_name : null,
                     memberType: 'host',
+                    wolfnetIp: wnInfo ? (wnInfo.address || null) : null,
+                    nodeAddress: node.address || null,
                     mounts: wdMounts,
                     containers: wdContainers,
                 },
@@ -23530,7 +23535,7 @@ function renderWolfDiskClusterSection(name, nodes) {
 
     // Topology bar
     html += '<div style="padding:10px 20px; background:var(--bg-tertiary, rgba(0,0,0,0.1)); font-size:11px; color:var(--text-muted); display:flex; flex-wrap:wrap; gap:12px;">';
-    if (leader) html += '<span>\u{1f451} Leader: <strong style="color:var(--text-primary);">' + leader.nodeName + '</strong> (' + leader.info.bind + ')</span>';
+    if (leader) html += '<span>\u{1f451} Leader: <strong style="color:var(--text-primary);">' + leader.nodeName + '</strong> (' + (leader.wolfnetIp || leader.info.bind) + (leader.wolfnetIp ? ' \ud83d\udd17 WolfNet' : '') + ')</span>';
     if (followers.length) html += '<span>\u{1f4e6} Followers: <strong style="color:var(--text-primary);">' + followers.map(f => f.nodeName).join(', ') + '</strong></span>';
     if (clients.length) html += '<span>\u{1f4bb} Clients: <strong style="color:var(--text-primary);">' + clients.map(c => c.nodeName).join(', ') + '</strong></span>';
     html += '</div>';
@@ -23660,6 +23665,7 @@ function renderWolfDiskNodeDetail(n) {
         html += wdDetailItem('Data Directory', info.data_dir);
         html += wdDetailItem('Mount Path', info.mount_path);
         html += wdDetailItem('Bind Address', info.bind);
+        if (n.wolfnetIp) html += wdDetailItem('WolfNet IP', n.wolfnetIp + ' \ud83d\udd17');
         html += wdDetailItem('Replication', info.replication_mode === 'replicated' ? 'Replicated ' + info.replication_factor + 'x' : 'Shared');
         if (info.peers && info.peers.length) html += wdDetailItem('Peers', info.peers.join(', '));
         if (info.s3_enabled) html += wdDetailItem('S3 API', 'Enabled on ' + (info.s3_bind || ':9878'));
@@ -23711,36 +23717,21 @@ function wdDetailItem(label, value) {
     return '<div><span style="color:var(--text-muted);">' + label + ':</span> <strong style="color:var(--text-primary);">' + value + '</strong></div>';
 }
 
+function wdOpenConsole(nodeId, type, consoleName) {
+    var url = '/console.html?type=' + encodeURIComponent(type) + '&name=' + encodeURIComponent(consoleName);
+    var node = allNodes.find(n => n.id === nodeId);
+    if (node && !node.is_self) {
+        url += '&node_id=' + encodeURIComponent(nodeId);
+    }
+    window.open(url, 'wd_install_' + consoleName, 'width=960,height=600,menubar=no,toolbar=no,scrollbars=yes,resizable=yes');
+}
+
 async function wdInstall(nodeId) {
     var node = wdClusterData.find(n => n.nodeId === nodeId);
     var name = node ? node.nodeName : nodeId;
-    if (!await showConfirm('Install WolfDisk on ' + name + '? This will download and set up the WolfDisk distributed filesystem.', 'Install WolfDisk')) return;
-    showToast('Installing WolfDisk on ' + name + '...', 'info');
-    try {
-        var resp = await fetch(nodeApiUrl(nodeId, '/api/storage/providers/wolfdisk/install'), { method: 'POST' });
-        var data = await resp.json();
-        if (resp.ok) {
-            showToast('WolfDisk installed on ' + name + '! Opening configuration...', 'success');
-            // If there's exactly one existing WolfDisk cluster, pre-fill join settings
-            var existingClusters = {};
-            for (var i = 0; i < wdClusterData.length; i++) {
-                var nd = wdClusterData[i];
-                if (nd.wdClusterName && nd.installed && nd.info) {
-                    existingClusters[nd.wdClusterName] = true;
-                }
-            }
-            var clusterNames = Object.keys(existingClusters);
-            if (clusterNames.length === 1) {
-                await wdJoinCluster(nodeId, clusterNames[0]);
-            } else {
-                await wdOpenConfig(nodeId);
-            }
-        } else {
-            showToast(data.error || 'Install failed', 'error');
-        }
-    } catch (e) {
-        showToast('Error: ' + e.message, 'error');
-    }
+    if (!await showConfirm('Install WolfDisk on ' + name + '?\n\nA terminal will open showing the installation progress.', 'Install WolfDisk')) return;
+    wdOpenConsole(nodeId, 'install', 'wolfdisk');
+    showToast('Installation terminal opened for ' + name + '. Refresh this page when complete.', 'success');
 }
 
 async function wdAction(mid, action) {
@@ -23766,45 +23757,24 @@ async function wdAction(mid, action) {
 }
 
 async function wdInstallContainer(hostNodeId, runtime, containerName) {
-    if (!await showConfirm('Install WolfDisk in ' + runtime.toUpperCase() + ' container "' + containerName + '"?', 'Install WolfDisk')) return;
-    showToast('Installing WolfDisk in ' + containerName + '...', 'info');
-    try {
-        var resp = await fetch(nodeApiUrl(hostNodeId, '/api/containers/install-component'), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ runtime: runtime, container: containerName, component: 'wolfdisk' }),
-        });
-        var data = await resp.json();
-        if (resp.ok) {
-            showToast('WolfDisk installed in ' + containerName + '!', 'success');
-            var mid = hostNodeId + ':' + runtime + ':' + containerName;
-            // Check for existing clusters to auto-join
-            var existingClusters = {};
-            for (var i = 0; i < wdClusterData.length; i++) {
-                var nd = wdClusterData[i];
-                if (nd.wdClusterName && nd.installed && nd.info) existingClusters[nd.wdClusterName] = true;
-            }
-            var cNames = Object.keys(existingClusters);
-            if (cNames.length === 1) {
-                await wdJoinCluster(mid, cNames[0]);
-            } else {
-                await wdOpenConfig(mid);
-            }
-        } else {
-            showToast(data.error || 'Install failed', 'error');
-        }
-    } catch (e) {
-        showToast('Error: ' + e.message, 'error');
-    }
+    if (!await showConfirm('Install WolfDisk in ' + runtime.toUpperCase() + ' container "' + containerName + '"?\n\nA terminal will open showing the installation progress.', 'Install WolfDisk')) return;
+    wdOpenConsole(hostNodeId, 'install', 'wolfdisk@' + runtime + ':' + containerName);
+    showToast('Installation terminal opened for ' + containerName + '. Refresh this page when complete.', 'success');
 }
 
 async function wdJoinCluster(mid, clusterName) {
-    // Collect peer addresses from existing nodes in that WolfDisk cluster
+    // Collect peer addresses — prefer WolfNet IPs for mesh connectivity, fall back to bind address
     var peers = [];
     for (var i = 0; i < wdClusterData.length; i++) {
         var nd = wdClusterData[i];
         if (nd.wdClusterName === clusterName && nd.installed && nd.info && nd.info.bind) {
-            peers.push(nd.info.bind);
+            var bindPort = nd.info.bind.split(':').pop() || '9500';
+            if (nd.wolfnetIp) {
+                // Prefer WolfNet IP with the WolfDisk port
+                peers.push(nd.wolfnetIp + ':' + bindPort);
+            } else {
+                peers.push(nd.info.bind);
+            }
         }
     }
     // Get replication settings from the first node in the cluster
