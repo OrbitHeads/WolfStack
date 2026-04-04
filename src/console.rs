@@ -190,7 +190,7 @@ async fn console_session(
                 "wolfserve" => "https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfScale/master/wolfserve/install.sh",
                 "wolfdisk" => "https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfScale/main/wolfdisk/setup.sh",
                 "wolfscale" => "https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfScale/main/setup_lb.sh",
-                "mariadb" => "https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfStack/main/mariadb_setup.sh",
+                "mariadb" => "__inline_mariadb__",
                 "certbot" => "__inline_certbot__",
                 _ => {
                     let _ = session.text(format!("\r\n\x1b[31mUnknown component: {}\x1b[0m\r\n", component)).await;
@@ -199,7 +199,21 @@ async fn console_session(
                 }
             };
 
-            // Certbot installs via package manager directly; other components use a remote script
+            // MariaDB and Certbot install via package manager directly; other components use a remote script
+            let mariadb_inline = "if command -v apt-get >/dev/null 2>&1; then \
+                apt-get update -qq && apt-get install -y mariadb-server && \
+                systemctl enable --now mariadb; \
+                elif command -v dnf >/dev/null 2>&1; then \
+                dnf install -y mariadb-server && \
+                systemctl enable --now mariadb; \
+                elif command -v zypper >/dev/null 2>&1; then \
+                zypper install -y mariadb && \
+                systemctl enable --now mariadb; \
+                elif command -v pacman >/dev/null 2>&1; then \
+                pacman -S --noconfirm mariadb && \
+                mariadb-install-db --user=mysql --basedir=/usr --datadir=/var/lib/mysql && \
+                systemctl enable --now mariadb; \
+                else echo 'Unsupported package manager' && exit 1; fi";
             let certbot_inline = "if command -v apt-get >/dev/null 2>&1; then \
                 apt-get update -qq && apt-get install -y certbot; \
                 elif command -v dnf >/dev/null 2>&1; then \
@@ -207,7 +221,12 @@ async fn console_session(
                 elif command -v zypper >/dev/null 2>&1; then \
                 zypper install -y certbot; \
                 else echo 'Unsupported package manager' && exit 1; fi";
-            let is_inline = install_script == "__inline_certbot__";
+            let inline_script = match install_script {
+                "__inline_mariadb__" => Some(mariadb_inline),
+                "__inline_certbot__" => Some(certbot_inline),
+                _ => None,
+            };
+            let is_inline = inline_script.is_some();
 
             match target {
                 None | Some("host") => {
@@ -218,7 +237,7 @@ async fn console_session(
                              export DEBIAN_FRONTEND=noninteractive && \
                              {}; \
                              echo '' && echo '\\x1b[1;32mInstallation complete. You can close this terminal.\\x1b[0m'",
-                            component, certbot_inline
+                            component, inline_script.unwrap()
                         ));
                     } else {
                         cmd.arg(format!(
@@ -243,7 +262,7 @@ async fn console_session(
                                          docker exec -e DEBIAN_FRONTEND=noninteractive -e TERM=xterm-256color -it {} sh -c \
                                          '{}'; \
                                          echo '' && echo '\\x1b[1;32mInstallation complete. You can close this terminal.\\x1b[0m'",
-                                        component, container, container, certbot_inline
+                                        component, container, container, inline_script.unwrap()
                                     ));
                                 } else {
                                     cmd.arg(format!(
@@ -271,7 +290,7 @@ async fn console_session(
                                          lxc-attach {}-n {} --set-var TERM=xterm-256color --set-var DEBIAN_FRONTEND=noninteractive -- sh -c \
                                          '{}'; \
                                          echo '' && echo '\\x1b[1;32mInstallation complete. You can close this terminal.\\x1b[0m'",
-                                        component, container, lxc_p, container, certbot_inline
+                                        component, container, lxc_p, container, inline_script.unwrap()
                                     ));
                                 } else {
                                     cmd.arg(format!(
