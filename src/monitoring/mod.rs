@@ -29,6 +29,9 @@ pub struct SystemMetrics {
     pub os_name: Option<String>,
     pub os_version: Option<String>,
     pub kernel_version: Option<String>,
+    /// Hardware classification: "low", "mid", or "high"
+    #[serde(default)]
+    pub hardware_tier: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,7 +66,13 @@ pub struct SystemMonitor {
     sys: System,
     disks: Disks,
     networks: Networks,
+    /// Counter for slow-path refreshes (processes, disks) — every Nth collect
+    tick: u32,
 }
+
+/// How often to do the expensive refresh (processes + disk list).
+/// At 2s polling interval, 15 ticks = every 30 seconds.
+const SLOW_REFRESH_TICKS: u32 = 15;
 
 impl SystemMonitor {
     pub fn new() -> Self {
@@ -76,14 +85,24 @@ impl SystemMonitor {
             sys,
             disks,
             networks,
+            tick: 0,
         }
     }
 
     /// Collect current system metrics
     pub fn collect(&mut self) -> SystemMetrics {
-        self.sys.refresh_all();
-        self.disks.refresh_list();
+        // Fast path (every tick): CPU + memory + network only
+        self.sys.refresh_cpu_all();
+        self.sys.refresh_memory();
         self.networks.refresh();
+
+        // Slow path (every ~30s): processes + disk list — these are expensive
+        self.tick += 1;
+        if self.tick >= SLOW_REFRESH_TICKS {
+            self.tick = 0;
+            self.sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            self.disks.refresh_list();
+        }
 
         let cpu_model = self.sys.cpus().first()
             .map(|c| c.brand().to_string())
@@ -128,16 +147,20 @@ impl SystemMonitor {
 
         let load = System::load_average();
 
+        let cpu_count = self.sys.cpus().len();
+        let total_memory = self.sys.total_memory();
+        let hardware_tier = classify_hardware(cpu_count, total_memory);
+
         SystemMetrics {
             hostname: System::host_name().unwrap_or_else(|| "unknown".to_string()),
             uptime_secs: System::uptime(),
             cpu_usage_percent: cpu_usage,
-            cpu_count: self.sys.cpus().len(),
+            cpu_count,
             cpu_model,
-            memory_total_bytes: self.sys.total_memory(),
+            memory_total_bytes: total_memory,
             memory_used_bytes: self.sys.used_memory(),
-            memory_percent: if self.sys.total_memory() > 0 {
-                (self.sys.used_memory() as f32 / self.sys.total_memory() as f32) * 100.0
+            memory_percent: if total_memory > 0 {
+                (self.sys.used_memory() as f32 / total_memory as f32) * 100.0
             } else { 0.0 },
             swap_total_bytes: self.sys.total_swap(),
             swap_used_bytes: self.sys.used_swap(),
@@ -152,7 +175,20 @@ impl SystemMonitor {
             os_name: System::name(),
             os_version: System::os_version(),
             kernel_version: System::kernel_version(),
+            hardware_tier,
         }
+    }
+}
+
+/// Classify hardware as "low", "mid", or "high" based on CPU cores and RAM
+pub fn classify_hardware(cpu_count: usize, total_memory_bytes: u64) -> String {
+    let ram_gb = total_memory_bytes / (1024 * 1024 * 1024);
+    if cpu_count <= 2 || ram_gb <= 4 {
+        "low".into()
+    } else if cpu_count <= 4 || ram_gb <= 8 {
+        "mid".into()
+    } else {
+        "high".into()
     }
 }
 

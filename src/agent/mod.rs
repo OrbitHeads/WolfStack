@@ -655,6 +655,7 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                         os_name: Some("Proxmox VE".to_string()),
                         os_version: None,
                         kernel_version: None,
+                        hardware_tier: crate::monitoring::classify_hardware(status.maxcpu as usize, status.mem_total),
                     };
 
                     // Prefer user's saved cluster name; only use API-fetched name as initial fallback
