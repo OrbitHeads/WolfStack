@@ -5939,6 +5939,169 @@ pub async fn pbs_config_save(
     }
 }
 
+// ─── Wolfram Memory Compression ───
+
+/// GET /api/wolfram/status — check if wolfram is installed and read stats
+pub async fn wolfram_status(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+
+    let installed = std::path::Path::new("/usr/local/bin/wolfram").exists();
+    let service_active = Command::new("systemctl")
+        .args(["is-active", "wolfram"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
+        .unwrap_or(false);
+    let service_enabled = Command::new("systemctl")
+        .args(["is-enabled", "wolfram"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "enabled")
+        .unwrap_or(false);
+
+    let version = if installed {
+        Command::new("/usr/local/bin/wolfram")
+            .arg("--version")
+            .output()
+            .ok()
+            .and_then(|o| {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                // Output is typically "wolfram X.Y.Z" — extract version
+                s.split_whitespace().last().map(|v| v.to_string())
+            })
+    } else {
+        None
+    };
+
+    let stats: Option<serde_json::Value> = if service_active {
+        std::fs::read_to_string("/var/lib/wolfram/stats.json")
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+    } else {
+        None
+    };
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "installed": installed,
+        "active": service_active,
+        "enabled": service_enabled,
+        "version": version,
+        "stats": stats,
+    }))
+}
+
+/// POST /api/wolfram/install — install wolfram via the install script
+pub async fn wolfram_install(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+
+    match web::block(|| {
+        let output = Command::new("sh")
+            .args(["-c", "curl -fsSL https://raw.githubusercontent.com/wolfsoftwaresystemsltd/wolfram/master/install.sh | sh"])
+            .output();
+        match output {
+            Ok(o) => {
+                let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+                if o.status.success() {
+                    Ok(format!("{}\n{}", stdout, stderr))
+                } else {
+                    Err(format!("Install failed (exit {}): {}\n{}", o.status.code().unwrap_or(-1), stdout, stderr))
+                }
+            }
+            Err(e) => Err(format!("Failed to run installer: {}", e)),
+        }
+    }).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({"ok": true, "message": msg})),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": e})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": format!("{}", e)})),
+    }
+}
+
+/// POST /api/wolfram/uninstall — remove wolfram
+pub async fn wolfram_uninstall(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+
+    match web::block(|| {
+        // Stop service, disable, remove binary and service file
+        let _ = Command::new("systemctl").args(["stop", "wolfram"]).output();
+        let _ = Command::new("systemctl").args(["disable", "wolfram"]).output();
+        let _ = std::fs::remove_file("/usr/local/bin/wolfram");
+        let _ = std::fs::remove_file("/etc/systemd/system/wolfram.service");
+        let _ = Command::new("systemctl").arg("daemon-reload").output();
+        Ok::<_, String>("Wolfram uninstalled".to_string())
+    }).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({"ok": true, "message": msg})),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": e})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": format!("{}", e)})),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct WolframActionRequest {
+    pub action: String,
+}
+
+/// POST /api/wolfram/action — start/stop/restart wolfram service
+pub async fn wolfram_action(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<WolframActionRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+
+    let action = match body.action.as_str() {
+        "start" | "stop" | "restart" | "enable" | "disable" => body.action.as_str(),
+        _ => return HttpResponse::BadRequest().json(serde_json::json!({"error": "Invalid action"})),
+    };
+
+    match Command::new("systemctl").args([action, "wolfram"]).output() {
+        Ok(o) if o.status.success() => {
+            HttpResponse::Ok().json(serde_json::json!({"ok": true}))
+        }
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr).to_string();
+            HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": err}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": format!("{}", e)})),
+    }
+}
+
+/// GET /api/wolfram/config — read /etc/wolfram/config.toml
+pub async fn wolfram_config_get(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let content = std::fs::read_to_string("/etc/wolfram/config.toml").unwrap_or_default();
+    HttpResponse::Ok().json(serde_json::json!({"config": content}))
+}
+
+#[derive(Deserialize)]
+pub struct WolframConfigSaveRequest {
+    pub config: String,
+}
+
+/// POST /api/wolfram/config — write /etc/wolfram/config.toml
+pub async fn wolfram_config_save(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<WolframConfigSaveRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let _ = std::fs::create_dir_all("/etc/wolfram");
+    match std::fs::write("/etc/wolfram/config.toml", &body.config) {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"ok": true})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": format!("{}", e)})),
+    }
+}
+
 // ─── Ceph Cluster API ───
 
 /// GET /api/ceph/status — full cluster status
@@ -14909,6 +15072,13 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/secrets", web::post().to(secrets_save))
         .route("/api/secrets/{key}", web::get().to(secrets_get))
         .route("/api/secrets/{key}", web::delete().to(secrets_delete))
+        // Wolfram — memory compression daemon
+        .route("/api/wolfram/status", web::get().to(wolfram_status))
+        .route("/api/wolfram/install", web::post().to(wolfram_install))
+        .route("/api/wolfram/uninstall", web::post().to(wolfram_uninstall))
+        .route("/api/wolfram/action", web::post().to(wolfram_action))
+        .route("/api/wolfram/config", web::get().to(wolfram_config_get))
+        .route("/api/wolfram/config", web::post().to(wolfram_config_save))
         // TOML Editors (WolfDisk, WolfScale)
         .route("/api/configurator/toml/{component}/structured", web::get().to(toml_get_structured))
         .route("/api/configurator/toml/{component}/structured", web::post().to(toml_save_structured))

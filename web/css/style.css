@@ -921,6 +921,21 @@
     background: #0a0a14;
 }
 
+/* ─── Monochrome Icons ─── */
+[data-mono-icons] .icon,
+[data-mono-icons] .server-child-item .icon,
+[data-mono-icons] .sidebar-nav .icon {
+    filter: grayscale(1) brightness(var(--mono-brightness, 0.9)) contrast(1.1)
+            sepia(var(--mono-sepia, 0)) hue-rotate(var(--mono-hue, 0deg)) saturate(var(--mono-sat, 0));
+}
+
+/* Also handle icon pack images and card header emojis */
+[data-mono-icons] .ws-icon-pack-img,
+[data-mono-icons] .card-header h3 .icon {
+    filter: grayscale(1) brightness(var(--mono-brightness, 0.9)) contrast(1.1)
+            sepia(var(--mono-sepia, 0)) hue-rotate(var(--mono-hue, 0deg)) saturate(var(--mono-sat, 0));
+}
+
 /* ─── No Icons Mode ─── */
 [data-no-icons] .icon {
     display: none !important;
@@ -957,6 +972,14 @@
 }
 
 #toggle-icons:checked + span + span {
+    transform: translateX(22px);
+}
+
+#toggle-mono-icons:checked + span {
+    background: var(--accent) !important;
+}
+
+#toggle-mono-icons:checked + span + span {
     transform: translateX(22px);
 }
 

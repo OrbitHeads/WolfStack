@@ -1100,6 +1100,7 @@ function selectServerView(nodeId, view) {
         'security': 'Security',
         'ceph': 'Ceph',
         'wolfkube': 'WolfKube',
+        'wolfram': 'Wolfram',
     };
     document.getElementById('page-title').textContent = `${hostname} — ${viewTitles[view] || view}`;
     document.getElementById('hostname-display').textContent = `${hostname} (${node?.address}:${node?.port})`;
@@ -1120,7 +1121,7 @@ function selectServerView(nodeId, view) {
 
     // Load data for the view
     // Show a modern loading overlay for views that fetch data asynchronously
-    const asyncViews = ['components', 'services', 'containers', 'compose', 'secrets', 'lxc', 'vms', 'storage', 'networking', 'backups', 'wolfnet', 'certificates', 'cron', 'pve-resources', 'mysql-editor', 'security', 'ceph', 'wolfkube'];
+    const asyncViews = ['components', 'services', 'containers', 'compose', 'secrets', 'lxc', 'vms', 'storage', 'networking', 'backups', 'wolfnet', 'certificates', 'cron', 'pve-resources', 'mysql-editor', 'security', 'ceph', 'wolfkube', 'wolfram'];
     if (asyncViews.includes(view) && el) {
         // Clear table bodies to prevent stale data showing
         el.querySelectorAll('tbody').forEach(tb => { tb.innerHTML = ''; });
@@ -1185,6 +1186,7 @@ function selectServerView(nodeId, view) {
     if (view === 'security') loadNodeSecurity().finally(() => hidePageLoadingOverlay(el));
     if (view === 'ceph') loadCephStatus().finally(() => hidePageLoadingOverlay(el));
     if (view === 'wolfkube') loadNodeWolfKube().finally(() => hidePageLoadingOverlay(el));
+    if (view === 'wolfram') loadWolframStatus().finally(() => hidePageLoadingOverlay(el));
 }
 
 // ─── Server Tree ───
@@ -1348,6 +1350,9 @@ function buildServerTree(nodes) {
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="security" onclick="selectServerView('${node.id}', 'security')">
                             <span class="icon">🛡️</span> Security
+                        </a>
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="wolfram" onclick="selectServerView('${node.id}', 'wolfram')">
+                            <span class="icon">🧠</span> Wolfram
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="terminal" onclick="selectServerView('${node.id}', 'terminal')">
                             <span class="icon">💻</span> Terminal
@@ -20127,7 +20132,8 @@ async function populateAppStoreStorage() {
         if (data.proxmox) {
             data.storages.filter(s => s.status === 'active').forEach(s => {
                 const free = formatBytes(s.available_bytes);
-                sel.innerHTML += `<option value="${escapeHtml(s.id)}">${escapeHtml(s.id)} (${s.type}, ${free} free)</option>`;
+                const val = s.path || s.id;
+                sel.innerHTML += `<option value="${escapeHtml(val)}">${escapeHtml(s.id)} (${s.type}, ${free} free)</option>`;
             });
         } else {
             data.storages.forEach(s => {
@@ -20637,6 +20643,7 @@ function initTheme() {
     applyTheme(saved);
     initIconTheme();
     initIconToggle();
+    initMonoIcons();
 }
 
 // ─── Icon Theme Application ───
@@ -20863,6 +20870,74 @@ function observeForIconPack() {
 
 // ─── Icon Toggle System ───
 const EMOJI_RE = /[\u{1F300}-\u{1F9FF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{E0020}-\u{E007F}\u{2700}-\u{27BF}\u{2300}-\u{23FF}\u{2B50}\u{2B55}\u{25AA}-\u{25FE}\u{2934}-\u{2935}\u{3030}\u{303D}\u{3297}\u{3299}\u{FE0F}\u{200D}]+/gu;
+
+// ─── Monochrome Icons ───
+const MONO_PRESETS = [
+    { name: 'Gray',       color: '#8893a7', sepia: 0, hue: 0,   sat: 0,   brightness: 0.9 },
+    { name: 'Blue',       color: '#5096d4', sepia: 1, hue: 180, sat: 3,   brightness: 0.7 },
+    { name: 'Slate',      color: '#6987a5', sepia: 1, hue: 170, sat: 1.5, brightness: 0.75 },
+    { name: 'Teal',       color: '#4db6ac', sepia: 1, hue: 135, sat: 2.5, brightness: 0.7 },
+    { name: 'Indigo',     color: '#7986cb', sepia: 1, hue: 200, sat: 2.5, brightness: 0.7 },
+    { name: 'Green',      color: '#66bb6a', sepia: 1, hue: 85,  sat: 2.5, brightness: 0.7 },
+    { name: 'Amber',      color: '#ffb74d', sepia: 1, hue: 0,   sat: 2,   brightness: 0.9 },
+    { name: 'Rose',       color: '#e57373', sepia: 1, hue: 315, sat: 2.5, brightness: 0.8 },
+    { name: 'Purple',     color: '#ab84c9', sepia: 1, hue: 230, sat: 2,   brightness: 0.8 },
+];
+
+function toggleMonoIcons(enabled) {
+    if (enabled) {
+        document.documentElement.setAttribute('data-mono-icons', '');
+        localStorage.setItem('wolfstack-mono-icons', '1');
+        const saved = localStorage.getItem('wolfstack-mono-preset') || 'Gray';
+        applyMonoPreset(saved);
+    } else {
+        document.documentElement.removeAttribute('data-mono-icons');
+        localStorage.removeItem('wolfstack-mono-icons');
+    }
+    const opts = document.getElementById('mono-icons-options');
+    if (opts) opts.style.display = enabled ? '' : 'none';
+}
+
+function applyMonoPreset(name) {
+    const preset = MONO_PRESETS.find(p => p.name === name) || MONO_PRESETS[0];
+    const root = document.documentElement;
+    root.style.setProperty('--mono-sepia', preset.sepia);
+    root.style.setProperty('--mono-hue', preset.hue + 'deg');
+    root.style.setProperty('--mono-sat', preset.sat);
+    root.style.setProperty('--mono-brightness', preset.brightness);
+    localStorage.setItem('wolfstack-mono-preset', preset.name);
+    // Update active state on preset buttons
+    document.querySelectorAll('.mono-preset-btn').forEach(btn => {
+        btn.style.outline = btn.dataset.preset === preset.name ? '2px solid var(--accent)' : 'none';
+        btn.style.outlineOffset = '2px';
+    });
+}
+
+function initMonoIcons() {
+    const enabled = localStorage.getItem('wolfstack-mono-icons') === '1';
+    const cb = document.getElementById('toggle-mono-icons');
+    if (cb) cb.checked = enabled;
+    const opts = document.getElementById('mono-icons-options');
+
+    // Render preset swatches
+    const presetsEl = document.getElementById('mono-color-presets');
+    if (presetsEl) {
+        presetsEl.innerHTML = MONO_PRESETS.map(p =>
+            `<button class="mono-preset-btn" data-preset="${p.name}" onclick="applyMonoPreset('${p.name}')"
+                style="width:32px;height:32px;border-radius:50%;border:2px solid var(--border);background:${p.color};cursor:pointer;padding:0;transition:outline .15s;"
+                title="${p.name}"></button>`
+        ).join('');
+    }
+
+    if (enabled) {
+        document.documentElement.setAttribute('data-mono-icons', '');
+        if (opts) opts.style.display = '';
+        const saved = localStorage.getItem('wolfstack-mono-preset') || 'Gray';
+        applyMonoPreset(saved);
+    } else {
+        if (opts) opts.style.display = 'none';
+    }
+}
 
 function toggleIcons(hide) {
     if (hide) {
@@ -31929,5 +32004,219 @@ async function revealSecret(key, btn) {
         }
     } catch (e) {
         showToast('Failed to reveal secret', 'error');
+    }
+}
+
+// ─── Wolfram Memory Compression ───
+
+async function loadWolframStatus() {
+    try {
+        const resp = await fetch(apiUrl('/api/wolfram/status'));
+        const data = await resp.json();
+
+        const setupBanner = document.getElementById('wolfram-setup-banner');
+        const runningView = document.getElementById('wolfram-running-view');
+
+        if (!data.installed) {
+            setupBanner.style.display = 'block';
+            runningView.style.display = 'none';
+            document.getElementById('wolfram-install-status').innerHTML = `
+                <div style="display:flex; align-items:center; gap:16px; padding:16px; background:var(--bg-secondary); border-radius:8px; border:1px solid var(--border);">
+                    <span style="font-size:32px;">🧠</span>
+                    <div style="flex:1;">
+                        <div style="font-weight:600; margin-bottom:4px;">Wolfram is not installed</div>
+                        <div style="font-size:13px; color:var(--text-muted);">Wolfram is a proactive memory compression daemon that saves RAM by compressing cold pages into zram, deduplicating with KSM, and optionally hibernating idle processes.</div>
+                    </div>
+                    <button class="btn btn-primary" onclick="wolframInstall()" id="wolfram-install-btn">Install Wolfram</button>
+                </div>`;
+            return;
+        }
+
+        if (!data.active) {
+            // Installed but not running
+            setupBanner.style.display = 'block';
+            runningView.style.display = 'none';
+            document.getElementById('wolfram-install-status').innerHTML = `
+                <div style="display:flex; align-items:center; gap:16px; padding:16px; background:var(--bg-secondary); border-radius:8px; border:1px solid var(--border);">
+                    <span style="font-size:32px;">⏸️</span>
+                    <div style="flex:1;">
+                        <div style="font-weight:600; margin-bottom:4px;">Wolfram is installed but not running</div>
+                        <div style="font-size:13px; color:var(--text-muted);">Version: ${data.version || 'unknown'}</div>
+                    </div>
+                    <div style="display:flex; gap:8px;">
+                        <button class="btn btn-primary" onclick="wolframAction('start')">Start</button>
+                        <button class="btn" style="background:var(--danger); color:#fff;" onclick="wolframUninstall()">Uninstall</button>
+                    </div>
+                </div>`;
+            return;
+        }
+
+        // Running — show stats
+        setupBanner.style.display = 'none';
+        runningView.style.display = 'block';
+        renderWolframStats(data);
+
+        // Load config
+        const cfgResp = await fetch(apiUrl('/api/wolfram/config'));
+        const cfgData = await cfgResp.json();
+        document.getElementById('wolfram-config-editor').value = cfgData.config || '';
+    } catch (e) {
+        console.error('Failed to load Wolfram status:', e);
+    }
+}
+
+function renderWolframStats(data) {
+    const v = data.version;
+    const s = data.stats || {};
+    const badge = document.getElementById('wolfram-version-badge');
+    if (badge) badge.textContent = v ? `v${v}` : '';
+
+    function fmtBytes(b) {
+        if (!b || b === 0) return '0 B';
+        if (b >= 1073741824) return (b / 1073741824).toFixed(1) + ' GiB';
+        if (b >= 1048576) return (b / 1048576).toFixed(1) + ' MiB';
+        if (b >= 1024) return (b / 1024).toFixed(1) + ' KiB';
+        return b + ' B';
+    }
+
+    function fmtUptime(secs) {
+        if (!secs) return '—';
+        const d = Math.floor(secs / 86400);
+        const h = Math.floor((secs % 86400) / 3600);
+        const m = Math.floor((secs % 3600) / 60);
+        if (d > 0) return `${d}d ${h}h`;
+        if (h > 0) return `${h}h ${m}m`;
+        return `${m}m`;
+    }
+
+    const totalSavedMib = s.total_saved_mib || 0;
+    const ratio = s.compression_ratio ? s.compression_ratio.toFixed(1) + ':1' : '—';
+
+    document.getElementById('wolfram-stats-grid').innerHTML = `
+        <div style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px; padding:14px;">
+            <div style="font-size:11px; color:var(--text-muted); margin-bottom:4px;">Total RAM Saved</div>
+            <div style="font-size:22px; font-weight:700; color:var(--success);">${totalSavedMib >= 1024 ? (totalSavedMib / 1024).toFixed(1) + ' GiB' : totalSavedMib + ' MiB'}</div>
+        </div>
+        <div style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px; padding:14px;">
+            <div style="font-size:11px; color:var(--text-muted); margin-bottom:4px;">Compression Ratio</div>
+            <div style="font-size:22px; font-weight:700;">${ratio}</div>
+        </div>
+        <div style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px; padding:14px;">
+            <div style="font-size:11px; color:var(--text-muted); margin-bottom:4px;">Backend</div>
+            <div style="font-size:22px; font-weight:700;">${(s.compression_backend || '—').toUpperCase()}</div>
+        </div>
+        <div style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px; padding:14px;">
+            <div style="font-size:11px; color:var(--text-muted); margin-bottom:4px;">Compressed Data</div>
+            <div style="font-size:18px; font-weight:700;">${fmtBytes(s.original_bytes)} → ${fmtBytes(s.compressed_bytes)}</div>
+        </div>
+        <div style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px; padding:14px;">
+            <div style="font-size:11px; color:var(--text-muted); margin-bottom:4px;">KSM Dedup Saved</div>
+            <div style="font-size:18px; font-weight:700;">${s.ksm_saved_mib || 0} MiB</div>
+            <div style="font-size:11px; color:var(--text-muted);">${(s.ksm_pages_sharing || 0).toLocaleString()} pages sharing</div>
+        </div>
+        <div style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px; padding:14px;">
+            <div style="font-size:11px; color:var(--text-muted); margin-bottom:4px;">Hibernated</div>
+            <div style="font-size:18px; font-weight:700;">${s.hibernated_processes || 0} procs</div>
+            <div style="font-size:11px; color:var(--text-muted);">${s.hibernated_saved_mib || 0} MiB freed</div>
+        </div>
+        <div style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px; padding:14px;">
+            <div style="font-size:11px; color:var(--text-muted); margin-bottom:4px;">Uptime</div>
+            <div style="font-size:18px; font-weight:700;">${fmtUptime(s.uptime_secs)}</div>
+            <div style="font-size:11px; color:var(--text-muted);">${s.cycles || 0} cycles</div>
+        </div>
+        <div style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px; padding:14px;">
+            <div style="font-size:11px; color:var(--text-muted); margin-bottom:4px;">zram Devices</div>
+            <div style="font-size:18px; font-weight:700;">${s.zram_devices || 0}</div>
+        </div>`;
+
+    document.getElementById('wolfram-detail').innerHTML = s.timestamp
+        ? `Last updated: ${new Date(s.timestamp).toLocaleString()} — Lifetime compressed: ${(s.lifetime_compressed_kib || 0) >= 1048576 ? ((s.lifetime_compressed_kib / 1048576).toFixed(1) + ' GiB') : ((s.lifetime_compressed_kib || 0) >= 1024 ? ((s.lifetime_compressed_kib / 1024).toFixed(1) + ' MiB') : ((s.lifetime_compressed_kib || 0) + ' KiB'))}`
+        : 'No stats available yet — waiting for first cycle to complete.';
+
+    // Service controls
+    document.getElementById('wolfram-service-controls').innerHTML = `
+        <span style="padding:4px 10px; border-radius:6px; font-size:12px; background:var(--success); color:#fff;">Running</span>
+        <span style="padding:4px 10px; border-radius:6px; font-size:12px; background:${data.enabled ? 'var(--success)' : 'var(--bg-tertiary)'}; color:${data.enabled ? '#fff' : 'var(--text-muted)'};">${data.enabled ? 'Enabled at boot' : 'Disabled at boot'}</span>
+        <div style="flex:1;"></div>
+        <button class="btn btn-sm" onclick="wolframAction('restart')" style="background:var(--bg-tertiary); color:var(--text-primary); border:1px solid var(--border);">Restart</button>
+        <button class="btn btn-sm" onclick="wolframAction('stop')" style="background:var(--bg-tertiary); color:var(--text-primary); border:1px solid var(--border);">Stop</button>
+        ${data.enabled
+            ? `<button class="btn btn-sm" onclick="wolframAction('disable')" style="background:var(--bg-tertiary); color:var(--text-primary); border:1px solid var(--border);">Disable at Boot</button>`
+            : `<button class="btn btn-sm" onclick="wolframAction('enable')" style="background:var(--bg-tertiary); color:var(--text-primary); border:1px solid var(--border);">Enable at Boot</button>`
+        }
+        <button class="btn btn-sm" onclick="wolframUninstall()" style="background:var(--danger); color:#fff;">Uninstall</button>`;
+}
+
+async function wolframInstall() {
+    const btn = document.getElementById('wolfram-install-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Installing...'; }
+    try {
+        const resp = await fetch(apiUrl('/api/wolfram/install'), { method: 'POST' });
+        const data = await resp.json();
+        if (data.ok) {
+            showToast('Wolfram installed successfully', 'success');
+            loadWolframStatus();
+        } else {
+            showToast('Install failed: ' + (data.error || 'Unknown error'), 'error');
+            if (btn) { btn.disabled = false; btn.textContent = 'Install Wolfram'; }
+        }
+    } catch (e) {
+        showToast('Install failed: ' + e.message, 'error');
+        if (btn) { btn.disabled = false; btn.textContent = 'Install Wolfram'; }
+    }
+}
+
+async function wolframUninstall() {
+    if (!confirm('Uninstall Wolfram? This will stop the service and remove the binary.')) return;
+    try {
+        const resp = await fetch(apiUrl('/api/wolfram/uninstall'), { method: 'POST' });
+        const data = await resp.json();
+        if (data.ok) {
+            showToast('Wolfram uninstalled', 'success');
+            loadWolframStatus();
+        } else {
+            showToast('Uninstall failed: ' + (data.error || 'Unknown error'), 'error');
+        }
+    } catch (e) {
+        showToast('Uninstall failed: ' + e.message, 'error');
+    }
+}
+
+async function wolframAction(action) {
+    try {
+        const resp = await fetch(apiUrl('/api/wolfram/action'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action }),
+        });
+        const data = await resp.json();
+        if (data.ok) {
+            showToast(`Wolfram ${action} successful`, 'success');
+            setTimeout(() => loadWolframStatus(), 1000);
+        } else {
+            showToast(`Failed to ${action}: ` + (data.error || 'Unknown error'), 'error');
+        }
+    } catch (e) {
+        showToast(`Failed to ${action}: ` + e.message, 'error');
+    }
+}
+
+async function wolframSaveConfig() {
+    const config = document.getElementById('wolfram-config-editor').value;
+    try {
+        const resp = await fetch(apiUrl('/api/wolfram/config'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ config }),
+        });
+        const data = await resp.json();
+        if (data.ok) {
+            showToast('Config saved, restarting Wolfram...', 'success');
+            await wolframAction('restart');
+        } else {
+            showToast('Failed to save config: ' + (data.error || 'Unknown error'), 'error');
+        }
+    } catch (e) {
+        showToast('Failed to save config: ' + e.message, 'error');
     }
 }

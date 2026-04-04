@@ -389,7 +389,7 @@
                 <!-- System Details (Neofetch) -->
                 <div class="card"
                     style="margin-bottom: 24px; background: linear-gradient(145deg, var(--card-bg), var(--bg-secondary)); border: 1px solid var(--border-color);">
-                    <div style="display: flex; gap: 40px; align-items: flex-start; flex-wrap: wrap;">
+                    <div style="display: flex; gap: 40px; align-items: flex-start; flex-wrap: wrap; padding: 24px 32px;">
                         <!-- Logo (ASCII-ish) -->
                         <!-- Logo (Text) -->
                         <div
@@ -3746,6 +3746,29 @@
                             </div>
                         </div>
 
+                        <!-- Monochrome Icons -->
+                        <div style="margin-top:24px; padding-top:20px; border-top:1px solid var(--border);">
+                            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+                                <div>
+                                    <h4 style="margin:0 0 4px 0; font-size:16px; font-weight:600;">Monochrome Icons</h4>
+                                    <p style="font-size:13px; color:var(--text-muted); margin:0;">Display all icons in a single muted colour, like Proxmox.</p>
+                                </div>
+                                <label style="position:relative;display:inline-block;width:48px;height:26px;flex-shrink:0;margin-left:16px;cursor:pointer;">
+                                    <input type="checkbox" id="toggle-mono-icons" onchange="toggleMonoIcons(this.checked)" style="opacity:0;width:0;height:0;">
+                                    <span style="position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:var(--border);border-radius:13px;transition:.3s;"></span>
+                                    <span style="position:absolute;top:3px;left:3px;width:20px;height:20px;background:var(--text-primary);border-radius:50%;transition:.3s;"></span>
+                                </label>
+                            </div>
+                            <div id="mono-icons-options" style="display:none;">
+                                <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+                                    <div id="mono-color-presets" style="display:flex;gap:6px;flex-wrap:wrap;"></div>
+                                </div>
+                                <div id="mono-preview" style="margin-top:12px;padding:10px 16px;background:var(--bg-primary);border:1px solid var(--border);border-radius:8px;">
+                                    <span class="icon" style="font-size:20px;letter-spacing:8px;">📊 📦 🐳 💾 🌐 🔒 🛡️ ⚡ 🧠 📋</span>
+                                </div>
+                            </div>
+                        </div>
+
                         <!-- Icon Toggle -->
                         <div style="margin-top:24px; padding-top:20px; border-top:1px solid var(--border);">
                             <div style="display:flex;align-items:center;justify-content:space-between;">
@@ -4594,6 +4617,56 @@
                             <thead><tr><th>ID</th><th>Name</th><th>Type</th></tr></thead>
                             <tbody id="ceph-crush-table"></tbody>
                         </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ═══ Wolfram Memory Compression ═══ -->
+        <div id="page-wolfram" class="page-view" style="display:none;">
+            <!-- Install banner (shown when not installed) -->
+            <div id="wolfram-setup-banner" style="display:none;">
+                <div class="card">
+                    <div class="card-header"><h3>Wolfram Memory Compression</h3></div>
+                    <div class="card-body">
+                        <div id="wolfram-install-status"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Running view (shown when installed & active) -->
+            <div id="wolfram-running-view" style="display:none;">
+                <!-- Stats Overview -->
+                <div class="card" style="margin-bottom:20px;">
+                    <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
+                        <h3>Wolfram Memory Compression</h3>
+                        <div style="display:flex; gap:8px; align-items:center;">
+                            <span id="wolfram-version-badge" style="font-size:11px; padding:2px 8px; background:var(--bg-tertiary); border-radius:4px; color:var(--text-muted);"></span>
+                            <button class="btn btn-sm" onclick="loadWolframStatus()" style="background:var(--bg-tertiary); color:var(--text-primary); border:1px solid var(--border); font-size:11px;">↻ Refresh</button>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <div id="wolfram-stats-grid" style="display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:12px; margin-bottom:16px;"></div>
+                        <div id="wolfram-detail" style="font-size:13px; color:var(--text-muted);"></div>
+                    </div>
+                </div>
+
+                <!-- Service Controls -->
+                <div class="card" style="margin-bottom:20px;">
+                    <div class="card-header"><h3>Service Controls</h3></div>
+                    <div class="card-body">
+                        <div id="wolfram-service-controls" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;"></div>
+                    </div>
+                </div>
+
+                <!-- Configuration -->
+                <div class="card">
+                    <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
+                        <h3>Configuration</h3>
+                        <button class="btn btn-sm btn-primary" onclick="wolframSaveConfig()" style="font-size:11px;">Save &amp; Restart</button>
+                    </div>
+                    <div class="card-body">
+                        <textarea id="wolfram-config-editor" class="form-control" style="width:100%; min-height:300px; font-family:monospace; font-size:13px; background:var(--bg-secondary); color:var(--text-primary); border:1px solid var(--border); border-radius:6px; padding:12px; resize:vertical;"></textarea>
                     </div>
                 </div>
             </div>
