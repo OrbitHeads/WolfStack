@@ -30,13 +30,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross
-        run: cargo install cross --version 0.2.5
+      - name: Install zigbuild
+        run: |
+          pip3 install ziglang
+          cargo install cargo-zigbuild
 
       - name: Build static binary
-        env:
-          LIBZ_SYS_STATIC: "0"
-        run: cross build --release --target ${{ matrix.target }}
+        run: cargo zigbuild --release --target ${{ matrix.target }}
 
       - name: Get version
         id: version
