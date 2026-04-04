@@ -212,7 +212,7 @@ pub fn flush_routes_to_disk(routes: &std::collections::HashMap<String, String>) 
 // These avoid the expensive per-container docker inspect calls that docker_list_all() performs.
 
 /// Count all Docker containers with a single subprocess call (no per-container inspect).
-pub fn docker_count() -> u32 {
+fn docker_count_inner() -> u32 {
     Command::new("docker")
         .args(["ps", "-aq"])
         .output()
@@ -226,7 +226,7 @@ pub fn docker_count() -> u32 {
 }
 
 /// Count all LXC containers with a single subprocess call.
-pub fn lxc_count() -> u32 {
+fn lxc_count_inner() -> u32 {
     // Check for pct (Proxmox) first
     let is_proxmox = Command::new("which").arg("pct").output()
         .map(|o| o.status.success()).unwrap_or(false);
@@ -256,6 +256,50 @@ pub fn lxc_count() -> u32 {
         }
     }
     count
+}
+
+// ─── Cached container counts ───
+// Avoid spawning docker/pct/lxc-ls subprocesses on every 2-second monitoring tick.
+
+static DOCKER_COUNT_CACHE: Mutex<Option<(u32, Instant)>> = Mutex::new(None);
+static LXC_COUNT_CACHE: Mutex<Option<(u32, Instant)>> = Mutex::new(None);
+
+const COUNT_CACHE_TTL_SECS: u64 = 5;
+
+/// Invalidate container count caches (call after create/delete operations).
+pub fn invalidate_count_caches() {
+    *DOCKER_COUNT_CACHE.lock().unwrap() = None;
+    *LXC_COUNT_CACHE.lock().unwrap() = None;
+}
+
+/// Count Docker containers (cached for 5s).
+pub fn docker_count() -> u32 {
+    {
+        let cache = DOCKER_COUNT_CACHE.lock().unwrap();
+        if let Some((val, ts)) = &*cache {
+            if ts.elapsed().as_secs() < COUNT_CACHE_TTL_SECS {
+                return *val;
+            }
+        }
+    } // release lock before subprocess
+    let val = docker_count_inner();
+    *DOCKER_COUNT_CACHE.lock().unwrap() = Some((val, Instant::now()));
+    val
+}
+
+/// Count LXC containers (cached for 5s).
+pub fn lxc_count() -> u32 {
+    {
+        let cache = LXC_COUNT_CACHE.lock().unwrap();
+        if let Some((val, ts)) = &*cache {
+            if ts.elapsed().as_secs() < COUNT_CACHE_TTL_SECS {
+                return *val;
+            }
+        }
+    } // release lock before subprocess
+    let val = lxc_count_inner();
+    *LXC_COUNT_CACHE.lock().unwrap() = Some((val, Instant::now()));
+    val
 }
 
 // ─── Cached runtime detection ───
@@ -2415,7 +2459,9 @@ pub fn docker_restart(container: &str) -> Result<String, String> {
 
 /// Remove a Docker container
 pub fn docker_remove(container: &str) -> Result<String, String> {
-    run_docker_cmd(&["rm", "-f", container])
+    let result = run_docker_cmd(&["rm", "-f", container]);
+    if result.is_ok() { invalidate_count_caches(); }
+    result
 }
 
 /// Pause a Docker container
@@ -3765,7 +3811,7 @@ pub fn lxc_unfreeze(container: &str) -> Result<String, String> {
 /// Destroy an LXC container
 pub fn lxc_destroy(container: &str) -> Result<String, String> {
     lxc_stop(container).ok(); // Stop first, ignore errors
-    if is_proxmox() {
+    let result = if is_proxmox() {
         run_lxc_cmd(&["pct", "destroy", container])
     } else {
         let base = lxc_base_dir(container);
@@ -3774,7 +3820,9 @@ pub fn lxc_destroy(container: &str) -> Result<String, String> {
         } else {
             run_lxc_cmd(&["lxc-destroy", "-n", container])
         }
-    }
+    };
+    if result.is_ok() { invalidate_count_caches(); }
+    result
 }
 
 /// Read LXC container config
@@ -6037,8 +6085,9 @@ pub fn lxc_create(name: &str, distribution: &str, release: &str, architecture: &
 
     // On Proxmox, delegate to pct create
     if is_proxmox() {
-
-        return pct_create_api(name, distribution, release, architecture, storage_path, None, None, None, None);
+        let result = pct_create_api(name, distribution, release, architecture, storage_path, None, None, None, None);
+        if result.is_ok() { invalidate_count_caches(); }
+        return result;
     }
 
     // Standalone: use native lxc-create
@@ -6102,6 +6151,7 @@ pub fn lxc_create(name: &str, distribution: &str, release: &str, architecture: &
         let storage_info = storage_path.filter(|p| !p.is_empty() && *p != LXC_DEFAULT_PATH)
             .map(|p| format!(" on {}", p))
             .unwrap_or_default();
+        invalidate_count_caches();
         Ok(format!("Container '{}' created ({} {} {}){}", name, distribution, release, architecture, storage_info))
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -6342,6 +6392,7 @@ pub fn docker_create(name: &str, image: &str, ports: &[String], env: &[String], 
             .map(|ip| format!(" [WolfNet: {} — applied on start]", ip))
             .unwrap_or_default();
 
+        invalidate_count_caches();
         Ok(format!("Container '{}' created ({}){}", name, &id[..12.min(id.len())], wolfnet_msg))
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();

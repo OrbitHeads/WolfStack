@@ -756,12 +756,12 @@
 
             <!-- Install Modal -->
             <div id="appstore-install-modal" class="modal-overlay" style="display:none;">
-                <div class="modal" style="max-width:520px; width:90%;">
+                <div class="modal" style="max-width:520px; width:90%; max-height:85vh; display:flex; flex-direction:column;">
                     <div class="modal-header">
                         <h3 id="appstore-install-title">Install App</h3>
                         <button class="modal-close" onclick="closeAppStoreInstallModal()">&times;</button>
                     </div>
-                    <div class="modal-body">
+                    <div class="modal-body" style="overflow-y:auto; flex:1;">
                         <div style="margin-bottom:16px;">
                             <label style="font-size:13px; font-weight:600; display:block; margin-bottom:6px;">🖥️ Deploy
                                 To</label>
@@ -796,6 +796,31 @@
                         <div id="appstore-install-inputs">
                             <!-- Dynamic user inputs injected by JS -->
                         </div>
+                        <details id="appstore-advanced-settings" style="margin-top:12px;">
+                            <summary style="font-size:13px; font-weight:600; cursor:pointer; color:var(--text-secondary); user-select:none;">Advanced Settings</summary>
+                            <div style="margin-top:12px; display:flex; flex-direction:column; gap:12px;">
+                                <div>
+                                    <label style="font-size:12px; font-weight:500; display:block; margin-bottom:4px; color:var(--text-secondary);">Extra Environment Variables</label>
+                                    <div id="appstore-extra-env-list" style="display:flex; flex-direction:column; gap:4px;"></div>
+                                    <button type="button" onclick="addAppStoreEnvRow()" class="btn btn-sm" style="margin-top:4px; font-size:11px; padding:3px 10px;">+ Add Variable</button>
+                                </div>
+                                <div>
+                                    <label style="font-size:12px; font-weight:500; display:block; margin-bottom:4px; color:var(--text-secondary);">Extra Volume Mounts</label>
+                                    <div id="appstore-extra-vol-list" style="display:flex; flex-direction:column; gap:4px;"></div>
+                                    <button type="button" onclick="addAppStoreVolRow()" class="btn btn-sm" style="margin-top:4px; font-size:11px; padding:3px 10px;">+ Add Volume</button>
+                                </div>
+                                <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+                                    <div>
+                                        <label style="font-size:12px; font-weight:500; display:block; margin-bottom:4px; color:var(--text-secondary);">Memory Limit</label>
+                                        <input type="text" id="appstore-memory-limit" class="form-control" placeholder="e.g. 512m, 2g" style="font-size:12px;">
+                                    </div>
+                                    <div>
+                                        <label style="font-size:12px; font-weight:500; display:block; margin-bottom:4px; color:var(--text-secondary);">CPU Limit</label>
+                                        <input type="text" id="appstore-cpu-limit" class="form-control" placeholder="e.g. 0.5, 2" style="font-size:12px;">
+                                    </div>
+                                </div>
+                            </div>
+                        </details>
                     </div>
                     <div class="modal-footer">
                         <button class="btn" onclick="closeAppStoreInstallModal()">Cancel</button>

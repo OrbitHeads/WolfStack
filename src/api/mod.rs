@@ -9552,6 +9552,14 @@ pub struct AppInstallRequest {
     pub storage_path: Option<String>,                // optional storage location
     #[serde(default)]
     pub ports: Option<Vec<String>>,                  // optional custom port mappings (overrides manifest)
+    #[serde(default)]
+    pub extra_env: Option<Vec<String>>,              // additional env vars (KEY=VALUE)
+    #[serde(default)]
+    pub extra_volumes: Option<Vec<String>>,           // additional volume mounts (host:container)
+    #[serde(default)]
+    pub memory_limit: Option<String>,                // e.g. "512m", "2g"
+    #[serde(default)]
+    pub cpu_limit: Option<String>,                   // e.g. "0.5", "2"
 }
 
 /// POST /api/appstore/apps/{id}/install — install an app
@@ -9608,9 +9616,14 @@ pub async fn appstore_prepare_install(
     let container_name = body.container_name.clone();
     let storage_path = body.storage_path.clone();
     let custom_ports = body.ports.clone();
+    let extra_env = body.extra_env.clone();
+    let extra_volumes = body.extra_volumes.clone();
+    let memory_limit = body.memory_limit.clone();
+    let cpu_limit = body.cpu_limit.clone();
 
     match web::block(move || {
-        appstore::prepare_install(&id, &target, &container_name, &inputs, storage_path.as_deref(), custom_ports.as_deref())
+        appstore::prepare_install(&id, &target, &container_name, &inputs, storage_path.as_deref(), custom_ports.as_deref(),
+            extra_env.as_deref(), extra_volumes.as_deref(), memory_limit.as_deref(), cpu_limit.as_deref())
     }).await {
         Ok(Ok((session_id, _script_path))) => HttpResponse::Ok().json(serde_json::json!({
             "session_id": session_id,

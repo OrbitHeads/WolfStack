@@ -19992,6 +19992,18 @@ function openAppStoreInstallModal(appId) {
         inputsEl.innerHTML = '';
     }
 
+    // Reset advanced settings
+    const envList = document.getElementById('appstore-extra-env-list');
+    if (envList) envList.innerHTML = '';
+    const volList = document.getElementById('appstore-extra-vol-list');
+    if (volList) volList.innerHTML = '';
+    const memEl = document.getElementById('appstore-memory-limit');
+    if (memEl) memEl.value = '';
+    const cpuEl = document.getElementById('appstore-cpu-limit');
+    if (cpuEl) cpuEl.value = '';
+    const advDetails = document.getElementById('appstore-advanced-settings');
+    if (advDetails) advDetails.removeAttribute('open');
+
     // Show modal
     const modal = document.getElementById('appstore-install-modal');
     modal.style.display = 'flex';
@@ -20081,6 +20093,9 @@ function selectInstallTarget(target) {
     // Show/hide port config (only for Docker/K8s)
     const portsSection = document.getElementById('appstore-install-ports-section');
     if (portsSection) portsSection.style.display = (target === 'docker' || target === 'kubernetes') ? '' : 'none';
+    // Show/hide advanced settings (only for Docker)
+    const advSettings = document.getElementById('appstore-advanced-settings');
+    if (advSettings) advSettings.style.display = target === 'docker' ? '' : 'none';
 }
 
 function populateAppStorePorts(app) {
@@ -20110,6 +20125,32 @@ function populateAppStorePorts(app) {
         // No default ports — still show section so user can add custom ones
         section.style.display = (appStoreInstallTarget === 'docker' || appStoreInstallTarget === 'kubernetes') ? '' : 'none';
     }
+}
+
+function addAppStoreEnvRow(key, val) {
+    const list = document.getElementById('appstore-extra-env-list');
+    if (!list) return;
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex; gap:4px; align-items:center;';
+    row.innerHTML = `
+        <input type="text" class="form-control appstore-env-key" placeholder="KEY" value="${escapeHtml(key || '')}" style="flex:1; font-size:12px; padding:4px 8px;">
+        <span style="color:var(--text-muted);">=</span>
+        <input type="text" class="form-control appstore-env-val" placeholder="value" value="${escapeHtml(val || '')}" style="flex:2; font-size:12px; padding:4px 8px;">
+        <button type="button" class="btn btn-sm" onclick="this.parentElement.remove()" style="padding:2px 8px; font-size:11px; color:var(--text-muted);">&times;</button>`;
+    list.appendChild(row);
+}
+
+function addAppStoreVolRow(host, container) {
+    const list = document.getElementById('appstore-extra-vol-list');
+    if (!list) return;
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex; gap:4px; align-items:center;';
+    row.innerHTML = `
+        <input type="text" class="form-control appstore-vol-host" placeholder="/host/path" value="${escapeHtml(host || '')}" style="flex:1; font-size:12px; padding:4px 8px;">
+        <span style="color:var(--text-muted);">:</span>
+        <input type="text" class="form-control appstore-vol-container" placeholder="/container/path" value="${escapeHtml(container || '')}" style="flex:1; font-size:12px; padding:4px 8px;">
+        <button type="button" class="btn btn-sm" onclick="this.parentElement.remove()" style="padding:2px 8px; font-size:11px; color:var(--text-muted);">&times;</button>`;
+    list.appendChild(row);
 }
 
 async function populateAppStoreStorage() {
@@ -20188,6 +20229,22 @@ async function executeAppStoreInstall() {
     // Collect custom port mappings
     const customPorts = collectPortRows('appstore-install-ports-list');
 
+    // Collect advanced settings
+    const extraEnv = [];
+    document.querySelectorAll('#appstore-extra-env-list > div').forEach(row => {
+        const k = row.querySelector('.appstore-env-key')?.value?.trim();
+        const v = row.querySelector('.appstore-env-val')?.value || '';
+        if (k) extraEnv.push(k + '=' + v);
+    });
+    const extraVolumes = [];
+    document.querySelectorAll('#appstore-extra-vol-list > div').forEach(row => {
+        const h = row.querySelector('.appstore-vol-host')?.value?.trim();
+        const c = row.querySelector('.appstore-vol-container')?.value?.trim();
+        if (h && c) extraVolumes.push(h + ':' + c);
+    });
+    const memoryLimit = document.getElementById('appstore-memory-limit')?.value?.trim() || null;
+    const cpuLimit = document.getElementById('appstore-cpu-limit')?.value?.trim() || null;
+
     // Determine the install URL based on selected host
     const selectedNodeId = document.getElementById('appstore-install-host').value;
     const selectedNode = allNodes.find(n => n.id === selectedNodeId);
@@ -20241,6 +20298,10 @@ async function executeAppStoreInstall() {
                 inputs: userInputs,
                 storage_path: storagePath,
                 ports: customPorts.length > 0 ? customPorts : undefined,
+                extra_env: extraEnv.length > 0 ? extraEnv : undefined,
+                extra_volumes: extraVolumes.length > 0 ? extraVolumes : undefined,
+                memory_limit: memoryLimit || undefined,
+                cpu_limit: cpuLimit || undefined,
             }),
         });
         const data = await res.json().catch(() => ({}));

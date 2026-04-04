@@ -573,6 +573,10 @@ pub fn prepare_install(
     user_inputs: &HashMap<String, String>,
     storage_path: Option<&str>,
     custom_ports: Option<&[String]>,
+    extra_env: Option<&[String]>,
+    extra_volumes: Option<&[String]>,
+    memory_limit: Option<&str>,
+    cpu_limit: Option<&str>,
 ) -> Result<(String, String), String> {
     let mut app = get_app(app_id).ok_or_else(|| format!("App '{}' not found", app_id))?;
 
@@ -673,15 +677,62 @@ pub fn prepare_install(
 
             let env = substitute_inputs(&docker.env, user_inputs);
             let mut create_args = format!("docker create --name {} -it --restart unless-stopped", shell_escape(container_name));
+            // Resource limits (validated: memory must be digits+unit, cpu must be a number)
+            if let Some(mem) = memory_limit {
+                let mem = mem.trim();
+                if !mem.is_empty() {
+                    // Must match e.g. "512m", "2g", "1024k", "1073741824"
+                    let valid = mem.len() <= 20 && mem.chars().all(|c| c.is_ascii_digit() || "kmgbKMGB".contains(c));
+                    if valid {
+                        create_args.push_str(&format!(" --memory {}", shell_escape(mem)));
+                    }
+                }
+            }
+            if let Some(cpu) = cpu_limit {
+                let cpu = cpu.trim();
+                if !cpu.is_empty() {
+                    // Must match e.g. "0.5", "2", "1.5"
+                    let valid = cpu.len() <= 10 && cpu.chars().all(|c| c.is_ascii_digit() || c == '.');
+                    if valid {
+                        create_args.push_str(&format!(" --cpus {}", shell_escape(cpu)));
+                    }
+                }
+            }
             for p in &docker.ports {
                 create_args.push_str(&format!(" -p {}", shell_escape(p)));
             }
             for e in &env {
                 create_args.push_str(&format!(" -e {}", shell_escape(e)));
             }
+            // Extra user-specified env vars (key must be a valid env var name)
+            if let Some(extras) = extra_env {
+                for e in extras {
+                    let trimmed = e.trim();
+                    if let Some(eq_pos) = trimmed.find('=') {
+                        let key = &trimmed[..eq_pos];
+                        if !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                           && key.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_') {
+                            create_args.push_str(&format!(" -e {}", shell_escape(trimmed)));
+                        }
+                    }
+                }
+            }
             for v in &docker.volumes {
                 let vol = if let Some(ref base) = vol_base { remap_volume(v, base) } else { v.clone() };
                 create_args.push_str(&format!(" -v {}", shell_escape(&vol)));
+            }
+            // Extra user-specified volumes (reject sensitive host paths)
+            if let Some(extras) = extra_volumes {
+                const BLOCKED_PREFIXES: &[&str] = &["/etc/shadow", "/etc/passwd", "/proc", "/sys"];
+                for v in extras {
+                    let trimmed = v.trim();
+                    if !trimmed.is_empty() && trimmed.contains(':') {
+                        let host_path = trimmed.split(':').next().unwrap_or("");
+                        if !BLOCKED_PREFIXES.iter().any(|b| host_path.starts_with(b)) {
+                            create_args.push_str(&format!(" -v {}", shell_escape(trimmed)));
+                        }
+                    }
+                }
             }
             if let Some(ref ip) = wolfnet_ip {
                 create_args.push_str(&format!(" --label wolfnet.ip={}", ip));
