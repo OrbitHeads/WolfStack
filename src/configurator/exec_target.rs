@@ -41,10 +41,23 @@ impl ExecTarget {
                     .map_err(|e| format!("Failed to exec in container '{}': {}", name, e))?
             }
             ExecTarget::Lxc(name) => {
-                Command::new("lxc-attach")
-                    .args(["-n", name, "--", "sh", "-c", cmd])
-                    .output()
-                    .map_err(|e| format!("Failed to attach to container '{}': {}", name, e))?
+                if crate::containers::is_proxmox() {
+                    Command::new("pct")
+                        .args(["exec", name, "--", "sh", "-c", cmd])
+                        .output()
+                        .map_err(|e| format!("Failed to exec in container '{}': {}", name, e))?
+                } else {
+                    let base = crate::containers::lxc_base_dir(name);
+                    let mut args = vec![];
+                    if base != crate::containers::LXC_DEFAULT_PATH {
+                        args.extend_from_slice(&["-P", &base]);
+                    }
+                    args.extend_from_slice(&["-n", name, "--", "sh", "-c", cmd]);
+                    Command::new("lxc-attach")
+                        .args(&args)
+                        .output()
+                        .map_err(|e| format!("Failed to attach to container '{}': {}", name, e))?
+                }
             }
         };
 
@@ -128,13 +141,31 @@ impl ExecTarget {
             }
             ExecTarget::Lxc(name) => {
                 let escaped_path = path.replace('\'', "'\\''");
-                let mut child = Command::new("lxc-attach")
-                    .args(["-n", name, "--", "sh", "-c", &format!("cat > '{}'", escaped_path)])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .map_err(|e| format!("Failed to write in container '{}': {}", name, e))?;
+                let shell_cmd = format!("cat > '{}'", escaped_path);
+                let mut child = if crate::containers::is_proxmox() {
+                    Command::new("pct")
+                        .args(["exec", name, "--", "sh", "-c", &shell_cmd])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .map_err(|e| format!("Failed to write in container '{}': {}", name, e))?
+                } else {
+                    let base = crate::containers::lxc_base_dir(name);
+                    let mut args: Vec<String> = vec![];
+                    if base != crate::containers::LXC_DEFAULT_PATH {
+                        args.push("-P".to_string());
+                        args.push(base);
+                    }
+                    args.extend(["-n".to_string(), name.to_string(), "--".to_string(), "sh".to_string(), "-c".to_string(), shell_cmd]);
+                    Command::new("lxc-attach")
+                        .args(&args)
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .map_err(|e| format!("Failed to write in container '{}': {}", name, e))?
+                };
 
                 if let Some(ref mut stdin) = child.stdin {
                     stdin.write_all(content.as_bytes())
