@@ -21119,7 +21119,7 @@ async function loadApiKeysTab() {
     const banner = document.getElementById('apikeys-license-banner');
     const content = document.getElementById('apikeys-content');
     try {
-        const resp = await fetch(apiUrl('/api/license'));
+        const resp = await fetch(apiUrl('/api/platform/status'));
         if (!resp.ok) return;
         const lic = await resp.json();
         if (lic.valid) {
@@ -21150,7 +21150,7 @@ async function loadApiKeys() {
     const tbody = document.getElementById('apikeys-table-body');
     if (!tbody) return;
     try {
-        const resp = await fetch(apiUrl('/api/apikeys'));
+        const resp = await fetch(apiUrl('/api/tokens'));
         if (!resp.ok) { tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);text-align:center;">Failed to load</td></tr>'; return; }
         const keys = await resp.json();
         if (keys.length === 0) {
@@ -21172,7 +21172,7 @@ async function loadApiScopes() {
     const container = document.getElementById('apikey-scopes');
     if (!container) return;
     try {
-        const resp = await fetch(apiUrl('/api/apikeys/scopes'));
+        const resp = await fetch(apiUrl('/api/tokens/scopes'));
         if (!resp.ok) return;
         const scopes = await resp.json();
         container.innerHTML = scopes.map(s => `
@@ -21189,7 +21189,7 @@ async function loadApiAuditLog() {
     const el = document.getElementById('apikeys-audit-log');
     if (!el) return;
     try {
-        const resp = await fetch(apiUrl('/api/apikeys/audit'));
+        const resp = await fetch(apiUrl('/api/tokens/events'));
         if (!resp.ok) return;
         const entries = await resp.json();
         if (entries.length === 0) {
@@ -21236,7 +21236,7 @@ async function createApiKey() {
 
     closeApiKeyModal();
     try {
-        const resp = await fetch(apiUrl('/api/apikeys'), {
+        const resp = await fetch(apiUrl('/api/tokens'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ name, scopes, expires }),
@@ -21258,7 +21258,7 @@ async function createApiKey() {
 async function revokeApiKey(id, name) {
     if (!confirm(`Revoke API key "${name}"? Any applications using this key will lose access.`)) return;
     try {
-        const resp = await fetch(apiUrl(`/api/apikeys/${id}`), { method: 'DELETE' });
+        const resp = await fetch(apiUrl(`/api/tokens/${id}`), { method: 'DELETE' });
         const data = await resp.json();
         if (!resp.ok) { showToast(data.error || 'Failed to revoke key', 'error'); return; }
         showToast('API key revoked', 'success');
@@ -22039,7 +22039,7 @@ async function loadSponsorHeaderBadge() {
 
     // Check enterprise license first — takes priority over sponsor tier
     try {
-        var licResp = await fetch(apiUrl('/api/license'));
+        var licResp = await fetch(apiUrl('/api/platform/status'));
         if (licResp.ok) {
             var lic = await licResp.json();
             if (lic.valid) {

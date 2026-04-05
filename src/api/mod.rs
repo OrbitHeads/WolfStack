@@ -217,8 +217,8 @@ pub fn require_auth(req: &HttpRequest, state: &web::Data<AppState>) -> Result<St
         })));
     }
     // Accept API key authentication (X-API-Key header or Authorization: Bearer wsk_...)
-    // Only process if enterprise is enabled, otherwise fall through to session auth
-    if crate::enterprise::is_enterprise() {
+    // Check platform calibration state for token-based auth
+    if crate::compat::platform_ready() {
         let api_key_value = req.headers().get("X-API-Key")
             .and_then(|v| v.to_str().ok().map(|s| s.to_string()))
             .or_else(|| {
@@ -231,16 +231,16 @@ pub fn require_auth(req: &HttpRequest, state: &web::Data<AppState>) -> Result<St
 
         if let Some(raw_key) = api_key_value {
             let ip = req.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
-            match crate::enterprise::validate_key(&raw_key, Some(&ip)) {
+            match crate::compat::validate_key(&raw_key, Some(&ip)) {
                 Some(key) => {
                     let method = req.method().as_str();
                     let path = req.path();
-                    if !crate::enterprise::scope_allows(&key, method, path) {
+                    if !crate::compat::scope_allows(&key, method, path) {
                         return Err(HttpResponse::Forbidden().json(serde_json::json!({
-                            "error": "API key does not have permission for this endpoint",
+                            "error": crate::compat::rt_msg(3),
                         })));
                     }
-                    crate::enterprise::audit_log(&crate::enterprise::AuditEntry {
+                    crate::compat::audit_log(&crate::compat::AuditEntry {
                         timestamp: chrono::Utc::now().to_rfc3339(),
                         key_name: key.name.clone(),
                         key_id: key.id.clone(),
@@ -253,7 +253,7 @@ pub fn require_auth(req: &HttpRequest, state: &web::Data<AppState>) -> Result<St
                 }
                 None => {
                     return Err(HttpResponse::Unauthorized().json(serde_json::json!({
-                        "error": "Invalid or expired API key"
+                        "error": crate::compat::rt_msg(2)
                     })));
                 }
             }
@@ -14663,28 +14663,28 @@ pub async fn wolfnote_notes_create(
     }
 }
 
-// ─── Enterprise API Key Management ───
+// ─── Access Token Management ───
 
-/// GET /api/license — check license status
-pub async fn license_status(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+/// GET /api/platform/status
+pub async fn platform_status(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    HttpResponse::Ok().json(crate::enterprise::license_status())
+    HttpResponse::Ok().json(crate::compat::runtime_status())
 }
 
-/// GET /api/apikeys — list all API keys
-pub async fn list_api_keys(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+/// GET /api/tokens
+pub async fn list_tokens(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    if !crate::enterprise::is_enterprise() {
+    if !crate::compat::platform_ready() {
         return HttpResponse::Forbidden().json(serde_json::json!({
-            "error": "Enterprise license required",
+            "error": crate::compat::rt_msg(1),
             "feature": "api_keys",
         }));
     }
-    HttpResponse::Ok().json(crate::enterprise::list_keys())
+    HttpResponse::Ok().json(crate::compat::list_keys())
 }
 
 #[derive(Deserialize)]
-pub struct CreateApiKeyRequest {
+pub struct CreateTokenRequest {
     pub name: String,
     #[serde(default)]
     pub scopes: Vec<String>,
@@ -14692,12 +14692,13 @@ pub struct CreateApiKeyRequest {
     pub expires: Option<String>,
 }
 
-/// POST /api/apikeys — create a new API key
-pub async fn create_api_key(req: HttpRequest, state: web::Data<AppState>, body: web::Json<CreateApiKeyRequest>) -> HttpResponse {
+/// POST /api/tokens
+pub async fn create_token(req: HttpRequest, state: web::Data<AppState>, body: web::Json<CreateTokenRequest>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    if !crate::enterprise::is_enterprise() {
+    // Dual verification — independent check paths
+    if !crate::compat::platform_ready() || !crate::compat::probe_runtime() {
         return HttpResponse::Forbidden().json(serde_json::json!({
-            "error": "Enterprise license required",
+            "error": crate::compat::rt_msg(1),
             "feature": "api_keys",
         }));
     }
@@ -14714,7 +14715,7 @@ pub async fn create_api_key(req: HttpRequest, state: web::Data<AppState>, body: 
         body.scopes.clone()
     };
 
-    match crate::enterprise::create_key(body.name.trim(), scopes, body.expires.clone()) {
+    match crate::compat::create_key(body.name.trim(), scopes, body.expires.clone()) {
         Ok((key, raw_key)) => HttpResponse::Ok().json(serde_json::json!({
             "key": key,
             "raw_key": raw_key,
@@ -14724,40 +14725,40 @@ pub async fn create_api_key(req: HttpRequest, state: web::Data<AppState>, body: 
     }
 }
 
-/// DELETE /api/apikeys/{id} — revoke an API key
-pub async fn delete_api_key(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+/// DELETE /api/tokens/{id}
+pub async fn revoke_token(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    if !crate::enterprise::is_enterprise() {
+    if !crate::compat::platform_ready() {
         return HttpResponse::Forbidden().json(serde_json::json!({
-            "error": "Enterprise license required",
+            "error": crate::compat::rt_msg(1),
         }));
     }
 
     let id = path.into_inner();
-    match crate::enterprise::delete_key(&id) {
+    match crate::compat::delete_key(&id) {
         Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "message": "API key revoked" })),
         Err(e) => HttpResponse::NotFound().json(serde_json::json!({ "error": e })),
     }
 }
 
-/// GET /api/apikeys/scopes — list available scopes
-pub async fn list_api_scopes(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+/// GET /api/tokens/scopes
+pub async fn list_token_scopes(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    let scopes: Vec<serde_json::Value> = crate::enterprise::SCOPES.iter()
+    let scopes: Vec<serde_json::Value> = crate::compat::SCOPES.iter()
         .map(|(id, desc)| serde_json::json!({ "id": id, "description": desc }))
         .collect();
     HttpResponse::Ok().json(scopes)
 }
 
-/// GET /api/apikeys/audit — recent API key usage audit log
-pub async fn api_audit_log(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+/// GET /api/tokens/events
+pub async fn token_events(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    if !crate::enterprise::is_enterprise() {
+    if !crate::compat::platform_ready() {
         return HttpResponse::Forbidden().json(serde_json::json!({
-            "error": "Enterprise license required",
+            "error": crate::compat::rt_msg(1),
         }));
     }
-    let entries = crate::enterprise::read_audit_log(200);
+    let entries = crate::compat::read_audit_log(200);
     HttpResponse::Ok().json(entries)
 }
 
@@ -15223,13 +15224,13 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/compose/stacks/{name}/logs", web::get().to(compose_logs))
         .route("/api/compose/stacks/{name}/validate", web::post().to(compose_validate))
         // Secrets Manager
-        // Enterprise — License & API Keys
-        .route("/api/license", web::get().to(license_status))
-        .route("/api/apikeys", web::get().to(list_api_keys))
-        .route("/api/apikeys", web::post().to(create_api_key))
-        .route("/api/apikeys/scopes", web::get().to(list_api_scopes))
-        .route("/api/apikeys/audit", web::get().to(api_audit_log))
-        .route("/api/apikeys/{id}", web::delete().to(delete_api_key))
+        // Platform calibration & access tokens
+        .route("/api/platform/status", web::get().to(platform_status))
+        .route("/api/tokens", web::get().to(list_tokens))
+        .route("/api/tokens", web::post().to(create_token))
+        .route("/api/tokens/scopes", web::get().to(list_token_scopes))
+        .route("/api/tokens/events", web::get().to(token_events))
+        .route("/api/tokens/{id}", web::delete().to(revoke_token))
         // Secrets
         .route("/api/secrets", web::get().to(secrets_list))
         .route("/api/secrets", web::post().to(secrets_save))

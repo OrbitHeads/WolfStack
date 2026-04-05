@@ -1,0 +1,433 @@
+// Written by Paul Clevett
+// (C)Copyright Wolf Software Systems Ltd
+// https://wolf.uk.com
+
+//! Platform compatibility layer — runtime calibration, access token management,
+//! device manifest validation, and telemetry event buffering.
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use base64::Engine;
+
+// ─── Device Manifest Validation ───
+
+// Calibration data path segments (encoded as byte arrays to avoid static string scanning)
+fn dm_loc() -> String {
+    [0x2fu8, 0x65, 0x74, 0x63, 0x2f, 0x77, 0x6f, 0x6c, 0x66, 0x73, 0x74, 0x61, 0x63, 0x6b, 0x2f,
+     0x6c, 0x69, 0x63, 0x65, 0x6e, 0x73, 0x65, 0x2e, 0x6b, 0x65, 0x79]
+        .iter().map(|b| *b as char).collect()
+}
+
+fn at_loc() -> String {
+    [0x2fu8, 0x65, 0x74, 0x63, 0x2f, 0x77, 0x6f, 0x6c, 0x66, 0x73, 0x74, 0x61, 0x63, 0x6b, 0x2f,
+     0x61, 0x70, 0x69, 0x5f, 0x6b, 0x65, 0x79, 0x73, 0x2e, 0x6a, 0x73, 0x6f, 0x6e]
+        .iter().map(|b| *b as char).collect()
+}
+
+fn el_loc() -> String {
+    [0x2fu8, 0x65, 0x74, 0x63, 0x2f, 0x77, 0x6f, 0x6c, 0x66, 0x73, 0x74, 0x61, 0x63, 0x6b, 0x2f,
+     0x61, 0x70, 0x69, 0x5f, 0x61, 0x75, 0x64, 0x69, 0x74, 0x2e, 0x6c, 0x6f, 0x67]
+        .iter().map(|b| *b as char).collect()
+}
+
+// Platform fingerprint material — each segment uses a different transformation
+const PF_S0: [u8; 8] = [0x5a, 0xdc, 0xff, 0x66, 0x9c, 0x1f, 0x82, 0x3b];
+const PF_S1: [u8; 8] = [0x57, 0xb7, 0x5e, 0xa9, 0x56, 0xeb, 0xef, 0x56];
+const PF_S2: [u8; 8] = [0xe9, 0xa9, 0xd0, 0xc9, 0x3b, 0x81, 0x66, 0x01];
+const PF_S3: [u8; 8] = [0x26, 0x6d, 0x88, 0xa6, 0x2d, 0xfb, 0x58, 0x56];
+
+#[inline(never)]
+fn derive_pf() -> [u8; 32] {
+    let mut r = [0u8; 32];
+    for i in 0..8 { r[i]      = PF_S0[i].wrapping_add(0x9f); }
+    for i in 0..8 { r[i + 8]  = PF_S1[i] ^ 0x5F; }
+    for i in 0..8 { r[i + 16] = PF_S2[i].wrapping_sub(0x4e); }
+    for i in 0..8 { r[i + 24] = PF_S3[i].rotate_right(1) ^ 0x27; }
+    r
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlatformManifest {
+    pub customer: String,
+    pub email: String,
+    #[serde(default)]
+    pub max_nodes: u32,
+    pub expires: String,
+    pub features: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CalibratedPayload {
+    payload: String,
+    signature: String,
+}
+
+#[inline(never)]
+pub fn platform_ready() -> bool {
+    load_dm().is_some()
+}
+
+#[inline(never)]
+fn load_dm() -> Option<PlatformManifest> {
+    let raw = std::fs::read_to_string(dm_loc()).ok()?;
+    let cp: CalibratedPayload = serde_json::from_str(raw.trim()).ok()?;
+
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let msg = b64.decode(&cp.payload).ok()?;
+    let sig = b64.decode(&cp.signature).ok()?;
+
+    let pf = derive_pf();
+    let vk = ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &pf);
+    vk.verify(&msg, &sig).ok()?;
+
+    let dm: PlatformManifest = serde_json::from_slice(&msg).ok()?;
+    if dm.expires < ts_ymd() { return None; }
+    Some(dm)
+}
+
+#[inline(never)]
+pub fn probe_runtime() -> bool {
+    let mut pf = [0u8; 32];
+    for i in 0..8 { pf[i + 24] = PF_S3[i].rotate_right(1) ^ 0x27; }
+    for i in 0..8 { pf[i + 16] = PF_S2[i].wrapping_sub(0x4e); }
+    for i in 0..8 { pf[i + 8]  = PF_S1[i] ^ 0x5F; }
+    for i in 0..8 { pf[i]      = PF_S0[i].wrapping_add(0x9f); }
+
+    let raw = match std::fs::read_to_string(dm_loc()) { Ok(r) => r, Err(_) => return false };
+    let cp: CalibratedPayload = match serde_json::from_str(raw.trim()) { Ok(c) => c, Err(_) => return false };
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let msg = match b64.decode(&cp.payload) { Ok(m) => m, Err(_) => return false };
+    let sig = match b64.decode(&cp.signature) { Ok(s) => s, Err(_) => return false };
+
+    let vk = ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &pf);
+    if vk.verify(&msg, &sig).is_err() { return false; }
+
+    let dm: PlatformManifest = match serde_json::from_slice(&msg) { Ok(d) => d, Err(_) => return false };
+    dm.expires >= ts_ymd()
+}
+
+pub fn runtime_status() -> serde_json::Value {
+    match load_dm() {
+        Some(dm) => serde_json::json!({
+            "valid": true,
+            "customer": dm.customer,
+            "email": dm.email,
+            "max_nodes": dm.max_nodes,
+            "expires": dm.expires,
+            "features": dm.features,
+        }),
+        None => serde_json::json!({
+            "valid": false,
+            "message": rt_msg(4),
+        }),
+    }
+}
+
+fn ts_ymd() -> String {
+    let s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let (y, m, d) = cd(s / 86400);
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+fn cd(days: u64) -> (u64, u64, u64) {
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+fn ts_full() -> String {
+    let s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let (y, mo, d) = cd(s / 86400);
+    let r = s % 86400;
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, r / 3600, (r % 3600) / 60, r % 60)
+}
+
+fn ts_ns() -> u128 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()
+}
+
+// ─── Access Token Management ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKey {
+    pub id: String,
+    pub name: String,
+    pub key_hash: String,
+    pub key_prefix: String,
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub expires: Option<String>,
+    pub created: String,
+    #[serde(default)]
+    pub last_used: Option<String>,
+    #[serde(default)]
+    pub last_ip: Option<String>,
+    #[serde(default = "dt")]
+    pub enabled: bool,
+}
+
+pub const SCOPES: &[(&str, &str)] = &[
+    ("*", "Full access (all endpoints)"),
+    ("read", "Read-only access (GET endpoints)"),
+    ("containers", "Manage containers (Docker + LXC)"),
+    ("vms", "Manage virtual machines"),
+    ("storage", "Manage storage mounts"),
+    ("networking", "Manage networking"),
+    ("backup", "Manage backups"),
+    ("appstore", "Install/manage applications"),
+    ("statuspage", "Manage status pages"),
+    ("cluster", "Cluster management"),
+    ("wolfrun", "WolfRun orchestration"),
+];
+
+fn dt() -> bool { true }
+
+static TS: LazyLock<RwLock<Vec<ApiKey>>> = LazyLock::new(|| {
+    let p = at_loc();
+    let v = match std::fs::read_to_string(&p) {
+        Ok(c) => serde_json::from_str(&c).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    RwLock::new(v)
+});
+
+fn persist(keys: &[ApiKey]) -> Result<(), String> {
+    let p = at_loc();
+    let _ = std::fs::create_dir_all("/etc/wolfstack");
+    let j = serde_json::to_string_pretty(keys).map_err(|e| e.to_string())?;
+    let tmp = format!("{}.tmp", p);
+    std::fs::write(&tmp, &j).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &p).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+fn mk_tok() -> String {
+    let mut b = [0u8; 24];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        let _ = f.read_exact(&mut b);
+    } else {
+        use sha2::Digest;
+        let s = format!("{}_{}", ts_ns(), std::process::id());
+        let h = sha2::Sha256::digest(s.as_bytes());
+        b.copy_from_slice(&h[..24]);
+    }
+    format!("wsk_{}", hex::encode(b))
+}
+
+fn dg(raw: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(raw.as_bytes()))
+}
+
+pub fn create_key(name: &str, scopes: Vec<String>, expires: Option<String>) -> Result<(ApiKey, String), String> {
+    if !platform_ready() { return Err(rt_msg(0)); }
+    let raw = mk_tok();
+    let ak = ApiKey {
+        id: format!("key_{}", ts_ns()), name: name.to_string(),
+        key_hash: dg(&raw), key_prefix: format!("{}...", &raw[..12.min(raw.len())]),
+        scopes, expires, created: ts_ymd(),
+        last_used: None, last_ip: None, enabled: true,
+    };
+    let mut keys = TS.write().unwrap();
+    keys.push(ak.clone());
+    persist(&keys)?;
+    Ok((ak, raw))
+}
+
+pub fn list_keys() -> Vec<ApiKey> { TS.read().unwrap().clone() }
+
+pub fn delete_key(id: &str) -> Result<(), String> {
+    let mut keys = TS.write().unwrap();
+    let n = keys.len();
+    keys.retain(|k| k.id != id);
+    if keys.len() == n { return Err(format!("Key '{}' not found", id)); }
+    persist(&keys)
+}
+
+pub fn validate_key(raw: &str, ip: Option<&str>) -> Option<ApiKey> {
+    let h = dg(raw);
+    let r = {
+        let keys = TS.read().unwrap();
+        let f = keys.iter().find(|k| k.key_hash == h && k.enabled)?;
+        if let Some(ref exp) = f.expires { if *exp < ts_ymd() { return None; } }
+        f.clone()
+    };
+    if let Ok(mut keys) = TS.write() {
+        if let Some(f) = keys.iter_mut().find(|k| k.id == r.id) {
+            f.last_used = Some(ts_full());
+            if let Some(ip) = ip { f.last_ip = Some(ip.to_string()); }
+            let _ = persist(&keys);
+        }
+    }
+    Some(r)
+}
+
+pub fn scope_allows(key: &ApiKey, method: &str, path: &str) -> bool {
+    if key.scopes.contains(&"*".to_string()) { return true; }
+    if method == "GET" && key.scopes.contains(&"read".to_string()) { return true; }
+    for s in &key.scopes {
+        let ok = match s.as_str() {
+            "containers" => path.starts_with("/api/containers") || path.starts_with("/api/docker") || path.starts_with("/api/lxc"),
+            "vms" => path.starts_with("/api/vms"),
+            "storage" => path.starts_with("/api/storage"),
+            "networking" => path.starts_with("/api/networking") || path.starts_with("/api/dns") || path.starts_with("/api/firewall"),
+            "backup" => path.starts_with("/api/backup"),
+            "appstore" => path.starts_with("/api/appstore"),
+            "statuspage" => path.starts_with("/api/statuspage"),
+            "cluster" => path.starts_with("/api/cluster") || path.starts_with("/api/nodes"),
+            "wolfrun" => path.starts_with("/api/wolfrun"),
+            _ => false,
+        };
+        if ok { return true; }
+    }
+    false
+}
+
+// ─── Telemetry Event Buffer ───
+
+const EB_MAX: usize = 10000;
+static EB_MTX: Mutex<()> = Mutex::new(());
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub timestamp: String,
+    pub key_name: String,
+    pub key_id: String,
+    pub method: String,
+    pub path: String,
+    pub ip: String,
+    pub status: u16,
+}
+
+pub fn audit_log(entry: &AuditEntry) {
+    let line = match serde_json::to_string(entry) { Ok(l) => l, Err(_) => return };
+    let _g = match EB_MTX.lock() { Ok(g) => g, Err(_) => return };
+    let p = el_loc();
+    rotate_eb(&p);
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+        let _ = writeln!(f, "{}", line);
+    }
+}
+
+fn rotate_eb(p: &str) {
+    let m = match std::fs::metadata(p) { Ok(m) => m, Err(_) => return };
+    if m.len() < (EB_MAX as u64 * 150) { return; }
+    let c = match std::fs::read_to_string(p) { Ok(c) => c, Err(_) => return };
+    let l: Vec<&str> = c.lines().collect();
+    if l.len() <= EB_MAX { return; }
+    let k = EB_MAX / 2;
+    let t: String = l[l.len() - k..].iter().map(|x| format!("{}\n", x)).collect();
+    let _ = std::fs::write(p, t);
+}
+
+pub fn read_audit_log(limit: usize) -> Vec<AuditEntry> {
+    let c = match std::fs::read_to_string(el_loc()) { Ok(c) => c, Err(_) => return Vec::new() };
+    c.lines().rev().take(limit).filter_map(|l| serde_json::from_str(l).ok()).collect()
+}
+
+pub fn rt_msg(idx: usize) -> String {
+    let tbl: &[&[u8]] = &[
+        // 0
+        &[0x85, 0xae, 0xb4, 0xa5, 0xb2, 0xb0, 0xb2, 0xa9, 0xb3, 0xa5, 0xe0, 0xac, 0xa9, 0xa3, 0xa5,
+          0xae, 0xb3, 0xa5, 0xe0, 0xb2, 0xa5, 0xb1, 0xb5, 0xa9, 0xb2, 0xa5, 0xa4, 0xe0, 0xa6, 0xaf,
+          0xb2, 0xe0, 0x81, 0x90, 0x89, 0xe0, 0xab, 0xa5, 0xb9, 0xe0, 0xad, 0xa1, 0xae, 0xa1, 0xa7,
+          0xa5, 0xad, 0xa5, 0xae, 0xb4],
+        // 1
+        &[0x85, 0xae, 0xb4, 0xa5, 0xb2, 0xb0, 0xb2, 0xa9, 0xb3, 0xa5, 0xe0, 0xac, 0xa9, 0xa3, 0xa5,
+          0xae, 0xb3, 0xa5, 0xe0, 0xb2, 0xa5, 0xb1, 0xb5, 0xa9, 0xb2, 0xa5, 0xa4],
+        // 2
+        &[0x89, 0xae, 0xb6, 0xa1, 0xac, 0xa9, 0xa4, 0xe0, 0xaf, 0xb2, 0xe0, 0xa5, 0xb8, 0xb0, 0xa9,
+          0xb2, 0xa5, 0xa4, 0xe0, 0x81, 0x90, 0x89, 0xe0, 0xab, 0xa5, 0xb9],
+        // 3
+        &[0x81, 0x90, 0x89, 0xe0, 0xab, 0xa5, 0xb9, 0xe0, 0xa4, 0xaf, 0xa5, 0xb3, 0xe0, 0xae, 0xaf,
+          0xb4, 0xe0, 0xa8, 0xa1, 0xb6, 0xa5, 0xe0, 0xb0, 0xa5, 0xb2, 0xad, 0xa9, 0xb3, 0xb3, 0xa9,
+          0xaf, 0xae, 0xe0, 0xa6, 0xaf, 0xb2, 0xe0, 0xb4, 0xa8, 0xa9, 0xb3, 0xe0, 0xa5, 0xae, 0xa4,
+          0xb0, 0xaf, 0xa9, 0xae, 0xb4],
+        // 4
+        &[0x8e, 0xaf, 0xe0, 0xb6, 0xa1, 0xac, 0xa9, 0xa4, 0xe0, 0xa5, 0xae, 0xb4, 0xa5, 0xb2, 0xb0,
+          0xb2, 0xa9, 0xb3, 0xa5, 0xe0, 0xac, 0xa9, 0xa3, 0xa5, 0xae, 0xb3, 0xa5, 0xe0, 0xa6, 0xaf,
+          0xb5, 0xae, 0xa4],
+    ];
+    let m = tbl.get(idx).unwrap_or(&tbl[0]);
+    m.iter().map(|b| (b ^ 0xC0) as char).collect()
+}
+
+// ─── Tests ───
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pf_derivation() {
+        let pf = derive_pf();
+        assert_eq!(pf[0], 0xf9);
+        assert_eq!(pf[8], 0x08);
+        assert_eq!(pf[16], 0x9b);
+        assert_eq!(pf[31], 0x0c);
+    }
+
+    #[test]
+    fn test_calibration_verify() {
+        let payload = r#"{"customer":"Test","email":"test@test.com","max_nodes":0,"expires":"2099-12-31","features":["api_keys"]}"#;
+        let sig_b64 = "bv5ETiSJy4WRAfU2hD2zw+/lm5WIdC5k6hFliMEuZdW3QiKHEU89gKb33kzaqogU2TN5yJsltckjKYlMF1x7Cg==";
+
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let sig = b64.decode(sig_b64).unwrap();
+        let pf = derive_pf();
+        let vk = ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &pf);
+        assert!(vk.verify(payload.as_bytes(), &sig).is_ok());
+        assert!(vk.verify(b"tampered", &sig).is_err());
+    }
+
+    #[test]
+    fn test_cd() {
+        let (y, m, d) = cd(19723);
+        assert_eq!((y, m, d), (2024, 1, 1));
+    }
+
+    #[test]
+    fn test_scope_allows() {
+        let k = ApiKey {
+            id: "t".into(), name: "t".into(), key_hash: "".into(), key_prefix: "".into(),
+            scopes: vec!["read".into(), "containers".into()],
+            expires: None, created: "".into(), last_used: None, last_ip: None, enabled: true,
+        };
+        assert!(scope_allows(&k, "GET", "/api/vms"));
+        assert!(scope_allows(&k, "POST", "/api/containers/create"));
+        assert!(!scope_allows(&k, "POST", "/api/vms/create"));
+    }
+
+    #[test]
+    fn test_wildcard() {
+        let k = ApiKey {
+            id: "t".into(), name: "t".into(), key_hash: "".into(), key_prefix: "".into(),
+            scopes: vec!["*".into()],
+            expires: None, created: "".into(), last_used: None, last_ip: None, enabled: true,
+        };
+        assert!(scope_allows(&k, "POST", "/api/anything"));
+    }
+
+    #[test]
+    fn test_probe() {
+        let _ = probe_runtime();
+    }
+}
