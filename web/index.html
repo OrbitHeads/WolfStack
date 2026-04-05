@@ -1892,6 +1892,150 @@
                 </div>
             </div>
 
+            <!-- MariaDB Settings (shown only for mariadb component) -->
+            <div class="card" style="margin-bottom: 20px; display:none;" id="detail-mariadb-section">
+                <div class="card-header">
+                    <h3>MariaDB Settings</h3>
+                    <div style="display:flex;gap:8px;align-items:center;">
+                        <button class="btn btn-sm" onclick="selectView('mysql')">🔌 Database Manager</button>
+                        <button class="btn btn-primary btn-sm" onclick="saveMariaDBSettings()">💾 Apply &amp; Restart</button>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <!-- Server Settings -->
+                    <h4 style="font-size:14px;font-weight:600;margin:0 0 12px;">Server</h4>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:20px;">
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Port</label>
+                            <input type="number" id="mdb-port" class="form-control" value="3306" style="font-size:13px;">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Bind Address</label>
+                            <input type="text" id="mdb-bind-address" class="form-control" value="127.0.0.1" placeholder="127.0.0.1 or 0.0.0.0" style="font-size:13px;">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Max Connections</label>
+                            <input type="number" id="mdb-max-connections" class="form-control" value="151" style="font-size:13px;">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Data Directory</label>
+                            <input type="text" id="mdb-datadir" class="form-control" value="/var/lib/mysql" style="font-size:13px;" readonly>
+                        </div>
+                    </div>
+
+                    <!-- Performance -->
+                    <h4 style="font-size:14px;font-weight:600;margin:0 0 12px;">Performance</h4>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:20px;">
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">InnoDB Buffer Pool</label>
+                            <input type="text" id="mdb-innodb-buffer-pool" class="form-control" value="128M" placeholder="128M, 1G, etc." style="font-size:13px;">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">InnoDB Log File Size</label>
+                            <input type="text" id="mdb-innodb-log-file-size" class="form-control" value="48M" placeholder="48M" style="font-size:13px;">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Query Cache Size</label>
+                            <input type="text" id="mdb-query-cache-size" class="form-control" value="0" placeholder="0 (disabled)" style="font-size:13px;">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Max Allowed Packet</label>
+                            <input type="text" id="mdb-max-allowed-packet" class="form-control" value="16M" placeholder="16M" style="font-size:13px;">
+                        </div>
+                    </div>
+
+                    <!-- Logging -->
+                    <h4 style="font-size:14px;font-weight:600;margin:0 0 12px;">Logging</h4>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:20px;">
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Slow Query Log</label>
+                            <select id="mdb-slow-query-log" class="form-control" style="font-size:13px;">
+                                <option value="0">Disabled</option>
+                                <option value="1">Enabled</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Long Query Time (sec)</label>
+                            <input type="number" id="mdb-long-query-time" class="form-control" value="10" step="1" style="font-size:13px;">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Binary Logging</label>
+                            <select id="mdb-log-bin" class="form-control" style="font-size:13px;">
+                                <option value="">Disabled</option>
+                                <option value="mysql-bin">Enabled (mysql-bin)</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Binlog Format</label>
+                            <select id="mdb-binlog-format" class="form-control" style="font-size:13px;">
+                                <option value="ROW">ROW</option>
+                                <option value="MIXED">MIXED</option>
+                                <option value="STATEMENT">STATEMENT</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Galera Cluster -->
+                    <details style="margin-bottom:16px;">
+                        <summary style="font-size:14px;font-weight:600;cursor:pointer;color:var(--text-primary);user-select:none;">Galera Cluster</summary>
+                        <div style="margin-top:12px;padding:16px;background:var(--bg-tertiary);border-radius:8px;">
+                            <p style="font-size:12px;color:var(--text-muted);margin:0 0 12px;">Configure Galera synchronous multi-master replication. All nodes must have identical settings.</p>
+                            <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:12px;">
+                                <div>
+                                    <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Enable Galera</label>
+                                    <select id="mdb-galera-enabled" class="form-control" style="font-size:13px;" onchange="document.getElementById('mdb-galera-fields').style.display=this.value==='1'?'':'none'">
+                                        <option value="0">Disabled</option>
+                                        <option value="1">Enabled</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Cluster Name</label>
+                                    <input type="text" id="mdb-galera-cluster-name" class="form-control" placeholder="my_wsrep_cluster" style="font-size:13px;">
+                                </div>
+                            </div>
+                            <div id="mdb-galera-fields" style="display:none;">
+                                <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:12px;">
+                                    <div style="grid-column:1/-1;">
+                                        <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Cluster Addresses (comma-separated)</label>
+                                        <input type="text" id="mdb-galera-cluster-address" class="form-control" placeholder="gcomm://10.0.0.1,10.0.0.2,10.0.0.3" style="font-size:13px;">
+                                    </div>
+                                    <div>
+                                        <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">This Node Address</label>
+                                        <input type="text" id="mdb-galera-node-address" class="form-control" placeholder="10.0.0.1" style="font-size:13px;">
+                                    </div>
+                                    <div>
+                                        <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Node Name</label>
+                                        <input type="text" id="mdb-galera-node-name" class="form-control" placeholder="node1" style="font-size:13px;">
+                                    </div>
+                                    <div>
+                                        <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">SST Method</label>
+                                        <select id="mdb-galera-sst-method" class="form-control" style="font-size:13px;">
+                                            <option value="rsync">rsync</option>
+                                            <option value="mariabackup">mariabackup</option>
+                                            <option value="mysqldump">mysqldump</option>
+                                        </select>
+                                    </div>
+                                    <div>
+                                        <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Galera Provider</label>
+                                        <input type="text" id="mdb-galera-provider" class="form-control" value="/usr/lib/galera/libgalera_smm.so" style="font-size:13px;">
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </details>
+
+                    <!-- Advanced toggle to raw config -->
+                    <details>
+                        <summary style="font-size:13px;font-weight:600;cursor:pointer;color:var(--text-muted);user-select:none;">Advanced — Raw Configuration</summary>
+                        <div style="margin-top:10px;">
+                            <span id="mdb-config-path" style="font-size:11px;color:var(--text-muted);font-family:monospace;"></span>
+                            <textarea id="mdb-raw-config" class="config-editor" spellcheck="false" style="margin-top:6px;min-height:200px;"></textarea>
+                            <button class="btn btn-primary btn-sm" style="margin-top:8px;" onclick="saveMariaDBRawConfig()">💾 Save Raw Config</button>
+                        </div>
+                    </details>
+                </div>
+            </div>
+
             <!-- Config Editor -->
             <div class="card" style="margin-bottom: 20px;" id="detail-config-section">
                 <div class="card-header">

@@ -67,11 +67,40 @@ impl Component {
             Component::WolfServe => Some("/etc/wolfserve/config.toml"),
             Component::WolfDisk => Some("/etc/wolfdisk/config.toml"),
             Component::WolfScale => Some("/etc/wolfscale/config.toml"),
-            Component::MariaDB => Some("/etc/mysql/mariadb.conf.d/50-server.cnf"),
+            Component::MariaDB => Some(mariadb_config_path()),
             Component::Certbot => None,
         }
     }
 
+}
+
+/// Detect the MariaDB/MySQL config file path for the current distro
+fn mariadb_config_path() -> &'static str {
+    // Debian/Ubuntu
+    if std::path::Path::new("/etc/mysql/mariadb.conf.d/50-server.cnf").exists() {
+        return "/etc/mysql/mariadb.conf.d/50-server.cnf";
+    }
+    // Arch/Manjaro/CachyOS
+    if std::path::Path::new("/etc/my.cnf.d/server.cnf").exists() {
+        return "/etc/my.cnf.d/server.cnf";
+    }
+    // RHEL/Fedora/CentOS
+    if std::path::Path::new("/etc/my.cnf.d/mariadb-server.cnf").exists() {
+        return "/etc/my.cnf.d/mariadb-server.cnf";
+    }
+    // SUSE
+    if std::path::Path::new("/etc/my.cnf.d/mysql/mysqld.cnf").exists() {
+        return "/etc/my.cnf.d/mysql/mysqld.cnf";
+    }
+    // Global fallback
+    if std::path::Path::new("/etc/my.cnf").exists() {
+        return "/etc/my.cnf";
+    }
+    // Default to Debian path even if it doesn't exist yet
+    "/etc/mysql/mariadb.conf.d/50-server.cnf"
+}
+
+impl Component {
     pub fn all() -> &'static [Component] {
         &[
             Component::WolfNet,

@@ -7678,17 +7678,26 @@ async function refreshComponentDetail(name) {
         document.getElementById('detail-btn-restart').style.display = d.running ? '' : 'none';
         document.getElementById('detail-btn-stop').style.display = d.running ? '' : 'none';
 
-        // Config
-        if (d.config_path && d.config !== null) {
-            configSection.style.display = '';
-            document.getElementById('detail-config-path').textContent = d.config_path;
-            document.getElementById('detail-config-editor').value = d.config || '';
-        } else if (d.config_path && d.config === null) {
-            configSection.style.display = '';
-            document.getElementById('detail-config-path').textContent = d.config_path + ' (not found)';
-            document.getElementById('detail-config-editor').value = '# Config file not found at ' + d.config_path;
+        // MariaDB structured settings
+        const mdbSection = document.getElementById('detail-mariadb-section');
+        if (name === 'mariadb' && mdbSection) {
+            mdbSection.style.display = '';
+            if (configSection) configSection.style.display = 'none';
+            populateMariaDBSettings(d.config || '', d.config_path || '');
         } else {
-            configSection.style.display = 'none';
+            if (mdbSection) mdbSection.style.display = 'none';
+            // Standard config editor for non-MariaDB components
+            if (d.config_path && d.config !== null) {
+                configSection.style.display = '';
+                document.getElementById('detail-config-path').textContent = d.config_path;
+                document.getElementById('detail-config-editor').value = d.config || '';
+            } else if (d.config_path && d.config === null) {
+                configSection.style.display = '';
+                document.getElementById('detail-config-path').textContent = d.config_path + ' (not found)';
+                document.getElementById('detail-config-editor').value = '# Config file not found at ' + d.config_path;
+            } else {
+                configSection.style.display = 'none';
+            }
         }
 
         // Logs
@@ -7715,6 +7724,125 @@ async function refreshComponentDetail(name) {
         console.error('Failed to load component detail:', e);
         showToast('Failed to load component details', 'error');
     }
+}
+
+// ─── MariaDB Structured Settings ───
+
+function populateMariaDBSettings(configText, configPath) {
+    document.getElementById('mdb-config-path').textContent = configPath;
+    document.getElementById('mdb-raw-config').value = configText;
+
+    // Parse INI-style config into key-value pairs
+    const vals = {};
+    for (const line of configText.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('[')) continue;
+        const eq = trimmed.indexOf('=');
+        if (eq === -1) { vals[trimmed] = ''; continue; }
+        vals[trimmed.substring(0, eq).trim().replace(/-/g, '_')] = trimmed.substring(eq + 1).trim();
+    }
+
+    // Populate form fields
+    const set = (id, key, def) => { const el = document.getElementById(id); if (el) el.value = vals[key] ?? def; };
+    set('mdb-port', 'port', '3306');
+    set('mdb-bind-address', 'bind_address', '127.0.0.1');
+    set('mdb-max-connections', 'max_connections', '151');
+    set('mdb-datadir', 'datadir', '/var/lib/mysql');
+    set('mdb-innodb-buffer-pool', 'innodb_buffer_pool_size', '128M');
+    set('mdb-innodb-log-file-size', 'innodb_log_file_size', '48M');
+    set('mdb-query-cache-size', 'query_cache_size', '0');
+    set('mdb-max-allowed-packet', 'max_allowed_packet', '16M');
+    set('mdb-slow-query-log', 'slow_query_log', '0');
+    set('mdb-long-query-time', 'long_query_time', '10');
+    set('mdb-log-bin', 'log_bin', '');
+    set('mdb-binlog-format', 'binlog_format', 'ROW');
+
+    // Galera
+    const hasGalera = vals['wsrep_on'] === 'ON' || vals['wsrep_on'] === '1' || !!vals['wsrep_cluster_address'];
+    document.getElementById('mdb-galera-enabled').value = hasGalera ? '1' : '0';
+    document.getElementById('mdb-galera-fields').style.display = hasGalera ? '' : 'none';
+    set('mdb-galera-cluster-name', 'wsrep_cluster_name', '');
+    set('mdb-galera-cluster-address', 'wsrep_cluster_address', '');
+    set('mdb-galera-node-address', 'wsrep_node_address', '');
+    set('mdb-galera-node-name', 'wsrep_node_name', '');
+    set('mdb-galera-sst-method', 'wsrep_sst_method', 'rsync');
+    set('mdb-galera-provider', 'wsrep_provider', '/usr/lib/galera/libgalera_smm.so');
+}
+
+function buildMariaDBConfig() {
+    const g = id => document.getElementById(id)?.value || '';
+    let cfg = '[mysqld]\n';
+    cfg += `port = ${g('mdb-port')}\n`;
+    cfg += `bind-address = ${g('mdb-bind-address')}\n`;
+    cfg += `max_connections = ${g('mdb-max-connections')}\n`;
+    cfg += `datadir = ${g('mdb-datadir')}\n`;
+    cfg += `\n# Performance\n`;
+    cfg += `innodb_buffer_pool_size = ${g('mdb-innodb-buffer-pool')}\n`;
+    cfg += `innodb_log_file_size = ${g('mdb-innodb-log-file-size')}\n`;
+    cfg += `query_cache_size = ${g('mdb-query-cache-size')}\n`;
+    cfg += `max_allowed_packet = ${g('mdb-max-allowed-packet')}\n`;
+    cfg += `\n# Logging\n`;
+    if (g('mdb-slow-query-log') === '1') {
+        cfg += `slow_query_log = 1\n`;
+        cfg += `long_query_time = ${g('mdb-long-query-time')}\n`;
+    }
+    if (g('mdb-log-bin')) {
+        cfg += `log_bin = ${g('mdb-log-bin')}\n`;
+        cfg += `binlog_format = ${g('mdb-binlog-format')}\n`;
+    }
+
+    // Galera
+    if (g('mdb-galera-enabled') === '1') {
+        cfg += `\n# Galera Cluster\n`;
+        cfg += `wsrep_on = ON\n`;
+        cfg += `wsrep_provider = ${g('mdb-galera-provider')}\n`;
+        cfg += `wsrep_cluster_name = ${g('mdb-galera-cluster-name')}\n`;
+        cfg += `wsrep_cluster_address = ${g('mdb-galera-cluster-address')}\n`;
+        cfg += `wsrep_node_address = ${g('mdb-galera-node-address')}\n`;
+        cfg += `wsrep_node_name = ${g('mdb-galera-node-name')}\n`;
+        cfg += `wsrep_sst_method = ${g('mdb-galera-sst-method')}\n`;
+        cfg += `binlog_format = ROW\n`;
+        cfg += `default_storage_engine = InnoDB\n`;
+        cfg += `innodb_autoinc_lock_mode = 2\n`;
+    }
+    return cfg;
+}
+
+async function saveMariaDBSettings() {
+    const config = buildMariaDBConfig();
+    try {
+        const resp = await fetch(apiUrl(`/api/components/mariadb/config`), {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: config }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Save failed', 'error'); return; }
+        // Also update raw editor
+        document.getElementById('mdb-raw-config').value = config;
+        // Restart MariaDB
+        await fetch(apiUrl('/api/services/mariadb/action'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'restart' }),
+        });
+        showToast('MariaDB settings saved and service restarted', 'success');
+        refreshComponentDetail('mariadb');
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+}
+
+async function saveMariaDBRawConfig() {
+    const content = document.getElementById('mdb-raw-config').value;
+    try {
+        const resp = await fetch(apiUrl(`/api/components/mariadb/config`), {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Save failed', 'error'); return; }
+        showToast(data.message || 'Config saved', 'success');
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
 }
 
 async function detailServiceAction(action) {
