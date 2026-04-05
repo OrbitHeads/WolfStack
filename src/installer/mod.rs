@@ -311,7 +311,7 @@ fn install_certbot(distro: DistroFamily) -> Result<String, String> {
 fn install_wolf_component(component: Component, _distro: DistroFamily) -> Result<String, String> {
     let install_url = match component {
         Component::WolfNet => "https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfScale/main/wolfnet/setup.sh",
-        Component::WolfProxy => "https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfScale/master/wolfproxy/install.sh",
+        Component::WolfProxy => "https://raw.githubusercontent.com/wolfsoftwaresystemsltd/wolfproxy/main/setup.sh",
         Component::WolfServe => "https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfScale/master/wolfserve/install.sh",
         Component::WolfDisk => "https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfScale/main/wolfdisk/setup.sh",
         Component::WolfScale => "https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfScale/main/setup_lb.sh",

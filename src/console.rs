@@ -186,7 +186,7 @@ async fn console_session(
 
             let install_script = match component {
                 "wolfnet" => "https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfScale/main/wolfnet/setup.sh",
-                "wolfproxy" => "https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfScale/master/wolfproxy/install.sh",
+                "wolfproxy" => "__inline_wolfproxy__",
                 "wolfserve" => "https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfScale/master/wolfserve/install.sh",
                 "wolfdisk" => "https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfScale/main/wolfdisk/setup.sh",
                 "wolfscale" => "https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfScale/main/setup_lb.sh",
@@ -221,9 +221,20 @@ async fn console_session(
                 elif command -v zypper >/dev/null 2>&1; then \
                 zypper install -y certbot; \
                 else echo 'Unsupported package manager' && exit 1; fi";
+            let wolfproxy_inline = "\
+                curl -fsSL 'https://raw.githubusercontent.com/wolfsoftwaresystemsltd/wolfproxy/main/setup.sh' | bash && \
+                mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled && \
+                if [ ! -f /etc/nginx/sites-available/default ]; then \
+                    printf 'server {\\n    listen 80 default_server;\\n    listen [::]:80 default_server;\\n    server_name _;\\n\\n    root /var/www/html;\\n    index index.html index.htm;\\n\\n    location / {\\n        try_files $uri $uri/ =404;\\n    }\\n}\\n' > /etc/nginx/sites-available/default && \
+                    ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default && \
+                    echo 'Default nginx site configuration created'; \
+                else \
+                    echo 'Existing nginx configuration preserved'; \
+                fi";
             let inline_script = match install_script {
                 "__inline_mariadb__" => Some(mariadb_inline),
                 "__inline_certbot__" => Some(certbot_inline),
+                "__inline_wolfproxy__" => Some(wolfproxy_inline),
                 _ => None,
             };
             let is_inline = inline_script.is_some();
