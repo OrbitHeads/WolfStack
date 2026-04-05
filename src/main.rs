@@ -39,6 +39,7 @@ mod tui;
 mod wolfflow;
 mod wolfnote;
 mod paths;
+mod enterprise;
 
 use actix_web::{web, App, HttpServer, HttpRequest, HttpResponse};
 use actix_files;

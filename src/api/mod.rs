@@ -216,6 +216,50 @@ pub fn require_auth(req: &HttpRequest, state: &web::Data<AppState>) -> Result<St
             "error": "Invalid cluster secret"
         })));
     }
+    // Accept API key authentication (X-API-Key header or Authorization: Bearer wsk_...)
+    // Only process if enterprise is enabled, otherwise fall through to session auth
+    if crate::enterprise::is_enterprise() {
+        let api_key_value = req.headers().get("X-API-Key")
+            .and_then(|v| v.to_str().ok().map(|s| s.to_string()))
+            .or_else(|| {
+                req.headers().get("Authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.strip_prefix("Bearer "))
+                    .filter(|v| v.starts_with("wsk_"))
+                    .map(|v| v.to_string())
+            });
+
+        if let Some(raw_key) = api_key_value {
+            let ip = req.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+            match crate::enterprise::validate_key(&raw_key, Some(&ip)) {
+                Some(key) => {
+                    let method = req.method().as_str();
+                    let path = req.path();
+                    if !crate::enterprise::scope_allows(&key, method, path) {
+                        return Err(HttpResponse::Forbidden().json(serde_json::json!({
+                            "error": "API key does not have permission for this endpoint",
+                        })));
+                    }
+                    crate::enterprise::audit_log(&crate::enterprise::AuditEntry {
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        key_name: key.name.clone(),
+                        key_id: key.id.clone(),
+                        method: method.to_string(),
+                        path: path.to_string(),
+                        ip,
+                        status: 200,
+                    });
+                    return Ok(format!("apikey:{}", key.name));
+                }
+                None => {
+                    return Err(HttpResponse::Unauthorized().json(serde_json::json!({
+                        "error": "Invalid or expired API key"
+                    })));
+                }
+            }
+        }
+    }
+
     match get_session_token(req) {
         Some(token) => {
             match state.sessions.validate(&token) {
@@ -14619,6 +14663,104 @@ pub async fn wolfnote_notes_create(
     }
 }
 
+// ─── Enterprise API Key Management ───
+
+/// GET /api/license — check license status
+pub async fn license_status(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    HttpResponse::Ok().json(crate::enterprise::license_status())
+}
+
+/// GET /api/apikeys — list all API keys
+pub async fn list_api_keys(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    if !crate::enterprise::is_enterprise() {
+        return HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "Enterprise license required",
+            "feature": "api_keys",
+        }));
+    }
+    HttpResponse::Ok().json(crate::enterprise::list_keys())
+}
+
+#[derive(Deserialize)]
+pub struct CreateApiKeyRequest {
+    pub name: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub expires: Option<String>,
+}
+
+/// POST /api/apikeys — create a new API key
+pub async fn create_api_key(req: HttpRequest, state: web::Data<AppState>, body: web::Json<CreateApiKeyRequest>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    if !crate::enterprise::is_enterprise() {
+        return HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "Enterprise license required",
+            "feature": "api_keys",
+        }));
+    }
+
+    if body.name.trim().is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "API key name is required"
+        }));
+    }
+
+    let scopes = if body.scopes.is_empty() {
+        vec!["read".to_string()]
+    } else {
+        body.scopes.clone()
+    };
+
+    match crate::enterprise::create_key(body.name.trim(), scopes, body.expires.clone()) {
+        Ok((key, raw_key)) => HttpResponse::Ok().json(serde_json::json!({
+            "key": key,
+            "raw_key": raw_key,
+            "message": "Save this key now — it will not be shown again",
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// DELETE /api/apikeys/{id} — revoke an API key
+pub async fn delete_api_key(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    if !crate::enterprise::is_enterprise() {
+        return HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "Enterprise license required",
+        }));
+    }
+
+    let id = path.into_inner();
+    match crate::enterprise::delete_key(&id) {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "message": "API key revoked" })),
+        Err(e) => HttpResponse::NotFound().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// GET /api/apikeys/scopes — list available scopes
+pub async fn list_api_scopes(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let scopes: Vec<serde_json::Value> = crate::enterprise::SCOPES.iter()
+        .map(|(id, desc)| serde_json::json!({ "id": id, "description": desc }))
+        .collect();
+    HttpResponse::Ok().json(scopes)
+}
+
+/// GET /api/apikeys/audit — recent API key usage audit log
+pub async fn api_audit_log(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    if !crate::enterprise::is_enterprise() {
+        return HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "Enterprise license required",
+        }));
+    }
+    let entries = crate::enterprise::read_audit_log(200);
+    HttpResponse::Ok().json(entries)
+}
+
 /// Configure all API routes
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg
@@ -15081,6 +15223,14 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/compose/stacks/{name}/logs", web::get().to(compose_logs))
         .route("/api/compose/stacks/{name}/validate", web::post().to(compose_validate))
         // Secrets Manager
+        // Enterprise — License & API Keys
+        .route("/api/license", web::get().to(license_status))
+        .route("/api/apikeys", web::get().to(list_api_keys))
+        .route("/api/apikeys", web::post().to(create_api_key))
+        .route("/api/apikeys/scopes", web::get().to(list_api_scopes))
+        .route("/api/apikeys/audit", web::get().to(api_audit_log))
+        .route("/api/apikeys/{id}", web::delete().to(delete_api_key))
+        // Secrets
         .route("/api/secrets", web::get().to(secrets_list))
         .route("/api/secrets", web::post().to(secrets_save))
         .route("/api/secrets/{key}", web::get().to(secrets_get))

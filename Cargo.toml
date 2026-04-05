@@ -1,6 +1,6 @@
 [package]
 name = "wolfstack"
-version = "16.7.4"
+version = "16.8.0"
 edition = "2024"
 authors = ["Wolf Software Systems Ltd"]
 description = "Server management platform for the Wolf software suite"
@@ -33,6 +33,7 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls", "multipart", "st
 # TLS
 openssl = { version = "0.10", features = ["vendored"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+ring = "0.17"
 webpki-roots = "0.26"
 
 # Logging

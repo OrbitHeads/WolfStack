@@ -21108,7 +21108,162 @@ function switchSettingsTab(tabName) {
         loadUsers();
     } else if (tabName === 'wolfnote') {
         loadWolfNoteConfig();
+    } else if (tabName === 'apikeys') {
+        loadApiKeysTab();
     }
+}
+
+// ─── Enterprise API Keys ───
+
+async function loadApiKeysTab() {
+    const banner = document.getElementById('apikeys-license-banner');
+    const content = document.getElementById('apikeys-content');
+    try {
+        const resp = await fetch(apiUrl('/api/license'));
+        if (!resp.ok) return;
+        const lic = await resp.json();
+        if (lic.valid) {
+            banner.innerHTML = `<div style="display:flex;align-items:center;gap:10px;padding:10px 14px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);border-radius:8px;margin-bottom:16px;font-size:13px;">
+                <span style="font-size:18px;">✅</span>
+                <div><strong>Enterprise License</strong> — ${escapeHtml(lic.customer)} (expires ${escapeHtml(lic.expires)})</div>
+            </div>`;
+            content.style.display = '';
+            loadApiKeys();
+            loadApiScopes();
+            loadApiAuditLog();
+        } else {
+            banner.innerHTML = `<div style="text-align:center;padding:40px 20px;">
+                <div style="font-size:48px;margin-bottom:12px;">🔑</div>
+                <h3 style="margin:0 0 8px 0;font-size:18px;">Enterprise Feature</h3>
+                <p style="color:var(--text-muted);font-size:13px;max-width:400px;margin:0 auto 16px;">
+                    API key management lets you create scoped keys for programmatic access to WolfStack.
+                    Available with an Enterprise license.
+                </p>
+                <a href="https://wolf.uk.com/enterprise" target="_blank" class="btn btn-primary">Learn More</a>
+            </div>`;
+            content.style.display = 'none';
+        }
+    } catch (e) { console.error('Failed to load license status:', e); }
+}
+
+async function loadApiKeys() {
+    const tbody = document.getElementById('apikeys-table-body');
+    if (!tbody) return;
+    try {
+        const resp = await fetch(apiUrl('/api/apikeys'));
+        if (!resp.ok) { tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);text-align:center;">Failed to load</td></tr>'; return; }
+        const keys = await resp.json();
+        if (keys.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);text-align:center;padding:20px;">No API keys created yet</td></tr>';
+            return;
+        }
+        tbody.innerHTML = keys.map(k => `<tr>
+            <td style="font-weight:600;">${escapeHtml(k.name)}</td>
+            <td><code style="font-size:11px;color:var(--text-muted);">${escapeHtml(k.key_prefix)}</code></td>
+            <td style="font-size:11px;">${k.scopes.map(s => `<span style="background:var(--bg-tertiary);padding:1px 6px;border-radius:4px;margin-right:3px;">${escapeHtml(s)}</span>`).join('')}</td>
+            <td style="font-size:12px;color:var(--text-muted);">${escapeHtml(k.created)}</td>
+            <td style="font-size:12px;color:var(--text-muted);">${k.last_used ? escapeHtml(k.last_used) : '<em>Never</em>'}</td>
+            <td><button class="btn btn-sm" onclick="revokeApiKey('${escapeHtml(k.id)}','${escapeHtml(k.name)}')" style="font-size:11px;color:var(--danger);border-color:var(--danger);">Revoke</button></td>
+        </tr>`).join('');
+    } catch (e) { console.error('Failed to load API keys:', e); }
+}
+
+async function loadApiScopes() {
+    const container = document.getElementById('apikey-scopes');
+    if (!container) return;
+    try {
+        const resp = await fetch(apiUrl('/api/apikeys/scopes'));
+        if (!resp.ok) return;
+        const scopes = await resp.json();
+        container.innerHTML = scopes.map(s => `
+            <label style="display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:4px;cursor:pointer;font-size:12px;">
+                <input type="checkbox" class="apikey-scope-checkbox" value="${escapeHtml(s.id)}" ${s.id === '*' ? 'checked' : ''}>
+                <code>${escapeHtml(s.id)}</code>
+                <span style="color:var(--text-muted);">— ${escapeHtml(s.description)}</span>
+            </label>
+        `).join('');
+    } catch (e) { console.error('Failed to load scopes:', e); }
+}
+
+async function loadApiAuditLog() {
+    const el = document.getElementById('apikeys-audit-log');
+    if (!el) return;
+    try {
+        const resp = await fetch(apiUrl('/api/apikeys/audit'));
+        if (!resp.ok) return;
+        const entries = await resp.json();
+        if (entries.length === 0) {
+            el.innerHTML = '<div style="color:var(--text-muted);text-align:center;">No audit entries yet</div>';
+            return;
+        }
+        el.innerHTML = entries.map(e => `<div style="display:flex;gap:12px;padding:4px 0;border-bottom:1px solid var(--border);">
+            <span style="color:var(--text-muted);min-width:160px;">${escapeHtml(e.timestamp?.substring(0, 19) || '')}</span>
+            <span style="font-weight:600;min-width:120px;">${escapeHtml(e.key_name)}</span>
+            <code style="min-width:50px;">${escapeHtml(e.method)}</code>
+            <span style="flex:1;color:var(--text-secondary);">${escapeHtml(e.path)}</span>
+            <span style="color:var(--text-muted);">${escapeHtml(e.ip)}</span>
+        </div>`).join('');
+    } catch (e) { console.error('Failed to load audit log:', e); }
+}
+
+function showCreateApiKeyModal() {
+    document.getElementById('apikey-name').value = '';
+    document.getElementById('apikey-expires').value = '';
+    // Reset scope checkboxes
+    document.querySelectorAll('.apikey-scope-checkbox').forEach(cb => {
+        cb.checked = cb.value === '*';
+    });
+    const modal = document.getElementById('apikey-create-modal');
+    modal.style.display = 'flex';
+    setTimeout(() => modal.classList.add('active'), 10);
+}
+
+function closeApiKeyModal() {
+    const modal = document.getElementById('apikey-create-modal');
+    modal.classList.remove('active');
+    setTimeout(() => modal.style.display = 'none', 200);
+}
+
+async function createApiKey() {
+    const name = document.getElementById('apikey-name').value.trim();
+    if (!name) { showToast('Please enter a key name', 'error'); return; }
+
+    const scopes = [];
+    document.querySelectorAll('.apikey-scope-checkbox:checked').forEach(cb => scopes.push(cb.value));
+    if (scopes.length === 0) { showToast('Please select at least one scope', 'error'); return; }
+
+    const expires = document.getElementById('apikey-expires').value || null;
+
+    closeApiKeyModal();
+    try {
+        const resp = await fetch(apiUrl('/api/apikeys'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, scopes, expires }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Failed to create key', 'error'); return; }
+
+        // Show the raw key
+        document.getElementById('apikey-raw-key').textContent = data.raw_key;
+        const modal = document.getElementById('apikey-created-modal');
+        modal.style.display = 'flex';
+        setTimeout(() => modal.classList.add('active'), 10);
+
+        loadApiKeys();
+        showToast('API key created', 'success');
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+}
+
+async function revokeApiKey(id, name) {
+    if (!confirm(`Revoke API key "${name}"? Any applications using this key will lose access.`)) return;
+    try {
+        const resp = await fetch(apiUrl(`/api/apikeys/${id}`), { method: 'DELETE' });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Failed to revoke key', 'error'); return; }
+        showToast('API key revoked', 'success');
+        loadApiKeys();
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
 }
 
 // ─── WolfNote Integration ───
