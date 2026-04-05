@@ -191,6 +191,7 @@ async fn console_session(
                 "wolfdisk" => "https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfScale/main/wolfdisk/setup.sh",
                 "wolfscale" => "https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfScale/main/setup_lb.sh",
                 "mariadb" => "__inline_mariadb__",
+                "postgresql" => "__inline_postgresql__",
                 "certbot" => "__inline_certbot__",
                 _ => {
                     let _ = session.text(format!("\r\n\x1b[31mUnknown component: {}\x1b[0m\r\n", component)).await;
@@ -231,8 +232,26 @@ async fn console_session(
                 else \
                     echo 'Existing nginx configuration preserved'; \
                 fi";
+            let postgresql_inline = "if command -v apt-get >/dev/null 2>&1; then \
+                apt-get update -qq && apt-get install -y postgresql && \
+                systemctl enable --now postgresql; \
+                elif command -v dnf >/dev/null 2>&1; then \
+                dnf install -y postgresql-server && \
+                postgresql-setup --initdb && \
+                systemctl enable --now postgresql; \
+                elif command -v zypper >/dev/null 2>&1; then \
+                zypper install -y postgresql-server && \
+                systemctl enable --now postgresql; \
+                elif command -v pacman >/dev/null 2>&1; then \
+                pacman -S --noconfirm postgresql && \
+                if [ ! -f /var/lib/postgres/data/PG_VERSION ]; then \
+                    su -c 'initdb -D /var/lib/postgres/data' postgres; \
+                fi && \
+                systemctl enable --now postgresql; \
+                else echo 'Unsupported package manager' && exit 1; fi";
             let inline_script = match install_script {
                 "__inline_mariadb__" => Some(mariadb_inline),
+                "__inline_postgresql__" => Some(postgresql_inline),
                 "__inline_certbot__" => Some(certbot_inline),
                 "__inline_wolfproxy__" => Some(wolfproxy_inline),
                 _ => None,

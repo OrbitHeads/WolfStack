@@ -20,6 +20,7 @@ pub enum Component {
     WolfDisk,
     WolfScale,
     MariaDB,
+    PostgreSQL,
     Certbot,
 }
 
@@ -32,6 +33,7 @@ impl Component {
             Component::WolfDisk => "WolfDisk",
             Component::WolfScale => "WolfScale",
             Component::MariaDB => "MariaDB",
+            Component::PostgreSQL => "PostgreSQL",
             Component::Certbot => "Certbot",
         }
     }
@@ -44,6 +46,7 @@ impl Component {
             Component::WolfDisk => "Distributed filesystem",
             Component::WolfScale => "MariaDB-compatible distributed database",
             Component::MariaDB => "MariaDB relational database server",
+            Component::PostgreSQL => "PostgreSQL relational database server",
             Component::Certbot => "Let's Encrypt certificate manager",
         }
     }
@@ -56,6 +59,7 @@ impl Component {
             Component::WolfDisk => "wolfdisk",
             Component::WolfScale => "wolfscale",
             Component::MariaDB => "mariadb",
+            Component::PostgreSQL => "postgresql",
             Component::Certbot => "certbot",
         }
     }
@@ -68,6 +72,7 @@ impl Component {
             Component::WolfDisk => Some("/etc/wolfdisk/config.toml"),
             Component::WolfScale => Some("/etc/wolfscale/config.toml"),
             Component::MariaDB => Some(mariadb_config_path()),
+            Component::PostgreSQL => Some(postgresql_config_path()),
             Component::Certbot => None,
         }
     }
@@ -100,6 +105,45 @@ fn mariadb_config_path() -> &'static str {
     "/etc/mysql/mariadb.conf.d/50-server.cnf"
 }
 
+/// Detect the PostgreSQL config file path for the current distro
+fn postgresql_config_path() -> &'static str {
+    // Debian/Ubuntu (version-specific paths)
+    for v in &["17", "16", "15", "14", "13"] {
+        let path = format!("/etc/postgresql/{}/main/postgresql.conf", v);
+        if std::path::Path::new(&path).exists() {
+            return match *v {
+                "17" => "/etc/postgresql/17/main/postgresql.conf",
+                "16" => "/etc/postgresql/16/main/postgresql.conf",
+                "15" => "/etc/postgresql/15/main/postgresql.conf",
+                "14" => "/etc/postgresql/14/main/postgresql.conf",
+                _ => "/etc/postgresql/13/main/postgresql.conf",
+            };
+        }
+    }
+    // Arch/Manjaro
+    if std::path::Path::new("/var/lib/postgres/data/postgresql.conf").exists() {
+        return "/var/lib/postgres/data/postgresql.conf";
+    }
+    // RHEL/Fedora/CentOS
+    for v in &["17", "16", "15", "14", "13"] {
+        let path = format!("/var/lib/pgsql/{}/data/postgresql.conf", v);
+        if std::path::Path::new(&path).exists() {
+            return match *v {
+                "17" => "/var/lib/pgsql/17/data/postgresql.conf",
+                "16" => "/var/lib/pgsql/16/data/postgresql.conf",
+                "15" => "/var/lib/pgsql/15/data/postgresql.conf",
+                "14" => "/var/lib/pgsql/14/data/postgresql.conf",
+                _ => "/var/lib/pgsql/13/data/postgresql.conf",
+            };
+        }
+    }
+    // RHEL default data dir
+    if std::path::Path::new("/var/lib/pgsql/data/postgresql.conf").exists() {
+        return "/var/lib/pgsql/data/postgresql.conf";
+    }
+    "/etc/postgresql/17/main/postgresql.conf"
+}
+
 impl Component {
     pub fn all() -> &'static [Component] {
         &[
@@ -109,6 +153,7 @@ impl Component {
             Component::WolfDisk,
             Component::WolfScale,
             Component::MariaDB,
+            Component::PostgreSQL,
             Component::Certbot,
         ]
     }
@@ -220,6 +265,7 @@ fn binary_exists(name: &str) -> bool {
 pub fn get_component_version(component: Component) -> Option<String> {
     let (cmd, args): (&str, &[&str]) = match component {
         Component::MariaDB => ("mariadb", &["--version"]),
+        Component::PostgreSQL => ("psql", &["--version"]),
         Component::Certbot => ("certbot", &["--version"]),
         Component::WolfNet => ("wolfnet", &["--version"]),
         Component::WolfProxy => ("wolfproxy", &["--version"]),
@@ -289,6 +335,7 @@ pub fn install_component(component: Component) -> Result<String, String> {
 
     match component {
         Component::MariaDB => install_mariadb(distro),
+        Component::PostgreSQL => install_postgresql(distro),
         Component::Certbot => install_certbot(distro),
         Component::WolfNet | Component::WolfProxy | Component::WolfServe
         | Component::WolfDisk | Component::WolfScale => install_wolf_component(component, distro),
@@ -315,6 +362,39 @@ fn install_mariadb(distro: DistroFamily) -> Result<String, String> {
     if output.status.success() {
         // Enable and start
         let _ = Command::new("sudo").args(["systemctl", "enable", "--now", "mariadb"]).output();
+        Ok(format!("{} installed and started", pkg_name))
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+fn install_postgresql(distro: DistroFamily) -> Result<String, String> {
+    let (pkg_mgr, install_flag) = pkg_install_cmd(distro);
+    let pkg_name = match distro {
+        DistroFamily::Debian => "postgresql",
+        DistroFamily::RedHat => "postgresql-server",
+        DistroFamily::Suse => "postgresql-server",
+        DistroFamily::Arch => "postgresql",
+        DistroFamily::Unknown => "postgresql",
+    };
+
+    let output = Command::new("sudo")
+        .args([pkg_mgr])
+        .args(install_flag.split_whitespace())
+        .arg(pkg_name)
+        .output()
+        .map_err(|e| format!("Failed to run package manager: {}", e))?;
+
+    if output.status.success() {
+        // Arch needs initdb before starting (skip if data dir already exists)
+        if distro == DistroFamily::Arch && !std::path::Path::new("/var/lib/postgres/data/PG_VERSION").exists() {
+            let _ = Command::new("sudo").args(["-u", "postgres", "initdb", "-D", "/var/lib/postgres/data"]).output();
+        }
+        // RHEL needs setup (skip if already initialised)
+        if distro == DistroFamily::RedHat && !std::path::Path::new("/var/lib/pgsql/data/PG_VERSION").exists() {
+            let _ = Command::new("sudo").args(["postgresql-setup", "--initdb"]).output();
+        }
+        let _ = Command::new("sudo").args(["systemctl", "enable", "--now", "postgresql"]).output();
         Ok(format!("{} installed and started", pkg_name))
     } else {
         Err(String::from_utf8_lossy(&output.stderr).to_string())

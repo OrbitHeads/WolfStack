@@ -1945,6 +1945,7 @@ pub async fn get_component_detail(req: HttpRequest, state: web::Data<AppState>, 
         "wolfdisk" => installer::Component::WolfDisk,
         "wolfscale" => installer::Component::WolfScale,
         "mariadb" => installer::Component::MariaDB,
+        "postgresql" => installer::Component::PostgreSQL,
         "certbot" => installer::Component::Certbot,
         _ => return HttpResponse::BadRequest().json(serde_json::json!({
             "error": format!("Unknown component: {}", name)
@@ -2004,6 +2005,7 @@ pub async fn save_component_config(
         "wolfdisk" => installer::Component::WolfDisk,
         "wolfscale" => installer::Component::WolfScale,
         "mariadb" => installer::Component::MariaDB,
+        "postgresql" => installer::Component::PostgreSQL,
         "certbot" => installer::Component::Certbot,
         _ => return HttpResponse::BadRequest().json(serde_json::json!({
             "error": format!("Unknown component: {}", name)
@@ -2041,6 +2043,7 @@ pub async fn install_component(req: HttpRequest, state: web::Data<AppState>, pat
         "wolfdisk" => installer::Component::WolfDisk,
         "wolfscale" => installer::Component::WolfScale,
         "mariadb" => installer::Component::MariaDB,
+        "postgresql" => installer::Component::PostgreSQL,
         "certbot" => installer::Component::Certbot,
         _ => return HttpResponse::BadRequest().json(serde_json::json!({
             "error": format!("Unknown component: {}", name)

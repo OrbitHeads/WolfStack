@@ -7678,15 +7678,28 @@ async function refreshComponentDetail(name) {
         document.getElementById('detail-btn-restart').style.display = d.running ? '' : 'none';
         document.getElementById('detail-btn-stop').style.display = d.running ? '' : 'none';
 
-        // MariaDB structured settings
+        // Structured settings panels (hide all first, then show the right one)
         const mdbSection = document.getElementById('detail-mariadb-section');
+        const pgSection = document.getElementById('detail-postgresql-section');
+        const wsSection = document.getElementById('detail-wolfscale-section');
+        if (mdbSection) mdbSection.style.display = 'none';
+        if (pgSection) pgSection.style.display = 'none';
+        if (wsSection) wsSection.style.display = 'none';
+
         if (name === 'mariadb' && mdbSection) {
             mdbSection.style.display = '';
             if (configSection) configSection.style.display = 'none';
             populateMariaDBSettings(d.config || '', d.config_path || '');
+        } else if (name === 'postgresql' && pgSection) {
+            pgSection.style.display = '';
+            if (configSection) configSection.style.display = 'none';
+            populatePostgreSQLSettings(d.config || '', d.config_path || '');
+        } else if (name === 'wolfscale' && wsSection) {
+            wsSection.style.display = '';
+            if (configSection) configSection.style.display = 'none';
+            populateWolfScaleSettings(d.config || '');
         } else {
-            if (mdbSection) mdbSection.style.display = 'none';
-            // Standard config editor for non-MariaDB components
+            // Standard config editor for other components
             if (d.config_path && d.config !== null) {
                 configSection.style.display = '';
                 document.getElementById('detail-config-path').textContent = d.config_path;
@@ -7771,62 +7784,91 @@ function populateMariaDBSettings(configText, configPath) {
 
 function buildMariaDBConfig() {
     const g = id => document.getElementById(id)?.value || '';
-    let cfg = '[mysqld]\n';
-    cfg += `port = ${g('mdb-port')}\n`;
-    cfg += `bind-address = ${g('mdb-bind-address')}\n`;
-    cfg += `max_connections = ${g('mdb-max-connections')}\n`;
-    cfg += `datadir = ${g('mdb-datadir')}\n`;
-    cfg += `\n# Performance\n`;
-    cfg += `innodb_buffer_pool_size = ${g('mdb-innodb-buffer-pool')}\n`;
-    cfg += `innodb_log_file_size = ${g('mdb-innodb-log-file-size')}\n`;
-    cfg += `query_cache_size = ${g('mdb-query-cache-size')}\n`;
-    cfg += `max_allowed_packet = ${g('mdb-max-allowed-packet')}\n`;
-    cfg += `\n# Logging\n`;
+    // Start from the existing raw config to preserve unknown directives
+    let existing = document.getElementById('mdb-raw-config')?.value || '';
+
+    // Patch known keys into the existing config (or append if missing)
+    const patches = {
+        'port': g('mdb-port'),
+        'bind-address': g('mdb-bind-address'),
+        'max_connections': g('mdb-max-connections'),
+        'innodb_buffer_pool_size': g('mdb-innodb-buffer-pool'),
+        'innodb_log_file_size': g('mdb-innodb-log-file-size'),
+        'query_cache_size': g('mdb-query-cache-size'),
+        'max_allowed_packet': g('mdb-max-allowed-packet'),
+    };
     if (g('mdb-slow-query-log') === '1') {
-        cfg += `slow_query_log = 1\n`;
-        cfg += `long_query_time = ${g('mdb-long-query-time')}\n`;
+        patches['slow_query_log'] = '1';
+        patches['long_query_time'] = g('mdb-long-query-time');
     }
     if (g('mdb-log-bin')) {
-        cfg += `log_bin = ${g('mdb-log-bin')}\n`;
-        cfg += `binlog_format = ${g('mdb-binlog-format')}\n`;
+        patches['log_bin'] = g('mdb-log-bin');
+        patches['binlog_format'] = g('mdb-binlog-format');
+    }
+    if (g('mdb-galera-enabled') === '1') {
+        patches['wsrep_on'] = 'ON';
+        patches['wsrep_provider'] = g('mdb-galera-provider');
+        patches['wsrep_cluster_name'] = g('mdb-galera-cluster-name');
+        patches['wsrep_cluster_address'] = g('mdb-galera-cluster-address');
+        patches['wsrep_node_address'] = g('mdb-galera-node-address');
+        patches['wsrep_node_name'] = g('mdb-galera-node-name');
+        patches['wsrep_sst_method'] = g('mdb-galera-sst-method');
+        patches['default_storage_engine'] = 'InnoDB';
+        patches['innodb_autoinc_lock_mode'] = '2';
+        patches['binlog_format'] = 'ROW';
     }
 
-    // Galera
-    if (g('mdb-galera-enabled') === '1') {
-        cfg += `\n# Galera Cluster\n`;
-        cfg += `wsrep_on = ON\n`;
-        cfg += `wsrep_provider = ${g('mdb-galera-provider')}\n`;
-        cfg += `wsrep_cluster_name = ${g('mdb-galera-cluster-name')}\n`;
-        cfg += `wsrep_cluster_address = ${g('mdb-galera-cluster-address')}\n`;
-        cfg += `wsrep_node_address = ${g('mdb-galera-node-address')}\n`;
-        cfg += `wsrep_node_name = ${g('mdb-galera-node-name')}\n`;
-        cfg += `wsrep_sst_method = ${g('mdb-galera-sst-method')}\n`;
-        cfg += `binlog_format = ROW\n`;
-        cfg += `default_storage_engine = InnoDB\n`;
-        cfg += `innodb_autoinc_lock_mode = 2\n`;
+    return patchIniConfig(existing, patches, '[mysqld]');
+}
+
+// Patch an INI-style config: update existing keys in-place, append missing ones
+function patchIniConfig(existing, patches, section) {
+    const applied = new Set();
+    const lines = existing.split('\n').map(line => {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('[')) return line;
+        const eq = trimmed.indexOf('=');
+        if (eq === -1) return line;
+        const key = trimmed.substring(0, eq).trim();
+        const normKey = key.replace(/-/g, '_');
+        for (const [pk, pv] of Object.entries(patches)) {
+            if (pk.replace(/-/g, '_') === normKey) {
+                applied.add(pk);
+                return `${key} = ${pv}`;
+            }
+        }
+        return line;
+    });
+
+    // Append any patches that weren't found in the existing config
+    const missing = Object.entries(patches).filter(([k]) => !applied.has(k));
+    if (missing.length > 0) {
+        if (!lines.some(l => l.trim() === section)) lines.unshift(section);
+        lines.push('');
+        for (const [k, v] of missing) lines.push(`${k} = ${v}`);
     }
-    return cfg;
+    return lines.join('\n');
 }
 
 async function saveMariaDBSettings() {
     const config = buildMariaDBConfig();
     try {
         const resp = await fetch(apiUrl(`/api/components/mariadb/config`), {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ content: config }),
         });
         const data = await resp.json();
         if (!resp.ok) { showToast(data.error || 'Save failed', 'error'); return; }
-        // Also update raw editor
         document.getElementById('mdb-raw-config').value = config;
-        // Restart MariaDB
-        await fetch(apiUrl('/api/services/mariadb/action'), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+        const rr = await fetch(apiUrl('/api/services/mariadb/action'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action: 'restart' }),
         });
-        showToast('MariaDB settings saved and service restarted', 'success');
+        if (rr.ok) {
+            showToast('MariaDB settings saved and service restarted', 'success');
+        } else {
+            showToast('Config saved but restart failed — check logs', 'error');
+        }
         refreshComponentDetail('mariadb');
     } catch (e) { showToast('Failed: ' + e.message, 'error'); }
 }
@@ -7837,6 +7879,224 @@ async function saveMariaDBRawConfig() {
         const resp = await fetch(apiUrl(`/api/components/mariadb/config`), {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Save failed', 'error'); return; }
+        showToast(data.message || 'Config saved', 'success');
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+}
+
+// ─── PostgreSQL Structured Settings ───
+
+function populatePostgreSQLSettings(configText, configPath) {
+    document.getElementById('pg-config-path').textContent = configPath;
+    document.getElementById('pg-raw-config').value = configText;
+
+    const vals = {};
+    for (const line of configText.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        const eq = trimmed.indexOf('=');
+        if (eq === -1) continue;
+        const key = trimmed.substring(0, eq).trim();
+        let val = trimmed.substring(eq + 1).trim();
+        // Strip inline comments and quotes
+        const commentIdx = val.indexOf('#');
+        if (commentIdx > 0) val = val.substring(0, commentIdx).trim();
+        val = val.replace(/^'(.*)'$/, '$1');
+        vals[key] = val;
+    }
+
+    const set = (id, key, def) => { const el = document.getElementById(id); if (el) el.value = vals[key] ?? def; };
+    set('pg-port', 'port', '5432');
+    set('pg-listen-addresses', 'listen_addresses', 'localhost');
+    set('pg-max-connections', 'max_connections', '100');
+    set('pg-data-directory', 'data_directory', '');
+    set('pg-shared-buffers', 'shared_buffers', '128MB');
+    set('pg-work-mem', 'work_mem', '4MB');
+    set('pg-maintenance-work-mem', 'maintenance_work_mem', '64MB');
+    set('pg-effective-cache-size', 'effective_cache_size', '4GB');
+    set('pg-wal-level', 'wal_level', 'replica');
+    set('pg-max-wal-size', 'max_wal_size', '1GB');
+    set('pg-checkpoint-completion-target', 'checkpoint_completion_target', '0.9');
+    set('pg-log-min-duration', 'log_min_duration_statement', '-1');
+    set('pg-log-statement', 'log_statement', 'none');
+    set('pg-max-wal-senders', 'max_wal_senders', '10');
+    set('pg-max-replication-slots', 'max_replication_slots', '10');
+    set('pg-hot-standby', 'hot_standby', 'on');
+}
+
+function buildPostgreSQLConfig() {
+    const g = id => document.getElementById(id)?.value || '';
+    let existing = document.getElementById('pg-raw-config')?.value || '';
+
+    const patches = {
+        'listen_addresses': `'${g('pg-listen-addresses')}'`,
+        'port': g('pg-port'),
+        'max_connections': g('pg-max-connections'),
+        'shared_buffers': g('pg-shared-buffers'),
+        'work_mem': g('pg-work-mem'),
+        'maintenance_work_mem': g('pg-maintenance-work-mem'),
+        'effective_cache_size': g('pg-effective-cache-size'),
+        'wal_level': g('pg-wal-level'),
+        'max_wal_size': g('pg-max-wal-size'),
+        'checkpoint_completion_target': g('pg-checkpoint-completion-target'),
+        'log_min_duration_statement': g('pg-log-min-duration'),
+        'log_statement': `'${g('pg-log-statement')}'`,
+        'max_wal_senders': g('pg-max-wal-senders'),
+        'max_replication_slots': g('pg-max-replication-slots'),
+        'hot_standby': g('pg-hot-standby'),
+    };
+
+    // PostgreSQL uses key = value (no sections), so patch with a blank section marker
+    return patchPgConfig(existing, patches);
+}
+
+function patchPgConfig(existing, patches) {
+    const applied = new Set();
+    const lines = existing.split('\n').map(line => {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) return line;
+        const eq = trimmed.indexOf('=');
+        if (eq === -1) return line;
+        const key = trimmed.substring(0, eq).trim();
+        if (patches.hasOwnProperty(key)) {
+            applied.add(key);
+            return `${key} = ${patches[key]}`;
+        }
+        return line;
+    });
+
+    const missing = Object.entries(patches).filter(([k]) => !applied.has(k));
+    if (missing.length > 0) {
+        lines.push('');
+        lines.push('# Added by WolfStack');
+        for (const [k, v] of missing) lines.push(`${k} = ${v}`);
+    }
+    return lines.join('\n');
+}
+
+async function savePostgreSQLSettings() {
+    const config = buildPostgreSQLConfig();
+    try {
+        const resp = await fetch(apiUrl('/api/components/postgresql/config'), {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: config }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Save failed', 'error'); return; }
+        document.getElementById('pg-raw-config').value = config;
+        const rr = await fetch(apiUrl('/api/services/postgresql/action'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'restart' }),
+        });
+        if (rr.ok) {
+            showToast('PostgreSQL settings saved and service restarted', 'success');
+        } else {
+            showToast('Config saved but restart failed — check logs', 'error');
+        }
+        refreshComponentDetail('postgresql');
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+}
+
+async function savePostgreSQLRawConfig() {
+    const content = document.getElementById('pg-raw-config').value;
+    try {
+        const resp = await fetch(apiUrl('/api/components/postgresql/config'), {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Save failed', 'error'); return; }
+        showToast(data.message || 'Config saved', 'success');
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+}
+
+// ─── WolfScale Cluster Structured Settings ───
+
+function populateWolfScaleSettings(configText) {
+    document.getElementById('ws-raw-config').value = configText;
+
+    // TOML parser (simple key = "value" or key = value)
+    const vals = {};
+    let section = '';
+    for (const line of configText.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        if (trimmed.startsWith('[')) { section = trimmed.replace(/[\[\]]/g, ''); continue; }
+        const eq = trimmed.indexOf('=');
+        if (eq === -1) continue;
+        const key = (section ? section + '.' : '') + trimmed.substring(0, eq).trim();
+        let val = trimmed.substring(eq + 1).trim();
+        val = val.replace(/^"(.*)"$/, '$1');
+        vals[key] = val;
+    }
+
+    const set = (id, key, def) => { const el = document.getElementById(id); if (el) el.value = vals[key] ?? def; };
+    set('ws-cluster-name', 'cluster.name', '');
+    set('ws-node-role', 'cluster.role', 'primary');
+    set('ws-listen-port', 'server.port', '3306');
+    set('ws-bind-address', 'server.bind', '0.0.0.0');
+    set('ws-cluster-nodes', 'cluster.nodes', '');
+    set('ws-replication-mode', 'replication.mode', 'binlog');
+    set('ws-sync-mode', 'replication.sync', 'async');
+    set('ws-auto-failover', 'replication.auto_failover', 'true');
+    set('ws-lb-port', 'loadbalancer.port', '3307');
+    set('ws-lb-strategy', 'loadbalancer.strategy', 'round_robin');
+    set('ws-health-interval', 'loadbalancer.health_check_interval', '5');
+    set('ws-max-conn-per-node', 'loadbalancer.max_connections_per_node', '100');
+}
+
+function buildWolfScaleConfig() {
+    const g = id => document.getElementById(id)?.value || '';
+    let cfg = `[server]\n`;
+    cfg += `port = ${g('ws-listen-port')}\n`;
+    cfg += `bind = "${g('ws-bind-address')}"\n`;
+    cfg += `\n[cluster]\n`;
+    cfg += `name = "${g('ws-cluster-name')}"\n`;
+    cfg += `role = "${g('ws-node-role')}"\n`;
+    cfg += `nodes = "${g('ws-cluster-nodes')}"\n`;
+    cfg += `\n[replication]\n`;
+    cfg += `mode = "${g('ws-replication-mode')}"\n`;
+    cfg += `sync = "${g('ws-sync-mode')}"\n`;
+    cfg += `auto_failover = ${g('ws-auto-failover')}\n`;
+    cfg += `\n[loadbalancer]\n`;
+    cfg += `port = ${g('ws-lb-port')}\n`;
+    cfg += `strategy = "${g('ws-lb-strategy')}"\n`;
+    cfg += `health_check_interval = ${g('ws-health-interval')}\n`;
+    cfg += `max_connections_per_node = ${g('ws-max-conn-per-node')}\n`;
+    return cfg;
+}
+
+async function saveWolfScaleSettings() {
+    const config = buildWolfScaleConfig();
+    try {
+        const resp = await fetch(apiUrl('/api/components/wolfscale/config'), {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: config }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Save failed', 'error'); return; }
+        document.getElementById('ws-raw-config').value = config;
+        const rr = await fetch(apiUrl('/api/services/wolfscale/action'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'restart' }),
+        });
+        if (rr.ok) {
+            showToast('WolfScale settings saved and service restarted', 'success');
+        } else {
+            showToast('Config saved but restart failed — check logs', 'error');
+        }
+        refreshComponentDetail('wolfscale');
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+}
+
+async function saveWolfScaleRawConfig() {
+    const content = document.getElementById('ws-raw-config').value;
+    try {
+        const resp = await fetch(apiUrl('/api/components/wolfscale/config'), {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ content }),
         });
         const data = await resp.json();

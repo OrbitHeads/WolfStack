@@ -2036,6 +2036,228 @@
                 </div>
             </div>
 
+            <!-- PostgreSQL Settings (shown only for postgresql component) -->
+            <div class="card" style="margin-bottom: 20px; display:none;" id="detail-postgresql-section">
+                <div class="card-header">
+                    <h3>PostgreSQL Settings</h3>
+                    <div style="display:flex;gap:8px;align-items:center;">
+                        <button class="btn btn-sm" onclick="selectView('mysql')">🔌 Database Manager</button>
+                        <button class="btn btn-primary btn-sm" onclick="savePostgreSQLSettings()">💾 Apply &amp; Restart</button>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <h4 style="font-size:14px;font-weight:600;margin:0 0 12px;">Connection</h4>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:20px;">
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Port</label>
+                            <input type="number" id="pg-port" class="form-control" value="5432" style="font-size:13px;">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Listen Addresses</label>
+                            <input type="text" id="pg-listen-addresses" class="form-control" value="localhost" placeholder="localhost, *, 0.0.0.0" style="font-size:13px;">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Max Connections</label>
+                            <input type="number" id="pg-max-connections" class="form-control" value="100" style="font-size:13px;">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Data Directory</label>
+                            <input type="text" id="pg-data-directory" class="form-control" value="/var/lib/postgresql/16/main" style="font-size:13px;" readonly>
+                        </div>
+                    </div>
+
+                    <h4 style="font-size:14px;font-weight:600;margin:0 0 12px;">Memory</h4>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:20px;">
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Shared Buffers</label>
+                            <input type="text" id="pg-shared-buffers" class="form-control" value="128MB" placeholder="128MB, 1GB" style="font-size:13px;">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Work Mem</label>
+                            <input type="text" id="pg-work-mem" class="form-control" value="4MB" placeholder="4MB" style="font-size:13px;">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Maintenance Work Mem</label>
+                            <input type="text" id="pg-maintenance-work-mem" class="form-control" value="64MB" placeholder="64MB" style="font-size:13px;">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Effective Cache Size</label>
+                            <input type="text" id="pg-effective-cache-size" class="form-control" value="4GB" placeholder="4GB" style="font-size:13px;">
+                        </div>
+                    </div>
+
+                    <h4 style="font-size:14px;font-weight:600;margin:0 0 12px;">WAL &amp; Checkpoints</h4>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:20px;">
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">WAL Level</label>
+                            <select id="pg-wal-level" class="form-control" style="font-size:13px;">
+                                <option value="replica">replica</option>
+                                <option value="minimal">minimal</option>
+                                <option value="logical">logical</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Max WAL Size</label>
+                            <input type="text" id="pg-max-wal-size" class="form-control" value="1GB" style="font-size:13px;">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Checkpoint Completion Target</label>
+                            <input type="text" id="pg-checkpoint-completion-target" class="form-control" value="0.9" style="font-size:13px;">
+                        </div>
+                    </div>
+
+                    <h4 style="font-size:14px;font-weight:600;margin:0 0 12px;">Logging</h4>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:20px;">
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Log Min Duration (ms)</label>
+                            <input type="number" id="pg-log-min-duration" class="form-control" value="-1" placeholder="-1 (disabled)" style="font-size:13px;">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Log Statement</label>
+                            <select id="pg-log-statement" class="form-control" style="font-size:13px;">
+                                <option value="none">none</option>
+                                <option value="ddl">ddl</option>
+                                <option value="mod">mod</option>
+                                <option value="all">all</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Replication -->
+                    <details style="margin-bottom:16px;">
+                        <summary style="font-size:14px;font-weight:600;cursor:pointer;color:var(--text-primary);user-select:none;">Streaming Replication</summary>
+                        <div style="margin-top:12px;padding:16px;background:var(--bg-tertiary);border-radius:8px;">
+                            <p style="font-size:12px;color:var(--text-muted);margin:0 0 12px;">Configure streaming replication for high availability. Set WAL level to 'replica' or 'logical' first.</p>
+                            <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;">
+                                <div>
+                                    <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Max WAL Senders</label>
+                                    <input type="number" id="pg-max-wal-senders" class="form-control" value="10" style="font-size:13px;">
+                                </div>
+                                <div>
+                                    <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Max Replication Slots</label>
+                                    <input type="number" id="pg-max-replication-slots" class="form-control" value="10" style="font-size:13px;">
+                                </div>
+                                <div>
+                                    <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Hot Standby</label>
+                                    <select id="pg-hot-standby" class="form-control" style="font-size:13px;">
+                                        <option value="on">on</option>
+                                        <option value="off">off</option>
+                                    </select>
+                                </div>
+                            </div>
+                        </div>
+                    </details>
+
+                    <details>
+                        <summary style="font-size:13px;font-weight:600;cursor:pointer;color:var(--text-muted);user-select:none;">Advanced — Raw Configuration</summary>
+                        <div style="margin-top:10px;">
+                            <span id="pg-config-path" style="font-size:11px;color:var(--text-muted);font-family:monospace;"></span>
+                            <textarea id="pg-raw-config" class="config-editor" spellcheck="false" style="margin-top:6px;min-height:200px;"></textarea>
+                            <button class="btn btn-primary btn-sm" style="margin-top:8px;" onclick="savePostgreSQLRawConfig()">💾 Save Raw Config</button>
+                        </div>
+                    </details>
+                </div>
+            </div>
+
+            <!-- WolfScale Settings (shown only for wolfscale component) -->
+            <div class="card" style="margin-bottom: 20px; display:none;" id="detail-wolfscale-section">
+                <div class="card-header">
+                    <h3>WolfScale Cluster Settings</h3>
+                    <div style="display:flex;gap:8px;align-items:center;">
+                        <button class="btn btn-sm" onclick="selectView('mysql')">🔌 Database Manager</button>
+                        <button class="btn btn-primary btn-sm" onclick="saveWolfScaleSettings()">💾 Apply &amp; Restart</button>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <h4 style="font-size:14px;font-weight:600;margin:0 0 12px;">Cluster</h4>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:20px;">
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Cluster Name</label>
+                            <input type="text" id="ws-cluster-name" class="form-control" placeholder="my-cluster" style="font-size:13px;">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Node Role</label>
+                            <select id="ws-node-role" class="form-control" style="font-size:13px;">
+                                <option value="primary">Primary (read/write)</option>
+                                <option value="replica">Replica (read-only)</option>
+                                <option value="arbiter">Arbiter (voting only)</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Listen Port</label>
+                            <input type="number" id="ws-listen-port" class="form-control" value="3306" style="font-size:13px;">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Bind Address</label>
+                            <input type="text" id="ws-bind-address" class="form-control" value="0.0.0.0" style="font-size:13px;">
+                        </div>
+                    </div>
+
+                    <h4 style="font-size:14px;font-weight:600;margin:0 0 12px;">Replication</h4>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:20px;">
+                        <div style="grid-column:1/-1;">
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Cluster Nodes (comma-separated)</label>
+                            <input type="text" id="ws-cluster-nodes" class="form-control" placeholder="10.0.0.1:3306,10.0.0.2:3306,10.0.0.3:3306" style="font-size:13px;">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Replication Mode</label>
+                            <select id="ws-replication-mode" class="form-control" style="font-size:13px;">
+                                <option value="binlog">Binary Log</option>
+                                <option value="gtid">GTID</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Sync Mode</label>
+                            <select id="ws-sync-mode" class="form-control" style="font-size:13px;">
+                                <option value="async">Asynchronous</option>
+                                <option value="semi-sync">Semi-Synchronous</option>
+                                <option value="sync">Synchronous</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Auto-Failover</label>
+                            <select id="ws-auto-failover" class="form-control" style="font-size:13px;">
+                                <option value="true">Enabled</option>
+                                <option value="false">Disabled</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <h4 style="font-size:14px;font-weight:600;margin:0 0 12px;">Load Balancer</h4>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:20px;">
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">LB Port</label>
+                            <input type="number" id="ws-lb-port" class="form-control" value="3307" style="font-size:13px;">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Strategy</label>
+                            <select id="ws-lb-strategy" class="form-control" style="font-size:13px;">
+                                <option value="round_robin">Round Robin</option>
+                                <option value="least_connections">Least Connections</option>
+                                <option value="read_write_split">Read/Write Split</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Health Check Interval (sec)</label>
+                            <input type="number" id="ws-health-interval" class="form-control" value="5" style="font-size:13px;">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:3px;color:var(--text-secondary);">Max Connections per Node</label>
+                            <input type="number" id="ws-max-conn-per-node" class="form-control" value="100" style="font-size:13px;">
+                        </div>
+                    </div>
+
+                    <details>
+                        <summary style="font-size:13px;font-weight:600;cursor:pointer;color:var(--text-muted);user-select:none;">Advanced — Raw Configuration (TOML)</summary>
+                        <div style="margin-top:10px;">
+                            <span style="font-size:11px;color:var(--text-muted);font-family:monospace;">/etc/wolfscale/config.toml</span>
+                            <textarea id="ws-raw-config" class="config-editor" spellcheck="false" style="margin-top:6px;min-height:200px;"></textarea>
+                            <button class="btn btn-primary btn-sm" style="margin-top:8px;" onclick="saveWolfScaleRawConfig()">💾 Save Raw Config</button>
+                        </div>
+                    </details>
+                </div>
+            </div>
+
             <!-- Config Editor -->
             <div class="card" style="margin-bottom: 20px;" id="detail-config-section">
                 <div class="card-header">
