@@ -22030,15 +22030,39 @@ async function saveFileLocations() {
 
 // ─── Sponsor Header Badge ───
 
-// Update the header sponsor badge with the user's tier
+// Update the header sponsor badge with the user's tier or enterprise license
 async function loadSponsorHeaderBadge() {
+    var linkEl = document.getElementById('sponsor-header-link');
+    var textEl = document.getElementById('sponsor-header-text');
+    var badgeEl = document.getElementById('sponsor-header-badge');
+    if (!badgeEl) return;
+
+    // Check enterprise license first — takes priority over sponsor tier
+    try {
+        var licResp = await fetch(apiUrl('/api/license'));
+        if (licResp.ok) {
+            var lic = await licResp.json();
+            if (lic.valid) {
+                badgeEl.style.background = 'linear-gradient(135deg, #dc2626, #ef4444)';
+                badgeEl.textContent = 'Enterprise';
+                if (textEl) textEl.textContent = lic.customer || 'Enterprise License';
+                if (linkEl) {
+                    linkEl.style.background = 'linear-gradient(135deg, rgba(220,38,38,0.12), rgba(239,68,68,0.08))';
+                    linkEl.style.borderColor = 'rgba(220,38,38,0.25)';
+                    linkEl.removeAttribute('href');
+                    linkEl.removeAttribute('target');
+                    linkEl.style.cursor = 'default';
+                }
+                return; // Skip sponsor check
+            }
+        }
+    } catch (e) { /* continue to sponsor check */ }
+
+    // Sponsor tier
     try {
         var resp = await fetch('/api/patreon/status');
         if (!resp.ok) return;
         var data = await resp.json();
-        var textEl = document.getElementById('sponsor-header-text');
-        var badgeEl = document.getElementById('sponsor-header-badge');
-        if (!badgeEl) return;
         if (data.linked && data.tier && data.tier !== 'none' && data.tier !== 'free') {
             var tierNames = { free: 'Free', basic: 'Basic', advanced: 'Advanced', platinum: 'Platinum', enterprise: 'Enterprise' };
             var tierColors = {
