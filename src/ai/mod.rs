@@ -407,6 +407,8 @@ impl AiAgent {
              If there are issues, list them concisely with severity (INFO/WARNING/CRITICAL).\n\
              IMPORTANT: Ignore /boot, /boot/efi, and /etc/pve partition usage — these are managed automatically \
              by the OS or Proxmox. Only flag them if over 99% full.\n\
+             When CPU or memory is high, the top processes are included — identify WHICH process is causing the issue \
+             by name (e.g. 'mysqld using 85% CPU', 'java consuming 4.2GB RAM'). Don't just say 'CPU is high' — say what's using it.\n\
              For Kubernetes clusters: flag unhealthy/NotReady nodes, failed or pending pods, pods with high restart counts \
              (10+), and any cluster that reports as UNHEALTHY. Include the cluster name and affected pod/node names.\n\n\
              Current server metrics:\n{}",
@@ -1155,6 +1157,29 @@ pub fn send_html_email(config: &AiConfig, subject: &str, html_body: &str) -> Res
 
 // ─── Metrics Summary Builder ───
 
+/// Get the top processes by CPU and memory usage (for AI analysis)
+fn get_top_processes() -> Option<String> {
+    // ps aux sorted by CPU, top 10 (skip header)
+    let output = std::process::Command::new("ps")
+        .args(["aux", "--sort=-pcpu"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() { return None; }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() { return None; }
+
+    let header = lines.remove(0);
+    // Take top 10 processes, format as a compact table
+    let mut result = format!("  {}\n", header);
+    for line in lines.iter().take(10) {
+        result.push_str(&format!("  {}\n", line));
+    }
+    Some(result)
+}
+
 pub fn build_metrics_summary(
     hostname: &str,
     cpu_percent: f32,
@@ -1195,6 +1220,14 @@ pub fn build_metrics_summary(
         vm_count,
         uptime_days, uptime_hours % 24,
     );
+
+    // When CPU or memory is elevated, include top processes so the AI can identify the cause
+    if cpu_percent > 50.0 || mem_percent > 75 {
+        if let Some(top_procs) = get_top_processes() {
+            summary.push_str("\n\nTop Processes (by CPU):\n");
+            summary.push_str(&top_procs);
+        }
+    }
 
     // Append per-guest CPU stats if available (from Proxmox nodes)
     if let Some(stats) = guest_cpu_stats {
