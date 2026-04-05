@@ -14671,6 +14671,50 @@ pub async fn platform_status(req: HttpRequest, state: web::Data<AppState>) -> Ht
     HttpResponse::Ok().json(crate::compat::runtime_status())
 }
 
+#[derive(Deserialize)]
+pub struct ApplyManifestRequest {
+    pub key: String,
+}
+
+/// POST /api/platform/apply
+pub async fn platform_apply(req: HttpRequest, state: web::Data<AppState>, body: web::Json<ApplyManifestRequest>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    let key = body.key.trim();
+    if key.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Key data is required" }));
+    }
+
+    // Validate it's valid JSON with the expected structure
+    if serde_json::from_str::<serde_json::Value>(key).is_err() {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Invalid key format" }));
+    }
+
+    // Write to the manifest file
+    let path = crate::compat::dm_path();
+    let _ = std::fs::create_dir_all("/etc/wolfstack");
+    if let Err(e) = std::fs::write(&path, key) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("Failed to save: {}", e)
+        }));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    // Schedule a restart
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let _ = std::process::Command::new("systemctl").args(["restart", "wolfstack"]).spawn();
+    });
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "message": "Key applied. WolfStack will restart in a moment."
+    }))
+}
+
 /// GET /api/tokens
 pub async fn list_tokens(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
@@ -15226,6 +15270,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // Secrets Manager
         // Platform calibration & access tokens
         .route("/api/platform/status", web::get().to(platform_status))
+        .route("/api/platform/apply", web::post().to(platform_apply))
         .route("/api/tokens", web::get().to(list_tokens))
         .route("/api/tokens", web::post().to(create_token))
         .route("/api/tokens/scopes", web::get().to(list_token_scopes))

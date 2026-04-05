@@ -21132,18 +21132,54 @@ async function loadApiKeysTab() {
             loadApiScopes();
             loadApiAuditLog();
         } else {
-            banner.innerHTML = `<div style="text-align:center;padding:40px 20px;">
-                <div style="font-size:48px;margin-bottom:12px;">🔑</div>
-                <h3 style="margin:0 0 8px 0;font-size:18px;">Enterprise Feature</h3>
-                <p style="color:var(--text-muted);font-size:13px;max-width:400px;margin:0 auto 16px;">
-                    API key management lets you create scoped keys for programmatic access to WolfStack.
-                    Available with an Enterprise license.
-                </p>
-                <a href="https://wolf.uk.com/enterprise" target="_blank" class="btn btn-primary">Learn More</a>
+            banner.innerHTML = `<div style="max-width:600px;">
+                <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;">
+                    <span style="font-size:28px;">🔑</span>
+                    <div>
+                        <h3 style="margin:0;font-size:17px;font-weight:700;">Enterprise License</h3>
+                        <p style="margin:2px 0 0;font-size:12px;color:var(--text-muted);">Paste your enterprise key below to unlock API key management and scoped access tokens.</p>
+                    </div>
+                </div>
+                <textarea id="enterprise-key-input" class="form-control" rows="6" placeholder="Paste your enterprise key here..." style="width:100%;font-family:monospace;font-size:12px;resize:vertical;margin-bottom:12px;"></textarea>
+                <div style="display:flex;gap:10px;align-items:center;">
+                    <button class="btn btn-primary" onclick="applyEnterpriseKey()">Apply Key</button>
+                    <span id="enterprise-key-status" style="font-size:12px;"></span>
+                    <a href="https://wolfstack.org/enterprise.php" target="_blank" style="margin-left:auto;font-size:12px;color:var(--accent);">Learn about Enterprise</a>
+                </div>
             </div>`;
             content.style.display = 'none';
         }
     } catch (e) { console.error('Failed to load license status:', e); }
+}
+
+async function applyEnterpriseKey() {
+    const input = document.getElementById('enterprise-key-input');
+    const status = document.getElementById('enterprise-key-status');
+    if (!input || !input.value.trim()) { showToast('Please paste your enterprise key', 'error'); return; }
+
+    status.textContent = 'Applying...';
+    status.style.color = 'var(--text-muted)';
+
+    try {
+        const resp = await fetch(apiUrl('/api/platform/apply'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key: input.value.trim() }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+            status.textContent = data.error || 'Failed to apply key';
+            status.style.color = 'var(--danger)';
+            showToast(data.error || 'Invalid key', 'error');
+            return;
+        }
+        status.textContent = 'Key applied — restarting WolfStack...';
+        status.style.color = 'var(--success)';
+        showToast('Enterprise key applied. WolfStack is restarting...', 'success');
+    } catch (e) {
+        status.textContent = 'Failed: ' + e.message;
+        status.style.color = 'var(--danger)';
+    }
 }
 
 async function loadApiKeys() {
