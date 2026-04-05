@@ -21081,6 +21081,11 @@ function applyTheme(themeId) {
     // Save preference
     localStorage.setItem('wolfstack-theme', themeId);
 
+    // Swap logo for light/dark backgrounds
+    const lightThemes = ['light', 'arctic'];
+    const logoSrc = lightThemes.includes(themeId) ? 'images/wolfstack-logo-dark.png' : 'images/wolfstack-logo.png';
+    document.querySelectorAll('img[alt="WolfStack"]').forEach(img => { img.src = logoSrc; });
+
     // Update theme picker cards (highlight active)
     document.querySelectorAll('.theme-card').forEach(card => {
         card.classList.toggle('active', card.getAttribute('data-theme-id') === themeId);
