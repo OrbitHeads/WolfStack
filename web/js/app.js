@@ -21633,7 +21633,7 @@ function addPluginNavItem(manifest) {
     if (!menu) return;
     const viewId = `plugin-${menu.view}`;
     // Skip if already added
-    if (document.querySelector(`[data-view="${viewId}"]`)) return;
+    if (document.querySelector(`[data-page="${viewId}"]`)) return;
 
     // Create the page container for this plugin
     if (!document.getElementById(`page-${viewId}`)) {
@@ -21645,16 +21645,18 @@ function addPluginNavItem(manifest) {
         document.querySelector('.main-content')?.appendChild(page);
     }
 
-    // Add to datacenter nav
+    // Add to the datacenter icon row (first .nav-section in .sidebar-nav)
     if (menu.section === 'datacenter') {
-        const navSection = document.querySelector('.nav-section:last-of-type .nav-items') || document.querySelector('.nav-items');
-        if (navSection) {
+        const iconRow = document.querySelector('.sidebar-nav > .nav-section');
+        if (iconRow) {
             const item = document.createElement('a');
             item.className = 'nav-item';
-            item.dataset.view = viewId;
+            item.dataset.page = viewId;
+            item.title = menu.label;
             item.onclick = () => selectView(viewId);
-            item.innerHTML = `<span class="nav-icon">${manifest.icon || '🔌'}</span>${escapeHtml(menu.label)}`;
-            navSection.appendChild(item);
+            item.style.cssText = 'display:flex;align-items:center;justify-content:center;width:40px;height:40px;padding:0;border-radius:10px;';
+            item.innerHTML = `<span class="icon" style="margin:0;font-size:20px;">${manifest.icon || '🔌'}</span>`;
+            iconRow.appendChild(item);
         }
     }
 }
