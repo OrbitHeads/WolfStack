@@ -175,6 +175,7 @@ impl WolfNoteClient {
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
+                .use_rustls_tls()
                 .build()
                 .unwrap_or_default(),
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -186,6 +187,7 @@ impl WolfNoteClient {
     pub async fn login(base_url: &str, username: &str, password: &str, company: &str) -> Result<WolfNoteLoginResponse, String> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
+            .use_rustls_tls()
             .build()
             .map_err(|e| e.to_string())?;
 
