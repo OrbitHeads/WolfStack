@@ -94,7 +94,7 @@
 
         // Create terminal
         const term = new Terminal({
-            cursorBlink: true,
+            cursorBlink: false,
             fontSize: 15,
             fontFamily: '"JetBrains Mono", "Fira Code", "Cascadia Code", "Courier New", monospace',
             theme: {
@@ -103,7 +103,7 @@
                 cursor: '#10b981',
                 selectionBackground: 'rgba(16, 185, 129, 0.3)'
             },
-            scrollback: 5000
+            scrollback: 1000
         });
         window._term = term; // expose for VR access
 
@@ -112,6 +112,22 @@
         term.open(document.getElementById('terminal-container'));
 
         let ws = null;
+        // Batch incoming data and render once per animation frame
+        // to avoid hammering the canvas on low-spec machines
+        let pendingWrites = [];
+        let writeScheduled = false;
+        function scheduleWrite(data) {
+            pendingWrites.push(data);
+            if (!writeScheduled) {
+                writeScheduled = true;
+                requestAnimationFrame(() => {
+                    const batch = pendingWrites.join('');
+                    pendingWrites = [];
+                    writeScheduled = false;
+                    term.write(batch);
+                });
+            }
+        }
 
         function doFit() {
             try {
@@ -160,9 +176,9 @@
 
             ws.onmessage = (event) => {
                 if (typeof event.data === 'string') {
-                    term.write(event.data);
+                    scheduleWrite(event.data);
                 } else {
-                    term.write(new Uint8Array(event.data));
+                    scheduleWrite(new TextDecoder().decode(new Uint8Array(event.data)));
                 }
             };
 
