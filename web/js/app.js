@@ -21501,10 +21501,168 @@ function switchSettingsTab(tabName) {
         loadUsers();
     } else if (tabName === 'wolfnote') {
         loadWolfNoteConfig();
+    } else if (tabName === 'plugins') {
+        loadPlugins();
     } else if (tabName === 'apikeys') {
         loadApiKeysTab();
     }
 }
+
+// ─── Plugin System ───
+
+async function loadPlugins() {
+    const list = document.getElementById('plugins-list');
+    if (!list) return;
+    try {
+        const resp = await fetch(apiUrl('/api/plugins'));
+        if (!resp.ok) { list.innerHTML = '<div style="color:var(--text-muted);text-align:center;">Failed to load plugins</div>'; return; }
+        const plugins = await resp.json();
+        if (plugins.length === 0) {
+            list.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:20px;">No plugins installed</div>';
+            return;
+        }
+        list.innerHTML = plugins.map(p => {
+            const m = p.manifest;
+            const statusColors = { active: 'var(--success)', disabled: 'var(--text-muted)', error: 'var(--danger)', requires_license: 'var(--warning)', stopped: 'var(--text-muted)' };
+            const statusColor = statusColors[p.status] || 'var(--text-muted)';
+            return `<div style="display:flex;align-items:center;gap:14px;padding:14px 16px;background:var(--bg-tertiary);border-radius:10px;border:1px solid var(--border);">
+                <span style="font-size:28px;">${m.icon || '🔌'}</span>
+                <div style="flex:1;">
+                    <div style="font-weight:600;font-size:14px;">${escapeHtml(m.name)} <span style="font-size:11px;color:var(--text-muted);font-weight:400;">v${escapeHtml(m.version)}</span>
+                        ${m.enterprise_only ? '<span style="font-size:10px;background:rgba(220,38,38,0.15);color:#ef4444;padding:1px 6px;border-radius:3px;margin-left:6px;">Enterprise</span>' : ''}
+                    </div>
+                    <div style="font-size:12px;color:var(--text-muted);margin-top:2px;">${escapeHtml(m.description)}</div>
+                    <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">by ${escapeHtml(m.author || 'Unknown')}${m.has_backend ? ' &bull; Backend on port ' + (m.api_port || '?') : ''}${m.has_frontend ? ' &bull; Has UI' : ''}</div>
+                </div>
+                <div style="display:flex;align-items:center;gap:8px;">
+                    <span style="font-size:11px;color:${statusColor};font-weight:600;">${p.status}</span>
+                    ${p.status !== 'error' ? `<button class="btn btn-sm" onclick="togglePlugin('${escapeHtml(m.id)}', ${!m.enabled})" style="font-size:11px;">${m.enabled ? 'Disable' : 'Enable'}</button>` : ''}
+                    <button class="btn btn-sm" onclick="uninstallPlugin('${escapeHtml(m.id)}', '${escapeHtml(m.name)}')" style="font-size:11px;color:var(--danger);border-color:var(--danger);">Uninstall</button>
+                </div>
+            </div>`;
+        }).join('');
+    } catch (e) { list.innerHTML = '<div style="color:var(--danger);">Error: ' + escapeHtml(e.message) + '</div>'; }
+}
+
+function showInstallPluginModal() {
+    document.getElementById('plugin-install-url').value = '';
+    const modal = document.getElementById('plugin-install-modal');
+    modal.style.display = 'flex';
+    setTimeout(() => modal.classList.add('active'), 10);
+}
+
+async function installPlugin() {
+    const url = document.getElementById('plugin-install-url').value.trim();
+    if (!url) { showToast('Please enter a plugin URL', 'error'); return; }
+    document.getElementById('plugin-install-modal').style.display = 'none';
+    showToast('Installing plugin...', 'info');
+    try {
+        const resp = await fetch(apiUrl('/api/plugins/install'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Install failed', 'error'); return; }
+        showToast(data.message || 'Plugin installed', 'success');
+        loadPlugins();
+        loadPluginAssets(); // Load new plugin's frontend
+    } catch (e) { showToast('Install failed: ' + e.message, 'error'); }
+}
+
+async function uninstallPlugin(id, name) {
+    if (!confirm(`Uninstall plugin "${name}"? This will remove all plugin files.`)) return;
+    try {
+        const resp = await fetch(apiUrl(`/api/plugins/${id}`), { method: 'DELETE' });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Uninstall failed', 'error'); return; }
+        showToast(data.message || 'Plugin uninstalled', 'success');
+        loadPlugins();
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+}
+
+async function togglePlugin(id, enabled) {
+    try {
+        const resp = await fetch(apiUrl(`/api/plugins/${id}/toggle`), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Toggle failed', 'error'); return; }
+        showToast(data.message, 'success');
+        loadPlugins();
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+}
+
+// Load plugin frontend assets (JS/CSS) on page load
+async function loadPluginAssets() {
+    try {
+        const resp = await fetch(apiUrl('/api/plugins'));
+        if (!resp.ok) return;
+        const plugins = await resp.json();
+        for (const p of plugins) {
+            if (p.status !== 'active') continue;
+            const m = p.manifest;
+
+            // Load CSS
+            if (m.has_css && !document.getElementById(`plugin-css-${m.id}`)) {
+                const link = document.createElement('link');
+                link.id = `plugin-css-${m.id}`;
+                link.rel = 'stylesheet';
+                link.href = apiUrl(`/api/plugins/${m.id}/file/plugin.css`);
+                document.head.appendChild(link);
+            }
+
+            // Load JS
+            if (m.has_frontend && !document.getElementById(`plugin-js-${m.id}`)) {
+                const script = document.createElement('script');
+                script.id = `plugin-js-${m.id}`;
+                script.src = apiUrl(`/api/plugins/${m.id}/file/plugin.js`);
+                document.body.appendChild(script);
+            }
+
+            // Add nav menu item if the plugin defines one
+            if (m.menu && m.menu.view) {
+                addPluginNavItem(m);
+            }
+        }
+    } catch (e) { console.error('Failed to load plugin assets:', e); }
+}
+
+function addPluginNavItem(manifest) {
+    const menu = manifest.menu;
+    if (!menu) return;
+    const viewId = `plugin-${menu.view}`;
+    // Skip if already added
+    if (document.querySelector(`[data-view="${viewId}"]`)) return;
+
+    // Create the page container for this plugin
+    if (!document.getElementById(`page-${viewId}`)) {
+        const page = document.createElement('div');
+        page.id = `page-${viewId}`;
+        page.className = 'page-view';
+        page.style.display = 'none';
+        page.innerHTML = `<div id="${viewId}-content" style="padding:4px;">Loading plugin...</div>`;
+        document.querySelector('.main-content')?.appendChild(page);
+    }
+
+    // Add to datacenter nav
+    if (menu.section === 'datacenter') {
+        const navSection = document.querySelector('.nav-section:last-of-type .nav-items') || document.querySelector('.nav-items');
+        if (navSection) {
+            const item = document.createElement('a');
+            item.className = 'nav-item';
+            item.dataset.view = viewId;
+            item.onclick = () => selectView(viewId);
+            item.innerHTML = `<span class="nav-icon">${manifest.icon || '🔌'}</span>${escapeHtml(menu.label)}`;
+            navSection.appendChild(item);
+        }
+    }
+}
+
+// Load plugins on startup
+document.addEventListener('DOMContentLoaded', function() {
+    setTimeout(loadPluginAssets, 1000);
+});
 
 // ─── Enterprise API Keys ───
 

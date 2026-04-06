@@ -40,6 +40,7 @@ mod wolfflow;
 mod wolfnote;
 mod paths;
 mod compat;
+mod plugins;
 
 use actix_web::{web, App, HttpServer, HttpRequest, HttpResponse};
 use actix_files;

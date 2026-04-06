@@ -14666,6 +14666,112 @@ pub async fn wolfnote_notes_create(
     }
 }
 
+// ─── Plugin System ───
+
+/// GET /api/plugins — list all plugins
+pub async fn plugins_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    HttpResponse::Ok().json(crate::plugins::list())
+}
+
+/// POST /api/plugins/reload — rescan plugins directory
+pub async fn plugins_reload(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    crate::plugins::reload();
+    HttpResponse::Ok().json(serde_json::json!({ "message": "Plugins reloaded" }))
+}
+
+#[derive(Deserialize)]
+pub struct PluginInstallRequest {
+    pub url: String,
+}
+
+/// POST /api/plugins/install — install a plugin from URL
+pub async fn plugins_install(req: HttpRequest, state: web::Data<AppState>, body: web::Json<PluginInstallRequest>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match web::block(move || crate::plugins::install_from_url(&body.url)).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
+    }
+}
+
+/// DELETE /api/plugins/{id} — uninstall a plugin
+pub async fn plugins_uninstall(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    match crate::plugins::uninstall(&id) {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+        Err(e) => HttpResponse::NotFound().json(serde_json::json!({ "error": e })),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PluginToggleRequest {
+    pub enabled: bool,
+}
+
+/// POST /api/plugins/{id}/toggle — enable/disable a plugin
+pub async fn plugins_toggle(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<PluginToggleRequest>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    match crate::plugins::set_enabled(&id, body.enabled) {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+        Err(e) => HttpResponse::NotFound().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// GET /api/plugins/{id}/file/{path} — serve plugin web assets (JS/CSS)
+pub async fn plugins_file(req: HttpRequest, path: web::Path<(String, String)>) -> HttpResponse {
+    // No auth required for static assets (they're loaded by the browser)
+    let (plugin_id, file_path) = path.into_inner();
+
+    match crate::plugins::read_file(&plugin_id, &file_path) {
+        Some(data) => {
+            let content_type = if file_path.ends_with(".js") {
+                "application/javascript"
+            } else if file_path.ends_with(".css") {
+                "text/css"
+            } else if file_path.ends_with(".json") {
+                "application/json"
+            } else if file_path.ends_with(".svg") {
+                "image/svg+xml"
+            } else if file_path.ends_with(".png") {
+                "image/png"
+            } else {
+                "application/octet-stream"
+            };
+            HttpResponse::Ok()
+                .content_type(content_type)
+                .body(data)
+        }
+        None => HttpResponse::NotFound().finish(),
+    }
+}
+
+/// Proxy requests to plugin backends: /api/plugins/{id}/api/{path}
+pub async fn plugins_proxy(req: HttpRequest, state: web::Data<AppState>, path: web::Path<(String, String)>, body: web::Bytes) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let (plugin_id, sub_path) = path.into_inner();
+
+    let method = req.method().as_str();
+    let headers: Vec<(String, String)> = req.headers().iter()
+        .filter(|(k, _)| !["host", "connection", "content-length"].contains(&k.as_str()))
+        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+
+    let body_data = if body.is_empty() { None } else { Some(body.as_ref()) };
+
+    match crate::plugins::proxy_request(&plugin_id, method, &sub_path, body_data, &headers).await {
+        Ok((status, content_type, data)) => {
+            HttpResponse::build(actix_web::http::StatusCode::from_u16(status).unwrap_or(actix_web::http::StatusCode::OK))
+                .content_type(content_type)
+                .body(data)
+        }
+        Err(e) => HttpResponse::BadGateway().json(serde_json::json!({ "error": e })),
+    }
+}
+
 // ─── Access Token Management ───
 
 /// GET /api/platform/status
@@ -15271,6 +15377,17 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/compose/stacks/{name}/logs", web::get().to(compose_logs))
         .route("/api/compose/stacks/{name}/validate", web::post().to(compose_validate))
         // Secrets Manager
+        // Plugins
+        .route("/api/plugins", web::get().to(plugins_list))
+        .route("/api/plugins/reload", web::post().to(plugins_reload))
+        .route("/api/plugins/install", web::post().to(plugins_install))
+        .route("/api/plugins/{id}", web::delete().to(plugins_uninstall))
+        .route("/api/plugins/{id}/toggle", web::post().to(plugins_toggle))
+        .route("/api/plugins/{id}/file/{path:.*}", web::get().to(plugins_file))
+        .route("/api/plugins/{id}/api/{path:.*}", web::get().to(plugins_proxy))
+        .route("/api/plugins/{id}/api/{path:.*}", web::post().to(plugins_proxy))
+        .route("/api/plugins/{id}/api/{path:.*}", web::put().to(plugins_proxy))
+        .route("/api/plugins/{id}/api/{path:.*}", web::delete().to(plugins_proxy))
         // Platform calibration & access tokens
         .route("/api/platform/status", web::get().to(platform_status))
         .route("/api/platform/apply", web::post().to(platform_apply))
