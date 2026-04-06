@@ -14722,7 +14722,7 @@ pub async fn plugins_toggle(req: HttpRequest, state: web::Data<AppState>, path: 
 }
 
 /// GET /api/plugins/{id}/file/{path} — serve plugin web assets (JS/CSS)
-pub async fn plugins_file(req: HttpRequest, path: web::Path<(String, String)>) -> HttpResponse {
+pub async fn plugins_file(_req: HttpRequest, path: web::Path<(String, String)>) -> HttpResponse {
     // No auth required for static assets (they're loaded by the browser)
     let (plugin_id, file_path) = path.into_inner();
 

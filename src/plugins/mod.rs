@@ -12,7 +12,6 @@
 //!     bin/handler       — standalone backend binary (optional, listens on api_port)
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::{LazyLock, RwLock};
 
 const PLUGINS_DIR: &str = "/etc/wolfstack/plugins";
@@ -266,6 +265,7 @@ pub fn set_enabled(id: &str, enabled: bool) -> Result<String, String> {
 }
 
 /// Start a plugin's backend binary (if it has one)
+#[allow(dead_code)]
 pub fn start_backend(id: &str) -> Result<(), String> {
     let plugin = get(id).ok_or_else(|| format!("Plugin '{}' not found", id))?;
     if !plugin.manifest.has_backend { return Ok(()); }

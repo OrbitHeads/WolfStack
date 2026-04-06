@@ -128,6 +128,7 @@ pub struct WolfNoteLoginResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct WolfNoteUser {
     pub id: String,
     pub username: String,

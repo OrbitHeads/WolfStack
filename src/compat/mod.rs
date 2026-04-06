@@ -6,7 +6,6 @@
 //! device manifest validation, and telemetry event buffering.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 

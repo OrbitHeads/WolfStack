@@ -399,7 +399,9 @@ async fn main() -> std::io::Result<()> {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
-                containers::cleanup_stale_wolfnet_routes();
+                tokio::task::spawn_blocking(|| {
+                    containers::cleanup_stale_wolfnet_routes();
+                }).await.ok();
             }
         });
 
@@ -799,7 +801,7 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
 
                             // ─── Docker Containers Table ───
                             {
-                                let local_docker = crate::containers::docker_list_all();
+                                let local_docker = tokio::task::spawn_blocking(|| crate::containers::docker_list_all()).await.unwrap_or_default();
                                 // Also fetch from remote WolfStack nodes
                                 let mut all_docker: Vec<(String, crate::containers::ContainerInfo)> = Vec::new();
                                 let local_host = {
@@ -842,7 +844,7 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
 
                             // ─── LXC Containers Table ───
                             {
-                                let local_lxc = crate::containers::lxc_list_all();
+                                let local_lxc = tokio::task::spawn_blocking(|| crate::containers::lxc_list_all()).await.unwrap_or_default();
                                 let mut all_lxc: Vec<(String, crate::containers::ContainerInfo)> = Vec::new();
                                 let local_host = {
                                     let nodes = scan_cluster.get_all_nodes();
@@ -1390,8 +1392,8 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                             else { format!("{:.0} KB", b as f64 / 1024.0) }
                         };
 
-                        let docker_stats = containers::docker_stats();
-                        let lxc_stats = containers::lxc_stats();
+                        let docker_stats = tokio::task::spawn_blocking(|| containers::docker_stats()).await.unwrap_or_default();
+                        let lxc_stats = tokio::task::spawn_blocking(|| containers::lxc_stats()).await.unwrap_or_default();
 
                         let docker_alerts = alerting::check_container_thresholds(&config, &docker_stats, "docker");
                         let lxc_alerts = alerting::check_container_thresholds(&config, &lxc_stats, "lxc");
