@@ -2384,61 +2384,63 @@ function startServicePolling() {
 }
 
 async function fetchServices() {
+    const el = document.getElementById('systemd-services-table');
     try {
         const resp = await fetch(apiUrl('/api/systemd'));
         if (!resp.ok) {
-            console.error('fetchServices: HTTP', resp.status);
-            document.getElementById('systemd-services-table').innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);text-align:center;padding:16px;">Failed to load services (HTTP ' + resp.status + ')</td></tr>';
+            if (el) el.innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);text-align:center;padding:16px;">Failed to load services (HTTP ' + resp.status + ')</td></tr>';
             return;
         }
         const services = await resp.json();
-        renderServices(Array.isArray(services) ? services : []);
+        const list = Array.isArray(services) ? services : [];
+        if (el) renderServices(el, list);
     } catch(e) {
-        console.error('fetchServices error:', e);
-        const el = document.getElementById('systemd-services-table');
-        if (el) el.innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);text-align:center;padding:16px;">Failed to load services</td></tr>';
+        if (el) el.innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);text-align:center;padding:16px;">Error: ' + e.message + '</td></tr>';
     }
 }
 
-function renderServices(services) {
-    const tbody = document.getElementById('systemd-services-table');
-    if (!tbody) return;
+function renderServices(tbody, services) {
     if (!services || services.length === 0) {
         tbody.innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);text-align:center;padding:16px;">No services found</td></tr>';
         return;
     }
     // Sort: active/running first, then failed, then inactive
-    services.sort((a, b) => {
-        const order = { 'running': 0, 'exited': 1, 'failed': 2, 'dead': 3 };
-        return (order[a.sub_state] ?? 4) - (order[b.sub_state] ?? 4);
+    var order = { 'running': 0, 'exited': 1, 'failed': 2, 'dead': 3 };
+    services.sort(function(a, b) {
+        var ao = order[a.sub_state] !== undefined ? order[a.sub_state] : 4;
+        var bo = order[b.sub_state] !== undefined ? order[b.sub_state] : 4;
+        return ao - bo;
     });
-    tbody.innerHTML = services.map(s => {
-        const statusClass = s.sub_state === 'running' ? 'running'
+    var html = '';
+    for (var i = 0; i < services.length; i++) {
+        var s = services[i];
+        var statusClass = s.sub_state === 'running' ? 'running'
             : s.active === 'failed' ? 'stopped'
             : s.sub_state === 'exited' ? 'paused'
             : 'stopped';
-        const statusText = s.active === 'failed' ? 'failed' : s.sub_state;
-        const isRunning = s.sub_state === 'running';
-        const isFailed = s.active === 'failed';
-        const esc = s.name.replace(/'/g, "\\'");
-        return `<tr>
-            <td style="font-family:'JetBrains Mono',monospace;font-size:11px;">${s.name}</td>
-            <td><span class="badge ${statusClass}" style="font-size:10px;">${statusText}</span></td>
-            <td style="font-size:11px;color:var(--text-muted);">${s.enabled || '—'}</td>
-            <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--text-secondary);" title="${s.description}">${s.description}</td>
-            <td>
-                <div style="display:flex;gap:4px;">
-                    ${isRunning ? `
-                        <button class="btn btn-sm" onclick="serviceAction('${esc}','restart',this)" style="font-size:10px;padding:2px 8px;" title="Restart">↻</button>
-                        <button class="btn btn-sm" onclick="serviceAction('${esc}','stop',this)" style="font-size:10px;padding:2px 8px;color:#ef4444;border-color:rgba(239,68,68,0.3);" title="Stop">■</button>
-                    ` : `
-                        <button class="btn btn-sm" onclick="serviceAction('${esc}','start',this)" style="font-size:10px;padding:2px 8px;color:#22c55e;border-color:rgba(34,197,94,0.3);" title="Start">▶</button>
-                        ${isFailed ? `<button class="btn btn-sm" onclick="serviceAction('${esc}','restart',this)" style="font-size:10px;padding:2px 8px;" title="Restart">↻</button>` : ''}
-                    `}
-                </div>
-            </td>
-        </tr>`;
-    }).join('');
+        var statusText = s.active === 'failed' ? 'failed' : s.sub_state;
+        var isRunning = s.sub_state === 'running';
+        var isFailed = s.active === 'failed';
+        var safeName = (s.name || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        var safeDesc = (s.description || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+        var escName = (s.name || '').replace(/'/g,"\\'");
+        var btns = '';
+        if (isRunning) {
+            btns = '<button class="btn btn-sm" onclick="serviceAction(\'' + escName + '\',\'restart\',this)" style="font-size:10px;padding:2px 8px;" title="Restart">&#8635;</button>' +
+                   '<button class="btn btn-sm" onclick="serviceAction(\'' + escName + '\',\'stop\',this)" style="font-size:10px;padding:2px 8px;color:#ef4444;border-color:rgba(239,68,68,0.3);" title="Stop">&#9632;</button>';
+        } else {
+            btns = '<button class="btn btn-sm" onclick="serviceAction(\'' + escName + '\',\'start\',this)" style="font-size:10px;padding:2px 8px;color:#22c55e;border-color:rgba(34,197,94,0.3);" title="Start">&#9654;</button>';
+            if (isFailed) btns += '<button class="btn btn-sm" onclick="serviceAction(\'' + escName + '\',\'restart\',this)" style="font-size:10px;padding:2px 8px;" title="Restart">&#8635;</button>';
+        }
+        html += '<tr>' +
+            '<td style="font-family:\'JetBrains Mono\',monospace;font-size:11px;">' + safeName + '</td>' +
+            '<td><span class="badge ' + statusClass + '" style="font-size:10px;">' + statusText + '</span></td>' +
+            '<td style="font-size:11px;color:var(--text-muted);">' + (s.enabled || '—') + '</td>' +
+            '<td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--text-secondary);" title="' + safeDesc + '">' + safeDesc + '</td>' +
+            '<td><div style="display:flex;gap:4px;">' + btns + '</div></td>' +
+            '</tr>';
+    }
+    tbody.innerHTML = html;
 }
 
 async function serviceAction(name, action, btn) {
