@@ -799,7 +799,7 @@ struct SystemdService {
     enabled: String,   // "enabled", "disabled", "static", "masked", etc.
 }
 
-/// GET /api/services — list systemd services
+/// GET /api/systemd — list systemd services
 pub async fn list_services(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let services = tokio::task::spawn_blocking(|| {

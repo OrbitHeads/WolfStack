@@ -2386,10 +2386,17 @@ function startServicePolling() {
 async function fetchServices() {
     try {
         const resp = await fetch(apiUrl('/api/systemd'));
-        if (!resp.ok) return;
+        if (!resp.ok) {
+            console.error('fetchServices: HTTP', resp.status);
+            document.getElementById('services-table').innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);text-align:center;padding:16px;">Failed to load services (HTTP ' + resp.status + ')</td></tr>';
+            return;
+        }
         const services = await resp.json();
-        renderServices(services);
-    } catch(e) { /* silent */ }
+        renderServices(Array.isArray(services) ? services : []);
+    } catch(e) {
+        console.error('fetchServices error:', e);
+        document.getElementById('services-table').innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);text-align:center;padding:16px;">Failed to load services</td></tr>';
+    }
 }
 
 function renderServices(services) {

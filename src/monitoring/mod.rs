@@ -199,15 +199,18 @@ impl SystemMonitor {
             self.sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
         }
         let total_mem = self.sys.total_memory();
+        let cpu_count = self.sys.cpus().len().max(1) as f32;
 
         let mut procs: Vec<ProcessInfo> = self.sys.processes().values()
             .filter(|p| p.cpu_usage() > 0.0 || p.memory() > 0)
             .map(|p| {
                 let mem = p.memory();
+                // sysinfo reports per-core CPU (e.g. 400% on 4 cores) — normalise to 0-100%
+                let cpu_normalized = p.cpu_usage() / cpu_count;
                 ProcessInfo {
                     pid: p.pid().as_u32(),
                     name: p.name().to_string_lossy().to_string(),
-                    cpu_percent: p.cpu_usage(),
+                    cpu_percent: cpu_normalized,
                     memory_bytes: mem,
                     memory_percent: if total_mem > 0 { (mem as f32 / total_mem as f32) * 100.0 } else { 0.0 },
                 }
