@@ -2863,17 +2863,19 @@ body.sidebar-collapsed #task-log-footer {
     /* Sidebar: always rendered but parked off-screen for instant toggle */
     .sidebar,
     body.sidebar-collapsed .sidebar {
-        width: 280px;
-        left: -280px;
-        transform: none;
-        z-index: 10001;
+        position: fixed !important;
+        width: 280px !important;
+        left: -280px !important;
+        transform: none !important;
+        z-index: 10001 !important;
         box-shadow: none;
+        display: flex !important;
     }
 
     body.sidebar-open .sidebar,
     body.sidebar-collapsed.sidebar-open .sidebar {
-        left: 0;
-        transform: none;
+        left: 0 !important;
+        transform: none !important;
         box-shadow: var(--shadow-lg);
     }
 
