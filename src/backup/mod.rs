@@ -334,8 +334,9 @@ pub fn backup_docker(name: &str) -> Result<(PathBuf, u64, String), String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default();
 
-    // Commit the container to a temp image
+    // Commit the container to a temp image (disable content trust — committed images have no signatures)
     let output = Command::new("docker")
+        .env("DOCKER_CONTENT_TRUST", "0")
         .args(["commit", name, &temp_image])
         .output()
         .map_err(|e| format!("Failed to commit container: {}", e))?;
