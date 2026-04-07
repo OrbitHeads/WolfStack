@@ -2322,6 +2322,15 @@ async function fetchTopProcesses() {
         renderProcessTable('top-cpu-table', data.top_cpu, 'cpu');
         renderProcessTable('top-mem-table', data.top_mem, 'mem');
     } catch(e) { /* silent */ }
+    // Also fetch systemd services in the same cycle
+    try {
+        var svcResp = await fetch(apiUrl('/api/systemd'));
+        if (svcResp.ok) {
+            var services = await svcResp.json();
+            var el = document.getElementById('systemd-services-table');
+            if (el && Array.isArray(services)) renderServices(el, services);
+        }
+    } catch(e) { /* silent */ }
 }
 
 function renderProcessTable(tableId, procs, type) {
@@ -2375,80 +2384,40 @@ async function killProcess(pid, name) {
 let _svcPollTimer = null;
 
 function startServicePolling() {
-    fetchServices();
-    if (_svcPollTimer) clearInterval(_svcPollTimer);
-    _svcPollTimer = setInterval(function() {
-        if (currentPage !== 'dashboard') { clearInterval(_svcPollTimer); _svcPollTimer = null; return; }
-        fetchServices();
-    }, 30000);
-}
-
-function fetchServices() {
-    var url = apiUrl('/api/systemd');
-    var xhr = new XMLHttpRequest();
-    xhr.open('GET', url, true);
-    xhr.onload = function() {
-        if (xhr.status !== 200) return;
-        try {
-            var services = JSON.parse(xhr.responseText);
-            var el = document.getElementById('systemd-services-table');
-            if (!el) return;
-            if (!Array.isArray(services)) { el.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:16px;color:var(--text-muted);">Invalid response</td></tr>'; return; }
-            renderServices(el, services);
-        } catch(e) {
-            var el2 = document.getElementById('systemd-services-table');
-            if (el2) el2.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:16px;color:var(--text-muted);">Parse error</td></tr>';
-        }
-    };
-    xhr.onerror = function() {
-        var el = document.getElementById('systemd-services-table');
-        if (el) el.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:16px;color:var(--text-muted);">Network error</td></tr>';
-    };
-    xhr.send();
+    // Services are fetched inside fetchTopProcesses — no separate poll needed
 }
 
 function renderServices(tbody, services) {
     if (!services || services.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);text-align:center;padding:16px;">No services found</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="5">No services found</td></tr>';
         return;
     }
-    // Sort: active/running first, then failed, then inactive
-    var order = { 'running': 0, 'exited': 1, 'failed': 2, 'dead': 3 };
     services.sort(function(a, b) {
-        var ao = order[a.sub_state] !== undefined ? order[a.sub_state] : 4;
-        var bo = order[b.sub_state] !== undefined ? order[b.sub_state] : 4;
-        return ao - bo;
+        if (a.sub_state === 'running' && b.sub_state !== 'running') return -1;
+        if (b.sub_state === 'running' && a.sub_state !== 'running') return 1;
+        return 0;
     });
-    var html = '';
+    var rows = [];
     for (var i = 0; i < services.length; i++) {
         var s = services[i];
-        var statusClass = s.sub_state === 'running' ? 'running'
-            : s.active === 'failed' ? 'stopped'
-            : s.sub_state === 'exited' ? 'paused'
-            : 'stopped';
-        var statusText = s.active === 'failed' ? 'failed' : s.sub_state;
-        var isRunning = s.sub_state === 'running';
-        var isFailed = s.active === 'failed';
-        var safeName = (s.name || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-        var safeDesc = (s.description || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-        var escName = (s.name || '').replace(/'/g,"\\'");
+        var name = s.name || '';
+        var desc = s.description || '';
+        var sub = s.sub_state || '';
+        var act = s.active || '';
+        var en = s.enabled || '';
+        var badge = sub === 'running' ? '<span class="badge running">running</span>'
+            : act === 'failed' ? '<span class="badge stopped">failed</span>'
+            : '<span class="badge">' + sub + '</span>';
         var btns = '';
-        if (isRunning) {
-            btns = '<button class="btn btn-sm" onclick="serviceAction(\'' + escName + '\',\'restart\',this)" style="font-size:10px;padding:2px 8px;" title="Restart">&#8635;</button>' +
-                   '<button class="btn btn-sm" onclick="serviceAction(\'' + escName + '\',\'stop\',this)" style="font-size:10px;padding:2px 8px;color:#ef4444;border-color:rgba(239,68,68,0.3);" title="Stop">&#9632;</button>';
+        if (sub === 'running') {
+            btns = '<button class="btn btn-sm" onclick="serviceAction(\'' + name.replace(/'/g,"\\'") + '\',\'restart\',this)" style="font-size:10px;padding:2px 6px;">Restart</button> ' +
+                   '<button class="btn btn-sm" onclick="serviceAction(\'' + name.replace(/'/g,"\\'") + '\',\'stop\',this)" style="font-size:10px;padding:2px 6px;color:#ef4444;">Stop</button>';
         } else {
-            btns = '<button class="btn btn-sm" onclick="serviceAction(\'' + escName + '\',\'start\',this)" style="font-size:10px;padding:2px 8px;color:#22c55e;border-color:rgba(34,197,94,0.3);" title="Start">&#9654;</button>';
-            if (isFailed) btns += '<button class="btn btn-sm" onclick="serviceAction(\'' + escName + '\',\'restart\',this)" style="font-size:10px;padding:2px 8px;" title="Restart">&#8635;</button>';
+            btns = '<button class="btn btn-sm" onclick="serviceAction(\'' + name.replace(/'/g,"\\'") + '\',\'start\',this)" style="font-size:10px;padding:2px 6px;color:#22c55e;">Start</button>';
         }
-        html += '<tr>' +
-            '<td style="font-family:\'JetBrains Mono\',monospace;font-size:11px;">' + safeName + '</td>' +
-            '<td><span class="badge ' + statusClass + '" style="font-size:10px;">' + statusText + '</span></td>' +
-            '<td style="font-size:11px;color:var(--text-muted);">' + (s.enabled || '—') + '</td>' +
-            '<td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--text-secondary);" title="' + safeDesc + '">' + safeDesc + '</td>' +
-            '<td><div style="display:flex;gap:4px;">' + btns + '</div></td>' +
-            '</tr>';
+        rows.push('<tr><td>' + name + '</td><td>' + badge + '</td><td>' + en + '</td><td>' + desc + '</td><td>' + btns + '</td></tr>');
     }
-    tbody.innerHTML = html;
+    tbody.innerHTML = rows.join('');
 }
 
 async function serviceAction(name, action, btn) {
