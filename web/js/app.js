@@ -7486,12 +7486,10 @@ function loadTaskLog() {
                 }));
             }
         }
-        // Show the task log footer on load (unless user has closed it)
+        // Show the task log footer on load (only if user hasn't closed it)
         loadTaskLogHeight();
-        if (!_taskLogUserClosed) showTaskLog();
         renderTaskLog();
-        // Log the session start
-        taskLog('Dashboard loaded');
+        if (!_taskLogUserClosed && _taskLogEntries.length > 0) showTaskLog();
     } catch (_) {}
 }
 

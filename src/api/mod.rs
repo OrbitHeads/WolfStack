@@ -803,32 +803,29 @@ struct SystemdService {
 pub async fn list_services(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let services = tokio::task::spawn_blocking(|| {
+        // Use JSON output for reliable parsing (supported by systemd 240+)
         let output = std::process::Command::new("systemctl")
-            .args(["list-units", "--type=service", "--all", "--no-pager", "--no-legend"])
+            .args(["list-units", "--type=service", "--all", "--no-pager", "--output=json"])
             .output();
         let mut result = Vec::new();
         if let Ok(out) = output {
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                // Strip leading bullet (● for failed units) and whitespace
-                let clean = line.trim_start_matches(|c: char| c == '●' || c.is_whitespace());
-                let parts: Vec<&str> = clean.split_whitespace().collect();
-                // Format: NAME.service LOAD ACTIVE SUB DESCRIPTION...
-                if parts.len() < 4 { continue; }
-                let name = parts[0].trim_end_matches(".service").to_string();
-                if name.is_empty() { continue; }
-                // Skip internal systemd units that clutter the list
-                if name.starts_with("systemd-") || name.starts_with("init-") || name == "-" { continue; }
-                // parts[1] = loaded/not-found, parts[2] = active/inactive/failed, parts[3] = running/dead/exited
-                let active = parts[2].to_string();
-                let sub = parts[3].to_string();
-                let desc = if parts.len() > 4 { parts[4..].join(" ") } else { String::new() };
-                result.push(SystemdService {
-                    name,
-                    description: desc,
-                    active,
-                    sub_state: sub,
-                    enabled: String::new(), // filled below
-                });
+            if let Ok(units) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout) {
+                for u in &units {
+                    let name = u["unit"].as_str().unwrap_or("").trim_end_matches(".service").to_string();
+                    if name.is_empty() { continue; }
+                    // Skip internal systemd units
+                    if name.starts_with("systemd-") { continue; }
+                    let active = u["active"].as_str().unwrap_or("").to_string();
+                    let sub = u["sub"].as_str().unwrap_or("").to_string();
+                    let desc = u["description"].as_str().unwrap_or("").to_string();
+                    result.push(SystemdService {
+                        name,
+                        description: desc,
+                        active,
+                        sub_state: sub,
+                        enabled: String::new(),
+                    });
+                }
             }
         }
         // Get enabled/disabled status
