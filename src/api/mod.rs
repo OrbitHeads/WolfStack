@@ -14830,6 +14830,76 @@ pub async fn plugins_proxy(req: HttpRequest, state: web::Data<AppState>, path: w
     }
 }
 
+// ─── Plugin Data Storage ───
+// Generic config read/write + file upload for plugins that don't have a backend binary.
+// Data stored in /etc/wolfstack/plugins/{id}/data/
+
+/// GET /api/plugins/{id}/data/config — read plugin config JSON
+pub async fn plugin_data_config_get(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let config_path = format!("/etc/wolfstack/plugins/{}/data/config.json", id);
+    match std::fs::read_to_string(&config_path) {
+        Ok(data) => HttpResponse::Ok().content_type("application/json").body(data),
+        Err(_) => HttpResponse::Ok().json(serde_json::json!({})),
+    }
+}
+
+/// POST /api/plugins/{id}/data/config — write plugin config JSON
+pub async fn plugin_data_config_set(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Bytes) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let data_dir = format!("/etc/wolfstack/plugins/{}/data", id);
+    let _ = std::fs::create_dir_all(&data_dir);
+    let config_path = format!("{}/config.json", data_dir);
+    match std::fs::write(&config_path, &body) {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"ok": true})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("{}", e)})),
+    }
+}
+
+/// POST /api/plugins/{id}/data/upload/{filename} — upload a file to plugin data dir
+pub async fn plugin_data_upload(req: HttpRequest, state: web::Data<AppState>, path: web::Path<(String, String)>, body: web::Bytes) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let (id, filename) = path.into_inner();
+    // Security: reject path traversal
+    if filename.contains("..") || filename.contains('/') || filename.contains('\\') {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "Invalid filename"}));
+    }
+    let data_dir = format!("/etc/wolfstack/plugins/{}/data", id);
+    let _ = std::fs::create_dir_all(&data_dir);
+    let file_path = format!("{}/{}", data_dir, filename);
+    match std::fs::write(&file_path, &body) {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({
+            "ok": true,
+            "url": format!("/api/plugins/{}/data/file/{}", id, filename),
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("{}", e)})),
+    }
+}
+
+/// GET /api/plugins/{id}/data/file/{filename} — serve a file from plugin data dir
+pub async fn plugin_data_file(req: HttpRequest, state: web::Data<AppState>, path: web::Path<(String, String)>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let (id, filename) = path.into_inner();
+    if filename.contains("..") || filename.contains('/') || filename.contains('\\') {
+        return HttpResponse::BadRequest().finish();
+    }
+    let file_path = format!("/etc/wolfstack/plugins/{}/data/{}", id, filename);
+    match std::fs::read(&file_path) {
+        Ok(data) => {
+            let ct = if filename.ends_with(".png") { "image/png" }
+                else if filename.ends_with(".jpg") || filename.ends_with(".jpeg") { "image/jpeg" }
+                else if filename.ends_with(".svg") { "image/svg+xml" }
+                else if filename.ends_with(".ico") { "image/x-icon" }
+                else if filename.ends_with(".webp") { "image/webp" }
+                else { "application/octet-stream" };
+            HttpResponse::Ok().content_type(ct).body(data)
+        }
+        Err(_) => HttpResponse::NotFound().finish(),
+    }
+}
+
 // ─── Access Token Management ───
 
 /// GET /api/platform/status
@@ -15444,6 +15514,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/plugins/install", web::post().to(plugins_install))
         .route("/api/plugins/{id}", web::delete().to(plugins_uninstall))
         .route("/api/plugins/{id}/toggle", web::post().to(plugins_toggle))
+        .route("/api/plugins/{id}/data/config", web::get().to(plugin_data_config_get))
+        .route("/api/plugins/{id}/data/config", web::post().to(plugin_data_config_set))
+        .route("/api/plugins/{id}/data/upload/{filename}", web::post().to(plugin_data_upload))
+        .route("/api/plugins/{id}/data/file/{filename}", web::get().to(plugin_data_file))
         .route("/api/plugins/{id}/file/{path:.*}", web::get().to(plugins_file))
         .route("/api/plugins/{id}/api/{path:.*}", web::get().to(plugins_proxy))
         .route("/api/plugins/{id}/api/{path:.*}", web::post().to(plugins_proxy))
