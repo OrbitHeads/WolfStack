@@ -2314,11 +2314,14 @@ function startProcessPolling() {
     }, 15000);
 }
 
+let _lastProcessData = { top_cpu: [], top_mem: [] };
+
 async function fetchTopProcesses() {
     try {
         const resp = await fetch(apiUrl('/api/metrics/processes'));
         if (!resp.ok) return;
         const data = await resp.json();
+        _lastProcessData = data;
         renderProcessTable('top-cpu-table', data.top_cpu, 'cpu');
         renderProcessTable('top-mem-table', data.top_mem, 'mem');
     } catch(e) { /* silent */ }
@@ -2387,9 +2390,26 @@ function startServicePolling() {
     // Services are fetched inside fetchTopProcesses — no separate poll needed
 }
 
+function matchServiceToProcesses(svcName) {
+    var allProcs = (_lastProcessData.top_cpu || []).concat(_lastProcessData.top_mem || []);
+    var seen = {};
+    var matched = [];
+    var svcLower = svcName.toLowerCase().replace(/-/g, '');
+    for (var i = 0; i < allProcs.length; i++) {
+        var p = allProcs[i];
+        if (seen[p.pid]) continue;
+        var pName = (p.name || '').toLowerCase().replace(/-/g, '');
+        if (pName === svcLower || pName.indexOf(svcLower) === 0 || svcLower.indexOf(pName) === 0) {
+            seen[p.pid] = true;
+            matched.push(p);
+        }
+    }
+    return matched;
+}
+
 function renderSystemdServices(tbody, services) {
     if (!services || services.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="5">No services found</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6">No services found</td></tr>';
         return;
     }
     services.sort(function(a, b) {
@@ -2408,14 +2428,35 @@ function renderSystemdServices(tbody, services) {
         var badge = sub === 'running' ? '<span class="badge running">running</span>'
             : act === 'failed' ? '<span class="badge stopped">failed</span>'
             : '<span class="badge">' + sub + '</span>';
+        var enBadge = en === 'enabled' ? '<span style="color:var(--success);">enabled</span>'
+            : en === 'disabled' ? '<span style="color:var(--text-muted);">disabled</span>'
+            : '<span style="color:var(--text-muted);">' + escapeHtml(en) + '</span>';
+        // Match to process usage
+        var usageCell = '<span style="color:var(--text-muted);">—</span>';
+        if (sub === 'running') {
+            var procs = matchServiceToProcesses(name);
+            if (procs.length > 0) {
+                var totalCpu = 0, totalMem = 0;
+                for (var j = 0; j < procs.length; j++) {
+                    totalCpu += procs[j].cpu_percent || 0;
+                    totalMem += procs[j].memory_bytes || 0;
+                }
+                var cpuColor = totalCpu > 50 ? '#ef4444' : totalCpu > 20 ? '#f59e0b' : 'var(--text-secondary)';
+                usageCell = '<span style="color:' + cpuColor + '; font-weight:500;">' + totalCpu.toFixed(1) + '%</span>' +
+                    ' <span style="color:var(--text-muted); font-size:10px;">CPU</span>' +
+                    '<br><span style="font-size:11px; color:var(--text-secondary);">' + formatBytes(totalMem) + '</span>' +
+                    ' <span style="color:var(--text-muted); font-size:10px;">MEM</span>';
+            }
+        }
+        var esc = name.replace(/'/g, "\\'");
         var btns = '';
         if (sub === 'running') {
-            btns = '<button class="btn btn-sm" onclick="serviceAction(\'' + name.replace(/'/g,"\\'") + '\',\'restart\',this)" style="font-size:10px;padding:2px 6px;">Restart</button> ' +
-                   '<button class="btn btn-sm" onclick="serviceAction(\'' + name.replace(/'/g,"\\'") + '\',\'stop\',this)" style="font-size:10px;padding:2px 6px;color:#ef4444;">Stop</button>';
+            btns = '<button class="btn btn-sm" onclick="serviceAction(\'' + esc + '\',\'restart\',this)">Restart</button> ' +
+                   '<button class="btn btn-sm btn-danger" onclick="serviceAction(\'' + esc + '\',\'stop\',this)">Stop</button>';
         } else {
-            btns = '<button class="btn btn-sm" onclick="serviceAction(\'' + name.replace(/'/g,"\\'") + '\',\'start\',this)" style="font-size:10px;padding:2px 6px;color:#22c55e;">Start</button>';
+            btns = '<button class="btn btn-sm btn-success" onclick="serviceAction(\'' + esc + '\',\'start\',this)">Start</button>';
         }
-        rows.push('<tr><td>' + name + '</td><td>' + badge + '</td><td>' + en + '</td><td>' + desc + '</td><td>' + btns + '</td></tr>');
+        rows.push('<tr><td>' + escapeHtml(name) + '</td><td>' + badge + '</td><td>' + enBadge + '</td><td style="white-space:nowrap;">' + usageCell + '</td><td>' + escapeHtml(desc) + '</td><td style="white-space:nowrap;">' + btns + '</td></tr>');
     }
     tbody.innerHTML = rows.join('');
 }
@@ -2438,7 +2479,7 @@ async function serviceAction(name, action, btn) {
         if (data.ok) {
             showToast(action + ' ' + name + ': OK', 'success');
             taskLog('Service ' + action + ': ' + name);
-            setTimeout(fetchServices, 500);
+            setTimeout(fetchTopProcesses, 500);
         } else {
             // Show error modal with diagnostics
             showServiceErrorModal(name, action, data);
