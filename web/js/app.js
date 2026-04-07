@@ -1309,7 +1309,7 @@ function buildServerTree(nodes) {
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="components" onclick="selectServerView('${node.id}', 'components')">
                             <span class="icon">📦</span> Components
-                            <span class="badge" style="font-size:10px; padding:1px 6px;">${node.components.filter(c => c.installed).length}</span>
+                            <span class="badge" style="font-size:10px; padding:1px 6px;">${(node.components || []).filter(c => c.installed).length}</span>
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="services" onclick="selectServerView('${node.id}', 'services')">
                             <span class="icon">⚡</span> Services
@@ -1510,7 +1510,7 @@ function filterSidebarNodes() {
 function renderDatacenterOverview() {
     const nodes = allNodes;
     const onlineCount = nodes.filter(n => n.online).length;
-    const totalComponents = nodes.reduce((sum, n) => sum + n.components.filter(c => c.installed).length, 0);
+    const totalComponents = nodes.reduce((sum, n) => sum + (n.components || []).filter(c => c.installed).length, 0);
 
     document.getElementById('dc-total-servers').textContent = nodes.length;
     document.getElementById('dc-online-servers').textContent = onlineCount;
@@ -1582,7 +1582,7 @@ function renderDatacenterOverview() {
 
         const components = isPve
             ? `<span style="font-size:10px;padding:1px 5px;border-radius:3px;background:rgba(99,102,241,0.1);color:var(--accent-light);">${node.vm_count || 0} VMs</span><span style="font-size:10px;padding:1px 5px;border-radius:3px;background:rgba(99,102,241,0.1);color:var(--accent-light);">${node.lxc_count || 0} CTs</span>`
-            : node.components.filter(c => c.installed).map(c =>
+            : (node.components || []).filter(c => c.installed).map(c =>
                 `<span style="font-size:10px;padding:1px 5px;border-radius:3px;background:${c.running ? 'var(--success-bg)' : 'var(--danger-bg)'};color:${c.running ? 'var(--success)' : 'var(--danger)'};" ${hasConfigurator(c.component) ? 'title="Configurator available — click Components to configure"' : ''}>${c.component}${hasConfigurator(c.component) ? ' ⚙️' : ''}</span>`
             ).join('');
 
@@ -3125,7 +3125,7 @@ function renderComponents(components) {
 function renderServices(components) {
     const table = document.getElementById('services-table');
     if (!table) return;
-    table.innerHTML = components.filter(c => c.installed).map(c => {
+    table.innerHTML = (Array.isArray(components) ? components : []).filter(c => c.installed).map(c => {
         const statusColor = c.running ? 'var(--success)' : 'var(--danger)';
         const statusText = c.running ? 'Active' : 'Inactive';
         const configureBtn = hasConfigurator(c.component)
