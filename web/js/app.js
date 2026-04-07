@@ -2388,19 +2388,20 @@ async function fetchServices() {
         const resp = await fetch(apiUrl('/api/systemd'));
         if (!resp.ok) {
             console.error('fetchServices: HTTP', resp.status);
-            document.getElementById('services-table').innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);text-align:center;padding:16px;">Failed to load services (HTTP ' + resp.status + ')</td></tr>';
+            document.getElementById('systemd-services-table').innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);text-align:center;padding:16px;">Failed to load services (HTTP ' + resp.status + ')</td></tr>';
             return;
         }
         const services = await resp.json();
         renderServices(Array.isArray(services) ? services : []);
     } catch(e) {
         console.error('fetchServices error:', e);
-        document.getElementById('services-table').innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);text-align:center;padding:16px;">Failed to load services</td></tr>';
+        const el = document.getElementById('systemd-services-table');
+        if (el) el.innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);text-align:center;padding:16px;">Failed to load services</td></tr>';
     }
 }
 
 function renderServices(services) {
-    const tbody = document.getElementById('services-table');
+    const tbody = document.getElementById('systemd-services-table');
     if (!tbody) return;
     if (!services || services.length === 0) {
         tbody.innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);text-align:center;padding:16px;">No services found</td></tr>';
