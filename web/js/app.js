@@ -2328,7 +2328,7 @@ async function fetchTopProcesses() {
         if (svcResp.ok) {
             var services = await svcResp.json();
             var el = document.getElementById('systemd-services-table');
-            if (el && Array.isArray(services)) renderServices(el, services);
+            if (el && Array.isArray(services)) renderSystemdServices(el, services);
         }
     } catch(e) { /* silent */ }
 }
@@ -2387,7 +2387,7 @@ function startServicePolling() {
     // Services are fetched inside fetchTopProcesses — no separate poll needed
 }
 
-function renderServices(tbody, services) {
+function renderSystemdServices(tbody, services) {
     if (!services || services.length === 0) {
         tbody.innerHTML = '<tr><td colspan="5">No services found</td></tr>';
         return;
