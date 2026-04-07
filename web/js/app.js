@@ -2377,26 +2377,34 @@ let _svcPollTimer = null;
 function startServicePolling() {
     fetchServices();
     if (_svcPollTimer) clearInterval(_svcPollTimer);
-    _svcPollTimer = setInterval(() => {
+    _svcPollTimer = setInterval(function() {
         if (currentPage !== 'dashboard') { clearInterval(_svcPollTimer); _svcPollTimer = null; return; }
         fetchServices();
     }, 30000);
 }
 
-async function fetchServices() {
-    const el = document.getElementById('systemd-services-table');
-    try {
-        const resp = await fetch(apiUrl('/api/systemd'));
-        if (!resp.ok) {
-            if (el) el.innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);text-align:center;padding:16px;">Failed to load services (HTTP ' + resp.status + ')</td></tr>';
-            return;
+function fetchServices() {
+    var url = apiUrl('/api/systemd');
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', url, true);
+    xhr.onload = function() {
+        if (xhr.status !== 200) return;
+        try {
+            var services = JSON.parse(xhr.responseText);
+            var el = document.getElementById('systemd-services-table');
+            if (!el) return;
+            if (!Array.isArray(services)) { el.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:16px;color:var(--text-muted);">Invalid response</td></tr>'; return; }
+            renderServices(el, services);
+        } catch(e) {
+            var el2 = document.getElementById('systemd-services-table');
+            if (el2) el2.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:16px;color:var(--text-muted);">Parse error</td></tr>';
         }
-        const services = await resp.json();
-        const list = Array.isArray(services) ? services : [];
-        if (el) renderServices(el, list);
-    } catch(e) {
-        if (el) el.innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);text-align:center;padding:16px;">Error: ' + e.message + '</td></tr>';
-    }
+    };
+    xhr.onerror = function() {
+        var el = document.getElementById('systemd-services-table');
+        if (el) el.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:16px;color:var(--text-muted);">Network error</td></tr>';
+    };
+    xhr.send();
 }
 
 function renderServices(tbody, services) {
