@@ -755,6 +755,39 @@ pub async fn get_metrics_history(req: HttpRequest, state: web::Data<AppState>) -
     HttpResponse::Ok().json(history.get_all())
 }
 
+/// GET /api/metrics/processes — top CPU and memory consuming processes
+pub async fn get_top_processes(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let (top_cpu, top_mem) = state.monitor.lock().unwrap().top_processes(10);
+    HttpResponse::Ok().json(serde_json::json!({
+        "top_cpu": top_cpu,
+        "top_mem": top_mem,
+    }))
+}
+
+/// POST /api/metrics/processes/{pid}/kill — kill a process by PID
+pub async fn kill_process(req: HttpRequest, state: web::Data<AppState>, path: web::Path<u32>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let pid = path.into_inner();
+    // Safety: refuse to kill PID 1 (init) or PID 0
+    if pid <= 1 {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "Cannot kill system process"}));
+    }
+    let result = std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .output();
+    match result {
+        Ok(o) if o.status.success() => {
+            HttpResponse::Ok().json(serde_json::json!({"ok": true, "pid": pid}))
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+            HttpResponse::Ok().json(serde_json::json!({"ok": false, "error": stderr.trim()}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("{}", e)})),
+    }
+}
+
 /// GET /api/nodes — all cluster nodes
 pub async fn get_nodes(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
@@ -14967,6 +15000,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // Dashboard
         .route("/api/metrics", web::get().to(get_metrics))
         .route("/api/metrics/history", web::get().to(get_metrics_history))
+        .route("/api/metrics/processes", web::get().to(get_top_processes))
+        .route("/api/metrics/processes/{pid}/kill", web::post().to(kill_process))
         .route("/api/auth/join-token", web::get().to(get_join_token))
         // Cluster
         .route("/api/cluster/verify-token", web::get().to(verify_join_token))

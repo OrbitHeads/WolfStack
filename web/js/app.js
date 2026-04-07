@@ -1139,6 +1139,7 @@ function selectServerView(nodeId, view) {
     }
     if (lxcPollTimer) { clearInterval(lxcPollTimer); lxcPollTimer = null; }
     if (containerPollTimer) { clearInterval(containerPollTimer); containerPollTimer = null; }
+    if (_procPollTimer) { clearInterval(_procPollTimer); _procPollTimer = null; }
     if (view === 'dashboard') {
         // Clear history for new server view to show fresh data
         cpuHistory = [];
@@ -1159,6 +1160,8 @@ function selectServerView(nodeId, view) {
 
         // If it's the local node (is_self), we could fetch history, but for now we'll build it live
         if (node?.is_self) fetchMetricsHistory();
+        // Start top-processes polling (only while on dashboard)
+        startProcessPolling();
     }
     if (view === 'components' || view === 'services') loadComponents().finally(() => hidePageLoadingOverlay(el));
     if (view === 'containers') loadDockerContainers().finally(() => hidePageLoadingOverlay(el));
@@ -2293,6 +2296,75 @@ async function fetchMetricsHistory() {
         redrawAllCharts();
     } catch (e) {
         console.error('Failed to fetch history:', e);
+    }
+}
+
+// ─── Top Processes (dashboard) ───
+
+let _procPollTimer = null;
+
+function startProcessPolling() {
+    fetchTopProcesses();
+    if (_procPollTimer) clearInterval(_procPollTimer);
+    _procPollTimer = setInterval(() => {
+        if (currentPage !== 'dashboard') { clearInterval(_procPollTimer); _procPollTimer = null; return; }
+        fetchTopProcesses();
+    }, 15000);
+}
+
+async function fetchTopProcesses() {
+    try {
+        const resp = await fetch(apiUrl('/api/metrics/processes'));
+        if (!resp.ok) return;
+        const data = await resp.json();
+        renderProcessTable('top-cpu-table', data.top_cpu, 'cpu');
+        renderProcessTable('top-mem-table', data.top_mem, 'mem');
+    } catch(e) { /* silent */ }
+}
+
+function renderProcessTable(tableId, procs, type) {
+    const tbody = document.getElementById(tableId);
+    if (!tbody || !procs) return;
+    if (procs.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="4" style="color:var(--text-muted); text-align:center; padding:16px;">No processes</td></tr>';
+        return;
+    }
+    tbody.innerHTML = procs.map(p => {
+        const val = type === 'cpu'
+            ? p.cpu_percent.toFixed(1) + '%'
+            : formatBytes(p.memory_bytes) + ' (' + p.memory_percent.toFixed(1) + '%)';
+        const barPct = type === 'cpu' ? Math.min(p.cpu_percent, 100) : Math.min(p.memory_percent, 100);
+        return `<tr>
+            <td style="font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--text-muted);">${p.pid}</td>
+            <td style="max-width:140px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${p.name}">${p.name}</td>
+            <td>
+                <div style="display:flex; align-items:center; gap:6px;">
+                    <div class="progress-bar" style="width:60px; margin:0;">
+                        <div class="fill ${progressClass(barPct)}" style="width:${barPct}%"></div>
+                    </div>
+                    <span style="font-size:11px; min-width:50px;">${val}</span>
+                </div>
+            </td>
+            <td>
+                <button onclick="killProcess(${p.pid}, '${p.name.replace(/'/g, "\\'")}')" class="btn btn-sm" style="font-size:10px; padding:2px 8px; color:#ef4444; border-color:rgba(239,68,68,0.3);" title="Kill process">✕</button>
+            </td>
+        </tr>`;
+    }).join('');
+}
+
+async function killProcess(pid, name) {
+    if (!confirm('Kill process ' + name + ' (PID ' + pid + ')?')) return;
+    try {
+        const resp = await fetch(apiUrl('/api/metrics/processes/' + pid + '/kill'), { method: 'POST' });
+        const data = await resp.json();
+        if (data.ok) {
+            taskLog('Killed process ' + name + ' (PID ' + pid + ')');
+            fetchTopProcesses();
+        } else {
+            alert('Failed to kill process: ' + (data.error || 'Unknown error'));
+        }
+    } catch(e) {
+        alert('Failed to kill process: ' + e.message);
     }
 }
 

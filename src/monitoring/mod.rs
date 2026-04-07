@@ -180,6 +180,52 @@ impl SystemMonitor {
     }
 }
 
+/// A single process entry for top-N display
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub name: String,
+    pub cpu_percent: f32,
+    pub memory_bytes: u64,
+    pub memory_percent: f32,
+}
+
+impl SystemMonitor {
+    /// Get top processes by CPU and memory usage.
+    /// Refreshes process list if stale (> 5s since last refresh).
+    pub fn top_processes(&mut self, count: usize) -> (Vec<ProcessInfo>, Vec<ProcessInfo>) {
+        // Ensure process data is reasonably fresh
+        if self.tick > 2 {
+            self.sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        }
+        let total_mem = self.sys.total_memory();
+
+        let mut procs: Vec<ProcessInfo> = self.sys.processes().values()
+            .filter(|p| p.cpu_usage() > 0.0 || p.memory() > 0)
+            .map(|p| {
+                let mem = p.memory();
+                ProcessInfo {
+                    pid: p.pid().as_u32(),
+                    name: p.name().to_string_lossy().to_string(),
+                    cpu_percent: p.cpu_usage(),
+                    memory_bytes: mem,
+                    memory_percent: if total_mem > 0 { (mem as f32 / total_mem as f32) * 100.0 } else { 0.0 },
+                }
+            })
+            .collect();
+
+        // Top CPU
+        procs.sort_by(|a, b| b.cpu_percent.partial_cmp(&a.cpu_percent).unwrap_or(std::cmp::Ordering::Equal));
+        let top_cpu: Vec<ProcessInfo> = procs.iter().take(count).cloned().collect();
+
+        // Top Memory
+        procs.sort_by(|a, b| b.memory_bytes.cmp(&a.memory_bytes));
+        let top_mem: Vec<ProcessInfo> = procs.iter().take(count).cloned().collect();
+
+        (top_cpu, top_mem)
+    }
+}
+
 /// Classify hardware as "low", "mid", or "high" based on CPU cores and RAM
 pub fn classify_hardware(cpu_count: usize, total_memory_bytes: u64) -> String {
     let ram_gb = total_memory_bytes / (1024 * 1024 * 1024);
