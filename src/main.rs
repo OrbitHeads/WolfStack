@@ -1554,7 +1554,10 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(15)).await;
             loop {
-                statuspage::pull_from_peers(&sp_sync, &sp_sync_cluster, &sp_sync_secret).await;
+                // Only sync if status pages are configured
+                if sp_sync.has_any_pages() {
+                    statuspage::pull_from_peers(&sp_sync, &sp_sync_cluster, &sp_sync_secret).await;
+                }
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
         });

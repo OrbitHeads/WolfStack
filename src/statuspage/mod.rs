@@ -256,6 +256,12 @@ impl StatusPageState {
         }
     }
 
+    /// Check if any status pages are configured
+    pub fn has_any_pages(&self) -> bool {
+        let config = self.config.read().unwrap();
+        !config.pages.is_empty()
+    }
+
     /// Get current status for a specific monitor
     pub fn monitor_status(&self, monitor_id: &str) -> MonitorStatus {
         let results = self.results.read().unwrap();

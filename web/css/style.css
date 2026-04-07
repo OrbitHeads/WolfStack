@@ -2818,6 +2818,9 @@ body.sidebar-collapsed #task-log-footer {
     opacity: 1;
 }
 
+/* Mobile-only elements: hidden on desktop, shown in mobile media query */
+.mobile-only { display: none; }
+
 /* ─── Tablet (1024px) ─── */
 @media (max-width: 1024px) {
     .sidebar {
@@ -2890,6 +2893,13 @@ body.sidebar-collapsed #task-log-footer {
 
     #task-log-footer {
         left: 0 !important;
+        display: none !important;
+    }
+
+    #task-log-footer.mobile-visible {
+        display: flex !important;
+        height: 50vh !important;
+        max-height: 50vh;
     }
 
     body.sidebar-collapsed .main-content {
@@ -2908,9 +2918,14 @@ body.sidebar-collapsed #task-log-footer {
         white-space: nowrap;
     }
 
-    /* Hide entire actions bar on mobile — all children are hidden anyway */
+    /* Hide top bar actions on mobile — task log toggle is in the sidebar instead */
     .top-bar-actions {
         display: none !important;
+    }
+
+    /* Show mobile-only elements */
+    .mobile-only {
+        display: inline-flex !important;
     }
 
     /* Page content compact */

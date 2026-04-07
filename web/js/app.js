@@ -7287,6 +7287,8 @@ function loadTaskLog() {
 }
 
 function showTaskLog() {
+    // On mobile, task log is hidden by CSS — use toggleTaskLogMobile() instead
+    if (isMobileView()) return;
     const footer = document.getElementById('task-log-footer');
     if (footer) { footer.style.display = 'flex'; _taskLogVisible = true; }
     updateTaskLogToggleBtn();
@@ -7312,6 +7314,22 @@ function toggleTaskLogVisible() {
         localStorage.removeItem('wolfstack_tasklog_closed');
         showTaskLog();
     }
+}
+
+// Mobile task log toggle — shows/hides the task log panel on mobile
+function toggleTaskLogMobile() {
+    const footer = document.getElementById('task-log-footer');
+    if (!footer) return;
+    if (footer.classList.contains('mobile-visible')) {
+        footer.classList.remove('mobile-visible');
+        _taskLogVisible = false;
+    } else {
+        footer.classList.add('mobile-visible');
+        _taskLogVisible = true;
+        renderTaskLog();
+    }
+    closeSidebarMobile();
+    updateContentPadding();
 }
 
 function updateTaskLogToggleBtn() {
@@ -9311,12 +9329,27 @@ function tomlToggleRaw(component, displayName) {
 }
 
 // ─── Polling Loop ───
-const POLL_INTERVAL = isMobileView() ? 60000 : 15000;
+// Fast poll: datacenter/dashboard views need frequent node updates for charts/sparklines
+// Slow poll: other views only need sidebar dots (online/offline) kept current
+const POLL_FAST = isMobileView() ? 30000 : 15000;
+const POLL_SLOW = isMobileView() ? 120000 : 60000;
+let _currentPollSpeed = 'fast';
 fetchNodes();
 fetchMetricsHistory(); // Initial history load
 loadTaskLog(); // Restore task log from localStorage
 checkWolfNoteTopBar(); // Show WolfNote button if connected
-setInterval(fetchNodes, POLL_INTERVAL);
+setInterval(() => {
+    // Only poll at full speed when viewing datacenter/dashboard (charts, sparklines)
+    // Other views get a slower tick just to keep sidebar dots accurate
+    const needsFast = (currentPage === 'datacenter' || currentPage === 'dashboard');
+    if (needsFast || _currentPollSpeed === 'slow') fetchNodes();
+    // On slow tick, skip if we're not due yet
+    _currentPollSpeed = needsFast ? 'fast' : 'slow';
+}, POLL_FAST);
+// Slow background poll for when user is on other pages
+setInterval(() => {
+    if (_currentPollSpeed === 'slow') fetchNodes();
+}, POLL_SLOW);
 // Load k8s cluster data for sidebar badges (non-blocking)
 (async () => {
     try {
@@ -9325,8 +9358,10 @@ setInterval(fetchNodes, POLL_INTERVAL);
     } catch(e) {}
     refreshK8sPodBadgeCounts();
 })();
-// Refresh k8s badge counts every 120 seconds
-setInterval(() => refreshK8sPodBadgeCounts(), 120000);
+// Refresh k8s badge counts only when viewing datacenter or k8s pages
+setInterval(() => {
+    if (currentPage === 'datacenter' || currentPage === 'kubernetes') refreshK8sPodBadgeCounts();
+}, 120000);
 
 // ─── Alert Log Polling (surfaces scan alerts to Tasks window) ───
 let _lastAlertId = 0;
@@ -9350,9 +9385,9 @@ async function pollAlerts() {
         }
     } catch (e) { /* ignore fetch errors */ }
 }
-// Poll every 30 seconds, first poll after 10s
+// Poll every 60 seconds, first poll after 10s — only when task log is visible
 setTimeout(pollAlerts, 10000);
-setInterval(pollAlerts, 30000);
+setInterval(() => { if (_taskLogVisible) pollAlerts(); }, 60000);
 
 // ─── Container Management ───
 
