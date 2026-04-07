@@ -1140,6 +1140,7 @@ function selectServerView(nodeId, view) {
     if (lxcPollTimer) { clearInterval(lxcPollTimer); lxcPollTimer = null; }
     if (containerPollTimer) { clearInterval(containerPollTimer); containerPollTimer = null; }
     if (_procPollTimer) { clearInterval(_procPollTimer); _procPollTimer = null; }
+    if (_svcPollTimer) { clearInterval(_svcPollTimer); _svcPollTimer = null; }
     if (view === 'dashboard') {
         // Clear history for new server view to show fresh data
         cpuHistory = [];
@@ -1160,8 +1161,9 @@ function selectServerView(nodeId, view) {
 
         // If it's the local node (is_self), we could fetch history, but for now we'll build it live
         if (node?.is_self) fetchMetricsHistory();
-        // Start top-processes polling (only while on dashboard)
+        // Start top-processes and services polling (only while on dashboard)
         startProcessPolling();
+        startServicePolling();
     }
     if (view === 'components' || view === 'services') loadComponents().finally(() => hidePageLoadingOverlay(el));
     if (view === 'containers') loadDockerContainers().finally(() => hidePageLoadingOverlay(el));
@@ -2366,6 +2368,134 @@ async function killProcess(pid, name) {
     } catch(e) {
         alert('Failed to kill process: ' + e.message);
     }
+}
+
+// ─── Systemd Services (dashboard) ───
+
+let _svcPollTimer = null;
+
+function startServicePolling() {
+    fetchServices();
+    if (_svcPollTimer) clearInterval(_svcPollTimer);
+    _svcPollTimer = setInterval(() => {
+        if (currentPage !== 'dashboard') { clearInterval(_svcPollTimer); _svcPollTimer = null; return; }
+        fetchServices();
+    }, 30000);
+}
+
+async function fetchServices() {
+    try {
+        const resp = await fetch(apiUrl('/api/systemd'));
+        if (!resp.ok) return;
+        const services = await resp.json();
+        renderServices(services);
+    } catch(e) { /* silent */ }
+}
+
+function renderServices(services) {
+    const tbody = document.getElementById('services-table');
+    if (!tbody) return;
+    if (!services || services.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);text-align:center;padding:16px;">No services found</td></tr>';
+        return;
+    }
+    // Sort: active/running first, then failed, then inactive
+    services.sort((a, b) => {
+        const order = { 'running': 0, 'exited': 1, 'failed': 2, 'dead': 3 };
+        return (order[a.sub_state] ?? 4) - (order[b.sub_state] ?? 4);
+    });
+    tbody.innerHTML = services.map(s => {
+        const statusClass = s.sub_state === 'running' ? 'running'
+            : s.active === 'failed' ? 'stopped'
+            : s.sub_state === 'exited' ? 'paused'
+            : 'stopped';
+        const statusText = s.active === 'failed' ? 'failed' : s.sub_state;
+        const isRunning = s.sub_state === 'running';
+        const isFailed = s.active === 'failed';
+        const esc = s.name.replace(/'/g, "\\'");
+        return `<tr>
+            <td style="font-family:'JetBrains Mono',monospace;font-size:11px;">${s.name}</td>
+            <td><span class="badge ${statusClass}" style="font-size:10px;">${statusText}</span></td>
+            <td style="font-size:11px;color:var(--text-muted);">${s.enabled || '—'}</td>
+            <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--text-secondary);" title="${s.description}">${s.description}</td>
+            <td>
+                <div style="display:flex;gap:4px;">
+                    ${isRunning ? `
+                        <button class="btn btn-sm" onclick="serviceAction('${esc}','restart',this)" style="font-size:10px;padding:2px 8px;" title="Restart">↻</button>
+                        <button class="btn btn-sm" onclick="serviceAction('${esc}','stop',this)" style="font-size:10px;padding:2px 8px;color:#ef4444;border-color:rgba(239,68,68,0.3);" title="Stop">■</button>
+                    ` : `
+                        <button class="btn btn-sm" onclick="serviceAction('${esc}','start',this)" style="font-size:10px;padding:2px 8px;color:#22c55e;border-color:rgba(34,197,94,0.3);" title="Start">▶</button>
+                        ${isFailed ? `<button class="btn btn-sm" onclick="serviceAction('${esc}','restart',this)" style="font-size:10px;padding:2px 8px;" title="Restart">↻</button>` : ''}
+                    `}
+                </div>
+            </td>
+        </tr>`;
+    }).join('');
+}
+
+async function serviceAction(name, action, btn) {
+    if (action === 'stop' && !confirm('Stop service ' + name + '?')) return;
+
+    // Show spinner on button
+    const origHtml = btn.innerHTML;
+    btn.innerHTML = '<span style="display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,0.2);border-top-color:#fff;border-radius:50%;animation:spin 0.7s linear infinite;"></span>';
+    btn.disabled = true;
+
+    try {
+        const resp = await fetch(apiUrl('/api/systemd/' + encodeURIComponent(name) + '/action'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action }),
+        });
+        const data = await resp.json();
+        if (data.ok) {
+            showToast(action + ' ' + name + ': OK', 'success');
+            taskLog('Service ' + action + ': ' + name);
+            setTimeout(fetchServices, 500);
+        } else {
+            // Show error modal with diagnostics
+            showServiceErrorModal(name, action, data);
+        }
+    } catch(e) {
+        showServiceErrorModal(name, action, { error: e.message });
+    }
+    btn.innerHTML = origHtml;
+    btn.disabled = false;
+}
+
+function showServiceErrorModal(name, action, data) {
+    const modal = document.createElement('div');
+    modal.className = 'modal-backdrop';
+    modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:20000;display:flex;align-items:center;justify-content:center;';
+    const statusText = (data.status || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const journalText = (data.journal || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const errorText = (data.error || 'Unknown error').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    modal.innerHTML = `
+        <div class="modal" style="width:700px;max-width:95vw;max-height:85vh;display:flex;flex-direction:column;border-radius:12px;background:var(--bg-secondary);border:1px solid var(--border-color);">
+            <div class="modal-header" style="padding:16px 20px;border-bottom:1px solid var(--border-color);display:flex;justify-content:space-between;align-items:center;">
+                <h3 style="margin:0;font-size:15px;color:#ef4444;">Failed to ${action} ${name}</h3>
+                <button onclick="this.closest('.modal-backdrop').remove()" style="background:none;border:none;color:var(--text-muted);font-size:20px;cursor:pointer;">&times;</button>
+            </div>
+            <div class="modal-body" style="padding:20px;overflow-y:auto;flex:1;">
+                <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);border-radius:8px;padding:12px;margin-bottom:16px;">
+                    <strong style="font-size:12px;color:#ef4444;">Error</strong>
+                    <pre style="margin:6px 0 0;font-size:12px;white-space:pre-wrap;color:var(--text-primary);font-family:'JetBrains Mono',monospace;">${errorText}</pre>
+                </div>
+                ${statusText ? `
+                <div style="margin-bottom:16px;">
+                    <strong style="font-size:12px;color:var(--text-secondary);">Service Status</strong>
+                    <pre style="margin:6px 0 0;padding:12px;background:var(--bg-tertiary);border-radius:6px;font-size:11px;white-space:pre-wrap;color:var(--text-primary);font-family:'JetBrains Mono',monospace;max-height:200px;overflow-y:auto;">${statusText}</pre>
+                </div>` : ''}
+                ${journalText ? `
+                <div>
+                    <strong style="font-size:12px;color:var(--text-secondary);">Journal (last 30 lines)</strong>
+                    <pre style="margin:6px 0 0;padding:12px;background:var(--bg-tertiary);border-radius:6px;font-size:11px;white-space:pre-wrap;color:var(--text-primary);font-family:'JetBrains Mono',monospace;max-height:250px;overflow-y:auto;">${journalText}</pre>
+                </div>` : ''}
+            </div>
+        </div>
+    `;
+    modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+    document.body.appendChild(modal);
 }
 
 // ─── Enhanced Canvas Charts ───

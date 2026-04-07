@@ -788,6 +788,135 @@ pub async fn kill_process(req: HttpRequest, state: web::Data<AppState>, path: we
     }
 }
 
+// ─── Systemd Services ───
+
+#[derive(Serialize)]
+struct SystemdService {
+    name: String,
+    description: String,
+    active: String,    // "active", "inactive", "failed", etc.
+    sub_state: String, // "running", "dead", "exited", "failed", etc.
+    enabled: String,   // "enabled", "disabled", "static", "masked", etc.
+}
+
+/// GET /api/services — list systemd services
+pub async fn list_services(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let services = tokio::task::spawn_blocking(|| {
+        let output = std::process::Command::new("systemctl")
+            .args(["list-units", "--type=service", "--all", "--no-pager", "--no-legend"])
+            .output();
+        let mut result = Vec::new();
+        if let Ok(out) = output {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() < 4 { continue; }
+                let name = parts[0].trim_end_matches(".service").to_string();
+                // Skip internal systemd units that clutter the list
+                if name.starts_with("systemd-") || name.starts_with("init") || name == "-.mount" { continue; }
+                let active = parts[2].to_string();
+                let sub = parts[3].to_string();
+                let desc = if parts.len() > 4 { parts[4..].join(" ") } else { String::new() };
+                result.push(SystemdService {
+                    name,
+                    description: desc,
+                    active,
+                    sub_state: sub,
+                    enabled: String::new(), // filled below
+                });
+            }
+        }
+        // Get enabled/disabled status
+        let enabled_output = std::process::Command::new("systemctl")
+            .args(["list-unit-files", "--type=service", "--no-pager", "--no-legend"])
+            .output();
+        if let Ok(out) = enabled_output {
+            let enabled_map: std::collections::HashMap<String, String> = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|line| {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        Some((parts[0].trim_end_matches(".service").to_string(), parts[1].to_string()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for svc in &mut result {
+                if let Some(state) = enabled_map.get(&svc.name) {
+                    svc.enabled = state.clone();
+                }
+            }
+        }
+        result
+    }).await.unwrap_or_default();
+    HttpResponse::Ok().json(services)
+}
+
+#[derive(Deserialize)]
+pub struct SystemdActionRequest {
+    pub action: String,
+}
+
+/// POST /api/services/{name}/action — start/stop/restart/enable/disable a systemd service
+pub async fn systemd_service_action(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<SystemdActionRequest>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let name = path.into_inner();
+    let action = body.action.clone();
+
+    // Validate action
+    if !["start", "stop", "restart", "enable", "disable"].contains(&action.as_str()) {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": format!("Unknown action: {}", action)}));
+    }
+    // Validate service name (prevent injection)
+    if !name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '@' || c == '.') {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "Invalid service name"}));
+    }
+
+    let svc_name = format!("{}.service", name);
+    let act = action.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let output = std::process::Command::new("systemctl")
+            .args([&act, &svc_name])
+            .output();
+        match output {
+            Ok(o) => {
+                let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+                (o.status.success(), stdout, stderr)
+            }
+            Err(e) => (false, String::new(), format!("Failed to execute: {}", e)),
+        }
+    }).await.unwrap_or((false, String::new(), "Task failed".to_string()));
+
+    if result.0 {
+        HttpResponse::Ok().json(serde_json::json!({"ok": true, "message": format!("{} {}", action, name)}))
+    } else {
+        // On failure, also grab the service status/journal for diagnostics
+        let svc_name2 = format!("{}.service", name);
+        let diagnostics = tokio::task::spawn_blocking(move || {
+            let status = std::process::Command::new("systemctl")
+                .args(["status", &svc_name2, "--no-pager", "-l"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            let journal = std::process::Command::new("journalctl")
+                .args(["-u", &svc_name2, "--no-pager", "-n", "30", "--no-hostname"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            (status, journal)
+        }).await.unwrap_or_default();
+
+        HttpResponse::Ok().json(serde_json::json!({
+            "ok": false,
+            "error": result.2.trim(),
+            "status": diagnostics.0,
+            "journal": diagnostics.1,
+        }))
+    }
+}
+
 /// GET /api/nodes — all cluster nodes
 pub async fn get_nodes(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
@@ -15072,6 +15201,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/metrics/history", web::get().to(get_metrics_history))
         .route("/api/metrics/processes", web::get().to(get_top_processes))
         .route("/api/metrics/processes/{pid}/kill", web::post().to(kill_process))
+        .route("/api/systemd", web::get().to(list_services))
+        .route("/api/systemd/{name}/action", web::post().to(systemd_service_action))
         .route("/api/auth/join-token", web::get().to(get_join_token))
         // Cluster
         .route("/api/cluster/verify-token", web::get().to(verify_join_token))
