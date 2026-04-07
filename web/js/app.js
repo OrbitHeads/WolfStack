@@ -21777,6 +21777,29 @@ function addPluginNavItem(manifest) {
             iconRow.appendChild(item);
         }
     }
+
+    // Add as a settings tab (appears inside Settings page, before Plugins tab)
+    if (menu.section === 'settings') {
+        const tabId = `plugin-${menu.view}`;
+        // Add tab button before the Plugins tab
+        const tabBar = document.querySelector('.settings-tab-btn[onclick*="plugins"]');
+        if (tabBar && !document.querySelector(`.settings-tab-btn[onclick*="${tabId}"]`)) {
+            const btn = document.createElement('button');
+            btn.className = 'settings-tab-btn';
+            btn.setAttribute('onclick', `switchSettingsTab('${tabId}')`);
+            btn.textContent = `${manifest.icon || '🔌'} ${menu.label}`;
+            tabBar.parentElement.insertBefore(btn, tabBar);
+        }
+        // Add tab panel
+        const panelsParent = document.getElementById('settings-tab-plugins')?.parentElement;
+        if (panelsParent && !document.getElementById(`settings-tab-${tabId}`)) {
+            const panel = document.createElement('div');
+            panel.id = `settings-tab-${tabId}`;
+            panel.className = 'settings-tab-panel';
+            panel.innerHTML = `<div id="${tabId}-content" style="padding:4px;">Loading plugin...</div>`;
+            panelsParent.insertBefore(panel, document.getElementById('settings-tab-plugins'));
+        }
+    }
 }
 
 // Load plugins on startup
