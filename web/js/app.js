@@ -53,9 +53,13 @@ if (localStorage.getItem('wolfstack_sidebar_collapsed') === '1') {
     document.body.classList.add('sidebar-collapsed');
 }
 
-// Clean up mobile sidebar state on resize to desktop
+// Clean up mobile sidebar state on resize to desktop (debounced)
+let _resizeTimer = null;
 window.addEventListener('resize', () => {
-    if (!isMobileView()) closeSidebarMobile();
+    if (_resizeTimer) clearTimeout(_resizeTimer);
+    _resizeTimer = setTimeout(() => {
+        if (!isMobileView()) closeSidebarMobile();
+    }, 200);
 });
 
 // ─── Map Collapse Toggle ───
@@ -2641,12 +2645,15 @@ function drawMultiLineChart(canvasId, legendId, historyMap) {
         return;
     }
 
+    let _chartHoverRaf = null;
     document.addEventListener('mousemove', e => {
         const canvas = e.target.closest('canvas');
         if (!canvas || !canvas._chartMeta) {
             tooltip.style.display = 'none';
             return;
         }
+        if (_chartHoverRaf) return; // throttle to animation frame rate
+        _chartHoverRaf = requestAnimationFrame(() => { _chartHoverRaf = null; });
         const meta = canvas._chartMeta;
         const cRect = canvas.getBoundingClientRect();
         const mx = e.clientX - cRect.left;
@@ -9304,7 +9311,7 @@ function tomlToggleRaw(component, displayName) {
 }
 
 // ─── Polling Loop ───
-const POLL_INTERVAL = isMobileView() ? 30000 : 10000;
+const POLL_INTERVAL = isMobileView() ? 60000 : 15000;
 fetchNodes();
 fetchMetricsHistory(); // Initial history load
 loadTaskLog(); // Restore task log from localStorage
@@ -9318,8 +9325,8 @@ setInterval(fetchNodes, POLL_INTERVAL);
     } catch(e) {}
     refreshK8sPodBadgeCounts();
 })();
-// Refresh k8s badge counts every 60 seconds
-setInterval(() => refreshK8sPodBadgeCounts(), 60000);
+// Refresh k8s badge counts every 120 seconds
+setInterval(() => refreshK8sPodBadgeCounts(), 120000);
 
 // ─── Alert Log Polling (surfaces scan alerts to Tasks window) ───
 let _lastAlertId = 0;
@@ -10869,11 +10876,10 @@ async function loadDockerContainers() {
     fetchContainerStatus();
 
     try {
-        // Fetch containers and stats in parallel
-        const [containersResp, statsResp, imagesResp] = await Promise.all([
+        // Fetch containers and stats in parallel (images fetched separately on tab click)
+        const [containersResp, statsResp] = await Promise.all([
             fetch(apiUrl('/api/containers/docker')),
             fetch(apiUrl('/api/containers/docker/stats')),
-            fetch(apiUrl('/api/containers/docker/images')),
         ]);
 
         // Discard response if user switched to a different server/page
@@ -10881,7 +10887,6 @@ async function loadDockerContainers() {
 
         const containers = await containersResp.json();
         const stats = await statsResp.json();
-        const images = await imagesResp.json();
 
         // Index stats by name
         dockerStats = {};
@@ -10889,7 +10894,13 @@ async function loadDockerContainers() {
 
         renderDockerContainers(containers);
         renderDockerStats(stats);
-        renderDockerImages(images);
+        // Load images only on initial page load (not on every poll)
+        try {
+            const imagesResp = await fetch(apiUrl('/api/containers/docker/images'));
+            if (gen === _dockerLoadGeneration && currentNodeId === loadNodeId) {
+                renderDockerImages(await imagesResp.json());
+            }
+        } catch(e) { /* images are non-critical */ }
         applyUpdateBadges();
         fetchContainerUpdateSummary();
     } catch (e) {
@@ -10898,7 +10909,7 @@ async function loadDockerContainers() {
 
     // Only set poll timer if we're still on this view/node
     if (gen === _dockerLoadGeneration && currentPage === 'containers') {
-        containerPollTimer = setInterval(refreshDockerStats, 5000);
+        containerPollTimer = setInterval(refreshDockerStats, isMobileView() ? 30000 : 15000);
     }
 }
 
@@ -11596,7 +11607,7 @@ async function loadLxcContainers() {
         lxcPollTimer = setInterval(async () => {
             if (currentPage !== 'lxc') { clearInterval(lxcPollTimer); lxcPollTimer = null; return; }
             loadLxcContainers();
-        }, 10000);
+        }, isMobileView() ? 30000 : 15000);
     }
 }
 
@@ -22923,12 +22934,12 @@ function showWolfRunPage(clusterName) {
 
     loadWolfRunServices();
 
-    // Auto-refresh every 10s
+    // Auto-refresh every 30s
     if (wolfrunRefreshTimer) clearInterval(wolfrunRefreshTimer);
     wolfrunRefreshTimer = setInterval(() => {
         if (currentPage === 'wolfrun') loadWolfRunServices();
         else clearInterval(wolfrunRefreshTimer);
-    }, 10000);
+    }, 30000);
 }
 
 // Build a WolfRun API URL that proxies through a cluster node when
@@ -26528,7 +26539,7 @@ async function openK8sCluster(clusterId) {
         } else {
             clearInterval(k8sRefreshTimer);
         }
-    }, 15000);
+    }, 30000);
 }
 
 async function renderK8sClusterDetail() {

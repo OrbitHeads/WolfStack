@@ -666,7 +666,10 @@ pub async fn run_checks(state: &Arc<StatusPageState>) {
                 run_ping_check(host, timeout).await
             }
             CheckType::Container { runtime, name, node_id: _ } => {
-                run_container_check(runtime, name)
+                let rt = runtime.clone();
+                let nm = name.clone();
+                tokio::task::spawn_blocking(move || run_container_check(&rt, &nm))
+                    .await.unwrap_or((false, Some("Check task failed".to_string())))
             }
             CheckType::Wolfrun { service_id, min_healthy, health_check, .. } => {
                 run_wolfrun_check(service_id, *min_healthy, health_check).await

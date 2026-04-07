@@ -2536,6 +2536,31 @@ pub async fn container_updates_apply(req: HttpRequest, state: web::Data<AppState
     }
 }
 
+/// POST /api/containers/{runtime}/{id}/exec — run a command inside a container
+pub async fn container_exec(req: HttpRequest, state: web::Data<AppState>, path: web::Path<(String, String)>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let (runtime, container) = path.into_inner();
+    let cmd = body["command"].as_str().unwrap_or("");
+    if cmd.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "No command provided"}));
+    }
+
+    let output = container_exec_cmd(&runtime, &container, &["sh", "-c", cmd]).output();
+    match output {
+        Ok(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+            HttpResponse::Ok().json(serde_json::json!({
+                "ok": o.status.success(),
+                "exit_code": o.status.code(),
+                "stdout": stdout,
+                "stderr": stderr,
+            }))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("Failed: {}", e)})),
+    }
+}
+
 // ─── Certbot API ───
 
 #[derive(Deserialize)]
@@ -2942,7 +2967,7 @@ pub async fn container_runtime_status(req: HttpRequest, state: web::Data<AppStat
 /// GET /api/containers/docker — list all Docker containers
 pub async fn docker_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    let containers = containers::docker_list_all();
+    let containers = containers::docker_list_all_cached();
     HttpResponse::Ok().json(containers)
 }
 
@@ -3313,14 +3338,14 @@ pub async fn wolfnet_routes_debug(req: HttpRequest, state: web::Data<AppState>) 
 /// GET /api/containers/docker/stats — Docker container stats
 pub async fn docker_stats(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    let stats = containers::docker_stats();
+    let stats = containers::docker_stats_cached();
     HttpResponse::Ok().json(stats)
 }
 
 /// GET /api/containers/docker/images — list Docker images
 pub async fn docker_images(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    let images = containers::docker_images();
+    let images = containers::docker_images_cached();
     HttpResponse::Ok().json(images)
 }
 
@@ -3448,14 +3473,14 @@ pub async fn docker_migrate(
 /// GET /api/containers/lxc — list all LXC containers
 pub async fn lxc_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    let containers = containers::lxc_list_all();
+    let containers = containers::lxc_list_all_cached();
     HttpResponse::Ok().json(containers)
 }
 
 /// GET /api/containers/lxc/stats — LXC container stats
 pub async fn lxc_stats(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    let stats = containers::lxc_stats();
+    let stats = containers::lxc_stats_cached();
     HttpResponse::Ok().json(stats)
 }
 
@@ -14980,6 +15005,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/containers/updates/summary", web::post().to(container_updates_summary))
         .route("/api/containers/{runtime}/{id}/updates/check", web::post().to(container_updates_check))
         .route("/api/containers/{runtime}/{id}/updates/apply", web::post().to(container_updates_apply))
+        .route("/api/containers/{runtime}/{id}/exec", web::post().to(container_exec))
         // Certificates
         .route("/api/certificates", web::post().to(request_certificate))
         .route("/api/certificates/list", web::get().to(list_certificates))

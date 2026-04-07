@@ -266,10 +266,107 @@ static LXC_COUNT_CACHE: Mutex<Option<(u32, Instant)>> = Mutex::new(None);
 
 const COUNT_CACHE_TTL_SECS: u64 = 5;
 
+// ─── Cached container list/stats/images ───
+// Avoid spawning dozens of subprocesses per API request.
+
+static DOCKER_LIST_CACHE: Mutex<Option<(Vec<ContainerInfo>, Instant)>> = Mutex::new(None);
+static DOCKER_STATS_CACHE: Mutex<Option<(Vec<ContainerStats>, Instant)>> = Mutex::new(None);
+static DOCKER_IMAGES_CACHE: Mutex<Option<(Vec<ContainerImage>, Instant)>> = Mutex::new(None);
+static LXC_LIST_CACHE: Mutex<Option<(Vec<ContainerInfo>, Instant)>> = Mutex::new(None);
+static LXC_STATS_CACHE: Mutex<Option<(Vec<ContainerStats>, Instant)>> = Mutex::new(None);
+
+const LIST_CACHE_TTL_SECS: u64 = 5;
+const IMAGES_CACHE_TTL_SECS: u64 = 60;
+
+/// Cached docker_list_all — reuses result for 5 seconds.
+pub fn docker_list_all_cached() -> Vec<ContainerInfo> {
+    {
+        let cache = DOCKER_LIST_CACHE.lock().unwrap();
+        if let Some((val, ts)) = &*cache {
+            if ts.elapsed().as_secs() < LIST_CACHE_TTL_SECS {
+                return val.clone();
+            }
+        }
+    }
+    let val = docker_list_all();
+    *DOCKER_LIST_CACHE.lock().unwrap() = Some((val.clone(), Instant::now()));
+    val
+}
+
+/// Cached docker_stats — reuses result for 5 seconds.
+pub fn docker_stats_cached() -> Vec<ContainerStats> {
+    {
+        let cache = DOCKER_STATS_CACHE.lock().unwrap();
+        if let Some((val, ts)) = &*cache {
+            if ts.elapsed().as_secs() < LIST_CACHE_TTL_SECS {
+                return val.clone();
+            }
+        }
+    }
+    let val = docker_stats();
+    *DOCKER_STATS_CACHE.lock().unwrap() = Some((val.clone(), Instant::now()));
+    val
+}
+
+/// Cached docker_images — reuses result for 60 seconds.
+pub fn docker_images_cached() -> Vec<ContainerImage> {
+    {
+        let cache = DOCKER_IMAGES_CACHE.lock().unwrap();
+        if let Some((val, ts)) = &*cache {
+            if ts.elapsed().as_secs() < IMAGES_CACHE_TTL_SECS {
+                return val.clone();
+            }
+        }
+    }
+    let val = docker_images();
+    *DOCKER_IMAGES_CACHE.lock().unwrap() = Some((val.clone(), Instant::now()));
+    val
+}
+
+/// Cached lxc_list_all — reuses result for 5 seconds.
+pub fn lxc_list_all_cached() -> Vec<ContainerInfo> {
+    {
+        let cache = LXC_LIST_CACHE.lock().unwrap();
+        if let Some((val, ts)) = &*cache {
+            if ts.elapsed().as_secs() < LIST_CACHE_TTL_SECS {
+                return val.clone();
+            }
+        }
+    }
+    let val = lxc_list_all();
+    *LXC_LIST_CACHE.lock().unwrap() = Some((val.clone(), Instant::now()));
+    val
+}
+
+/// Cached lxc_stats — reuses result for 5 seconds.
+pub fn lxc_stats_cached() -> Vec<ContainerStats> {
+    {
+        let cache = LXC_STATS_CACHE.lock().unwrap();
+        if let Some((val, ts)) = &*cache {
+            if ts.elapsed().as_secs() < LIST_CACHE_TTL_SECS {
+                return val.clone();
+            }
+        }
+    }
+    let val = lxc_stats();
+    *LXC_STATS_CACHE.lock().unwrap() = Some((val.clone(), Instant::now()));
+    val
+}
+
 /// Invalidate container count caches (call after create/delete operations).
 pub fn invalidate_count_caches() {
     *DOCKER_COUNT_CACHE.lock().unwrap() = None;
     *LXC_COUNT_CACHE.lock().unwrap() = None;
+}
+
+/// Invalidate all container list/stats caches (call after create/delete/start/stop).
+#[allow(dead_code)]
+pub fn invalidate_list_caches() {
+    *DOCKER_LIST_CACHE.lock().unwrap() = None;
+    *DOCKER_STATS_CACHE.lock().unwrap() = None;
+    *DOCKER_IMAGES_CACHE.lock().unwrap() = None;
+    *LXC_LIST_CACHE.lock().unwrap() = None;
+    *LXC_STATS_CACHE.lock().unwrap() = None;
 }
 
 /// Count Docker containers (cached for 5s).

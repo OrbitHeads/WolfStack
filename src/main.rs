@@ -395,10 +395,11 @@ async fn main() -> std::io::Result<()> {
             }
         });
 
-        // Background: clean up stale WolfNet kernel routes (every 30s, was every 10s)
+        // Background: clean up stale WolfNet kernel routes (every 60s)
+        // Only runs if WolfNet is configured (cleanup fn returns early if not)
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                tokio::time::sleep(Duration::from_secs(60)).await;
                 tokio::task::spawn_blocking(|| {
                     containers::cleanup_stale_wolfnet_routes();
                 }).await.ok();
