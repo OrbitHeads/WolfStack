@@ -809,11 +809,16 @@ pub async fn list_services(req: HttpRequest, state: web::Data<AppState>) -> Http
         let mut result = Vec::new();
         if let Ok(out) = output {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
+                // Strip leading bullet (● for failed units) and whitespace
+                let clean = line.trim_start_matches(|c: char| c == '●' || c.is_whitespace());
+                let parts: Vec<&str> = clean.split_whitespace().collect();
+                // Format: NAME.service LOAD ACTIVE SUB DESCRIPTION...
                 if parts.len() < 4 { continue; }
                 let name = parts[0].trim_end_matches(".service").to_string();
+                if name.is_empty() { continue; }
                 // Skip internal systemd units that clutter the list
-                if name.starts_with("systemd-") || name.starts_with("init") || name == "-.mount" { continue; }
+                if name.starts_with("systemd-") || name.starts_with("init-") || name == "-" { continue; }
+                // parts[1] = loaded/not-found, parts[2] = active/inactive/failed, parts[3] = running/dead/exited
                 let active = parts[2].to_string();
                 let sub = parts[3].to_string();
                 let desc = if parts.len() > 4 { parts[4..].join(" ") } else { String::new() };
