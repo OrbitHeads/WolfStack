@@ -3,7 +3,7 @@
 /* https://wolf.uk.com */
 
 /* WolfStack Dashboard — Premium Dark Theme */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Antonio:wght@400;500;600;700&display=swap');
 
 :root {
     --bg-primary: #0a0e1a;
@@ -777,44 +777,45 @@
 
 /* ─── Trek Theme — LCARS-inspired Star Trek aesthetic ─── */
 /* ─── LCARS Theme (Trek) ───
- * Authentic LCARS aesthetic: thick colored bar segments, pill shapes,
- * signature elbow corners, navy panel backgrounds, lavender/amber accents.
- * Reference: Star Trek TNG/DS9/VOY LCARS interface panels.
+ * Authentic LCARS (Library Computer Access/Retrieval System) aesthetic.
+ * Designed by Michael Okuda for Star Trek TNG/DS9/VOY.
+ * Font: Antonio (closest web match to Helvetica Ultra Compressed).
+ * All text uppercase. Colored bars on pure black void. 3px black gaps
+ * between bar segments. Pill-shaped buttons. Signature elbow corners.
  *
- * LCARS palette:
- *   Bars:  #CC6699 (mauve)  #CC99CC (lavender)  #FF9966 (peach)
- *          #FF9900 (amber)  #9999CC (periwinkle) #CC6666 (rose)
- *          #FFCC99 (tan)    #99CCFF (sky)        #6688CC (steel)
- *   BG:   #000000 (black)   #0C1120 (deep navy)  #182040 (panel navy)
- *   Text: #FF9900 (amber)   #CC99CC (lavender)    #99CCFF (sky)
+ * Canonical LCARS color palette (R,G,B are multiples of 0x33):
+ *   #CC6699 hopbush     #CC99CC lilac       #FFCC99 tanoi
+ *   #FF9900 amber       #9999CC blue-bell   #FF9966 orange-peel
+ *   #6688CC danub       #99CCFF anakiwa     #CC6666 chestnut-rose
+ *   #FFCC66 golden      #9999FF melrose     #CCDDFF periwinkle
  */
 [data-theme="trek"] {
     --bg-primary: #000000;
-    --bg-secondary: #0C0C1A;
-    --bg-card: #101828;
-    --bg-card-hover: #182040;
-    --bg-input: #080C18;
-    --bg-tertiary: #101828;
-    --border: #6688CC;
-    --border-light: #3A4468;
-    --text-primary: #CCDDFF;
-    --text-secondary: #9999CC;
-    --text-muted: #6672AA;
+    --bg-secondary: #000000;
+    --bg-card: #0C1120;
+    --bg-card-hover: #152040;
+    --bg-input: #060A14;
+    --bg-tertiary: #0C1120;
+    --border: #3344668;
+    --border-light: #2A3458;
+    --text-primary: #FF9900;
+    --text-secondary: #CC99CC;
+    --text-muted: #6688CC;
     --text: #CCDDFF;
     --accent: #FF9900;
     --accent-light: #FFCC66;
-    --accent-glow: rgba(255, 153, 0, 0.12);
+    --accent-glow: rgba(255, 153, 0, 0.08);
     --success: #99CCFF;
-    --success-bg: rgba(153, 204, 255, 0.08);
+    --success-bg: rgba(153, 204, 255, 0.06);
     --warning: #FF9900;
-    --warning-bg: rgba(255, 153, 0, 0.08);
+    --warning-bg: rgba(255, 153, 0, 0.06);
     --danger: #CC6666;
-    --danger-bg: rgba(204, 102, 102, 0.08);
+    --danger-bg: rgba(204, 102, 102, 0.06);
     --info: #9999CC;
-    --info-bg: rgba(153, 153, 204, 0.08);
-    --gradient-main: linear-gradient(135deg, #CC6699 0%, #FF9900 100%);
-    --gradient-success: linear-gradient(135deg, #6688CC 0%, #99CCFF 100%);
-    --gradient-danger: linear-gradient(135deg, #CC6666 0%, #FF8888 100%);
+    --info-bg: rgba(153, 153, 204, 0.06);
+    --gradient-main: linear-gradient(90deg, #CC6699, #FF9900);
+    --gradient-success: linear-gradient(90deg, #6688CC, #99CCFF);
+    --gradient-danger: linear-gradient(90deg, #CC6666, #FF9966);
     --shadow-sm: none;
     --shadow-md: none;
     --shadow-lg: none;
@@ -824,36 +825,62 @@
     --radius-lg: 0px;
 }
 
+/* ── Global LCARS typography ── */
 [data-theme="trek"] body {
-    font-family: 'Inter', 'Helvetica Neue', Arial, sans-serif;
+    font-family: 'Antonio', 'Helvetica Neue', Arial, sans-serif;
     background: #000000;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
 }
 
-/* ── Sidebar: LCARS bar column ── */
+[data-theme="trek"] h1, [data-theme="trek"] h2, [data-theme="trek"] h3,
+[data-theme="trek"] h4, [data-theme="trek"] h5, [data-theme="trek"] h6 {
+    font-family: 'Antonio', 'Helvetica Neue', Arial, sans-serif;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    font-weight: 700;
+}
+
+/* ── Sidebar: LCARS vertical bar column ── */
 [data-theme="trek"] .sidebar {
     background: #000000;
     border-right: none;
     box-shadow: none;
-    gap: 0;
 }
 
-/* Thick LCARS elbow connecting sidebar top to header */
-[data-theme="trek"] .sidebar::after {
+/* ─ LCARS Elbow: the iconic curved sweep at sidebar/header junction ─
+ * A colored block with a large outer radius and a black inner cutout.
+ * This is the single most recognizable LCARS element. */
+[data-theme="trek"] .sidebar::before {
     content: '';
     position: absolute;
     top: 0;
-    right: -24px;
-    width: 24px;
-    height: 72px;
+    right: -30px;
+    width: 30px;
+    height: 80px;
     background: #CC6699;
-    border-bottom-left-radius: 22px;
+    z-index: 200;
+}
+[data-theme="trek"] .sidebar::after {
+    content: '';
+    position: absolute;
+    top: 32px;
+    right: -30px;
+    width: 30px;
+    height: 48px;
+    background: #000;
+    border-top-left-radius: 20px;
+    z-index: 201;
 }
 
+/* Logo area — solid LCARS bar with rounded bottom-left (pill end) */
 [data-theme="trek"] .sidebar-logo {
     background: #CC6699;
-    border-bottom: 4px solid #000;
-    border-radius: 0 0 0 20px;
-    padding: 12px 16px;
+    border-bottom: 3px solid #000;
+    border-radius: 0;
+    padding: 10px 14px;
+    position: relative;
+    z-index: 1;
 }
 
 [data-theme="trek"] .sidebar-logo img {
@@ -862,82 +889,114 @@
 
 [data-theme="trek"] .sidebar-logo .version {
     color: #000;
+    font-family: 'Antonio', sans-serif;
     font-weight: 700;
+    font-size: 13px;
+    letter-spacing: 1px;
 }
 
+/* Nav container */
 [data-theme="trek"] .sidebar-nav {
     padding: 0;
-    gap: 0;
 }
 
-/* LCARS bar segment between sections */
 [data-theme="trek"] .sidebar-nav .nav-section {
     margin: 0;
     padding: 0;
 }
 
-[data-theme="trek"] .sidebar-nav .nav-section-title {
-    background: #9999CC;
-    color: #000;
-    font-weight: 700;
-    letter-spacing: 2px;
-    padding: 5px 16px;
-    margin: 0;
-    border-bottom: 3px solid #000;
-    border-radius: 0 0 0 16px;
-}
-
-/* The datacenter icon row */
+/* Datacenter icon row — solid colored LCARS bar */
 [data-theme="trek"] .sidebar-nav .nav-section:first-child {
     background: #CC99CC;
     padding: 6px 8px;
     border-bottom: 3px solid #000;
-    border-radius: 0 0 0 16px;
+    border-radius: 0 0 0 20px;
+    margin: 0;
 }
 
 [data-theme="trek"] .sidebar-nav .nav-section:first-child .nav-item {
-    background: rgba(0,0,0,0.25);
-    border-radius: 8px;
+    background: rgba(0,0,0,0.3);
+    border-radius: 10px;
+    border: none;
+}
+
+[data-theme="trek"] .sidebar-nav .nav-section:first-child .nav-item:hover {
+    background: rgba(0,0,0,0.5);
 }
 
 [data-theme="trek"] .sidebar-nav .nav-section:first-child .nav-item.active {
     background: #FF9900;
     box-shadow: none;
+    color: #000;
 }
 
 [data-theme="trek"] .sidebar-nav .nav-section:first-child .nav-item.active .icon {
     filter: brightness(0);
 }
 
-/* Nav items — LCARS-style bar segments */
+/* Section title — LCARS colored bar segment */
+[data-theme="trek"] .sidebar-nav .nav-section-title {
+    background: #9999CC;
+    color: #000;
+    font-family: 'Antonio', sans-serif;
+    font-weight: 700;
+    font-size: 13px;
+    letter-spacing: 2.5px;
+    padding: 4px 16px;
+    margin: 0;
+    border-bottom: 3px solid #000;
+    border-radius: 0 0 0 20px;
+}
+
+/* Search input */
+[data-theme="trek"] #sidebar-node-search {
+    background: #060A14 !important;
+    border: 2px solid #6688CC !important;
+    border-radius: 20px !important;
+    color: #CCDDFF !important;
+    margin: 6px 10px !important;
+    font-family: 'Antonio', sans-serif !important;
+    text-transform: uppercase !important;
+    letter-spacing: 1px !important;
+}
+
+/* Nav items */
 [data-theme="trek"] .nav-item {
     border-radius: 0;
-    padding: 4px 12px;
+    padding: 3px 12px;
     margin: 0;
     border-bottom: 2px solid #000;
-    color: #CCDDFF;
+    color: #CC99CC;
+    font-family: 'Antonio', sans-serif;
+    letter-spacing: 1px;
 }
 
 [data-theme="trek"] .nav-item:hover {
-    background: rgba(153, 153, 204, 0.15);
+    background: rgba(204, 153, 204, 0.1);
+    color: #FFCC99;
 }
 
 [data-theme="trek"] .nav-item.active {
-    background: rgba(255, 153, 0, 0.15);
+    background: rgba(255, 153, 0, 0.1);
     box-shadow: inset 4px 0 0 #FF9900;
+    color: #FF9900;
 }
 
-/* Server node headers — thick LCARS bars */
+/* Server node headers — thick LCARS colored bars */
 [data-theme="trek"] .server-node-header {
     background: #6688CC !important;
     color: #000 !important;
     border-bottom: 3px solid #000;
-    border-radius: 0 0 0 14px;
-    padding: 6px 12px !important;
+    border-radius: 0 0 0 16px;
+    padding: 5px 12px !important;
+    font-family: 'Antonio', sans-serif;
+    font-weight: 700;
+    letter-spacing: 1.5px;
 }
 
 [data-theme="trek"] .server-node-header * {
     color: #000 !important;
+    font-family: 'Antonio', sans-serif;
 }
 
 [data-theme="trek"] .server-node-header .server-dot {
@@ -946,25 +1005,31 @@
 
 [data-theme="trek"] .server-node-header .server-dot.online {
     background: #33FF33 !important;
+    box-shadow: 0 0 4px #33FF33;
 }
 
 [data-theme="trek"] .server-node-header .server-dot.offline {
     background: #CC6666 !important;
 }
 
-/* Child nav items under servers */
-[data-theme="trek"] .server-child-item {
-    border-bottom: 1px solid rgba(102, 136, 204, 0.15);
-    border-radius: 0;
+/* Alternating colors for different cluster headers */
+[data-theme="trek"] .server-tree-node:nth-child(even) > .server-node-header {
+    background: #CC99CC !important;
 }
 
-/* Search input in sidebar */
-[data-theme="trek"] #sidebar-node-search {
-    background: #101828 !important;
-    border: 2px solid #6688CC !important;
-    border-radius: 16px !important;
-    color: #CCDDFF !important;
-    margin: 8px 12px !important;
+[data-theme="trek"] .server-tree-node:nth-child(3n) > .server-node-header {
+    background: #FF9966 !important;
+}
+
+/* Server child items */
+[data-theme="trek"] .server-child-item {
+    border-bottom: 1px solid #111828;
+    border-radius: 0;
+    color: #9999CC;
+}
+
+[data-theme="trek"] .server-child-item:hover {
+    color: #FFCC99;
 }
 
 /* Sidebar footer */
@@ -973,8 +1038,16 @@
     border-top: none;
 }
 
+[data-theme="trek"] .sidebar-footer .copyright {
+    color: #6688CC;
+}
+
+[data-theme="trek"] .sidebar-footer .copyright a {
+    color: #CC99CC;
+}
+
 [data-theme="trek"] .sidebar-icon-buttons {
-    background: #CC99CC;
+    background: #FFCC99;
     border-radius: 20px 0 0 0;
     padding: 8px;
     margin: 0;
@@ -983,102 +1056,145 @@
 
 [data-theme="trek"] .sidebar-icon-buttons .btn {
     background: rgba(0,0,0,0.2);
-    border-radius: 8px;
+    border-radius: 10px;
     border: none;
+    color: #000;
 }
 
 [data-theme="trek"] .sidebar-icon-buttons .btn:hover {
     background: #FF9900;
+    color: #000;
 }
 
-/* ── Top Bar: LCARS header strip ── */
+/* ── Top Bar: LCARS header ── */
 [data-theme="trek"] .top-bar {
     background: #000;
     border-bottom: none;
-    padding-left: 32px;
+    padding-left: 40px;
     position: relative;
 }
 
-/* LCARS colored strip under the header */
+/* Thick multi-segment LCARS colored strip under header */
 [data-theme="trek"] .top-bar::after {
     content: '';
     position: absolute;
     bottom: 0;
     left: 0;
     right: 0;
-    height: 6px;
+    height: 8px;
     background: linear-gradient(90deg,
-        #CC6699 0%, #CC6699 15%,
-        #000 15%, #000 16%,
-        #9999CC 16%, #9999CC 40%,
-        #000 40%, #000 41%,
-        #FF9966 41%, #FF9966 55%,
-        #000 55%, #000 56%,
-        #CC99CC 56%, #CC99CC 100%
+        #CC6699 0%, #CC6699 12%,
+        #000 12%, #000 12.5%,
+        #9999CC 12.5%, #9999CC 35%,
+        #000 35%, #000 35.5%,
+        #FF9966 35.5%, #FF9966 52%,
+        #000 52%, #000 52.5%,
+        #CC99CC 52.5%, #CC99CC 72%,
+        #000 72%, #000 72.5%,
+        #FFCC99 72.5%, #FFCC99 100%
     );
 }
 
 [data-theme="trek"] .top-bar h2 {
     color: #FF9900;
+    font-family: 'Antonio', sans-serif;
+    font-size: 22px;
     text-transform: uppercase;
-    letter-spacing: 2px;
+    letter-spacing: 3px;
     font-weight: 700;
 }
 
-/* ── Cards: LCARS panels ── */
+/* ── Main content area ── */
+[data-theme="trek"] .main-content {
+    background: #000;
+}
+
+/* ── Cards: LCARS data panels ── */
 [data-theme="trek"] .card,
 [data-theme="trek"] .stat-card {
-    background: #101828;
-    border: 2px solid #3A4468;
+    background: #0C1120;
+    border: 1px solid #1E2848;
     border-left: 6px solid #CC6699;
-    border-radius: 0 14px 14px 0;
+    border-radius: 0 12px 12px 0;
     box-shadow: none;
 }
 
 [data-theme="trek"] .card:hover,
 [data-theme="trek"] .stat-card:hover {
     border-left-color: #FF9900;
-    background: #182040;
+    background: #101828;
 }
 
 [data-theme="trek"] .card-header {
-    border-bottom: 2px solid #3A4468;
+    border-bottom: 2px solid #1E2848;
 }
 
 [data-theme="trek"] .card-header h3 {
     color: #CC99CC;
+    font-family: 'Antonio', sans-serif;
     text-transform: uppercase;
-    letter-spacing: 1px;
+    letter-spacing: 2px;
     font-weight: 700;
 }
 
+/* Alternating card left-border colors for visual variety */
+[data-theme="trek"] .card:nth-child(even) {
+    border-left-color: #9999CC;
+}
+
+[data-theme="trek"] .card:nth-child(3n) {
+    border-left-color: #FF9966;
+}
+
+[data-theme="trek"] .card:nth-child(4n) {
+    border-left-color: #FFCC99;
+}
+
+/* ── Stat cards: LCARS readout displays ── */
+[data-theme="trek"] .stat-card .stat-value,
+[data-theme="trek"] .stat-value {
+    font-family: 'Antonio', sans-serif;
+    color: #FFCC66;
+    font-weight: 700;
+    letter-spacing: 1px;
+}
+
+[data-theme="trek"] .stat-card .stat-label,
+[data-theme="trek"] .stat-label {
+    font-family: 'Antonio', sans-serif;
+    color: #9999CC;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+}
+
 /* ── Buttons: LCARS pill/capsule shapes ── */
+[data-theme="trek"] .btn {
+    border-radius: 20px;
+    border-color: #6688CC;
+    font-family: 'Antonio', sans-serif;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: #CC99CC;
+}
+
+[data-theme="trek"] .btn:hover {
+    border-color: #FF9900;
+    color: #FF9900;
+    background: rgba(255, 153, 0, 0.08);
+}
+
 [data-theme="trek"] .btn-primary {
     background: #CC6699;
     border: none;
     border-radius: 20px;
     color: #000;
     font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 1px;
 }
 
 [data-theme="trek"] .btn-primary:hover {
     background: #FF9900;
     color: #000;
-}
-
-[data-theme="trek"] .btn {
-    border-radius: 20px;
-    border-color: #6688CC;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-}
-
-[data-theme="trek"] .btn:hover {
-    border-color: #FF9900;
-    color: #FF9900;
 }
 
 [data-theme="trek"] .btn-secondary {
@@ -1090,6 +1206,7 @@
 
 [data-theme="trek"] .btn-secondary:hover {
     background: #FFCC99;
+    color: #000;
 }
 
 [data-theme="trek"] .btn-danger {
@@ -1098,75 +1215,92 @@
     border: none;
 }
 
-/* ── Nav items — active state ── */
-[data-theme="trek"] .nav-item.active {
-    background: rgba(255, 153, 0, 0.12);
-    box-shadow: inset 4px 0 0 #FF9900;
-    color: #FF9900;
+[data-theme="trek"] .btn-danger:hover {
+    background: #FF9966;
+    color: #000;
 }
 
 /* ── Modals: LCARS framed panels ── */
-[data-theme="trek"] .modal-content {
-    border: 3px solid #CC6699;
-    border-radius: 0 20px 20px 0;
-    border-left-width: 8px;
-    box-shadow: 0 0 60px rgba(0,0,0,0.9);
+[data-theme="trek"] .modal-content,
+[data-theme="trek"] .modal {
+    border: 2px solid #1E2848;
+    border-left: 8px solid #CC6699;
+    border-radius: 0 16px 16px 0;
+    box-shadow: 0 0 80px rgba(0,0,0,0.95);
+    background: #0C1120;
 }
 
 [data-theme="trek"] .modal-header {
-    border-bottom: 2px solid #3A4468;
+    border-bottom: 2px solid #1E2848;
 }
 
 [data-theme="trek"] .modal-header h3,
 [data-theme="trek"] .modal-header h2 {
     color: #FF9900;
+    font-family: 'Antonio', sans-serif;
     text-transform: uppercase;
-    letter-spacing: 1px;
+    letter-spacing: 2px;
 }
 
 /* ── Form inputs ── */
 [data-theme="trek"] input,
 [data-theme="trek"] select,
-[data-theme="trek"] textarea {
+[data-theme="trek"] textarea,
+[data-theme="trek"] .form-control {
     border-radius: 10px;
-    border: 2px solid #3A4468;
-    background: #080C18;
+    border: 2px solid #2A3458;
+    background: #060A14;
     color: #CCDDFF;
+    font-family: 'Antonio', sans-serif;
+    letter-spacing: 0.5px;
 }
 
 [data-theme="trek"] input:focus,
 [data-theme="trek"] select:focus,
-[data-theme="trek"] textarea:focus {
+[data-theme="trek"] textarea:focus,
+[data-theme="trek"] .form-control:focus {
     border-color: #CC99CC;
-    box-shadow: 0 0 0 2px rgba(204, 153, 204, 0.2);
+    box-shadow: 0 0 0 2px rgba(204, 153, 204, 0.15);
 }
 
-/* ── Tables ── */
+/* ── Tables: LCARS data readout ── */
+[data-theme="trek"] .data-table {
+    border: 1px solid #1E2848;
+}
+
 [data-theme="trek"] .data-table thead {
-    background: #182040;
+    background: #101828;
     border-bottom: 3px solid #CC6699;
 }
 
 [data-theme="trek"] .data-table thead th {
     color: #CC99CC;
+    font-family: 'Antonio', sans-serif;
     text-transform: uppercase;
-    letter-spacing: 1px;
+    letter-spacing: 2px;
     font-weight: 700;
+    font-size: 12px;
 }
 
 [data-theme="trek"] .data-table tbody tr {
-    border-bottom: 1px solid #1E2848;
+    border-bottom: 1px solid #111828;
 }
 
 [data-theme="trek"] .data-table tbody tr:hover {
-    background: rgba(102, 136, 204, 0.08);
+    background: rgba(102, 136, 204, 0.06);
+}
+
+[data-theme="trek"] .data-table tbody td {
+    color: #99CCFF;
+    font-family: 'Antonio', sans-serif;
+    letter-spacing: 0.5px;
 }
 
 /* ── Progress bars ── */
 [data-theme="trek"] .progress-bar {
-    background: #0C1020;
+    background: #060A14;
     border-radius: 10px;
-    border: 1px solid #3A4468;
+    border: 1px solid #2A3458;
 }
 
 [data-theme="trek"] .progress-bar .fill {
@@ -1181,22 +1315,22 @@
 [data-theme="trek"] .log-viewer {
     background: #000000;
     color: #99CCFF;
-    border: 2px solid #3A4468;
+    border: 1px solid #1E2848;
     border-left: 6px solid #6688CC;
     border-radius: 0 10px 10px 0;
+    font-family: 'JetBrains Mono', monospace;
 }
 
 /* ── Stat icons ── */
 [data-theme="trek"] .stat-icon {
     border-radius: 50%;
-    background: rgba(204, 153, 204, 0.15);
-    box-shadow: 0 0 12px rgba(204, 153, 204, 0.15);
+    background: rgba(153, 153, 204, 0.1);
 }
 
 /* ── Status dots ── */
 [data-theme="trek"] .server-dot.online {
     background: #33FF33;
-    box-shadow: 0 0 6px rgba(51, 255, 51, 0.4);
+    box-shadow: 0 0 5px rgba(51, 255, 51, 0.5);
 }
 
 /* ── Selection ── */
@@ -1212,14 +1346,15 @@
 }
 
 [data-theme="trek"] ::-webkit-scrollbar-track {
-    background: #080C18;
+    background: #060A14;
 }
 
 /* ── Sidebar toggle button ── */
 [data-theme="trek"] .sidebar-toggle {
-    border-color: #6688CC;
+    border: 2px solid #6688CC;
     color: #CC99CC;
     border-radius: 20px;
+    font-family: 'Antonio', sans-serif;
 }
 
 [data-theme="trek"] .sidebar-toggle:hover {
@@ -1230,26 +1365,51 @@
 
 /* ── Task log footer ── */
 [data-theme="trek"] #task-log-footer {
-    background: #0C0C1A;
-    border-top: 4px solid #CC6699;
+    background: #000;
+    border-top: 3px solid #CC6699;
 }
 
 /* ── Datacenter compact cards ── */
 [data-theme="trek"] .dc-compact-card {
-    border-radius: 0 14px 14px 0 !important;
+    border-radius: 0 12px 12px 0 !important;
+}
+
+/* ── Datacenter cluster headers ── */
+[data-theme="trek"] .dc-cluster-card {
+    border-left-color: #9999CC;
 }
 
 /* ── Toast notifications ── */
 [data-theme="trek"] .toast {
-    border-radius: 0 14px 14px 0;
-    border-left: 6px solid;
-    background: #101828 !important;
-    border: 2px solid #3A4468;
+    border-radius: 0 12px 12px 0;
+    border: 1px solid #1E2848;
+    background: #0C1120 !important;
 }
 [data-theme="trek"] .toast.success { border-left: 6px solid #99CCFF; }
 [data-theme="trek"] .toast.error { border-left: 6px solid #CC6666; }
 [data-theme="trek"] .toast.warning { border-left: 6px solid #FF9900; }
 [data-theme="trek"] .toast.info { border-left: 6px solid #9999CC; }
+
+/* ── Update banner ── */
+[data-theme="trek"] #update-banner {
+    background: rgba(255, 153, 0, 0.15) !important;
+    border-color: #FF9900 !important;
+    border-radius: 20px !important;
+    font-family: 'Antonio', sans-serif;
+    letter-spacing: 1px;
+}
+
+/* ── AI chat bubble ── */
+[data-theme="trek"] #ai-chat-bubble {
+    background: #CC6699 !important;
+    border: none !important;
+}
+
+[data-theme="trek"] #ai-chat-panel {
+    border: 2px solid #CC6699 !important;
+    border-radius: 0 16px 16px 0 !important;
+    background: #0C1120 !important;
+}
 
 /* ─── Monochrome Icons ─── */
 [data-mono-icons] .icon,
