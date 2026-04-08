@@ -1021,15 +1021,33 @@
     background: #FF9966 !important;
 }
 
-/* Server child items */
+/* Server node children container — solid LCARS panel block */
+[data-theme="trek"] .server-node-children {
+    background: #152040;
+    border-left: 4px solid #9999CC;
+    margin-left: 0;
+    padding-left: 8px;
+    border-bottom: 3px solid #000;
+    border-radius: 0 0 0 12px;
+}
+
+/* Server child items — solid background, not transparent */
 [data-theme="trek"] .server-child-item {
-    border-bottom: 1px solid #111828;
+    background: #152040;
+    border-bottom: 1px solid #1E2848;
     border-radius: 0;
-    color: #9999CC;
+    color: #99CCFF;
 }
 
 [data-theme="trek"] .server-child-item:hover {
+    background: #1E2848;
     color: #FFCC99;
+}
+
+[data-theme="trek"] .server-child-item.active,
+[data-theme="trek"] .server-node-children .nav-item.active {
+    background: rgba(255, 153, 0, 0.12);
+    color: #FF9900;
 }
 
 /* Sidebar footer */
@@ -1105,8 +1123,10 @@
 }
 
 /* ── Main content area ── */
+/* Main content: transparent so user's custom background image shows through.
+ * The dc-bg-overlay div sits at z-index:-1 behind this. */
 [data-theme="trek"] .main-content {
-    background: #000;
+    background: transparent;
 }
 
 /* ── Cards: LCARS data panels ── */
