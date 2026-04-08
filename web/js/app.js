@@ -3382,7 +3382,7 @@ async function discoverLibvirtVms() {
                 <div class="modal-header"><h3>Adopt Existing VMs</h3></div>
                 <div class="modal-body">
                     <p style="color:var(--text-muted); margin-bottom:12px;">
-                        Found <strong>${vms.length}</strong> VM(s) in libvirt.
+                        Found <strong>${vms.length}</strong> VM(s) in libvirt. VMs stay running under libvirt — WolfStack manages them alongside.
                         ${managed.length > 0 ? `<br><small>${managed.length} already managed by WolfStack.</small>` : ''}
                     </p>`;
 
@@ -3390,9 +3390,6 @@ async function discoverLibvirtVms() {
             html += `<p style="text-align:center; padding:20px; color:var(--text-muted);">All discovered VMs are already managed by WolfStack.</p>`;
         } else {
             html += `
-                    <div style="margin-bottom:12px;">
-                        <label><input type="checkbox" id="adopt-undefine" checked> Remove from libvirt after adopting (keeps disk files)</label>
-                    </div>
                     <table class="data-table" style="width:100%;">
                         <thead><tr>
                             <th style="width:30px;"><input type="checkbox" id="adopt-select-all" onchange="document.querySelectorAll('.adopt-vm-cb').forEach(c=>c.checked=this.checked)" checked></th>
@@ -3446,7 +3443,6 @@ async function adoptSelectedVms() {
         return;
     }
 
-    const undefine = document.getElementById('adopt-undefine')?.checked ?? true;
     const names = Array.from(checkboxes).map(cb => cb.value);
 
     showToast(`Adopting ${names.length} VM(s)...`, 'info');
@@ -3458,7 +3454,7 @@ async function adoptSelectedVms() {
             const resp = await fetch(apiUrl('/api/vms/adopt-libvirt'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ name, undefine_from_libvirt: undefine })
+                body: JSON.stringify({ name })
             });
             const data = await resp.json();
             if (resp.ok) {

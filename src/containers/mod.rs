@@ -5392,6 +5392,17 @@ pub fn is_proxmox() -> bool {
     })
 }
 
+/// Detect if system has libvirt/virsh for VM management (but is NOT Proxmox)
+pub fn is_libvirt() -> bool {
+    static IS_LIBVIRT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *IS_LIBVIRT.get_or_init(|| {
+        if is_proxmox() { return false; } // Proxmox takes priority
+        Command::new("which").arg("virsh").output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+}
+
 /// PVE storage entry from `pvesm status`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PveStorage {

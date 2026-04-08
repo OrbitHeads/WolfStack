@@ -172,6 +172,10 @@ impl VmManager {
         if containers::is_proxmox() {
             return self.qm_list_all();
         }
+        // On libvirt, discover VMs via virsh
+        if containers::is_libvirt() {
+            return self.virsh_list_all();
+        }
 
         // Standalone: scan local config files
         let mut vms = Vec::new();
@@ -374,6 +378,10 @@ impl VmManager {
         // On Proxmox, delegate to qm create
         if containers::is_proxmox() {
             return self.qm_create(&config);
+        }
+        // On libvirt, delegate to virt-install
+        if containers::is_libvirt() {
+            return self.virsh_create(&config);
         }
 
         // Standalone: use QEMU directly
@@ -825,6 +833,27 @@ impl VmManager {
             }
             return Ok(());
         }
+        // On libvirt, delegate to virsh (VM must be stopped for most changes)
+        if containers::is_libvirt() {
+            if let Some(c) = cpus {
+                if c > 0 {
+                    let _ = Command::new("virsh").args(["setvcpus", name, &c.to_string(), "--config", "--maximum"]).output();
+                    let _ = Command::new("virsh").args(["setvcpus", name, &c.to_string(), "--config"]).output();
+                }
+            }
+            if let Some(m) = memory_mb {
+                if m >= 256 {
+                    let kb = (m as u64) * 1024;
+                    let _ = Command::new("virsh").args(["setmaxmem", name, &kb.to_string(), "--config"]).output();
+                    let _ = Command::new("virsh").args(["setmem", name, &kb.to_string(), "--config"]).output();
+                }
+            }
+            if let Some(a) = auto_start {
+                let val = if a { "--enable" } else { "--disable" };
+                let _ = Command::new("virsh").args(["autostart", name, val]).output();
+            }
+            return Ok(());
+        }
 
         if self.check_running(name) {
             return Err("Cannot edit VM while it is running. Stop it first.".to_string());
@@ -924,6 +953,16 @@ impl VmManager {
             }
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!("qm start failed: {}", stderr.trim()));
+        }
+        // On libvirt, delegate to virsh start
+        if containers::is_libvirt() {
+            let output = Command::new("virsh").args(["start", name]).output()
+                .map_err(|e| format!("Failed to run virsh start: {}", e))?;
+            if output.status.success() {
+                return Ok(());
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("virsh start failed: {}", stderr.trim()));
         }
 
         if self.check_running(name) {
@@ -1672,6 +1711,16 @@ impl VmManager {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!("qm stop failed: {}", stderr.trim()));
         }
+        // On libvirt, delegate to virsh destroy (immediate stop, like qm stop)
+        if containers::is_libvirt() {
+            let output = Command::new("virsh").args(["destroy", name]).output()
+                .map_err(|e| format!("Failed to run virsh destroy: {}", e))?;
+            if output.status.success() {
+                return Ok(());
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("virsh stop failed: {}", stderr.trim()));
+        }
 
         // Read config to get WolfNet IP for cleanup
         let config = self.get_vm(name);
@@ -1710,6 +1759,10 @@ impl VmManager {
         if containers::is_proxmox() {
             return self.qm_list_all().into_iter().find(|vm| vm.name == name);
         }
+        // On libvirt, get VM details via virsh
+        if containers::is_libvirt() {
+            return self.virsh_vm_to_config(name);
+        }
 
         let config_path = self.vm_config_path(name);
         let content = fs::read_to_string(&config_path).ok()?;
@@ -1738,6 +1791,25 @@ impl VmManager {
             }
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!("qm destroy failed: {}", stderr.trim()));
+        }
+        // On libvirt, delegate to virsh undefine
+        if containers::is_libvirt() {
+            // Stop first if running
+            let _ = Command::new("virsh").args(["destroy", name]).output();
+            // Undefine with --remove-all-storage to delete disk files
+            let output = Command::new("virsh").args(["undefine", name, "--remove-all-storage", "--nvram"]).output()
+                .map_err(|e| format!("Failed to run virsh undefine: {}", e))?;
+            if output.status.success() {
+                return Ok(());
+            }
+            // Retry without --nvram for non-UEFI VMs
+            let output2 = Command::new("virsh").args(["undefine", name, "--remove-all-storage"]).output()
+                .map_err(|e| format!("Failed to run virsh undefine: {}", e))?;
+            if output2.status.success() {
+                return Ok(());
+            }
+            let stderr = String::from_utf8_lossy(&output2.stderr);
+            return Err(format!("virsh undefine failed: {}", stderr.trim()));
         }
 
         if self.check_running(name) {
@@ -1797,6 +1869,174 @@ impl VmManager {
         let content = fs::read_to_string(&runtime_path).ok()?;
         let runtime: serde_json::Value = serde_json::from_str(&content).ok()?;
         runtime.get("vnc_ws_port").and_then(|v| v.as_u64()).map(|v| v as u16)
+    }
+
+    // ─── Libvirt VM Management (virsh) ───
+
+    /// List all VMs from libvirt via `virsh list --all`
+    fn virsh_list_all(&self) -> Vec<VmConfig> {
+        let output = match Command::new("virsh").args(["list", "--all", "--name"]).output() {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+            _ => return vec![],
+        };
+
+        output.lines()
+            .map(|l| l.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .filter_map(|name| self.virsh_vm_to_config(&name))
+            .collect()
+    }
+
+    /// Convert a libvirt VM into a VmConfig (used by list and get)
+    fn virsh_vm_to_config(&self, name: &str) -> Option<VmConfig> {
+        // dominfo for CPU, memory, state
+        let dominfo = Command::new("virsh").args(["dominfo", name]).output().ok()?;
+        let dominfo_text = String::from_utf8_lossy(&dominfo.stdout);
+
+        let mut cpus = 1u32;
+        let mut memory_kb = 1048576u64;
+        let mut running = false;
+        let mut auto_start = false;
+
+        for line in dominfo_text.lines() {
+            let parts: Vec<&str> = line.splitn(2, ':').collect();
+            if parts.len() != 2 { continue; }
+            let key = parts[0].trim();
+            let val = parts[1].trim();
+            match key {
+                "CPU(s)" => { cpus = val.parse().unwrap_or(1); }
+                "Max memory" => {
+                    memory_kb = val.split_whitespace().next()
+                        .and_then(|v| v.parse().ok()).unwrap_or(1048576);
+                }
+                "State" => { running = val.contains("running"); }
+                "Autostart" => { auto_start = val.contains("enable"); }
+                _ => {}
+            }
+        }
+
+        // Primary disk: first non-CDROM from domblklist
+        let blklist = Command::new("virsh").args(["domblklist", name, "--details"]).output().ok()?;
+        let blklist_text = String::from_utf8_lossy(&blklist.stdout);
+        let mut disk_size_gb = 0u32;
+        let mut disk_source = String::new();
+        let mut iso_path: Option<String> = None;
+
+        for line in blklist_text.lines().skip(2) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 4 { continue; }
+            let device = parts[1]; // disk, cdrom
+            let target = parts[2]; // vda, sda
+            let source = parts[3..].join(" ");
+            if source == "-" || source.is_empty() { continue; }
+
+            if device == "cdrom" {
+                iso_path = Some(source);
+            } else if disk_source.is_empty() {
+                disk_source = source;
+                disk_size_gb = disk_size_from_virsh(name, target).unwrap_or(0);
+            }
+        }
+
+        // MAC address from first NIC
+        let iflist = Command::new("virsh").args(["domiflist", name]).output().ok()?;
+        let iflist_text = String::from_utf8_lossy(&iflist.stdout);
+        let mut mac_address: Option<String> = None;
+        for line in iflist_text.lines().skip(2) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 5 {
+                mac_address = Some(parts[4].to_string());
+                break;
+            }
+        }
+
+        // VNC port for running VMs: virsh vncdisplay
+        let vnc_port = if running {
+            Command::new("virsh").args(["vncdisplay", name]).output().ok()
+                .and_then(|o| {
+                    let text = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    // Returns ":N" where port = 5900 + N
+                    text.strip_prefix(':').and_then(|n| n.parse::<u16>().ok()).map(|n| 5900 + n)
+                })
+        } else {
+            None
+        };
+
+        // Storage path from disk source directory
+        let storage_path = Path::new(&disk_source).parent()
+            .map(|p| p.to_string_lossy().to_string());
+
+        Some(VmConfig {
+            name: name.to_string(),
+            cpus,
+            memory_mb: (memory_kb / 1024) as u32,
+            disk_size_gb,
+            iso_path,
+            running,
+            vnc_port,
+            vnc_ws_port: None, // libvirt VMs don't use WebSocket VNC
+            mac_address,
+            auto_start,
+            wolfnet_ip: None,
+            storage_path,
+            os_disk_bus: "virtio".to_string(),
+            net_model: "virtio".to_string(),
+            drivers_iso: None,
+            import_image: None,
+            extra_disks: Vec::new(),
+            extra_nics: Vec::new(),
+            vmid: None,
+            bios_type: "seabios".to_string(),
+        })
+    }
+
+    /// Create a VM via libvirt (virt-install)
+    fn virsh_create(&self, config: &VmConfig) -> Result<(), String> {
+        let storage_dir = config.storage_path.as_deref().unwrap_or("/var/lib/libvirt/images");
+        let disk_path = format!("{}/{}.qcow2", storage_dir, config.name);
+
+        let mut args = vec![
+            "--name".to_string(), config.name.clone(),
+            "--vcpus".to_string(), config.cpus.to_string(),
+            "--memory".to_string(), config.memory_mb.to_string(),
+            "--disk".to_string(), format!("path={},size={},format=qcow2", disk_path, config.disk_size_gb),
+            "--os-variant".to_string(), "generic".to_string(),
+            "--graphics".to_string(), "vnc,listen=0.0.0.0".to_string(),
+            "--noautoconsole".to_string(),
+        ];
+
+        // Network: use default network
+        args.extend(["--network".to_string(), "default".to_string()]);
+
+        // Import image or ISO
+        if let Some(ref import) = config.import_image {
+            if !import.is_empty() {
+                args.extend(["--import".to_string()]);
+                // Replace the disk arg with the import image
+                if let Some(pos) = args.iter().position(|a| a.starts_with("path=")) {
+                    args[pos] = format!("path={},format=qcow2", import);
+                }
+            }
+        } else if let Some(ref iso) = config.iso_path {
+            if !iso.is_empty() {
+                args.extend(["--cdrom".to_string(), iso.clone()]);
+            }
+        } else {
+            args.push("--import".to_string());
+        }
+
+        if config.bios_type == "ovmf" {
+            args.extend(["--boot".to_string(), "uefi".to_string()]);
+        }
+
+        let output = Command::new("virt-install").args(&args).output()
+            .map_err(|e| format!("Failed to run virt-install: {}", e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("virt-install failed: {}", stderr.trim()));
+        }
+
+        Ok(())
     }
 
     // ─── Libvirt VM Discovery & Adoption ───
@@ -1859,7 +2099,7 @@ impl VmManager {
             let parts: Vec<&str> = line.split_whitespace().collect();
             // Format: Type  Device  Target  Source
             if parts.len() < 4 { continue; }
-            let dev_type = parts[0]; // file, block, etc.
+            let _dev_type = parts[0]; // file, block, etc.
             let device = parts[1];   // disk, cdrom
             let target = parts[2];   // vda, sda, hda
             let source = parts[3..].join(" "); // path (may contain spaces)
@@ -1867,8 +2107,16 @@ impl VmManager {
             if source == "-" || source.is_empty() { continue; }
 
             let is_cdrom = device == "cdrom";
-            let (size_gb, format) = if !is_cdrom && dev_type == "file" {
-                disk_info_from_qemu_img(&source)
+            // Get disk size: try virsh domblkinfo first (works on running VMs),
+            // fall back to qemu-img info
+            let (size_gb, format) = if !is_cdrom {
+                let size = disk_size_from_virsh(name, target)
+                    .unwrap_or_else(|| disk_info_from_qemu_img(&source).0);
+                let fmt = Path::new(&source).extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("qcow2")
+                    .to_string();
+                (size, fmt)
             } else {
                 (0, "raw".to_string())
             };
@@ -1937,8 +2185,9 @@ impl VmManager {
 
     /// Adopt a libvirt VM into WolfStack management.
     /// Creates a WolfStack config pointing at the existing disk files.
-    /// Optionally undefines the VM from libvirt (but does NOT delete disks).
-    pub fn adopt_libvirt_vm(&self, name: &str, undefine_from_libvirt: bool) -> Result<VmConfig, String> {
+    /// Does NOT modify or remove anything from libvirt — the user can
+    /// stop and undefine from libvirt themselves when ready to switch.
+    pub fn adopt_libvirt_vm(&self, name: &str) -> Result<VmConfig, String> {
         // Validate name
         if name.contains('/') || name.contains("..") || name.contains('\0') || name.is_empty() {
             return Err("Invalid VM name".to_string());
@@ -1953,11 +2202,6 @@ impl VmManager {
         let existing = self.list_vms().iter().map(|v| v.name.clone()).collect::<Vec<_>>();
         let discovered = self.discover_single_libvirt_vm(name, &existing)
             .ok_or_else(|| format!("Could not read VM '{}' from libvirt", name))?;
-
-        // Refuse to adopt running VMs when undefining — we can't block waiting for shutdown
-        if undefine_from_libvirt && discovered.state.contains("running") {
-            return Err(format!("VM '{}' is running. Stop it in libvirt first (virsh shutdown {}), then adopt.", name, name));
-        }
 
         // Find primary disk (first non-CDROM disk)
         let primary_disk = discovered.disks.iter()
@@ -2048,19 +2292,7 @@ impl VmManager {
         let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
         fs::write(self.vm_config_path(name), json).map_err(|e| e.to_string())?;
 
-        // Optionally undefine from libvirt (keeps disk files — VM is already stopped)
-        if undefine_from_libvirt {
-            let undefine_out = Command::new("virsh").args(["undefine", name, "--nvram"]).output();
-            if let Ok(ref o) = undefine_out {
-                if !o.status.success() {
-                    // Try without --nvram (non-UEFI VMs)
-                    let _ = Command::new("virsh").args(["undefine", name]).output();
-                }
-            }
-            info!("Undefined VM '{}' from libvirt", name);
-        }
-
-        info!("Adopted libvirt VM '{}' into WolfStack", name);
+        info!("Adopted libvirt VM '{}' into WolfStack (libvirt config left intact)", name);
         Ok(config)
     }
 }
@@ -2094,6 +2326,22 @@ pub struct DiscoveredNic {
     pub source: String,
     pub model: String,
     pub mac: String,
+}
+
+/// Get disk size from virsh domblkinfo (works on running VMs)
+fn disk_size_from_virsh(vm_name: &str, target: &str) -> Option<u32> {
+    let output = Command::new("virsh").args(["domblkinfo", vm_name, target]).output().ok()?;
+    if !output.status.success() { return None; }
+    let text = String::from_utf8_lossy(&output.stdout);
+    // Parse "Capacity:       21474836480" line
+    for line in text.lines() {
+        if let Some(val) = line.strip_prefix("Capacity:") {
+            let bytes: u64 = val.trim().parse().ok()?;
+            let gb = (bytes / (1024 * 1024 * 1024)) as u32;
+            return Some(gb.max(1));
+        }
+    }
+    None
 }
 
 /// Get disk size and format from qemu-img info

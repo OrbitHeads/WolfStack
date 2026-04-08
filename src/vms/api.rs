@@ -694,15 +694,13 @@ async fn discover_libvirt(req: HttpRequest, state: web::Data<AppState>) -> HttpR
 #[derive(Deserialize)]
 struct AdoptLibvirtRequest {
     name: String,
-    #[serde(default)]
-    undefine_from_libvirt: bool,
 }
 
 /// POST /api/vms/adopt-libvirt — adopt a libvirt VM into WolfStack
 async fn adopt_libvirt(req: HttpRequest, state: web::Data<AppState>, body: web::Json<AdoptLibvirtRequest>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let manager = state.vms.lock().unwrap();
-    match manager.adopt_libvirt_vm(&body.name, body.undefine_from_libvirt) {
+    match manager.adopt_libvirt_vm(&body.name) {
         Ok(config) => HttpResponse::Ok().json(serde_json::json!({
             "success": true,
             "message": format!("VM '{}' adopted successfully", config.name),
