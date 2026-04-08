@@ -1068,6 +1068,7 @@ function selectView(page) {
 
 function selectServerView(nodeId, view) {
     closeSidebarMobile();
+    if (nodeId !== currentNodeId) _physicalInterfacesCache = null; // reset NIC cache on node switch
     currentNodeId = nodeId;
     currentPage = view;
 
@@ -5858,15 +5859,68 @@ function closeVmCreate() {
 
 // ─── Extra NIC management (multi-NIC VMs) ───
 
+// Cache for physical interfaces (fetched once per session)
+let _physicalInterfacesCache = null;
+
+async function loadPhysicalInterfaces() {
+    if (_physicalInterfacesCache) return _physicalInterfacesCache;
+    try {
+        const resp = await fetch(apiUrl('/api/networking/interfaces'));
+        if (!resp.ok) return [];
+        const ifaces = await resp.json();
+        // Filter to physical NICs only — exclude virtual/bridge/vlan/tunnel interfaces
+        const virtualPrefixes = ['br', 'vmbr', 'docker', 'veth', 'tap', 'tun', 'macvtap', 'virbr', 'wolfnet', 'wg', 'lo', 'dummy', 'bond'];
+        _physicalInterfacesCache = ifaces.filter(iface => {
+            if (!iface.name || !iface.driver) return false;
+            const name = iface.name.toLowerCase();
+            // Skip virtual interfaces by name prefix
+            if (virtualPrefixes.some(p => name.startsWith(p))) return false;
+            // Skip VLANs
+            if (iface.is_vlan) return false;
+            return true;
+        });
+        return _physicalInterfacesCache;
+    } catch (e) {
+        console.warn('Failed to load physical interfaces:', e);
+        return [];
+    }
+}
+
+function toggleNicMode(select) {
+    const row = select.closest('.vm-extra-nic-row');
+    if (!row) return;
+    const bridgeWrap = row.querySelector('.vm-nic-bridge-wrap');
+    const ptWrap = row.querySelector('.vm-nic-pt-wrap');
+    if (select.value === 'passthrough') {
+        bridgeWrap.style.display = 'none';
+        ptWrap.style.display = '';
+        // Load interfaces into dropdown if not already loaded
+        const ptSelect = row.querySelector('.vm-nic-pt-iface');
+        if (ptSelect && ptSelect.options.length <= 1) {
+            loadPhysicalInterfaces().then(ifaces => {
+                ptSelect.innerHTML = '<option value="">Select interface...</option>';
+                for (const iface of ifaces) {
+                    const label = iface.speed ? `${iface.name} (${iface.driver}, ${iface.speed})` : `${iface.name} (${iface.driver})`;
+                    ptSelect.innerHTML += `<option value="${iface.name}">${label}</option>`;
+                }
+            });
+        }
+    } else {
+        bridgeWrap.style.display = '';
+        ptWrap.style.display = 'none';
+    }
+}
+
 function addExtraNicRow(containerId, nic) {
     const container = document.getElementById(containerId);
     if (!container) return;
     const idx = container.children.length;
+    const isPassthrough = nic?.passthrough_interface ? true : false;
     const row = document.createElement('div');
     row.className = 'vm-extra-nic-row';
-    row.style.cssText = 'display:flex; gap:8px; align-items:center; margin-bottom:6px; padding:8px; background:var(--bg-tertiary); border:1px solid var(--border); border-radius:8px;';
+    row.style.cssText = 'display:flex; gap:8px; align-items:center; margin-bottom:6px; padding:8px; background:var(--bg-tertiary); border:1px solid var(--border); border-radius:8px; flex-wrap:wrap;';
     row.innerHTML = `
-        <div style="flex:1;">
+        <div style="flex:0 0 auto;">
             <select class="form-control vm-nic-model" style="font-size:12px; padding:4px 8px;">
                 <option value="virtio"${(nic?.model||'virtio')==='virtio'?' selected':''}>VirtIO</option>
                 <option value="e1000"${nic?.model==='e1000'?' selected':''}>e1000</option>
@@ -5874,11 +5928,23 @@ function addExtraNicRow(containerId, nic) {
                 <option value="rtl8139"${nic?.model==='rtl8139'?' selected':''}>rtl8139</option>
             </select>
         </div>
-        <div style="flex:1.5;">
-            <input type="text" class="form-control vm-nic-bridge" placeholder="Bridge (e.g. br0, vmbr1)"
+        <div style="flex:0 0 auto;">
+            <select class="form-control vm-nic-mode" onchange="toggleNicMode(this)" style="font-size:12px; padding:4px 8px;">
+                <option value="bridge"${!isPassthrough?' selected':''}>Bridge</option>
+                <option value="passthrough"${isPassthrough?' selected':''}>Physical NIC</option>
+            </select>
+        </div>
+        <div class="vm-nic-bridge-wrap" style="flex:1.5;${isPassthrough?' display:none;':''}">
+            <input type="text" class="form-control vm-nic-bridge" placeholder="e.g. br0, vmbr1"
                 value="${nic?.bridge||''}" style="font-size:12px; padding:4px 8px;">
         </div>
-        <div style="flex:1.5;">
+        <div class="vm-nic-pt-wrap" style="flex:1.5;${!isPassthrough?' display:none;':''}">
+            <select class="form-control vm-nic-pt-iface" data-saved="${nic?.passthrough_interface||''}" style="font-size:12px; padding:4px 8px;">
+                <option value="">Select interface...</option>
+                ${isPassthrough && nic?.passthrough_interface ? `<option value="${nic.passthrough_interface}" selected>${nic.passthrough_interface}</option>` : ''}
+            </select>
+        </div>
+        <div style="flex:1;">
             <input type="text" class="form-control vm-nic-mac" placeholder="MAC (auto)"
                 value="${nic?.mac||''}" style="font-size:12px; padding:4px 8px; font-family:monospace;">
         </div>
@@ -5887,6 +5953,19 @@ function addExtraNicRow(containerId, nic) {
             style="font-size:10px; padding:2px 6px; color:var(--danger); border-color:rgba(239,68,68,0.3);">✕</button>
     `;
     container.appendChild(row);
+
+    // If passthrough mode, load interfaces and pre-select
+    if (isPassthrough) {
+        const ptSelect = row.querySelector('.vm-nic-pt-iface');
+        loadPhysicalInterfaces().then(ifaces => {
+            ptSelect.innerHTML = '<option value="">Select interface...</option>';
+            for (const iface of ifaces) {
+                const label = iface.speed ? `${iface.name} (${iface.driver}, ${iface.speed})` : `${iface.name} (${iface.driver})`;
+                const selected = iface.name === nic.passthrough_interface ? ' selected' : '';
+                ptSelect.innerHTML += `<option value="${iface.name}"${selected}>${label}</option>`;
+            }
+        });
+    }
 }
 
 function collectExtraNics(containerId) {
@@ -5895,9 +5974,15 @@ function collectExtraNics(containerId) {
     const nics = [];
     for (const row of container.children) {
         const model = row.querySelector('.vm-nic-model')?.value || 'virtio';
-        const bridge = row.querySelector('.vm-nic-bridge')?.value.trim() || '';
         const mac = row.querySelector('.vm-nic-mac')?.value.trim() || '';
-        nics.push({ model, bridge: bridge || null, mac: mac || null });
+        const mode = row.querySelector('.vm-nic-mode')?.value || 'bridge';
+        if (mode === 'passthrough') {
+            const ptIface = row.querySelector('.vm-nic-pt-iface')?.value || '';
+            nics.push({ model, bridge: null, passthrough_interface: ptIface || null, mac: mac || null });
+        } else {
+            const bridge = row.querySelector('.vm-nic-bridge')?.value.trim() || '';
+            nics.push({ model, bridge: bridge || null, passthrough_interface: null, mac: mac || null });
+        }
     }
     return nics;
 }

@@ -59,6 +59,10 @@ pub struct NicConfig {
     /// Bridge name for this NIC (e.g. "br0", "vmbr1"). Empty = user-mode networking.
     #[serde(default)]
     pub bridge: Option<String>,
+    /// Physical NIC passthrough: specify a host interface (e.g. "enp2s0") and WolfStack
+    /// will auto-create a dedicated bridge for it. Used for OPNsense WAN, Starlink, etc.
+    #[serde(default)]
+    pub passthrough_interface: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -801,7 +805,9 @@ impl VmManager {
                         _ => "virtio",
                     };
                     let mac = nic.mac.clone().unwrap_or_else(generate_mac);
-                    let bridge = nic.bridge.as_deref().unwrap_or("vmbr0");
+                    // Resolve bridge — passthrough_interface auto-creates a vmbr, or use manual bridge
+                    let bridge = self.resolve_nic_bridge(nic)
+                        .unwrap_or_else(|| "vmbr0".to_string());
                     let val = format!("{}={},bridge={}", model, mac, bridge);
                     let _ = Command::new("qm").args(["set", &vmid_str, &key, &val]).output();
                 }
@@ -1174,30 +1180,29 @@ impl VmManager {
             let mac = nic.mac.clone().unwrap_or_else(generate_mac);
             let dev_arg = format!("{},netdev={},mac={}", dev, net_id, mac);
 
-            if let Some(ref bridge) = nic.bridge {
-                if !bridge.is_empty() {
-                    // Bridge mode — create a TAP on the specified bridge
-                    let tap = format!("tap-{}-{}", &name[..name.len().min(8)], idx);
-                    // Create TAP attached to bridge
-                    let _ = Command::new("ip").args(["link", "set", &tap, "down"]).output();
-                    let _ = Command::new("ip").args(["tuntap", "del", "dev", &tap, "mode", "tap"]).output();
-                    if let Ok(o) = Command::new("ip").args(["tuntap", "add", "dev", &tap, "mode", "tap"]).output() {
-                        if o.status.success() {
-                            let master_out = Command::new("ip").args(["link", "set", &tap, "master", bridge]).output();
-                            if let Ok(ref mo) = master_out {
-                                if !mo.status.success() {
-                                    write_log(&format!("WARNING: bridge '{}' not found or cannot attach TAP — NIC {} may have no connectivity", bridge, net_id));
-                                }
+            // Resolve bridge — passthrough_interface auto-creates a bridge, or use manual bridge
+            if let Some(bridge) = self.resolve_nic_bridge(nic) {
+                // Bridge mode — create a TAP on the resolved bridge
+                let tap = format!("tap-{}-{}", &name[..name.len().min(8)], idx);
+                // Clean up any stale TAP
+                let _ = Command::new("ip").args(["link", "set", &tap, "down"]).output();
+                let _ = Command::new("ip").args(["tuntap", "del", "dev", &tap, "mode", "tap"]).output();
+                if let Ok(o) = Command::new("ip").args(["tuntap", "add", "dev", &tap, "mode", "tap"]).output() {
+                    if o.status.success() {
+                        let master_out = Command::new("ip").args(["link", "set", &tap, "master", &bridge]).output();
+                        if let Ok(ref mo) = master_out {
+                            if !mo.status.success() {
+                                write_log(&format!("WARNING: bridge '{}' not found or cannot attach TAP — NIC {} may have no connectivity", bridge, net_id));
                             }
-                            let _ = Command::new("ip").args(["link", "set", &tap, "up"]).output();
-                            cmd.arg("-netdev").arg(format!("tap,id={},ifname={},script=no,downscript=no", net_id, tap))
-                               .arg("-device").arg(&dev_arg);
-                            write_log(&format!("Extra NIC {}: {} on bridge {} (mac: {}, tap: {})", net_id, dev, bridge, mac, tap));
-                            continue;
                         }
+                        let _ = Command::new("ip").args(["link", "set", &tap, "up"]).output();
+                        cmd.arg("-netdev").arg(format!("tap,id={},ifname={},script=no,downscript=no", net_id, tap))
+                           .arg("-device").arg(&dev_arg);
+                        write_log(&format!("Extra NIC {}: {} on bridge {} (mac: {}, tap: {})", net_id, dev, bridge, mac, tap));
+                        continue;
                     }
-                    write_log(&format!("Extra NIC {}: bridge TAP failed for '{}', falling back to user-mode", net_id, bridge));
                 }
+                write_log(&format!("Extra NIC {}: bridge TAP failed for '{}', falling back to user-mode", net_id, bridge));
             }
             // Fallback: user-mode networking
             cmd.arg("-netdev").arg(format!("user,id={}", net_id))
@@ -1501,10 +1506,146 @@ impl VmManager {
         Ok(())
     }
 
+    /// Ensure a dedicated bridge exists for a physical NIC passthrough.
+    /// Returns the bridge name to use for TAP attachment.
+    fn ensure_passthrough_bridge(&self, iface: &str) -> Result<String, String> {
+        // Sanitise interface name — prevent path traversal and injection
+        if iface.is_empty() || iface.len() > 15
+            || !iface.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        {
+            return Err(format!("Invalid interface name: '{}'", iface));
+        }
+
+        // Validate interface exists
+        if !Path::new(&format!("/sys/class/net/{}", iface)).exists() {
+            return Err(format!("Physical interface '{}' not found", iface));
+        }
+
+        // Check if interface is already in a bridge — reuse it
+        let master_link = format!("/sys/class/net/{}/master", iface);
+        if let Ok(target) = std::fs::read_link(&master_link) {
+            if let Some(bridge_name) = target.file_name().and_then(|n| n.to_str()) {
+                // Verify the master is actually a bridge (not a bond, etc.)
+                let bridge_check = format!("/sys/class/net/{}/bridge", bridge_name);
+                if Path::new(&bridge_check).exists() {
+                    info!("Passthrough: {} already in bridge {}", iface, bridge_name);
+                    return Ok(bridge_name.to_string());
+                }
+                warn!("Passthrough: {} has master '{}' but it is not a bridge — creating new bridge", iface, bridge_name);
+            }
+        }
+
+        if containers::is_proxmox() {
+            self.create_proxmox_passthrough_bridge(iface)
+        } else {
+            self.create_linux_passthrough_bridge(iface)
+        }
+    }
+
+    /// Create a Linux bridge for physical NIC passthrough (standalone QEMU/KVM)
+    fn create_linux_passthrough_bridge(&self, iface: &str) -> Result<String, String> {
+        let bridge_name = format!("br-pt-{}", iface);
+
+        // Create bridge (ignore "File exists" — means it already exists)
+        let out = Command::new("ip").args(["link", "add", &bridge_name, "type", "bridge"]).output()
+            .map_err(|e| format!("Failed to create bridge: {}", e))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !stderr.contains("File exists") {
+                return Err(format!("Failed to create bridge '{}': {}", bridge_name, stderr.trim()));
+            }
+        }
+
+        // Flush IPs from physical interface (it's being dedicated to the VM)
+        let _ = Command::new("ip").args(["addr", "flush", "dev", iface]).output();
+
+        // Add physical interface to bridge
+        let out = Command::new("ip").args(["link", "set", iface, "master", &bridge_name]).output()
+            .map_err(|e| format!("Failed to add {} to bridge: {}", iface, e))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !stderr.contains("already a member") && !stderr.contains("Device or resource busy") {
+                return Err(format!("Failed to add {} to bridge {}: {}", iface, bridge_name, stderr.trim()));
+            }
+        }
+
+        // Bring up both
+        let _ = Command::new("ip").args(["link", "set", iface, "up"]).output();
+        let _ = Command::new("ip").args(["link", "set", &bridge_name, "up"]).output();
+
+        info!("Passthrough: created bridge {} for physical NIC {}", bridge_name, iface);
+        Ok(bridge_name)
+    }
+
+    /// Create a Proxmox vmbr bridge for physical NIC passthrough
+    fn create_proxmox_passthrough_bridge(&self, iface: &str) -> Result<String, String> {
+        // Find next available vmbr{N}
+        let mut next_id = 1u32;
+        let bridge_name = loop {
+            let candidate = format!("vmbr{}", next_id);
+            if !Path::new(&format!("/sys/class/net/{}", candidate)).exists() {
+                break candidate;
+            }
+            next_id += 1;
+            if next_id > 99 {
+                return Err("No available vmbr{N} slot (checked up to vmbr99)".to_string());
+            }
+        };
+
+        // Register with Proxmox for persistence across reboots
+        let pve_node = Command::new("hostname").arg("-s").output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|_| "localhost".to_string());
+
+        let pvesh_out = Command::new("pvesh").args([
+            "create", &format!("/nodes/{}/network", pve_node),
+            "--iface", &bridge_name,
+            "--type", "bridge",
+            "--bridge_ports", iface,
+            "--autostart", "1",
+        ]).output();
+
+        if let Ok(ref o) = pvesh_out {
+            if !o.status.success() {
+                warn!("pvesh create bridge failed: {} — creating with ip commands only",
+                    String::from_utf8_lossy(&o.stderr).trim());
+            }
+        }
+
+        // Create immediately with ip commands (pvesh config only takes effect on reboot/ifreload)
+        let _ = Command::new("ip").args(["link", "add", &bridge_name, "type", "bridge"]).output();
+        let _ = Command::new("ip").args(["addr", "flush", "dev", iface]).output();
+        let _ = Command::new("ip").args(["link", "set", iface, "master", &bridge_name]).output();
+        let _ = Command::new("ip").args(["link", "set", iface, "up"]).output();
+        let _ = Command::new("ip").args(["link", "set", &bridge_name, "up"]).output();
+
+        info!("Passthrough: created Proxmox bridge {} for physical NIC {}", bridge_name, iface);
+        Ok(bridge_name)
+    }
+
+    /// Resolve the effective bridge for a NIC config — handles passthrough_interface
+    fn resolve_nic_bridge(&self, nic: &NicConfig) -> Option<String> {
+        // Passthrough takes priority over manual bridge
+        if let Some(ref pt_iface) = nic.passthrough_interface {
+            if !pt_iface.is_empty() {
+                match self.ensure_passthrough_bridge(pt_iface) {
+                    Ok(bridge) => return Some(bridge),
+                    Err(e) => {
+                        warn!("Passthrough bridge failed for {}: {}", pt_iface, e);
+                    }
+                }
+            }
+        }
+        // Fall back to manual bridge
+        nic.bridge.clone().filter(|b| !b.is_empty())
+    }
+
     /// Clean up TAP interfaces for extra NICs
     fn cleanup_extra_nic_taps(&self, name: &str, nics: &[NicConfig]) {
         for (i, nic) in nics.iter().enumerate() {
-            if nic.bridge.as_ref().map(|b| !b.is_empty()).unwrap_or(false) {
+            let has_bridge = nic.bridge.as_ref().map(|b| !b.is_empty()).unwrap_or(false);
+            let has_passthrough = nic.passthrough_interface.as_ref().map(|p| !p.is_empty()).unwrap_or(false);
+            if has_bridge || has_passthrough {
                 let tap = format!("tap-{}-{}", &name[..name.len().min(8)], i + 1);
                 let _ = self.cleanup_tap(&tap);
             }
