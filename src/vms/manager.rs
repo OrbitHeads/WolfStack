@@ -1241,9 +1241,11 @@ impl VmManager {
             }
         }
 
-        // Boot order: boot media first (for installation), then disk
+        // Boot order: always explicit so OVMF (UEFI) doesn't default to PXE
         if has_boot_media {
-            cmd.arg("-boot").arg("order=dc");
+            cmd.arg("-boot").arg("order=dc");  // CD/USB first, then disk (installation)
+        } else {
+            cmd.arg("-boot").arg("order=c");   // Disk first (normal boot)
         }
 
         write_log(&format!("Launching QEMU: VNC :{} (port {}), KVM: {}", vnc_num, vnc_port, kvm_available));
