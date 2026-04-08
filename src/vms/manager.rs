@@ -1592,9 +1592,34 @@ impl VmManager {
         }
     }
 
-    /// Create a Linux bridge for physical NIC passthrough (standalone QEMU/KVM)
+    /// Read the current IPv4 address, prefix, and default gateway from an interface
+    fn read_iface_ip_config(iface: &str) -> Option<(String, u32, Option<String>)> {
+        // Get IP/prefix: ip -j addr show dev {iface}
+        let addr_out = Command::new("ip").args(["-j", "addr", "show", "dev", iface]).output().ok()?;
+        let addr_json: Vec<serde_json::Value> = serde_json::from_slice(&addr_out.stdout).ok()?;
+        let entry = addr_json.first()?;
+        let addr_info = entry["addr_info"].as_array()?;
+        let ipv4 = addr_info.iter().find(|a| a["family"].as_str() == Some("inet") && a["scope"].as_str() == Some("global"))?;
+        let ip = ipv4["local"].as_str()?.to_string();
+        let prefix = ipv4["prefixlen"].as_u64()? as u32;
+
+        // Get default gateway: ip -j route show default dev {iface}
+        let route_out = Command::new("ip").args(["-j", "route", "show", "default", "dev", iface]).output().ok()?;
+        let routes: Vec<serde_json::Value> = serde_json::from_slice(&route_out.stdout).unwrap_or_default();
+        let gateway = routes.first()
+            .and_then(|r| r["gateway"].as_str())
+            .map(|g| g.to_string());
+
+        Some((ip, prefix, gateway))
+    }
+
+    /// Create a Linux bridge for physical NIC passthrough (standalone QEMU/KVM).
+    /// Moves the host's IP from the physical NIC to the bridge so the host stays reachable.
     fn create_linux_passthrough_bridge(&self, iface: &str) -> Result<String, String> {
         let bridge_name = format!("br-pt-{}", iface);
+
+        // Capture the host's current IP config BEFORE bridging — we need to move it
+        let ip_config = Self::read_iface_ip_config(iface);
 
         // Create bridge (ignore "File exists" — means it already exists)
         let out = Command::new("ip").args(["link", "add", &bridge_name, "type", "bridge"]).output()
@@ -1606,7 +1631,7 @@ impl VmManager {
             }
         }
 
-        // Flush IPs from physical interface (it's being dedicated to the VM)
+        // Flush IPs from physical interface (will be moved to the bridge)
         let _ = Command::new("ip").args(["addr", "flush", "dev", iface]).output();
 
         // Add physical interface to bridge
@@ -1622,6 +1647,16 @@ impl VmManager {
         // Bring up both
         let _ = Command::new("ip").args(["link", "set", iface, "up"]).output();
         let _ = Command::new("ip").args(["link", "set", &bridge_name, "up"]).output();
+
+        // Move the host's IP and gateway to the bridge so the host stays reachable
+        if let Some((ip, prefix, gateway)) = ip_config {
+            let cidr = format!("{}/{}", ip, prefix);
+            let _ = Command::new("ip").args(["addr", "add", &cidr, "dev", &bridge_name]).output();
+            if let Some(gw) = gateway {
+                let _ = Command::new("ip").args(["route", "add", "default", "via", &gw, "dev", &bridge_name]).output();
+            }
+            info!("Passthrough: moved host IP {} to bridge {}", cidr, bridge_name);
+        }
 
         info!("Passthrough: created bridge {} for physical NIC {}", bridge_name, iface);
         Ok(bridge_name)
@@ -1662,12 +1697,25 @@ impl VmManager {
             }
         }
 
+        // Capture the host's current IP config BEFORE bridging
+        let ip_config = Self::read_iface_ip_config(iface);
+
         // Create immediately with ip commands (pvesh config only takes effect on reboot/ifreload)
         let _ = Command::new("ip").args(["link", "add", &bridge_name, "type", "bridge"]).output();
         let _ = Command::new("ip").args(["addr", "flush", "dev", iface]).output();
         let _ = Command::new("ip").args(["link", "set", iface, "master", &bridge_name]).output();
         let _ = Command::new("ip").args(["link", "set", iface, "up"]).output();
         let _ = Command::new("ip").args(["link", "set", &bridge_name, "up"]).output();
+
+        // Move the host's IP and gateway to the bridge so the host stays reachable
+        if let Some((ip, prefix, gateway)) = ip_config {
+            let cidr = format!("{}/{}", ip, prefix);
+            let _ = Command::new("ip").args(["addr", "add", &cidr, "dev", &bridge_name]).output();
+            if let Some(gw) = gateway {
+                let _ = Command::new("ip").args(["route", "add", "default", "via", &gw, "dev", &bridge_name]).output();
+            }
+            info!("Passthrough: moved host IP {} to bridge {}", cidr, bridge_name);
+        }
 
         info!("Passthrough: created Proxmox bridge {} for physical NIC {}", bridge_name, iface);
         Ok(bridge_name)
