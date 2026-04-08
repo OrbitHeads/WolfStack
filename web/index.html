@@ -20,8 +20,9 @@
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
     <script src="/js/vendor/three.min.js?v=15.10.7a"></script>
-    <link rel="stylesheet" href="/css/style.css?v=16.11.0">
+    <link rel="stylesheet" id="main-css" href="/css/style.css?v=16.11.0">
     <link rel="stylesheet" href="/css/xterm.min.css?v=16.11.0">
+    <script>document.getElementById('main-css').href='/css/style.css?v='+Date.now();</script>
     <script src="/js/vendor/xterm.min.js?v=15.10.7a"></script>
     <script src="/js/vendor/xterm-addon-fit.min.js?v=15.10.7a"></script>
     <style>

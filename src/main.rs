@@ -253,6 +253,7 @@ async fn main() -> std::io::Result<()> {
         containers::lxc_autostart_all();
         networking::apply_all_wireguard_bridges();
         kubernetes::apply_all_wolfnet_routes();
+        plugins::start_all_backends();
     });
 
     // Check if TLS will be available (so the frontend knows the correct protocol for URLs)
@@ -331,27 +332,27 @@ async fn main() -> std::io::Result<()> {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
-                let (metrics, components) = {
-                    let mut monitor = state_clone.monitor.lock().unwrap();
-                    let m = monitor.collect();
-                    let c = installer::get_all_status_cached();
-                    (m, c)
-                };
+                // Run all blocking sysinfo/subprocess work off the async runtime
+                let sc = state_clone.clone();
+                let (metrics, components, docker_count, lxc_count, vm_count, has_docker, has_lxc, has_kvm) =
+                    tokio::task::spawn_blocking(move || {
+                        let mut monitor = sc.monitor.lock().unwrap();
+                        let m = monitor.collect();
+                        drop(monitor);  // release mutex before spawning subprocesses
+                        let c = installer::get_all_status_cached();
+                        let dc = containers::docker_count();
+                        let lc = containers::lxc_count();
+                        let vc = sc.vms.lock().unwrap().list_vms().len() as u32;
+                        let hd = containers::has_docker_cached();
+                        let hl = containers::has_lxc_cached();
+                        let hk = containers::has_kvm_cached();
+                        (m, c, dc, lc, vc, hd, hl, hk)
+                    }).await.unwrap();
                 // Record historical snapshot
                 {
                     let mut history = state_clone.metrics_history.lock().unwrap();
                     history.push(&metrics);
                 }
-                // Use lightweight counts (1 subprocess each) instead of full listing
-                // (which spawns 3+ subprocesses per container for docker inspect)
-                let docker_count = containers::docker_count();
-                let lxc_count = containers::lxc_count();
-                let vm_count = state_clone.vms.lock().unwrap().list_vms().len() as u32;
-                // Use cached runtime detection (TTL 120s) instead of spawning
-                // 'which', 'docker info', etc. on every 2-second cycle
-                let has_docker = containers::has_docker_cached();
-                let has_lxc = containers::has_lxc_cached();
-                let has_kvm = containers::has_kvm_cached();
 
                 // Cache the agent status report for instant polling responses
                 let self_id = cluster_clone.self_id.clone();
@@ -508,7 +509,10 @@ async fn main() -> std::io::Result<()> {
                         let mut all_issues: Vec<(String, String, api::Issue)> = Vec::new();
 
                         // Local node
-                        let metrics = scan_state.monitor.lock().unwrap().collect();
+                        let ss = scan_state.clone();
+                        let metrics = tokio::task::spawn_blocking(move || {
+                            ss.monitor.lock().unwrap().collect()
+                        }).await.unwrap();
                         let local_hostname = metrics.hostname.clone();
                         let local_cluster = {
                             let nodes = scan_cluster.get_all_nodes();
@@ -1103,24 +1107,26 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
 
                 if is_configured {
                     // Collect local metrics (sync — release mutex before any .await)
+                    let ai_sc = ai_state.clone();
                     let (hostname, cpu_pct, mem_used_gb, mem_total_gb, disk_used_gb, disk_total_gb,
-                         docker_count, lxc_count, vm_count, uptime_secs) = {
-                        let mut monitor = ai_state.monitor.lock().unwrap();
-                        let m = monitor.collect();
-                        let docker_count = containers::docker_count();
-                        let lxc_count = containers::lxc_count();
-                        let vm_count = ai_state.vms.lock().unwrap().list_vms().len() as u32;
+                         docker_count, lxc_count, vm_count, uptime_secs) =
+                        tokio::task::spawn_blocking(move || {
+                            let mut monitor = ai_sc.monitor.lock().unwrap();
+                            let m = monitor.collect();
+                            drop(monitor);
+                            let docker_count = containers::docker_count();
+                            let lxc_count = containers::lxc_count();
+                            let vm_count = ai_sc.vms.lock().unwrap().list_vms().len() as u32;
 
-                        let mem_used = m.memory_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-                        let mem_total = m.memory_total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-                        let root_disk = m.disks.iter().find(|d| d.mount_point == "/").or_else(|| m.disks.first());
-                        let disk_used = root_disk.map(|d| d.used_bytes as f64 / (1024.0 * 1024.0 * 1024.0)).unwrap_or(0.0);
-                        let disk_total = root_disk.map(|d| d.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0)).unwrap_or(0.0);
+                            let mem_used = m.memory_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                            let mem_total = m.memory_total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                            let root_disk = m.disks.iter().find(|d| d.mount_point == "/").or_else(|| m.disks.first());
+                            let disk_used = root_disk.map(|d| d.used_bytes as f64 / (1024.0 * 1024.0 * 1024.0)).unwrap_or(0.0);
+                            let disk_total = root_disk.map(|d| d.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0)).unwrap_or(0.0);
 
-                        (m.hostname.clone(), m.cpu_usage_percent, mem_used, mem_total,
-                         disk_used, disk_total, docker_count, lxc_count, vm_count, m.uptime_secs)
-                    };
-                    // MutexGuard is now dropped — safe to .await below
+                            (m.hostname.clone(), m.cpu_usage_percent, mem_used, mem_total,
+                             disk_used, disk_total, docker_count, lxc_count, vm_count, m.uptime_secs)
+                        }).await.unwrap();
 
                     // Collect per-guest CPU stats from Proxmox nodes in the cluster
                     let pve_nodes: Vec<_> = ai_state.cluster.get_all_nodes().into_iter()

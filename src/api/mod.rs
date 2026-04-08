@@ -744,7 +744,10 @@ pub async fn disable_2fa(req: HttpRequest, state: web::Data<AppState>, path: web
 /// GET /api/metrics — current system metrics
 pub async fn get_metrics(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    let metrics = state.monitor.lock().unwrap().collect();
+    let st = state.into_inner();
+    let metrics = tokio::task::spawn_blocking(move || {
+        st.monitor.lock().unwrap().collect()
+    }).await.unwrap();
     HttpResponse::Ok().json(metrics)
 }
 
@@ -758,7 +761,10 @@ pub async fn get_metrics_history(req: HttpRequest, state: web::Data<AppState>) -
 /// GET /api/metrics/processes — top CPU and memory consuming processes
 pub async fn get_top_processes(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    let (top_cpu, top_mem) = state.monitor.lock().unwrap().top_processes(10);
+    let st = state.into_inner();
+    let (top_cpu, top_mem) = tokio::task::spawn_blocking(move || {
+        st.monitor.lock().unwrap().top_processes(10)
+    }).await.unwrap_or_default();
     HttpResponse::Ok().json(serde_json::json!({
         "top_cpu": top_cpu,
         "top_mem": top_mem,
@@ -2765,15 +2771,20 @@ pub async fn agent_status(req: HttpRequest, state: web::Data<AppState>) -> HttpR
     }
 
     // Fallback: first request before cache is populated (only happens once at startup)
-    let metrics = state.monitor.lock().unwrap().collect();
-    let components = installer::get_all_status();
+    let st = state.clone().into_inner();
+    let (metrics, components, docker_count, lxc_count, vm_count, has_docker, has_lxc, has_kvm) =
+        tokio::task::spawn_blocking(move || {
+            let m = st.monitor.lock().unwrap().collect();
+            let c = installer::get_all_status();
+            let dc = containers::docker_list_all().len() as u32;
+            let lc = containers::lxc_list_all().len() as u32;
+            let vc = st.vms.lock().unwrap().list_vms().len() as u32;
+            let hd = containers::docker_status().installed;
+            let hl = containers::lxc_status().installed;
+            let hk = containers::kvm_installed();
+            (m, c, dc, lc, vc, hd, hl, hk)
+        }).await.unwrap();
     let hostname = metrics.hostname.clone();
-    let docker_count = containers::docker_list_all().len() as u32;
-    let lxc_count = containers::lxc_list_all().len() as u32;
-    let vm_count = state.vms.lock().unwrap().list_vms().len() as u32;
-    let has_docker = containers::docker_status().installed;
-    let has_lxc = containers::lxc_status().installed;
-    let has_kvm = containers::kvm_installed();
     let public_ip = state.cluster.get_node(&state.cluster.self_id).and_then(|n| n.public_ip);
     let msg = AgentMessage::StatusReport {
         node_id: state.cluster.self_id.clone(),
@@ -12279,7 +12290,10 @@ pub async fn scan_issues(
 ) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
 
-    let metrics = state.monitor.lock().unwrap().collect();
+    let st = state.clone().into_inner();
+    let metrics = tokio::task::spawn_blocking(move || {
+        st.monitor.lock().unwrap().collect()
+    }).await.unwrap();
     let issues = collect_issues(&metrics);
 
     HttpResponse::Ok().json(serde_json::json!({

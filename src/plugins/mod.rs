@@ -179,6 +179,8 @@ fn load_manifest(path: &std::path::Path) -> Result<PluginManifest, String> {
 pub fn reload() {
     let mut plugins = PLUGINS.write().unwrap();
     *plugins = scan_plugins();
+    drop(plugins);
+    start_all_backends();
 }
 
 /// Get all loaded plugins
@@ -264,8 +266,22 @@ pub fn set_enabled(id: &str, enabled: bool) -> Result<String, String> {
     Ok(format!("Plugin '{}' {}", id, if enabled { "enabled" } else { "disabled" }))
 }
 
+/// Start all enabled plugin backends (called on startup and after reload)
+pub fn start_all_backends() {
+    let plugins = PLUGINS.read().unwrap().clone();
+    for plugin in &plugins {
+        if plugin.status == "active" && plugin.manifest.has_backend {
+            if let Err(e) = start_backend(&plugin.manifest.id) {
+                tracing::warn!("Failed to start plugin '{}' backend: {}", plugin.manifest.id, e);
+            } else if plugin.manifest.api_port.is_some() {
+                tracing::info!("Started plugin '{}' backend on port {}",
+                    plugin.manifest.id, plugin.manifest.api_port.unwrap());
+            }
+        }
+    }
+}
+
 /// Start a plugin's backend binary (if it has one)
-#[allow(dead_code)]
 pub fn start_backend(id: &str) -> Result<(), String> {
     let plugin = get(id).ok_or_else(|| format!("Plugin '{}' not found", id))?;
     if !plugin.manifest.has_backend { return Ok(()); }
