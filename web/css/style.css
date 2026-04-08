@@ -1419,7 +1419,9 @@ body.sidebar-collapsed #task-log-footer {
 .main-content {
     margin-left: 260px;
     min-height: calc(100vh - var(--task-log-height));
+    min-height: calc(100dvh - var(--task-log-height));
     max-height: calc(100vh - var(--task-log-height));
+    max-height: calc(100dvh - var(--task-log-height));
     overflow-y: auto;
     transition: margin-left 0.3s ease;
 }
@@ -1429,6 +1431,7 @@ body.sidebar-collapsed #task-log-footer {
     top: 0;
     background: rgba(10, 14, 26, 0.85);
     backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
     border-bottom: 1px solid var(--border);
     padding: 12px 16px;
     display: flex;
@@ -2854,10 +2857,73 @@ body.sidebar-collapsed #task-log-footer {
 
 /* ─── Mobile (768px) ─── */
 @media (max-width: 768px) {
-    /* Kill all transitions/animations on mobile for speed */
-    *, *::before, *::after {
+    /*
+     * Disable transitions/animations on specific elements — NOT on *.
+     * A blanket * rule disrupts Android Chrome's GPU compositing and can
+     * cause blank/invisible areas on fixed/sticky elements.
+     */
+    .sidebar,
+    .sidebar *,
+    .main-content,
+    .top-bar,
+    .card,
+    .card::before,
+    .card::after,
+    .stat-card,
+    .stat-card::before,
+    .stat-card::after,
+    .modal,
+    .modal-overlay,
+    .sidebar-backdrop,
+    .nav-item,
+    .btn,
+    .toast,
+    .progress-bar .fill {
         transition: none !important;
         animation: none !important;
+    }
+
+    /*
+     * Disable backdrop-filter everywhere on mobile.
+     * backdrop-filter: blur() on fixed/sticky elements inside overflow
+     * containers causes blank rendering on Android Chrome/WebView.
+     */
+    .top-bar,
+    .sidebar,
+    .sidebar-backdrop,
+    .modal-overlay,
+    .card,
+    .stat-card,
+    .log-viewer,
+    [data-theme="glass"] .sidebar,
+    [data-theme="glass"] .top-bar,
+    [data-theme="glass"] .card,
+    [data-theme="glass"] .stat-card,
+    [data-theme="glass"] .log-viewer,
+    [data-theme="glass"] .form-control,
+    [data-theme="glass"] input,
+    [data-theme="glass"] select,
+    [data-theme="glass"] textarea {
+        backdrop-filter: none !important;
+        -webkit-backdrop-filter: none !important;
+    }
+
+    /* Fix viewport height for Android (address bar changes visible area) */
+    .main-content {
+        margin-left: 0;
+        max-height: 100vh;
+        max-height: 100dvh;  /* dynamic viewport — excludes address bar */
+        min-height: 100vh;
+        min-height: 100dvh;
+    }
+
+    /* Solid top-bar background (replaces translucent + blur) */
+    .top-bar {
+        padding: 8px 12px;
+        background: var(--bg-secondary) !important;
+        position: sticky;
+        top: 0;
+        z-index: 50;
     }
 
     /* Sidebar: always rendered but parked off-screen for instant toggle */
@@ -2870,6 +2936,9 @@ body.sidebar-collapsed #task-log-footer {
         z-index: 10001 !important;
         box-shadow: none;
         display: flex !important;
+        /* Force own GPU layer so left transition is smooth */
+        will-change: left;
+        background: var(--bg-secondary) !important;
     }
 
     body.sidebar-open .sidebar,
@@ -2881,16 +2950,11 @@ body.sidebar-collapsed #task-log-footer {
 
     .sidebar-backdrop {
         z-index: 10000;
-        backdrop-filter: none;
     }
 
     body.sidebar-open .sidebar-backdrop {
         display: block;
         opacity: 1;
-    }
-
-    .main-content {
-        margin-left: 0;
     }
 
     #task-log-footer {
@@ -2906,11 +2970,6 @@ body.sidebar-collapsed #task-log-footer {
 
     body.sidebar-collapsed .main-content {
         margin-left: 0;
-    }
-
-    /* Top bar compact */
-    .top-bar {
-        padding: 8px 12px;
     }
 
     .top-bar h2 {
@@ -2971,6 +3030,7 @@ body.sidebar-collapsed #task-log-footer {
     .modal {
         width: 95%;
         max-height: 85vh;
+        max-height: 85dvh;
         border-radius: var(--radius);
     }
 
