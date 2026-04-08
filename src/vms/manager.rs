@@ -833,19 +833,30 @@ impl VmManager {
             }
             return Ok(());
         }
-        // On libvirt, delegate to virsh (VM must be stopped for most changes)
+        // On libvirt, delegate to virsh (VM must be stopped for CPU/memory changes)
         if containers::is_libvirt() {
             if let Some(c) = cpus {
                 if c > 0 {
-                    let _ = Command::new("virsh").args(["setvcpus", name, &c.to_string(), "--config", "--maximum"]).output();
-                    let _ = Command::new("virsh").args(["setvcpus", name, &c.to_string(), "--config"]).output();
+                    let cs = c.to_string();
+                    let out = Command::new("virsh").args(["setvcpus", name, &cs, "--config", "--maximum"]).output()
+                        .map_err(|e| format!("virsh setvcpus failed: {}", e))?;
+                    if !out.status.success() {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        return Err(format!("Failed to set CPUs: {}", stderr.trim()));
+                    }
+                    let _ = Command::new("virsh").args(["setvcpus", name, &cs, "--config"]).output();
                 }
             }
             if let Some(m) = memory_mb {
                 if m >= 256 {
-                    let kb = (m as u64) * 1024;
-                    let _ = Command::new("virsh").args(["setmaxmem", name, &kb.to_string(), "--config"]).output();
-                    let _ = Command::new("virsh").args(["setmem", name, &kb.to_string(), "--config"]).output();
+                    let kb = format!("{}k", (m as u64) * 1024);
+                    let out = Command::new("virsh").args(["setmaxmem", name, &kb, "--config"]).output()
+                        .map_err(|e| format!("virsh setmaxmem failed: {}", e))?;
+                    if !out.status.success() {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        return Err(format!("Failed to set memory: {}", stderr.trim()));
+                    }
+                    let _ = Command::new("virsh").args(["setmem", name, &kb, "--config"]).output();
                 }
             }
             if let Some(a) = auto_start {
@@ -1719,6 +1730,10 @@ impl VmManager {
                 return Ok(());
             }
             let stderr = String::from_utf8_lossy(&output.stderr);
+            // "domain is not running" is not an error — VM is already stopped
+            if stderr.contains("not running") || stderr.contains("not found") {
+                return Ok(());
+            }
             return Err(format!("virsh stop failed: {}", stderr.trim()));
         }
 
@@ -1792,18 +1807,18 @@ impl VmManager {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!("qm destroy failed: {}", stderr.trim()));
         }
-        // On libvirt, delegate to virsh undefine
+        // On libvirt, delegate to virsh undefine (keeps disk files — user can delete manually)
         if containers::is_libvirt() {
             // Stop first if running
             let _ = Command::new("virsh").args(["destroy", name]).output();
-            // Undefine with --remove-all-storage to delete disk files
-            let output = Command::new("virsh").args(["undefine", name, "--remove-all-storage", "--nvram"]).output()
+            // Undefine the VM definition (does NOT delete disk files)
+            let output = Command::new("virsh").args(["undefine", name, "--nvram"]).output()
                 .map_err(|e| format!("Failed to run virsh undefine: {}", e))?;
             if output.status.success() {
                 return Ok(());
             }
             // Retry without --nvram for non-UEFI VMs
-            let output2 = Command::new("virsh").args(["undefine", name, "--remove-all-storage"]).output()
+            let output2 = Command::new("virsh").args(["undefine", name]).output()
                 .map_err(|e| format!("Failed to run virsh undefine: {}", e))?;
             if output2.status.success() {
                 return Ok(());
@@ -1950,13 +1965,15 @@ impl VmManager {
             }
         }
 
-        // VNC port for running VMs: virsh vncdisplay
+        // VNC port for running VMs: virsh vncdisplay returns ":N" or "host:N"
         let vnc_port = if running {
             Command::new("virsh").args(["vncdisplay", name]).output().ok()
                 .and_then(|o| {
                     let text = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                    // Returns ":N" where port = 5900 + N
-                    text.strip_prefix(':').and_then(|n| n.parse::<u16>().ok()).map(|n| 5900 + n)
+                    // Parse display number after the last ':'  (handles both ":0" and "127.0.0.1:0")
+                    text.rsplit(':').next()
+                        .and_then(|n| n.parse::<u16>().ok())
+                        .map(|n| 5900 + n)
                 })
         } else {
             None
@@ -1965,6 +1982,18 @@ impl VmManager {
         // Storage path from disk source directory
         let storage_path = Path::new(&disk_source).parent()
             .map(|p| p.to_string_lossy().to_string());
+
+        // Detect UEFI/OVMF from dumpxml
+        let bios_type = Command::new("virsh").args(["dumpxml", name]).output().ok()
+            .map(|o| {
+                let xml = String::from_utf8_lossy(&o.stdout);
+                if xml.contains("OVMF") || xml.contains("ovmf") || xml.contains("AAVMF") || xml.contains("edk2") {
+                    "ovmf".to_string()
+                } else {
+                    "seabios".to_string()
+                }
+            })
+            .unwrap_or_else(|| "seabios".to_string());
 
         Some(VmConfig {
             name: name.to_string(),
@@ -1986,7 +2015,7 @@ impl VmManager {
             extra_disks: Vec::new(),
             extra_nics: Vec::new(),
             vmid: None,
-            bios_type: "seabios".to_string(),
+            bios_type,
         })
     }
 
@@ -2008,10 +2037,10 @@ impl VmManager {
         // Network: use default network
         args.extend(["--network".to_string(), "default".to_string()]);
 
-        // Import image or ISO
+        // Import image or ISO — one of these is required for virt-install
         if let Some(ref import) = config.import_image {
             if !import.is_empty() {
-                args.extend(["--import".to_string()]);
+                args.push("--import".to_string());
                 // Replace the disk arg with the import image
                 if let Some(pos) = args.iter().position(|a| a.starts_with("path=")) {
                     args[pos] = format!("path={},format=qcow2", import);
@@ -2020,9 +2049,11 @@ impl VmManager {
         } else if let Some(ref iso) = config.iso_path {
             if !iso.is_empty() {
                 args.extend(["--cdrom".to_string(), iso.clone()]);
+            } else {
+                return Err("An ISO or import image is required to create a VM via libvirt".to_string());
             }
         } else {
-            args.push("--import".to_string());
+            return Err("An ISO or import image is required to create a VM via libvirt".to_string());
         }
 
         if config.bios_type == "ovmf" {

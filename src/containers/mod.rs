@@ -5397,7 +5397,8 @@ pub fn is_libvirt() -> bool {
     static IS_LIBVIRT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *IS_LIBVIRT.get_or_init(|| {
         if is_proxmox() { return false; } // Proxmox takes priority
-        Command::new("which").arg("virsh").output()
+        // Check virsh can actually connect to the hypervisor (not just installed)
+        Command::new("virsh").arg("uri").output()
             .map(|o| o.status.success())
             .unwrap_or(false)
     })
