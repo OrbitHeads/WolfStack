@@ -14,6 +14,8 @@ pub fn config(cfg: &mut web::ServiceConfig) {
             .route("/create", web::post().to(create_vm))
             .route("/storage", web::get().to(list_storage))
             .route("/import-external", web::post().to(vm_import_external))
+            .route("/discover-libvirt", web::get().to(discover_libvirt))
+            .route("/adopt-libvirt", web::post().to(adopt_libvirt))
             .route("/{name}/action", web::post().to(vm_action))
             .route("/{name}/logs", web::get().to(vm_logs))
             .route("/{name}/migrate", web::post().to(vm_migrate))
@@ -677,5 +679,35 @@ async fn vm_import_external(
             let _ = std::fs::remove_file(&archive);
             HttpResponse::InternalServerError().json(serde_json::json!({"error": e}))
         }
+    }
+}
+
+// ─── Libvirt VM Discovery & Adoption ───
+
+/// GET /api/vms/discover-libvirt — discover VMs managed by libvirt
+async fn discover_libvirt(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let manager = state.vms.lock().unwrap();
+    HttpResponse::Ok().json(manager.discover_libvirt_vms())
+}
+
+#[derive(Deserialize)]
+struct AdoptLibvirtRequest {
+    name: String,
+    #[serde(default)]
+    undefine_from_libvirt: bool,
+}
+
+/// POST /api/vms/adopt-libvirt — adopt a libvirt VM into WolfStack
+async fn adopt_libvirt(req: HttpRequest, state: web::Data<AppState>, body: web::Json<AdoptLibvirtRequest>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let manager = state.vms.lock().unwrap();
+    match manager.adopt_libvirt_vm(&body.name, body.undefine_from_libvirt) {
+        Ok(config) => HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "message": format!("VM '{}' adopted successfully", config.name),
+            "vm": config,
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
     }
 }

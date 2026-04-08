@@ -3554,7 +3554,10 @@
             <div class="card">
                 <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
                     <h3>Virtual Machines (KVM/QEMU)</h3>
-                    <button class="btn btn-sm btn-primary" onclick="showVmCreate()">+ Create VM</button>
+                    <div style="display:flex; gap:6px;">
+                        <button class="btn btn-sm" onclick="discoverLibvirtVms()" title="Adopt existing libvirt/QEMU VMs">Adopt VMs</button>
+                        <button class="btn btn-sm btn-primary" onclick="showVmCreate()">+ Create VM</button>
+                    </div>
                 </div>
                 <div class="card-body">
                     <table class="data-table">

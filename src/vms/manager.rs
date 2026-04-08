@@ -1798,6 +1798,320 @@ impl VmManager {
         let runtime: serde_json::Value = serde_json::from_str(&content).ok()?;
         runtime.get("vnc_ws_port").and_then(|v| v.as_u64()).map(|v| v as u16)
     }
+
+    // ─── Libvirt VM Discovery & Adoption ───
+
+    /// Discover VMs managed by libvirt that could be adopted into WolfStack
+    pub fn discover_libvirt_vms(&self) -> Vec<DiscoveredVm> {
+        // Check if virsh is available
+        let virsh_check = Command::new("which").arg("virsh").output();
+        if !virsh_check.map(|o| o.status.success()).unwrap_or(false) {
+            return vec![];
+        }
+
+        // Get all VM names
+        let output = match Command::new("virsh").args(["list", "--all", "--name"]).output() {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+            _ => return vec![],
+        };
+
+        let existing_vms: Vec<String> = self.list_vms().iter().map(|v| v.name.clone()).collect();
+
+        output.lines()
+            .map(|l| l.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .filter_map(|name| self.discover_single_libvirt_vm(&name, &existing_vms))
+            .collect()
+    }
+
+    fn discover_single_libvirt_vm(&self, name: &str, existing: &[String]) -> Option<DiscoveredVm> {
+        // Get dominfo for CPU, memory, state
+        let dominfo = Command::new("virsh").args(["dominfo", name]).output().ok()?;
+        let dominfo_text = String::from_utf8_lossy(&dominfo.stdout);
+
+        let mut cpus = 1u32;
+        let mut memory_kb = 1048576u64; // 1GB default
+        let mut state = "unknown".to_string();
+
+        for line in dominfo_text.lines() {
+            let parts: Vec<&str> = line.splitn(2, ':').collect();
+            if parts.len() != 2 { continue; }
+            let key = parts[0].trim();
+            let val = parts[1].trim();
+            match key {
+                "CPU(s)" => { cpus = val.parse().unwrap_or(1); }
+                "Max memory" => {
+                    // Format: "2097152 KiB"
+                    memory_kb = val.split_whitespace().next()
+                        .and_then(|v| v.parse().ok()).unwrap_or(1048576);
+                }
+                "State" => { state = val.to_string(); }
+                _ => {}
+            }
+        }
+
+        // Get disk info via domblklist
+        let blklist = Command::new("virsh").args(["domblklist", name, "--details"]).output().ok()?;
+        let blklist_text = String::from_utf8_lossy(&blklist.stdout);
+        let mut disks = Vec::new();
+
+        for line in blklist_text.lines().skip(2) { // Skip header + separator
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            // Format: Type  Device  Target  Source
+            if parts.len() < 4 { continue; }
+            let dev_type = parts[0]; // file, block, etc.
+            let device = parts[1];   // disk, cdrom
+            let target = parts[2];   // vda, sda, hda
+            let source = parts[3..].join(" "); // path (may contain spaces)
+
+            if source == "-" || source.is_empty() { continue; }
+
+            let is_cdrom = device == "cdrom";
+            let (size_gb, format) = if !is_cdrom && dev_type == "file" {
+                disk_info_from_qemu_img(&source)
+            } else {
+                (0, "raw".to_string())
+            };
+
+            disks.push(DiscoveredDisk {
+                target: target.to_string(),
+                source: source.to_string(),
+                size_gb,
+                format,
+                is_cdrom,
+            });
+        }
+
+        // Get NIC info via domiflist
+        let iflist = Command::new("virsh").args(["domiflist", name]).output().ok()?;
+        let iflist_text = String::from_utf8_lossy(&iflist.stdout);
+        let mut nics = Vec::new();
+
+        for line in iflist_text.lines().skip(2) { // Skip header + separator
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            // Format: Interface  Type  Source  Model  MAC
+            if parts.len() < 5 { continue; }
+            nics.push(DiscoveredNic {
+                nic_type: parts[1].to_string(),
+                source: parts[2].to_string(),
+                model: parts[3].to_string(),
+                mac: parts[4].to_string(),
+            });
+        }
+
+        // Parse dumpxml for BIOS type and primary disk bus
+        let (bios_type, os_disk_bus) = if let Ok(xml_out) = Command::new("virsh").args(["dumpxml", name]).output() {
+            let xml = String::from_utf8_lossy(&xml_out.stdout);
+            let bios = if xml.contains("OVMF") || xml.contains("ovmf") || xml.contains("AAVMF") || xml.contains("edk2") {
+                "ovmf".to_string()
+            } else {
+                "seabios".to_string()
+            };
+            // Find primary disk bus: look for <target dev='vda' bus='virtio'/> in first <disk device='disk'> block
+            let bus = xml.lines()
+                .skip_while(|l| !l.contains("device='disk'"))
+                .find(|l| l.contains("<target") && l.contains("bus="))
+                .and_then(|l| {
+                    l.split("bus='").nth(1).or_else(|| l.split("bus=\"").nth(1))
+                        .and_then(|s| s.split(['\'', '"']).next())
+                })
+                .unwrap_or("virtio")
+                .to_string();
+            (bios, bus)
+        } else {
+            ("seabios".to_string(), "virtio".to_string())
+        };
+
+        Some(DiscoveredVm {
+            name: name.to_string(),
+            state,
+            cpus,
+            memory_mb: (memory_kb / 1024) as u32,
+            disks,
+            nics,
+            bios_type,
+            os_disk_bus,
+            already_managed: existing.contains(&name.to_string()),
+        })
+    }
+
+    /// Adopt a libvirt VM into WolfStack management.
+    /// Creates a WolfStack config pointing at the existing disk files.
+    /// Optionally undefines the VM from libvirt (but does NOT delete disks).
+    pub fn adopt_libvirt_vm(&self, name: &str, undefine_from_libvirt: bool) -> Result<VmConfig, String> {
+        // Validate name
+        if name.contains('/') || name.contains("..") || name.contains('\0') || name.is_empty() {
+            return Err("Invalid VM name".to_string());
+        }
+
+        // Check not already managed
+        if self.vm_config_path(name).exists() {
+            return Err(format!("VM '{}' is already managed by WolfStack", name));
+        }
+
+        // Discover VM details
+        let existing = self.list_vms().iter().map(|v| v.name.clone()).collect::<Vec<_>>();
+        let discovered = self.discover_single_libvirt_vm(name, &existing)
+            .ok_or_else(|| format!("Could not read VM '{}' from libvirt", name))?;
+
+        // Refuse to adopt running VMs when undefining — we can't block waiting for shutdown
+        if undefine_from_libvirt && discovered.state.contains("running") {
+            return Err(format!("VM '{}' is running. Stop it in libvirt first (virsh shutdown {}), then adopt.", name, name));
+        }
+
+        // Find primary disk (first non-CDROM disk)
+        let primary_disk = discovered.disks.iter()
+            .find(|d| !d.is_cdrom)
+            .ok_or_else(|| format!("VM '{}' has no disk images", name))?;
+
+        // Validate disk is a real file
+        let disk_path = Path::new(&primary_disk.source);
+        if !disk_path.exists() {
+            return Err(format!("Disk file not found: {}", primary_disk.source));
+        }
+        let disk_dir = disk_path.parent()
+            .ok_or_else(|| "Cannot determine disk directory".to_string())?;
+
+        // If the disk filename doesn't match {name}.qcow2, create a symlink
+        let storage_path = disk_dir.to_string_lossy().to_string();
+        let expected_path = disk_dir.join(format!("{}.qcow2", name));
+        if disk_path != expected_path {
+            if expected_path.exists() {
+                warn!("Expected disk path {} already exists — using it as-is", expected_path.display());
+            } else {
+                std::os::unix::fs::symlink(disk_path, &expected_path)
+                    .map_err(|e| format!("Failed to create symlink for disk: {}", e))?;
+                info!("Created symlink: {} -> {}", expected_path.display(), disk_path.display());
+            }
+        }
+
+        // Build VmConfig
+        let primary_mac = discovered.nics.first().map(|n| n.mac.clone());
+        let primary_nic_model = discovered.nics.first()
+            .map(|n| n.model.clone()).unwrap_or_else(|| "virtio".to_string());
+
+        // Extra NICs (all after the first)
+        let extra_nics: Vec<NicConfig> = discovered.nics.iter().skip(1).map(|n| {
+            NicConfig {
+                model: n.model.clone(),
+                mac: Some(n.mac.clone()),
+                bridge: if n.nic_type == "bridge" { Some(n.source.clone()) } else { None },
+                passthrough_interface: None,
+            }
+        }).collect();
+
+        // Extra disks (non-primary, non-CDROM)
+        let extra_disks: Vec<StorageVolume> = discovered.disks.iter()
+            .filter(|d| !d.is_cdrom && d.source != primary_disk.source)
+            .enumerate()
+            .map(|(i, d)| {
+                let dp = Path::new(&d.source);
+                StorageVolume {
+                    name: format!("{}-extra{}", name, i + 1),
+                    size_gb: d.size_gb,
+                    storage_path: dp.parent().map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| storage_path.clone()),
+                    format: d.format.clone(),
+                    bus: discovered.os_disk_bus.clone(),
+                }
+            }).collect();
+
+        // ISO (first CDROM with a source)
+        let iso_path = discovered.disks.iter()
+            .find(|d| d.is_cdrom && !d.source.is_empty())
+            .map(|d| d.source.clone());
+
+        let config = VmConfig {
+            name: name.to_string(),
+            cpus: discovered.cpus,
+            memory_mb: discovered.memory_mb,
+            disk_size_gb: primary_disk.size_gb,
+            iso_path,
+            running: false,
+            vnc_port: None,
+            vnc_ws_port: None,
+            mac_address: primary_mac,
+            auto_start: false,
+            wolfnet_ip: None,
+            storage_path: Some(storage_path),
+            os_disk_bus: discovered.os_disk_bus,
+            net_model: primary_nic_model,
+            drivers_iso: None,
+            import_image: None,
+            extra_disks,
+            extra_nics,
+            vmid: None,
+            bios_type: discovered.bios_type,
+        };
+
+        // Save config
+        let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+        fs::write(self.vm_config_path(name), json).map_err(|e| e.to_string())?;
+
+        // Optionally undefine from libvirt (keeps disk files — VM is already stopped)
+        if undefine_from_libvirt {
+            let undefine_out = Command::new("virsh").args(["undefine", name, "--nvram"]).output();
+            if let Ok(ref o) = undefine_out {
+                if !o.status.success() {
+                    // Try without --nvram (non-UEFI VMs)
+                    let _ = Command::new("virsh").args(["undefine", name]).output();
+                }
+            }
+            info!("Undefined VM '{}' from libvirt", name);
+        }
+
+        info!("Adopted libvirt VM '{}' into WolfStack", name);
+        Ok(config)
+    }
+}
+
+/// A VM discovered from libvirt that can be adopted
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DiscoveredVm {
+    pub name: String,
+    pub state: String,
+    pub cpus: u32,
+    pub memory_mb: u32,
+    pub disks: Vec<DiscoveredDisk>,
+    pub nics: Vec<DiscoveredNic>,
+    pub bios_type: String,
+    pub os_disk_bus: String,
+    pub already_managed: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DiscoveredDisk {
+    pub target: String,
+    pub source: String,
+    pub size_gb: u32,
+    pub format: String,
+    pub is_cdrom: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DiscoveredNic {
+    pub nic_type: String,
+    pub source: String,
+    pub model: String,
+    pub mac: String,
+}
+
+/// Get disk size and format from qemu-img info
+fn disk_info_from_qemu_img(path: &str) -> (u32, String) {
+    let output = Command::new("qemu-img").args(["info", "--output=json", path]).output();
+    match output {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            if let Ok(info) = serde_json::from_str::<serde_json::Value>(&text) {
+                let size_bytes = info["virtual-size"].as_u64().unwrap_or(0);
+                let size_gb = (size_bytes / (1024 * 1024 * 1024)) as u32;
+                let format = info["format"].as_str().unwrap_or("qcow2").to_string();
+                return (size_gb.max(1), format);
+            }
+            (0, "qcow2".to_string())
+        }
+        _ => (0, "qcow2".to_string()),
+    }
 }
 
 // ─── VM Migration (standalone functions — no mutex needed) ───

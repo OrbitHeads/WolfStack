@@ -3349,6 +3349,141 @@ function renderVms(vms) {
     }).join('');
 }
 
+// ─── Libvirt VM Discovery & Adoption ───
+
+function escapeHtml(str) {
+    return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+async function discoverLibvirtVms() {
+    try {
+        showToast('Scanning for libvirt VMs...', 'info');
+        const resp = await fetch(apiUrl('/api/vms/discover-libvirt'));
+        if (handleAuthError(resp)) return;
+        if (!resp.ok) {
+            const data = await resp.json().catch(() => ({}));
+            showToast(data.error || 'Failed to discover VMs', 'error');
+            return;
+        }
+        const vms = await resp.json();
+
+        if (!Array.isArray(vms) || vms.length === 0) {
+            showToast('No libvirt VMs found (is libvirtd running?)', 'info');
+            return;
+        }
+
+        // Build modal content
+        const adoptable = vms.filter(v => !v.already_managed);
+        const managed = vms.filter(v => v.already_managed);
+
+        let html = `
+            <div class="modal-overlay active" id="adopt-vm-modal" onclick="if(event.target===this)this.classList.remove('active')">
+            <div class="modal" style="max-width:700px; max-height:85vh; overflow-y:auto;">
+                <div class="modal-header"><h3>Adopt Existing VMs</h3></div>
+                <div class="modal-body">
+                    <p style="color:var(--text-muted); margin-bottom:12px;">
+                        Found <strong>${vms.length}</strong> VM(s) in libvirt.
+                        ${managed.length > 0 ? `<br><small>${managed.length} already managed by WolfStack.</small>` : ''}
+                    </p>`;
+
+        if (adoptable.length === 0) {
+            html += `<p style="text-align:center; padding:20px; color:var(--text-muted);">All discovered VMs are already managed by WolfStack.</p>`;
+        } else {
+            html += `
+                    <div style="margin-bottom:12px;">
+                        <label><input type="checkbox" id="adopt-undefine" checked> Remove from libvirt after adopting (keeps disk files)</label>
+                    </div>
+                    <table class="data-table" style="width:100%;">
+                        <thead><tr>
+                            <th style="width:30px;"><input type="checkbox" id="adopt-select-all" onchange="document.querySelectorAll('.adopt-vm-cb').forEach(c=>c.checked=this.checked)" checked></th>
+                            <th>Name</th>
+                            <th>State</th>
+                            <th>CPU / RAM</th>
+                            <th>Disk</th>
+                        </tr></thead>
+                        <tbody>`;
+
+            for (const vm of adoptable) {
+                const primaryDisk = vm.disks.find(d => !d.is_cdrom);
+                const diskInfo = primaryDisk ? `${primaryDisk.size_gb} GiB ${escapeHtml(primaryDisk.format)}` : 'No disk';
+                const stateColor = vm.state.includes('running') ? 'var(--success)' : 'var(--text-muted)';
+                const safeName = escapeHtml(vm.name);
+                html += `
+                            <tr>
+                                <td><input type="checkbox" class="adopt-vm-cb" value="${safeName}" checked></td>
+                                <td><strong>${safeName}</strong>${vm.bios_type === 'ovmf' ? ' <small style="color:var(--accent);">UEFI</small>' : ''}</td>
+                                <td><span style="color:${stateColor};">${escapeHtml(vm.state)}</span></td>
+                                <td>${vm.cpus} vCPU / ${vm.memory_mb} MB</td>
+                                <td>${diskInfo}</td>
+                            </tr>`;
+            }
+
+            html += `</tbody></table>`;
+        }
+
+        html += `
+                </div>
+                <div class="modal-footer" style="display:flex; gap:8px; justify-content:flex-end; padding-top:12px; border-top:1px solid var(--border);">
+                    <button class="btn" onclick="document.getElementById('adopt-vm-modal').classList.remove('active')">Cancel</button>
+                    ${adoptable.length > 0 ? `<button class="btn btn-primary" onclick="adoptSelectedVms()">Adopt Selected</button>` : ''}
+                </div>
+            </div></div>`;
+
+        // Remove existing modal if any, then insert
+        const existing = document.getElementById('adopt-vm-modal');
+        if (existing) existing.remove();
+        document.body.insertAdjacentHTML('beforeend', html);
+    } catch (e) {
+        console.error('Discover failed:', e);
+        showToast('Failed to discover VMs: ' + e.message, 'error');
+    }
+}
+
+async function adoptSelectedVms() {
+    const checkboxes = document.querySelectorAll('.adopt-vm-cb:checked');
+    if (checkboxes.length === 0) {
+        showToast('No VMs selected', 'error');
+        return;
+    }
+
+    const undefine = document.getElementById('adopt-undefine')?.checked ?? true;
+    const names = Array.from(checkboxes).map(cb => cb.value);
+
+    showToast(`Adopting ${names.length} VM(s)...`, 'info');
+
+    let succeeded = 0;
+    let failed = 0;
+    for (const name of names) {
+        try {
+            const resp = await fetch(apiUrl('/api/vms/adopt-libvirt'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, undefine_from_libvirt: undefine })
+            });
+            const data = await resp.json();
+            if (resp.ok) {
+                succeeded++;
+                taskLog('Adopted VM: ' + name);
+            } else {
+                failed++;
+                showToast(`Failed to adopt ${name}: ${data.error}`, 'error');
+            }
+        } catch (e) {
+            failed++;
+            showToast(`Failed to adopt ${name}: ${e.message}`, 'error');
+        }
+    }
+
+    // Close modal and refresh
+    const modal = document.getElementById('adopt-vm-modal');
+    if (modal) modal.classList.remove('active');
+
+    if (succeeded > 0) {
+        showToast(`Adopted ${succeeded} VM(s)${failed > 0 ? `, ${failed} failed` : ''}`, 'success');
+        loadVms();
+    }
+}
+
 // ─── Ceph Cluster ───
 
 let _cephStatus = null;
