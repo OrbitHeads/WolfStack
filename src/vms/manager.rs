@@ -47,6 +47,20 @@ impl StorageVolume {
     }
 }
 
+/// Additional network interface configuration for multi-NIC VMs (e.g. OPNsense WAN+LAN)
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NicConfig {
+    /// NIC model: "virtio", "e1000", "e1000e", "rtl8139"
+    #[serde(default = "default_net_model")]
+    pub model: String,
+    /// MAC address (auto-generated if empty)
+    #[serde(default)]
+    pub mac: Option<String>,
+    /// Bridge name for this NIC (e.g. "br0", "vmbr1"). Empty = user-mode networking.
+    #[serde(default)]
+    pub bridge: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VmConfig {
     pub name: String,
@@ -80,6 +94,9 @@ pub struct VmConfig {
     /// Extra disks attached to this VM
     #[serde(default)]
     pub extra_disks: Vec<StorageVolume>,
+    /// Extra network interfaces (net1, net2, ...) — e.g. OPNsense WAN+LAN
+    #[serde(default)]
+    pub extra_nics: Vec<NicConfig>,
     /// Proxmox VMID (only set when running on Proxmox VE)
     #[serde(default)]
     pub vmid: Option<u32>,
@@ -111,6 +128,7 @@ impl VmConfig {
             drivers_iso: None,
             import_image: None,
             extra_disks: Vec::new(),
+            extra_nics: Vec::new(),
             vmid: None,
             bios_type: "seabios".to_string(),
         }
@@ -127,7 +145,7 @@ fn detect_image_format(path: &str) -> &str {
     else { "raw" } // .img and anything else treated as raw
 }
 
-fn generate_mac() -> String {
+pub(crate) fn generate_mac() -> String {
     let mut rng = rand::thread_rng();
     format!("52:54:00:{:02x}:{:02x}:{:02x}", rng.r#gen::<u8>(), rng.r#gen::<u8>(), rng.r#gen::<u8>())
 }
@@ -275,6 +293,7 @@ impl VmManager {
                     drivers_iso: None,
                     import_image: None,
                     extra_disks: Vec::new(),
+                    extra_nics: Vec::new(),
                     vmid: Some(vmid),
                     bios_type: "seabios".to_string(),
                 })
@@ -746,7 +765,8 @@ impl VmManager {
                      disk_size_gb: Option<u32>,
                      os_disk_bus: Option<String>, net_model: Option<String>,
                      drivers_iso: Option<String>, auto_start: Option<bool>,
-                     bios_type: Option<String>) -> Result<(), String> {
+                     bios_type: Option<String>,
+                     extra_nics: Option<Vec<NicConfig>>) -> Result<(), String> {
         // On Proxmox, delegate to qm set
         if containers::is_proxmox() {
             let vmid = self.qm_vmid_by_name(name)
@@ -771,6 +791,31 @@ impl VmManager {
             if let Some(new_size) = disk_size_gb {
                 let size_arg = format!("{}G", new_size);
                 let _ = Command::new("qm").args(["resize", &vmid_str, "scsi0", &size_arg]).output();
+            }
+            // Extra NICs on Proxmox: net1=virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr1
+            if let Some(ref nics) = extra_nics {
+                for (i, nic) in nics.iter().enumerate() {
+                    let key = format!("--net{}", i + 1);
+                    let model = match nic.model.as_str() {
+                        "e1000" | "e1000e" | "rtl8139" => nic.model.as_str(),
+                        _ => "virtio",
+                    };
+                    let mac = nic.mac.clone().unwrap_or_else(generate_mac);
+                    let bridge = nic.bridge.as_deref().unwrap_or("vmbr0");
+                    let val = format!("{}={},bridge={}", model, mac, bridge);
+                    let _ = Command::new("qm").args(["set", &vmid_str, &key, &val]).output();
+                }
+                // Remove higher-numbered NICs that may have been deleted.
+                // Only try deleting net{N} if qm config shows it exists (avoid spurious errors).
+                if let Ok(cfg_out) = Command::new("qm").args(["config", &vmid_str]).output() {
+                    let cfg_text = String::from_utf8_lossy(&cfg_out.stdout);
+                    for i in nics.len()..8 {
+                        let net_key = format!("net{}", i + 1);
+                        if cfg_text.contains(&format!("{}: ", net_key)) {
+                            let _ = Command::new("qm").args(["set", &vmid_str, "--delete", &net_key]).output();
+                        }
+                    }
+                }
             }
             return Ok(());
         }
@@ -827,6 +872,15 @@ impl VmManager {
         }
         if let Some(ref bt) = bios_type {
             if !bt.is_empty() { config.bios_type = bt.clone(); }
+        }
+        if let Some(nics) = extra_nics {
+            // Auto-generate MACs for any NICs that don't have one
+            config.extra_nics = nics.into_iter().map(|mut n| {
+                if n.mac.is_none() || n.mac.as_ref().map(|m| m.is_empty()).unwrap_or(false) {
+                    n.mac = Some(generate_mac());
+                }
+                n
+            }).collect();
         }
 
         // Disk resize (grow only)
@@ -1107,6 +1161,50 @@ impl VmManager {
                .arg("-device").arg(&nic_arg);
         }
 
+        // Extra NICs (net1, net2, ...) — e.g. OPNsense WAN+LAN, multi-homed servers
+        for (i, nic) in config.extra_nics.iter().enumerate() {
+            let idx = i + 1; // net1, net2, ...
+            let net_id = format!("net{}", idx);
+            let dev = match nic.model.as_str() {
+                "e1000" => "e1000",
+                "e1000e" => "e1000e",
+                "rtl8139" => "rtl8139",
+                _ => "virtio-net-pci",
+            };
+            let mac = nic.mac.clone().unwrap_or_else(generate_mac);
+            let dev_arg = format!("{},netdev={},mac={}", dev, net_id, mac);
+
+            if let Some(ref bridge) = nic.bridge {
+                if !bridge.is_empty() {
+                    // Bridge mode — create a TAP on the specified bridge
+                    let tap = format!("tap-{}-{}", &name[..name.len().min(8)], idx);
+                    // Create TAP attached to bridge
+                    let _ = Command::new("ip").args(["link", "set", &tap, "down"]).output();
+                    let _ = Command::new("ip").args(["tuntap", "del", "dev", &tap, "mode", "tap"]).output();
+                    if let Ok(o) = Command::new("ip").args(["tuntap", "add", "dev", &tap, "mode", "tap"]).output() {
+                        if o.status.success() {
+                            let master_out = Command::new("ip").args(["link", "set", &tap, "master", bridge]).output();
+                            if let Ok(ref mo) = master_out {
+                                if !mo.status.success() {
+                                    write_log(&format!("WARNING: bridge '{}' not found or cannot attach TAP — NIC {} may have no connectivity", bridge, net_id));
+                                }
+                            }
+                            let _ = Command::new("ip").args(["link", "set", &tap, "up"]).output();
+                            cmd.arg("-netdev").arg(format!("tap,id={},ifname={},script=no,downscript=no", net_id, tap))
+                               .arg("-device").arg(&dev_arg);
+                            write_log(&format!("Extra NIC {}: {} on bridge {} (mac: {}, tap: {})", net_id, dev, bridge, mac, tap));
+                            continue;
+                        }
+                    }
+                    write_log(&format!("Extra NIC {}: bridge TAP failed for '{}', falling back to user-mode", net_id, bridge));
+                }
+            }
+            // Fallback: user-mode networking
+            cmd.arg("-netdev").arg(format!("user,id={}", net_id))
+               .arg("-device").arg(&dev_arg);
+            write_log(&format!("Extra NIC {}: {} user-mode (mac: {})", net_id, dev, mac));
+        }
+
         // Boot media: ISO (CD-ROM) or .img (USB drive)
         let mut has_boot_media = false;
         if let Some(iso) = &config.iso_path {
@@ -1172,21 +1270,23 @@ impl VmManager {
                 let tap = Self::tap_name(name);
                 let _ = self.cleanup_tap(&tap);
             }
+            self.cleanup_extra_nic_taps(name, &config.extra_nics);
             return Err(format!("QEMU failed to start: {}", err_msg));
         }
 
         // -daemonize makes QEMU fork, so output.status may be 0 even if the child crashes.
         std::thread::sleep(std::time::Duration::from_secs(1));
-        
+
         if !self.check_running(name) {
             let log_content = fs::read_to_string(&log_path).unwrap_or_else(|_| "no log available".to_string());
             write_log("VM exited immediately after daemonize — check QEMU errors above");
             error!("VM {} exited immediately after daemonize. Log: {}", name, log_content);
-            
+
             if config.wolfnet_ip.is_some() {
                 let tap = Self::tap_name(name);
                 let _ = self.cleanup_tap(&tap);
             }
+            self.cleanup_extra_nic_taps(name, &config.extra_nics);
             return Err(format!("VM crashed immediately after starting. QEMU log:\n{}", log_content));
         }
 
@@ -1399,6 +1499,16 @@ impl VmManager {
         Ok(())
     }
 
+    /// Clean up TAP interfaces for extra NICs
+    fn cleanup_extra_nic_taps(&self, name: &str, nics: &[NicConfig]) {
+        for (i, nic) in nics.iter().enumerate() {
+            if nic.bridge.as_ref().map(|b| !b.is_empty()).unwrap_or(false) {
+                let tap = format!("tap-{}-{}", &name[..name.len().min(8)], i + 1);
+                let _ = self.cleanup_tap(&tap);
+            }
+        }
+    }
+
     /// Clean up WolfNet routes for a specific IP
     fn cleanup_wolfnet_routes(&self, wolfnet_ip: &str) {
         let _ = Command::new("ip").args(["route", "del", &format!("{}/32", wolfnet_ip)]).output();
@@ -1442,6 +1552,7 @@ impl VmManager {
                     self.cleanup_wolfnet_routes(ip);
                 }
             }
+            self.cleanup_extra_nic_taps(name, &config.extra_nics);
         }
 
         // Clean up runtime file

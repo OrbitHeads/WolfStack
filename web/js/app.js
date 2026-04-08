@@ -5856,6 +5856,52 @@ function closeVmCreate() {
     document.querySelectorAll('.modal-overlay').forEach(m => m.classList.remove('active'));
 }
 
+// ─── Extra NIC management (multi-NIC VMs) ───
+
+function addExtraNicRow(containerId, nic) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    const idx = container.children.length;
+    const row = document.createElement('div');
+    row.className = 'vm-extra-nic-row';
+    row.style.cssText = 'display:flex; gap:8px; align-items:center; margin-bottom:6px; padding:8px; background:var(--bg-tertiary); border:1px solid var(--border); border-radius:8px;';
+    row.innerHTML = `
+        <div style="flex:1;">
+            <select class="form-control vm-nic-model" style="font-size:12px; padding:4px 8px;">
+                <option value="virtio"${(nic?.model||'virtio')==='virtio'?' selected':''}>VirtIO</option>
+                <option value="e1000"${nic?.model==='e1000'?' selected':''}>e1000</option>
+                <option value="e1000e"${nic?.model==='e1000e'?' selected':''}>e1000e</option>
+                <option value="rtl8139"${nic?.model==='rtl8139'?' selected':''}>rtl8139</option>
+            </select>
+        </div>
+        <div style="flex:1.5;">
+            <input type="text" class="form-control vm-nic-bridge" placeholder="Bridge (e.g. br0, vmbr1)"
+                value="${nic?.bridge||''}" style="font-size:12px; padding:4px 8px;">
+        </div>
+        <div style="flex:1.5;">
+            <input type="text" class="form-control vm-nic-mac" placeholder="MAC (auto)"
+                value="${nic?.mac||''}" style="font-size:12px; padding:4px 8px; font-family:monospace;">
+        </div>
+        <span style="font-size:10px; color:var(--text-muted); white-space:nowrap;">net${idx + 1}</span>
+        <button type="button" class="btn btn-sm" onclick="this.closest('.vm-extra-nic-row').remove()"
+            style="font-size:10px; padding:2px 6px; color:var(--danger); border-color:rgba(239,68,68,0.3);">✕</button>
+    `;
+    container.appendChild(row);
+}
+
+function collectExtraNics(containerId) {
+    const container = document.getElementById(containerId);
+    if (!container) return [];
+    const nics = [];
+    for (const row of container.children) {
+        const model = row.querySelector('.vm-nic-model')?.value || 'virtio';
+        const bridge = row.querySelector('.vm-nic-bridge')?.value.trim() || '';
+        const mac = row.querySelector('.vm-nic-mac')?.value.trim() || '';
+        nics.push({ model, bridge: bridge || null, mac: mac || null });
+    }
+    return nics;
+}
+
 async function createVm() {
     const name = document.getElementById('new-vm-name').value.trim();
     const cpus = parseInt(document.getElementById('new-vm-cpus').value);
@@ -5902,7 +5948,8 @@ async function createVm() {
                 net_model: netModel,
                 drivers_iso: driversIso,
                 bios_type: biosType,
-                extra_disks: extraDisks
+                extra_disks: extraDisks,
+                extra_nics: collectExtraNics('new-vm-extra-nics')
             })
         });
         const data = await resp.json();
@@ -15103,6 +15150,16 @@ async function showVmSettings(name) {
                             placeholder="Leave empty for user-mode networking">
                     </div>
                 </div>
+                <!-- Extra NICs -->
+                <div style="margin-top:12px; padding:12px; background:var(--bg-tertiary); border-radius:8px; border:1px solid var(--border);">
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+                        <h4 style="margin:0; font-size:13px;">🔌 Additional NICs</h4>
+                        <button type="button" class="btn btn-sm" onclick="addExtraNicRow('edit-vm-extra-nics')"
+                            style="font-size:11px; padding:2px 10px;">+ Add NIC</button>
+                    </div>
+                    <small style="color:var(--text-muted); display:block; margin-bottom:8px;">Extra network interfaces (net1, net2, ...) for multi-homed VMs like OPNsense.</small>
+                    <div id="edit-vm-extra-nics"></div>
+                </div>
                 <div style="padding:12px;background:var(--bg-tertiary);border-radius:8px;border:1px solid var(--border);margin-top:12px;">
                     <h4 style="margin:0 0 8px 0;font-size:13px;">💿 Boot Options</h4>
                     <div class="form-group">
@@ -15142,6 +15199,12 @@ async function showVmSettings(name) {
                 <button class="btn" onclick="closeContainerDetail()">Cancel</button>
             </div>
         `;
+        // Populate existing extra NICs
+        if (vm.extra_nics && vm.extra_nics.length > 0) {
+            for (const nic of vm.extra_nics) {
+                addExtraNicRow('edit-vm-extra-nics', nic);
+            }
+        }
     } catch (e) {
         body.innerHTML = `<p style="color:var(--danger); padding:1rem;">Failed to load VM: ${e.message}</p>`;
     }
@@ -15257,6 +15320,7 @@ async function saveVmSettings(name) {
                 net_model: netModel,
                 drivers_iso: driversIso,
                 bios_type: biosType,
+                extra_nics: collectExtraNics('edit-vm-extra-nics'),
             })
         });
         const data = await resp.json();

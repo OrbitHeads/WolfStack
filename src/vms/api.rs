@@ -81,6 +81,9 @@ struct CreateVmRequest {
     /// Extra disks to create with the VM (Proxmox-style)
     #[serde(default)]
     extra_disks: Vec<CreateVmDisk>,
+    /// Extra network interfaces (net1, net2, ...) for multi-NIC VMs
+    #[serde(default)]
+    extra_nics: Vec<super::manager::NicConfig>,
     /// BIOS type: "seabios" (legacy) or "ovmf" (UEFI/EFI)
     #[serde(default = "default_bios_type")]
     bios_type: String,
@@ -131,6 +134,15 @@ async fn create_vm(req: HttpRequest, state: web::Data<AppState>, body: web::Json
         });
     }
 
+    // Extra NICs (auto-generate MACs where missing)
+    config.extra_nics = body.extra_nics.iter().map(|n| {
+        let mut nic = n.clone();
+        if nic.mac.is_none() || nic.mac.as_ref().map(|m| m.is_empty()).unwrap_or(false) {
+            nic.mac = Some(super::manager::generate_mac());
+        }
+        nic
+    }).collect();
+
     match manager.create_vm(config) {
         Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "success": true })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
@@ -149,6 +161,7 @@ struct UpdateVmRequest {
     drivers_iso: Option<String>,
     auto_start: Option<bool>,
     bios_type: Option<String>,
+    extra_nics: Option<Vec<super::manager::NicConfig>>,
 }
 
 async fn update_vm(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<UpdateVmRequest>) -> HttpResponse {
@@ -160,7 +173,8 @@ async fn update_vm(req: HttpRequest, state: web::Data<AppState>, path: web::Path
                             body.wolfnet_ip.clone(), body.disk_size_gb,
                             body.os_disk_bus.clone(), body.net_model.clone(),
                             body.drivers_iso.clone(), body.auto_start,
-                            body.bios_type.clone()) {
+                            body.bios_type.clone(),
+                            body.extra_nics.clone()) {
         Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "success": true })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
     }
