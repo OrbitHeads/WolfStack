@@ -120,9 +120,10 @@ fn scan_plugins() -> Vec<LoadedPlugin> {
                 manifest.has_css = path.join("web/plugin.css").exists();
                 manifest.has_backend = path.join("bin/handler").exists();
 
+                // Plugins require an Enterprise license
                 let status = if !manifest.enabled {
                     "disabled".to_string()
-                } else if manifest.enterprise_only && !crate::compat::platform_ready() {
+                } else if !crate::compat::platform_ready() {
                     "requires_license".to_string()
                 } else {
                     "active".to_string()
@@ -321,8 +322,9 @@ pub async fn proxy_request(
     let plugin = get(plugin_id).ok_or_else(|| format!("Plugin '{}' not found", plugin_id))?;
     let port = plugin.manifest.api_port.ok_or("Plugin has no API port")?;
 
-    if plugin.manifest.enterprise_only && !crate::compat::platform_ready() {
-        return Err("Enterprise license required for this plugin".to_string());
+    // All plugins require an Enterprise license
+    if !crate::compat::platform_ready() {
+        return Err("Enterprise license required to use plugins".to_string());
     }
 
     let url = format!("http://127.0.0.1:{}/{}", port, sub_path.trim_start_matches('/'));

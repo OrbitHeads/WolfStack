@@ -14889,9 +14889,15 @@ pub struct PluginInstallRequest {
     pub url: String,
 }
 
-/// POST /api/plugins/install — install a plugin from URL
+/// POST /api/plugins/install — install a plugin from URL (Enterprise only)
 pub async fn plugins_install(req: HttpRequest, state: web::Data<AppState>, body: web::Json<PluginInstallRequest>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
+    if !crate::compat::platform_ready() {
+        return HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "Plugins require an Enterprise license",
+            "feature": "plugins"
+        }));
+    }
     match web::block(move || crate::plugins::install_from_url(&body.url)).await {
         Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
         Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
@@ -14924,9 +14930,13 @@ pub async fn plugins_toggle(req: HttpRequest, state: web::Data<AppState>, path: 
     }
 }
 
-/// GET /api/plugins/{id}/file/{path} — serve plugin web assets (JS/CSS)
+/// GET /api/plugins/{id}/file/{path} — serve plugin web assets (JS/CSS) (Enterprise only)
 pub async fn plugins_file(_req: HttpRequest, path: web::Path<(String, String)>) -> HttpResponse {
     // No auth required for static assets (they're loaded by the browser)
+    // But plugins are an Enterprise feature — don't serve assets without a license
+    if !crate::compat::platform_ready() {
+        return HttpResponse::Forbidden().finish();
+    }
     let (plugin_id, file_path) = path.into_inner();
 
     match crate::plugins::read_file(&plugin_id, &file_path) {
