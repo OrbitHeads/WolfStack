@@ -1251,25 +1251,6 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         },
 
 
-        AppManifest {
-            id: "focalboard".into(),
-            name: "Focalboard".into(),
-            icon: "📋".into(),
-            category: "Project Management".into(),
-            description: "Open-source Trello/Notion/Asana alternative for project management".into(),
-            website: Some("https://www.focalboard.com".into()),
-            docker: Some(DockerTarget {
-                image: "mattermost/focalboard:latest".into(),
-                ports: vec!["8787:8000".into()],
-                env: vec![],
-                volumes: vec!["focalboard_data:/opt/focalboard/data".into()],
-                sidecars: vec![],
-            }),
-            lxc: None,
-            bare_metal: None,
-            user_inputs: vec![],
-        },
-
         // ── CMS & Publishing ──
 
         AppManifest {
@@ -1558,7 +1539,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
             website: Some("https://jellyfin.org".into()),
             docker: Some(DockerTarget {
                 image: "jellyfin/jellyfin:latest".into(),
-                ports: vec!["8096:8096".into()],
+                ports: vec!["8096:8096".into(), "8920:8920".into(), "7359:7359/udp".into()],
                 env: vec![],
                 volumes: vec!["jellyfin_config:/config".into(), "jellyfin_cache:/cache".into()],
                 sidecars: vec![],
@@ -1876,11 +1857,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
             docker: Some(DockerTarget {
                 image: "n8nio/n8n:latest".into(),
                 ports: vec!["5678:5678".into()],
-                env: vec![
-                    "N8N_BASIC_AUTH_ACTIVE=true".into(),
-                    "N8N_BASIC_AUTH_USER=${ADMIN_USER}".into(),
-                    "N8N_BASIC_AUTH_PASSWORD=${ADMIN_PASSWORD}".into(),
-                ],
+                env: vec![],
                 volumes: vec!["n8n_data:/home/node/.n8n".into()],
                 sidecars: vec![],
             }),
@@ -2179,7 +2156,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
             website: Some("https://portainer.io".into()),
             docker: Some(DockerTarget {
                 image: "portainer/portainer-ce:latest".into(),
-                ports: vec!["9000:9000".into()],
+                ports: vec!["9000:9000".into(), "9443:9443".into()],
                 env: vec![],
                 volumes: vec!["/var/run/docker.sock:/var/run/docker.sock".into(), "portainer_data:/data".into()],
                 sidecars: vec![],
@@ -2327,7 +2304,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
             description: "Leading open-source headless CMS — 100% JavaScript/TypeScript".into(),
             website: Some("https://strapi.io".into()),
             docker: Some(DockerTarget {
-                image: "strapi/strapi:latest".into(),
+                image: "naskio/strapi:latest".into(),
                 ports: vec!["1337:1337".into()],
                 env: vec![],
                 volumes: vec!["strapi_data:/srv/app".into()],
@@ -4555,7 +4532,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
             website: Some("https://frigate.video".into()),
             docker: Some(DockerTarget {
                 image: "ghcr.io/blakeblackshear/frigate:stable".into(),
-                ports: vec!["5000:5000".into(), "8554:8554".into(), "8555:8555/tcp".into()],
+                ports: vec!["5000:5000".into(), "8554:8554".into(), "8555:8555/tcp".into(), "8555:8555/udp".into()],
                 env: vec![],
                 volumes: vec!["frigate_config:/config".into(), "frigate_media:/media/frigate".into()],
                 sidecars: vec![],
@@ -6406,22 +6383,10 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
                 UserInput { id: "PHOTOS_PATH".into(), label: "Photos Path".into(), input_type: "text".into(), default: Some("/opt/photos".into()), required: true, placeholder: None, options: vec![] },
             ],
         },
-        AppManifest { id: "changedetection-io".into(), name: "Changedetection.io".into(), icon: "👀".into(), category: "Other".into(),
-            description: "Monitor websites for changes — price drops, content updates".into(),
-            website: Some("https://changedetection.io".into()),
-            docker: Some(DockerTarget { image: "ghcr.io/dgtlmoon/changedetection.io:latest".into(), ports: vec!["5000:5000".into()], env: vec![], volumes: vec!["changedetection_data:/datastore".into()], sidecars: vec![] }),
-            lxc: None, bare_metal: None, user_inputs: vec![],
-        },
         AppManifest { id: "upsnap".into(), name: "UpSnap".into(), icon: "💤".into(), category: "Other".into(),
             description: "Wake-on-LAN dashboard — wake sleeping devices from the browser".into(),
             website: Some("https://github.com/seriousm4x/UpSnap".into()),
             docker: Some(DockerTarget { image: "ghcr.io/seriousm4x/upsnap:latest".into(), ports: vec!["8090:8090".into()], env: vec![], volumes: vec!["upsnap_data:/app/pb_data".into()], sidecars: vec![] }),
-            lxc: None, bare_metal: None, user_inputs: vec![],
-        },
-        AppManifest { id: "it-tools-v2".into(), name: "IT Tools".into(), icon: "🔧".into(), category: "Other".into(),
-            description: "Collection of developer utilities — encoding, hashing, formatting".into(),
-            website: Some("https://it-tools.tech".into()),
-            docker: Some(DockerTarget { image: "corentinth/it-tools:latest".into(), ports: vec!["8080:80".into()], env: vec![], volumes: vec![], sidecars: vec![] }),
             lxc: None, bare_metal: None, user_inputs: vec![],
         },
         AppManifest { id: "openspeedtest".into(), name: "OpenSpeedTest".into(), icon: "🏎️".into(), category: "Other".into(),
@@ -6633,7 +6598,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         AppManifest { id: "netboot".into(), name: "Netboot.xyz".into(), icon: "🌐".into(), category: "Other".into(), description: "PXE boot server — boot any OS installer over the network".into(), website: Some("https://netboot.xyz".into()), docker: Some(DockerTarget { image: "linuxserver/netbootxyz:latest".into(), ports: vec!["3000:3000".into(), "69:69/udp".into(), "8080:80".into()], env: vec![], volumes: vec!["netboot_config:/config".into(), "netboot_assets:/assets".into()], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
         AppManifest { id: "uptimerobot".into(), name: "Uptime Robot".into(), icon: "🤖".into(), category: "Other".into(), description: "Status page for Uptime Robot monitors".into(), website: Some("https://github.com/louislam/uptime-kuma".into()), docker: Some(DockerTarget { image: "louislam/uptime-kuma:latest".into(), ports: vec!["3001:3001".into()], env: vec![], volumes: vec!["uptimerobot_data:/app/data".into()], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
         AppManifest { id: "statping".into(), name: "Statping-ng".into(), icon: "📊".into(), category: "Other".into(), description: "Status page and monitoring for websites and applications".into(), website: Some("https://github.com/statping-ng/statping-ng".into()), docker: Some(DockerTarget { image: "adamboutcher/statping-ng:latest".into(), ports: vec!["8080:8080".into()], env: vec![], volumes: vec!["statping_data:/app".into()], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
-        AppManifest { id: "webtop".into(), name: "Webtop".into(), icon: "🖥️".into(), category: "Other".into(), description: "Full Linux desktop in the browser — Ubuntu, Fedora, Alpine".into(), website: Some("https://github.com/linuxserver/docker-webtop".into()), docker: Some(DockerTarget { image: "linuxserver/webtop:ubuntu-xfce".into(), ports: vec!["3000:3000".into()], env: vec!["PUID=1000".into(), "PGID=1000".into()], volumes: vec!["webtop_config:/config".into()], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
+        AppManifest { id: "webtop".into(), name: "Webtop".into(), icon: "🖥️".into(), category: "Other".into(), description: "Full Linux desktop in the browser — Ubuntu, Fedora, Alpine".into(), website: Some("https://github.com/linuxserver/docker-webtop".into()), docker: Some(DockerTarget { image: "linuxserver/webtop:ubuntu-xfce".into(), ports: vec!["3000:3000".into(), "3001:3001".into()], env: vec!["PUID=1000".into(), "PGID=1000".into()], volumes: vec!["webtop_config:/config".into()], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
         AppManifest { id: "kasm".into(), name: "Kasm Workspaces".into(), icon: "🖥️".into(), category: "Other".into(), description: "Streaming containerised apps and desktops to the browser".into(), website: Some("https://kasmweb.com".into()), docker: Some(DockerTarget { image: "kasmweb/core:latest".into(), ports: vec!["443:443".into()], env: vec![], volumes: vec!["kasm_data:/opt/kasm".into()], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
         AppManifest { id: "reactive-resume".into(), name: "Reactive Resume".into(), icon: "📄".into(), category: "Other".into(), description: "Beautiful resume builder with real-time preview".into(), website: Some("https://rxresu.me".into()), docker: Some(DockerTarget { image: "amruthpillai/reactive-resume:latest".into(), ports: vec!["3000:3000".into()], env: vec![], volumes: vec![], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
         AppManifest { id: "inventree".into(), name: "InvenTree".into(), icon: "📦".into(), category: "Other".into(), description: "Inventory management for electronics and parts".into(), website: Some("https://inventree.org".into()), docker: Some(DockerTarget { image: "inventree/inventree:stable".into(), ports: vec!["1337:8000".into()], env: vec!["INVENTREE_DB_ENGINE=sqlite3".into()], volumes: vec!["inventree_data:/home/inventree/data".into()], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
@@ -6789,6 +6754,38 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         AppManifest { id: "seaweedfs".into(), name: "SeaweedFS".into(), icon: "🌊".into(), category: "Other".into(), description: "Distributed file system for billions of files — S3 compatible".into(), website: Some("https://github.com/seaweedfs/seaweedfs".into()), docker: Some(DockerTarget { image: "chrislusf/seaweedfs:latest".into(), ports: vec!["9333:9333".into(), "8080:8080".into(), "8888:8888".into()], env: vec![], volumes: vec!["seaweedfs_data:/data".into()], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
         AppManifest { id: "proxitok".into(), name: "ProxiTok".into(), icon: "🎵".into(), category: "Privacy".into(), description: "Privacy-friendly TikTok frontend — no tracking".into(), website: Some("https://github.com/pablouser1/ProxiTok".into()), docker: Some(DockerTarget { image: "ghcr.io/pablouser1/proxitok:latest".into(), ports: vec!["8080:80".into()], env: vec![], volumes: vec![], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
         AppManifest { id: "bibliogram".into(), name: "Bibliogram".into(), icon: "📸".into(), category: "Privacy".into(), description: "Privacy-friendly Instagram frontend".into(), website: Some("https://git.sr.ht/~cadence/bibliogram".into()), docker: Some(DockerTarget { image: "quay.io/pussthecatorg/bibliogram:latest".into(), ports: vec!["10407:10407".into()], env: vec![], volumes: vec![], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
+        AppManifest { id: "claude-code".into(), name: "Claude Code".into(), icon: "🤖".into(), category: "AI".into(), description: "Anthropic's agentic coding CLI — write, refactor, and debug code with Claude from the terminal".into(), website: Some("https://docs.anthropic.com/en/docs/claude-code".into()), docker: None, lxc: Some(LxcTarget { distribution: "debian".into(), release: "bookworm".into(), architecture: "amd64".into(), setup_commands: vec!["apt-get update && apt-get install -y curl".into(), "curl -fsSL https://deb.nodesource.com/setup_22.x | bash -".into(), "apt-get install -y nodejs".into(), "npm install -g @anthropic-ai/claude-code".into()] }), bare_metal: Some(BareMetalTarget { packages_debian: vec!["nodejs".into(), "npm".into()], packages_redhat: vec!["nodejs".into(), "npm".into()], post_install: vec!["npm install -g @anthropic-ai/claude-code".into()], service: None }), user_inputs: vec![] },
+        AppManifest { id: "openclaw".into(), name: "OpenClaw".into(), icon: "🐾".into(), category: "AI".into(), description: "Personal AI assistant with WhatsApp, Telegram, Discord, Slack integration and persistent memory".into(), website: Some("https://openclaw.ai".into()), docker: Some(DockerTarget { image: "ghcr.io/openclaw/openclaw:latest".into(), ports: vec!["18789:18789".into()], env: vec![], volumes: vec!["openclaw_config:/home/node/.openclaw".into()], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
+
+        // ── New additions — AI, Infrastructure, Business, Media, Security, Health ──
+
+        // AI
+        AppManifest { id: "librechat".into(), name: "LibreChat".into(), icon: "💬".into(), category: "AI".into(), description: "ChatGPT-like UI for Claude, GPT, Gemini, Ollama and other AI providers".into(), website: Some("https://librechat.ai".into()), docker: Some(DockerTarget { image: "ghcr.io/danny-avila/librechat:latest".into(), ports: vec!["3080:3080".into()], env: vec![], volumes: vec!["librechat_data:/app/data".into(), "librechat_logs:/app/api/logs".into()], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
+        AppManifest { id: "bolt-diy".into(), name: "Bolt.diy".into(), icon: "⚡".into(), category: "AI".into(), description: "AI-powered full-stack app builder in the browser — prompt to working app".into(), website: Some("https://github.com/stackblitz-labs/bolt.diy".into()), docker: Some(DockerTarget { image: "ghcr.io/stackblitz-labs/bolt.diy:latest".into(), ports: vec!["5173:5173".into()], env: vec![], volumes: vec!["bolt_data:/app/data".into()], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
+        AppManifest { id: "open-interpreter".into(), name: "Open Interpreter".into(), icon: "🖥️".into(), category: "AI".into(), description: "AI that runs code locally — natural language to Python, JavaScript, shell".into(), website: Some("https://openinterpreter.com".into()), docker: Some(DockerTarget { image: "ghcr.io/openinterpreter/open-interpreter:latest".into(), ports: vec!["8000:8000".into()], env: vec![], volumes: vec!["openinterpreter_data:/root/.openinterpreter".into()], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
+
+        // Infrastructure
+        AppManifest { id: "dockge".into(), name: "Dockge".into(), icon: "🐋".into(), category: "Other".into(), description: "Docker Compose manager — create, edit, start and stop compose stacks from a clean UI".into(), website: Some("https://dockge.kuma.pet".into()), docker: Some(DockerTarget { image: "louislam/dockge:1".into(), ports: vec!["5001:5001".into()], env: vec![], volumes: vec!["/var/run/docker.sock:/var/run/docker.sock".into(), "dockge_data:/app/data".into(), "/opt/stacks:/opt/stacks".into()], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
+        AppManifest { id: "pangolin".into(), name: "Pangolin".into(), icon: "🦔".into(), category: "Networking".into(), description: "Self-hosted reverse proxy with tunnels — Cloudflare Tunnel alternative".into(), website: Some("https://github.com/fosrl/pangolin".into()), docker: Some(DockerTarget { image: "fosrl/pangolin:latest".into(), ports: vec!["443:443".into(), "80:80".into(), "8443:8443".into()], env: vec![], volumes: vec!["pangolin_config:/config".into()], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
+        AppManifest { id: "cosmos".into(), name: "Cosmos".into(), icon: "🌌".into(), category: "Other".into(), description: "Self-hosted platform manager with automatic HTTPS, SSO, and container management".into(), website: Some("https://cosmos-cloud.io".into()), docker: Some(DockerTarget { image: "azukaar/cosmos-server:latest".into(), ports: vec!["80:80".into(), "443:443".into()], env: vec![], volumes: vec!["/var/run/docker.sock:/var/run/docker.sock".into(), "cosmos_config:/config".into()], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
+
+        // Business / Productivity
+        AppManifest { id: "twenty".into(), name: "Twenty CRM".into(), icon: "📇".into(), category: "Project Management".into(), description: "Open-source CRM — modern Salesforce alternative with clean UI".into(), website: Some("https://twenty.com".into()), docker: Some(DockerTarget { image: "twentycrm/twenty:latest".into(), ports: vec!["3000:3000".into()], env: vec!["SERVER_URL=http://localhost:3000".into()], volumes: vec!["twenty_data:/app/.local-storage".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "twentycrm/twenty-postgres:latest".into(), ports: vec![], env: vec!["POSTGRES_USER=twenty".into(), "POSTGRES_PASSWORD=twenty".into(), "POSTGRES_DB=default".into()], volumes: vec!["twenty_db:/bitnami/postgresql".into()] }] }), lxc: None, bare_metal: None, user_inputs: vec![] },
+        AppManifest { id: "appflowy".into(), name: "AppFlowy".into(), icon: "📝".into(), category: "Other".into(), description: "Open-source Notion alternative — notes, wikis, and project management".into(), website: Some("https://appflowy.io".into()), docker: Some(DockerTarget { image: "appflowyio/appflowy-cloud:latest".into(), ports: vec!["9025:9025".into()], env: vec![], volumes: vec!["appflowy_data:/data".into()], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
+        AppManifest { id: "firefly-iii".into(), name: "Firefly III".into(), icon: "💰".into(), category: "Other".into(), description: "Personal finance manager — budgets, transactions, reports and charts".into(), website: Some("https://firefly-iii.org".into()), docker: Some(DockerTarget { image: "fireflyiii/core:latest".into(), ports: vec!["8084:8080".into()], env: vec!["APP_KEY=SomeRandomStringOf32CharsExactly".into(), "DB_CONNECTION=sqlite".into(), "TRUSTED_PROXIES=**".into()], volumes: vec!["firefly_upload:/var/www/html/storage/upload".into(), "firefly_db:/var/www/html/storage/database".into()], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
+        AppManifest { id: "erpnext".into(), name: "ERPNext".into(), icon: "🏢".into(), category: "Other".into(), description: "Full open-source ERP — accounting, inventory, HR, CRM, manufacturing".into(), website: Some("https://erpnext.com".into()), docker: Some(DockerTarget { image: "frappe/erpnext:latest".into(), ports: vec!["8082:8080".into()], env: vec![], volumes: vec!["erpnext_sites:/home/frappe/frappe-bench/sites".into()], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
+        AppManifest { id: "odoo".into(), name: "Odoo".into(), icon: "🏭".into(), category: "Other".into(), description: "Business suite — CRM, eCommerce, accounting, inventory, project management".into(), website: Some("https://www.odoo.com".into()), docker: Some(DockerTarget { image: "odoo:17".into(), ports: vec!["8069:8069".into()], env: vec![], volumes: vec!["odoo_data:/var/lib/odoo".into(), "odoo_config:/etc/odoo".into(), "odoo_addons:/mnt/extra-addons".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:16".into(), ports: vec![], env: vec!["POSTGRES_USER=odoo".into(), "POSTGRES_PASSWORD=odoo".into(), "POSTGRES_DB=postgres".into(), "PGDATA=/var/lib/postgresql/data/pgdata".into()], volumes: vec!["odoo_db:/var/lib/postgresql/data/pgdata".into()] }] }), lxc: None, bare_metal: None, user_inputs: vec![] },
+
+        // Media / Home
+        AppManifest { id: "notifiarr".into(), name: "Notifiarr".into(), icon: "🔔".into(), category: "Media".into(), description: "Notification aggregator for Sonarr, Radarr, Lidarr, Readarr and other *arr apps".into(), website: Some("https://notifiarr.com".into()), docker: Some(DockerTarget { image: "golift/notifiarr:latest".into(), ports: vec!["5454:5454".into()], env: vec![], volumes: vec!["notifiarr_config:/config".into()], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
+        AppManifest { id: "bar-assistant".into(), name: "Bar Assistant".into(), icon: "🍸".into(), category: "Other".into(), description: "Cocktail recipe manager and bar inventory tracker".into(), website: Some("https://barassistant.app".into()), docker: Some(DockerTarget { image: "barassistant/server:latest".into(), ports: vec!["8087:8080".into()], env: vec!["APP_URL=http://localhost:8087".into()], volumes: vec!["bar_data:/var/www/cocktails/storage".into()], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
+
+        // Security
+        AppManifest { id: "falco".into(), name: "Falco".into(), icon: "🦅".into(), category: "Security".into(), description: "Runtime security and threat detection for containers and Kubernetes".into(), website: Some("https://falco.org".into()), docker: Some(DockerTarget { image: "falcosecurity/falco-no-driver:latest".into(), ports: vec!["8765:8765".into()], env: vec![], volumes: vec!["/proc:/host/proc:ro".into(), "/etc:/host/etc:ro".into()], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
+        AppManifest { id: "dependency-track".into(), name: "Dependency-Track".into(), icon: "🔗".into(), category: "Security".into(), description: "Software supply chain security — track vulnerabilities in project dependencies".into(), website: Some("https://dependencytrack.org".into()), docker: Some(DockerTarget { image: "dependencytrack/bundled:latest".into(), ports: vec!["8081:8080".into()], env: vec![], volumes: vec!["deptrack_data:/data".into()], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
+
+        // Health
+        AppManifest { id: "fasten-health".into(), name: "Fasten Health".into(), icon: "🏥".into(), category: "Other".into(), description: "Personal health record aggregator — pull medical records from hospitals and insurers".into(), website: Some("https://fastenhealth.com".into()), docker: Some(DockerTarget { image: "ghcr.io/fastenhealth/fasten-onprem:latest".into(), ports: vec!["9090:8080".into()], env: vec![], volumes: vec!["fasten_db:/opt/fasten/db".into()], sidecars: vec![] }), lxc: None, bare_metal: None, user_inputs: vec![] },
 
     ]
 }
