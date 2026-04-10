@@ -1,0 +1,26 @@
+[
+  {
+    "id": "wolfhost",
+    "name": "WolfHost",
+    "version": "1.0.0",
+    "description": "Complete web hosting platform — customer management, billing, domains, email, SSL, FTP, and a white-label customer portal. Includes DirectAdmin backend support.",
+    "author": "Wolf Software Systems Ltd",
+    "icon": "🌐",
+    "enterprise_only": true,
+    "download_url": "https://github.com/wolfsoftwaresystemsltd/WolfStack/releases/latest/download/wolfhost.tar.gz",
+    "category": "hosting",
+    "tags": ["hosting", "billing", "domains", "email", "ssl", "ftp", "directadmin"]
+  },
+  {
+    "id": "wolfcustom",
+    "name": "WolfCustom",
+    "version": "1.0.0",
+    "description": "White-label branding — replace the WolfStack logo, product name, colours, favicon, and copyright with your own company identity.",
+    "author": "Wolf Software Systems Ltd",
+    "icon": "🎨",
+    "enterprise_only": true,
+    "download_url": "https://github.com/wolfsoftwaresystemsltd/WolfStack/releases/latest/download/wolfcustom.tar.gz",
+    "category": "branding",
+    "tags": ["branding", "white-label", "customisation"]
+  }
+]

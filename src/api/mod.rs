@@ -14893,7 +14893,7 @@ pub async fn plugins_reload(req: HttpRequest, state: web::Data<AppState>) -> Htt
     HttpResponse::Ok().json(serde_json::json!({ "message": "Plugins reloaded" }))
 }
 
-const PLUGIN_INDEX_URL: &str = "https://wolfstack.org/pkg/index.json";
+const PLUGIN_INDEX_URL: &str = "https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfStack/master/pkg/index.json";
 
 /// GET /api/plugins/store — fetch available plugins from the plugin store (Enterprise only)
 pub async fn plugins_store(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
