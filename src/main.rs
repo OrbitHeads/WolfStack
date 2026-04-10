@@ -41,6 +41,7 @@ mod wolfnote;
 mod paths;
 mod compat;
 mod plugins;
+#[allow(dead_code)]
 mod integrations;
 
 use actix_web::{web, App, HttpServer, HttpRequest, HttpResponse};
@@ -322,6 +323,9 @@ async fn main() -> std::io::Result<()> {
             migration_tasks: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             alert_log: Arc::new(std::sync::RwLock::new(Vec::new())),
             password_reset_tokens: Arc::new(auth::PasswordResetTokens::new()),
+            oidc_pending_flows: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            image_watcher_cache: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            integrations: Arc::new(crate::integrations::IntegrationState::new(&cluster_secret)),
         });
 
         // Background: periodic self-monitoring update
@@ -481,6 +485,38 @@ async fn main() -> std::io::Result<()> {
                         crate::compat::report_license_heartbeat(&hb_cluster).await;
                     }
                     tokio::time::sleep(Duration::from_secs(86400)).await; // once per day
+                }
+            });
+        }
+
+        // Background: image watcher — periodic check for container image updates
+        {
+            let iw_cache = app_state.image_watcher_cache.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(120)).await;
+                loop {
+                    let config = crate::containers::image_watcher::ImageWatcherConfig::load();
+                    if config.enabled {
+                        let results = crate::containers::image_watcher::check_all_containers(&config).await;
+                        let mut cache = iw_cache.write().unwrap();
+                        for r in results {
+                            cache.insert(r.container_name.clone(), r);
+                        }
+                    }
+                    let interval = config.check_interval_secs.max(300);
+                    tokio::time::sleep(Duration::from_secs(interval)).await;
+                }
+            });
+        }
+
+        // Background: integration health checks (every 60 seconds)
+        {
+            let int_state = app_state.integrations.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                loop {
+                    int_state.check_all_health().await;
+                    tokio::time::sleep(Duration::from_secs(60)).await;
                 }
             });
         }

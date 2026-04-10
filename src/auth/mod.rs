@@ -10,7 +10,9 @@
 // with optional WolfStack user accounts and TOTP two-factor authentication.
 
 pub mod users;
+#[allow(dead_code)]
 pub mod oidc;
+#[allow(dead_code)]
 pub mod webauthn;
 
 use std::collections::HashMap;

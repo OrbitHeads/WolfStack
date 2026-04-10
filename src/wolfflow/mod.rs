@@ -1369,7 +1369,7 @@ pub async fn execute_workflow(
 
         // Retry loop
         let max_attempts = (step.retry_count + 1) as usize;
-        let mut step_succeeded = false;
+        let mut _step_succeeded = false;
 
         for attempt in 0..max_attempts {
             if attempt > 0 {
@@ -1466,7 +1466,7 @@ pub async fn execute_workflow(
             }
 
             if !step_had_failure {
-                step_succeeded = true;
+                _step_succeeded = true;
                 // Store output in context for downstream template references
                 if let Some(output) = last_output {
                     context.step_outputs.insert(step.name.clone(), output);

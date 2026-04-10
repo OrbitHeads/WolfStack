@@ -125,6 +125,12 @@ pub struct AppState {
     pub alert_log: Arc<std::sync::RwLock<Vec<AlertLogEntry>>>,
     /// Password reset tokens (in-memory, 30-minute expiry)
     pub password_reset_tokens: Arc<crate::auth::PasswordResetTokens>,
+    /// OIDC pending authentication flows (state token → flow data, 5-minute TTL)
+    pub oidc_pending_flows: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::auth::oidc::OidcPendingFlow>>>,
+    /// Image update watcher cache (container name → last check result)
+    pub image_watcher_cache: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::containers::image_watcher::ImageCheckResult>>>,
+    /// Integration framework state
+    pub integrations: Arc<crate::integrations::IntegrationState>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -15198,6 +15204,261 @@ pub async fn token_events(req: HttpRequest, state: web::Data<AppState>) -> HttpR
     HttpResponse::Ok().json(entries)
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ─── OIDC Authentication Endpoints ───
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// GET /api/auth/oidc/providers — list available OIDC providers (no auth)
+pub async fn oidc_providers() -> HttpResponse {
+    if !crate::compat::platform_ready() {
+        return HttpResponse::Ok().json(serde_json::json!([]));
+    }
+    let config = crate::auth::oidc::OidcConfig::load();
+    if !config.enabled {
+        return HttpResponse::Ok().json(serde_json::json!([]));
+    }
+    let providers: Vec<serde_json::Value> = config.providers.iter()
+        .filter(|p| p.enabled)
+        .map(|p| serde_json::json!({
+            "id": p.id,
+            "name": p.name,
+            "button_label": format!("Sign in with {}", p.name),
+        }))
+        .collect();
+    HttpResponse::Ok().json(providers)
+}
+
+/// GET /api/auth/oidc/login/{provider_id} — initiate OIDC login (no auth, returns 302)
+pub async fn oidc_login(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    let provider_id = path.into_inner();
+    let config = crate::auth::oidc::OidcConfig::load();
+    if !config.enabled {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": "OIDC is not enabled" }));
+    }
+    let provider = match config.providers.iter().find(|p| p.id == provider_id && p.enabled) {
+        Some(p) => p.clone(),
+        None => return HttpResponse::NotFound().json(serde_json::json!({ "error": "Provider not found" })),
+    };
+
+    let conn = req.connection_info();
+    let redirect_uri_base = format!("{}://{}", conn.scheme(), conn.host());
+
+    match crate::auth::oidc::build_auth_url(&provider, &redirect_uri_base).await {
+        Ok((auth_url, pending)) => {
+            let csrf_state = pending.csrf_state.clone();
+            state.oidc_pending_flows.write().unwrap().insert(csrf_state, pending);
+            HttpResponse::Found().append_header(("Location", auth_url)).finish()
+        }
+        Err(e) => {
+            error!("OIDC build_auth_url failed: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct OidcCallbackQuery {
+    pub code: String,
+    pub state: String,
+}
+
+/// GET /api/auth/oidc/callback — OIDC callback (no auth, returns 302 to dashboard)
+pub async fn oidc_callback(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    query: web::Query<OidcCallbackQuery>,
+) -> HttpResponse {
+    // Look up and remove the pending flow (single use)
+    let pending = {
+        let mut flows = state.oidc_pending_flows.write().unwrap();
+        flows.remove(&query.state)
+    };
+    let pending = match pending {
+        Some(p) => p,
+        None => return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "Invalid or expired OIDC state token"
+        })),
+    };
+
+    // Find the provider
+    let config = crate::auth::oidc::OidcConfig::load();
+    let provider = match config.providers.iter().find(|p| p.id == pending.provider_id) {
+        Some(p) => p.clone(),
+        None => return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": "OIDC provider no longer configured"
+        })),
+    };
+
+    let conn = req.connection_info();
+    let redirect_uri_base = format!("{}://{}", conn.scheme(), conn.host());
+
+    // Exchange the authorization code for claims
+    let claims = match crate::auth::oidc::exchange_code(
+        &provider, &query.code, &pending, &redirect_uri_base, &state.cluster_secret,
+    ).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!("OIDC code exchange failed: {}", e);
+            return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+        }
+    };
+
+    // Extract username from claims (preferred_username → email → sub)
+    let username = claims.get("preferred_username")
+        .or_else(|| claims.get("email"))
+        .or_else(|| claims.get("sub"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("oidc-user")
+        .to_string();
+
+    // Map IdP claims to a WolfStack role using the provider's role_claim + role_mappings
+    let role = crate::auth::oidc::map_claims_to_role(&claims, &provider);
+    tracing::info!("OIDC login: user='{}', provider='{}', role='{}'", username, provider.id, role);
+
+    // Create session and set cookie
+    let token = state.sessions.create_session(&username);
+    let mut cookie = Cookie::build("wolfstack_session", &token)
+        .path("/")
+        .http_only(true)
+        .same_site(actix_web::cookie::SameSite::Lax)
+        .max_age(actix_web::cookie::time::Duration::hours(8))
+        .finish();
+    if state.tls_enabled {
+        cookie.set_secure(true);
+    }
+
+    HttpResponse::Found()
+        .cookie(cookie)
+        .append_header(("Location", "/index.html"))
+        .finish()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ─── Image Watcher Endpoints ───
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// GET /api/image-watcher/config
+pub async fn image_watcher_config_get(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    HttpResponse::Ok().json(crate::containers::image_watcher::ImageWatcherConfig::load())
+}
+
+/// PUT /api/image-watcher/config
+pub async fn image_watcher_config_save(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<crate::containers::image_watcher::ImageWatcherConfig>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match body.into_inner().save() {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "message": "Image watcher config saved" })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// GET /api/image-watcher/status
+pub async fn image_watcher_status(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let cache = state.image_watcher_cache.read().unwrap();
+    let results: Vec<&crate::containers::image_watcher::ImageCheckResult> = cache.values().collect();
+    HttpResponse::Ok().json(results)
+}
+
+/// POST /api/image-watcher/check/{container}
+pub async fn image_watcher_check(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let container = path.into_inner();
+    match crate::containers::image_watcher::check_container_update(&container).await {
+        Ok(result) => {
+            state.image_watcher_cache.write().unwrap()
+                .insert(result.container_name.clone(), result.clone());
+            HttpResponse::Ok().json(result)
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ─── Integration Framework Endpoints ───
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// GET /api/integrations/connectors — list available connector types
+pub async fn integrations_connectors(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let infos: Vec<crate::integrations::ConnectorInfo> = state.integrations.connectors
+        .values().map(|c| c.info()).collect();
+    HttpResponse::Ok().json(infos)
+}
+
+/// GET /api/integrations — list configured integration instances
+pub async fn integrations_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let instances = state.integrations.list_instances();
+    let result: Vec<serde_json::Value> = instances.iter().map(|inst| {
+        let health = state.integrations.get_health(&inst.id);
+        serde_json::json!({
+            "instance": inst,
+            "health": health,
+        })
+    }).collect();
+    HttpResponse::Ok().json(result)
+}
+
+/// POST /api/integrations — create a new integration instance
+pub async fn integrations_create(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<crate::integrations::IntegrationInstance>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match state.integrations.create_instance(body.into_inner()) {
+        Ok(inst) => HttpResponse::Ok().json(inst),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// GET /api/integrations/{id} — get a single integration instance
+pub async fn integrations_get(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    match state.integrations.get_instance(&id) {
+        Some(inst) => {
+            let health = state.integrations.get_health(&id);
+            HttpResponse::Ok().json(serde_json::json!({
+                "instance": inst,
+                "health": health,
+            }))
+        }
+        None => HttpResponse::NotFound().json(serde_json::json!({ "error": "Integration not found" })),
+    }
+}
+
+/// DELETE /api/integrations/{id} — delete an integration instance
+pub async fn integrations_delete(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    match state.integrations.delete_instance(&id) {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "message": "Integration deleted" })),
+        Err(e) => HttpResponse::NotFound().json(serde_json::json!({ "error": e })),
+    }
+}
+
 /// Configure all API routes
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg
@@ -15212,6 +15473,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/auth/smtp-configured", web::get().to(smtp_configured))
         .route("/api/auth/forgot-password", web::post().to(forgot_password))
         .route("/api/auth/reset-password", web::post().to(reset_password))
+        // OIDC Authentication (no auth required)
+        .route("/api/auth/oidc/providers", web::get().to(oidc_providers))
+        .route("/api/auth/oidc/login/{provider_id}", web::get().to(oidc_login))
+        .route("/api/auth/oidc/callback", web::get().to(oidc_callback))
         // User management (auth required)
         .route("/api/auth/config", web::get().to(get_auth_config))
         .route("/api/auth/config", web::post().to(save_auth_config))
@@ -15268,6 +15533,11 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/containers/{runtime}/{id}/updates/check", web::post().to(container_updates_check))
         .route("/api/containers/{runtime}/{id}/updates/apply", web::post().to(container_updates_apply))
         .route("/api/containers/{runtime}/{id}/exec", web::post().to(container_exec))
+        // Image Watcher (auth required)
+        .route("/api/image-watcher/config", web::get().to(image_watcher_config_get))
+        .route("/api/image-watcher/config", web::put().to(image_watcher_config_save))
+        .route("/api/image-watcher/status", web::get().to(image_watcher_status))
+        .route("/api/image-watcher/check/{container}", web::post().to(image_watcher_check))
         // Certificates
         .route("/api/certificates", web::post().to(request_certificate))
         .route("/api/certificates/list", web::get().to(list_certificates))
@@ -15604,6 +15874,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/alerts/config", web::get().to(alerts_config_get))
         .route("/api/alerts/config", web::post().to(alerts_config_save))
         .route("/api/alerts/test", web::post().to(alerts_test))
+        // Integrations (auth required)
+        .route("/api/integrations/connectors", web::get().to(integrations_connectors))
+        .route("/api/integrations", web::get().to(integrations_list))
+        .route("/api/integrations", web::post().to(integrations_create))
+        .route("/api/integrations/{id}", web::get().to(integrations_get))
+        .route("/api/integrations/{id}", web::delete().to(integrations_delete))
         // WolfRun — container orchestration
         .route("/api/wolfrun/services", web::get().to(wolfrun_list))
         .route("/api/wolfrun/services", web::post().to(wolfrun_create))
