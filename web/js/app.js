@@ -11501,21 +11501,30 @@ function applyContainerView(type) {
     }
 }
 
+// SVG pie chart helper — tiny donut chart
+function svgPie(pct, color, size = 48, label = '') {
+    const r = (size - 6) / 2;
+    const circ = 2 * Math.PI * r;
+    const offset = circ - (pct / 100) * circ;
+    return `<div style="position:relative;width:${size}px;height:${size}px;flex-shrink:0;">
+        <svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">
+            <circle cx="${size/2}" cy="${size/2}" r="${r}" fill="none" stroke="var(--bg-tertiary)" stroke-width="5"/>
+            <circle cx="${size/2}" cy="${size/2}" r="${r}" fill="none" stroke="${color}" stroke-width="5"
+                stroke-dasharray="${circ}" stroke-dashoffset="${offset}"
+                transform="rotate(-90 ${size/2} ${size/2})" stroke-linecap="round"/>
+        </svg>
+        <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;color:var(--text-primary);">${Math.round(pct)}%</div>
+    </div>
+    ${label ? `<div style="font-size:10px;color:var(--text-muted);text-align:center;margin-top:2px;">${label}</div>` : ''}`;
+}
+
 function renderDockerCards(containers) {
     const grid = document.getElementById('docker-card-grid');
     if (!grid) return;
     if (containers.length === 0) { grid.innerHTML = ''; return; }
 
-    const cardBtnStyle = 'margin:1px;font-size:16px;line-height:1;padding:3px 5px;background:none;border:1px solid var(--border);border-radius:4px;cursor:pointer;';
-    const cardBtnDisabled = cardBtnStyle + 'opacity:0.3;cursor:not-allowed;pointer-events:none;';
-
-    const barSeg = (icon, pctVal, color, label) => `<div style="display:flex;align-items:center;gap:4px;">
-        <span style="font-size:11px;">${icon}</span>
-        <div style="flex:1;height:6px;background:var(--bg-tertiary);border-radius:3px;overflow:hidden;min-width:60px;">
-            <div style="width:${pctVal}%;height:100%;background:${color};border-radius:3px;transition:width 0.3s;"></div>
-        </div>
-        <span style="font-size:10px;white-space:nowrap;color:var(--text-muted);">${label}</span>
-    </div>`;
+    const bs = 'margin:1px;font-size:16px;line-height:1;padding:3px 5px;background:none;border:1px solid var(--border);border-radius:4px;cursor:pointer;';
+    const bd = bs + 'opacity:0.3;cursor:not-allowed;pointer-events:none;';
 
     grid.innerHTML = containers.map(c => {
         const s = dockerStats[c.name] || {};
@@ -11529,57 +11538,36 @@ function renderDockerCards(containers) {
         const hasStorage = c.disk_usage !== undefined && c.disk_total;
         const diskPct = hasStorage ? Math.round((c.disk_usage / c.disk_total) * 100) : 0;
         const diskColor = diskPct > 90 ? '#ef4444' : diskPct > 70 ? '#f59e0b' : '#10b981';
-
+        const ports = c.ports.length > 0 ? c.ports.slice(0, 3).map(p => escapeHtml(p)).join(', ') : '-';
         const svcItems = (c.services && c.services.length > 0) ? c.services.map(sv => {
             const sColor = sv.status === 'running' ? '#10b981' : '#ef4444';
             return `<span style="font-size:9px;padding:1px 4px;border-radius:2px;background:${sColor}22;color:${sColor};">${sv.name}</span>`;
         }).join(' ') : '';
 
-        return `<div style="background:var(--bg-card);border:1px solid var(--border);border-left:4px solid ${borderColor};border-radius:10px;padding:0;display:flex;flex-direction:column;overflow:hidden;">
-            <!-- Controls bar -->
-            <div style="display:flex;flex-wrap:wrap;padding:8px 10px;background:var(--bg-secondary);border-bottom:1px solid var(--border);gap:1px;">
-                ${isRunning ? `
-                    <button class="btn btn-sm" style="${cardBtnDisabled}" disabled title="Start">▶️</button>
-                    <button class="btn btn-sm" style="${cardBtnStyle}" onclick="dockerAction('${c.name}','stop',this)" title="Stop">⏹️</button>
-                    <button class="btn btn-sm" style="${cardBtnStyle}" onclick="dockerAction('${c.name}','restart',this)" title="Restart">🔄</button>
-                    <button class="btn btn-sm" style="${cardBtnStyle}" onclick="dockerAction('${c.name}','pause',this)" title="Pause">⏸️</button>
-                    <button class="btn btn-sm" style="${cardBtnStyle}" onclick="openConsole('docker','${c.name}')" title="Console">💻</button>
-                ` : isPaused ? `
-                    <button class="btn btn-sm" style="${cardBtnStyle}" onclick="dockerAction('${c.name}','unpause',this)" title="Unpause">▶️</button>
-                ` : `
-                    <button class="btn btn-sm" style="${cardBtnStyle}" onclick="dockerAction('${c.name}','start',this)" title="Start">▶️</button>
-                    <button class="btn btn-sm" style="${cardBtnDisabled}" disabled>⏹️</button>
-                    <button class="btn btn-sm" style="${cardBtnDisabled}" disabled>🔄</button>
-                `}
-                <button class="btn btn-sm" style="${cardBtnStyle}" onclick="viewContainerLogs('docker','${c.name}')" title="Logs">📜</button>
-                <button class="btn btn-sm" style="${cardBtnStyle}" onclick="viewDockerVolumes('${c.name}')" title="Volumes">📁</button>
-                <button class="btn btn-sm" style="${cardBtnStyle}" onclick="browseContainerFiles('docker','${c.name}')" title="Files">📂</button>
-                <button class="btn btn-sm" style="${cardBtnStyle}" onclick="openDockerSettings('${c.name}')" title="Settings">⚙️</button>
-                <button class="btn btn-sm" style="${cardBtnStyle}" onclick="openContainerConfigurator('docker','${c.name}')" title="Configure">🔧</button>
-                <button class="btn btn-sm" style="${cardBtnStyle}" onclick="openContainerUpdates('docker','${c.name}')" title="Updates">📦</button>
-                <button class="btn btn-sm" style="${cardBtnStyle}" onclick="openContainerCron('docker','${c.name}')" title="Cron">⏰</button>
-                <button class="btn btn-sm" style="${cardBtnStyle}" onclick="cloneDockerContainer('${c.name}')" title="Clone">📋</button>
-                <button class="btn btn-sm" style="${cardBtnStyle}" onclick="migrateDockerContainer('${c.name}')" title="Migrate">🚀</button>
-                ${!isRunning ? `<button class="btn btn-sm" style="${cardBtnStyle}color:#ef4444;" onclick="dockerAction('${c.name}','remove',this)" title="Remove">🗑️</button>` : ''}
-            </div>
+        const pies = [];
+        if (cpuPct >= 0) pies.push(`<div style="text-align:center;">${svgPie(cpuPct, cpuColor, 52)}<div style="font-size:9px;color:var(--text-muted);">CPU</div></div>`);
+        if (memPct >= 0) pies.push(`<div style="text-align:center;">${svgPie(memPct, memColor, 52)}<div style="font-size:9px;color:var(--text-muted);">RAM</div></div>`);
+        if (hasStorage) pies.push(`<div style="text-align:center;">${svgPie(diskPct, diskColor, 52)}<div style="font-size:9px;color:var(--text-muted);">Disk</div></div>`);
 
-            <!-- Status bars -->
-            <div style="padding:10px 12px;display:flex;flex-direction:column;gap:4px;">
-                ${cpuPct >= 0 ? barSeg('⚡', cpuPct, cpuColor, s.cpu_percent.toFixed(1) + '%') : ''}
-                ${memPct >= 0 ? barSeg('🧠', memPct, memColor, formatBytes(s.memory_usage) + '/' + formatBytes(s.memory_limit)) : ''}
-                ${hasStorage ? barSeg('💾', diskPct, diskColor, formatBytes(c.disk_usage) + '/' + formatBytes(c.disk_total)) : ''}
+        return `<div style="background:var(--bg-card);border:1px solid var(--border);border-left:4px solid ${borderColor};border-radius:10px;overflow:hidden;">
+            <div style="display:flex;flex-wrap:wrap;padding:6px 8px;background:var(--bg-secondary);border-bottom:1px solid var(--border);gap:1px;">
+                ${isRunning ? `<button class="btn btn-sm" style="${bd}" disabled>▶️</button><button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','stop',this)" title="Stop">⏹️</button><button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','restart',this)" title="Restart">🔄</button><button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','pause',this)" title="Pause">⏸️</button><button class="btn btn-sm" style="${bs}" onclick="openConsole('docker','${c.name}')" title="Console">💻</button>` : isPaused ? `<button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','unpause',this)">▶️</button>` : `<button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','start',this)">▶️</button><button class="btn btn-sm" style="${bd}" disabled>⏹️</button><button class="btn btn-sm" style="${bd}" disabled>🔄</button>`}
+                <button class="btn btn-sm" style="${bs}" onclick="viewContainerLogs('docker','${c.name}')" title="Logs">📜</button><button class="btn btn-sm" style="${bs}" onclick="viewDockerVolumes('${c.name}')" title="Volumes">📁</button><button class="btn btn-sm" style="${bs}" onclick="browseContainerFiles('docker','${c.name}')" title="Files">📂</button><button class="btn btn-sm" style="${bs}" onclick="openDockerSettings('${c.name}')" title="Settings">⚙️</button><button class="btn btn-sm" style="${bs}" onclick="openContainerConfigurator('docker','${c.name}')" title="Configure">🔧</button><button class="btn btn-sm" style="${bs}" onclick="openContainerUpdates('docker','${c.name}')" title="Updates">📦</button><button class="btn btn-sm" style="${bs}" onclick="openContainerCron('docker','${c.name}')" title="Cron">⏰</button><button class="btn btn-sm" style="${bs}" onclick="cloneDockerContainer('${c.name}')" title="Clone">📋</button><button class="btn btn-sm" style="${bs}" onclick="migrateDockerContainer('${c.name}')" title="Migrate">🚀</button>${!isRunning ? `<button class="btn btn-sm" style="${bs}color:#ef4444;" onclick="dockerAction('${c.name}','remove',this)" title="Remove">🗑️</button>` : ''}
             </div>
-
-            <!-- Info -->
-            <div style="padding:0 12px 10px;flex:1;">
-                <div style="font-weight:700;font-size:14px;">${escapeHtml(c.name)}</div>
-                <div style="font-size:11px;color:var(--text-muted);">${escapeHtml(c.image)}</div>
+            ${pies.length > 0 ? `<div style="display:flex;justify-content:center;gap:16px;padding:10px 8px;border-bottom:1px solid var(--border);">${pies.join('')}</div>` : ''}
+            <div style="padding:10px 12px;">
+                <div style="display:flex;justify-content:space-between;align-items:start;">
+                    <div><div style="font-weight:700;font-size:14px;">${escapeHtml(c.name)}</div><div style="font-size:11px;color:var(--text-muted);">${escapeHtml(c.image)}</div></div>
+                    <span style="font-size:10px;padding:2px 8px;border-radius:4px;background:${borderColor}22;color:${borderColor};font-weight:600;">${c.state}</span>
+                </div>
                 ${svcItems ? `<div style="margin-top:4px;">${svcItems}</div>` : ''}
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:2px;margin-top:6px;font-size:11px;color:var(--text-muted);">
-                    <span>🌐 ${c.ip_address || '-'}</span>
-                    <span>🔌 ${c.ports.length > 0 ? escapeHtml(c.ports[0]) : '-'}</span>
-                    ${c.mac_address ? `<span>MAC: ${escapeHtml(c.mac_address)}</span>` : ''}
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:2px;margin-top:8px;font-size:11px;color:var(--text-muted);">
+                    <span>🌐 ${c.ip_address || '-'}</span><span>🔌 ${ports}</span>
+                    ${c.gateway ? `<span>GW: ${escapeHtml(c.gateway)}</span>` : ''}${c.mac_address ? `<span>MAC: ${escapeHtml(c.mac_address)}</span>` : ''}
                     <span>🔄 ${c.autostart ? 'Autostart' : 'Manual'}</span>
+                    ${hasStorage ? `<span>💾 ${formatBytes(c.disk_usage)}/${formatBytes(c.disk_total)}</span>` : ''}
+                    ${memPct >= 0 ? `<span>🧠 ${formatBytes(s.memory_usage)}/${formatBytes(s.memory_limit)}</span>` : ''}
+                    ${cpuPct >= 0 ? `<span>⚡ ${s.cpu_percent.toFixed(1)}%</span>` : ''}
                 </div>
                 <span data-update-badge="docker:${c.name}"></span>
             </div>
@@ -11587,48 +11575,72 @@ function renderDockerCards(containers) {
     }).join('');
 }
 
-function renderLxcCards(containers) {
+function renderLxcCards(containers, stats) {
     const grid = document.getElementById('lxc-card-grid');
     if (!grid) return;
     if (containers.length === 0) { grid.innerHTML = ''; return; }
+    if (!stats) stats = {};
 
-    const cardBtnStyle = 'margin:1px;font-size:16px;line-height:1;padding:3px 5px;background:none;border:1px solid var(--border);border-radius:4px;cursor:pointer;';
-    const cardBtnDisabled = cardBtnStyle + 'opacity:0.3;cursor:not-allowed;pointer-events:none;';
+    const bs = 'margin:1px;font-size:16px;line-height:1;padding:3px 5px;background:none;border:1px solid var(--border);border-radius:4px;cursor:pointer;';
+    const bd = bs + 'opacity:0.3;cursor:not-allowed;pointer-events:none;';
 
     grid.innerHTML = containers.map(c => {
-        const isRunning = c.state === 'RUNNING';
-        const borderColor = isRunning ? '#10b981' : '#6b7280';
+        const s = stats[c.name] || {};
+        const isRunning = c.state === 'running';
+        const isFrozen = c.state === 'frozen';
+        const borderColor = isRunning ? '#10b981' : isFrozen ? '#f59e0b' : '#6b7280';
+        const cpuPct = s.cpu_percent !== undefined ? Math.min(s.cpu_percent, 100) : -1;
+        const cpuColor = cpuPct > 80 ? '#ef4444' : cpuPct > 50 ? '#f59e0b' : '#10b981';
+        const memPct = (s.memory_usage && s.memory_limit) ? Math.min(Math.round((s.memory_usage / s.memory_limit) * 100), 100) : -1;
+        const memColor = memPct > 90 ? '#ef4444' : memPct > 70 ? '#f59e0b' : '#10b981';
+        const hasStorage = c.disk_usage !== undefined && c.disk_total;
+        const diskPct = hasStorage ? Math.round((c.disk_usage / c.disk_total) * 100) : 0;
+        const diskColor = diskPct > 90 ? '#ef4444' : diskPct > 70 ? '#f59e0b' : '#10b981';
 
-        return `<div style="background:var(--bg-card);border:1px solid var(--border);border-left:4px solid ${borderColor};border-radius:10px;padding:0;display:flex;flex-direction:column;overflow:hidden;">
-            <!-- Controls bar -->
-            <div style="display:flex;flex-wrap:wrap;padding:8px 10px;background:var(--bg-secondary);border-bottom:1px solid var(--border);gap:1px;">
-                ${isRunning ? `
-                    <button class="btn btn-sm" style="${cardBtnDisabled}" disabled>▶️</button>
-                    <button class="btn btn-sm" style="${cardBtnStyle}" onclick="lxcAction('${c.name}','stop',this)" title="Stop">⏹️</button>
-                    <button class="btn btn-sm" style="${cardBtnStyle}" onclick="lxcAction('${c.name}','restart',this)" title="Restart">🔄</button>
-                    <button class="btn btn-sm" style="${cardBtnStyle}" onclick="lxcAction('${c.name}','freeze',this)" title="Freeze">⏸️</button>
-                    <button class="btn btn-sm" style="${cardBtnStyle}" onclick="openConsole('lxc','${c.name}')" title="Console">💻</button>
-                ` : `
-                    <button class="btn btn-sm" style="${cardBtnStyle}" onclick="lxcAction('${c.name}','start',this)" title="Start">▶️</button>
-                    <button class="btn btn-sm" style="${cardBtnDisabled}" disabled>⏹️</button>
-                    <button class="btn btn-sm" style="${cardBtnDisabled}" disabled>🔄</button>
-                `}
-                <button class="btn btn-sm" style="${cardBtnStyle}" onclick="viewContainerLogs('lxc','${c.name}')" title="Logs">📜</button>
-                <button class="btn btn-sm" style="${cardBtnStyle}" onclick="browseContainerFiles('lxc','${c.name}')" title="Files">📂</button>
-                <button class="btn btn-sm" style="${cardBtnStyle}" onclick="openContainerUpdates('lxc','${c.name}')" title="Updates">📦</button>
-                <button class="btn btn-sm" style="${cardBtnStyle}" onclick="openContainerCron('lxc','${c.name}')" title="Cron">⏰</button>
-                <button class="btn btn-sm" style="${cardBtnStyle}" onclick="openLxcResources('${c.name}')" title="Resources">📊</button>
-                <button class="btn btn-sm" style="${cardBtnStyle}" onclick="migrateLxcContainer('${c.name}')" title="Migrate">🚀</button>
-                ${!isRunning ? `<button class="btn btn-sm" style="${cardBtnStyle}color:#ef4444;" onclick="deleteLxc('${c.name}')" title="Delete">🗑️</button>` : ''}
+        const svcItems = (c.services && c.services.length > 0) ? c.services.map(sv => {
+            const sColor = sv.status === 'running' ? '#10b981' : '#ef4444';
+            return `<span style="font-size:9px;padding:1px 4px;border-radius:2px;background:${sColor}22;color:${sColor};">${sv.name}</span>`;
+        }).join(' ') : '';
+
+        const pies = [];
+        if (cpuPct >= 0) pies.push(`<div style="text-align:center;">${svgPie(cpuPct, cpuColor, 52)}<div style="font-size:9px;color:var(--text-muted);">CPU</div></div>`);
+        if (memPct >= 0) pies.push(`<div style="text-align:center;">${svgPie(memPct, memColor, 52)}<div style="font-size:9px;color:var(--text-muted);">RAM</div></div>`);
+        if (hasStorage) pies.push(`<div style="text-align:center;">${svgPie(diskPct, diskColor, 52)}<div style="font-size:9px;color:var(--text-muted);">Disk</div></div>`);
+
+        return `<div style="background:var(--bg-card);border:1px solid var(--border);border-left:4px solid ${borderColor};border-radius:10px;overflow:hidden;">
+            <div style="display:flex;flex-wrap:wrap;padding:6px 8px;background:var(--bg-secondary);border-bottom:1px solid var(--border);gap:1px;">
+                <button class="btn btn-sm" style="${isRunning ? bd : bs}" ${isRunning ? 'disabled' : ''} ${!isRunning ? `onclick="lxcAction('${c.name}','start',this)"` : ''} title="Start">▶️</button>
+                <button class="btn btn-sm" style="${!isRunning ? bd : bs}" ${!isRunning ? 'disabled' : ''} ${isRunning ? `onclick="lxcAction('${c.name}','stop',this)"` : ''} title="Stop">⏹️</button>
+                <button class="btn btn-sm" style="${!isRunning ? bd : bs}" ${!isRunning ? 'disabled' : ''} ${isRunning ? `onclick="lxcAction('${c.name}','restart',this)"` : ''} title="Restart">🔄</button>
+                <button class="btn btn-sm" style="${!isRunning ? bd : bs}" ${!isRunning ? 'disabled' : ''} ${isRunning ? `onclick="lxcAction('${c.name}','freeze',this)"` : ''} title="Freeze">⏸️</button>
+                <button class="btn btn-sm" style="${!isRunning ? bd : bs}" ${!isRunning ? 'disabled' : ''} ${isRunning ? `onclick="openLxcConsole('${c.name}','${c.hostname || c.name}')"` : ''} title="Console">💻</button>
+                <button class="btn btn-sm" style="${isRunning ? bd : bs}" ${isRunning ? 'disabled' : ''} ${!isRunning ? `onclick="lxcAction('${c.name}','destroy',this)"` : ''} title="Destroy">🗑️</button>
+                <button class="btn btn-sm" style="${bs}" onclick="viewContainerLogs('lxc','${c.name}')" title="Logs">📜</button>
+                <button class="btn btn-sm" style="${bs}" onclick="browseContainerFiles('lxc','${c.name}','${(c.storage_path||'').replace(/'/g,"\\'")}')" title="Files">📂</button>
+                <button class="btn btn-sm" style="${bs}" onclick="openLxcSettings('${c.name}')" title="Settings">⚙️</button>
+                <button class="btn btn-sm" style="${bs}" onclick="openContainerConfigurator('lxc','${c.name}')" title="Configure">🔧</button>
+                <button class="btn btn-sm" style="${bs}" onclick="openContainerUpdates('lxc','${c.name}')" title="Updates">📦</button>
+                <button class="btn btn-sm" style="${bs}" onclick="openContainerCron('lxc','${c.name}')" title="Cron">⏰</button>
+                <button class="btn btn-sm" style="${bs}" onclick="cloneLxcContainer('${c.name}')" title="Clone">📋</button>
+                <button class="btn btn-sm" style="${bs}" onclick="migrateLxcContainer('${c.name}')" title="Migrate">🚀</button>
+                <button class="btn btn-sm" style="${bs}" onclick="exportLxcContainer('${c.name}')" title="Export">🗃️</button>
             </div>
-
-            <!-- Info -->
-            <div style="padding:10px 12px;flex:1;">
-                <div style="font-weight:700;font-size:14px;">${escapeHtml(c.name)}</div>
-                <div style="font-size:11px;color:var(--text-muted);">${escapeHtml(c.version || '')}</div>
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:2px;margin-top:6px;font-size:11px;color:var(--text-muted);">
-                    <span>🌐 ${c.ip || '-'}</span>
+            ${pies.length > 0 ? `<div style="display:flex;justify-content:center;gap:16px;padding:10px 8px;border-bottom:1px solid var(--border);">${pies.join('')}</div>` : ''}
+            <div style="padding:10px 12px;">
+                <div style="display:flex;justify-content:space-between;align-items:start;">
+                    <div><div style="font-weight:700;font-size:14px;">${escapeHtml(c.hostname || c.name)}</div>${c.hostname ? `<div style="font-size:11px;color:var(--text-muted);">CT ${c.name}</div>` : ''}<div style="font-size:11px;color:var(--text-secondary);">${c.version || ''}</div></div>
+                    <span style="font-size:10px;padding:2px 8px;border-radius:4px;background:${borderColor}22;color:${borderColor};font-weight:600;">${c.state}</span>
+                </div>
+                ${svcItems ? `<div style="margin-top:4px;">${svcItems}</div>` : ''}
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:2px;margin-top:8px;font-size:11px;color:var(--text-muted);">
+                    <span>🌐 ${c.ip_address || '-'}</span>
                     <span>🔄 ${c.autostart ? 'Autostart' : 'Manual'}</span>
+                    ${c.gateway ? `<span>GW: ${escapeHtml(c.gateway)}</span>` : ''}
+                    ${c.mac_address ? `<span>MAC: ${escapeHtml(c.mac_address)}</span>` : ''}
+                    ${hasStorage ? `<span>💾 ${formatBytes(c.disk_usage)}/${formatBytes(c.disk_total)}</span>` : ''}
+                    ${memPct >= 0 ? `<span>🧠 ${formatBytes(s.memory_usage)}/${formatBytes(s.memory_limit)}</span>` : ''}
+                    ${cpuPct >= 0 ? `<span>⚡ ${s.cpu_percent.toFixed(1)}%</span>` : ''}
+                    ${c.fs_type ? `<span>FS: ${escapeHtml(c.fs_type)}</span>` : ''}
                 </div>
                 <span data-update-badge="lxc:${c.name}"></span>
             </div>
@@ -11641,8 +11653,8 @@ function renderVmCards(vms) {
     if (!grid) return;
     if (vms.length === 0) { grid.innerHTML = ''; return; }
 
-    const cardBtnStyle = 'margin:1px;font-size:16px;line-height:1;padding:3px 5px;background:none;border:1px solid var(--border);border-radius:4px;cursor:pointer;';
-    const cardBtnDisabled = cardBtnStyle + 'opacity:0.3;cursor:not-allowed;pointer-events:none;';
+    const bs = 'margin:1px;font-size:16px;line-height:1;padding:3px 5px;background:none;border:1px solid var(--border);border-radius:4px;cursor:pointer;';
+    const bd = bs + 'opacity:0.3;cursor:not-allowed;pointer-events:none;';
 
     grid.innerHTML = vms.map(vm => {
         const isRunning = vm.running;
@@ -11652,35 +11664,34 @@ function renderVmCards(vms) {
             const node = allNodes.find(n => n.id === currentNodeId);
             if (node && !node.is_self) vncHost = node.address;
         }
+        const vncLink = (vm.running && vm.vnc_ws_port) ? `/vnc.html?name=${encodeURIComponent(vm.name)}&port=${vm.vnc_ws_port}&host=${encodeURIComponent(vncHost)}` : '';
 
-        return `<div style="background:var(--bg-card);border:1px solid var(--border);border-left:4px solid ${borderColor};border-radius:10px;padding:0;display:flex;flex-direction:column;overflow:hidden;">
-            <!-- Controls bar -->
-            <div style="display:flex;flex-wrap:wrap;padding:8px 10px;background:var(--bg-secondary);border-bottom:1px solid var(--border);gap:1px;">
-                ${isRunning ? `
-                    <button class="btn btn-sm" style="${cardBtnDisabled}" disabled>▶️</button>
-                    <button class="btn btn-sm" style="${cardBtnStyle}" onclick="vmAction('${vm.name}','stop',this)" title="Stop">⏹️</button>
-                    ${vm.vnc_ws_port ? `<button class="btn btn-sm" style="${cardBtnStyle}" onclick="window.open('/vnc.html?name=${encodeURIComponent(vm.name)}&port=${vm.vnc_ws_port}&host=${encodeURIComponent(vncHost)}')" title="VNC Console">🖥️</button>` : ''}
-                ` : `
-                    <button class="btn btn-sm" style="${cardBtnStyle}" onclick="vmAction('${vm.name}','start',this)" title="Start">▶️</button>
-                    <button class="btn btn-sm" style="${cardBtnDisabled}" disabled>⏹️</button>
-                `}
-                <button class="btn btn-sm" style="${cardBtnStyle}" onclick="showVmSettings('${vm.name}')" title="Settings">⚙️</button>
-                <button class="btn btn-sm" style="${cardBtnStyle}" onclick="showVmLogs('${vm.name}')" title="Logs">📜</button>
-                <button class="btn btn-sm" style="${cardBtnStyle}" onclick="migrateVm('${vm.name}')" title="Migrate">🚀</button>
-                ${!isRunning ? `<button class="btn btn-sm" style="${cardBtnStyle}color:#ef4444;" onclick="deleteVm('${vm.name}')" title="Delete">🗑️</button>` : ''}
+        return `<div style="background:var(--bg-card);border:1px solid var(--border);border-left:4px solid ${borderColor};border-radius:10px;overflow:hidden;">
+            <div style="display:flex;flex-wrap:wrap;padding:6px 8px;background:var(--bg-secondary);border-bottom:1px solid var(--border);gap:1px;">
+                <button class="btn btn-sm" style="${isRunning ? bd : bs}" ${isRunning ? 'disabled' : `onclick="vmAction('${vm.name}','start',this)"`} title="Start">▶️</button>
+                <button class="btn btn-sm" style="${!isRunning ? bd : bs}" ${!isRunning ? 'disabled' : `onclick="vmAction('${vm.name}','stop',this)"`} title="Stop">⏹️</button>
+                ${vncLink ? `<button class="btn btn-sm" style="${bs}" onclick="window.open('${vncLink}')" title="VNC">🖥️</button>` : ''}
+                <button class="btn btn-sm" style="${bs}" onclick="showVmSettings('${vm.name}')" title="Settings">⚙️</button>
+                <button class="btn btn-sm" style="${bs}" onclick="showVmLogs('${vm.name}')" title="Logs">📜</button>
+                <button class="btn btn-sm" style="${bs}" onclick="migrateVm('${vm.name}')" title="Migrate">🚀</button>
+                ${!isRunning ? `<button class="btn btn-sm" style="${bs}color:#ef4444;" onclick="deleteVm('${vm.name}')" title="Delete">🗑️</button>` : ''}
             </div>
-
-            <!-- Info -->
-            <div style="padding:10px 12px;flex:1;">
-                <div style="font-weight:700;font-size:14px;">${escapeHtml(vm.name)}</div>
-                <div style="font-size:11px;color:var(--text-muted);">${vm.bios_type === 'ovmf' ? 'UEFI' : 'BIOS'} · ${vm.os_disk_bus} · ${vm.net_model || 'virtio'}</div>
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:2px;margin-top:6px;font-size:11px;color:var(--text-muted);">
+            <div style="padding:10px 12px;">
+                <div style="display:flex;justify-content:space-between;align-items:start;">
+                    <div><div style="font-weight:700;font-size:14px;">${escapeHtml(vm.name)}</div><div style="font-size:11px;color:var(--text-muted);">${vm.bios_type === 'ovmf' ? 'UEFI' : 'BIOS'} · ${vm.os_disk_bus} · ${vm.net_model || 'virtio'}</div></div>
+                    <span style="font-size:10px;padding:2px 8px;border-radius:4px;background:${borderColor}22;color:${borderColor};font-weight:600;">${isRunning ? 'Running' : 'Stopped'}</span>
+                </div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:2px;margin-top:8px;font-size:11px;color:var(--text-muted);">
                     <span>⚡ ${vm.cpus} vCPU</span>
                     <span>🧠 ${vm.memory_mb} MB</span>
                     <span>💾 ${vm.disk_size_gb} GB</span>
                     <span>🌐 ${vm.wolfnet_ip || '-'}</span>
                     <span>🔄 ${vm.auto_start ? 'Autostart' : 'Manual'}</span>
-                    ${vm.iso_path ? `<span>💿 ISO</span>` : ''}
+                    <span>📡 ${vm.mac_address || '-'}</span>
+                    ${vm.iso_path ? `<span>💿 ${escapeHtml(vm.iso_path.split('/').pop())}</span>` : ''}
+                    ${vm.extra_nics && vm.extra_nics.length > 0 ? `<span>🔌 ${vm.extra_nics.length} extra NIC${vm.extra_nics.length > 1 ? 's' : ''}</span>` : ''}
+                    ${vm.usb_devices && vm.usb_devices.length > 0 ? `<span>🔌 ${vm.usb_devices.length} USB</span>` : ''}
+                    ${vm.pci_devices && vm.pci_devices.length > 0 ? `<span>🎮 ${vm.pci_devices.length} PCI</span>` : ''}
                 </div>
             </div>
         </div>`;
@@ -12349,7 +12360,7 @@ async function loadLxcContainers() {
         stats.forEach(s => { lxcStats[s.name] = s; });
 
         renderLxcContainers(containers, lxcStats);
-        renderLxcCards(containers);
+        renderLxcCards(containers, lxcStats);
         applyContainerView('lxc');
         applyUpdateBadges();
         // Fire update summary check in background — don't block page render
