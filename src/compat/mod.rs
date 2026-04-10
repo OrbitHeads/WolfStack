@@ -197,7 +197,7 @@ pub async fn report_license_heartbeat(cluster: &crate::agent::ClusterState) {
         .danger_accept_invalid_certs(true)
         .build()
         .unwrap_or_default()
-        .post("https://wolfscale.org/adminsys/heartbeat.php")
+        .post("https://wolfstack.org/adminsys/heartbeat.php")
         .json(&payload)
         .send()
         .await;
