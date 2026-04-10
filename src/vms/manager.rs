@@ -981,6 +981,11 @@ impl VmManager {
         let mut config: VmConfig = serde_json::from_str(&content)
             .map_err(|e| format!("Invalid config: {}", e))?;
 
+        // Capture old network state for OVMF boot entry reset detection
+        let old_wolfnet_ip = config.wolfnet_ip.clone();
+        let old_net_model = config.net_model.clone();
+        let old_nics_count = config.extra_nics.len();
+
         if let Some(c) = cpus { if c > 0 { config.cpus = c; } }
         if let Some(m) = memory_mb { if m >= 256 { config.memory_mb = m; } }
         if let Some(a) = auto_start { config.auto_start = a; }
@@ -1046,6 +1051,33 @@ impl VmManager {
                 }
                 p
             }).collect();
+        }
+
+        // OVMF boot entry fix: when network topology changes on a UEFI VM, the OVMF
+        // boot entries reference device paths that are no longer valid. Reset the EFI
+        // vars file so OVMF re-discovers the boot device on next start.
+        if config.bios_type == "ovmf" {
+            let net_changed = config.wolfnet_ip != old_wolfnet_ip;
+            let nics_changed = config.extra_nics.len() != old_nics_count;
+            let model_changed = config.net_model != old_net_model;
+            if net_changed || nics_changed || model_changed {
+                let vars_path = self.vm_efivars_path(&config);
+                if vars_path.exists() {
+                    let vars_sources = [
+                        "/usr/share/OVMF/OVMF_VARS_4M.fd",
+                        "/usr/share/OVMF/OVMF_VARS.fd",
+                        "/usr/share/edk2/x64/OVMF_VARS.fd",
+                        "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd",
+                        "/usr/share/qemu/OVMF_VARS.fd",
+                        "/usr/share/OVMF/OVMF_VARS.pure-efi.fd",
+                    ];
+                    if let Some(src) = vars_sources.iter().find(|p| std::path::Path::new(p).exists()) {
+                        if fs::copy(src, &vars_path).is_ok() {
+                            info!("Reset OVMF EFI vars for VM '{}' due to network topology change", name);
+                        }
+                    }
+                }
+            }
         }
 
         // Disk resize (grow only)
