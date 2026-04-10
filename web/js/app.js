@@ -11513,9 +11513,9 @@ function svgPie(pct, color, size = 48, label = '') {
                 stroke-dasharray="${circ}" stroke-dashoffset="${offset}"
                 transform="rotate(-90 ${size/2} ${size/2})" stroke-linecap="round"/>
         </svg>
-        <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;color:var(--text-primary);">${Math.round(pct)}%</div>
+        <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;color:var(--text-secondary);">${Math.round(pct)}%</div>
     </div>
-    ${label ? `<div style="font-size:10px;color:var(--text-muted);text-align:center;margin-top:2px;">${label}</div>` : ''}`;
+    ${label ? `<div style="font-size:10px;color:var(--text-secondary);text-align:center;margin-top:2px;">${label}</div>` : ''}`;
 }
 
 function renderDockerCards(containers) {
@@ -11545,16 +11545,16 @@ function renderDockerCards(containers) {
         }).join(' ') : '';
 
         const pies = [];
-        if (cpuPct >= 0) pies.push(`<div style="text-align:center;">${svgPie(cpuPct, cpuColor, 52)}<div style="font-size:9px;color:var(--text-muted);">CPU</div></div>`);
-        if (memPct >= 0) pies.push(`<div style="text-align:center;">${svgPie(memPct, memColor, 52)}<div style="font-size:9px;color:var(--text-muted);">RAM</div></div>`);
-        if (hasStorage) pies.push(`<div style="text-align:center;">${svgPie(diskPct, diskColor, 52)}<div style="font-size:9px;color:var(--text-muted);">Disk</div></div>`);
+        if (cpuPct >= 0) pies.push(`<div style="text-align:center;flex:1;">${svgPie(cpuPct, cpuColor, 64)}<div style="font-size:9px;color:var(--text-muted);">CPU</div></div>`);
+        if (memPct >= 0) pies.push(`<div style="text-align:center;flex:1;">${svgPie(memPct, memColor, 64)}<div style="font-size:9px;color:var(--text-muted);">RAM</div></div>`);
+        if (hasStorage) pies.push(`<div style="text-align:center;flex:1;">${svgPie(diskPct, diskColor, 64)}<div style="font-size:9px;color:var(--text-muted);">Disk</div></div>`);
 
         return `<div style="background:var(--bg-card);border:1px solid var(--border);border-left:4px solid ${borderColor};border-radius:10px;overflow:hidden;">
             <div style="display:flex;flex-wrap:wrap;padding:6px 8px;background:var(--bg-secondary);border-bottom:1px solid var(--border);gap:1px;">
                 ${isRunning ? `<button class="btn btn-sm" style="${bd}" disabled>▶️</button><button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','stop',this)" title="Stop">⏹️</button><button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','restart',this)" title="Restart">🔄</button><button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','pause',this)" title="Pause">⏸️</button><button class="btn btn-sm" style="${bs}" onclick="openConsole('docker','${c.name}')" title="Console">💻</button>` : isPaused ? `<button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','unpause',this)">▶️</button>` : `<button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','start',this)">▶️</button><button class="btn btn-sm" style="${bd}" disabled>⏹️</button><button class="btn btn-sm" style="${bd}" disabled>🔄</button>`}
                 <button class="btn btn-sm" style="${bs}" onclick="viewContainerLogs('docker','${c.name}')" title="Logs">📜</button><button class="btn btn-sm" style="${bs}" onclick="viewDockerVolumes('${c.name}')" title="Volumes">📁</button><button class="btn btn-sm" style="${bs}" onclick="browseContainerFiles('docker','${c.name}')" title="Files">📂</button><button class="btn btn-sm" style="${bs}" onclick="openDockerSettings('${c.name}')" title="Settings">⚙️</button><button class="btn btn-sm" style="${bs}" onclick="openContainerConfigurator('docker','${c.name}')" title="Configure">🔧</button><button class="btn btn-sm" style="${bs}" onclick="openContainerUpdates('docker','${c.name}')" title="Updates">📦</button><button class="btn btn-sm" style="${bs}" onclick="openContainerCron('docker','${c.name}')" title="Cron">⏰</button><button class="btn btn-sm" style="${bs}" onclick="cloneDockerContainer('${c.name}')" title="Clone">📋</button><button class="btn btn-sm" style="${bs}" onclick="migrateDockerContainer('${c.name}')" title="Migrate">🚀</button>${!isRunning ? `<button class="btn btn-sm" style="${bs}color:#ef4444;" onclick="dockerAction('${c.name}','remove',this)" title="Remove">🗑️</button>` : ''}
             </div>
-            ${pies.length > 0 ? `<div style="display:flex;justify-content:center;gap:16px;padding:10px 8px;border-bottom:1px solid var(--border);">${pies.join('')}</div>` : ''}
+            ${pies.length > 0 ? `<div style="display:flex;justify-content:space-evenly;padding:12px 8px;border-bottom:1px solid var(--border);">${pies.join('')}</div>` : ''}
             <div style="padding:10px 12px;">
                 <div style="display:flex;justify-content:space-between;align-items:start;">
                     <div><div style="font-weight:700;font-size:14px;">${escapeHtml(c.name)}</div><div style="font-size:11px;color:var(--text-muted);">${escapeHtml(c.image)}</div></div>
@@ -11603,9 +11603,9 @@ function renderLxcCards(containers, stats) {
         }).join(' ') : '';
 
         const pies = [];
-        if (cpuPct >= 0) pies.push(`<div style="text-align:center;">${svgPie(cpuPct, cpuColor, 52)}<div style="font-size:9px;color:var(--text-muted);">CPU</div></div>`);
-        if (memPct >= 0) pies.push(`<div style="text-align:center;">${svgPie(memPct, memColor, 52)}<div style="font-size:9px;color:var(--text-muted);">RAM</div></div>`);
-        if (hasStorage) pies.push(`<div style="text-align:center;">${svgPie(diskPct, diskColor, 52)}<div style="font-size:9px;color:var(--text-muted);">Disk</div></div>`);
+        if (cpuPct >= 0) pies.push(`<div style="text-align:center;flex:1;">${svgPie(cpuPct, cpuColor, 64)}<div style="font-size:9px;color:var(--text-muted);">CPU</div></div>`);
+        if (memPct >= 0) pies.push(`<div style="text-align:center;flex:1;">${svgPie(memPct, memColor, 64)}<div style="font-size:9px;color:var(--text-muted);">RAM</div></div>`);
+        if (hasStorage) pies.push(`<div style="text-align:center;flex:1;">${svgPie(diskPct, diskColor, 64)}<div style="font-size:9px;color:var(--text-muted);">Disk</div></div>`);
 
         return `<div style="background:var(--bg-card);border:1px solid var(--border);border-left:4px solid ${borderColor};border-radius:10px;overflow:hidden;">
             <div style="display:flex;flex-wrap:wrap;padding:6px 8px;background:var(--bg-secondary);border-bottom:1px solid var(--border);gap:1px;">
@@ -11625,7 +11625,7 @@ function renderLxcCards(containers, stats) {
                 <button class="btn btn-sm" style="${bs}" onclick="migrateLxcContainer('${c.name}')" title="Migrate">🚀</button>
                 <button class="btn btn-sm" style="${bs}" onclick="exportLxcContainer('${c.name}')" title="Export">🗃️</button>
             </div>
-            ${pies.length > 0 ? `<div style="display:flex;justify-content:center;gap:16px;padding:10px 8px;border-bottom:1px solid var(--border);">${pies.join('')}</div>` : ''}
+            ${pies.length > 0 ? `<div style="display:flex;justify-content:space-evenly;padding:12px 8px;border-bottom:1px solid var(--border);">${pies.join('')}</div>` : ''}
             <div style="padding:10px 12px;">
                 <div style="display:flex;justify-content:space-between;align-items:start;">
                     <div><div style="font-weight:700;font-size:14px;">${escapeHtml(c.hostname || c.name)}</div>${c.hostname ? `<div style="font-size:11px;color:var(--text-muted);">CT ${c.name}</div>` : ''}<div style="font-size:11px;color:var(--text-secondary);">${c.version || ''}</div></div>
