@@ -580,6 +580,9 @@ pub enum AgentMessage {
         has_lxc: bool,
         #[serde(default)]
         has_kvm: bool,
+        /// Enterprise license key — propagated to cluster nodes that don't have one
+        #[serde(default)]
+        license_key: Option<String>,
     },
     /// "Give me your status"
     StatusRequest,
@@ -742,7 +745,7 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
             {
                 Ok(resp) => {
                     if let Ok(msg) = resp.json::<AgentMessage>().await {
-                        if let AgentMessage::StatusReport { node_id: _, hostname, metrics, components, docker_count, lxc_count, vm_count, public_ip, known_nodes, deleted_ids, wolfnet_ips, has_docker, has_lxc, has_kvm } = msg {
+                        if let AgentMessage::StatusReport { node_id: _, hostname, metrics, components, docker_count, lxc_count, vm_count, public_ip, known_nodes, deleted_ids, wolfnet_ips, has_docker, has_lxc, has_kvm, license_key } = msg {
                             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                             // Detect TLS: HTTP on port+1 means TLS is on the main port,
                             // HTTPS on main port also means TLS. Only plain HTTP on the
@@ -779,6 +782,22 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
 
                             // Reset fail count on success
                             POLL_FAIL_COUNTS.lock().unwrap().remove(&node.id);
+
+                            // Enterprise license propagation: if a remote node has a
+                            // valid license and we don't, save it locally.
+                            if let Some(ref lk) = license_key {
+                                if !lk.is_empty() && !crate::compat::platform_ready() {
+                                    let dm_path = crate::compat::dm_path();
+                                    if std::fs::read_to_string(&dm_path).map(|s| s.trim().is_empty()).unwrap_or(true) {
+                                        if let Some(parent) = std::path::Path::new(&dm_path).parent() {
+                                            let _ = std::fs::create_dir_all(parent);
+                                        }
+                                        if std::fs::write(&dm_path, lk).is_ok() {
+                                            tracing::info!("Enterprise license received from cluster node '{}'", node.hostname);
+                                        }
+                                    }
+                                }
+                            }
 
                             // Merge tombstones first — so we don't re-add deleted nodes
                             cluster.merge_tombstones(&deleted_ids);

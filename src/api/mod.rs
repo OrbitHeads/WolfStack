@@ -2807,6 +2807,9 @@ pub async fn agent_status(req: HttpRequest, state: web::Data<AppState>) -> HttpR
         has_docker,
         has_lxc,
         has_kvm,
+        license_key: if crate::compat::platform_ready() {
+            std::fs::read_to_string(crate::compat::dm_path()).ok().map(|s| s.trim().to_string())
+        } else { None },
     };
     HttpResponse::Ok().json(msg)
 }
@@ -14890,6 +14893,45 @@ pub async fn plugins_reload(req: HttpRequest, state: web::Data<AppState>) -> Htt
     HttpResponse::Ok().json(serde_json::json!({ "message": "Plugins reloaded" }))
 }
 
+const PLUGIN_INDEX_URL: &str = "https://wolfscale.org/pkg/index.json";
+
+/// GET /api/plugins/store — fetch available plugins from the plugin store (Enterprise only)
+pub async fn plugins_store(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    if !crate::compat::platform_ready() {
+        return HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "Plugin store requires an Enterprise license",
+            "feature": "plugins"
+        }));
+    }
+    // Fetch the index from the remote store
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap_or_default();
+    match client.get(PLUGIN_INDEX_URL).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let body = resp.text().await.unwrap_or_else(|_| "[]".to_string());
+            // Parse to validate, then return. Tag each plugin with installed status.
+            let mut plugins: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap_or_default();
+            let installed = crate::plugins::list();
+            for p in &mut plugins {
+                let id = p["id"].as_str().unwrap_or("");
+                let is_installed = installed.iter().any(|i| i.manifest.id == id);
+                p["installed"] = serde_json::json!(is_installed);
+            }
+            HttpResponse::Ok().json(plugins)
+        }
+        Ok(resp) => HttpResponse::BadGateway().json(serde_json::json!({
+            "error": format!("Plugin store returned HTTP {}", resp.status())
+        })),
+        Err(e) => HttpResponse::BadGateway().json(serde_json::json!({
+            "error": format!("Failed to reach plugin store: {}", e)
+        })),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct PluginInstallRequest {
     pub url: String,
@@ -15944,6 +15986,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // Plugins
         .route("/api/plugins", web::get().to(plugins_list))
         .route("/api/plugins/reload", web::post().to(plugins_reload))
+        .route("/api/plugins/store", web::get().to(plugins_store))
         .route("/api/plugins/install", web::post().to(plugins_install))
         .route("/api/plugins/{id}", web::delete().to(plugins_uninstall))
         .route("/api/plugins/{id}/toggle", web::post().to(plugins_toggle))

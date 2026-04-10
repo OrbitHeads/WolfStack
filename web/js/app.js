@@ -22311,15 +22311,67 @@ async function loadPlugins() {
     } catch (e) { list.innerHTML = '<div style="color:var(--danger);">Error: ' + escapeHtml(e.message) + '</div>'; }
 }
 
-function showInstallPluginModal() {
-    document.getElementById('plugin-install-url').value = '';
+async function showInstallPluginModal() {
     const modal = document.getElementById('plugin-install-modal');
     modal.style.display = 'flex';
     setTimeout(() => modal.classList.add('active'), 10);
+
+    // Load store
+    const storeList = document.getElementById('plugin-store-list');
+    if (storeList) storeList.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:20px;">Loading plugin store...</div>';
+    try {
+        const resp = await fetch(apiUrl('/api/plugins/store'));
+        if (!resp.ok) {
+            const data = await resp.json().catch(() => ({}));
+            if (storeList) storeList.innerHTML = `<div style="color:var(--danger);text-align:center;padding:20px;">${escapeHtml(data.error || 'Failed to load store')}</div>`;
+            return;
+        }
+        const plugins = await resp.json();
+        if (!Array.isArray(plugins) || plugins.length === 0) {
+            if (storeList) storeList.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:20px;">No plugins available</div>';
+            return;
+        }
+        if (storeList) storeList.innerHTML = plugins.map(p => `
+            <div style="display:flex;align-items:center;gap:14px;padding:14px 16px;background:var(--bg-primary);border-radius:10px;border:1px solid var(--border);margin-bottom:8px;">
+                <span style="font-size:32px;">${p.icon || '\u{1F50C}'}</span>
+                <div style="flex:1;">
+                    <div style="font-weight:600;font-size:14px;">${escapeHtml(p.name)} <span style="font-size:11px;color:var(--text-muted);font-weight:400;">v${escapeHtml(p.version || '1.0')}</span>
+                        ${p.enterprise_only ? '<span style="font-size:10px;background:rgba(220,38,38,0.15);color:#ef4444;padding:1px 6px;border-radius:3px;margin-left:6px;">Enterprise</span>' : ''}
+                    </div>
+                    <div style="font-size:12px;color:var(--text-secondary);margin-top:3px;line-height:1.5;">${escapeHtml(p.description || '')}</div>
+                    <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">by ${escapeHtml(p.author || 'Unknown')}</div>
+                </div>
+                <div>
+                    ${p.installed
+                        ? '<span style="font-size:12px;color:var(--success);font-weight:600;">Installed</span>'
+                        : `<button class="btn btn-sm btn-primary" onclick="installPluginFromStore('${escapeAttr(p.download_url)}', '${escapeAttr(p.name)}')" style="font-size:12px;white-space:nowrap;">Install</button>`
+                    }
+                </div>
+            </div>
+        `).join('');
+    } catch (e) {
+        if (storeList) storeList.innerHTML = `<div style="color:var(--danger);text-align:center;padding:20px;">Error: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+async function installPluginFromStore(url, name) {
+    showToast(`Installing ${name}...`, 'info');
+    document.getElementById('plugin-install-modal').style.display = 'none';
+    try {
+        const resp = await fetch(apiUrl('/api/plugins/install'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Install failed', 'error'); return; }
+        showToast(`${name} installed successfully`, 'success');
+        loadPlugins();
+        loadPluginAssets();
+    } catch (e) { showToast('Install failed: ' + e.message, 'error'); }
 }
 
 async function installPlugin() {
-    const url = document.getElementById('plugin-install-url').value.trim();
+    const url = document.getElementById('plugin-install-url')?.value?.trim();
     if (!url) { showToast('Please enter a plugin URL', 'error'); return; }
     document.getElementById('plugin-install-modal').style.display = 'none';
     showToast('Installing plugin...', 'info');
@@ -22332,7 +22384,7 @@ async function installPlugin() {
         if (!resp.ok) { showToast(data.error || 'Install failed', 'error'); return; }
         showToast(data.message || 'Plugin installed', 'success');
         loadPlugins();
-        loadPluginAssets(); // Load new plugin's frontend
+        loadPluginAssets();
     } catch (e) { showToast('Install failed: ' + e.message, 'error'); }
 }
 
