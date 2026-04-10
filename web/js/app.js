@@ -22347,7 +22347,10 @@ async function showInstallPluginModal() {
                 </div>
                 <div>
                     ${p.installed
-                        ? '<span style="font-size:12px;color:var(--success);font-weight:600;">Installed</span>'
+                        ? `<div style="display:flex;gap:6px;align-items:center;">
+                            <span style="font-size:11px;color:var(--success);font-weight:600;">Installed</span>
+                            <button class="btn btn-sm" onclick="installPluginFromStore('${escapeAttr(p.download_url)}', '${escapeAttr(p.name)}')" style="font-size:11px;white-space:nowrap;">Reinstall</button>
+                          </div>`
                         : `<button class="btn btn-sm btn-primary" onclick="installPluginFromStore('${escapeAttr(p.download_url)}', '${escapeAttr(p.name)}')" style="font-size:12px;white-space:nowrap;">Install</button>`
                     }
                 </div>
