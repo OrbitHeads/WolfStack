@@ -10,6 +10,7 @@ use tracing::{error, warn, info};
 use rand::Rng;
 use crate::containers;
 use crate::networking;
+use super::passthrough::{parse_libvirt_hostdevs, parse_proxmox_passthrough, find_conflicts};
 
 /// A storage volume that can be attached to a VM
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -65,6 +66,67 @@ pub struct NicConfig {
     pub passthrough_interface: Option<String>,
 }
 
+/// USB device passthrough configuration. The device is matched on the host by
+/// vendor:product ID — simple, stable across reboots, but if multiple identical
+/// devices are plugged in QEMU grabs the first one. For pinning to a specific
+/// physical port, use host_bus instead (format: "bus-port", e.g. "1-4").
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct UsbDevice {
+    /// USB vendor ID in hex, without 0x prefix (e.g. "046d")
+    #[serde(default)]
+    pub vendor_id: String,
+    /// USB product ID in hex, without 0x prefix (e.g. "c52b")
+    #[serde(default)]
+    pub product_id: String,
+    /// Optional: pin to a specific bus-port (e.g. "1-4") instead of vendor:product.
+    /// When set, vendor_id/product_id are ignored by the builder.
+    #[serde(default)]
+    pub host_bus: Option<String>,
+    /// Human-readable label for the UI (from lsusb). Not used by QEMU.
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+impl UsbDevice {
+    /// Stable identifier used for conflict detection across VMs.
+    pub fn match_key(&self) -> String {
+        if let Some(ref hb) = self.host_bus {
+            if !hb.is_empty() {
+                return format!("usb-bus:{}", hb);
+            }
+        }
+        format!("usb:{}:{}", self.vendor_id.to_lowercase(), self.product_id.to_lowercase())
+    }
+}
+
+/// PCI device passthrough configuration. Identified by BDF (bus:device.function)
+/// in the canonical format "DDDD:BB:DD.F" (e.g. "0000:01:00.0"). At runtime
+/// WolfStack binds the device to vfio-pci (or lets libvirt/Proxmox handle it).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PciDevice {
+    /// Canonical BDF: DDDD:BB:DD.F (e.g. "0000:01:00.0")
+    #[serde(default)]
+    pub bdf: String,
+    /// Enable PCIe capability (hostpci pcie=1 on Proxmox, pcie bus on native). Default: true.
+    #[serde(default = "default_true")]
+    pub pcie: bool,
+    /// Pass through as primary GPU (x-vga=1 / rombar tweaks). Default: false.
+    #[serde(default)]
+    pub primary_gpu: bool,
+    /// Human-readable label for the UI (from lspci). Not used by QEMU.
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+fn default_true() -> bool { true }
+
+impl PciDevice {
+    /// Stable identifier used for conflict detection across VMs.
+    pub fn match_key(&self) -> String {
+        format!("pci:{}", self.bdf.to_lowercase())
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VmConfig {
     pub name: String,
@@ -101,6 +163,12 @@ pub struct VmConfig {
     /// Extra network interfaces (net1, net2, ...) — e.g. OPNsense WAN+LAN
     #[serde(default)]
     pub extra_nics: Vec<NicConfig>,
+    /// USB devices passed through from host to guest (e.g. security dongles, cameras)
+    #[serde(default)]
+    pub usb_devices: Vec<UsbDevice>,
+    /// PCI devices passed through from host to guest (e.g. GPUs, HBAs, NVMe)
+    #[serde(default)]
+    pub pci_devices: Vec<PciDevice>,
     /// Proxmox VMID (only set when running on Proxmox VE)
     #[serde(default)]
     pub vmid: Option<u32>,
@@ -133,6 +201,8 @@ impl VmConfig {
             import_image: None,
             extra_disks: Vec::new(),
             extra_nics: Vec::new(),
+            usb_devices: Vec::new(),
+            pci_devices: Vec::new(),
             vmid: None,
             bios_type: "seabios".to_string(),
         }
@@ -233,8 +303,12 @@ impl VmManager {
                 let mut iso_path: Option<String> = None;
                 let mut storage_path: Option<String> = None;
 
-                if let Ok(cfg_out) = Command::new("qm").args(["config", &vmid.to_string()]).output() {
-                    let cfg_text = String::from_utf8_lossy(&cfg_out.stdout);
+                // Capture the raw qm config text so we can parse passthrough lines too
+                let qm_config_text = Command::new("qm").args(["config", &vmid.to_string()]).output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                    .unwrap_or_default();
+                if !qm_config_text.is_empty() {
+                    let cfg_text = qm_config_text.as_str();
                     for cline in cfg_text.lines() {
                         let cline = cline.trim();
                         if cline.starts_with("cores:") {
@@ -283,6 +357,9 @@ impl VmManager {
                     }
                 }
 
+                // Parse usbN= and hostpciN= lines so device state round-trips through edits
+                let (usb_devices, pci_devices) = parse_proxmox_passthrough(&qm_config_text);
+
                 Some(VmConfig {
                     name,
                     cpus,
@@ -302,6 +379,8 @@ impl VmManager {
                     import_image: None,
                     extra_disks: Vec::new(),
                     extra_nics: Vec::new(),
+                    usb_devices,
+                    pci_devices,
                     vmid: Some(vmid),
                     bios_type: "seabios".to_string(),
                 })
@@ -576,6 +655,13 @@ impl VmManager {
             }
         }
 
+        // Apply USB/PCI passthrough via qm set if the user configured any
+        if !config.usb_devices.is_empty() || !config.pci_devices.is_empty() {
+            if let Err(e) = super::passthrough::apply_proxmox_passthrough(vmid, config) {
+                warn!("Failed to apply passthrough devices to Proxmox VM {}: {}", vmid, e);
+            }
+        }
+
         // Save a WolfStack config for tracking
         let mut tracked = config.clone();
         tracked.storage_path = Some(storage.to_string());
@@ -772,13 +858,16 @@ impl VmManager {
     }
 
     /// Update VM settings (must be stopped)
+    #[allow(clippy::too_many_arguments)]
     pub fn update_vm(&self, name: &str, cpus: Option<u32>, memory_mb: Option<u32>,
                      iso_path: Option<String>, wolfnet_ip: Option<String>,
                      disk_size_gb: Option<u32>,
                      os_disk_bus: Option<String>, net_model: Option<String>,
                      drivers_iso: Option<String>, auto_start: Option<bool>,
                      bios_type: Option<String>,
-                     extra_nics: Option<Vec<NicConfig>>) -> Result<(), String> {
+                     extra_nics: Option<Vec<NicConfig>>,
+                     usb_devices: Option<Vec<UsbDevice>>,
+                     pci_devices: Option<Vec<PciDevice>>) -> Result<(), String> {
         // On Proxmox, delegate to qm set
         if containers::is_proxmox() {
             let vmid = self.qm_vmid_by_name(name)
@@ -831,6 +920,15 @@ impl VmManager {
                     }
                 }
             }
+            // USB/PCI passthrough — build a temporary VmConfig-like holder since
+            // apply_proxmox_passthrough operates on a VmConfig. We only need the
+            // usb/pci fields populated for that call.
+            if usb_devices.is_some() || pci_devices.is_some() {
+                let mut tmp = VmConfig::new(name.to_string(), 1, 512, 1);
+                tmp.usb_devices = usb_devices.clone().unwrap_or_default();
+                tmp.pci_devices = pci_devices.clone().unwrap_or_default();
+                super::passthrough::apply_proxmox_passthrough(vmid, &tmp)?;
+            }
             return Ok(());
         }
         // On libvirt, delegate to virsh (VM must be stopped for CPU/memory changes)
@@ -862,6 +960,13 @@ impl VmManager {
             if let Some(a) = auto_start {
                 let val = if a { "--enable" } else { "--disable" };
                 let _ = Command::new("virsh").args(["autostart", name, val]).output();
+            }
+            // USB/PCI passthrough via virsh attach-device / detach-device
+            if usb_devices.is_some() || pci_devices.is_some() {
+                let mut tmp = VmConfig::new(name.to_string(), 1, 512, 1);
+                tmp.usb_devices = usb_devices.clone().unwrap_or_default();
+                tmp.pci_devices = pci_devices.clone().unwrap_or_default();
+                super::passthrough::apply_libvirt_passthrough(name, &tmp)?;
             }
             return Ok(());
         }
@@ -929,6 +1034,20 @@ impl VmManager {
             }).collect();
         }
 
+        // USB/PCI passthrough
+        if let Some(usbs) = usb_devices {
+            config.usb_devices = usbs;
+        }
+        if let Some(pcis) = pci_devices {
+            // Normalize BDFs on write so we store canonical form
+            config.pci_devices = pcis.into_iter().map(|mut p| {
+                if let Ok(norm) = super::passthrough::normalize_bdf(&p.bdf) {
+                    p.bdf = norm;
+                }
+                p
+            }).collect();
+        }
+
         // Disk resize (grow only)
         if let Some(new_size) = disk_size_gb {
             if new_size > config.disk_size_gb {
@@ -953,6 +1072,21 @@ impl VmManager {
     }
 
     pub fn start_vm(&self, name: &str) -> Result<(), String> {
+        // Start-time conflict guard: check no running VM on this host has already
+        // claimed any USB/PCI device configured on the target VM. Applies to all
+        // three backends (native, Proxmox, libvirt) because list_vms() pulls from
+        // the active backend's authoritative state.
+        let all_vms = self.list_vms();
+        if let Some(target) = all_vms.iter().find(|v| v.name == name) {
+            let conflicts = find_conflicts(target, &all_vms);
+            if !conflicts.is_empty() {
+                return Err(format!(
+                    "Cannot start VM '{}': passthrough device conflict — {}",
+                    name, conflicts.join("; ")
+                ));
+            }
+        }
+
         // On Proxmox, delegate to qm start
         if containers::is_proxmox() {
             let vmid = self.qm_vmid_by_name(name)
@@ -1301,6 +1435,25 @@ impl VmManager {
             cmd.arg("-boot").arg("order=dc");  // CD/USB first, then disk (installation)
         } else {
             cmd.arg("-boot").arg("order=c");   // Disk first (normal boot)
+        }
+
+        // USB/PCI passthrough — append -device usb-host,... and -device vfio-pci,...
+        // for each configured device. The native path already has `-usb` on the
+        // command line, so usb-host can attach.
+        if !config.usb_devices.is_empty() || !config.pci_devices.is_empty() {
+            write_log(&format!("Passthrough: {} USB, {} PCI", config.usb_devices.len(), config.pci_devices.len()));
+            if let Err(e) = super::passthrough::append_qemu_passthrough_args(&mut cmd, &config) {
+                write_log(&format!("Passthrough configuration error: {}", e));
+                return Err(format!("Passthrough configuration error: {}", e));
+            }
+            for u in &config.usb_devices {
+                write_log(&format!("  USB: {}:{} {}", u.vendor_id, u.product_id,
+                    u.label.clone().unwrap_or_default()));
+            }
+            for p in &config.pci_devices {
+                write_log(&format!("  PCI: {} {} (pcie={})", p.bdf,
+                    p.label.clone().unwrap_or_default(), p.pcie));
+            }
         }
 
         write_log(&format!("Launching QEMU: VNC :{} (port {}), KVM: {}", vnc_num, vnc_port, kvm_available));
@@ -2031,17 +2184,18 @@ impl VmManager {
         let storage_path = Path::new(&disk_source).parent()
             .map(|p| p.to_string_lossy().to_string());
 
-        // Detect UEFI/OVMF from dumpxml
-        let bios_type = Command::new("virsh").args(["dumpxml", name]).output().ok()
-            .map(|o| {
-                let xml = String::from_utf8_lossy(&o.stdout);
-                if xml.contains("OVMF") || xml.contains("ovmf") || xml.contains("AAVMF") || xml.contains("edk2") {
-                    "ovmf".to_string()
-                } else {
-                    "seabios".to_string()
-                }
-            })
-            .unwrap_or_else(|| "seabios".to_string());
+        // Detect UEFI/OVMF from dumpxml, and parse <hostdev> nodes for USB/PCI passthrough
+        let dumpxml = Command::new("virsh").args(["dumpxml", name]).output().ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+
+        let bios_type = if dumpxml.contains("OVMF") || dumpxml.contains("ovmf") || dumpxml.contains("AAVMF") || dumpxml.contains("edk2") {
+            "ovmf".to_string()
+        } else {
+            "seabios".to_string()
+        };
+
+        let (usb_devices, pci_devices) = parse_libvirt_hostdevs(&dumpxml);
 
         Some(VmConfig {
             name: name.to_string(),
@@ -2062,6 +2216,8 @@ impl VmManager {
             import_image: None,
             extra_disks: Vec::new(),
             extra_nics: Vec::new(),
+            usb_devices,
+            pci_devices,
             vmid: None,
             bios_type,
         })
@@ -2113,6 +2269,13 @@ impl VmManager {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!("virt-install failed: {}", stderr.trim()));
+        }
+
+        // Attach USB/PCI passthrough devices to the newly-created domain
+        if !config.usb_devices.is_empty() || !config.pci_devices.is_empty() {
+            if let Err(e) = super::passthrough::apply_libvirt_passthrough(&config.name, config) {
+                warn!("Failed to attach passthrough devices to libvirt VM {}: {}", config.name, e);
+            }
         }
 
         Ok(())
@@ -2344,6 +2507,12 @@ impl VmManager {
             .find(|d| d.is_cdrom && !d.source.is_empty())
             .map(|d| d.source.clone());
 
+        // Parse passthrough devices from the libvirt XML so adopted VMs retain them
+        let dumpxml = Command::new("virsh").args(["dumpxml", name]).output().ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        let (usb_devices, pci_devices) = parse_libvirt_hostdevs(&dumpxml);
+
         let config = VmConfig {
             name: name.to_string(),
             cpus: discovered.cpus,
@@ -2363,6 +2532,8 @@ impl VmManager {
             import_image: None,
             extra_disks,
             extra_nics,
+            usb_devices,
+            pci_devices,
             vmid: None,
             bios_type: discovered.bios_type,
         };
@@ -2483,6 +2654,9 @@ pub fn export_vm(name: &str) -> Result<PathBuf, String> {
     portable.wolfnet_ip = None;
     portable.storage_path = None; // will use target default
     portable.vmid = None; // clear Proxmox VMID
+    // Passthrough devices are host-specific — they never survive a migration
+    portable.usb_devices.clear();
+    portable.pci_devices.clear();
     // Reset extra disk storage paths to default
     for disk in &mut portable.extra_disks {
         disk.storage_path = VM_BASE.to_string();
@@ -2499,9 +2673,8 @@ pub fn export_vm(name: &str) -> Result<PathBuf, String> {
         base.join(format!("{}.qcow2", name))
     };
 
-    if containers::is_proxmox() && config.vmid.is_some() {
+    if let Some(vmid) = config.vmid.filter(|_| containers::is_proxmox()) {
         // On Proxmox, export disk via qemu-img convert
-        let vmid = config.vmid.unwrap();
         // Get the disk path from Proxmox storage
         let pvesm = Command::new("pvesm")
             .args(["path", &format!("local-lvm:vm-{}-disk-0", vmid)])
@@ -2646,6 +2819,10 @@ pub fn import_vm(archive_path: &str, new_name: Option<&str>, storage: Option<&st
     config.storage_path = dest_storage.map(|s| s.to_string());
     config.vmid = None;
     config.mac_address = Some(generate_mac()); // new MAC to avoid conflicts
+    // Passthrough devices are host-specific; the target host may not even have
+    // matching hardware, so clear them.
+    config.usb_devices.clear();
+    config.pci_devices.clear();
     // Reset extra disk storage paths
     let disk_storage = dest_storage.unwrap_or(VM_BASE);
     for disk in &mut config.extra_disks {

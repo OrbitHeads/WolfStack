@@ -5,7 +5,8 @@
 use actix_web::{web, HttpResponse, HttpRequest};
 use serde::Deserialize;
 use crate::api::{AppState, require_auth, build_node_urls};
-use super::manager::{VmConfig, StorageVolume};
+use super::manager::{VmConfig, StorageVolume, UsbDevice, PciDevice};
+use super::passthrough;
 
 pub fn config(cfg: &mut web::ServiceConfig) {
     cfg.service(
@@ -13,6 +14,7 @@ pub fn config(cfg: &mut web::ServiceConfig) {
             .route("", web::get().to(list_vms))
             .route("/create", web::post().to(create_vm))
             .route("/storage", web::get().to(list_storage))
+            .route("/host-devices", web::get().to(host_devices))
             .route("/import-external", web::post().to(vm_import_external))
             .route("/discover-libvirt", web::get().to(discover_libvirt))
             .route("/adopt-libvirt", web::post().to(adopt_libvirt))
@@ -27,6 +29,20 @@ pub fn config(cfg: &mut web::ServiceConfig) {
             .route("/{name}", web::delete().to(delete_vm))
             .route("/{name}", web::get().to(get_vm))
     );
+}
+
+/// GET /api/vms/host-devices — list USB + PCI devices on the host with IOMMU
+/// info and VFIO preflight. Devices currently claimed by a VM configured in
+/// WolfStack are tagged with `in_use_by` so the picker can grey them out.
+async fn host_devices(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let vms = {
+        let manager = state.vms.lock().unwrap();
+        manager.list_vms()
+    };
+    let ownership = passthrough::build_ownership(&vms);
+    let response = passthrough::list_host_devices(&ownership);
+    HttpResponse::Ok().json(response)
 }
 
 async fn list_vms(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
@@ -86,6 +102,12 @@ struct CreateVmRequest {
     /// Extra network interfaces (net1, net2, ...) for multi-NIC VMs
     #[serde(default)]
     extra_nics: Vec<super::manager::NicConfig>,
+    /// USB devices to pass through from host
+    #[serde(default)]
+    usb_devices: Vec<UsbDevice>,
+    /// PCI devices to pass through from host
+    #[serde(default)]
+    pci_devices: Vec<PciDevice>,
     /// BIOS type: "seabios" (legacy) or "ovmf" (UEFI/EFI)
     #[serde(default = "default_bios_type")]
     bios_type: String,
@@ -145,6 +167,16 @@ async fn create_vm(req: HttpRequest, state: web::Data<AppState>, body: web::Json
         nic
     }).collect();
 
+    // USB/PCI passthrough devices
+    config.usb_devices = body.usb_devices.clone();
+    config.pci_devices = body.pci_devices.iter().map(|p| {
+        let mut d = p.clone();
+        if let Ok(norm) = passthrough::normalize_bdf(&d.bdf) {
+            d.bdf = norm;
+        }
+        d
+    }).collect();
+
     match manager.create_vm(config) {
         Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "success": true })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
@@ -164,19 +196,23 @@ struct UpdateVmRequest {
     auto_start: Option<bool>,
     bios_type: Option<String>,
     extra_nics: Option<Vec<super::manager::NicConfig>>,
+    usb_devices: Option<Vec<UsbDevice>>,
+    pci_devices: Option<Vec<PciDevice>>,
 }
 
 async fn update_vm(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<UpdateVmRequest>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let name = path.into_inner();
     let manager = state.vms.lock().unwrap();
-    
+
     match manager.update_vm(&name, body.cpus, body.memory_mb, body.iso_path.clone(),
                             body.wolfnet_ip.clone(), body.disk_size_gb,
                             body.os_disk_bus.clone(), body.net_model.clone(),
                             body.drivers_iso.clone(), body.auto_start,
                             body.bios_type.clone(),
-                            body.extra_nics.clone()) {
+                            body.extra_nics.clone(),
+                            body.usb_devices.clone(),
+                            body.pci_devices.clone()) {
         Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "success": true })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
     }

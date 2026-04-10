@@ -10,6 +10,8 @@
 // with optional WolfStack user accounts and TOTP two-factor authentication.
 
 pub mod users;
+pub mod oidc;
+pub mod webauthn;
 
 use std::collections::HashMap;
 use std::sync::RwLock;

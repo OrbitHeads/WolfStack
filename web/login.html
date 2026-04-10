@@ -375,6 +375,16 @@
                 </div>
             </div>
 
+            <!-- OIDC / SSO providers (populated dynamically) -->
+            <div id="oidc-providers" style="display:none;">
+                <div style="display:flex;align-items:center;gap:12px;margin:20px 0;">
+                    <div style="flex:1;height:1px;background:var(--border);"></div>
+                    <span style="color:var(--text-muted);font-size:12px;text-transform:uppercase;">or</span>
+                    <div style="flex:1;height:1px;background:var(--border);"></div>
+                </div>
+                <div id="oidc-buttons" style="display:flex;flex-direction:column;gap:8px;"></div>
+            </div>
+
             <div class="login-info" id="login-info" style="display:none;">
                 <p>
                     <span class="icon">🔒</span> Sign in with your credentials.
@@ -434,6 +444,27 @@
                     window.location.href = '/index.html?_=' + Date.now();
                 }
             });
+
+        // Load OIDC / SSO providers (Enterprise feature)
+        fetch('/api/auth/oidc/providers')
+            .then(r => r.ok ? r.json() : [])
+            .then(providers => {
+                if (Array.isArray(providers) && providers.length > 0) {
+                    const container = document.getElementById('oidc-buttons');
+                    providers.forEach(p => {
+                        const btn = document.createElement('button');
+                        btn.type = 'button';
+                        btn.style.cssText = 'width:100%;padding:12px 16px;border-radius:10px;border:1px solid var(--border);background:var(--bg-card);color:var(--text-primary);font-size:14px;font-weight:500;cursor:pointer;transition:all 0.2s;display:flex;align-items:center;justify-content:center;gap:8px;';
+                        btn.textContent = p.button_label || ('Sign in with ' + p.name);
+                        btn.onmouseenter = () => { btn.style.borderColor = 'var(--accent)'; btn.style.background = 'rgba(220,38,38,0.08)'; };
+                        btn.onmouseleave = () => { btn.style.borderColor = 'var(--border)'; btn.style.background = 'var(--bg-card)'; };
+                        btn.onclick = () => { window.location.href = '/api/auth/oidc/login/' + encodeURIComponent(p.id); };
+                        container.appendChild(btn);
+                    });
+                    document.getElementById('oidc-providers').style.display = '';
+                }
+            })
+            .catch(() => {}); // No OIDC configured — silent fail
 
         let _needs2fa = false;
 

@@ -1,0 +1,47 @@
+# WolfStack Satellite Node — WolfNet + WolfDisk for NAS platforms
+#
+# Joins your Unraid/Synology/TrueNAS to the WolfStack cluster overlay.
+#
+# Usage:
+#   WOLFNET_JOIN_TOKEN=<token> docker compose -f docker-compose.satellite.yml up -d
+#
+# Get the join token from WolfStack UI or by running `wolfnet invite` on a cluster node.
+
+services:
+  wolfnet:
+    image: ghcr.io/wolfsoftwaresystemsltd/wolfnet:latest
+    container_name: wolfnet
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - wolfnet-config:/etc/wolfnet
+      - /run/wolfnet:/var/run/wolfnet
+    environment:
+      - WOLFNET_JOIN_TOKEN=${WOLFNET_JOIN_TOKEN:-}
+
+  wolfdisk:
+    image: ghcr.io/wolfsoftwaresystemsltd/wolfdisk:latest
+    container_name: wolfdisk
+    restart: unless-stopped
+    privileged: true
+    network_mode: host
+    devices:
+      - /dev/fuse:/dev/fuse
+    volumes:
+      - wolfdisk-config:/etc/wolfdisk
+      - wolfdisk-data:/var/lib/wolfdisk
+      - /mnt/wolfdisk:/mnt/wolfdisk:rshared
+    environment:
+      - WOLFDISK_ROLE=client
+      - WOLFDISK_PEERS=${WOLFDISK_LEADER:-}
+    depends_on:
+      - wolfnet
+
+volumes:
+  wolfnet-config:
+  wolfdisk-config:
+  wolfdisk-data:

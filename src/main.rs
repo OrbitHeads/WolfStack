@@ -41,6 +41,7 @@ mod wolfnote;
 mod paths;
 mod compat;
 mod plugins;
+mod integrations;
 
 use actix_web::{web, App, HttpServer, HttpRequest, HttpResponse};
 use actix_files;

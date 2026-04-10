@@ -15269,6 +15269,10 @@ async function showVmSettings(name) {
                     style="flex:1; padding:10px 16px; border:none; background:none; color:var(--text-muted); font-size:13px; font-weight:600; cursor:pointer; border-bottom:2px solid transparent; transition:all .2s;">
                     🌐 Network & Boot
                 </button>
+                <button class="vms-tab-btn" data-stab="4" onclick="switchVmSettingsTab(4)"
+                    style="flex:1; padding:10px 16px; border:none; background:none; color:var(--text-muted); font-size:13px; font-weight:600; cursor:pointer; border-bottom:2px solid transparent; transition:all .2s;">
+                    🔌 Passthrough
+                </button>
             </div>
 
             <!-- ═══ Tab 1: General ═══ -->
@@ -15409,6 +15413,33 @@ async function showVmSettings(name) {
                 </div>
             </div>
 
+            <!-- ═══ Tab 4: Passthrough ═══ -->
+            <div class="vms-tab-page" id="vms-tab-4" style="display:none;">
+                <div id="edit-vm-passthrough-preflight"></div>
+                <div style="padding:12px; background:var(--bg-tertiary); border:1px solid var(--border); border-radius:8px; margin-bottom:12px;">
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+                        <h4 style="margin:0; font-size:13px;">🔌 USB Devices</h4>
+                        <button type="button" class="btn btn-sm" onclick="reloadHostDevices(this.dataset.vm)"
+                            data-vm="${escapeAttr(vm.name)}" style="font-size:11px; padding:2px 10px;">↻ Refresh</button>
+                    </div>
+                    <small style="color:var(--text-muted); display:block; margin-bottom:8px;">
+                        Tick a device to pass it through to this VM. A device in use by another <em>running</em> VM will be disabled.
+                    </small>
+                    <div id="edit-vm-usb-list" style="max-height:200px; overflow-y:auto;">
+                        <div style="color:var(--text-muted); font-size:12px; padding:8px;">Loading...</div>
+                    </div>
+                </div>
+                <div style="padding:12px; background:var(--bg-tertiary); border:1px solid var(--border); border-radius:8px;">
+                    <h4 style="margin:0 0 8px 0; font-size:13px;">🎮 PCI Devices</h4>
+                    <small style="color:var(--text-muted); display:block; margin-bottom:8px;">
+                        GPUs, HBAs, NVMe, etc. Devices in the same IOMMU group must be passed together.
+                    </small>
+                    <div id="edit-vm-pci-list" style="max-height:300px; overflow-y:auto;">
+                        <div style="color:var(--text-muted); font-size:12px; padding:8px;">Loading...</div>
+                    </div>
+                </div>
+            </div>
+
             <!-- Footer (always visible) -->
             <div style="display:flex; gap:8px; margin-top:16px; padding-top:12px; border-top:1px solid var(--border);">
                 <button class="btn btn-primary" onclick="saveVmSettings('${vm.name}')">💾 Save</button>
@@ -15421,9 +15452,183 @@ async function showVmSettings(name) {
                 addExtraNicRow('edit-vm-extra-nics', nic);
             }
         }
+        // Stash the VM's current passthrough selection + load host devices
+        window._editVmPassthrough = {
+            vmName: vm.name,
+            selectedUsb: (vm.usb_devices || []).map(u => `usb:${(u.vendor_id||'').toLowerCase()}:${(u.product_id||'').toLowerCase()}`),
+            selectedPci: (vm.pci_devices || []).map(p => `pci:${(p.bdf||'').toLowerCase()}`),
+            savedUsb: vm.usb_devices || [],
+            savedPci: vm.pci_devices || [],
+            tabOpened: false,  // Only load host devices when the user clicks the Passthrough tab
+        };
     } catch (e) {
-        body.innerHTML = `<p style="color:var(--danger); padding:1rem;">Failed to load VM: ${e.message}</p>`;
+        body.innerHTML = `<p style="color:var(--danger); padding:1rem;">Failed to load VM: ${escapeHtml(e.message)}</p>`;
     }
+}
+
+async function loadHostDevicesForEdit(vmName) {
+    try {
+        const resp = await fetch(apiUrl('/api/vms/host-devices'));
+        if (!resp.ok) {
+            document.getElementById('edit-vm-usb-list').innerHTML = '<div style="color:var(--danger); font-size:12px; padding:8px;">Failed to load host devices</div>';
+            document.getElementById('edit-vm-pci-list').innerHTML = '';
+            return;
+        }
+        const data = await resp.json();
+        renderPassthroughPreflight(data.preflight);
+        renderUsbList(vmName, data.usb || []);
+        renderPciList(vmName, data.pci || []);
+    } catch (e) {
+        const list = document.getElementById('edit-vm-usb-list');
+        if (list) list.innerHTML = `<div style="color:var(--danger); font-size:12px; padding:8px;">Error: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+async function reloadHostDevices(vmName) {
+    const usbList = document.getElementById('edit-vm-usb-list');
+    const pciList = document.getElementById('edit-vm-pci-list');
+    if (usbList) usbList.innerHTML = '<div style="color:var(--text-muted); font-size:12px; padding:8px;">Loading...</div>';
+    if (pciList) pciList.innerHTML = '<div style="color:var(--text-muted); font-size:12px; padding:8px;">Loading...</div>';
+    await loadHostDevicesForEdit(vmName);
+}
+
+function renderPassthroughPreflight(pre) {
+    const container = document.getElementById('edit-vm-passthrough-preflight');
+    if (!container) return;
+    if (!pre || !pre.warnings || pre.warnings.length === 0) {
+        container.innerHTML = `<div style="padding:8px 12px; background:rgba(34,197,94,0.08); border:1px solid rgba(34,197,94,0.3); border-radius:6px; font-size:12px; color:var(--text-secondary); margin-bottom:12px;">
+            ✓ Host ready for passthrough · IOMMU ${pre?.iommu_enabled?'on':'off'} · vfio-pci ${pre?.vfio_pci_loaded?'loaded':'missing'} · backend: ${escapeHtml(pre?.backend||'unknown')}
+        </div>`;
+        return;
+    }
+    const items = pre.warnings.map(w => `<li style="margin:4px 0;">${escapeHtml(w)}</li>`).join('');
+    container.innerHTML = `<div style="padding:10px 12px; background:rgba(245,158,11,0.08); border:1px solid rgba(245,158,11,0.4); border-radius:6px; font-size:12px; color:var(--text-secondary); margin-bottom:12px;">
+        <div style="font-weight:600; margin-bottom:6px;">⚠️ Passthrough preflight (backend: ${escapeHtml(pre.backend||'unknown')})</div>
+        <ul style="margin:0; padding-left:18px;">${items}</ul>
+    </div>`;
+}
+
+function renderUsbList(vmName, usbs) {
+    const container = document.getElementById('edit-vm-usb-list');
+    if (!container) return;
+    if (usbs.length === 0) {
+        container.innerHTML = '<div style="color:var(--text-muted); font-size:12px; padding:8px;">No USB devices detected on host</div>';
+        return;
+    }
+    const state = window._editVmPassthrough || { selectedUsb: [] };
+    const selected = new Set(state.selectedUsb);
+    container.innerHTML = usbs.map(u => {
+        const key = u.match_key || '';
+        const isSelected = selected.has(key);
+        const ownerIsOther = u.in_use_by && u.in_use_by !== vmName;
+        const blocked = ownerIsOther && u.in_use_running;
+        const hint = ownerIsOther
+            ? (u.in_use_running
+                ? `<span style="color:var(--danger); font-size:10px;"> · in use by running VM '${escapeHtml(u.in_use_by)}'</span>`
+                : `<span style="color:var(--warning); font-size:10px;"> · configured on stopped VM '${escapeHtml(u.in_use_by)}'</span>`)
+            : '';
+        return `<label style="display:flex; align-items:center; gap:8px; padding:6px 8px; border-bottom:1px solid var(--border); font-size:12px; ${blocked?'opacity:0.5; cursor:not-allowed;':'cursor:pointer;'}">
+            <input type="checkbox" class="edit-vm-usb-check" data-key="${escapeAttr(key)}"
+                data-vendor="${escapeAttr(u.vendor_id)}" data-product="${escapeAttr(u.product_id)}"
+                data-label="${escapeAttr(u.description||'')}" ${isSelected?'checked':''} ${blocked?'disabled':''}>
+            <span style="font-family:monospace; color:var(--text-muted); min-width:100px;">${escapeHtml(u.vendor_id)}:${escapeHtml(u.product_id)}</span>
+            <span style="flex:1;">${escapeHtml(u.description||'USB device')}</span>
+            ${hint}
+        </label>`;
+    }).join('');
+}
+
+function renderPciList(vmName, pcis) {
+    const container = document.getElementById('edit-vm-pci-list');
+    if (!container) return;
+    if (pcis.length === 0) {
+        container.innerHTML = '<div style="color:var(--text-muted); font-size:12px; padding:8px;">No PCI devices eligible for passthrough</div>';
+        return;
+    }
+    // Group by IOMMU group for display
+    const groups = {};
+    for (const p of pcis) {
+        const g = (p.iommu_group !== undefined && p.iommu_group !== null) ? String(p.iommu_group) : 'ungrouped';
+        if (!groups[g]) groups[g] = [];
+        groups[g].push(p);
+    }
+    const state = window._editVmPassthrough || { selectedPci: [] };
+    const selected = new Set(state.selectedPci);
+    const sortedGroups = Object.keys(groups).sort((a, b) => {
+        if (a === 'ungrouped') return 1;
+        if (b === 'ungrouped') return -1;
+        return parseInt(a) - parseInt(b);
+    });
+    container.innerHTML = sortedGroups.map(g => {
+        const rows = groups[g].map(p => {
+            const key = p.match_key || '';
+            const isSelected = selected.has(key);
+            const ownerIsOther = p.in_use_by && p.in_use_by !== vmName;
+            const blocked = ownerIsOther && p.in_use_running;
+            const driver = p.driver ? ` · drv: ${escapeHtml(p.driver)}` : '';
+            const hint = ownerIsOther
+                ? (p.in_use_running
+                    ? `<span style="color:var(--danger); font-size:10px;"> · in use by running VM '${escapeHtml(p.in_use_by)}'</span>`
+                    : `<span style="color:var(--warning); font-size:10px;"> · on stopped VM '${escapeHtml(p.in_use_by)}'</span>`)
+                : '';
+            return `<label style="display:flex; align-items:center; gap:8px; padding:6px 8px; border-bottom:1px solid var(--border); font-size:12px; ${blocked?'opacity:0.5; cursor:not-allowed;':'cursor:pointer;'}">
+                <input type="checkbox" class="edit-vm-pci-check" data-key="${escapeAttr(key)}"
+                    data-bdf="${escapeAttr(p.bdf)}" data-iommu="${escapeAttr(String(p.iommu_group||''))}"
+                    data-label="${escapeAttr(p.description||'')}" ${isSelected?'checked':''} ${blocked?'disabled':''}>
+                <span style="font-family:monospace; color:var(--text-muted); min-width:120px;">${escapeHtml(p.bdf)}</span>
+                <span style="flex:1;">${escapeHtml(p.description||p.class||'PCI device')}${driver}</span>
+                ${hint}
+            </label>`;
+        }).join('');
+        const header = g === 'ungrouped'
+            ? '<div style="padding:4px 8px; font-size:10px; color:var(--text-muted); text-transform:uppercase; background:var(--bg-secondary);">Ungrouped (IOMMU disabled?)</div>'
+            : `<div style="padding:4px 8px; font-size:10px; color:var(--text-muted); text-transform:uppercase; background:var(--bg-secondary);">IOMMU group ${escapeHtml(g)}</div>`;
+        return header + rows;
+    }).join('');
+}
+
+function escapeAttr(s) {
+    return String(s || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function collectPassthroughDevices() {
+    const state = window._editVmPassthrough || {};
+    const savedUsb = state.savedUsb || [];
+    const savedPci = state.savedPci || [];
+
+    // If the user never opened the Passthrough tab, keep the saved config unchanged.
+    if (!state.tabOpened) {
+        return { usb_devices: savedUsb, pci_devices: savedPci };
+    }
+
+    const usbContainer = document.getElementById('edit-vm-usb-list');
+    const pciContainer = document.getElementById('edit-vm-pci-list');
+    const usbChecks = usbContainer ? usbContainer.querySelectorAll('.edit-vm-usb-check') : [];
+    const pciChecks = pciContainer ? pciContainer.querySelectorAll('.edit-vm-pci-check') : [];
+
+    const usbs = [];
+    for (const c of usbChecks) {
+        if (c.checked) {
+            usbs.push({
+                vendor_id: (c.dataset.vendor || '').toLowerCase(),
+                product_id: (c.dataset.product || '').toLowerCase(),
+                host_bus: null,
+                label: c.dataset.label || null,
+            });
+        }
+    }
+    const pcis = [];
+    for (const c of pciChecks) {
+        if (c.checked) {
+            pcis.push({
+                bdf: c.dataset.bdf || '',
+                pcie: true,
+                primary_gpu: false,
+                label: c.dataset.label || null,
+            });
+        }
+    }
+    return { usb_devices: usbs, pci_devices: pcis };
 }
 
 async function addVmVolume(vmName) {
@@ -15509,6 +15714,11 @@ function switchVmSettingsTab(tab) {
         btn.style.borderBottomColor = isActive ? 'var(--accent)' : 'transparent';
         btn.classList.toggle('active', isActive);
     });
+    // Lazy-load passthrough host devices on first visit to tab 4
+    if (tab === 4 && window._editVmPassthrough && !window._editVmPassthrough.tabOpened) {
+        window._editVmPassthrough.tabOpened = true;
+        loadHostDevicesForEdit(window._editVmPassthrough.vmName);
+    }
 }
 
 async function saveVmSettings(name) {
@@ -15522,6 +15732,7 @@ async function saveVmSettings(name) {
     const driversIso = document.getElementById('edit-vm-drivers-iso')?.value.trim() ?? undefined;
     const biosType = document.getElementById('edit-vm-bios-type')?.value || undefined;
 
+    const passthrough = collectPassthroughDevices();
     try {
         const resp = await fetch(apiUrl(`/api/vms/${name}`), {
             method: 'PUT',
@@ -15537,6 +15748,8 @@ async function saveVmSettings(name) {
                 drivers_iso: driversIso,
                 bios_type: biosType,
                 extra_nics: collectExtraNics('edit-vm-extra-nics'),
+                usb_devices: passthrough.usb_devices,
+                pci_devices: passthrough.pci_devices,
             })
         });
         const data = await resp.json();
@@ -31857,24 +32070,40 @@ let wfEditorTarget = { scope: 'local' }; // Workflow-level target
 
 // Color mapping for action types (left border accent)
 const wfActionColors = {
-    update_packages:  '#f59e0b',
-    update_wolfstack: '#8b5cf6',
-    restart_service:  '#3b82f6',
-    run_command:      '#10b981',
-    clean_logs:       '#6366f1',
-    check_disk_space: '#06b6d4',
-    restart_container:'#ec4899',
-    docker_prune:     '#ef4444',
+    update_packages:    '#f59e0b',
+    update_wolfstack:   '#8b5cf6',
+    restart_service:    '#3b82f6',
+    run_command:        '#10b981',
+    clean_logs:         '#6366f1',
+    check_disk_space:   '#06b6d4',
+    restart_container:  '#ec4899',
+    docker_prune:       '#ef4444',
+    docker_check_update:'#0ea5e9',
+    docker_update:      '#0284c7',
+    http_request:       '#8b5cf6',
+    condition:          '#f97316',
+    netbird_action:     '#06b6d4',
+    truenas_action:     '#14b8a6',
+    unifi_action:       '#6366f1',
+    integration_action: '#a855f7',
 };
 const wfActionIcons = {
-    update_packages:  '\u{1F4E6}',
-    update_wolfstack: '\u{1F43A}',
-    restart_service:  '\u{1F504}',
-    run_command:      '\u{1F4BB}',
-    clean_logs:       '\u{1F9F9}',
-    check_disk_space: '\u{1F4BF}',
-    restart_container:'\u{1F4E6}',
-    docker_prune:     '\u{1F433}',
+    update_packages:    '\u{1F4E6}',
+    update_wolfstack:   '\u{1F43A}',
+    restart_service:    '\u{1F504}',
+    run_command:        '\u{1F4BB}',
+    clean_logs:         '\u{1F9F9}',
+    check_disk_space:   '\u{1F4BF}',
+    restart_container:  '\u{1F4E6}',
+    docker_prune:       '\u{1F433}',
+    docker_check_update:'\u{1F50D}',
+    docker_update:      '\u{2B06}',
+    http_request:       '\u{1F310}',
+    condition:          '\u{1F500}',
+    netbird_action:     '\u{1F5A7}',
+    truenas_action:     '\u{1F4BE}',
+    unifi_action:       '\u{1F4F6}',
+    integration_action: '\u{1F517}',
 };
 
 // ─── List View ───
@@ -32461,6 +32690,14 @@ function renderActionFields(actionKey, container, actionData) {
                 <textarea class="form-control wf-action-field" data-field="${f.name}" placeholder="${escapeHtml(f.placeholder || '')}" rows="3"
                     style="font-size:12px;font-family:'JetBrains Mono',monospace;resize:vertical;">${escapeHtml(String(val))}</textarea>
             </div>`;
+        } else if (f.type === 'checkbox') {
+            const checked = val === true || val === 'true' || val === 1;
+            return `<div style="margin-bottom:8px;">
+                <label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer;">
+                    <input type="checkbox" class="wf-action-field" data-field="${f.name}" data-type="checkbox" ${checked ? 'checked' : ''}>
+                    <span style="font-weight:600;color:var(--text-secondary);">${escapeHtml(f.label)}</span>
+                </label>
+            </div>`;
         } else if (f.type === 'number') {
             return `<div style="margin-bottom:8px;">
                 <label style="font-size:11px;font-weight:600;display:block;margin-bottom:3px;color:var(--text-secondary);">${escapeHtml(f.label)}${f.required ? ' *' : ''}</label>
@@ -32628,9 +32865,13 @@ function updateWolfFlowStepFromPanel() {
         document.querySelectorAll('.wf-action-field').forEach(el => {
             const fieldName = el.dataset.field;
             if (fieldName) {
-                let val = el.value;
-                if (el.type === 'number' && val !== '') val = Number(val);
-                newAction[fieldName] = val;
+                if (el.type === 'checkbox' || el.dataset.type === 'checkbox') {
+                    newAction[fieldName] = el.checked;
+                } else {
+                    let val = el.value;
+                    if (el.type === 'number' && val !== '') val = Number(val);
+                    newAction[fieldName] = val;
+                }
             }
         });
         step.action = newAction;

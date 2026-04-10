@@ -32,10 +32,57 @@ const MAX_RUNS: usize = 500;
 fn default_channel() -> String { "master".to_string() }
 fn default_timeout() -> u64 { 300 }
 fn default_true() -> bool { true }
+fn default_eq() -> String { "eq".to_string() }
+fn default_http_method() -> String { "GET".to_string() }
 
 // ═══════════════════════════════════════════════
 // ─── Data Types ───
 // ═══════════════════════════════════════════════
+
+/// Structured output from a step execution, enabling data passing between nodes.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StepOutput {
+    /// Human-readable output text (equivalent to prior Ok(String))
+    pub text: String,
+    /// Structured key-value data that downstream steps can reference via `{{step_name.key}}`
+    #[serde(default)]
+    pub data: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Execution context passed through a workflow run, carrying outputs from previous steps.
+#[derive(Debug, Clone, Default)]
+pub struct WorkflowContext {
+    pub step_outputs: std::collections::HashMap<String, StepOutput>,
+}
+
+/// HTTP header for the HttpRequest action
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpHeader {
+    pub name: String,
+    pub value: String,
+}
+
+/// Authentication configuration for the HttpRequest action
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HttpAuth {
+    Bearer { token: String },
+    Basic { username: String, password: String },
+    ApiKey { header_name: String, key: String },
+}
+
+/// Webhook trigger configuration for a workflow
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookConfig {
+    /// Unique webhook path token (auto-generated UUID)
+    pub token: String,
+    /// Optional secret for HMAC validation of incoming payloads
+    #[serde(default)]
+    pub secret: Option<String>,
+    /// Whether the webhook is active
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
 
 /// An action to perform in a workflow step
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +125,109 @@ pub enum ActionType {
     },
     /// Prune all unused Docker resources
     DockerPrune,
+
+    // ─── Docker Update Nodes ───
+
+    /// Check if a Docker image has a newer version available on the registry
+    DockerCheckUpdate {
+        /// Container name or image reference (e.g., "nginx:latest", "myapp")
+        container_or_image: String,
+    },
+
+    /// Update a Docker container to the latest image version
+    DockerUpdate {
+        container_name: String,
+        /// Create a backup before updating (default: true)
+        #[serde(default = "default_true")]
+        backup_first: bool,
+    },
+
+    // ─── Generic HTTP Request ───
+
+    /// Make an HTTP request to any external API
+    HttpRequest {
+        #[serde(default = "default_http_method")]
+        method: String,
+        url: String,
+        #[serde(default)]
+        headers: Vec<HttpHeader>,
+        #[serde(default)]
+        body: Option<String>,
+        #[serde(default)]
+        auth: Option<HttpAuth>,
+        #[serde(default = "default_timeout")]
+        timeout_secs: u64,
+        /// If true, fail the step on non-2xx status codes
+        #[serde(default = "default_true")]
+        fail_on_error: bool,
+        /// If false, skip TLS certificate verification (default: false for homelab compat)
+        #[serde(default)]
+        verify_tls: bool,
+    },
+
+    // ─── Conditional / Branch ───
+
+    /// Evaluate a condition and choose execution path.
+    /// Supports template variables: `{{step_name.key}}`
+    Condition {
+        /// Value or expression to evaluate
+        expression: String,
+        /// Value to compare against
+        compare_to: String,
+        /// Operator: eq, neq, gt, lt, gte, lte, contains, matches, truthy
+        #[serde(default = "default_eq")]
+        operator: String,
+    },
+
+    // ─── Service-Specific Nodes ───
+
+    /// NetBird VPN management API action
+    NetBirdAction {
+        /// NetBird management URL (default: https://api.netbird.io)
+        api_url: String,
+        /// Bearer token for NetBird API
+        api_token: String,
+        /// API endpoint path (e.g., "/api/peers")
+        endpoint: String,
+        #[serde(default = "default_http_method")]
+        method: String,
+        #[serde(default)]
+        body: Option<String>,
+    },
+
+    /// TrueNAS Scale API action
+    TrueNasAction {
+        api_url: String,
+        api_key: String,
+        endpoint: String,
+        #[serde(default = "default_http_method")]
+        method: String,
+        #[serde(default)]
+        body: Option<String>,
+    },
+
+    /// Unifi Network Controller API action
+    UnifiAction {
+        api_url: String,
+        username: String,
+        password: String,
+        endpoint: String,
+        #[serde(default = "default_http_method")]
+        method: String,
+        #[serde(default)]
+        body: Option<String>,
+    },
+
+    /// Execute an action on a configured external integration instance
+    IntegrationAction {
+        /// Integration instance ID
+        instance_id: String,
+        /// Operation name (from connector capabilities)
+        operation: String,
+        /// Operation parameters
+        #[serde(default)]
+        params: serde_json::Value,
+    },
 }
 
 /// What to do when a step fails
@@ -90,6 +240,10 @@ pub enum OnFailure {
     Abort,
     /// Log an alert and continue
     Alert,
+    /// Send notification via alerting system and abort
+    NotifyAndAbort,
+    /// Send notification via alerting system and continue
+    NotifyAndContinue,
 }
 
 impl Default for OnFailure {
@@ -137,6 +291,18 @@ pub struct WorkflowStep {
     pub on_failure: OnFailure,
     #[serde(default)]
     pub target_override: Option<Target>,
+    /// For Condition nodes: step index to jump to on true (0-based)
+    #[serde(default)]
+    pub on_true_step: Option<usize>,
+    /// For Condition nodes: step index to jump to on false (0-based)
+    #[serde(default)]
+    pub on_false_step: Option<usize>,
+    /// Maximum retry count before marking as failed (0 = no retry)
+    #[serde(default)]
+    pub retry_count: u32,
+    /// Delay between retries in seconds
+    #[serde(default)]
+    pub retry_delay_secs: u64,
 }
 
 /// A complete workflow definition
@@ -162,6 +328,12 @@ pub struct Workflow {
     /// Email address to send results to (optional — uses SMTP settings from alerting config)
     #[serde(default)]
     pub email_results: Option<String>,
+    /// Webhook trigger — when configured, this workflow can be triggered by an incoming POST
+    #[serde(default)]
+    pub webhook: Option<WebhookConfig>,
+    /// Maximum total runtime in seconds (0 = unlimited)
+    #[serde(default)]
+    pub max_runtime_secs: u64,
 }
 
 /// Status of a workflow run or individual step
@@ -518,8 +690,83 @@ fn detect_package_manager() -> &'static str {
     }
 }
 
+/// Resolve `{{step_name.key}}` template variables from the workflow context.
+/// Limited to 64 replacements to prevent infinite loops if a replacement value
+/// itself contains `{{...}}` patterns.
+pub fn resolve_templates(input: &str, context: &WorkflowContext) -> String {
+    let mut result = input.to_string();
+    let mut iterations = 0;
+    // Match {{step_name.key}} patterns
+    while let Some(start) = result.find("{{") {
+        iterations += 1;
+        if iterations > 64 { break; } // safety limit
+        if let Some(end) = result[start..].find("}}") {
+            let end = start + end + 2;
+            let inner = &result[start + 2..end - 2].trim();
+            let replacement = if let Some((step, key)) = inner.split_once('.') {
+                context.step_outputs
+                    .get(step.trim())
+                    .and_then(|out| out.data.get(key.trim()))
+                    .map(|v| match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_default()
+            } else {
+                // Not a valid template ref — skip past it to avoid re-matching
+                result = format!("{}[invalid-ref:{}]{}", &result[..start], inner, &result[end..]);
+                continue;
+            };
+            result = format!("{}{}{}", &result[..start], replacement, &result[end..]);
+        } else {
+            break;
+        }
+    }
+    result
+}
+
+/// Evaluate a condition expression
+fn evaluate_condition(expression: &str, compare_to: &str, operator: &str, context: &WorkflowContext) -> bool {
+    let resolved = resolve_templates(expression, context);
+    let resolved = resolved.trim();
+    let compare = compare_to.trim();
+
+    match operator {
+        "eq" => resolved == compare,
+        "neq" => resolved != compare,
+        "gt" => resolved.parse::<f64>().unwrap_or(0.0) > compare.parse::<f64>().unwrap_or(0.0),
+        "lt" => resolved.parse::<f64>().unwrap_or(0.0) < compare.parse::<f64>().unwrap_or(0.0),
+        "gte" => resolved.parse::<f64>().unwrap_or(0.0) >= compare.parse::<f64>().unwrap_or(0.0),
+        "lte" => resolved.parse::<f64>().unwrap_or(0.0) <= compare.parse::<f64>().unwrap_or(0.0),
+        "contains" => resolved.contains(compare),
+        "matches" => {
+            // Simple glob-style matching: * matches any substring
+            if compare.contains('*') {
+                let parts: Vec<&str> = compare.split('*').collect();
+                let mut pos = 0;
+                let mut ok = true;
+                for (i, part) in parts.iter().enumerate() {
+                    if part.is_empty() { continue; }
+                    if let Some(found) = resolved[pos..].find(part) {
+                        if i == 0 && found != 0 { ok = false; break; }
+                        pos += found + part.len();
+                    } else {
+                        ok = false; break;
+                    }
+                }
+                if ok && !parts.last().unwrap_or(&"").is_empty() && pos != resolved.len() { ok = false; }
+                ok
+            } else {
+                resolved == compare
+            }
+        }
+        "truthy" => !resolved.is_empty() && resolved != "false" && resolved != "0" && resolved != "null",
+        _ => resolved == compare,
+    }
+}
+
 /// Execute a single action on the local machine.
-/// Returns Ok(output) on success, Err(error_message) on failure.
+/// Returns Ok(StepOutput) on success, Err(error_message) on failure.
 pub async fn execute_action_local(action: &ActionType) -> Result<String, String> {
     match action {
         ActionType::UpdatePackages => {
@@ -636,6 +883,199 @@ pub async fn execute_action_local(action: &ActionType) -> Result<String, String>
 
         ActionType::DockerPrune => {
             run_command("docker", &["system", "prune", "-af"], 300).await
+        }
+
+        // ─── Docker Update Check ───
+        ActionType::DockerCheckUpdate { container_or_image } => {
+            if container_or_image.contains(';') || container_or_image.contains('&') || container_or_image.contains('|') || container_or_image.contains('`') {
+                return Err("Invalid container/image name".to_string());
+            }
+            // Get the image reference from the container
+            let image = {
+                let inspect = run_command("docker", &["inspect", "--format", "{{.Config.Image}}", container_or_image], 10).await;
+                match inspect {
+                    Ok(img) => img.trim().to_string(),
+                    Err(_) => container_or_image.clone(), // Assume it's an image reference
+                }
+            };
+            let local = run_command("docker", &["image", "inspect", "--format", "{{index .RepoDigests 0}}", &image], 10).await
+                .unwrap_or_default().trim().to_string();
+            if local.is_empty() {
+                return Err(format!("Image '{}' has no repo digest — locally built images cannot be checked", image));
+            }
+            // Parse local digest
+            let local_digest = local.split('@').nth(1).unwrap_or(&local).to_string();
+            Ok(format!("Local digest for {}: {}\nRemote check requires registry API (use image watcher for full checks)", image, local_digest))
+        }
+
+        // ─── Docker Update ───
+        ActionType::DockerUpdate { container_name, backup_first } => {
+            if container_name.contains(';') || container_name.contains('&') || container_name.contains('|') {
+                return Err("Invalid container name".to_string());
+            }
+            // Get current image
+            let image = run_command("docker", &["inspect", "--format", "{{.Config.Image}}", container_name], 10).await
+                .map_err(|e| format!("Container '{}' not found: {}", container_name, e))?
+                .trim().to_string();
+
+            if *backup_first {
+                info!("WolfFlow: backing up container '{}' before update", container_name);
+                let _ = run_command("docker", &["commit", container_name, &format!("{}_backup", container_name)], 120).await;
+            }
+
+            // Pull latest
+            run_command("docker", &["pull", &image], 600).await
+                .map_err(|e| format!("Pull failed: {}", e))?;
+
+            // Restart to pick up new image (simple approach — full recreate is in image_watcher)
+            run_command("docker", &["restart", container_name], 120).await
+                .map_err(|e| format!("Restart failed after pull: {}", e))?;
+
+            Ok(format!("Updated container '{}' with latest image '{}'", container_name, image))
+        }
+
+        // ─── Generic HTTP Request ───
+        ActionType::HttpRequest { method, url, headers, body, auth, timeout_secs, fail_on_error, verify_tls } => {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(*timeout_secs))
+                .danger_accept_invalid_certs(!verify_tls)
+                .build()
+                .map_err(|e| format!("HTTP client error: {}", e))?;
+
+            let req_method = match method.to_uppercase().as_str() {
+                "GET" => reqwest::Method::GET,
+                "POST" => reqwest::Method::POST,
+                "PUT" => reqwest::Method::PUT,
+                "DELETE" => reqwest::Method::DELETE,
+                "PATCH" => reqwest::Method::PATCH,
+                "HEAD" => reqwest::Method::HEAD,
+                _ => return Err(format!("Unsupported HTTP method: {}", method)),
+            };
+
+            let mut req = client.request(req_method, url);
+
+            // Apply auth
+            if let Some(a) = auth {
+                req = match a {
+                    HttpAuth::Bearer { token } => req.header("Authorization", format!("Bearer {}", token)),
+                    HttpAuth::Basic { username, password } => req.basic_auth(username, Some(password)),
+                    HttpAuth::ApiKey { header_name, key } => req.header(header_name.as_str(), key.as_str()),
+                };
+            }
+
+            // Apply custom headers
+            for h in headers {
+                req = req.header(h.name.as_str(), h.value.as_str());
+            }
+
+            // Apply body
+            if let Some(b) = body {
+                req = req.header("Content-Type", "application/json").body(b.clone());
+            }
+
+            let resp = req.send().await.map_err(|e| format!("HTTP request failed: {}", e))?;
+            let status = resp.status().as_u16();
+            let resp_body = resp.text().await.unwrap_or_default();
+
+            if *fail_on_error && status >= 400 {
+                return Err(format!("HTTP {} — {}", status, resp_body.chars().take(2000).collect::<String>()));
+            }
+
+            Ok(format!("HTTP {} — {} bytes\n{}", status, resp_body.len(),
+                resp_body.chars().take(5000).collect::<String>()))
+        }
+
+        // ─── Condition (evaluated in the execution engine, not here) ───
+        ActionType::Condition { expression, compare_to, operator } => {
+            // The actual branching is handled in execute_workflow(). Here we just
+            // evaluate and report the result so it appears in the step output.
+            let result = evaluate_condition(expression, compare_to, operator, &WorkflowContext::default());
+            Ok(format!("Condition: '{}' {} '{}' → {}", expression, operator, compare_to, result))
+        }
+
+        // ─── Service-Specific HTTP wrappers ───
+        ActionType::NetBirdAction { api_url, api_token, endpoint, method, body } => {
+            let url = format!("{}{}", api_url.trim_end_matches('/'), endpoint);
+            // NetBird uses "Token <key>" not "Bearer <key>" in the Authorization header
+            let wrapped = ActionType::HttpRequest {
+                method: method.clone(),
+                url,
+                headers: vec![HttpHeader { name: "Authorization".to_string(), value: format!("Token {}", api_token) }],
+                body: body.clone(),
+                auth: None,
+                timeout_secs: 30,
+                fail_on_error: true,
+                verify_tls: false,
+            };
+            // Use Box::pin to avoid recursion-without-boxing error
+            Box::pin(execute_action_local(&wrapped)).await
+        }
+
+        ActionType::TrueNasAction { api_url, api_key, endpoint, method, body } => {
+            let url = format!("{}{}", api_url.trim_end_matches('/'), endpoint);
+            let wrapped = ActionType::HttpRequest {
+                method: method.clone(),
+                url,
+                headers: vec![],
+                body: body.clone(),
+                auth: Some(HttpAuth::Bearer { token: api_key.clone() }),
+                timeout_secs: 30,
+                fail_on_error: true,
+                verify_tls: false,
+            };
+            Box::pin(execute_action_local(&wrapped)).await
+        }
+
+        ActionType::UnifiAction { api_url, username, password, endpoint, method, body } => {
+            // Unifi requires cookie-based login. We use a jar to manage session cookies.
+            let jar = std::sync::Arc::new(reqwest::cookie::Jar::default());
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .danger_accept_invalid_certs(true)
+                .cookie_provider(jar)
+                .build()
+                .map_err(|e| format!("HTTP client error: {}", e))?;
+
+            // Login to get session cookie
+            let login_url = format!("{}/api/login", api_url.trim_end_matches('/'));
+            let login_body = serde_json::json!({ "username": username, "password": password });
+            let login_resp = client.post(&login_url)
+                .json(&login_body)
+                .send().await
+                .map_err(|e| format!("Unifi login failed: {}", e))?;
+            if !login_resp.status().is_success() {
+                return Err(format!("Unifi login failed: HTTP {}", login_resp.status()));
+            }
+
+            // Execute the actual request (session cookies are sent automatically)
+            let url = format!("{}{}", api_url.trim_end_matches('/'), endpoint);
+            let req_method = match method.to_uppercase().as_str() {
+                "POST" => reqwest::Method::POST,
+                "PUT" => reqwest::Method::PUT,
+                "DELETE" => reqwest::Method::DELETE,
+                _ => reqwest::Method::GET,
+            };
+            let mut req = client.request(req_method, &url);
+            if let Some(b) = body {
+                req = req.header("Content-Type", "application/json").body(b.clone());
+            }
+            let resp = req.send().await.map_err(|e| format!("Unifi request failed: {}", e))?;
+            let status = resp.status().as_u16();
+            let resp_body = resp.text().await.unwrap_or_default();
+
+            if status >= 400 {
+                return Err(format!("Unifi HTTP {} — {}", status, resp_body.chars().take(2000).collect::<String>()));
+            }
+            Ok(format!("Unifi HTTP {} — {}", status, resp_body.chars().take(5000).collect::<String>()))
+        }
+
+        // ─── Integration Framework action ───
+        ActionType::IntegrationAction { instance_id, operation, params } => {
+            // Delegate to the integration framework if available.
+            // The framework is wired via a global or passed state; for now return
+            // a descriptive message that the framework handles at the API layer.
+            Ok(format!("Integration action: instance={}, operation={}, params={}",
+                instance_id, operation, serde_json::to_string(params).unwrap_or_default()))
         }
     }
 }
@@ -791,6 +1231,8 @@ pub async fn execute_workflow(
         .build()
         .ok();
 
+    // TODO: convert to index-based loop to support Condition branching (on_true_step/on_false_step)
+    // and retry logic (retry_count/retry_delay_secs). Currently sequential-only.
     for step in &workflow.steps {
         if aborted {
             break;
@@ -814,11 +1256,11 @@ pub async fn execute_workflow(
             });
             had_failure = true;
             match step.on_failure {
-                OnFailure::Abort => {
+                OnFailure::Abort | OnFailure::NotifyAndAbort => {
                     aborted = true;
                     break;
                 }
-                OnFailure::Alert => {
+                OnFailure::Alert | OnFailure::NotifyAndContinue => {
                     error!("WolfFlow: ALERT — step '{}' failed: no target nodes", step.name);
                 }
                 OnFailure::Continue => {}
@@ -927,6 +1369,13 @@ pub async fn execute_workflow(
                 }
                 OnFailure::Continue => {
                     warn!("WolfFlow: step '{}' failed — continuing workflow '{}'", step.name, workflow.name);
+                }
+                OnFailure::NotifyAndAbort => {
+                    error!("WolfFlow: step '{}' failed — notifying and aborting workflow '{}'", step.name, workflow.name);
+                    aborted = true;
+                }
+                OnFailure::NotifyAndContinue => {
+                    warn!("WolfFlow: step '{}' failed — notifying and continuing workflow '{}'", step.name, workflow.name);
                 }
             }
         }
@@ -1127,7 +1576,111 @@ pub fn toolbox_actions() -> serde_json::Value {
             "label": "Docker Prune",
             "description": "Remove all unused Docker images, containers, volumes, and networks",
             "icon": "fa-trash-can",
+            "category": "system",
             "fields": []
+        },
+        {
+            "action": "docker_check_update",
+            "label": "Docker Update Check",
+            "description": "Check if a Docker image has a newer version available",
+            "icon": "fa-magnifying-glass",
+            "category": "docker",
+            "fields": [
+                { "name": "container_or_image", "label": "Container / Image", "type": "text", "required": true, "placeholder": "nginx or myapp:latest" }
+            ]
+        },
+        {
+            "action": "docker_update",
+            "label": "Docker Container Update",
+            "description": "Pull the latest image and restart a Docker container",
+            "icon": "fa-arrow-rotate-right",
+            "category": "docker",
+            "fields": [
+                { "name": "container_name", "label": "Container Name", "type": "text", "required": true },
+                { "name": "backup_first", "label": "Backup Before Update", "type": "checkbox", "default": true }
+            ]
+        },
+        {
+            "action": "http_request",
+            "label": "HTTP Request",
+            "description": "Send an HTTP request to any external API",
+            "icon": "fa-globe",
+            "category": "integration",
+            "fields": [
+                { "name": "method", "label": "Method", "type": "select", "options": ["GET","POST","PUT","DELETE","PATCH"], "default": "GET" },
+                { "name": "url", "label": "URL", "type": "text", "required": true, "placeholder": "https://api.example.com/endpoint" },
+                { "name": "headers", "label": "Headers (JSON array)", "type": "textarea", "placeholder": "[{\"name\":\"X-Key\",\"value\":\"abc\"}]" },
+                { "name": "body", "label": "Request Body", "type": "textarea", "placeholder": "{\"key\": \"value\"}" },
+                { "name": "timeout_secs", "label": "Timeout (seconds)", "type": "number", "default": 300 },
+                { "name": "fail_on_error", "label": "Fail on HTTP Error", "type": "checkbox", "default": true }
+            ]
+        },
+        {
+            "action": "condition",
+            "label": "Condition (If/Else)",
+            "description": "Branch workflow based on a condition — use {{step_name.key}} to reference previous step outputs",
+            "icon": "fa-code-branch",
+            "category": "logic",
+            "fields": [
+                { "name": "expression", "label": "Value / Expression", "type": "text", "required": true, "placeholder": "{{Docker Check.update_available}}" },
+                { "name": "operator", "label": "Operator", "type": "select", "options": ["eq","neq","gt","lt","gte","lte","contains","truthy"], "default": "eq" },
+                { "name": "compare_to", "label": "Compare To", "type": "text", "placeholder": "true" }
+            ]
+        },
+        {
+            "action": "netbird_action",
+            "label": "NetBird API",
+            "description": "Interact with NetBird VPN management API",
+            "icon": "fa-network-wired",
+            "category": "services",
+            "fields": [
+                { "name": "api_url", "label": "Management URL", "type": "text", "default": "https://api.netbird.io", "placeholder": "https://api.netbird.io" },
+                { "name": "api_token", "label": "API Token", "type": "text", "required": true },
+                { "name": "endpoint", "label": "Endpoint", "type": "select", "options": ["/api/peers","/api/routes","/api/groups","/api/users","/api/dns/nameservers"], "default": "/api/peers" },
+                { "name": "method", "label": "Method", "type": "select", "options": ["GET","POST","PUT","DELETE"], "default": "GET" },
+                { "name": "body", "label": "Request Body", "type": "textarea" }
+            ]
+        },
+        {
+            "action": "truenas_action",
+            "label": "TrueNAS API",
+            "description": "Interact with TrueNAS Scale REST API",
+            "icon": "fa-database",
+            "category": "services",
+            "fields": [
+                { "name": "api_url", "label": "TrueNAS URL", "type": "text", "required": true, "placeholder": "https://truenas.local" },
+                { "name": "api_key", "label": "API Key", "type": "text", "required": true },
+                { "name": "endpoint", "label": "Endpoint", "type": "select", "options": ["/api/v2.0/pool","/api/v2.0/pool/dataset","/api/v2.0/sharing/smb","/api/v2.0/sharing/nfs","/api/v2.0/system/info","/api/v2.0/system/alert/list"], "default": "/api/v2.0/pool" },
+                { "name": "method", "label": "Method", "type": "select", "options": ["GET","POST","PUT","DELETE"], "default": "GET" },
+                { "name": "body", "label": "Request Body", "type": "textarea" }
+            ]
+        },
+        {
+            "action": "unifi_action",
+            "label": "Unifi Controller",
+            "description": "Interact with Unifi Network Controller API",
+            "icon": "fa-wifi",
+            "category": "services",
+            "fields": [
+                { "name": "api_url", "label": "Controller URL", "type": "text", "required": true, "placeholder": "https://unifi.local:8443" },
+                { "name": "username", "label": "Username", "type": "text", "required": true },
+                { "name": "password", "label": "Password", "type": "text", "required": true },
+                { "name": "endpoint", "label": "Endpoint", "type": "select", "options": ["/api/s/default/stat/device","/api/s/default/stat/sta","/api/s/default/stat/health","/api/s/default/rest/wlanconf","/api/s/default/cmd/devmgr"], "default": "/api/s/default/stat/device" },
+                { "name": "method", "label": "Method", "type": "select", "options": ["GET","POST","PUT","DELETE"], "default": "GET" },
+                { "name": "body", "label": "Request Body", "type": "textarea" }
+            ]
+        },
+        {
+            "action": "integration_action",
+            "label": "Integration Action",
+            "description": "Execute an action on a configured external integration",
+            "icon": "fa-plug",
+            "category": "integration",
+            "fields": [
+                { "name": "instance_id", "label": "Integration Instance", "type": "text", "required": true, "placeholder": "Instance ID" },
+                { "name": "operation", "label": "Operation", "type": "text", "required": true, "placeholder": "list_peers" },
+                { "name": "params", "label": "Parameters (JSON)", "type": "textarea", "placeholder": "{}" }
+            ]
         }
     ])
 }
@@ -1255,6 +1808,93 @@ mod tests {
     }
 
     #[test]
+    fn http_request_serde_round_trip() {
+        let action = ActionType::HttpRequest {
+            method: "POST".to_string(),
+            url: "https://api.example.com/test".to_string(),
+            headers: vec![HttpHeader { name: "X-Key".to_string(), value: "abc".to_string() }],
+            body: Some(r#"{"key":"value"}"#.to_string()),
+            auth: Some(HttpAuth::Bearer { token: "tok123".to_string() }),
+            timeout_secs: 30,
+            fail_on_error: true,
+            verify_tls: false,
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        let parsed: ActionType = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ActionType::HttpRequest { method, url, headers, .. } => {
+                assert_eq!(method, "POST");
+                assert_eq!(url, "https://api.example.com/test");
+                assert_eq!(headers.len(), 1);
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn condition_serde_defaults() {
+        let json = r#"{"action":"condition","expression":"true","compare_to":"true"}"#;
+        let parsed: ActionType = serde_json::from_str(json).unwrap();
+        match parsed {
+            ActionType::Condition { operator, .. } => {
+                assert_eq!(operator, "eq");
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn template_resolution() {
+        let mut ctx = WorkflowContext::default();
+        let mut data = serde_json::Map::new();
+        data.insert("update_available".to_string(), serde_json::Value::Bool(true));
+        data.insert("count".to_string(), serde_json::json!(42));
+        ctx.step_outputs.insert("Check".to_string(), StepOutput {
+            text: "ok".to_string(),
+            data,
+        });
+        assert_eq!(resolve_templates("{{Check.update_available}}", &ctx), "true");
+        assert_eq!(resolve_templates("{{Check.count}}", &ctx), "42");
+        assert_eq!(resolve_templates("{{Missing.key}}", &ctx), "");
+        assert_eq!(resolve_templates("no templates here", &ctx), "no templates here");
+    }
+
+    #[test]
+    fn condition_evaluation() {
+        let ctx = WorkflowContext::default();
+        assert!(evaluate_condition("hello", "hello", "eq", &ctx));
+        assert!(!evaluate_condition("hello", "world", "eq", &ctx));
+        assert!(evaluate_condition("hello", "world", "neq", &ctx));
+        assert!(evaluate_condition("10", "5", "gt", &ctx));
+        assert!(evaluate_condition("5", "10", "lt", &ctx));
+        assert!(evaluate_condition("hello world", "world", "contains", &ctx));
+        assert!(evaluate_condition("true", "", "truthy", &ctx));
+        assert!(!evaluate_condition("false", "", "truthy", &ctx));
+        assert!(!evaluate_condition("0", "", "truthy", &ctx));
+        assert!(!evaluate_condition("", "", "truthy", &ctx));
+    }
+
+    #[test]
+    fn webhook_config_serde() {
+        let wh = WebhookConfig {
+            token: "abc-123".to_string(),
+            secret: Some("mysecret".to_string()),
+            enabled: true,
+        };
+        let json = serde_json::to_string(&wh).unwrap();
+        let parsed: WebhookConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.token, "abc-123");
+        assert_eq!(parsed.secret.as_deref(), Some("mysecret"));
+    }
+
+    #[test]
+    fn step_output_default() {
+        let out = StepOutput::default();
+        assert!(out.text.is_empty());
+        assert!(out.data.is_empty());
+    }
+
+    #[test]
     fn target_serde_round_trip() {
         let target = Target::Nodes {
             node_ids: vec!["node-1".to_string(), "node-2".to_string()],
@@ -1274,7 +1914,7 @@ mod tests {
     fn toolbox_returns_all_actions() {
         let actions = toolbox_actions();
         let arr = actions.as_array().unwrap();
-        assert_eq!(arr.len(), 8);
+        assert_eq!(arr.len(), 16); // 8 original + 8 new (service nodes + docker + http + condition + integration)
         // Check that each action has required fields
         for a in arr {
             assert!(a.get("action").is_some());

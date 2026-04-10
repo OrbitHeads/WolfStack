@@ -8,6 +8,8 @@
 //! LXC: communicates via lxc-* CLI commands
 //! WolfNet: Optional overlay network integration for container networking
 
+pub mod image_watcher;
+
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;

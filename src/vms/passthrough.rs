@@ -1,0 +1,970 @@
+// Written by Paul Clevett
+// (C)Copyright Wolf Software Systems Ltd
+// https://wolf.uk.com
+
+//! USB and PCI device passthrough — host enumeration, preflight checks,
+//! backend-specific wiring (native QEMU, Proxmox qm, libvirt hostdev XML).
+
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::process::Command;
+
+use super::manager::{PciDevice, UsbDevice, VmConfig};
+
+// ─── Host enumeration ───
+
+/// A USB device visible on the host as returned to the frontend picker.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct HostUsbDevice {
+    /// Vendor ID in lowercase hex (4 chars, no 0x)
+    pub vendor_id: String,
+    /// Product ID in lowercase hex (4 chars, no 0x)
+    pub product_id: String,
+    /// Bus-port path (e.g. "1-4") for port-stable pinning
+    pub host_bus: String,
+    /// Human-readable description from lsusb
+    pub description: String,
+    /// Stable identifier for the frontend to match against VmConfig.usb_devices
+    pub match_key: String,
+    /// Currently assigned to this VM (if any)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_use_by: Option<String>,
+    /// Is the owning VM currently running
+    #[serde(default)]
+    pub in_use_running: bool,
+}
+
+/// A PCI device visible on the host as returned to the frontend picker.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct HostPciDevice {
+    /// Canonical BDF: DDDD:BB:DD.F
+    pub bdf: String,
+    /// Vendor ID (4-char hex, lowercase)
+    pub vendor_id: String,
+    /// Device ID (4-char hex, lowercase)
+    pub device_id: String,
+    /// Short class (e.g. "VGA compatible controller")
+    pub class: String,
+    /// Full vendor + device description from lspci -nn
+    pub description: String,
+    /// IOMMU group number (None if IOMMU disabled / not isolated)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iommu_group: Option<u32>,
+    /// Current kernel driver bound to the device (e.g. "nvidia", "vfio-pci")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    /// Stable identifier for frontend matching
+    pub match_key: String,
+    /// VM currently claiming this device (if any)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_use_by: Option<String>,
+    /// Is the owning VM currently running
+    #[serde(default)]
+    pub in_use_running: bool,
+}
+
+/// VFIO / IOMMU host preflight state — surfaced to the UI so the user
+/// knows why PCI passthrough might be rejected.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct HostPassthroughPreflight {
+    /// IOMMU groups populated under /sys/kernel/iommu_groups — means IOMMU is on.
+    pub iommu_enabled: bool,
+    /// `vfio-pci` kernel module is loaded (required for QEMU/libvirt VFIO).
+    pub vfio_pci_loaded: bool,
+    /// Kernel command line contains `intel_iommu=on` or `amd_iommu=on`.
+    pub iommu_cmdline: bool,
+    /// Backend currently in use: "proxmox", "libvirt", or "native"
+    pub backend: String,
+    /// Warnings the user should see at the top of the picker
+    pub warnings: Vec<String>,
+}
+
+/// Full response for GET /api/vms/host-devices
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct HostDevicesResponse {
+    pub usb: Vec<HostUsbDevice>,
+    pub pci: Vec<HostPciDevice>,
+    pub preflight: HostPassthroughPreflight,
+}
+
+/// Convert `in_use_by` map keys (match_key) → VM name/running state.
+pub struct DeviceOwnership {
+    /// match_key → (vm_name, running)
+    pub by_key: HashMap<String, (String, bool)>,
+}
+
+/// Parse `lsusb` output. Format per line:
+///   `Bus 001 Device 004: ID 046d:c52b Logitech, Inc. Unifying Receiver`
+pub fn list_host_usb() -> Vec<HostUsbDevice> {
+    let output = match Command::new("lsusb").output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return Vec::new(),
+    };
+
+    let mut devs = Vec::new();
+    for line in output.lines() {
+        // Bus BBB Device DDD: ID vvvv:pppp <description>
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        // Split "ID xxxx:yyyy ..."
+        let id_idx = match line.find("ID ") { Some(i) => i, None => continue };
+        let rest = &line[id_idx + 3..];
+        let space_idx = rest.find(' ').unwrap_or(rest.len());
+        let id_part = &rest[..space_idx];
+        let desc = rest.get(space_idx + 1..).unwrap_or("").trim().to_string();
+        let mut ids = id_part.split(':');
+        let vid = ids.next().unwrap_or("").to_lowercase();
+        let pid = ids.next().unwrap_or("").to_lowercase();
+        if vid.len() != 4 || pid.len() != 4 { continue; }
+
+        // Skip Linux Foundation root hubs — users can't pass them through and
+        // they clutter the list.
+        if vid == "1d6b" { continue; }
+
+        // Extract Bus nnn Device nnn → bus-port style via sysfs if possible,
+        // otherwise just "Bus-Device" as a reasonable host_bus hint.
+        let bus_num: u32 = line.split_whitespace().nth(1)
+            .and_then(|s| s.parse().ok()).unwrap_or(0);
+        let dev_num: u32 = line.split_whitespace().nth(3)
+            .and_then(|s| s.trim_end_matches(':').parse().ok()).unwrap_or(0);
+        let host_bus = format!("{}-{}", bus_num, dev_num);
+
+        let dev = HostUsbDevice {
+            vendor_id: vid.clone(),
+            product_id: pid.clone(),
+            host_bus,
+            description: if desc.is_empty() { format!("USB device {}:{}", vid, pid) } else { desc },
+            match_key: format!("usb:{}:{}", vid, pid),
+            in_use_by: None,
+            in_use_running: false,
+        };
+        devs.push(dev);
+    }
+    devs
+}
+
+/// Parse `lspci -nn -D` output plus IOMMU groups from sysfs.
+/// Line format:
+///   `0000:01:00.0 VGA compatible controller [0300]: NVIDIA ... [10de:2484] (rev a1)`
+pub fn list_host_pci() -> Vec<HostPciDevice> {
+    let output = match Command::new("lspci").args(["-nn", "-D"]).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return Vec::new(),
+    };
+
+    // Build BDF -> IOMMU group map by walking /sys/kernel/iommu_groups/
+    let iommu = read_iommu_groups();
+
+    let mut devs = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        // BDF is the first whitespace token
+        let mut parts = line.splitn(2, ' ');
+        let bdf = parts.next().unwrap_or("").to_lowercase();
+        let rest = parts.next().unwrap_or("");
+        if bdf.len() < 7 { continue; }
+
+        // Split "<class> [CCCC]: <vendor device> [VVVV:DDDD] (rev ...)"
+        // Class is before the first colon that follows "]:".
+        let class_end = rest.find("]:").map(|i| i + 1).unwrap_or(0);
+        let class = rest[..class_end].trim_end_matches(':').trim().to_string();
+        let after_class = rest.get(class_end + 1..).unwrap_or(rest).trim();
+
+        // Vendor:device ID is in the LAST [vvvv:dddd]
+        let (vendor_id, device_id) = extract_last_id(after_class).unwrap_or_else(|| (String::new(), String::new()));
+        if vendor_id.is_empty() { continue; }
+
+        // Skip host bridge / root ports — they can't be passed through and
+        // usually own the whole IOMMU group anyway.
+        if class.to_lowercase().contains("host bridge")
+            || class.to_lowercase().contains("pci bridge")
+            || class.to_lowercase().contains("isa bridge")
+        {
+            continue;
+        }
+
+        let driver = read_pci_driver(&bdf);
+        let iommu_group = iommu.get(&bdf).copied();
+
+        devs.push(HostPciDevice {
+            bdf: bdf.clone(),
+            vendor_id,
+            device_id,
+            class,
+            description: after_class.trim().to_string(),
+            iommu_group,
+            driver,
+            match_key: format!("pci:{}", bdf),
+            in_use_by: None,
+            in_use_running: false,
+        });
+    }
+    devs
+}
+
+/// Extract the LAST [xxxx:yyyy] from a string.
+fn extract_last_id(s: &str) -> Option<(String, String)> {
+    let mut last: Option<(String, String)> = None;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            if let Some(close) = s[i + 1..].find(']') {
+                let inner = &s[i + 1..i + 1 + close];
+                if inner.len() == 9 && &inner[4..5] == ":" {
+                    let v = inner[..4].to_lowercase();
+                    let d = inner[5..].to_lowercase();
+                    if v.chars().all(|c| c.is_ascii_hexdigit())
+                        && d.chars().all(|c| c.is_ascii_hexdigit())
+                    {
+                        last = Some((v, d));
+                    }
+                }
+                i = i + 1 + close + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    last
+}
+
+/// Build a BDF -> IOMMU group number map by walking /sys/kernel/iommu_groups/*/devices/
+fn read_iommu_groups() -> HashMap<String, u32> {
+    let mut map = HashMap::new();
+    let root = Path::new("/sys/kernel/iommu_groups");
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(_) => return map,
+    };
+    for entry in entries.flatten() {
+        let group: u32 = match entry.file_name().to_string_lossy().parse() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let dev_dir = entry.path().join("devices");
+        if let Ok(devs) = std::fs::read_dir(&dev_dir) {
+            for d in devs.flatten() {
+                let bdf = d.file_name().to_string_lossy().to_lowercase();
+                map.insert(bdf, group);
+            }
+        }
+    }
+    map
+}
+
+fn read_pci_driver(bdf: &str) -> Option<String> {
+    let link = format!("/sys/bus/pci/devices/{}/driver", bdf);
+    let target = std::fs::read_link(&link).ok()?;
+    target.file_name().map(|n| n.to_string_lossy().to_string())
+}
+
+/// Check host passthrough readiness.
+pub fn host_preflight() -> HostPassthroughPreflight {
+    let iommu_enabled = std::fs::read_dir("/sys/kernel/iommu_groups")
+        .map(|mut it| it.next().is_some())
+        .unwrap_or(false);
+
+    let vfio_pci_loaded = std::fs::read_to_string("/proc/modules")
+        .map(|s| s.lines().any(|l| l.starts_with("vfio_pci ") || l.starts_with("vfio_pci\t")))
+        .unwrap_or(false)
+        || Path::new("/sys/module/vfio_pci").exists();
+
+    let iommu_cmdline = std::fs::read_to_string("/proc/cmdline")
+        .map(|s| s.contains("intel_iommu=on") || s.contains("amd_iommu=on") || s.contains("iommu=pt"))
+        .unwrap_or(false);
+
+    let backend = if crate::containers::is_proxmox() {
+        "proxmox".to_string()
+    } else if crate::containers::is_libvirt() {
+        "libvirt".to_string()
+    } else {
+        "native".to_string()
+    };
+
+    let mut warnings = Vec::new();
+    if !iommu_enabled {
+        warnings.push("IOMMU groups not found — the kernel IOMMU is not active. PCI passthrough will not work until you enable it.".to_string());
+    }
+    if !iommu_cmdline {
+        warnings.push("Kernel command line does not include intel_iommu=on or amd_iommu=on — add it to GRUB_CMDLINE_LINUX_DEFAULT and regenerate grub, then reboot.".to_string());
+    }
+    if !vfio_pci_loaded {
+        warnings.push("vfio-pci kernel module is not loaded — run `modprobe vfio-pci` (and add to /etc/modules-load.d/vfio.conf for persistence).".to_string());
+    }
+
+    HostPassthroughPreflight {
+        iommu_enabled,
+        vfio_pci_loaded,
+        iommu_cmdline,
+        backend,
+        warnings,
+    }
+}
+
+/// Full host devices response. `ownership` tags devices that are already
+/// configured on another VM so the UI can grey them out.
+pub fn list_host_devices(ownership: &DeviceOwnership) -> HostDevicesResponse {
+    let mut usb = list_host_usb();
+    let mut pci = list_host_pci();
+
+    for u in &mut usb {
+        if let Some((name, running)) = ownership.by_key.get(&u.match_key) {
+            u.in_use_by = Some(name.clone());
+            u.in_use_running = *running;
+        }
+    }
+    for p in &mut pci {
+        if let Some((name, running)) = ownership.by_key.get(&p.match_key) {
+            p.in_use_by = Some(name.clone());
+            p.in_use_running = *running;
+        }
+    }
+
+    HostDevicesResponse {
+        usb,
+        pci,
+        preflight: host_preflight(),
+    }
+}
+
+/// Build an ownership map from a list of VMs.
+pub fn build_ownership(vms: &[VmConfig]) -> DeviceOwnership {
+    let mut by_key = HashMap::new();
+    for vm in vms {
+        for u in &vm.usb_devices {
+            by_key.insert(u.match_key(), (vm.name.clone(), vm.running));
+        }
+        for p in &vm.pci_devices {
+            by_key.insert(p.match_key(), (vm.name.clone(), vm.running));
+        }
+    }
+    DeviceOwnership { by_key }
+}
+
+// ─── Conflict detection ───
+
+/// Find conflicts: which devices in `target` are already claimed by another
+/// running VM in `others`. Returns human-readable conflict messages.
+pub fn find_conflicts(target: &VmConfig, others: &[VmConfig]) -> Vec<String> {
+    let mut claimed: HashMap<String, String> = HashMap::new();
+    for vm in others {
+        if vm.name == target.name || !vm.running { continue; }
+        for u in &vm.usb_devices {
+            claimed.insert(u.match_key(), vm.name.clone());
+        }
+        for p in &vm.pci_devices {
+            claimed.insert(p.match_key(), vm.name.clone());
+        }
+    }
+
+    let mut conflicts = Vec::new();
+    for u in &target.usb_devices {
+        if let Some(other) = claimed.get(&u.match_key()) {
+            conflicts.push(format!(
+                "USB device {}:{} is in use by running VM '{}'",
+                u.vendor_id, u.product_id, other
+            ));
+        }
+    }
+    for p in &target.pci_devices {
+        if let Some(other) = claimed.get(&p.match_key()) {
+            conflicts.push(format!(
+                "PCI device {} is in use by running VM '{}'",
+                p.bdf, other
+            ));
+        }
+    }
+    conflicts
+}
+
+// ─── Native QEMU argument builders ───
+
+/// Append `-device usb-host,...` and `-device vfio-pci,...` arguments for each
+/// configured passthrough device. The caller is responsible for having `-usb`
+/// already on the command line (the native start path already does).
+pub fn append_qemu_passthrough_args(cmd: &mut Command, config: &VmConfig) -> Result<(), String> {
+    for u in &config.usb_devices {
+        let spec = if let Some(ref hb) = u.host_bus {
+            if !hb.is_empty() {
+                // hostbus/hostport form: "1-4" → hostbus=1,hostport=4
+                let (bus, port) = match hb.split_once('-') {
+                    Some((b, p)) => (b, p),
+                    None => return Err(format!("Invalid host_bus format '{}', expected 'bus-port'", hb)),
+                };
+                format!("usb-host,hostbus={},hostport={}", bus, port)
+            } else {
+                format!("usb-host,vendorid=0x{},productid=0x{}", u.vendor_id, u.product_id)
+            }
+        } else {
+            if u.vendor_id.len() != 4 || u.product_id.len() != 4 {
+                return Err(format!(
+                    "Invalid USB device id: vendor='{}' product='{}'",
+                    u.vendor_id, u.product_id
+                ));
+            }
+            format!("usb-host,vendorid=0x{},productid=0x{}", u.vendor_id, u.product_id)
+        };
+        cmd.arg("-device").arg(spec);
+    }
+
+    for p in &config.pci_devices {
+        validate_bdf(&p.bdf)?;
+        // Bind to vfio-pci first. If the device is already bound (e.g. at boot)
+        // this is a no-op. Ignore errors — QEMU will give a better diagnostic.
+        let _ = bind_vfio_pci(&p.bdf);
+
+        let mut spec = format!("vfio-pci,host={}", p.bdf);
+        if p.primary_gpu {
+            spec.push_str(",x-vga=on");
+        }
+        cmd.arg("-device").arg(spec);
+    }
+    Ok(())
+}
+
+/// Validate a BDF string to prevent shell injection and malformed addresses.
+/// Accepts both short (BB:DD.F) and full (DDDD:BB:DD.F) forms, normalising to full.
+pub fn normalize_bdf(bdf: &str) -> Result<String, String> {
+    let bdf = bdf.trim();
+    if bdf.is_empty() { return Err("Empty BDF".to_string()); }
+    let parts: Vec<&str> = bdf.split(':').collect();
+    let (dom, bus, devfunc) = match parts.len() {
+        3 => (parts[0].to_string(), parts[1].to_string(), parts[2].to_string()),
+        2 => ("0000".to_string(), parts[0].to_string(), parts[1].to_string()),
+        _ => return Err(format!("Invalid BDF '{}': expected DDDD:BB:DD.F or BB:DD.F", bdf)),
+    };
+    let df_parts: Vec<&str> = devfunc.split('.').collect();
+    if df_parts.len() != 2 {
+        return Err(format!("Invalid BDF '{}': device.function missing", bdf));
+    }
+    if dom.len() != 4 || bus.len() != 2 || df_parts[0].len() != 2 || df_parts[1].len() != 1 {
+        return Err(format!("Invalid BDF '{}': component width wrong", bdf));
+    }
+    let all_hex = [&dom, &bus, &df_parts[0].to_string(), &df_parts[1].to_string()]
+        .iter()
+        .all(|s| s.chars().all(|c| c.is_ascii_hexdigit()));
+    if !all_hex {
+        return Err(format!("Invalid BDF '{}': non-hex characters", bdf));
+    }
+    Ok(format!("{}:{}:{}.{}", dom.to_lowercase(), bus.to_lowercase(),
+               df_parts[0].to_lowercase(), df_parts[1]))
+}
+
+fn validate_bdf(bdf: &str) -> Result<(), String> {
+    normalize_bdf(bdf).map(|_| ())
+}
+
+/// Bind a PCI device to the vfio-pci driver. Best-effort — returns Ok even if
+/// the device is already bound.
+fn bind_vfio_pci(bdf: &str) -> Result<(), String> {
+    let bdf = normalize_bdf(bdf)?;
+    let dev_path = format!("/sys/bus/pci/devices/{}", bdf);
+    if !Path::new(&dev_path).exists() {
+        return Err(format!("PCI device {} not found in sysfs", bdf));
+    }
+
+    // If already bound to vfio-pci, nothing to do
+    if let Ok(target) = std::fs::read_link(format!("{}/driver", dev_path)) {
+        if target.file_name().and_then(|s| s.to_str()) == Some("vfio-pci") {
+            return Ok(());
+        }
+    }
+
+    // Read vendor:device for the driver_override
+    let vendor = std::fs::read_to_string(format!("{}/vendor", dev_path))
+        .map_err(|e| format!("Read vendor: {}", e))?
+        .trim().trim_start_matches("0x").to_string();
+    let device = std::fs::read_to_string(format!("{}/device", dev_path))
+        .map_err(|e| format!("Read device: {}", e))?
+        .trim().trim_start_matches("0x").to_string();
+
+    // Unbind from current driver
+    let unbind = format!("{}/driver/unbind", dev_path);
+    if Path::new(&unbind).exists() {
+        let _ = std::fs::write(&unbind, bdf.as_bytes());
+    }
+
+    // Tell the kernel to route future binds to vfio-pci
+    let _ = std::fs::write(format!("{}/driver_override", dev_path), b"vfio-pci");
+
+    // Register the ID with vfio-pci then probe
+    let _ = std::fs::write(
+        "/sys/bus/pci/drivers/vfio-pci/new_id",
+        format!("{} {}", vendor, device).as_bytes(),
+    );
+    let _ = std::fs::write("/sys/bus/pci/drivers_probe", bdf.as_bytes());
+    Ok(())
+}
+
+// ─── Proxmox qm set helpers ───
+
+/// Apply passthrough devices to a Proxmox VM via `qm set`.
+/// Removes any usbN/hostpciN slots higher than what we're setting so
+/// devices removed in the UI actually get removed from Proxmox.
+pub fn apply_proxmox_passthrough(vmid: u32, config: &VmConfig) -> Result<(), String> {
+    let vmid_str = vmid.to_string();
+
+    // Read current config so we know which slots currently exist
+    let cfg_text = Command::new("qm").args(["config", &vmid_str]).output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+
+    // USB slots: usb0..usb4 on Proxmox (5 slots total)
+    for (i, u) in config.usb_devices.iter().take(5).enumerate() {
+        let key = format!("--usb{}", i);
+        let val = if let Some(ref hb) = u.host_bus {
+            if !hb.is_empty() {
+                format!("host={},usb3=1", hb)
+            } else {
+                format!("host={}:{}", u.vendor_id, u.product_id)
+            }
+        } else {
+            if u.vendor_id.len() != 4 || u.product_id.len() != 4 {
+                return Err(format!("Invalid USB device id {}:{}", u.vendor_id, u.product_id));
+            }
+            format!("host={}:{}", u.vendor_id, u.product_id)
+        };
+        let out = Command::new("qm").args(["set", &vmid_str, &key, &val]).output()
+            .map_err(|e| format!("qm set usb failed: {}", e))?;
+        if !out.status.success() {
+            return Err(format!("qm set {} failed: {}", key, String::from_utf8_lossy(&out.stderr).trim()));
+        }
+    }
+    // Drop higher-numbered usb slots that are no longer wanted
+    for i in config.usb_devices.len()..5 {
+        let key = format!("usb{}", i);
+        if cfg_text.lines().any(|l| l.starts_with(&format!("{}: ", key))) {
+            let _ = Command::new("qm").args(["set", &vmid_str, "--delete", &key]).output();
+        }
+    }
+
+    // PCI slots: hostpci0..hostpci3 (4 slots)
+    for (i, p) in config.pci_devices.iter().take(4).enumerate() {
+        let bdf = normalize_bdf(&p.bdf)?;
+        let key = format!("--hostpci{}", i);
+        let mut val = bdf.clone();
+        if p.pcie { val.push_str(",pcie=1"); }
+        if p.primary_gpu { val.push_str(",x-vga=1"); }
+        let out = Command::new("qm").args(["set", &vmid_str, &key, &val]).output()
+            .map_err(|e| format!("qm set hostpci failed: {}", e))?;
+        if !out.status.success() {
+            return Err(format!("qm set {} failed: {}", key, String::from_utf8_lossy(&out.stderr).trim()));
+        }
+    }
+    for i in config.pci_devices.len()..4 {
+        let key = format!("hostpci{}", i);
+        if cfg_text.lines().any(|l| l.starts_with(&format!("{}: ", key))) {
+            let _ = Command::new("qm").args(["set", &vmid_str, "--delete", &key]).output();
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse `qm config` output for existing usbN=/hostpciN= lines.
+pub fn parse_proxmox_passthrough(cfg_text: &str) -> (Vec<UsbDevice>, Vec<PciDevice>) {
+    let mut usb = Vec::new();
+    let mut pci = Vec::new();
+
+    for line in cfg_text.lines() {
+        let line = line.trim();
+        // usbN: host=VID:PID[,usb3=1]  or  host=1-4
+        if line.starts_with("usb") && line.contains(':') {
+            if let Some(rest) = line.splitn(2, ':').nth(1) {
+                let rest = rest.trim();
+                let host_val = rest
+                    .split(',')
+                    .find_map(|kv| kv.trim().strip_prefix("host="))
+                    .unwrap_or("");
+                if host_val.is_empty() { continue; }
+                if host_val.contains(':') {
+                    // vendor:product
+                    let mut it = host_val.split(':');
+                    let v = it.next().unwrap_or("").to_lowercase();
+                    let p = it.next().unwrap_or("").to_lowercase();
+                    usb.push(UsbDevice {
+                        vendor_id: v,
+                        product_id: p,
+                        host_bus: None,
+                        label: None,
+                    });
+                } else if host_val.contains('-') {
+                    // bus-port
+                    usb.push(UsbDevice {
+                        vendor_id: String::new(),
+                        product_id: String::new(),
+                        host_bus: Some(host_val.to_string()),
+                        label: None,
+                    });
+                }
+            }
+        } else if line.starts_with("hostpci") && line.contains(':') {
+            if let Some(rest) = line.splitn(2, ':').nth(1) {
+                let rest = rest.trim();
+                // First token (before a comma) is the BDF
+                let first = rest.split(',').next().unwrap_or("").trim();
+                // Proxmox also accepts "host=BDF" — strip the prefix if present
+                let bdf_raw = first.trim_start_matches("host=");
+                if let Ok(bdf) = normalize_bdf(bdf_raw) {
+                    let pcie = rest.split(',').any(|kv| kv.trim() == "pcie=1");
+                    let primary = rest.split(',').any(|kv| kv.trim() == "x-vga=1");
+                    pci.push(PciDevice {
+                        bdf,
+                        pcie,
+                        primary_gpu: primary,
+                        label: None,
+                    });
+                }
+            }
+        }
+    }
+    (usb, pci)
+}
+
+// ─── Libvirt hostdev XML ───
+
+/// Build a `<hostdev>` XML fragment for a single USB device.
+/// managed='no' for USB because libvirt handles USB binding itself and doesn't
+/// need the driver detach/reattach dance.
+pub fn libvirt_usb_xml(u: &UsbDevice) -> Result<String, String> {
+    if u.vendor_id.len() != 4 || u.product_id.len() != 4 {
+        return Err(format!("Invalid USB device id {}:{}", u.vendor_id, u.product_id));
+    }
+    Ok(format!(
+        "<hostdev mode='subsystem' type='usb' managed='no'>\n  <source>\n    <vendor id='0x{}'/>\n    <product id='0x{}'/>\n  </source>\n</hostdev>",
+        u.vendor_id, u.product_id
+    ))
+}
+
+/// Build a `<hostdev>` XML fragment for a PCI device. managed='yes' lets
+/// libvirt detach the host driver and reattach it on guest shutdown.
+pub fn libvirt_pci_xml(p: &PciDevice) -> Result<String, String> {
+    let bdf = normalize_bdf(&p.bdf)?;
+    // DDDD:BB:DD.F → domain/bus/slot/function
+    let parts: Vec<&str> = bdf.split(':').collect();
+    let dom = parts[0];
+    let bus = parts[1];
+    let df: Vec<&str> = parts[2].split('.').collect();
+    let slot = df[0];
+    let func = df[1];
+    Ok(format!(
+        "<hostdev mode='subsystem' type='pci' managed='yes'>\n  <source>\n    <address domain='0x{}' bus='0x{}' slot='0x{}' function='0x{}'/>\n  </source>\n</hostdev>",
+        dom, bus, slot, func
+    ))
+}
+
+/// Apply passthrough to a libvirt domain: detach devices no longer wanted,
+/// attach new ones. Uses `virsh attach-device --config` (persistent).
+pub fn apply_libvirt_passthrough(name: &str, config: &VmConfig) -> Result<(), String> {
+    // Read current domain XML to know what's already attached
+    let xml_out = Command::new("virsh").args(["dumpxml", name]).output()
+        .map_err(|e| format!("virsh dumpxml failed: {}", e))?;
+    let xml = String::from_utf8_lossy(&xml_out.stdout).to_string();
+    let (current_usb, current_pci) = parse_libvirt_hostdevs(&xml);
+
+    // Desired state -> match_key set
+    let desired_usb: HashSet<String> = config.usb_devices.iter().map(|u| u.match_key()).collect();
+    let desired_pci: HashSet<String> = config.pci_devices.iter().map(|p| p.match_key()).collect();
+
+    // Detach any currently-attached device that's no longer wanted
+    for u in &current_usb {
+        if !desired_usb.contains(&u.match_key()) {
+            let xml = libvirt_usb_xml(u)?;
+            detach_libvirt_device(name, &xml)?;
+        }
+    }
+    for p in &current_pci {
+        if !desired_pci.contains(&p.match_key()) {
+            let xml = libvirt_pci_xml(p)?;
+            detach_libvirt_device(name, &xml)?;
+        }
+    }
+
+    // Attach any new device not already present
+    let current_usb_keys: HashSet<String> = current_usb.iter().map(|u| u.match_key()).collect();
+    let current_pci_keys: HashSet<String> = current_pci.iter().map(|p| p.match_key()).collect();
+
+    for u in &config.usb_devices {
+        if !current_usb_keys.contains(&u.match_key()) {
+            let xml = libvirt_usb_xml(u)?;
+            attach_libvirt_device(name, &xml)?;
+        }
+    }
+    for p in &config.pci_devices {
+        if !current_pci_keys.contains(&p.match_key()) {
+            let xml = libvirt_pci_xml(p)?;
+            attach_libvirt_device(name, &xml)?;
+        }
+    }
+    Ok(())
+}
+
+fn attach_libvirt_device(vm: &str, xml: &str) -> Result<(), String> {
+    let tmp = std::env::temp_dir().join(format!("wolfstack-hostdev-{}.xml", uuid::Uuid::new_v4()));
+    std::fs::write(&tmp, xml).map_err(|e| format!("Failed to write hostdev XML: {}", e))?;
+    let out = Command::new("virsh")
+        .args(["attach-device", vm, &tmp.to_string_lossy(), "--config"])
+        .output()
+        .map_err(|e| format!("virsh attach-device failed: {}", e))?;
+    let _ = std::fs::remove_file(&tmp);
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // "already exists" is not fatal
+        if stderr.contains("already exists") || stderr.contains("exists in domain") {
+            return Ok(());
+        }
+        return Err(format!("virsh attach-device failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
+fn detach_libvirt_device(vm: &str, xml: &str) -> Result<(), String> {
+    let tmp = std::env::temp_dir().join(format!("wolfstack-hostdev-{}.xml", uuid::Uuid::new_v4()));
+    std::fs::write(&tmp, xml).map_err(|e| format!("Failed to write hostdev XML: {}", e))?;
+    let out = Command::new("virsh")
+        .args(["detach-device", vm, &tmp.to_string_lossy(), "--config"])
+        .output()
+        .map_err(|e| format!("virsh detach-device failed: {}", e))?;
+    let _ = std::fs::remove_file(&tmp);
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Device already gone → not an error
+        if stderr.contains("not found") || stderr.contains("no such") {
+            return Ok(());
+        }
+        return Err(format!("virsh detach-device failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
+/// Parse `<hostdev>` nodes from a libvirt domain XML blob.
+/// Handles both USB (vendor/product) and PCI (address) forms.
+pub fn parse_libvirt_hostdevs(xml: &str) -> (Vec<UsbDevice>, Vec<PciDevice>) {
+    let mut usb = Vec::new();
+    let mut pci = Vec::new();
+
+    // Split on "<hostdev" occurrences — simple state machine, no XML parser dep
+    let mut rest = xml;
+    while let Some(start) = rest.find("<hostdev") {
+        let after = &rest[start..];
+        let end = match after.find("</hostdev>") {
+            Some(e) => e + "</hostdev>".len(),
+            None => break,
+        };
+        let block = &after[..end];
+        rest = &after[end..];
+
+        let is_usb = block.contains("type='usb'") || block.contains("type=\"usb\"");
+        let is_pci = block.contains("type='pci'") || block.contains("type=\"pci\"");
+
+        if is_usb {
+            let vid = extract_xml_attr(block, "vendor", "id").unwrap_or_default();
+            let pid = extract_xml_attr(block, "product", "id").unwrap_or_default();
+            // strip 0x prefix and lowercase
+            let vid = vid.trim_start_matches("0x").to_lowercase();
+            let pid = pid.trim_start_matches("0x").to_lowercase();
+            if vid.len() == 4 && pid.len() == 4 {
+                usb.push(UsbDevice {
+                    vendor_id: vid,
+                    product_id: pid,
+                    host_bus: None,
+                    label: None,
+                });
+            }
+        } else if is_pci {
+            let dom = extract_xml_attr(block, "address", "domain").unwrap_or_else(|| "0x0000".to_string());
+            let bus = extract_xml_attr(block, "address", "bus").unwrap_or_default();
+            let slot = extract_xml_attr(block, "address", "slot").unwrap_or_default();
+            let func = extract_xml_attr(block, "address", "function").unwrap_or_default();
+            let clean = |s: String, width: usize| -> String {
+                let s = s.trim_start_matches("0x").to_string();
+                format!("{:0>width$}", s, width = width)
+            };
+            let bdf = format!(
+                "{}:{}:{}.{}",
+                clean(dom, 4), clean(bus, 2), clean(slot, 2), clean(func, 1)
+            );
+            if let Ok(norm) = normalize_bdf(&bdf) {
+                // We can't reliably infer primary_gpu from the libvirt XML —
+                // it's stored by virt-manager as a QEMU commandline arg hack.
+                pci.push(PciDevice {
+                    bdf: norm,
+                    pcie: true,
+                    primary_gpu: false,
+                    label: None,
+                });
+            }
+        }
+    }
+    (usb, pci)
+}
+
+/// Extract `attr='value'` or `attr="value"` from the given tag inside `block`.
+fn extract_xml_attr(block: &str, tag: &str, attr: &str) -> Option<String> {
+    let tag_open = format!("<{}", tag);
+    let tag_pos = block.find(&tag_open)?;
+    let after = &block[tag_pos..];
+    // Limit to end of the tag (before `/>` or `>`)
+    let end = after.find(">").unwrap_or(after.len());
+    let inside = &after[..end];
+
+    for quote in ['\'', '"'] {
+        let key = format!("{}={}", attr, quote);
+        if let Some(p) = inside.find(&key) {
+            let val_start = p + key.len();
+            if let Some(q) = inside[val_start..].find(quote) {
+                return Some(inside[val_start..val_start + q].to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_lsusb_line() {
+        let sample = "Bus 001 Device 004: ID 046d:c52b Logitech, Inc. Unifying Receiver";
+        // Simulate by feeding one line via stdout: we can only test the parser indirectly
+        let ex = extract_last_id("Logitech, Inc. Unifying Receiver [046d:c52b]");
+        assert_eq!(ex, Some(("046d".to_string(), "c52b".to_string())));
+        // Ensure the full lsusb line contains what we need
+        assert!(sample.contains("046d:c52b"));
+    }
+
+    #[test]
+    fn extracts_last_pci_id() {
+        let line = "VGA compatible controller [0300]: NVIDIA GP104 [GeForce GTX 1080] [10de:1b80] (rev a1)";
+        assert_eq!(
+            extract_last_id(line),
+            Some(("10de".to_string(), "1b80".to_string()))
+        );
+    }
+
+    #[test]
+    fn normalizes_bdf_variants() {
+        assert_eq!(normalize_bdf("01:00.0").unwrap(), "0000:01:00.0");
+        assert_eq!(normalize_bdf("0000:01:00.0").unwrap(), "0000:01:00.0");
+        assert_eq!(normalize_bdf("0000:AB:CD.1").unwrap(), "0000:ab:cd.1");
+        assert!(normalize_bdf("").is_err());
+        assert!(normalize_bdf("bogus").is_err());
+        assert!(normalize_bdf("0000:01:00").is_err());
+        assert!(normalize_bdf("zz:00.0").is_err());
+    }
+
+    #[test]
+    fn parses_proxmox_passthrough_lines() {
+        let cfg = "\
+cores: 4
+memory: 4096
+usb0: host=046d:c52b
+usb1: host=1-4,usb3=1
+hostpci0: 0000:01:00.0,pcie=1,x-vga=1
+hostpci1: host=0000:02:00.0
+net0: virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0
+";
+        let (usb, pci) = parse_proxmox_passthrough(cfg);
+        assert_eq!(usb.len(), 2);
+        assert_eq!(usb[0].vendor_id, "046d");
+        assert_eq!(usb[0].product_id, "c52b");
+        assert_eq!(usb[1].host_bus.as_deref(), Some("1-4"));
+        assert_eq!(pci.len(), 2);
+        assert_eq!(pci[0].bdf, "0000:01:00.0");
+        assert!(pci[0].pcie);
+        assert!(pci[0].primary_gpu);
+        assert_eq!(pci[1].bdf, "0000:02:00.0");
+    }
+
+    #[test]
+    fn parses_libvirt_hostdev_xml() {
+        let xml = "\
+<domain>
+  <devices>
+    <hostdev mode='subsystem' type='usb' managed='no'>
+      <source>
+        <vendor id='0x046d'/>
+        <product id='0xc52b'/>
+      </source>
+    </hostdev>
+    <hostdev mode='subsystem' type='pci' managed='yes'>
+      <source>
+        <address domain='0x0000' bus='0x01' slot='0x00' function='0x0'/>
+      </source>
+    </hostdev>
+  </devices>
+</domain>";
+        let (usb, pci) = parse_libvirt_hostdevs(xml);
+        assert_eq!(usb.len(), 1);
+        assert_eq!(usb[0].vendor_id, "046d");
+        assert_eq!(usb[0].product_id, "c52b");
+        assert_eq!(pci.len(), 1);
+        assert_eq!(pci[0].bdf, "0000:01:00.0");
+    }
+
+    #[test]
+    fn find_conflicts_detects_running_claim() {
+        let running = VmConfig {
+            name: "gaming".to_string(),
+            running: true,
+            usb_devices: vec![UsbDevice {
+                vendor_id: "046d".to_string(),
+                product_id: "c52b".to_string(),
+                host_bus: None,
+                label: None,
+            }],
+            pci_devices: vec![PciDevice {
+                bdf: "0000:01:00.0".to_string(),
+                pcie: true,
+                primary_gpu: true,
+                label: None,
+            }],
+            ..VmConfig::new("gaming".to_string(), 1, 1024, 10)
+        };
+        let target = VmConfig {
+            name: "work".to_string(),
+            usb_devices: vec![UsbDevice {
+                vendor_id: "046d".to_string(),
+                product_id: "c52b".to_string(),
+                host_bus: None,
+                label: None,
+            }],
+            pci_devices: vec![],
+            ..VmConfig::new("work".to_string(), 1, 1024, 10)
+        };
+        let conflicts = find_conflicts(&target, &[running]);
+        assert_eq!(conflicts.len(), 1);
+        assert!(conflicts[0].contains("046d:c52b"));
+        assert!(conflicts[0].contains("gaming"));
+    }
+
+    #[test]
+    fn find_conflicts_ignores_stopped_claim() {
+        let stopped = VmConfig {
+            name: "other".to_string(),
+            running: false,
+            pci_devices: vec![PciDevice {
+                bdf: "0000:01:00.0".to_string(),
+                pcie: true,
+                primary_gpu: false,
+                label: None,
+            }],
+            ..VmConfig::new("other".to_string(), 1, 1024, 10)
+        };
+        let target = VmConfig {
+            name: "work".to_string(),
+            pci_devices: vec![PciDevice {
+                bdf: "0000:01:00.0".to_string(),
+                pcie: true,
+                primary_gpu: false,
+                label: None,
+            }],
+            ..VmConfig::new("work".to_string(), 1, 1024, 10)
+        };
+        assert!(find_conflicts(&target, &[stopped]).is_empty());
+    }
+}

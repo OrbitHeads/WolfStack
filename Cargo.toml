@@ -1,6 +1,6 @@
 [package]
 name = "wolfstack"
-version = "16.15.1"
+version = "16.16.0"
 edition = "2024"
 authors = ["Wolf Software Systems Ltd"]
 description = "Server management platform for the Wolf software suite"
@@ -28,7 +28,7 @@ toml = "0.8"
 tokio = { version = "1", features = ["full"] }
 
 # HTTP client for agent communication
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "rustls-tls-native-roots", "multipart", "stream"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "rustls-tls-native-roots", "multipart", "stream", "cookies"], default-features = false }
 
 # TLS
 openssl = { version = "0.10", features = ["vendored"] }
