@@ -152,9 +152,10 @@ fi
 
 # ─── Update system packages first ─────────────────────────────────────────
 # Ensures package index is in sync and avoids dependency mismatches
-# (e.g. libssl-dev requiring an older libssl3t64 than what's installed)
+# Refresh package index (needed to install dependencies) but do NOT upgrade existing packages.
+# A full system upgrade can break things, takes ages, and the user didn't ask for it.
 echo ""
-echo "Updating system packages..."
+echo "Refreshing package index..."
 if [ "$PKG_MANAGER" = "apt" ]; then
     if ! apt update -qq 2>/dev/null; then
         echo "  ⚠ Some repositories failed to update."
@@ -165,17 +166,14 @@ if [ "$PKG_MANAGER" = "apt" ]; then
         echo "      Check /etc/apt/sources.list.d/ for the problematic .list file"
         echo "    Continuing installation..."
     fi
-    apt upgrade -y -qq 2>/dev/null || true
 elif [ "$PKG_MANAGER" = "dnf" ]; then
-    dnf upgrade -y --quiet --skip-broken 2>/dev/null || true
-elif [ "$PKG_MANAGER" = "yum" ]; then
-    yum update -y -q
+    dnf makecache -q 2>/dev/null || true
 elif [ "$PKG_MANAGER" = "zypper" ]; then
-    zypper refresh -q && zypper update -y
+    zypper refresh -q 2>/dev/null || true
 elif [ "$PKG_MANAGER" = "pacman" ]; then
-    pacman -Syu --noconfirm
+    pacman -Sy --noconfirm 2>/dev/null || true
 fi
-echo "✓ System packages up to date"
+echo "✓ Package index refreshed"
 
 # ─── Detect Proxmox VE host ─────────────────────────────────────────────────
 IS_PROXMOX=false
