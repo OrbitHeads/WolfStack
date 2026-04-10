@@ -468,6 +468,23 @@ async fn main() -> std::io::Result<()> {
             }
         });
 
+        // Background: Enterprise license heartbeat (once daily)
+        // Reports server hostname, version, and cluster name to Wolf Software Systems
+        // for license compliance. Fire-and-forget — never blocks the server.
+        {
+            let hb_cluster = cluster.clone();
+            tokio::spawn(async move {
+                // Initial delay — first heartbeat 5 minutes after boot
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                loop {
+                    if crate::compat::platform_ready() {
+                        crate::compat::report_license_heartbeat(&hb_cluster).await;
+                    }
+                    tokio::time::sleep(Duration::from_secs(86400)).await; // once per day
+                }
+            });
+        }
+
         // Background: scheduled issues scan (configurable alerts + daily summary)
         let scan_state = app_state.clone();
         let scan_ai = ai_agent.clone();

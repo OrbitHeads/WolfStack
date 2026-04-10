@@ -147,6 +147,62 @@ fn cd(days: u64) -> (u64, u64, u64) {
     (y, m, d)
 }
 
+/// Report license usage to Wolf Software Systems. Called once daily by a
+/// background task. Fire-and-forget — never blocks or breaks the server.
+pub async fn report_license_heartbeat(cluster: &crate::agent::ClusterState) {
+    let dm = match load_dm() {
+        Some(d) => d,
+        None => return, // no valid license — nothing to report
+    };
+
+    // Read the raw license key so the server can match it
+    let license_key = match std::fs::read_to_string(dm_loc()) {
+        Ok(k) => k.trim().to_string(),
+        Err(_) => return,
+    };
+
+    // Self node info
+    let self_node = cluster.get_all_nodes().into_iter().find(|n| n.is_self);
+    let (node_id, hostname) = match &self_node {
+        Some(n) => (n.id.clone(), n.hostname.clone()),
+        None => return,
+    };
+
+    let cluster_name = self_node.as_ref()
+        .and_then(|n| n.cluster_name.clone())
+        .unwrap_or_else(|| "WolfStack".to_string());
+
+    // Detect OS
+    let os = std::fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("PRETTY_NAME="))
+                .map(|l| l.trim_start_matches("PRETTY_NAME=").trim_matches('"').to_string())
+        })
+        .unwrap_or_else(|| "Linux".to_string());
+
+    let payload = serde_json::json!({
+        "license_key": license_key,
+        "node_id": node_id,
+        "hostname": hostname,
+        "cluster_name": cluster_name,
+        "wolfstack_version": env!("CARGO_PKG_VERSION"),
+        "os": os,
+        "arch": std::env::consts::ARCH,
+    });
+
+    let _ = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap_or_default()
+        .post("https://wolfscale.org/adminsys/heartbeat.php")
+        .json(&payload)
+        .send()
+        .await;
+}
+
 fn ts_full() -> String {
     let s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let (y, mo, d) = cd(s / 86400);
