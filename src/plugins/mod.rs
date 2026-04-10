@@ -210,6 +210,13 @@ pub fn read_file(plugin_id: &str, file_path: &str) -> Option<Vec<u8>> {
 pub fn install_from_url(url: &str) -> Result<String, String> {
     let _ = std::fs::create_dir_all(PLUGINS_DIR);
 
+    // Stop any existing backend processes for plugins being reinstalled
+    for plugin in list() {
+        if plugin.manifest.has_backend {
+            stop_backend(&plugin.manifest.id);
+        }
+    }
+
     // Download to temp file
     let tmp = format!("/tmp/wolfstack-plugin-{}.tar.gz",
         std::time::SystemTime::now()
@@ -280,6 +287,23 @@ pub fn start_all_backends() {
             }
         }
     }
+}
+
+/// Stop a plugin's backend process (if running)
+pub fn stop_backend(id: &str) {
+    let plugin = match get(id) { Some(p) => p, None => return };
+    if !plugin.manifest.has_backend { return; }
+    let port = plugin.manifest.api_port.unwrap_or(0);
+    if port == 0 { return; }
+
+    // Kill any handler process listening on this port
+    let _ = std::process::Command::new("sh")
+        .args(["-c", &format!("fuser -k {}/tcp 2>/dev/null || pkill -f '{}/bin/handler'", port, plugin.path)])
+        .status();
+
+    // Give it a moment to die
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    tracing::info!("Stopped plugin '{}' backend (port {})", id, port);
 }
 
 /// Start a plugin's backend binary (if it has one)
