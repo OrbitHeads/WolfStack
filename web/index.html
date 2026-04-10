@@ -6706,6 +6706,12 @@ region = us-east-1"></textarea>
                             <small style="color:var(--text-muted);">Path to an OS installer ISO on the host. Windows ISOs are detected automatically.</small>
                         </div>
                         <div class="form-group" style="margin-top:12px;">
+                            <label>Import Disk Image (Optional)</label>
+                            <input type="text" class="form-control" id="new-vm-import-image"
+                                placeholder="/path/to/image.qcow2 or .img or .vmdk or .vdi">
+                            <small style="color:var(--text-muted);">Import an existing disk image instead of creating an empty disk. Supports QCOW2, IMG, VMDK, VDI, VHD. The image is converted to QCOW2 automatically.</small>
+                        </div>
+                        <div class="form-group" style="margin-top:12px;">
                             <label>VirtIO Drivers ISO (Optional)</label>
                             <input type="text" class="form-control" id="new-vm-drivers-iso"
                                 placeholder="/var/lib/wolfstack/isos/virtio-win.iso">

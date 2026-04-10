@@ -5904,6 +5904,8 @@ async function showVmCreate() {
     if (busSelect) busSelect.value = 'virtio';
     const driversInput = document.getElementById('new-vm-drivers-iso');
     if (driversInput) driversInput.value = '';
+    const importInput = document.getElementById('new-vm-import-image');
+    if (importInput) importInput.value = '';
     const netSelect = document.getElementById('new-vm-net-model');
     if (netSelect) netSelect.value = 'virtio';
     const busWarning = document.getElementById('vm-bus-warning');
@@ -6129,6 +6131,7 @@ async function createVm() {
     const osDiskBus = document.getElementById('new-vm-os-bus').value || 'virtio';
     const netModel = document.getElementById('new-vm-net-model').value || 'virtio';
     const driversIso = document.getElementById('new-vm-drivers-iso').value.trim() || null;
+    const importImage = document.getElementById('new-vm-import-image')?.value.trim() || null;
     const biosType = document.getElementById('new-vm-bios-type').value || 'seabios';
 
     if (!name) { showToast('Enter VM name', 'error'); return; }
@@ -6163,6 +6166,7 @@ async function createVm() {
                 os_disk_bus: osDiskBus,
                 net_model: netModel,
                 drivers_iso: driversIso,
+                import_image: importImage,
                 bios_type: biosType,
                 extra_disks: extraDisks,
                 extra_nics: collectExtraNics('new-vm-extra-nics')
