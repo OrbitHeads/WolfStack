@@ -985,6 +985,13 @@ fi
 
 echo "✓ wolfstack installed to /usr/local/bin/wolfstack"
 
+# ─── Install AI knowledge base ──────────────────────────────────────────────
+if [ -d "$INSTALL_DIR/knowledge" ]; then
+    mkdir -p /etc/wolfstack/knowledge
+    cp "$INSTALL_DIR/knowledge/"*.md /etc/wolfstack/knowledge/ 2>/dev/null || true
+    echo "✓ AI knowledge base installed"
+fi
+
 # ─── Install web UI ─────────────────────────────────────────────────────────
 echo ""
 echo "Installing web UI..."

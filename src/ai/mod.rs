@@ -539,7 +539,23 @@ impl AiAgent {
 fn load_knowledge_base() -> String {
     let mut knowledge = String::new();
 
-    // Try multiple locations for the wolfscale web files
+    // Load the expert knowledge base first (shipped with WolfStack)
+    let kb_paths = [
+        "/etc/wolfstack/knowledge/wolfstack-kb.md",
+        "knowledge/wolfstack-kb.md",
+        "../knowledge/wolfstack-kb.md",
+    ];
+    for kb_path in &kb_paths {
+        if let Ok(content) = std::fs::read_to_string(kb_path) {
+            if !content.trim().is_empty() {
+                knowledge.push_str(&content);
+                tracing::info!("Loaded expert knowledge base from {}", kb_path);
+                break;
+            }
+        }
+    }
+
+    // Also load wolfscale web files for additional context
     let dirs = [KNOWLEDGE_DIR, KNOWLEDGE_DIR_DEV, "wolfscale/web", "../wolfscale/web"];
     let mut found_dir = None;
 
@@ -579,9 +595,9 @@ fn load_knowledge_base() -> String {
     if knowledge.is_empty() {
         "WolfStack is a server management platform by Wolf Software Systems Ltd.".to_string()
     } else {
-        // Truncate to ~30KB to keep context lean and responses fast
-        if knowledge.len() > 30_000 {
-            knowledge.truncate(30_000);
+        // Truncate to ~60KB to keep context lean and responses fast
+        if knowledge.len() > 60_000 {
+            knowledge.truncate(60_000);
         }
         knowledge
     }
