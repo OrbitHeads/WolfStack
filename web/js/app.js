@@ -32643,6 +32643,8 @@ function renderWolfFlowProperties(step) {
                 <option value="abort" ${onFail === 'abort' ? 'selected' : ''}>Abort workflow</option>
                 <option value="continue" ${onFail === 'continue' ? 'selected' : ''}>Continue to next step</option>
                 <option value="alert" ${onFail === 'alert' ? 'selected' : ''}>Alert and continue</option>
+                <option value="notify_and_abort" ${onFail === 'notify_and_abort' ? 'selected' : ''}>Notify and abort</option>
+                <option value="notify_and_continue" ${onFail === 'notify_and_continue' ? 'selected' : ''}>Notify and continue</option>
             </select>
         </div>
 
@@ -32711,6 +32713,53 @@ function renderActionFields(actionKey, container, actionData) {
             </div>`;
         }
     }).join('');
+
+    // If this is a condition action, render available output references from previous steps
+    if (actionKey === 'condition') {
+        renderWfOutputPicker(container);
+    }
+}
+
+/** Render a clickable list of {{step_name.key}} references from previous steps */
+function renderWfOutputPicker(container) {
+    if (!container || !wfSteps || wfSelectedStepIdx <= 0) return;
+    const toolbox = wfToolboxCache || [];
+    const selectedIdx = wfSelectedStepIdx;
+
+    let refs = [];
+    for (let i = 0; i < selectedIdx; i++) {
+        const step = wfSteps[i];
+        if (!step) continue;
+        const tool = toolbox.find(t => t.action === step.action?.action);
+        const outputs = tool?.outputs || [];
+        for (const key of outputs) {
+            refs.push({ step: step.name, key, ref: `{{${step.name}.${key}}}` });
+        }
+    }
+
+    if (refs.length === 0) return;
+
+    const pickerHtml = `
+        <div style="margin-top:12px;padding:10px;background:var(--bg-tertiary);border:1px solid var(--border);border-radius:8px;">
+            <div style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase;margin-bottom:6px;">Available References (click to insert)</div>
+            ${refs.map(r => `<div class="wf-ref-item" data-ref="${escapeAttr(r.ref)}"
+                style="display:flex;justify-content:space-between;align-items:center;padding:4px 8px;margin:2px 0;border-radius:4px;cursor:pointer;font-size:11px;font-family:'JetBrains Mono',monospace;background:var(--bg-primary);border:1px solid var(--border);"
+                onmouseover="this.style.borderColor='var(--accent)'" onmouseout="this.style.borderColor='var(--border)'"
+                onclick="wfInsertRef(this.dataset.ref)">
+                <span style="color:var(--accent);">${escapeHtml(r.ref)}</span>
+                <span style="color:var(--text-muted);font-size:10px;margin-left:8px;">${escapeHtml(r.step)} → ${escapeHtml(r.key)}</span>
+            </div>`).join('')}
+        </div>`;
+    container.insertAdjacentHTML('beforeend', pickerHtml);
+}
+
+/** Insert a template reference into the expression field */
+function wfInsertRef(ref) {
+    const field = document.querySelector('.wf-action-field[data-field="expression"]');
+    if (field) {
+        field.value = ref;
+        field.focus();
+    }
 }
 
 function wfPopulateNodeCheckboxes(target) {

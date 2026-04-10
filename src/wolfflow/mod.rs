@@ -765,9 +765,19 @@ fn evaluate_condition(expression: &str, compare_to: &str, operator: &str, contex
     }
 }
 
+/// Helper: wrap a plain string result into a StepOutput with no structured data.
+fn plain_output(text: String) -> StepOutput {
+    StepOutput { text, data: serde_json::Map::new() }
+}
+
+/// Helper: build a StepOutput with structured data.
+fn structured_output(text: String, data: serde_json::Map<String, serde_json::Value>) -> StepOutput {
+    StepOutput { text, data }
+}
+
 /// Execute a single action on the local machine.
-/// Returns Ok(StepOutput) on success, Err(error_message) on failure.
-pub async fn execute_action_local(action: &ActionType) -> Result<String, String> {
+/// Returns Ok(StepOutput) with structured data on success, Err(error_message) on failure.
+pub async fn execute_action_local(action: &ActionType) -> Result<StepOutput, String> {
     match action {
         ActionType::UpdatePackages => {
             let pm = detect_package_manager();
@@ -778,7 +788,7 @@ pub async fn execute_action_local(action: &ActionType) -> Result<String, String>
                 "zypper" => ("bash", vec!["-c", "zypper refresh && zypper update -y"]),
                 _ => ("bash", vec!["-c", "apt-get update -y && apt-get upgrade -y"]),
             };
-            run_command(cmd, &args, 600).await
+            run_command(cmd, &args, 600).await.map(plain_output)
         }
 
         ActionType::UpdateWolfstack { channel } => {
@@ -786,7 +796,7 @@ pub async fn execute_action_local(action: &ActionType) -> Result<String, String>
                 "curl -sSL https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfStack/{}/setup.sh | bash",
                 channel
             );
-            run_command("bash", &["-c", &script], 600).await
+            run_command("bash", &["-c", &script], 600).await.map(plain_output)
         }
 
         ActionType::RestartService { service_name } => {
@@ -799,17 +809,17 @@ pub async fn execute_action_local(action: &ActionType) -> Result<String, String>
             {
                 return Err("Invalid service name".to_string());
             }
-            run_command("systemctl", &["restart", service_name], 60).await
+            run_command("systemctl", &["restart", service_name], 60).await.map(plain_output)
         }
 
         ActionType::RunCommand { command, timeout_secs } => {
-            run_command("bash", &["-c", command], *timeout_secs).await
+            run_command("bash", &["-c", command], *timeout_secs).await.map(plain_output)
         }
 
         ActionType::CleanLogs { max_size_mb } => {
             let size = max_size_mb.unwrap_or(500);
             let arg = format!("--vacuum-size={}M", size);
-            run_command("journalctl", &[&arg], 120).await
+            run_command("journalctl", &[&arg], 120).await.map(plain_output)
         }
 
         ActionType::CheckDiskSpace { warn_threshold_pct, mount_point } => {
@@ -832,7 +842,7 @@ pub async fn execute_action_local(action: &ActionType) -> Result<String, String>
                     }
                 }
                 if over.is_empty() {
-                    Ok(output)
+                    Ok(plain_output(output))
                 } else {
                     Err(format!("Over {}%: {}\n\n{}", threshold, over.join(", "), output))
                 }
@@ -852,7 +862,7 @@ pub async fn execute_action_local(action: &ActionType) -> Result<String, String>
                 if pct > threshold {
                     Err(format!("{}: {}% exceeds threshold {}%\n\n{}", mp, pct, threshold, output))
                 } else {
-                    Ok(output)
+                    Ok(plain_output(output))
                 }
             }
         }
@@ -864,25 +874,23 @@ pub async fn execute_action_local(action: &ActionType) -> Result<String, String>
             }
             match runtime.to_lowercase().as_str() {
                 "docker" => {
-                    run_command("docker", &["restart", name], 120).await
+                    run_command("docker", &["restart", name], 120).await.map(plain_output)
                 }
                 "lxc" => {
-                    // Stop then start for LXC
                     let stop_result = run_command("lxc-stop", &["-n", name], 60).await;
                     if let Err(e) = &stop_result {
-                        // If stop fails because it's already stopped, continue
                         if !e.contains("not running") {
                             warn!("WolfFlow: lxc-stop failed for {}: {}", name, e);
                         }
                     }
-                    run_command("lxc-start", &["-n", name], 60).await
+                    run_command("lxc-start", &["-n", name], 60).await.map(plain_output)
                 }
                 _ => Err(format!("Unknown runtime: {}", runtime)),
             }
         }
 
         ActionType::DockerPrune => {
-            run_command("docker", &["system", "prune", "-af"], 300).await
+            run_command("docker", &["system", "prune", "-af"], 300).await.map(plain_output)
         }
 
         // ─── Docker Update Check ───
@@ -905,7 +913,15 @@ pub async fn execute_action_local(action: &ActionType) -> Result<String, String>
             }
             // Parse local digest
             let local_digest = local.split('@').nth(1).unwrap_or(&local).to_string();
-            Ok(format!("Local digest for {}: {}\nRemote check requires registry API (use image watcher for full checks)", image, local_digest))
+            let mut data = serde_json::Map::new();
+            data.insert("image".to_string(), serde_json::json!(image));
+            data.insert("local_digest".to_string(), serde_json::json!(local_digest));
+            data.insert("update_available".to_string(), serde_json::json!(false));
+            data.insert("container".to_string(), serde_json::json!(container_or_image));
+            Ok(structured_output(
+                format!("Local digest for {}: {}", image, local_digest),
+                data,
+            ))
         }
 
         // ─── Docker Update ───
@@ -931,7 +947,14 @@ pub async fn execute_action_local(action: &ActionType) -> Result<String, String>
             run_command("docker", &["restart", container_name], 120).await
                 .map_err(|e| format!("Restart failed after pull: {}", e))?;
 
-            Ok(format!("Updated container '{}' with latest image '{}'", container_name, image))
+            let mut data = serde_json::Map::new();
+            data.insert("success".to_string(), serde_json::json!(true));
+            data.insert("container".to_string(), serde_json::json!(container_name));
+            data.insert("image".to_string(), serde_json::json!(image));
+            Ok(structured_output(
+                format!("Updated container '{}' with latest image '{}'", container_name, image),
+                data,
+            ))
         }
 
         // ─── Generic HTTP Request ───
@@ -981,16 +1004,32 @@ pub async fn execute_action_local(action: &ActionType) -> Result<String, String>
                 return Err(format!("HTTP {} — {}", status, resp_body.chars().take(2000).collect::<String>()));
             }
 
-            Ok(format!("HTTP {} — {} bytes\n{}", status, resp_body.len(),
-                resp_body.chars().take(5000).collect::<String>()))
+            let mut data = serde_json::Map::new();
+            data.insert("status_code".to_string(), serde_json::json!(status));
+            data.insert("response_body".to_string(), serde_json::json!(resp_body.chars().take(5000).collect::<String>()));
+            // Try to parse response as JSON for structured access
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&resp_body) {
+                data.insert("json".to_string(), parsed);
+            }
+            Ok(structured_output(
+                format!("HTTP {} — {} bytes", status, resp_body.len()),
+                data,
+            ))
         }
 
-        // ─── Condition (evaluated in the execution engine, not here) ───
+        // ─── Condition — returns structured result for branching ───
         ActionType::Condition { expression, compare_to, operator } => {
-            // The actual branching is handled in execute_workflow(). Here we just
-            // evaluate and report the result so it appears in the step output.
-            let result = evaluate_condition(expression, compare_to, operator, &WorkflowContext::default());
-            Ok(format!("Condition: '{}' {} '{}' → {}", expression, operator, compare_to, result))
+            // When called standalone (not from execute_workflow), context is empty.
+            // The real evaluation with context happens in the execution engine.
+            let mut data = serde_json::Map::new();
+            data.insert("result".to_string(), serde_json::json!(false));
+            data.insert("expression".to_string(), serde_json::json!(expression));
+            data.insert("operator".to_string(), serde_json::json!(operator));
+            data.insert("compare_to".to_string(), serde_json::json!(compare_to));
+            Ok(structured_output(
+                format!("Condition: '{}' {} '{}' (context required for evaluation)", expression, operator, compare_to),
+                data,
+            ))
         }
 
         // ─── Service-Specific HTTP wrappers ───
@@ -1026,7 +1065,7 @@ pub async fn execute_action_local(action: &ActionType) -> Result<String, String>
             Box::pin(execute_action_local(&wrapped)).await
         }
 
-        ActionType::UnifiAction { api_url, username, password, endpoint, method, body } => {
+        ActionType::UnifiAction { api_url, username, password, endpoint, method, body: body_str } => {
             // Unifi requires cookie-based login. We use a jar to manage session cookies.
             let jar = std::sync::Arc::new(reqwest::cookie::Jar::default());
             let client = reqwest::Client::builder()
@@ -1056,7 +1095,7 @@ pub async fn execute_action_local(action: &ActionType) -> Result<String, String>
                 _ => reqwest::Method::GET,
             };
             let mut req = client.request(req_method, &url);
-            if let Some(b) = body {
+            if let Some(b) = body_str {
                 req = req.header("Content-Type", "application/json").body(b.clone());
             }
             let resp = req.send().await.map_err(|e| format!("Unifi request failed: {}", e))?;
@@ -1066,16 +1105,24 @@ pub async fn execute_action_local(action: &ActionType) -> Result<String, String>
             if status >= 400 {
                 return Err(format!("Unifi HTTP {} — {}", status, resp_body.chars().take(2000).collect::<String>()));
             }
-            Ok(format!("Unifi HTTP {} — {}", status, resp_body.chars().take(5000).collect::<String>()))
+            let mut data = serde_json::Map::new();
+            data.insert("status_code".to_string(), serde_json::json!(status));
+            data.insert("response_body".to_string(), serde_json::json!(resp_body.chars().take(5000).collect::<String>()));
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&resp_body) {
+                data.insert("json".to_string(), parsed);
+            }
+            Ok(structured_output(format!("Unifi HTTP {}", status), data))
         }
 
         // ─── Integration Framework action ───
         ActionType::IntegrationAction { instance_id, operation, params } => {
-            // Delegate to the integration framework if available.
-            // The framework is wired via a global or passed state; for now return
-            // a descriptive message that the framework handles at the API layer.
-            Ok(format!("Integration action: instance={}, operation={}, params={}",
-                instance_id, operation, serde_json::to_string(params).unwrap_or_default()))
+            let mut data = serde_json::Map::new();
+            data.insert("instance_id".to_string(), serde_json::json!(instance_id));
+            data.insert("operation".to_string(), serde_json::json!(operation));
+            Ok(structured_output(
+                format!("Integration action: instance={}, operation={}", instance_id, operation),
+                data,
+            ))
         }
     }
 }
@@ -1231,11 +1278,52 @@ pub async fn execute_workflow(
         .build()
         .ok();
 
-    // TODO: convert to index-based loop to support Condition branching (on_true_step/on_false_step)
-    // and retry logic (retry_count/retry_delay_secs). Currently sequential-only.
-    for step in &workflow.steps {
-        if aborted {
-            break;
+    // Index-based execution loop with branching, context passing, and retry
+    let mut step_idx: usize = 0;
+    let mut context = WorkflowContext::default();
+    let max_runtime = if workflow.max_runtime_secs > 0 { Some(std::time::Duration::from_secs(workflow.max_runtime_secs)) } else { None };
+
+    while step_idx < workflow.steps.len() && !aborted {
+        // Check max runtime
+        if let Some(max) = max_runtime {
+            if run_start.elapsed() > max {
+                error!("WolfFlow: workflow '{}' exceeded max runtime of {}s — aborting", workflow.name, workflow.max_runtime_secs);
+                aborted = true;
+                break;
+            }
+        }
+
+        let step = &workflow.steps[step_idx];
+
+        // For Condition actions, evaluate with context and branch
+        if let ActionType::Condition { ref expression, ref compare_to, ref operator } = step.action {
+            let result = evaluate_condition(expression, compare_to, operator, &context);
+            let mut data = serde_json::Map::new();
+            data.insert("result".to_string(), serde_json::json!(result));
+            data.insert("expression_resolved".to_string(), serde_json::json!(resolve_templates(expression, &context)));
+            context.step_outputs.insert(step.name.clone(), StepOutput {
+                text: format!("Condition: {} → {}", expression, result),
+                data,
+            });
+            run.steps.push(StepResult {
+                step_name: step.name.clone(),
+                node_id: "local".to_string(),
+                node_hostname: "local".to_string(),
+                status: RunStatus::Completed,
+                output: format!("Condition '{}' {} '{}' → {}", resolve_templates(expression, &context), operator, compare_to, result),
+                started_at: Utc::now().to_rfc3339(),
+                finished_at: Utc::now().to_rfc3339(),
+                duration_ms: 0,
+            });
+            // Branch based on result
+            step_idx = if result {
+                step.on_true_step.unwrap_or(step_idx + 1)
+            } else {
+                step.on_false_step.unwrap_or(step_idx + 1)
+            };
+            run.duration_ms = run_start.elapsed().as_millis() as u64;
+            state.update_run(&run_id, run.clone());
+            continue;
         }
 
         // Determine target: step override or workflow default
@@ -1256,126 +1344,144 @@ pub async fn execute_workflow(
             });
             had_failure = true;
             match step.on_failure {
-                OnFailure::Abort | OnFailure::NotifyAndAbort => {
-                    aborted = true;
-                    break;
-                }
+                OnFailure::Abort | OnFailure::NotifyAndAbort => { aborted = true; }
                 OnFailure::Alert | OnFailure::NotifyAndContinue => {
                     error!("WolfFlow: ALERT — step '{}' failed: no target nodes", step.name);
                 }
                 OnFailure::Continue => {}
             }
+            step_idx += 1;
             continue;
         }
 
-        // Execute on each target node
-        let mut step_futures = Vec::new();
-        for (node_id, node_hostname, node_address, node_port, is_self) in &targets {
-            let action = step.action.clone();
-            let step_name = step.name.clone();
-            let node_id = node_id.clone();
-            let node_hostname = node_hostname.clone();
-            let node_address = node_address.clone();
-            let node_port = *node_port;
-            let is_self = *is_self;
-            let secret = cluster_secret.to_string();
-            let client = http_client.clone();
+        // Retry loop
+        let max_attempts = (step.retry_count + 1) as usize;
+        let mut step_succeeded = false;
 
-            step_futures.push(tokio::spawn(async move {
-                let step_start = std::time::Instant::now();
-                let started = Utc::now().to_rfc3339();
-
-                let result = if is_self {
-                    // Execute locally
-                    execute_action_local(&action).await
-                } else {
-                    // Execute remotely via API
-                    execute_action_remote(
-                        &client,
-                        &node_address,
-                        node_port,
-                        &secret,
-                        &action,
-                    )
-                    .await
-                };
-
-                let elapsed = step_start.elapsed().as_millis() as u64;
-                let finished = Utc::now().to_rfc3339();
-
-                match result {
-                    Ok(output) => StepResult {
-                        step_name,
-                        node_id,
-                        node_hostname,
-                        status: RunStatus::Completed,
-                        output: output.chars().take(5000).collect(),
-                        started_at: started,
-                        finished_at: finished,
-                        duration_ms: elapsed,
-                    },
-                    Err(err) => StepResult {
-                        step_name,
-                        node_id,
-                        node_hostname,
-                        status: RunStatus::Failed,
-                        output: err.chars().take(5000).collect(),
-                        started_at: started,
-                        finished_at: finished,
-                        duration_ms: elapsed,
-                    },
-                }
-            }));
-        }
-
-        // Collect results from all nodes for this step
-        let mut step_had_failure = false;
-        for future in step_futures {
-            match future.await {
-                Ok(result) => {
-                    if result.status == RunStatus::Failed {
-                        step_had_failure = true;
-                        had_failure = true;
-                    }
-                    run.steps.push(result);
-                }
-                Err(e) => {
-                    // Task panicked or was cancelled
-                    step_had_failure = true;
-                    had_failure = true;
-                    run.steps.push(StepResult {
-                        step_name: step.name.clone(),
-                        node_id: "unknown".to_string(),
-                        node_hostname: "unknown".to_string(),
-                        status: RunStatus::Failed,
-                        output: format!("Task error: {}", e),
-                        started_at: Utc::now().to_rfc3339(),
-                        finished_at: Utc::now().to_rfc3339(),
-                        duration_ms: 0,
-                    });
+        for attempt in 0..max_attempts {
+            if attempt > 0 {
+                info!("WolfFlow: retrying step '{}' (attempt {}/{})", step.name, attempt + 1, max_attempts);
+                if step.retry_delay_secs > 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(step.retry_delay_secs)).await;
                 }
             }
-        }
 
-        // Handle failure policy
-        if step_had_failure {
-            match step.on_failure {
-                OnFailure::Abort => {
-                    error!("WolfFlow: step '{}' failed — aborting workflow '{}'", step.name, workflow.name);
-                    aborted = true;
+            // Execute on each target node in parallel
+            let mut step_futures = Vec::new();
+            for (node_id, node_hostname, node_address, node_port, is_self) in &targets {
+                let action = step.action.clone();
+                let step_name = step.name.clone();
+                let node_id = node_id.clone();
+                let node_hostname = node_hostname.clone();
+                let node_address = node_address.clone();
+                let node_port = *node_port;
+                let is_self = *is_self;
+                let secret = cluster_secret.to_string();
+                let client = http_client.clone();
+
+                step_futures.push(tokio::spawn(async move {
+                    let step_start = std::time::Instant::now();
+                    let started = Utc::now().to_rfc3339();
+
+                    let result = if is_self {
+                        execute_action_local(&action).await
+                    } else {
+                        execute_action_remote(&client, &node_address, node_port, &secret, &action).await
+                    };
+
+                    let elapsed = step_start.elapsed().as_millis() as u64;
+                    let finished = Utc::now().to_rfc3339();
+
+                    match result {
+                        Ok(output) => (StepResult {
+                            step_name,
+                            node_id,
+                            node_hostname,
+                            status: RunStatus::Completed,
+                            output: output.text.chars().take(5000).collect(),
+                            started_at: started,
+                            finished_at: finished,
+                            duration_ms: elapsed,
+                        }, Some(output)),
+                        Err(err) => (StepResult {
+                            step_name,
+                            node_id,
+                            node_hostname,
+                            status: RunStatus::Failed,
+                            output: err.chars().take(5000).collect(),
+                            started_at: started,
+                            finished_at: finished,
+                            duration_ms: elapsed,
+                        }, None),
+                    }
+                }));
+            }
+
+            // Collect results
+            let mut step_had_failure = false;
+            let mut last_output: Option<StepOutput> = None;
+            // Clear previous attempt's results for this step
+            if attempt > 0 {
+                run.steps.retain(|r| r.step_name != step.name);
+            }
+
+            for future in step_futures {
+                match future.await {
+                    Ok((result, output)) => {
+                        if result.status == RunStatus::Failed {
+                            step_had_failure = true;
+                        }
+                        if let Some(o) = output {
+                            last_output = Some(o);
+                        }
+                        run.steps.push(result);
+                    }
+                    Err(e) => {
+                        step_had_failure = true;
+                        run.steps.push(StepResult {
+                            step_name: step.name.clone(),
+                            node_id: "unknown".to_string(),
+                            node_hostname: "unknown".to_string(),
+                            status: RunStatus::Failed,
+                            output: format!("Task error: {}", e),
+                            started_at: Utc::now().to_rfc3339(),
+                            finished_at: Utc::now().to_rfc3339(),
+                            duration_ms: 0,
+                        });
+                    }
                 }
-                OnFailure::Alert => {
-                    error!("WolfFlow: ALERT — step '{}' failed in workflow '{}'", step.name, workflow.name);
+            }
+
+            if !step_had_failure {
+                step_succeeded = true;
+                // Store output in context for downstream template references
+                if let Some(output) = last_output {
+                    context.step_outputs.insert(step.name.clone(), output);
                 }
-                OnFailure::Continue => {
-                    warn!("WolfFlow: step '{}' failed — continuing workflow '{}'", step.name, workflow.name);
-                }
-                OnFailure::NotifyAndAbort => {
-                    error!("WolfFlow: step '{}' failed — notifying and aborting workflow '{}'", step.name, workflow.name);
-                    aborted = true;
-                }
-                OnFailure::NotifyAndContinue => {
-                    warn!("WolfFlow: step '{}' failed — notifying and continuing workflow '{}'", step.name, workflow.name);
+                break; // Success — no more retries needed
+            }
+
+            // Last attempt failed — don't retry
+            if attempt == max_attempts - 1 {
+                had_failure = true;
+                match step.on_failure {
+                    OnFailure::Abort => {
+                        error!("WolfFlow: step '{}' failed — aborting workflow '{}'", step.name, workflow.name);
+                        aborted = true;
+                    }
+                    OnFailure::Alert => {
+                        error!("WolfFlow: ALERT — step '{}' failed in workflow '{}'", step.name, workflow.name);
+                    }
+                    OnFailure::Continue => {
+                        warn!("WolfFlow: step '{}' failed — continuing workflow '{}'", step.name, workflow.name);
+                    }
+                    OnFailure::NotifyAndAbort => {
+                        error!("WolfFlow: step '{}' failed — notifying and aborting workflow '{}'", step.name, workflow.name);
+                        aborted = true;
+                    }
+                    OnFailure::NotifyAndContinue => {
+                        warn!("WolfFlow: step '{}' failed — notifying and continuing workflow '{}'", step.name, workflow.name);
+                    }
                 }
             }
         }
@@ -1383,6 +1489,7 @@ pub async fn execute_workflow(
         // Update run in-progress
         run.duration_ms = run_start.elapsed().as_millis() as u64;
         state.update_run(&run_id, run.clone());
+        step_idx += 1;
     }
 
     // Determine final status
@@ -1455,7 +1562,7 @@ async fn execute_action_remote(
     port: u16,
     secret: &str,
     action: &ActionType,
-) -> Result<String, String> {
+) -> Result<StepOutput, String> {
     let client = client.as_ref().ok_or_else(|| "HTTP client not available".to_string())?;
 
     let urls = crate::api::build_node_urls(address, port, "/api/wolfflow/exec");
@@ -1480,19 +1587,24 @@ async fn execute_action_remote(
                     if let Some(error) = result.get("error").and_then(|e| e.as_str()) {
                         return Err(error.to_string());
                     }
-                    let output = result
+                    let text = result
                         .get("output")
                         .and_then(|o| o.as_str())
                         .unwrap_or("OK")
                         .to_string();
-                    return Ok(output);
+                    // Parse structured data if present in the response
+                    let data = result.get("data")
+                        .and_then(|d| d.as_object())
+                        .cloned()
+                        .unwrap_or_default();
+                    return Ok(StepOutput { text, data });
                 } else {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
                     return Err(format!("Remote node returned {}: {}", status, body));
                 }
             }
-            Err(_) => continue, // Try next URL variant
+            Err(_) => continue,
         }
     }
 
@@ -1587,7 +1699,8 @@ pub fn toolbox_actions() -> serde_json::Value {
             "category": "docker",
             "fields": [
                 { "name": "container_or_image", "label": "Container / Image", "type": "text", "required": true, "placeholder": "nginx or myapp:latest" }
-            ]
+            ],
+            "outputs": ["image", "local_digest", "update_available", "container"]
         },
         {
             "action": "docker_update",
@@ -1598,7 +1711,8 @@ pub fn toolbox_actions() -> serde_json::Value {
             "fields": [
                 { "name": "container_name", "label": "Container Name", "type": "text", "required": true },
                 { "name": "backup_first", "label": "Backup Before Update", "type": "checkbox", "default": true }
-            ]
+            ],
+            "outputs": ["success", "container", "image"]
         },
         {
             "action": "http_request",
@@ -1613,7 +1727,8 @@ pub fn toolbox_actions() -> serde_json::Value {
                 { "name": "body", "label": "Request Body", "type": "textarea", "placeholder": "{\"key\": \"value\"}" },
                 { "name": "timeout_secs", "label": "Timeout (seconds)", "type": "number", "default": 300 },
                 { "name": "fail_on_error", "label": "Fail on HTTP Error", "type": "checkbox", "default": true }
-            ]
+            ],
+            "outputs": ["status_code", "response_body", "json"]
         },
         {
             "action": "condition",
@@ -1625,7 +1740,8 @@ pub fn toolbox_actions() -> serde_json::Value {
                 { "name": "expression", "label": "Value / Expression", "type": "text", "required": true, "placeholder": "{{Docker Check.update_available}}" },
                 { "name": "operator", "label": "Operator", "type": "select", "options": ["eq","neq","gt","lt","gte","lte","contains","truthy"], "default": "eq" },
                 { "name": "compare_to", "label": "Compare To", "type": "text", "placeholder": "true" }
-            ]
+            ],
+            "outputs": ["result"]
         },
         {
             "action": "netbird_action",
@@ -1639,7 +1755,8 @@ pub fn toolbox_actions() -> serde_json::Value {
                 { "name": "endpoint", "label": "Endpoint", "type": "select", "options": ["/api/peers","/api/routes","/api/groups","/api/users","/api/dns/nameservers"], "default": "/api/peers" },
                 { "name": "method", "label": "Method", "type": "select", "options": ["GET","POST","PUT","DELETE"], "default": "GET" },
                 { "name": "body", "label": "Request Body", "type": "textarea" }
-            ]
+            ],
+            "outputs": ["status_code", "response_body", "json"]
         },
         {
             "action": "truenas_action",
@@ -1653,7 +1770,8 @@ pub fn toolbox_actions() -> serde_json::Value {
                 { "name": "endpoint", "label": "Endpoint", "type": "select", "options": ["/api/v2.0/pool","/api/v2.0/pool/dataset","/api/v2.0/sharing/smb","/api/v2.0/sharing/nfs","/api/v2.0/system/info","/api/v2.0/system/alert/list"], "default": "/api/v2.0/pool" },
                 { "name": "method", "label": "Method", "type": "select", "options": ["GET","POST","PUT","DELETE"], "default": "GET" },
                 { "name": "body", "label": "Request Body", "type": "textarea" }
-            ]
+            ],
+            "outputs": ["status_code", "response_body", "json"]
         },
         {
             "action": "unifi_action",
