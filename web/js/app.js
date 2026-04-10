@@ -3271,6 +3271,8 @@ async function loadVms() {
         if (handleAuthError(resp)) return;
         const vms = await resp.json();
         renderVms(vms);
+        renderVmCards(vms);
+        applyContainerView('vms');
     } catch (e) {
         console.error('Failed to load VMs:', e);
         showToast('Failed to load VMs', 'error');
@@ -11423,6 +11425,8 @@ async function loadDockerContainers() {
         stats.forEach(s => { dockerStats[s.name] = s; });
 
         renderDockerContainers(containers);
+        renderDockerCards(containers);
+        applyContainerView('docker');
         renderDockerStats(stats);
         // Load images only on initial page load (not on every poll)
         try {
@@ -11459,8 +11463,153 @@ async function refreshDockerStats() {
         dockerStats = {};
         stats.forEach(s => { dockerStats[s.name] = s; });
         renderDockerContainers(containers);
+        renderDockerCards(containers);
+        applyContainerView('docker');
         renderDockerStats(stats);
     } catch (e) { /* silent */ }
+}
+
+// ─── Card/Table View Toggle System ───
+
+function getContainerView(type) {
+    return localStorage.getItem(`wolfstack_view_${type}`) || 'table';
+}
+
+function setContainerView(type, view) {
+    localStorage.setItem(`wolfstack_view_${type}`, view);
+    applyContainerView(type);
+    // Re-render the current data
+    if (type === 'docker') loadDockerContainers();
+    else if (type === 'lxc') loadLxcContainers();
+    else if (type === 'vms') loadVms();
+}
+
+function applyContainerView(type) {
+    const view = getContainerView(type);
+    const table = document.getElementById(`${type}-table-view`);
+    const grid = document.getElementById(`${type}-card-grid`);
+    if (table) table.style.display = view === 'table' ? '' : 'none';
+    if (grid) grid.style.display = view === 'card' ? 'grid' : 'none';
+    // Update toggle button styling
+    const toggle = document.getElementById(`${type}-view-toggle`);
+    if (toggle) {
+        toggle.querySelectorAll('.view-toggle-btn').forEach(btn => {
+            const isActive = btn.dataset.view === view;
+            btn.style.background = isActive ? 'var(--accent)' : 'none';
+            btn.style.color = isActive ? '#fff' : 'var(--text-muted)';
+        });
+    }
+}
+
+function renderDockerCards(containers) {
+    const grid = document.getElementById('docker-card-grid');
+    if (!grid) return;
+    if (containers.length === 0) { grid.innerHTML = ''; return; }
+    grid.innerHTML = containers.map(c => {
+        const s = dockerStats[c.name] || {};
+        const isRunning = c.state === 'running';
+        const borderColor = isRunning ? '#10b981' : c.state === 'paused' ? '#f59e0b' : '#6b7280';
+        const cpuPct = s.cpu_percent !== undefined ? s.cpu_percent.toFixed(1) : '-';
+        const memStr = s.memory_usage ? formatBytes(s.memory_usage) : '-';
+        return `<div style="background:var(--bg-card);border:1px solid var(--border);border-left:3px solid ${borderColor};border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:8px;">
+            <div style="display:flex;justify-content:space-between;align-items:start;">
+                <div>
+                    <div style="font-weight:700;font-size:14px;">${escapeHtml(c.name)}</div>
+                    <div style="font-size:11px;color:var(--text-muted);margin-top:2px;">${escapeHtml(c.image)}</div>
+                </div>
+                <span style="font-size:10px;padding:2px 8px;border-radius:4px;background:${borderColor}22;color:${borderColor};font-weight:600;">${c.state}</span>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:11px;color:var(--text-muted);">
+                <span>⚡ CPU: ${cpuPct}%</span>
+                <span>🧠 RAM: ${memStr}</span>
+                <span>🌐 ${c.ip_address || '-'}</span>
+                <span>🔌 ${c.ports.length > 0 ? c.ports[0] : '-'}</span>
+            </div>
+            <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:auto;">
+                ${isRunning ? `
+                    <button class="btn btn-sm" onclick="dockerAction('${c.name}','stop',this)" style="font-size:11px;padding:3px 8px;">⏹ Stop</button>
+                    <button class="btn btn-sm" onclick="dockerAction('${c.name}','restart',this)" style="font-size:11px;padding:3px 8px;">🔄 Restart</button>
+                    <button class="btn btn-sm" onclick="openConsole('docker','${c.name}')" style="font-size:11px;padding:3px 8px;">💻 Console</button>
+                ` : `
+                    <button class="btn btn-sm" onclick="dockerAction('${c.name}','start',this)" style="font-size:11px;padding:3px 8px;">▶ Start</button>
+                    <button class="btn btn-sm" onclick="dockerAction('${c.name}','remove',this)" style="font-size:11px;padding:3px 8px;color:#ef4444;">🗑 Remove</button>
+                `}
+                <button class="btn btn-sm" onclick="viewContainerLogs('docker','${c.name}')" style="font-size:11px;padding:3px 8px;">📜</button>
+                <button class="btn btn-sm" onclick="openDockerSettings('${c.name}')" style="font-size:11px;padding:3px 8px;">⚙️</button>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+function renderLxcCards(containers) {
+    const grid = document.getElementById('lxc-card-grid');
+    if (!grid) return;
+    if (containers.length === 0) { grid.innerHTML = ''; return; }
+    grid.innerHTML = containers.map(c => {
+        const isRunning = c.state === 'RUNNING';
+        const borderColor = isRunning ? '#10b981' : '#6b7280';
+        return `<div style="background:var(--bg-card);border:1px solid var(--border);border-left:3px solid ${borderColor};border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:8px;">
+            <div style="display:flex;justify-content:space-between;align-items:start;">
+                <div>
+                    <div style="font-weight:700;font-size:14px;">${escapeHtml(c.name)}</div>
+                    <div style="font-size:11px;color:var(--text-muted);margin-top:2px;">${escapeHtml(c.version || '')}</div>
+                </div>
+                <span style="font-size:10px;padding:2px 8px;border-radius:4px;background:${borderColor}22;color:${borderColor};font-weight:600;">${c.state}</span>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:11px;color:var(--text-muted);">
+                <span>🌐 ${c.ip || '-'}</span>
+                <span>🔄 Autostart: ${c.autostart ? 'On' : 'Off'}</span>
+            </div>
+            <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:auto;">
+                ${isRunning ? `
+                    <button class="btn btn-sm" onclick="lxcAction('${c.name}','stop',this)" style="font-size:11px;padding:3px 8px;">⏹ Stop</button>
+                    <button class="btn btn-sm" onclick="lxcAction('${c.name}','restart',this)" style="font-size:11px;padding:3px 8px;">🔄 Restart</button>
+                    <button class="btn btn-sm" onclick="openConsole('lxc','${c.name}')" style="font-size:11px;padding:3px 8px;">💻 Console</button>
+                ` : `
+                    <button class="btn btn-sm" onclick="lxcAction('${c.name}','start',this)" style="font-size:11px;padding:3px 8px;">▶ Start</button>
+                    <button class="btn btn-sm" onclick="deleteLxc('${c.name}')" style="font-size:11px;padding:3px 8px;color:#ef4444;">🗑 Delete</button>
+                `}
+                <button class="btn btn-sm" onclick="viewContainerLogs('lxc','${c.name}')" style="font-size:11px;padding:3px 8px;">📜</button>
+                <button class="btn btn-sm" onclick="browseContainerFiles('lxc','${c.name}')" style="font-size:11px;padding:3px 8px;">📂</button>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+function renderVmCards(vms) {
+    const grid = document.getElementById('vms-card-grid');
+    if (!grid) return;
+    if (vms.length === 0) { grid.innerHTML = ''; return; }
+    grid.innerHTML = vms.map(vm => {
+        const isRunning = vm.running;
+        const borderColor = isRunning ? '#10b981' : '#6b7280';
+        return `<div style="background:var(--bg-card);border:1px solid var(--border);border-left:3px solid ${borderColor};border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:8px;">
+            <div style="display:flex;justify-content:space-between;align-items:start;">
+                <div>
+                    <div style="font-weight:700;font-size:14px;">${escapeHtml(vm.name)}</div>
+                    <div style="font-size:11px;color:var(--text-muted);margin-top:2px;">${vm.bios_type === 'ovmf' ? 'UEFI' : 'BIOS'} · ${vm.os_disk_bus}</div>
+                </div>
+                <span style="font-size:10px;padding:2px 8px;border-radius:4px;background:${borderColor}22;color:${borderColor};font-weight:600;">${isRunning ? 'Running' : 'Stopped'}</span>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:11px;color:var(--text-muted);">
+                <span>⚡ ${vm.cpus} vCPU</span>
+                <span>🧠 ${vm.memory_mb}MB</span>
+                <span>💾 ${vm.disk_size_gb}GB</span>
+                <span>🌐 ${vm.wolfnet_ip || '-'}</span>
+            </div>
+            <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:auto;">
+                ${isRunning ? `
+                    <button class="btn btn-sm" onclick="vmAction('${vm.name}','stop',this)" style="font-size:11px;padding:3px 8px;">⏹ Stop</button>
+                    ${vm.vnc_ws_port ? `<button class="btn btn-sm" onclick="openVnc('${vm.name}',${vm.vnc_ws_port})" style="font-size:11px;padding:3px 8px;">🖥 VNC</button>` : ''}
+                ` : `
+                    <button class="btn btn-sm" onclick="vmAction('${vm.name}','start',this)" style="font-size:11px;padding:3px 8px;">▶ Start</button>
+                    <button class="btn btn-sm" onclick="deleteVm('${vm.name}')" style="font-size:11px;padding:3px 8px;color:#ef4444;">🗑 Delete</button>
+                `}
+                <button class="btn btn-sm" onclick="showVmSettings('${vm.name}')" style="font-size:11px;padding:3px 8px;">⚙️ Settings</button>
+                <button class="btn btn-sm" onclick="showVmLogs('${vm.name}')" style="font-size:11px;padding:3px 8px;">📜</button>
+            </div>
+        </div>`;
+    }).join('');
 }
 
 function renderDockerContainers(containers) {
@@ -12125,6 +12274,8 @@ async function loadLxcContainers() {
         stats.forEach(s => { lxcStats[s.name] = s; });
 
         renderLxcContainers(containers, lxcStats);
+        renderLxcCards(containers);
+        applyContainerView('lxc');
         applyUpdateBadges();
         // Fire update summary check in background — don't block page render
         fetchContainerUpdateSummary();

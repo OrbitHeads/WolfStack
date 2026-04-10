@@ -91,6 +91,9 @@
         }
         .bm-icon-opt:hover { border-color: var(--text-muted); }
         .bm-icon-opt.selected { border-color: var(--accent); background: var(--accent-glow); }
+        @media (max-width: 1200px) { #docker-card-grid, #lxc-card-grid, #vms-card-grid { grid-template-columns: repeat(3, 1fr) !important; } }
+        @media (max-width: 900px) { #docker-card-grid, #lxc-card-grid, #vms-card-grid { grid-template-columns: repeat(2, 1fr) !important; } }
+        @media (max-width: 600px) { #docker-card-grid, #lxc-card-grid, #vms-card-grid { grid-template-columns: 1fr !important; } }
     </style>
 </head>
 
@@ -3278,11 +3281,18 @@
             <div class="card">
                 <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
                     <h3>Docker Containers</h3>
-                    <button class="btn btn-sm btn-primary" onclick="showDockerCreate()" style="font-size:12px;">+
-                        Create Container</button>
+                    <div style="display:flex;gap:8px;align-items:center;">
+                        <div id="docker-view-toggle" style="display:flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;">
+                            <button onclick="setContainerView('docker','table')" class="view-toggle-btn" data-view="table" style="padding:4px 8px;border:none;background:none;cursor:pointer;font-size:14px;" title="Table view">☰</button>
+                            <button onclick="setContainerView('docker','card')" class="view-toggle-btn" data-view="card" style="padding:4px 8px;border:none;background:none;cursor:pointer;font-size:14px;" title="Card view">▦</button>
+                        </div>
+                        <button class="btn btn-sm btn-primary" onclick="showDockerCreate()" style="font-size:12px;">+
+                            Create Container</button>
+                    </div>
                 </div>
                 <div class="card-body">
-                    <table class="data-table">
+                    <div id="docker-card-grid" style="display:none;grid-template-columns:repeat(4,1fr);gap:12px;"></div>
+                    <table class="data-table" id="docker-table-view">
                         <thead>
                             <tr>
                                 <th>Name</th>
@@ -3498,7 +3508,11 @@
             <div class="card">
                 <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
                     <h3>LXC Containers</h3>
-                    <div style="display:flex; gap:8px;">
+                    <div style="display:flex; gap:8px; align-items:center;">
+                        <div id="lxc-view-toggle" style="display:flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;">
+                            <button onclick="setContainerView('lxc','table')" class="view-toggle-btn" data-view="table" style="padding:4px 8px;border:none;background:none;cursor:pointer;font-size:14px;" title="Table view">☰</button>
+                            <button onclick="setContainerView('lxc','card')" class="view-toggle-btn" data-view="card" style="padding:4px 8px;border:none;background:none;cursor:pointer;font-size:14px;" title="Card view">▦</button>
+                        </div>
                         <button class="btn btn-sm" onclick="generateTransferToken()"
                             style="font-size:12px; background:var(--bg-tertiary); color:var(--text-primary); border:1px solid var(--border);">🔑
                             Import Token</button>
@@ -3507,7 +3521,8 @@
                     </div>
                 </div>
                 <div class="card-body">
-                    <table class="data-table">
+                    <div id="lxc-card-grid" style="display:none;grid-template-columns:repeat(4,1fr);gap:12px;"></div>
+                    <table class="data-table" id="lxc-table-view">
                         <thead>
                             <tr>
                                 <th>Name</th>
@@ -3554,13 +3569,18 @@
             <div class="card">
                 <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
                     <h3>Virtual Machines (KVM/QEMU)</h3>
-                    <div style="display:flex; gap:6px;">
+                    <div style="display:flex; gap:6px; align-items:center;">
+                        <div id="vms-view-toggle" style="display:flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;">
+                            <button onclick="setContainerView('vms','table')" class="view-toggle-btn" data-view="table" style="padding:4px 8px;border:none;background:none;cursor:pointer;font-size:14px;" title="Table view">☰</button>
+                            <button onclick="setContainerView('vms','card')" class="view-toggle-btn" data-view="card" style="padding:4px 8px;border:none;background:none;cursor:pointer;font-size:14px;" title="Card view">▦</button>
+                        </div>
                         <button class="btn btn-sm" onclick="discoverLibvirtVms()" title="Adopt existing libvirt/QEMU VMs">Adopt VMs</button>
                         <button class="btn btn-sm btn-primary" onclick="showVmCreate()">+ Create VM</button>
                     </div>
                 </div>
                 <div class="card-body">
-                    <table class="data-table">
+                    <div id="vms-card-grid" style="display:none;grid-template-columns:repeat(4,1fr);gap:12px;"></div>
+                    <table class="data-table" id="vms-table-view">
                         <thead>
                             <tr>
                                 <th>Name</th>
