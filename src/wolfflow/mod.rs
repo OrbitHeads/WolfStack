@@ -826,44 +826,57 @@ pub async fn execute_action_local(action: &ActionType) -> Result<StepOutput, Str
             let threshold = warn_threshold_pct.unwrap_or(90);
             let mp = mount_point.as_deref().unwrap_or("all");
 
-            if mp == "all" || mp.is_empty() {
-                // Run df -h excluding network filesystems (NFS/CIFS can hang)
-                let output = run_command("df", &["-h", "-x", "nfs", "-x", "nfs4", "-x", "cifs", "-x", "sshfs", "-x", "fuse.sshfs"], 10).await?;
-                // Quick scan for any partition over threshold
-                let mut over = Vec::new();
-                for line in output.lines().skip(1) {
-                    let fields: Vec<&str> = line.split_whitespace().collect();
-                    if fields.len() >= 6 {
-                        if let Ok(pct) = fields[4].trim_end_matches('%').parse::<u32>() {
-                            if pct > threshold {
-                                over.push(format!("{} at {}%", fields[5], pct));
-                            }
-                        }
-                    }
-                }
-                if over.is_empty() {
-                    Ok(plain_output(output))
-                } else {
-                    Err(format!("Over {}%: {}\n\n{}", threshold, over.join(", "), output))
-                }
+            // Use df -BG for parseable gigabyte values + df -h for human-readable display
+            let human_output = run_command("df", &["-h", "-x", "nfs", "-x", "nfs4", "-x", "cifs", "-x", "sshfs", "-x", "fuse.sshfs"], 10).await?;
+            let gb_output = if mp == "all" || mp.is_empty() {
+                run_command("df", &["-BG", "-x", "nfs", "-x", "nfs4", "-x", "cifs", "-x", "sshfs", "-x", "fuse.sshfs"], 10).await?
             } else {
-                // Check specific mount point
-                let output = run_command("df", &["-h", mp], 10).await?;
-                let lines: Vec<&str> = output.lines().collect();
-                if lines.len() < 2 {
-                    return Err(format!("Mount point '{}' not found", mp));
-                }
-                let fields: Vec<&str> = lines[1].split_whitespace().collect();
-                if fields.len() < 5 {
-                    return Err("Unexpected df output format".to_string());
-                }
-                let pct_str = fields[4].trim_end_matches('%');
-                let pct: u32 = pct_str.parse().map_err(|_| "Could not parse disk usage".to_string())?;
-                if pct > threshold {
-                    Err(format!("{}: {}% exceeds threshold {}%\n\n{}", mp, pct, threshold, output))
+                run_command("df", &["-BG", mp], 10).await?
+            };
+
+            // Parse structured data from df -BG output
+            // Format: Filesystem  1G-blocks  Used  Available  Use%  Mounted
+            let mut data = serde_json::Map::new();
+            let mut over = Vec::new();
+            let mut root_avail: u64 = 0;
+            let mut root_total: u64 = 0;
+            let mut root_pct: u32 = 0;
+
+            for line in gb_output.lines().skip(1) {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                if fields.len() < 6 { continue; }
+                let mount = fields[5];
+                let total: u64 = fields[1].trim_end_matches('G').parse().unwrap_or(0);
+                let avail: u64 = fields[3].trim_end_matches('G').parse().unwrap_or(0);
+                let pct: u32 = fields[4].trim_end_matches('%').parse().unwrap_or(0);
+
+                // Track the target mount (or "/" for "all" mode)
+                let is_target = if mp == "all" || mp.is_empty() {
+                    mount == "/"
                 } else {
-                    Ok(plain_output(output))
+                    mount == mp
+                };
+                if is_target {
+                    root_avail = avail;
+                    root_total = total;
+                    root_pct = pct;
                 }
+                if pct > threshold {
+                    over.push(format!("{} at {}%", mount, pct));
+                }
+            }
+
+            data.insert("available_gb".to_string(), serde_json::json!(root_avail));
+            data.insert("total_gb".to_string(), serde_json::json!(root_total));
+            data.insert("usage_pct".to_string(), serde_json::json!(root_pct));
+            data.insert("mount_point".to_string(), serde_json::json!(if mp == "all" || mp.is_empty() { "/" } else { mp }));
+            data.insert("over_threshold".to_string(), serde_json::json!(!over.is_empty()));
+
+            if over.is_empty() {
+                Ok(structured_output(human_output, data))
+            } else {
+                // Still return structured data even on failure so conditions can use it
+                Err(format!("Over {}%: {}\n\n{}", threshold, over.join(", "), human_output))
             }
         }
 
@@ -1618,89 +1631,42 @@ async fn execute_action_remote(
 /// Returns a JSON array describing each action type's form fields
 /// for the frontend workflow builder UI.
 pub fn toolbox_actions() -> serde_json::Value {
+    // Sorted alphabetically by label for the frontend toolbox sidebar
     serde_json::json!([
         {
-            "action": "update_packages",
-            "label": "Update System Packages",
-            "description": "Run the system package manager to update and upgrade all packages",
-            "icon": "fa-arrow-up",
-            "fields": []
-        },
-        {
-            "action": "update_wolfstack",
-            "label": "Update WolfStack",
-            "description": "Pull and install the latest WolfStack build from a given channel",
-            "icon": "fa-download",
+            "action": "check_disk_space",
+            "label": "Check Disk Space",
+            "description": "Check disk usage and return available_gb, total_gb, usage_pct for use in conditions",
+            "icon": "fa-hard-drive",
+            "category": "system",
             "fields": [
-                { "name": "channel", "label": "Channel", "type": "text", "default": "master", "placeholder": "master" }
-            ]
-        },
-        {
-            "action": "restart_service",
-            "label": "Restart Systemd Service",
-            "description": "Restart a systemd service by name",
-            "icon": "fa-rotate",
-            "fields": [
-                { "name": "service_name", "label": "Service Name", "type": "text", "required": true, "placeholder": "nginx" }
-            ]
-        },
-        {
-            "action": "run_command",
-            "label": "Run Shell Command",
-            "description": "Execute an arbitrary shell command with a timeout",
-            "icon": "fa-terminal",
-            "fields": [
-                { "name": "command", "label": "Command", "type": "textarea", "required": true, "placeholder": "echo hello" },
-                { "name": "timeout_secs", "label": "Timeout (seconds)", "type": "number", "default": 300 }
-            ]
+                { "name": "warn_threshold_pct", "label": "Threshold (%)", "type": "number", "default": 90, "placeholder": "90" },
+                { "name": "mount_point", "label": "Mount Point", "type": "text", "placeholder": "/ or /var or all (default: all)" }
+            ],
+            "outputs": ["available_gb", "total_gb", "usage_pct", "mount_point", "over_threshold"]
         },
         {
             "action": "clean_logs",
             "label": "Clean Journal Logs",
             "description": "Vacuum systemd journal logs to a maximum size",
             "icon": "fa-broom",
+            "category": "system",
             "fields": [
                 { "name": "max_size_mb", "label": "Max Size (MB)", "type": "number", "default": 500, "placeholder": "500" }
             ]
         },
         {
-            "action": "check_disk_space",
-            "label": "Check Disk Space",
-            "description": "Check disk usage on a specific mount point or all mounts",
-            "icon": "fa-hard-drive",
+            "action": "condition",
+            "label": "Condition (If/Else)",
+            "description": "Branch workflow based on a condition — use {{step_name.key}} to reference previous step outputs",
+            "icon": "fa-code-branch",
+            "category": "logic",
             "fields": [
-                { "name": "warn_threshold_pct", "label": "Threshold (%)", "type": "number", "default": 90, "placeholder": "90" },
-                { "name": "mount_point", "label": "Mount Point", "type": "text", "placeholder": "/ or /var or all (default: all)" }
-            ]
-        },
-        {
-            "action": "restart_container",
-            "label": "Restart Container",
-            "description": "Restart a Docker or LXC container by name",
-            "icon": "fa-cube",
-            "fields": [
-                { "name": "runtime", "label": "Runtime", "type": "select", "options": ["docker", "lxc"], "required": true },
-                { "name": "name", "label": "Container Name", "type": "text", "required": true }
-            ]
-        },
-        {
-            "action": "docker_prune",
-            "label": "Docker Prune",
-            "description": "Remove all unused Docker images, containers, volumes, and networks",
-            "icon": "fa-trash-can",
-            "category": "system",
-            "fields": []
-        },
-        {
-            "action": "docker_check_update",
-            "label": "Docker Update Check",
-            "description": "Check if a Docker image has a newer version available",
-            "icon": "fa-magnifying-glass",
-            "category": "docker",
-            "fields": [
-                { "name": "container_or_image", "label": "Container / Image", "type": "text", "required": true, "placeholder": "nginx or myapp:latest" }
+                { "name": "expression", "label": "Value / Expression", "type": "text", "required": true, "placeholder": "{{Check Disk.available_gb}}" },
+                { "name": "operator", "label": "Operator", "type": "select", "options": ["eq","neq","gt","lt","gte","lte","contains","matches","truthy"], "default": "eq" },
+                { "name": "compare_to", "label": "Compare To", "type": "text", "placeholder": "500" }
             ],
-            "outputs": ["image", "local_digest", "update_available", "container"]
+            "outputs": ["result"]
         },
         {
             "action": "docker_update",
@@ -1713,6 +1679,25 @@ pub fn toolbox_actions() -> serde_json::Value {
                 { "name": "backup_first", "label": "Backup Before Update", "type": "checkbox", "default": true }
             ],
             "outputs": ["success", "container", "image"]
+        },
+        {
+            "action": "docker_prune",
+            "label": "Docker Prune",
+            "description": "Remove all unused Docker images, containers, volumes, and networks",
+            "icon": "fa-trash-can",
+            "category": "docker",
+            "fields": []
+        },
+        {
+            "action": "docker_check_update",
+            "label": "Docker Update Check",
+            "description": "Check if a Docker image has a newer version available",
+            "icon": "fa-magnifying-glass",
+            "category": "docker",
+            "fields": [
+                { "name": "container_or_image", "label": "Container / Image", "type": "text", "required": true, "placeholder": "nginx or myapp:latest" }
+            ],
+            "outputs": ["image", "local_digest", "update_available", "container"]
         },
         {
             "action": "http_request",
@@ -1731,17 +1716,17 @@ pub fn toolbox_actions() -> serde_json::Value {
             "outputs": ["status_code", "response_body", "json"]
         },
         {
-            "action": "condition",
-            "label": "Condition (If/Else)",
-            "description": "Branch workflow based on a condition — use {{step_name.key}} to reference previous step outputs",
-            "icon": "fa-code-branch",
-            "category": "logic",
+            "action": "integration_action",
+            "label": "Integration Action",
+            "description": "Execute an action on a configured external integration",
+            "icon": "fa-plug",
+            "category": "integration",
             "fields": [
-                { "name": "expression", "label": "Value / Expression", "type": "text", "required": true, "placeholder": "{{Docker Check.update_available}}" },
-                { "name": "operator", "label": "Operator", "type": "select", "options": ["eq","neq","gt","lt","gte","lte","contains","truthy"], "default": "eq" },
-                { "name": "compare_to", "label": "Compare To", "type": "text", "placeholder": "true" }
+                { "name": "instance_id", "label": "Integration Instance", "type": "text", "required": true, "placeholder": "Instance ID" },
+                { "name": "operation", "label": "Operation", "type": "text", "required": true, "placeholder": "list_peers" },
+                { "name": "params", "label": "Parameters (JSON)", "type": "textarea", "placeholder": "{}" }
             ],
-            "outputs": ["result"]
+            "outputs": ["instance_id", "operation"]
         },
         {
             "action": "netbird_action",
@@ -1757,6 +1742,38 @@ pub fn toolbox_actions() -> serde_json::Value {
                 { "name": "body", "label": "Request Body", "type": "textarea" }
             ],
             "outputs": ["status_code", "response_body", "json"]
+        },
+        {
+            "action": "restart_container",
+            "label": "Restart Container",
+            "description": "Restart a Docker or LXC container by name",
+            "icon": "fa-cube",
+            "category": "system",
+            "fields": [
+                { "name": "runtime", "label": "Runtime", "type": "select", "options": ["docker", "lxc"], "required": true },
+                { "name": "name", "label": "Container Name", "type": "text", "required": true }
+            ]
+        },
+        {
+            "action": "restart_service",
+            "label": "Restart Systemd Service",
+            "description": "Restart a systemd service by name",
+            "icon": "fa-rotate",
+            "category": "system",
+            "fields": [
+                { "name": "service_name", "label": "Service Name", "type": "text", "required": true, "placeholder": "nginx" }
+            ]
+        },
+        {
+            "action": "run_command",
+            "label": "Run Shell Command",
+            "description": "Execute an arbitrary shell command with a timeout",
+            "icon": "fa-terminal",
+            "category": "system",
+            "fields": [
+                { "name": "command", "label": "Command", "type": "textarea", "required": true, "placeholder": "echo hello" },
+                { "name": "timeout_secs", "label": "Timeout (seconds)", "type": "number", "default": 300 }
+            ]
         },
         {
             "action": "truenas_action",
@@ -1786,18 +1803,25 @@ pub fn toolbox_actions() -> serde_json::Value {
                 { "name": "endpoint", "label": "Endpoint", "type": "select", "options": ["/api/s/default/stat/device","/api/s/default/stat/sta","/api/s/default/stat/health","/api/s/default/rest/wlanconf","/api/s/default/cmd/devmgr"], "default": "/api/s/default/stat/device" },
                 { "name": "method", "label": "Method", "type": "select", "options": ["GET","POST","PUT","DELETE"], "default": "GET" },
                 { "name": "body", "label": "Request Body", "type": "textarea" }
-            ]
+            ],
+            "outputs": ["status_code", "response_body", "json"]
         },
         {
-            "action": "integration_action",
-            "label": "Integration Action",
-            "description": "Execute an action on a configured external integration",
-            "icon": "fa-plug",
-            "category": "integration",
+            "action": "update_packages",
+            "label": "Update System Packages",
+            "description": "Run the system package manager to update and upgrade all packages",
+            "icon": "fa-arrow-up",
+            "category": "system",
+            "fields": []
+        },
+        {
+            "action": "update_wolfstack",
+            "label": "Update WolfStack",
+            "description": "Pull and install the latest WolfStack build from a given channel",
+            "icon": "fa-download",
+            "category": "system",
             "fields": [
-                { "name": "instance_id", "label": "Integration Instance", "type": "text", "required": true, "placeholder": "Instance ID" },
-                { "name": "operation", "label": "Operation", "type": "text", "required": true, "placeholder": "list_peers" },
-                { "name": "params", "label": "Parameters (JSON)", "type": "textarea", "placeholder": "{}" }
+                { "name": "channel", "label": "Channel", "type": "text", "default": "master", "placeholder": "master" }
             ]
         }
     ])
