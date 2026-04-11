@@ -986,10 +986,19 @@ fi
 echo "✓ wolfstack installed to /usr/local/bin/wolfstack"
 
 # ─── Install AI knowledge base ──────────────────────────────────────────────
-if [ -d "$INSTALL_DIR/knowledge" ]; then
-    mkdir -p /etc/wolfstack/knowledge
+mkdir -p /etc/wolfstack/knowledge
+if [ -d "$INSTALL_DIR/knowledge" ] && ls "$INSTALL_DIR/knowledge/"*.md >/dev/null 2>&1; then
     cp "$INSTALL_DIR/knowledge/"*.md /etc/wolfstack/knowledge/ 2>/dev/null || true
-    echo "✓ AI knowledge base installed"
+    echo "✓ AI knowledge base installed (from source)"
+else
+    # Download knowledge base from GitHub (for prebuilt binary installs)
+    echo "  Downloading AI knowledge base..."
+    KB_URL="https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfStack/${CHANNEL:-master}/knowledge/wolfstack-kb.md"
+    if curl -fsSL --connect-timeout 10 -o /etc/wolfstack/knowledge/wolfstack-kb.md "$KB_URL" 2>/dev/null; then
+        echo "✓ AI knowledge base installed"
+    else
+        echo "  ⚠ Could not download AI knowledge base (non-critical)"
+    fi
 fi
 
 # ─── Install web UI ─────────────────────────────────────────────────────────
