@@ -9817,10 +9817,13 @@ pub async fn user_prefs_patch(req: HttpRequest, state: web::Data<AppState>, body
 pub async fn wolfusb_status(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let config = crate::wolfusb::WolfUsbConfig::load();
+    let available = crate::wolfusb::is_wolfusb_available();
+    let version = if available { crate::wolfusb::get_wolfusb_version() } else { None };
     HttpResponse::Ok().json(serde_json::json!({
-        "usbip_available": crate::wolfusb::is_wolfusb_available(),
+        "usbip_available": available,
         "enabled": config.enabled,
         "assignment_count": config.assignments.len(),
+        "version": version,
     }))
 }
 

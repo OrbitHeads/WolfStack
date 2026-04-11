@@ -149,6 +149,17 @@ pub fn is_wolfusb_available() -> bool {
     find_wolfusb_binary().is_some()
 }
 
+/// Get the installed wolfusb version string
+pub fn get_wolfusb_version() -> Option<String> {
+    let binary = find_wolfusb_binary()?;
+    let output = Command::new(&binary).arg("--version").output().ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
 /// Run a wolfusb command with the cluster secret as auth key
 fn run_wolfusb(args: &[&str]) -> Result<String, String> {
     let binary = find_wolfusb_binary()
@@ -349,9 +360,9 @@ fn wolfusb_detach_device(source_address: &str, busid: &str, session_id: u64) -> 
 
 // ─── Install ───
 
-/// Install the wolfusb binary and set up the systemd service
+/// Install or upgrade the wolfusb binary and set up the systemd service
 pub async fn install_wolfusb() -> Result<String, String> {
-    info!("WolfUSB: installing wolfusb");
+    info!("WolfUSB: installing/upgrading wolfusb");
     let script = r#"
 set -e
 
@@ -364,19 +375,32 @@ elif command -v apt-get >/dev/null 2>&1; then
     apt-get update -qq && apt-get install -y libusb-1.0-0 2>/dev/null || true
 elif command -v dnf >/dev/null 2>&1; then
     echo "Installing libusb via dnf..."
-    dnf install -y libusbx 2>/dev/null || libusb1 2>/dev/null || true
+    dnf install -y libusbx 2>/dev/null || dnf install -y libusb1 2>/dev/null || true
 elif command -v zypper >/dev/null 2>&1; then
     echo "Installing libusb via zypper..."
     zypper install -y libusb-1_0-0 2>/dev/null || true
 fi
 
-# ─── Install wolfusb binary ───
+# ─── Stop existing service before upgrade ───
+if systemctl is-active --quiet wolfusb 2>/dev/null; then
+    echo "Stopping wolfusb service for upgrade..."
+    systemctl stop wolfusb
+fi
+
+# ─── Show old version if upgrading ───
 if command -v wolfusb >/dev/null 2>&1; then
-    echo "wolfusb already installed at $(command -v wolfusb)"
-    wolfusb --version 2>/dev/null || true
-else
-    echo "Downloading wolfusb..."
-    curl -fsSL https://raw.githubusercontent.com/wolfsoftwaresystemsltd/wolfusb/main/setup.sh | bash
+    OLD_VER=$(wolfusb --version 2>/dev/null || echo "unknown")
+    echo "Current version: $OLD_VER"
+fi
+
+# ─── Download and install latest wolfusb ───
+echo "Downloading latest wolfusb..."
+curl -fsSL https://raw.githubusercontent.com/wolfsoftwaresystemsltd/wolfusb/main/setup.sh | bash
+
+# ─── Show new version ───
+if command -v wolfusb >/dev/null 2>&1; then
+    NEW_VER=$(wolfusb --version 2>/dev/null || echo "unknown")
+    echo "Installed version: $NEW_VER"
 fi
 
 # ─── Set up udev rules for USB access ───
@@ -384,12 +408,9 @@ mkdir -p /etc/udev/rules.d
 echo 'SUBSYSTEM=="usb", MODE="0666", GROUP="plugdev"' > /etc/udev/rules.d/99-wolfusb.rules
 udevadm control --reload-rules 2>/dev/null || true
 
-# ─── Install systemd service if not present ───
+# ─── Install systemd service ───
 if [ ! -f /etc/systemd/system/wolfusb.service ]; then
-    if [ -x /usr/local/bin/install-service.sh ]; then
-        /usr/local/bin/install-service.sh
-    elif command -v wolfusb >/dev/null 2>&1; then
-        cat > /etc/systemd/system/wolfusb.service << 'UNIT'
+    cat > /etc/systemd/system/wolfusb.service << 'UNIT'
 [Unit]
 Description=WolfUSB Server
 After=network.target
@@ -404,8 +425,7 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 UNIT
-        systemctl daemon-reload
-    fi
+    systemctl daemon-reload
 fi
 
 # ─── Enable and start ───
