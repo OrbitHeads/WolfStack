@@ -25,9 +25,12 @@ const KNOWLEDGE_DIR_DEV: &str = "../wolfscale/web";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiConfig {
-    pub provider: String,         // "claude", "gemini", or "local"
+    pub provider: String,         // "claude", "gemini", "openrouter", or "local"
     pub claude_api_key: String,
     pub gemini_api_key: String,
+    /// OpenRouter API key (https://openrouter.ai — access hundreds of models via one API)
+    #[serde(default)]
+    pub openrouter_api_key: String,
     /// URL of a local/self-hosted AI server (OpenAI-compatible API)
     /// Supports: Ollama (http://localhost:11434/v1), LM Studio (http://localhost:1234/v1),
     /// LocalAI, vLLM, text-generation-webui, or any OpenAI-compatible endpoint
@@ -58,6 +61,7 @@ impl Default for AiConfig {
             provider: "claude".to_string(),
             claude_api_key: String::new(),
             gemini_api_key: String::new(),
+            openrouter_api_key: String::new(),
             local_url: String::new(),
             local_api_key: String::new(),
             model: "claude-sonnet-4-20250514".to_string(),
@@ -96,6 +100,7 @@ impl AiConfig {
             "provider": self.provider,
             "claude_api_key": mask_key(&self.claude_api_key),
             "gemini_api_key": mask_key(&self.gemini_api_key),
+            "openrouter_api_key": mask_key(&self.openrouter_api_key),
             "local_url": self.local_url,
             "local_api_key": mask_key(&self.local_api_key),
             "model": self.model,
@@ -109,6 +114,7 @@ impl AiConfig {
             "scan_schedule": self.scan_schedule,
             "has_claude_key": !self.claude_api_key.is_empty(),
             "has_gemini_key": !self.gemini_api_key.is_empty(),
+            "has_openrouter_key": !self.openrouter_api_key.is_empty(),
             "has_local_url": !self.local_url.is_empty(),
             "has_smtp_pass": !self.smtp_pass.is_empty(),
         })
@@ -117,6 +123,7 @@ impl AiConfig {
     fn active_key(&self) -> &str {
         match self.provider.as_str() {
             "local" => if self.local_api_key.is_empty() { "local" } else { &self.local_api_key },
+            "openrouter" => &self.openrouter_api_key,
             "gemini" => &self.gemini_api_key,
             _ => &self.claude_api_key,
         }
@@ -125,6 +132,7 @@ impl AiConfig {
     pub fn is_configured(&self) -> bool {
         match self.provider.as_str() {
             "local" => !self.local_url.is_empty(),
+            "openrouter" => !self.openrouter_api_key.is_empty(),
             _ => !self.active_key().is_empty(),
         }
     }
@@ -237,6 +245,9 @@ impl AiAgent {
             let response = match config.provider.as_str() {
                 "gemini" => {
                     call_gemini(&self.client, &config.gemini_api_key, &config.model, &system_prompt, &history, &current_msg).await?
+                }
+                "openrouter" => {
+                    call_local(&self.client, "https://openrouter.ai/api/v1", &config.openrouter_api_key, &config.model, &system_prompt, &history, &current_msg).await?
                 }
                 "local" => {
                     call_local(&self.client, &config.local_url, &config.local_api_key, &config.model, &system_prompt, &history, &current_msg).await?
@@ -531,6 +542,26 @@ impl AiAgent {
     /// List available models for the configured provider
     pub async fn list_models(&self, provider: &str, api_key: &str) -> Result<Vec<String>, String> {
         match provider {
+            "openrouter" => {
+                // OpenRouter uses the OpenAI-compatible /v1/models endpoint
+                let resp = self.client.get("https://openrouter.ai/api/v1/models")
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .send().await
+                    .map_err(|e| format!("OpenRouter API error: {}", e))?;
+                let status = resp.status();
+                let text = resp.text().await.map_err(|e| format!("OpenRouter response error: {}", e))?;
+                if !status.is_success() {
+                    return Err(format!("OpenRouter API {} — {}", status, text));
+                }
+                let json: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|e| format!("OpenRouter JSON error: {}", e))?;
+                let models = json["data"].as_array()
+                    .map(|arr| arr.iter().filter_map(|m| {
+                        m["id"].as_str().map(|s| s.to_string())
+                    }).collect())
+                    .unwrap_or_default();
+                Ok(models)
+            }
             "gemini" => {
                 let url = format!(
                     "https://generativelanguage.googleapis.com/v1beta/models?key={}",
@@ -612,6 +643,7 @@ impl AiAgent {
 
         let result = match config.provider.as_str() {
             "gemini" => call_gemini(&self.client, &config.gemini_api_key, &config.model, system, &[], &prompt).await,
+            "openrouter" => call_local(&self.client, "https://openrouter.ai/api/v1", &config.openrouter_api_key, &config.model, system, &[], &prompt).await,
             "local" => call_local(&self.client, &config.local_url, &config.local_api_key, &config.model, system, &[], &prompt).await,
             _ => call_claude(&self.client, &config.claude_api_key, &config.model, system, &[], &prompt).await,
         };
@@ -748,6 +780,7 @@ impl AiAgent {
 
         let result = match config.provider.as_str() {
             "gemini" => call_gemini(&self.client, &config.gemini_api_key, &config.model, system, &[], issue_description).await,
+            "openrouter" => call_local(&self.client, "https://openrouter.ai/api/v1", &config.openrouter_api_key, &config.model, system, &[], issue_description).await,
             "local" => call_local(&self.client, &config.local_url, &config.local_api_key, &config.model, system, &[], issue_description).await,
             _ => call_claude(&self.client, &config.claude_api_key, &config.model, system, &[], issue_description).await,
         };

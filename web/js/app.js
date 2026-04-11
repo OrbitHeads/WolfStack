@@ -18051,11 +18051,14 @@ async function loadAiConfig() {
         if ((el = document.getElementById('ai-provider'))) el.value = cfg.provider || 'claude';
         if ((el = document.getElementById('ai-claude-key'))) el.value = cfg.has_claude_key ? cfg.claude_api_key : '';
         if ((el = document.getElementById('ai-gemini-key'))) el.value = cfg.has_gemini_key ? cfg.gemini_api_key : '';
+        if ((el = document.getElementById('ai-openrouter-key'))) el.value = cfg.has_openrouter_key ? cfg.openrouter_api_key : '';
         if ((el = document.getElementById('ai-local-url'))) el.value = cfg.local_url || '';
         if ((el = document.getElementById('ai-local-key'))) el.value = cfg.has_local_url ? (cfg.local_api_key || '') : '';
-        // Show/hide local fields
+        // Show/hide provider-specific fields
         const localFields = document.getElementById('ai-local-fields');
         if (localFields) localFields.style.display = (cfg.provider === 'local') ? '' : 'none';
+        const orFields = document.getElementById('ai-openrouter-fields');
+        if (orFields) orFields.style.display = (cfg.provider === 'openrouter') ? '' : 'none';
         if ((el = document.getElementById('ai-email-enabled'))) el.checked = cfg.email_enabled || false;
         if ((el = document.getElementById('ai-email-to'))) el.value = cfg.email_to || '';
         if ((el = document.getElementById('ai-smtp-host'))) el.value = cfg.smtp_host || '';
@@ -18117,6 +18120,7 @@ async function saveAiConfig() {
         provider: (document.getElementById('ai-provider') || {}).value || 'claude',
         claude_api_key: (document.getElementById('ai-claude-key') || {}).value || '',
         gemini_api_key: (document.getElementById('ai-gemini-key') || {}).value || '',
+        openrouter_api_key: (document.getElementById('ai-openrouter-key') || {}).value || '',
         local_url: (document.getElementById('ai-local-url') || {}).value || '',
         local_api_key: (document.getElementById('ai-local-key') || {}).value || '',
         model: (document.getElementById('ai-model') || {}).value || '',
@@ -18210,6 +18214,7 @@ async function testAiConnection() {
         provider: (document.getElementById('ai-provider') || {}).value || 'claude',
         claude_api_key: (document.getElementById('ai-claude-key') || {}).value || '',
         gemini_api_key: (document.getElementById('ai-gemini-key') || {}).value || '',
+        openrouter_api_key: (document.getElementById('ai-openrouter-key') || {}).value || '',
         local_url: (document.getElementById('ai-local-url') || {}).value || '',
         local_api_key: (document.getElementById('ai-local-key') || {}).value || '',
         model: (document.getElementById('ai-model') || {}).value || '',
@@ -18262,9 +18267,11 @@ async function sendTestEmail() {
 
 function onAiProviderChange() {
     var provider = (document.getElementById('ai-provider') || {}).value || 'claude';
-    // Show/hide local AI fields
+    // Show/hide provider-specific fields
     const localFields = document.getElementById('ai-local-fields');
     if (localFields) localFields.style.display = provider === 'local' ? '' : 'none';
+    const orFields = document.getElementById('ai-openrouter-fields');
+    if (orFields) orFields.style.display = provider === 'openrouter' ? '' : 'none';
     fetchAiModels(provider, '');
 }
 

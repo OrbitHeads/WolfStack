@@ -5372,6 +5372,7 @@ pub async fn ai_models(
     } else {
         let api_key = match provider {
             "gemini" => &config.gemini_api_key,
+            "openrouter" => &config.openrouter_api_key,
             _ => &config.claude_api_key,
         };
         if api_key.is_empty() {
