@@ -182,6 +182,34 @@ fn run_wolfusb(args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// Run a wolfusb command — try with key first, fall back to without key
+fn run_wolfusb_with_fallback(args: &[&str]) -> Result<String, String> {
+    let binary = find_wolfusb_binary()
+        .ok_or_else(|| "wolfusb binary not found".to_string())?;
+
+    let secret = get_secret();
+
+    // Try with key if we have one
+    if !secret.is_empty() {
+        let output = Command::new(&binary).args(args).arg("--key").arg(secret)
+            .output().map_err(|e| format!("Failed to run wolfusb: {}", e))?;
+        if output.status.success() {
+            return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+        }
+    }
+
+    // Try without key (server may not require auth)
+    let output = Command::new(&binary).args(args)
+        .output().map_err(|e| format!("Failed to run wolfusb: {}", e))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(format!("wolfusb failed: {}", stderr))
+    }
+}
+
 /// Ensure the wolfusb server is running on this node
 pub fn ensure_wolfusb_server() {
     // Check if already running via systemctl
@@ -254,8 +282,8 @@ struct WolfUsbDeviceIdJson {
 
 /// List USB devices on this node. Returns (devices, wolfusb_working).
 pub fn list_local_devices_with_status(config: &WolfUsbConfig) -> (Vec<UsbDevice>, bool) {
-    // Try wolfusb list --json against the local server
-    match run_wolfusb(&["list", "--server", "127.0.0.1:3240", "--json"]) {
+    // Try with key first, fall back to without key
+    match run_wolfusb_with_fallback(&["list", "--server", "127.0.0.1:3240", "--json"]) {
         Ok(json_str) => {
             match serde_json::from_str::<Vec<WolfUsbDeviceJson>>(&json_str) {
                 Ok(raw_devices) => {
