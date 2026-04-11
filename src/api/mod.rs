@@ -9813,66 +9813,42 @@ pub async fn user_prefs_patch(req: HttpRequest, state: web::Data<AppState>, body
 
 // ─── WolfUSB API ───
 
-/// GET /api/wolfusb/status — installation status, service status, config
+/// GET /api/wolfusb/status — usbip availability, config, assignments
 pub async fn wolfusb_status(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let config = crate::wolfusb::WolfUsbConfig::load();
     HttpResponse::Ok().json(serde_json::json!({
-        "installed": crate::wolfusb::is_installed(),
-        "version": crate::wolfusb::installed_version(),
-        "running": crate::wolfusb::is_running(),
-        "config": {
-            "enabled": config.enabled,
-            "bind_address": config.bind_address,
-            "port": config.port,
-            "has_auth_key": !config.auth_key.is_empty(),
-        },
+        "usbip_available": crate::wolfusb::is_usbip_available(),
+        "enabled": config.enabled,
         "assignment_count": config.assignments.len(),
     }))
 }
 
-/// POST /api/wolfusb/install — install WolfUSB from setup script
+/// POST /api/wolfusb/install — install usbip tools
 pub async fn wolfusb_install(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    match crate::wolfusb::install().await {
+    match crate::wolfusb::install_usbip().await {
         Ok(output) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "output": output })),
         Err(e) => HttpResponse::Ok().json(serde_json::json!({ "ok": false, "error": e })),
     }
 }
 
-/// GET /api/wolfusb/config — get full config
+/// GET /api/wolfusb/config — get config
 pub async fn wolfusb_get_config(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let config = crate::wolfusb::WolfUsbConfig::load();
     HttpResponse::Ok().json(&config)
 }
 
-/// POST /api/wolfusb/config — save config and optionally start/stop service
+/// POST /api/wolfusb/config — save config
 pub async fn wolfusb_save_config(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let mut config = crate::wolfusb::WolfUsbConfig::load();
-
     if let Some(v) = body.get("enabled").and_then(|v| v.as_bool()) { config.enabled = v; }
-    if let Some(v) = body.get("bind_address").and_then(|v| v.as_str()) { config.bind_address = v.to_string(); }
-    if let Some(v) = body.get("port").and_then(|v| v.as_u64()) { config.port = v as u16; }
-    if let Some(v) = body.get("auth_key").and_then(|v| v.as_str()) {
-        if !v.contains("••••") { config.auth_key = v.to_string(); }
+    match config.save() {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
     }
-
-    if let Err(e) = config.save() {
-        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
-    }
-
-    // Start or stop service based on enabled flag
-    if config.enabled && crate::wolfusb::is_installed() {
-        if let Err(e) = crate::wolfusb::start_service(&config) {
-            return HttpResponse::Ok().json(serde_json::json!({ "ok": true, "warning": format!("Config saved but failed to start service: {}", e) }));
-        }
-    } else if !config.enabled {
-        let _ = crate::wolfusb::stop_service();
-    }
-
-    HttpResponse::Ok().json(serde_json::json!({ "ok": true }))
 }
 
 /// GET /api/wolfusb/devices — list USB devices on this node
@@ -9880,28 +9856,54 @@ pub async fn wolfusb_devices(req: HttpRequest, state: web::Data<AppState>) -> Ht
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let config = crate::wolfusb::WolfUsbConfig::load();
     let devices = crate::wolfusb::list_local_devices(&config);
+    let attached = crate::wolfusb::list_attached();
     HttpResponse::Ok().json(serde_json::json!({
         "devices": devices,
         "assignments": config.assignments,
+        "attached": attached,
     }))
 }
 
-/// POST /api/wolfusb/assign — assign a USB device to a container/VM
+/// POST /api/wolfusb/assign — assign a USB device to a container/VM (cluster-wide)
 pub async fn wolfusb_assign(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let mut config = crate::wolfusb::WolfUsbConfig::load();
 
-    let bus = body.get("bus").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
-    let address = body.get("address").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+    let busid = body.get("busid").and_then(|v| v.as_str()).unwrap_or("");
     let label = body.get("label").and_then(|v| v.as_str()).unwrap_or("");
+    let usb_id = body.get("usb_id").and_then(|v| v.as_str()).unwrap_or("");
+    let source_node_id = body.get("source_node_id").and_then(|v| v.as_str()).unwrap_or("");
+    let source_hostname = body.get("source_hostname").and_then(|v| v.as_str()).unwrap_or("");
+    let source_address = body.get("source_address").and_then(|v| v.as_str()).unwrap_or("");
     let target_type = body.get("target_type").and_then(|v| v.as_str()).unwrap_or("");
     let target_name = body.get("target_name").and_then(|v| v.as_str()).unwrap_or("");
+    let target_node_id = body.get("target_node_id").and_then(|v| v.as_str()).unwrap_or("");
+    let target_hostname = body.get("target_hostname").and_then(|v| v.as_str()).unwrap_or("");
 
-    if bus == 0 || target_type.is_empty() || target_name.is_empty() {
-        return HttpResponse::BadRequest().json(serde_json::json!({ "error": "bus, target_type, and target_name are required" }));
+    if busid.is_empty() || target_type.is_empty() || target_name.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": "busid, target_type, and target_name are required" }));
     }
 
-    match crate::wolfusb::assign_device(&mut config, bus, address, label, target_type, target_name) {
+    // Determine if this node is the source
+    let self_node = state.cluster.get_all_nodes().into_iter().find(|n| n.is_self);
+    let self_id = self_node.as_ref().map(|n| n.id.as_str()).unwrap_or("");
+    let is_local_source = source_node_id == self_id || source_node_id.is_empty();
+
+    // Use WolfNet IP if available, otherwise the regular address
+    let effective_address = if !source_address.is_empty() {
+        source_address.to_string()
+    } else {
+        self_node.as_ref().map(|n| n.address.clone()).unwrap_or_default()
+    };
+
+    match crate::wolfusb::assign_device(
+        &mut config, busid, label, usb_id,
+        if source_node_id.is_empty() { self_id } else { source_node_id },
+        source_hostname, &effective_address,
+        target_type, target_name,
+        target_node_id, target_hostname,
+        is_local_source,
+    ) {
         Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "message": msg })),
         Err(e) => HttpResponse::Ok().json(serde_json::json!({ "ok": false, "error": e })),
     }
@@ -9912,10 +9914,29 @@ pub async fn wolfusb_unassign(req: HttpRequest, state: web::Data<AppState>, body
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let mut config = crate::wolfusb::WolfUsbConfig::load();
 
-    let bus = body.get("bus").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
-    let address = body.get("address").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+    let busid = body.get("busid").and_then(|v| v.as_str()).unwrap_or("");
+    let source_node_id = body.get("source_node_id").and_then(|v| v.as_str()).unwrap_or("");
 
-    match crate::wolfusb::unassign_device(&mut config, bus, address) {
+    match crate::wolfusb::unassign_device(&mut config, busid, source_node_id) {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "message": msg })),
+        Err(e) => HttpResponse::Ok().json(serde_json::json!({ "ok": false, "error": e })),
+    }
+}
+
+/// POST /api/wolfusb/attach — attach a remote USB device and pass into container (called on target node)
+pub async fn wolfusb_attach(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    let source_address = body.get("source_address").and_then(|v| v.as_str()).unwrap_or("");
+    let busid = body.get("busid").and_then(|v| v.as_str()).unwrap_or("");
+    let target_type = body.get("target_type").and_then(|v| v.as_str()).unwrap_or("");
+    let target_name = body.get("target_name").and_then(|v| v.as_str()).unwrap_or("");
+
+    if source_address.is_empty() || busid.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": "source_address and busid required" }));
+    }
+
+    match crate::wolfusb::attach_and_passthrough(source_address, busid, target_type, target_name) {
         Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "message": msg })),
         Err(e) => HttpResponse::Ok().json(serde_json::json!({ "ok": false, "error": e })),
     }
@@ -16329,6 +16350,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/wolfusb/devices", web::get().to(wolfusb_devices))
         .route("/api/wolfusb/assign", web::post().to(wolfusb_assign))
         .route("/api/wolfusb/unassign", web::post().to(wolfusb_unassign))
+        .route("/api/wolfusb/attach", web::post().to(wolfusb_attach))
         // VR Terminal
         .route("/api/vr-terminal/create", web::post().to(crate::vr_terminal::vr_term_create))
         .route("/api/vr-terminal/{id}/output", web::get().to(crate::vr_terminal::vr_term_output))

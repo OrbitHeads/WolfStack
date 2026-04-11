@@ -34524,73 +34524,54 @@ async function wolframSaveConfig() {
 }
 
 // ═══════════════════════════════════════════════
-// ─── WolfUSB — USB over IP ───
+// ─── WolfUSB — USB over IP (usbip) ───
 // ═══════════════════════════════════════════════
 
 async function loadWolfUsbPage() {
     var el = document.getElementById('page-wolfusb');
     if (!el) return;
-
-    el.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted);">Loading USB Sharing...</div>';
+    el.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted);">Loading WolfUSB...</div>';
 
     try {
         var resp = await fetch(apiUrl('/api/wolfusb/status'));
         var status = await resp.json();
 
-        var html = '<div class="content-header"><h2>USB Sharing</h2><p style="color:var(--text-muted);font-size:13px;">Share USB devices across your network with WolfUSB. Assign devices to Docker containers, LXC containers, and VMs.</p></div>';
+        var html = '<div class="content-header"><h2>WolfUSB</h2><p style="color:var(--text-muted);font-size:13px;">Share USB devices across your cluster. Assign any USB device to any Docker container, LXC container, or VM on any node. Devices appear as real USB via <code>usbip</code>.</p></div>';
 
-        // Installation status
-        if (!status.installed) {
-            html += '<div class="card" style="margin-bottom:16px;">'
-                + '<div class="card-header">Install WolfUSB</div>'
-                + '<div class="card-body">'
-                + '<p style="color:var(--text-secondary);margin-bottom:12px;">WolfUSB is not installed on this node. Install it to share USB devices over the network.</p>'
-                + '<button class="btn btn-primary" onclick="installWolfUsb()" id="wolfusb-install-btn">Install WolfUSB</button>'
+        if (!status.usbip_available) {
+            html += '<div class="card" style="margin-bottom:16px;"><div class="card-header">Install usbip Tools</div><div class="card-body">'
+                + '<p style="color:var(--text-secondary);margin-bottom:12px;">The <code>usbip</code> kernel tools are required for USB device sharing. They are part of the Linux kernel but need to be installed as a package.</p>'
+                + '<button class="btn btn-primary" onclick="installWolfUsb()" id="wolfusb-install-btn">Install usbip Tools</button>'
                 + '<div id="wolfusb-install-output" style="display:none;margin-top:12px;"></div>'
                 + '</div></div>';
             el.innerHTML = html;
             return;
         }
 
-        // Config section
-        html += '<div class="card" style="margin-bottom:16px;">'
-            + '<div class="card-header" style="display:flex;justify-content:space-between;align-items:center;">'
+        // Config
+        html += '<div class="card" style="margin-bottom:16px;"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center;">'
             + '<span>Configuration</span>'
-            + '<div style="display:flex;gap:8px;align-items:center;">'
-            + '<span style="font-size:11px;color:' + (status.running ? '#22c55e' : 'var(--text-muted)') + ';">' + (status.running ? 'Running' : 'Stopped') + '</span>'
-            + (status.version ? '<span style="font-size:10px;color:var(--text-muted);">v' + escapeHtml(status.version) + '</span>' : '')
-            + '</div></div>'
-            + '<div class="card-body">'
-            + '<div class="form-row" style="display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:12px;align-items:end;">'
-            + '<div class="form-group"><label>Bind Address</label><input type="text" id="wolfusb-bind" class="form-control" value="' + escapeAttr(status.config.bind_address || '0.0.0.0') + '"></div>'
-            + '<div class="form-group"><label>Port</label><input type="number" id="wolfusb-port" class="form-control" value="' + (status.config.port || 3240) + '"></div>'
-            + '<div class="form-group"><label>Auth Key</label><input type="password" id="wolfusb-key" class="form-control" placeholder="Optional" value="' + (status.config.has_auth_key ? '••••••••' : '') + '"></div>'
-            + '<div class="form-group"><label>&nbsp;</label><div style="display:flex;gap:8px;">'
-            + '<label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;white-space:nowrap;"><input type="checkbox" id="wolfusb-enabled" ' + (status.config.enabled ? 'checked' : '') + '> Enabled</label>'
-            + '<button class="btn btn-primary" onclick="saveWolfUsbConfig()" style="padding:6px 16px;font-size:12px;">Save</button>'
-            + '</div></div>'
-            + '</div></div></div>';
+            + '<span style="font-size:11px;color:#22c55e;">usbip ready</span>'
+            + '</div><div class="card-body">'
+            + '<label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">'
+            + '<input type="checkbox" id="wolfusb-enabled" ' + (status.enabled ? 'checked' : '') + ' onchange="saveWolfUsbConfig()"> Enable USB sharing on this node</label>'
+            + '</div></div>';
 
-        // Devices section
-        html += '<div class="card" style="margin-bottom:16px;">'
-            + '<div class="card-header" style="display:flex;justify-content:space-between;align-items:center;">'
-            + '<span>USB Devices</span>'
+        // Devices
+        html += '<div class="card" style="margin-bottom:16px;"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center;">'
+            + '<span>USB Devices on This Node</span>'
             + '<button class="btn btn-sm" onclick="refreshWolfUsbDevices()" style="padding:4px 12px;font-size:11px;">Refresh</button>'
-            + '</div>'
-            + '<div class="card-body" id="wolfusb-devices-body">'
+            + '</div><div class="card-body" id="wolfusb-devices-body">'
             + '<div style="color:var(--text-muted);font-size:12px;text-align:center;padding:12px;">Loading devices...</div>'
             + '</div></div>';
 
-        // Assignments section
-        html += '<div class="card" style="margin-bottom:16px;">'
-            + '<div class="card-header">Active Assignments</div>'
+        // Assignments
+        html += '<div class="card" style="margin-bottom:16px;"><div class="card-header">Active Assignments</div>'
             + '<div class="card-body" id="wolfusb-assignments-body">'
             + '<div style="color:var(--text-muted);font-size:12px;text-align:center;padding:12px;">Loading...</div>'
             + '</div></div>';
 
         el.innerHTML = html;
-
-        // Load devices
         refreshWolfUsbDevices();
     } catch (e) {
         el.innerHTML = '<div style="color:var(--danger);padding:20px;">Failed to load WolfUSB: ' + escapeHtml(e.message) + '</div>';
@@ -34601,49 +34582,27 @@ async function installWolfUsb() {
     var btn = document.getElementById('wolfusb-install-btn');
     var output = document.getElementById('wolfusb-install-output');
     if (btn) { btn.disabled = true; btn.textContent = 'Installing...'; }
-    if (output) { output.style.display = 'block'; output.innerHTML = '<pre style="background:var(--bg-primary);padding:12px;border-radius:8px;font-size:11px;max-height:300px;overflow:auto;">Installing WolfUSB...</pre>'; }
-
+    if (output) { output.style.display = 'block'; output.innerHTML = '<pre style="background:var(--bg-primary);padding:12px;border-radius:8px;font-size:11px;max-height:300px;overflow:auto;">Installing usbip tools...</pre>'; }
     try {
         var resp = await fetch(apiUrl('/api/wolfusb/install'), { method: 'POST' });
         var data = await resp.json();
-        if (data.ok) {
-            showToast('WolfUSB installed successfully', 'success');
-            loadWolfUsbPage();
-        } else {
-            showToast('Installation failed: ' + (data.error || ''), 'error');
+        if (data.ok) { showToast('usbip tools installed', 'success'); loadWolfUsbPage(); }
+        else {
+            showToast('Install failed: ' + (data.error || ''), 'error');
             if (output) output.querySelector('pre').textContent = data.error || 'Unknown error';
-            if (btn) { btn.disabled = false; btn.textContent = 'Retry Install'; }
+            if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
         }
-    } catch (e) {
-        showToast('Install failed: ' + e.message, 'error');
-        if (btn) { btn.disabled = false; btn.textContent = 'Retry Install'; }
-    }
+    } catch (e) { showToast('Install failed: ' + e.message, 'error'); if (btn) { btn.disabled = false; btn.textContent = 'Retry'; } }
 }
 
 async function saveWolfUsbConfig() {
-    var config = {
-        enabled: document.getElementById('wolfusb-enabled')?.checked || false,
-        bind_address: document.getElementById('wolfusb-bind')?.value || '0.0.0.0',
-        port: parseInt(document.getElementById('wolfusb-port')?.value) || 3240,
-        auth_key: document.getElementById('wolfusb-key')?.value || '',
-    };
-
     try {
-        var resp = await fetch(apiUrl('/api/wolfusb/config'), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(config),
+        await fetch(apiUrl('/api/wolfusb/config'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: document.getElementById('wolfusb-enabled')?.checked || false }),
         });
-        var data = await resp.json();
-        if (data.ok) {
-            showToast(data.warning || 'WolfUSB config saved', data.warning ? 'warning' : 'success');
-            loadWolfUsbPage();
-        } else {
-            showToast('Failed: ' + (data.error || ''), 'error');
-        }
-    } catch (e) {
-        showToast('Failed: ' + e.message, 'error');
-    }
+        showToast('WolfUSB config saved', 'success');
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
 }
 
 async function refreshWolfUsbDevices() {
@@ -34658,51 +34617,56 @@ async function refreshWolfUsbDevices() {
         var assignments = data.assignments || [];
 
         if (devices.length === 0) {
-            body.innerHTML = '<div style="color:var(--text-muted);font-size:12px;text-align:center;padding:16px;">No USB devices detected on this node.</div>';
+            body.innerHTML = '<div style="color:var(--text-muted);font-size:12px;text-align:center;padding:16px;">No USB devices detected.</div>';
         } else {
-            // Build target options from local containers/VMs
-            var targetOpts = await _wolfusbGetTargets();
+            // Build cluster-wide target options (all nodes' containers/VMs)
+            var targetOpts = await _wolfusbGetClusterTargets();
+
+            // Get current node info for source fields
+            var selfNode = allNodes.find(function(n) { return n.is_self; }) || allNodes.find(function(n) { return n.id === currentNodeId; });
+            var sourceId = selfNode ? selfNode.id : '';
+            var sourceHostname = selfNode ? selfNode.hostname : '';
+            var sourceAddr = selfNode ? selfNode.address : '';
 
             var html = '<table class="data-table" style="width:100%;font-size:12px;"><thead><tr>'
-                + '<th>Bus</th><th>Addr</th><th>ID</th><th>Device</th><th>Assigned To</th><th style="width:280px;">Assign</th>'
+                + '<th>Bus ID</th><th>ID</th><th>Device</th><th>Assigned To</th><th style="width:320px;">Assign To</th>'
                 + '</tr></thead><tbody>';
-            devices.forEach(function(d) {
-                var vid = ('0000' + d.vendor_id.toString(16)).slice(-4);
-                var pid = ('0000' + d.product_id.toString(16)).slice(-4);
+            devices.forEach(function(d, idx) {
+                var safeId = (d.busid || '').replace(/[^a-zA-Z0-9\-\.]/g, '_');
                 var assignedBadge = d.assigned_to
                     ? '<span style="background:rgba(34,197,94,0.15);color:#22c55e;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600;">' + escapeHtml(d.assigned_to) + '</span>'
                     : '<span style="color:var(--text-muted);font-size:11px;">—</span>';
 
                 html += '<tr>'
-                    + '<td>' + d.bus + '</td>'
-                    + '<td>' + d.address + '</td>'
-                    + '<td style="font-family:monospace;">' + vid + ':' + pid + '</td>'
-                    + '<td>' + escapeHtml(d.product || 'Unknown Device') + '</td>'
+                    + '<td style="font-family:monospace;">' + escapeHtml(d.busid) + '</td>'
+                    + '<td style="font-family:monospace;">' + escapeHtml(d.vendor_id) + ':' + escapeHtml(d.product_id) + '</td>'
+                    + '<td>' + escapeHtml(d.product || 'Unknown') + '</td>'
                     + '<td>' + assignedBadge + '</td>'
                     + '<td><div style="display:flex;gap:6px;align-items:center;">'
-                    + '<select id="wolfusb-target-' + d.bus + '-' + d.address + '" class="form-control" style="font-size:11px;padding:4px 8px;flex:1;">'
-                    + '<option value="">— Select target —</option>' + targetOpts + '</select>'
-                    + '<button class="btn btn-sm" onclick="wolfusbAssign(' + d.bus + ',' + d.address + ',\'' + escapeAttr(d.product || 'USB Device') + '\')" style="padding:4px 10px;font-size:11px;">Assign</button>'
-                    + (d.assigned_to ? '<button class="btn btn-sm" onclick="wolfusbUnassign(' + d.bus + ',' + d.address + ')" style="padding:4px 10px;font-size:11px;background:rgba(239,68,68,0.1);color:#ef4444;border-color:rgba(239,68,68,0.3);">Remove</button>' : '')
+                    + '<select id="wolfusb-tgt-' + safeId + '" class="form-control" style="font-size:11px;padding:4px 8px;flex:1;">'
+                    + '<option value="">— Select —</option>' + targetOpts + '</select>'
+                    + '<button class="btn btn-sm" onclick="wolfusbAssign(\'' + escapeAttr(d.busid) + '\',\'' + escapeAttr(d.product || 'USB Device') + '\',\'' + escapeAttr(d.vendor_id + ':' + d.product_id) + '\',\'' + escapeAttr(sourceId) + '\',\'' + escapeAttr(sourceHostname) + '\',\'' + escapeAttr(sourceAddr) + '\')" style="padding:4px 10px;font-size:11px;">Assign</button>'
+                    + (d.assigned_to ? '<button class="btn btn-sm" onclick="wolfusbUnassign(\'' + escapeAttr(d.busid) + '\',\'' + escapeAttr(sourceId) + '\')" style="padding:4px 10px;font-size:11px;background:rgba(239,68,68,0.1);color:#ef4444;border-color:rgba(239,68,68,0.3);">Remove</button>' : '')
                     + '</div></td></tr>';
             });
             html += '</tbody></table>';
             body.innerHTML = html;
         }
 
-        // Render assignments
+        // Assignments table
         if (assignBody) {
             if (assignments.length === 0) {
-                assignBody.innerHTML = '<div style="color:var(--text-muted);font-size:12px;text-align:center;padding:12px;">No USB devices assigned yet.</div>';
+                assignBody.innerHTML = '<div style="color:var(--text-muted);font-size:12px;text-align:center;padding:12px;">No devices assigned yet.</div>';
             } else {
-                var ahtml = '<table class="data-table" style="width:100%;font-size:12px;"><thead><tr><th>Device</th><th>Bus:Addr</th><th>Target</th><th></th></tr></thead><tbody>';
+                var ahtml = '<table class="data-table" style="width:100%;font-size:12px;"><thead><tr><th>Device</th><th>Bus ID</th><th>From</th><th>To</th><th></th></tr></thead><tbody>';
                 assignments.forEach(function(a) {
-                    var typeIcon = a.target_type === 'docker' ? '🐳' : a.target_type === 'lxc' ? '📦' : '🖥️';
+                    var icon = a.target_type === 'docker' ? '🐳' : a.target_type === 'lxc' ? '📦' : '🖥️';
                     ahtml += '<tr>'
-                        + '<td>' + escapeHtml(a.label || 'USB Device') + '</td>'
-                        + '<td style="font-family:monospace;">' + a.bus + ':' + a.address + '</td>'
-                        + '<td>' + typeIcon + ' ' + escapeHtml(a.target_type) + ':' + escapeHtml(a.target_name) + '</td>'
-                        + '<td><button class="btn btn-sm" onclick="wolfusbUnassign(' + a.bus + ',' + a.address + ')" style="padding:3px 8px;font-size:10px;background:rgba(239,68,68,0.1);color:#ef4444;border-color:rgba(239,68,68,0.3);">Remove</button></td>'
+                        + '<td>' + escapeHtml(a.label || a.usb_id || 'USB') + '</td>'
+                        + '<td style="font-family:monospace;">' + escapeHtml(a.busid) + '</td>'
+                        + '<td>' + escapeHtml(a.source_hostname || '?') + '</td>'
+                        + '<td>' + icon + ' ' + escapeHtml(a.target_name) + ' <span style="color:var(--text-muted);font-size:10px;">on ' + escapeHtml(a.target_hostname || '?') + '</span></td>'
+                        + '<td><button class="btn btn-sm" onclick="wolfusbUnassign(\'' + escapeAttr(a.busid) + '\',\'' + escapeAttr(a.source_node_id) + '\')" style="padding:3px 8px;font-size:10px;background:rgba(239,68,68,0.1);color:#ef4444;border-color:rgba(239,68,68,0.3);">Remove</button></td>'
                         + '</tr>';
                 });
                 ahtml += '</tbody></table>';
@@ -34710,82 +34674,77 @@ async function refreshWolfUsbDevices() {
             }
         }
     } catch (e) {
-        body.innerHTML = '<div style="color:var(--danger);font-size:12px;padding:12px;">Failed to load devices: ' + escapeHtml(e.message) + '</div>';
+        body.innerHTML = '<div style="color:var(--danger);font-size:12px;padding:12px;">Failed: ' + escapeHtml(e.message) + '</div>';
     }
 }
 
-async function _wolfusbGetTargets() {
-    // Fetch Docker, LXC, and VM lists for the target dropdown
+async function _wolfusbGetClusterTargets() {
+    // Fetch infrastructure tree (all nodes' containers/VMs) for the target dropdown
     var opts = '';
     try {
-        var results = await Promise.allSettled([
-            fetch(apiUrl('/api/containers/docker')).then(function(r) { return r.ok ? r.json() : []; }),
-            fetch(apiUrl('/api/containers/lxc')).then(function(r) { return r.ok ? r.json() : []; }),
-            fetch(apiUrl('/api/vms')).then(function(r) { return r.ok ? r.json() : []; }),
-        ]);
-        var docker = results[0].status === 'fulfilled' ? results[0].value : [];
-        var lxc = results[1].status === 'fulfilled' ? results[1].value : [];
-        var vms = results[2].status === 'fulfilled' ? results[2].value : [];
+        var resp = await fetch('/api/wolfflow/infrastructure');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        var infra = await resp.json();
 
-        if (docker.length) {
-            opts += '<optgroup label="Docker Containers">';
-            docker.forEach(function(c) { opts += '<option value="docker:' + escapeAttr(c.name) + '">🐳 ' + escapeHtml(c.name) + '</option>'; });
-            opts += '</optgroup>';
-        }
-        if (lxc.length) {
-            opts += '<optgroup label="LXC Containers">';
-            lxc.forEach(function(c) { opts += '<option value="lxc:' + escapeAttr(c.name) + '">📦 ' + escapeHtml(c.name) + '</option>'; });
-            opts += '</optgroup>';
-        }
-        if (vms.length) {
-            opts += '<optgroup label="Virtual Machines">';
-            vms.forEach(function(v) { opts += '<option value="vm:' + escapeAttr(v.name) + '">🖥️ ' + escapeHtml(v.name) + '</option>'; });
-            opts += '</optgroup>';
-        }
+        Object.keys(infra).sort().forEach(function(clusterName) {
+            (infra[clusterName] || []).forEach(function(node) {
+                var nh = node.hostname || node.id;
+                var nid = node.id;
+                var docker = node.docker || [];
+                var lxc = node.lxc || [];
+                var vms = node.vms || [];
+                if (docker.length + lxc.length + vms.length === 0) return;
+
+                opts += '<optgroup label="' + escapeAttr(nh) + '">';
+                docker.forEach(function(c) {
+                    opts += '<option value="docker|' + escapeAttr(c.name) + '|' + escapeAttr(nid) + '|' + escapeAttr(nh) + '">🐳 ' + escapeHtml(c.name) + '</option>';
+                });
+                lxc.forEach(function(c) {
+                    opts += '<option value="lxc|' + escapeAttr(c.name) + '|' + escapeAttr(nid) + '|' + escapeAttr(nh) + '">📦 ' + escapeHtml(c.name) + '</option>';
+                });
+                vms.forEach(function(v) {
+                    opts += '<option value="vm|' + escapeAttr(v.name) + '|' + escapeAttr(nid) + '|' + escapeAttr(nh) + '">🖥️ ' + escapeHtml(v.name) + '</option>';
+                });
+                opts += '</optgroup>';
+            });
+        });
     } catch(e) {}
     return opts;
 }
 
-async function wolfusbAssign(bus, addr, label) {
-    var sel = document.getElementById('wolfusb-target-' + bus + '-' + addr);
+async function wolfusbAssign(busid, label, usbId, sourceNodeId, sourceHostname, sourceAddr) {
+    var safeId = busid.replace(/[^a-zA-Z0-9\-\.]/g, '_');
+    var sel = document.getElementById('wolfusb-tgt-' + safeId);
     if (!sel || !sel.value) { showToast('Select a target first', 'warning'); return; }
-    var parts = sel.value.split(':');
-    var targetType = parts[0];
-    var targetName = parts.slice(1).join(':');
+
+    // Parse "type|name|nodeId|hostname" from option value
+    var parts = sel.value.split('|');
+    var targetType = parts[0], targetName = parts[1], targetNodeId = parts[2] || '', targetHostname = parts[3] || '';
 
     try {
         var resp = await fetch(apiUrl('/api/wolfusb/assign'), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ bus: bus, address: addr, label: label, target_type: targetType, target_name: targetName }),
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                busid: busid, label: label, usb_id: usbId,
+                source_node_id: sourceNodeId, source_hostname: sourceHostname, source_address: sourceAddr,
+                target_type: targetType, target_name: targetName,
+                target_node_id: targetNodeId, target_hostname: targetHostname,
+            }),
         });
         var data = await resp.json();
-        if (data.ok) {
-            showToast(data.message || 'USB device assigned', 'success');
-            refreshWolfUsbDevices();
-        } else {
-            showToast('Failed: ' + (data.error || ''), 'error');
-        }
-    } catch (e) {
-        showToast('Failed: ' + e.message, 'error');
-    }
+        if (data.ok) { showToast(data.message || 'Assigned', 'success'); refreshWolfUsbDevices(); }
+        else { showToast('Failed: ' + (data.error || ''), 'error'); }
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
 }
 
-async function wolfusbUnassign(bus, addr) {
+async function wolfusbUnassign(busid, sourceNodeId) {
     try {
         var resp = await fetch(apiUrl('/api/wolfusb/unassign'), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ bus: bus, address: addr }),
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ busid: busid, source_node_id: sourceNodeId }),
         });
         var data = await resp.json();
-        if (data.ok) {
-            showToast(data.message || 'Assignment removed', 'success');
-            refreshWolfUsbDevices();
-        } else {
-            showToast('Failed: ' + (data.error || ''), 'error');
-        }
-    } catch (e) {
-        showToast('Failed: ' + e.message, 'error');
-    }
+        if (data.ok) { showToast(data.message || 'Removed', 'success'); refreshWolfUsbDevices(); }
+        else { showToast('Failed: ' + (data.error || ''), 'error'); }
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
 }
