@@ -1101,7 +1101,7 @@ function selectServerView(nodeId, view) {
         'pve-resources': 'VMs & Containers',
         'mysql-editor': 'Database Manager',
         'terminal': 'Terminal',
-        'wolfusb': 'USB Sharing',
+        'wolfusb': 'WolfUSB',
         'syslogs': 'System Logs',
         'security': 'Security',
         'ceph': 'Ceph',
@@ -1361,9 +1361,6 @@ function buildServerTree(nodes) {
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="terminal" onclick="selectServerView('${node.id}', 'terminal')">
                             <span class="icon">💻</span> Terminal
                         </a>
-                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="wolfusb" onclick="selectServerView('${node.id}', 'wolfusb')">
-                            <span class="icon">🔌</span> USB Sharing
-                        </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="vms" onclick="selectServerView('${node.id}', 'vms')">
                             <span class="icon">🖥️</span> Virtual Machines
                             ${node.vm_count ? `<span class="badge" style="font-size:10px; padding:1px 6px;">${node.vm_count}</span>` : ''}
@@ -1374,6 +1371,9 @@ function buildServerTree(nodes) {
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="wolfnet" onclick="selectServerView('${node.id}', 'wolfnet')">
                             <span class="icon">🔗</span> WolfNet
+                        </a>
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="wolfusb" onclick="selectServerView('${node.id}', 'wolfusb')">
+                            <span class="icon">🔌</span> WolfUSB
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="wolfram" onclick="selectServerView('${node.id}', 'wolfram')">
                             <span class="icon">🧠</span> Wolfram
