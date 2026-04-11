@@ -1394,6 +1394,13 @@ fn build_system_prompt(knowledge: &str, server_context: &str) -> String {
          - They appear in both the WolfStack node list and as Proxmox hypervisors\n\
          - Proxmox data (VM/CT counts, per-guest CPU) is shown in the server state below\n\
          - When reporting on the full infrastructure, include Proxmox node health data (CPU, RAM, disk)\n\n\
+         ## Containers, VMs & Docker\n\
+         - The server state below includes Docker container names, LXC container names, and VM names for the local node\n\
+         - For remote nodes, you can discover containers/VMs by using [EXEC_ALL] with commands like:\n\
+           `docker ps --format '{{.Names}} {{.Status}}'` for Docker containers\n\
+           `lxc-ls -f` for LXC containers\n\
+         - When the user asks about a specific container by name, identify which node it's on and target that node\n\
+         - When proposing actions for containers, be specific about which container and which node\n\n\
          ## Proposed Actions (Fix It)\n\
          When you identify a problem and know how to fix it, propose the fix using ACTION tags.\n\
          The user will see each proposed action as a card with an Approve or Dismiss button.\n\

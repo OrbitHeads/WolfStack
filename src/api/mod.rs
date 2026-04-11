@@ -5011,9 +5011,30 @@ pub async fn ai_chat(
         let ws_nodes: Vec<&crate::agent::Node> = nodes.iter().filter(|n| n.node_type != "proxmox").collect();
         let pve_nodes: Vec<&crate::agent::Node> = nodes.iter().filter(|n| n.node_type == "proxmox").collect();
 
+        // For the local node, get actual container/VM names
+        let local_docker: Vec<String> = crate::containers::docker_list_all().iter().map(|c| {
+            format!("{} [{}]", c.name, c.state)
+        }).collect();
+        let local_lxc: Vec<String> = crate::containers::lxc_list_all().iter().map(|c| {
+            format!("{} [{}]", c.name, c.state)
+        }).collect();
+        let local_vms: Vec<String> = state.vms.lock().unwrap().list_vms().iter().map(|v| {
+            format!("{} [{}]", v.name, if v.running { "running" } else { "stopped" })
+        }).collect();
+
         let node_info = ws_nodes.iter().map(|n| {
-            format!("  - {} ({}) [{}]", n.hostname, n.address,
-                if n.online { "online" } else { "offline" })
+            let mut line = format!("  - {} ({}) [{}]", n.hostname, n.address,
+                if n.online { "online" } else { "offline" });
+            if n.docker_count > 0 { line.push_str(&format!(" — {} Docker", n.docker_count)); }
+            if n.lxc_count > 0 { line.push_str(&format!(", {} LXC", n.lxc_count)); }
+            if n.vm_count > 0 { line.push_str(&format!(", {} VMs", n.vm_count)); }
+            // For the local node, include actual names
+            if n.is_self {
+                if !local_docker.is_empty() { line.push_str(&format!("\n      Docker: {}", local_docker.join(", "))); }
+                if !local_lxc.is_empty() { line.push_str(&format!("\n      LXC: {}", local_lxc.join(", "))); }
+                if !local_vms.is_empty() { line.push_str(&format!("\n      VMs: {}", local_vms.join(", "))); }
+            }
+            line
         }).collect::<Vec<_>>().join("\n");
 
         // Group PVE nodes by cluster
