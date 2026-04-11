@@ -1228,7 +1228,7 @@ fn shell_escape(s: &str) -> String {
 }
 
 /// Write an audit log entry for an action
-fn log_action_audit(action: &AiAction, event: &str, user: &str, output: &str) {
+pub fn log_action_audit(action: &AiAction, event: &str, user: &str, output: &str) {
     let log_path = format!("{}/ai-actions.log", crate::paths::get().config_dir);
     let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
     let hostname = hostname::get()

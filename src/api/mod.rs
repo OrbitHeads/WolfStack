@@ -5165,7 +5165,10 @@ pub async fn ai_chat(
     }
 }
 
-/// POST /api/ai/action — approve or reject a proposed action
+/// POST /api/ai/action — approve or reject a proposed action.
+/// Approve only marks the action as "approved" — it does NOT execute it.
+/// The terminal (console.html) fetches the command via GET /api/ai/action/command
+/// and sends it to the PTY shell, so the user sees it run live.
 #[derive(Deserialize)]
 pub struct AiActionRequest {
     pub action_id: String,
@@ -5191,29 +5194,31 @@ pub async fn ai_action(
         }
     }
 
-    // Build cluster nodes for remote execution
-    let cluster_nodes: Vec<(String, String, String, String)> = {
-        let nodes = state.cluster.get_all_nodes();
-        nodes.iter()
-            .filter(|n| !n.is_self && n.online && n.node_type != "proxmox")
-            .map(|n| {
-                let url1 = format!("http://{}:{}", n.address, n.port + 1);
-                let url2 = format!("http://{}:{}", n.address, n.port);
-                (n.id.clone(), n.hostname.clone(), url1, url2)
-            })
-            .collect()
-    };
-
-    match state.ai_agent.execute_action(&body.action_id, &username, &cluster_nodes, &state.cluster_secret).await {
-        Ok(output) => HttpResponse::Ok().json(serde_json::json!({
-            "status": "executed",
-            "output": output,
-        })),
-        Err(e) => HttpResponse::Ok().json(serde_json::json!({
-            "status": "failed",
-            "error": e,
-        })),
+    // Mark as approved (terminal will fetch and execute the command)
+    {
+        let mut pa = state.ai_agent.pending_actions.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        if let Some(a) = pa.iter_mut().find(|a| a.id == body.action_id) {
+            if a.status != "pending" {
+                return HttpResponse::BadRequest().json(serde_json::json!({
+                    "error": format!("Action already {}", a.status)
+                }));
+            }
+            if now - a.created_at > 600 {
+                a.status = "expired".to_string();
+                return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Action expired" }));
+            }
+            a.status = "approved".to_string();
+            a.approved_by = username.clone();
+            crate::ai::log_action_audit(a, "approved", &username, "");
+            return HttpResponse::Ok().json(serde_json::json!({
+                "status": "approved",
+                "command": a.command,
+            }));
+        }
     }
+
+    HttpResponse::NotFound().json(serde_json::json!({ "error": "Action not found" }))
 }
 
 /// GET /api/ai/action/command?id=xxx — retrieve the command for an approved action (one-time, for terminal auto-exec)

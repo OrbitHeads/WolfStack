@@ -174,18 +174,24 @@
                 term.focus();
 
                 // Auto-execute command if passed via ?action_id= parameter (from AI actions)
-                // Fetches the command from the server (one-time, prevents URL-based injection)
+                // Fetches the command from the server (requires approved status, prevents URL-based injection)
                 const actionId = params.get('action_id');
                 if (actionId && /^[a-zA-Z0-9\-]+$/.test(actionId)) {
                     fetch('/api/ai/action/command?id=' + encodeURIComponent(actionId))
-                        .then(r => r.json())
+                        .then(r => {
+                            if (!r.ok) throw new Error('Action not found or not approved');
+                            return r.json();
+                        })
                         .then(data => {
                             if (data.command) {
-                                term.writeln('\x1b[33m🐺 AI Action: ' + data.command + '\x1b[0m\r\n');
-                                setTimeout(() => { ws.send(data.command + '\n'); }, 500);
+                                term.writeln('\x1b[33m🐺 AI Action: ' + data.title + '\x1b[0m');
+                                term.writeln('\x1b[36m$ ' + data.command + '\x1b[0m\r\n');
+                                setTimeout(() => { ws.send(data.command + '\n'); }, 800);
                             }
                         })
-                        .catch(() => {});
+                        .catch(e => {
+                            term.writeln('\x1b[31m⚠ Failed to load AI action: ' + e.message + '\x1b[0m\r\n');
+                        });
                 }
             };
 

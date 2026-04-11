@@ -17825,8 +17825,8 @@ async function sendAiMessage() {
     if (!msg) return;
     input.value = '';
 
-    // Refresh visible infra for action target picker (await so picker is populated before actions render)
-    await _aiRefreshVisibleInfra();
+    // Refresh visible infra for action target picker (race against a 3s timeout so we don't block)
+    await Promise.race([_aiRefreshVisibleInfra(), new Promise(function(r) { setTimeout(r, 3000); })]);
 
     var messages = document.getElementById('ai-chat-messages');
 
@@ -17993,12 +17993,20 @@ async function approveAiAction(actionId) {
 
     // Mark the action as approved on the server first (required before terminal can fetch the command)
     try {
-        await fetch('/api/ai/action', {
+        var approveResp = await fetch('/api/ai/action', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action_id: actionId, approved: true })
         });
-    } catch(e) {}
+        var approveData = await approveResp.json();
+        if (approveData.error) {
+            if (btns) btns.innerHTML = '<span style="color:var(--danger);font-size:12px;font-weight:600;">' + escapeHtml(approveData.error) + '</span>';
+            return;
+        }
+    } catch(e) {
+        if (btns) btns.innerHTML = '<span style="color:var(--danger);font-size:12px;">Failed to approve: ' + escapeHtml(e.message) + '</span>';
+        return;
+    }
 
     // Open a console window — passes action_id, NOT the raw command (server-side lookup prevents injection)
     var url = '/console.html?type=' + encodeURIComponent(consoleType)
