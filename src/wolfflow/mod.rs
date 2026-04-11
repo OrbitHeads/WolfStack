@@ -1122,7 +1122,7 @@ pub async fn execute_action_local(action: &ActionType) -> Result<StepOutput, Str
         }
 
         // ─── Integration Framework action ───
-        ActionType::IntegrationAction { instance_id, operation, params } => {
+        ActionType::IntegrationAction { instance_id, operation, params: _params } => {
             let mut data = serde_json::Map::new();
             data.insert("instance_id".to_string(), serde_json::json!(instance_id));
             data.insert("operation".to_string(), serde_json::json!(operation));
@@ -1248,6 +1248,7 @@ pub async fn exec_in_vm(vm_name: &str, command: &str, timeout_secs: u64) -> Resu
 }
 
 /// Shell-quote a string for safe embedding in an SSH command
+#[allow(dead_code)]
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }

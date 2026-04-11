@@ -150,7 +150,7 @@ fn cd(days: u64) -> (u64, u64, u64) {
 /// Report license usage to Wolf Software Systems. Called once daily by a
 /// background task. Fire-and-forget — never blocks or breaks the server.
 pub async fn report_license_heartbeat(cluster: &crate::agent::ClusterState) {
-    let dm = match load_dm() {
+    let _dm = match load_dm() {
         Some(d) => d,
         None => return, // no valid license — nothing to report
     };

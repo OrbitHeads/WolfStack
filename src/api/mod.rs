@@ -9929,9 +9929,11 @@ pub async fn wolfusb_assign(req: HttpRequest, state: web::Data<AppState>, body: 
         self_node.as_ref().map(|n| n.address.clone()).unwrap_or_default()
     };
 
+    let effective_source_id = if source_node_id.is_empty() { self_id } else { source_node_id };
+
     match crate::wolfusb::assign_device(
         &mut config, busid, label, usb_id,
-        if source_node_id.is_empty() { self_id } else { source_node_id },
+        effective_source_id,
         source_hostname, &effective_address,
         target_type, target_name,
         target_node_id, target_hostname,
@@ -9939,6 +9941,46 @@ pub async fn wolfusb_assign(req: HttpRequest, state: web::Data<AppState>, body: 
     ) {
         Ok(msg) => {
             wolfusb_broadcast_sync(&state);
+
+            // If the target is a REMOTE node, trigger the attach on that node
+            let is_local_target = target_node_id == self_id || target_node_id.is_empty();
+            if !is_local_target && !target_node_id.is_empty() {
+                let nodes = state.cluster.get_all_nodes();
+                if let Some(target_node) = nodes.iter().find(|n| n.id == target_node_id) {
+                    let urls = crate::api::build_node_urls(&target_node.address, target_node.port, "/api/wolfusb/attach");
+                    let secret = state.cluster_secret.clone();
+                    let client = reqwest::Client::new();
+                    let body = serde_json::json!({
+                        "source_address": effective_address,
+                        "busid": busid,
+                        "target_type": target_type,
+                        "target_name": target_name,
+                    });
+                    tokio::spawn(async move {
+                        for url in &urls {
+                            match client.post(url)
+                                .header("X-WolfStack-Secret", &secret)
+                                .json(&body)
+                                .timeout(std::time::Duration::from_secs(30))
+                                .send()
+                                .await
+                            {
+                                Ok(resp) if resp.status().is_success() => {
+                                    tracing::info!("WolfUSB: remote attach triggered on target node");
+                                    break;
+                                }
+                                Ok(resp) => {
+                                    tracing::warn!("WolfUSB: remote attach returned {}", resp.status());
+                                }
+                                Err(e) => {
+                                    tracing::warn!("WolfUSB: remote attach failed ({}): {}", url, e);
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+
             HttpResponse::Ok().json(serde_json::json!({ "ok": true, "message": msg }))
         }
         Err(e) => HttpResponse::Ok().json(serde_json::json!({ "ok": false, "error": e })),

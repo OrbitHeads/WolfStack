@@ -18,8 +18,6 @@ use std::process::Command as StdCommand;
 use std::time::Duration;
 
 fn ai_config_path() -> String { crate::paths::get().ai_config }
-const KNOWLEDGE_DIR: &str = "/opt/wolfscale/web";
-const KNOWLEDGE_DIR_DEV: &str = "../wolfscale/web";
 
 // ─── Configuration ───
 
@@ -421,6 +419,7 @@ impl AiAgent {
     }
 
     /// Execute an approved action by ID. Returns the command output.
+    #[allow(dead_code)]
     pub async fn execute_action(
         &self,
         action_id: &str,
@@ -798,174 +797,12 @@ impl AiAgent {
 // ─── Knowledge Base ───
 
 fn load_knowledge_base() -> String {
-    let mut knowledge = String::new();
-
-    let kb_dest = "/etc/wolfstack/knowledge/wolfstack-kb.md";
-
-    // Load the expert knowledge base first (shipped with WolfStack)
-    let kb_paths = [
-        kb_dest,
-        "knowledge/wolfstack-kb.md",
-        "../knowledge/wolfstack-kb.md",
-    ];
-    for kb_path in &kb_paths {
-        if let Ok(content) = std::fs::read_to_string(kb_path) {
-            if !content.trim().is_empty() {
-                knowledge.push_str(&content);
-                tracing::info!("Loaded expert knowledge base from {} ({} bytes)", kb_path, content.len());
-                break;
-            }
-        }
-    }
-
-    // If no knowledge base found, try downloading it from GitHub
-    if knowledge.is_empty() {
-        tracing::info!("AI knowledge base not found locally — downloading from GitHub...");
-        let _ = std::fs::create_dir_all("/etc/wolfstack/knowledge");
-        let url = "https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfStack/master/knowledge/wolfstack-kb.md";
-        match std::process::Command::new("curl")
-            .args(["-fsSL", "--connect-timeout", "10", "--max-time", "30", "-o", kb_dest, url])
-            .status()
-        {
-            Ok(s) if s.success() => {
-                if let Ok(content) = std::fs::read_to_string(kb_dest) {
-                    if !content.trim().is_empty() {
-                        tracing::info!("Downloaded AI knowledge base ({} bytes)", content.len());
-                        knowledge.push_str(&content);
-                    }
-                }
-            }
-            Ok(s) => tracing::warn!("Failed to download knowledge base (exit {})", s),
-            Err(e) => tracing::warn!("Failed to download knowledge base: {}", e),
-        }
-    }
-
-    // Also load wolfscale web files for additional context
-    let dirs = [KNOWLEDGE_DIR, KNOWLEDGE_DIR_DEV, "wolfscale/web", "../wolfscale/web"];
-    let mut found_dir = None;
-
-    for dir in &dirs {
-        let path = std::path::Path::new(dir);
-        if path.exists() && path.is_dir() {
-            found_dir = Some(dir.to_string());
-            break;
-        }
-    }
-
-    let dir = match found_dir {
-        Some(d) => d,
-        None => {
-            warn!("AI knowledge base directory not found, AI will have limited knowledge");
-            return "WolfStack is a server management platform by Wolf Software Systems Ltd.".to_string();
-        }
-    };
-
-    // Read all HTML files and extract text
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().map(|e| e == "html").unwrap_or(false) {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    let filename = path.file_stem().unwrap_or_default().to_string_lossy();
-                    let text = strip_html_tags(&content);
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() && trimmed.len() > 50 {
-                        knowledge.push_str(&format!("\n\n=== {} ===\n{}", filename.to_uppercase(), trimmed));
-                    }
-                }
-            }
-        }
-    }
-
-    if knowledge.is_empty() {
-        "WolfStack is a server management platform by Wolf Software Systems Ltd.".to_string()
-    } else {
-        // Truncate to ~60KB to keep context lean and responses fast
-        if knowledge.len() > 60_000 {
-            knowledge.truncate(60_000);
-        }
-        knowledge
-    }
+    // Knowledge base is compiled into the binary — always available, no file I/O needed
+    let knowledge = include_str!("wolfstack-kb.md").to_string();
+    tracing::info!("Loaded embedded knowledge base ({} bytes)", knowledge.len());
+    knowledge
 }
 
-/// Strip HTML tags and return plain text
-fn strip_html_tags(html: &str) -> String {
-    let mut result = String::new();
-    let mut in_tag = false;
-    let mut in_script = false;
-    let mut in_style = false;
-    let lower = html.to_lowercase();
-    let chars: Vec<char> = html.chars().collect();
-    let lower_chars: Vec<char> = lower.chars().collect();
-
-    let mut i = 0;
-    while i < chars.len() {
-        if !in_tag && i + 7 < lower_chars.len() {
-            let slice: String = lower_chars[i..i+7].iter().collect();
-            if slice == "<script" { in_script = true; }
-            if slice == "<style " || (i + 6 < lower_chars.len() && lower_chars[i..i+6].iter().collect::<String>() == "<style") {
-                in_style = true;
-            }
-        }
-
-        if chars[i] == '<' {
-            // Check for end of script/style
-            if in_script && i + 9 < lower_chars.len() {
-                let slice: String = lower_chars[i..i+9].iter().collect();
-                if slice == "</script>" { in_script = false; }
-            }
-            if in_style && i + 8 < lower_chars.len() {
-                let slice: String = lower_chars[i..i+8].iter().collect();
-                if slice == "</style>" { in_style = false; }
-            }
-            in_tag = true;
-        } else if chars[i] == '>' {
-            in_tag = false;
-        } else if !in_tag && !in_script && !in_style {
-            result.push(chars[i]);
-        }
-        i += 1;
-    }
-
-    // Clean up excessive whitespace
-    let mut cleaned = String::new();
-    let mut last_was_space = false;
-    let mut newline_count = 0;
-    for c in result.chars() {
-        if c == '\n' || c == '\r' {
-            newline_count += 1;
-            if newline_count <= 2 {
-                cleaned.push('\n');
-            }
-            last_was_space = true;
-        } else if c.is_whitespace() {
-            if !last_was_space {
-                cleaned.push(' ');
-            }
-            last_was_space = true;
-            newline_count = 0;
-        } else {
-            cleaned.push(c);
-            last_was_space = false;
-            newline_count = 0;
-        }
-    }
-
-    // Decode common HTML entities
-    cleaned
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&mdash;", "—")
-        .replace("&ndash;", "–")
-        .replace("&nbsp;", " ")
-        .replace("&rsquo;", "'")
-        .replace("&lsquo;", "'")
-        .replace("&rdquo;", "\u{201d}")
-        .replace("&ldquo;", "\u{201c}")
-}
 
 // ─── Safe Command Execution ───
 
