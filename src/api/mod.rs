@@ -9813,21 +9813,21 @@ pub async fn user_prefs_patch(req: HttpRequest, state: web::Data<AppState>, body
 
 // ─── WolfUSB API ───
 
-/// GET /api/wolfusb/status — usbip availability, config, assignments
+/// GET /api/wolfusb/status — wolfusb availability, config, assignments
 pub async fn wolfusb_status(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let config = crate::wolfusb::WolfUsbConfig::load();
     HttpResponse::Ok().json(serde_json::json!({
-        "usbip_available": crate::wolfusb::is_usbip_available(),
+        "usbip_available": crate::wolfusb::is_wolfusb_available(),
         "enabled": config.enabled,
         "assignment_count": config.assignments.len(),
     }))
 }
 
-/// POST /api/wolfusb/install — install usbip tools
+/// POST /api/wolfusb/install — install wolfusb tools
 pub async fn wolfusb_install(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    match crate::wolfusb::install_usbip().await {
+    match crate::wolfusb::install_wolfusb().await {
         Ok(output) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "output": output })),
         Err(e) => HttpResponse::Ok().json(serde_json::json!({ "ok": false, "error": e })),
     }
@@ -9888,12 +9888,11 @@ fn wolfusb_broadcast_sync(state: &web::Data<AppState>) {
 pub async fn wolfusb_devices(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let config = crate::wolfusb::WolfUsbConfig::load();
-    let devices = crate::wolfusb::list_local_devices(&config);
-    let attached = crate::wolfusb::list_attached();
+    let (devices, wolfusb_working) = crate::wolfusb::list_local_devices_with_status(&config);
     HttpResponse::Ok().json(serde_json::json!({
         "devices": devices,
         "assignments": config.assignments,
-        "attached": attached,
+        "wolfusb_working": wolfusb_working,
     }))
 }
 

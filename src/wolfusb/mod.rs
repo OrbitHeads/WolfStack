@@ -2,23 +2,36 @@
 // (C)Copyright Wolf Software Systems Ltd
 // https://wolf.uk.com
 
-//! WolfUSB Integration — USB-over-IP device sharing across the cluster
+//! WolfUSB Integration — USB device sharing across the cluster
 //!
-//! Uses the Linux kernel's built-in `usbip` module to share USB devices across
-//! nodes. WolfStack manages discovery, assignment, and auto-reconnection.
-//! Devices appear as real USB in `lsusb` inside containers and VMs.
+//! Uses the standalone `wolfusb` binary (https://github.com/wolfsoftwaresystemsltd/wolfusb)
+//! which provides USB-over-IP via libusb with its own authenticated protocol.
 //!
 //! Architecture:
-//! - Source node: runs `usbip bind` to export the physical USB device
-//! - Target node: runs `usbip attach` to create a virtual USB device locally
-//! - The virtual device is then passed into the container/VM via standard mechanisms
-//!   (Docker --device, LXC cgroup+mount, QEMU USB passthrough)
+//! - Each node runs `wolfusb server` (managed via systemd or direct spawn)
+//! - WolfStack queries the local wolfusb server for device discovery
+//! - Assignments are stored in WolfStack config and synced across the cluster
+//! - Local passthrough uses /dev/bus/usb directly (Docker --device, LXC mount, QEMU)
+//! - Remote access uses the wolfusb protocol with cluster secret as the auth key
 
 use serde::{Deserialize, Serialize};
 use std::process::Command;
+use std::sync::OnceLock;
 use tracing::{info, warn};
 
 fn config_path() -> String { format!("{}/wolfusb.json", crate::paths::get().config_dir) }
+
+/// Cluster secret stored at init time, used as the wolfusb auth key
+static CLUSTER_SECRET: OnceLock<String> = OnceLock::new();
+
+/// Initialize the WolfUSB module with the cluster secret (call from main.rs)
+pub fn init(cluster_secret: &str) {
+    let _ = CLUSTER_SECRET.set(cluster_secret.to_string());
+}
+
+fn get_secret() -> &'static str {
+    CLUSTER_SECRET.get().map(|s| s.as_str()).unwrap_or("")
+}
 
 // ─── Configuration ───
 
@@ -36,10 +49,7 @@ fn default_true() -> bool { true }
 
 impl Default for WolfUsbConfig {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            assignments: Vec::new(),
-        }
+        Self { enabled: true, assignments: Vec::new() }
     }
 }
 
@@ -67,7 +77,7 @@ impl WolfUsbConfig {
 /// Assignment of a USB device to a container/VM (possibly on another node)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsbAssignment {
-    /// USB bus ID string for usbip (e.g. "1-2")
+    /// USB bus ID string (e.g. "wolfusb-1-2")
     pub busid: String,
     /// Friendly label (e.g. "Logitech Webcam")
     #[serde(default)]
@@ -80,7 +90,7 @@ pub struct UsbAssignment {
     /// Source node hostname (for display)
     #[serde(default)]
     pub source_hostname: String,
-    /// Source node address (IP/hostname for usbip connection)
+    /// Source node address (IP/hostname for wolfusb connection)
     pub source_address: String,
     /// Target type: "docker", "lxc", "vm"
     pub target_type: String,
@@ -91,10 +101,13 @@ pub struct UsbAssignment {
     /// Target node hostname (for display)
     #[serde(default)]
     pub target_hostname: String,
-    /// Whether this assignment is currently active (usbip attached)
+    /// Whether this assignment is currently active
     #[serde(default)]
     pub active: bool,
-    /// The virtual USB bus path on the target node (set after usbip attach)
+    /// WolfUSB session ID (returned by wolfusb attach, needed for detach)
+    #[serde(default)]
+    pub session_id: Option<u64>,
+    /// Legacy field — kept for config compat
     #[serde(default)]
     pub virtual_busid: Option<String>,
 }
@@ -103,7 +116,7 @@ pub struct UsbAssignment {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsbDevice {
-    /// usbip bus ID (e.g. "1-2", "2-1.3")
+    /// Bus ID (e.g. "wolfusb-1-2")
     pub busid: String,
     pub vendor_id: String,
     pub product_id: String,
@@ -112,191 +125,294 @@ pub struct UsbDevice {
     pub assigned_to: Option<String>,
 }
 
-// ─── usbip Kernel Module Management ───
+// ─── WolfUSB Binary Management ───
 
-/// Ensure the usbip kernel modules are loaded
-pub fn ensure_usbip_modules() -> Result<(), String> {
-    // Load usbip-host (for exporting devices) and vhci-hcd (for importing)
-    for module in &["usbip-core", "usbip-host", "vhci-hcd"] {
-        let status = Command::new("modprobe").arg(module).status();
-        match status {
-            Ok(s) if s.success() => {}
-            Ok(s) => {
-                // Not fatal — the module might already be built-in
-                warn!("WolfUSB: modprobe {} exited with {}", module, s);
-            }
-            Err(e) => {
-                warn!("WolfUSB: failed to load module {}: {}", module, e);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Check if usbip is available (binary in PATH or kernel modules loaded)
-pub fn is_usbip_available() -> bool {
-    // Check for binary via shell (more reliable than `which` across distros)
-    if Command::new("sh").args(["-c", "command -v usbip"]).output()
+/// Find the wolfusb binary
+fn find_wolfusb_binary() -> Option<String> {
+    // Check PATH
+    if Command::new("sh").args(["-c", "command -v wolfusb"]).output()
         .map(|o| o.status.success()).unwrap_or(false)
     {
-        return true;
-    }
-    // Check common paths directly
-    if std::path::Path::new("/usr/local/bin/usbip").exists()
-        || std::path::Path::new("/usr/sbin/usbip").exists()
-    {
-        return true;
-    }
-    // Check if kernel module is loaded
-    std::path::Path::new("/sys/module/usbip_host").exists()
-}
-
-/// Ensure the usbipd daemon is running (required for remote nodes to attach/list devices)
-pub fn ensure_usbipd_running() -> Result<(), String> {
-    // Check if usbipd is already listening on port 3240
-    let check = Command::new("sh")
-        .args(["-c", "ss -tlnp 2>/dev/null | grep ':3240 ' || netstat -tlnp 2>/dev/null | grep ':3240 '"])
-        .output();
-    if let Ok(o) = &check {
-        if o.status.success() && !o.stdout.is_empty() {
-            return Ok(()); // Already running
-        }
-    }
-
-    // Find the usbipd binary
-    let usbipd = find_usbipd_binary();
-    let binary = match &usbipd {
-        Some(b) => b.as_str(),
-        None => {
-            warn!("WolfUSB: usbipd binary not found — remote USB sharing will not work");
-            return Err("usbipd binary not found".to_string());
-        }
-    };
-
-    info!("WolfUSB: starting usbipd daemon on port 3240");
-    let result = Command::new(binary).args(["-D"]).status();
-    match result {
-        Ok(s) if s.success() => {
-            info!("WolfUSB: usbipd daemon started");
-            Ok(())
-        }
-        Ok(s) => {
-            let msg = format!("usbipd exited with {}", s);
-            warn!("WolfUSB: {}", msg);
-            Err(msg)
-        }
-        Err(e) => {
-            let msg = format!("Failed to start usbipd: {}", e);
-            warn!("WolfUSB: {}", msg);
-            Err(msg)
-        }
-    }
-}
-
-/// Find the usbipd binary (may be in different locations across distros)
-fn find_usbipd_binary() -> Option<String> {
-    // Check PATH first
-    if Command::new("sh").args(["-c", "command -v usbipd"]).output()
-        .map(|o| o.status.success()).unwrap_or(false)
-    {
-        return Some("usbipd".to_string());
+        return Some("wolfusb".to_string());
     }
     // Common locations
-    for path in &["/usr/sbin/usbipd", "/usr/local/bin/usbipd", "/usr/lib/linux-tools/usbipd"] {
+    for path in &["/usr/local/bin/wolfusb", "/usr/bin/wolfusb", "/opt/wolfusb/wolfusb"] {
         if std::path::Path::new(path).exists() {
             return Some(path.to_string());
-        }
-    }
-    // On some distros, usbipd is part of the usbip package under linux-tools
-    if let Ok(o) = Command::new("sh").args(["-c", "find /usr/lib/linux-tools/ -name usbipd 2>/dev/null | head -1"]).output() {
-        let path = String::from_utf8_lossy(&o.stdout).trim().to_string();
-        if !path.is_empty() && std::path::Path::new(&path).exists() {
-            return Some(path);
         }
     }
     None
 }
 
-/// Install usbip tools — handles Arch, Debian, Ubuntu, Proxmox, Fedora, RHEL, openSUSE
-pub async fn install_usbip() -> Result<String, String> {
-    info!("WolfUSB: installing usbip tools");
+/// Check if the wolfusb binary is available
+pub fn is_wolfusb_available() -> bool {
+    find_wolfusb_binary().is_some()
+}
+
+/// Run a wolfusb command with the cluster secret as auth key
+fn run_wolfusb(args: &[&str]) -> Result<String, String> {
+    let binary = find_wolfusb_binary()
+        .ok_or_else(|| "wolfusb binary not found".to_string())?;
+
+    let secret = get_secret();
+    let mut cmd = Command::new(&binary);
+    cmd.args(args);
+    if !secret.is_empty() {
+        cmd.arg("--key").arg(secret);
+    }
+
+    let output = cmd.output().map_err(|e| format!("Failed to run wolfusb: {}", e))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(format!("wolfusb failed: {}", stderr))
+    }
+}
+
+/// Ensure the wolfusb server is running on this node
+pub fn ensure_wolfusb_server() {
+    // Check if already running via systemctl
+    if let Ok(o) = Command::new("systemctl").args(["is-active", "--quiet", "wolfusb"]).status() {
+        if o.success() { return; } // Already running
+    }
+
+    // Check if port 3240 is already in use
+    if let Ok(o) = Command::new("sh")
+        .args(["-c", "ss -tlnp 2>/dev/null | grep -q ':3240 '"])
+        .status()
+    {
+        if o.success() { return; } // Something already listening
+    }
+
+    // Write the cluster secret to the wolfusb env file so systemd picks it up
+    let secret = get_secret();
+    if !secret.is_empty() {
+        let _ = std::fs::create_dir_all("/etc/wolfusb");
+        let env_content = format!("WOLFUSB_BIND=0.0.0.0\nWOLFUSB_PORT=3240\nWOLFUSB_KEY={}\n", secret);
+        let _ = std::fs::write("/etc/wolfusb/wolfusb.env", &env_content);
+    }
+
+    // Try systemctl start first
+    if let Ok(o) = Command::new("systemctl").args(["start", "wolfusb"]).status() {
+        if o.success() {
+            info!("WolfUSB: started wolfusb server via systemctl");
+            return;
+        }
+    }
+
+    // Fallback: spawn directly
+    if let Some(binary) = find_wolfusb_binary() {
+        let mut cmd = Command::new(&binary);
+        cmd.args(["server", "--port", "3240"]);
+        if !secret.is_empty() {
+            cmd.arg("--key").arg(secret);
+        }
+        match cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(_) => info!("WolfUSB: spawned wolfusb server directly on port 3240"),
+            Err(e) => warn!("WolfUSB: failed to start wolfusb server: {}", e),
+        }
+    } else {
+        warn!("WolfUSB: wolfusb binary not found — USB sharing unavailable");
+    }
+}
+
+// ─── Device Operations ───
+
+/// JSON structure returned by `wolfusb list --json`
+#[derive(Debug, Deserialize)]
+struct WolfUsbDeviceJson {
+    device_id: WolfUsbDeviceIdJson,
+    vendor_id: u16,
+    product_id: u16,
+    manufacturer: Option<String>,
+    product: Option<String>,
+    #[allow(dead_code)]
+    serial_number: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WolfUsbDeviceIdJson {
+    bus_number: u8,
+    address: u8,
+}
+
+/// List USB devices on this node. Returns (devices, wolfusb_working).
+pub fn list_local_devices_with_status(config: &WolfUsbConfig) -> (Vec<UsbDevice>, bool) {
+    // Try wolfusb list --json against the local server
+    match run_wolfusb(&["list", "--server", "127.0.0.1:3240", "--json"]) {
+        Ok(json_str) => {
+            match serde_json::from_str::<Vec<WolfUsbDeviceJson>>(&json_str) {
+                Ok(raw_devices) => {
+                    let devices = raw_devices.into_iter()
+                        .filter(|d| d.vendor_id != 0x1d6b) // Filter root hubs
+                        .map(|d| {
+                            let busid = format!("wolfusb-{}-{}", d.device_id.bus_number, d.device_id.address);
+                            let usb_id = format!("{:04x}:{:04x}", d.vendor_id, d.product_id);
+                            let product = match (&d.manufacturer, &d.product) {
+                                (Some(m), Some(p)) => format!("{} : {} ({usb_id})", m, p),
+                                (None, Some(p)) => format!("{} ({usb_id})", p),
+                                (Some(m), None) => format!("{} ({usb_id})", m),
+                                (None, None) => format!("USB Device ({usb_id})"),
+                            };
+                            let assigned = config.assignments.iter()
+                                .find(|a| a.busid == busid || a.usb_id == usb_id)
+                                .map(|a| format!("{}:{} on {}", a.target_type, a.target_name, a.target_hostname));
+                            UsbDevice {
+                                busid,
+                                vendor_id: format!("{:04x}", d.vendor_id),
+                                product_id: format!("{:04x}", d.product_id),
+                                product,
+                                assigned_to: assigned,
+                            }
+                        })
+                        .collect();
+                    (devices, true)
+                }
+                Err(e) => {
+                    warn!("WolfUSB: failed to parse device list JSON: {}", e);
+                    (Vec::new(), false)
+                }
+            }
+        }
+        Err(e) => {
+            warn!("WolfUSB: wolfusb list failed: {}", e);
+            (Vec::new(), false)
+        }
+    }
+}
+
+/// Parse "wolfusb-BUS-ADDR" into (bus, addr)
+fn parse_busid(busid: &str) -> Result<(u8, u8), String> {
+    let stripped = busid.strip_prefix("wolfusb-").unwrap_or(busid);
+    let parts: Vec<&str> = stripped.splitn(2, '-').collect();
+    if parts.len() != 2 {
+        return Err(format!("Invalid busid format: {}", busid));
+    }
+    let bus: u8 = parts[0].parse().map_err(|_| format!("Invalid bus number in {}", busid))?;
+    let addr: u8 = parts[1].parse().map_err(|_| format!("Invalid address in {}", busid))?;
+    Ok((bus, addr))
+}
+
+/// Find the /dev/bus/usb path for a device by bus:addr
+fn find_dev_path(busid: &str) -> Option<String> {
+    let (bus, addr) = parse_busid(busid).ok()?;
+    let path = format!("/dev/bus/usb/{:03}/{:03}", bus, addr);
+    if std::path::Path::new(&path).exists() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+/// Attach to a remote USB device via the wolfusb protocol
+fn wolfusb_attach_device(source_address: &str, busid: &str) -> Result<u64, String> {
+    let (bus, addr) = parse_busid(busid)?;
+    let server = format!("{}:3240", source_address);
+
+    let output = run_wolfusb(&[
+        "attach",
+        "--server", &server,
+        "--bus", &bus.to_string(),
+        "--addr", &addr.to_string(),
+    ])?;
+
+    // Parse session_id from output: "Attached to X:Y, session_id = NNN"
+    if let Some(sid_str) = output.split("session_id = ").nth(1) {
+        if let Ok(sid) = sid_str.trim().parse::<u64>() {
+            return Ok(sid);
+        }
+    }
+    // If we can't parse the session_id, the attach still succeeded
+    warn!("WolfUSB: attached but could not parse session_id from: {}", output.trim());
+    Ok(0)
+}
+
+/// Detach from a remote USB device
+fn wolfusb_detach_device(source_address: &str, busid: &str, session_id: u64) -> Result<(), String> {
+    let (bus, addr) = parse_busid(busid)?;
+    let server = format!("{}:3240", source_address);
+
+    run_wolfusb(&[
+        "detach",
+        "--server", &server,
+        "--bus", &bus.to_string(),
+        "--addr", &addr.to_string(),
+        "--session-id", &session_id.to_string(),
+    ])?;
+    Ok(())
+}
+
+// ─── Install ───
+
+/// Install the wolfusb binary and set up the systemd service
+pub async fn install_wolfusb() -> Result<String, String> {
+    info!("WolfUSB: installing wolfusb");
     let script = r#"
-KERNEL="$(uname -r)"
-echo "Kernel: $KERNEL"
+set -e
 
-# ─── Arch / CachyOS / Manjaro ───
+# ─── Install libusb (required by wolfusb) ───
 if command -v pacman >/dev/null 2>&1; then
-    echo "Detected: Arch-based (pacman)"
-    pacman -S --noconfirm usbip 2>/dev/null || true
-
-# ─── Debian / Ubuntu / Proxmox VE ───
+    echo "Installing libusb via pacman..."
+    pacman -S --noconfirm libusb 2>/dev/null || true
 elif command -v apt-get >/dev/null 2>&1; then
-    echo "Detected: Debian/Ubuntu-based (apt)"
-    apt-get update -y || true
-    # Debian, Proxmox: package is simply "usbip"
-    # Ubuntu: "usbip" or "linux-tools-generic" + "linux-tools-$KERNEL"
-    apt-get install -y usbip 2>/dev/null \
-        || apt-get install -y linux-tools-generic "linux-tools-$KERNEL" 2>/dev/null \
-        || apt-get install -y linux-tools-common 2>/dev/null \
-        || true
-
-# ─── Fedora / RHEL / Rocky / AlmaLinux ───
+    echo "Installing libusb via apt..."
+    apt-get update -qq && apt-get install -y libusb-1.0-0 2>/dev/null || true
 elif command -v dnf >/dev/null 2>&1; then
-    echo "Detected: Fedora/RHEL-based (dnf)"
-    dnf install -y usbip-utils 2>/dev/null || true
-
-# ─── openSUSE ───
+    echo "Installing libusb via dnf..."
+    dnf install -y libusbx 2>/dev/null || libusb1 2>/dev/null || true
 elif command -v zypper >/dev/null 2>&1; then
-    echo "Detected: openSUSE (zypper)"
-    zypper install -y usbip-utils 2>/dev/null || zypper install -y usbip 2>/dev/null || true
+    echo "Installing libusb via zypper..."
+    zypper install -y libusb-1_0-0 2>/dev/null || true
+fi
 
+# ─── Install wolfusb binary ───
+if command -v wolfusb >/dev/null 2>&1; then
+    echo "wolfusb already installed at $(command -v wolfusb)"
+    wolfusb --version 2>/dev/null || true
 else
-    echo "ERROR: No supported package manager found"
+    echo "Downloading wolfusb..."
+    curl -fsSL https://raw.githubusercontent.com/wolfsoftwaresystemsltd/wolfusb/main/setup.sh | bash
 fi
 
-# ─── Load kernel modules ───
-modprobe usbip-core 2>/dev/null || true
-modprobe usbip-host 2>/dev/null || true
-modprobe vhci-hcd 2>/dev/null || true
+# ─── Set up udev rules for USB access ───
+mkdir -p /etc/udev/rules.d
+echo 'SUBSYSTEM=="usb", MODE="0666", GROUP="plugdev"' > /etc/udev/rules.d/99-wolfusb.rules
+udevadm control --reload-rules 2>/dev/null || true
 
-# ─── Persist modules across reboots ───
-mkdir -p /etc/modules-load.d
-printf 'usbip-core\nusbip-host\nvhci-hcd\n' > /etc/modules-load.d/wolfusb.conf 2>/dev/null || true
+# ─── Install systemd service if not present ───
+if [ ! -f /etc/systemd/system/wolfusb.service ]; then
+    if [ -x /usr/local/bin/install-service.sh ]; then
+        /usr/local/bin/install-service.sh
+    elif command -v wolfusb >/dev/null 2>&1; then
+        cat > /etc/systemd/system/wolfusb.service << 'UNIT'
+[Unit]
+Description=WolfUSB Server
+After=network.target
 
-# ─── Find binary if not in PATH (Ubuntu puts it under /usr/lib/linux-tools/) ───
-if ! command -v usbip >/dev/null 2>&1; then
-    for p in /usr/lib/linux-tools/"$KERNEL"/usbip /usr/lib/linux-tools/*/usbip /usr/sbin/usbip; do
-        if [ -x "$p" ]; then
-            echo "Found usbip at $p — creating symlink to /usr/local/bin/usbip"
-            ln -sf "$p" /usr/local/bin/usbip
-            break
-        fi
-    done
+[Service]
+Type=simple
+EnvironmentFile=-/etc/wolfusb/wolfusb.env
+ExecStart=/usr/local/bin/wolfusb server --bind ${WOLFUSB_BIND:-0.0.0.0} --port ${WOLFUSB_PORT:-3240}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+        systemctl daemon-reload
+    fi
 fi
 
-# ─── Start usbipd daemon ───
-if command -v usbipd >/dev/null 2>&1; then
-    # Kill any existing instance and restart
-    killall usbipd 2>/dev/null || true
-    usbipd -D 2>/dev/null && echo "OK: usbipd daemon started on port 3240" || echo "WARNING: failed to start usbipd"
-elif [ -x /usr/sbin/usbipd ]; then
-    killall usbipd 2>/dev/null || true
-    /usr/sbin/usbipd -D 2>/dev/null && echo "OK: usbipd daemon started on port 3240" || echo "WARNING: failed to start usbipd"
-else
-    echo "WARNING: usbipd binary not found — remote USB sharing requires usbipd"
-fi
+# ─── Enable and start ───
+systemctl enable wolfusb 2>/dev/null || true
+systemctl start wolfusb 2>/dev/null || true
 
-# ─── Verify ───
-if command -v usbip >/dev/null 2>&1; then
-    echo "OK: usbip installed at $(command -v usbip)"
-    usbip version 2>/dev/null || true
-elif [ -d /sys/module/usbip_host ]; then
-    echo "OK: usbip kernel modules loaded but binary not found in PATH"
-else
-    echo "WARNING: usbip installation may be incomplete"
-    echo "Modules in /lib/modules/$KERNEL/kernel/drivers/usb/usbip/:"
-    ls /lib/modules/"$KERNEL"/kernel/drivers/usb/usbip/ 2>/dev/null || echo "  (none)"
-fi
+echo "OK: wolfusb installation complete"
     "#;
 
     let output = tokio::process::Command::new("bash")
@@ -312,304 +428,16 @@ fi
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Try loading modules after install
-    let _ = ensure_usbip_modules();
-
-    if is_usbip_available() {
+    if is_wolfusb_available() {
         Ok(combined)
     } else {
-        // Even if the check fails, the script output tells the user what happened
-        Err(format!("Installation may have partially succeeded. Check output:\n{}", combined))
+        Err(format!("Installation may have partially succeeded:\n{}", combined))
     }
 }
 
-// ─── Device Operations ───
-
-/// List USB devices available for sharing on this node via usbip
-pub fn list_local_devices(config: &WolfUsbConfig) -> Vec<UsbDevice> {
-    let _ = ensure_usbip_modules();
-
-    // Use usbip list -l to show locally available devices
-    let output = match Command::new("usbip").args(["list", "-l"]).output() {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-        _ => {
-            // Fallback to lsusb
-            return parse_lsusb(config);
-        }
-    };
-
-    parse_usbip_list_local(&output, config)
-}
-
-/// Parse `usbip list -l` output
-fn parse_usbip_list_local(text: &str, config: &WolfUsbConfig) -> Vec<UsbDevice> {
-    let mut devices = Vec::new();
-    let mut current_busid = String::new();
-    let mut current_desc = String::new();
-    let mut current_vid = String::new();
-    let mut current_pid = String::new();
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        // Lines like: " - busid 1-2 (046d:0825)"
-        if trimmed.starts_with("- busid ") {
-            // Save previous device (skip root hubs)
-            if !current_busid.is_empty() && current_vid != "1d6b" {
-                let usb_id = format!("{}:{}", current_vid, current_pid);
-                let assigned = config.assignments.iter()
-                    .find(|a| a.busid == current_busid && a.usb_id == usb_id)
-                    .map(|a| format!("{}:{} on {}", a.target_type, a.target_name, a.target_hostname));
-                devices.push(UsbDevice {
-                    busid: current_busid.clone(),
-                    vendor_id: current_vid.clone(),
-                    product_id: current_pid.clone(),
-                    product: current_desc.clone(),
-                    assigned_to: assigned,
-                });
-            }
-
-            // Parse busid and vendor:product
-            let rest = &trimmed[8..]; // after "- busid "
-            let parts: Vec<&str> = rest.split_whitespace().collect();
-            current_busid = parts.first().unwrap_or(&"").to_string();
-            // Extract (VVVV:PPPP) from parentheses
-            if let Some(ids) = rest.split('(').nth(1).and_then(|s| s.split(')').next()) {
-                let id_parts: Vec<&str> = ids.split(':').collect();
-                current_vid = id_parts.first().unwrap_or(&"").to_string();
-                current_pid = id_parts.get(1).unwrap_or(&"").to_string();
-            }
-            current_desc = String::new();
-        } else if !current_busid.is_empty() && !trimmed.is_empty() && current_desc.is_empty() {
-            // Description line follows the busid line
-            current_desc = trimmed.trim_start_matches(':').trim().to_string();
-        }
-    }
-
-    // Don't forget the last device
-    if !current_busid.is_empty() && current_vid != "1d6b" {
-        let usb_id = format!("{}:{}", current_vid, current_pid);
-        let assigned = config.assignments.iter()
-            .find(|a| a.busid == current_busid && a.usb_id == usb_id)
-            .map(|a| format!("{}:{} on {}", a.target_type, a.target_name, a.target_hostname));
-        devices.push(UsbDevice {
-            busid: current_busid,
-            vendor_id: current_vid,
-            product_id: current_pid,
-            product: current_desc,
-            assigned_to: assigned,
-        });
-    }
-
-    // Filter out root hubs from usbip list too
-    devices.retain(|d| d.vendor_id != "1d6b");
-
-    // If usbip list was empty, fallback to lsusb
-    if devices.is_empty() {
-        return parse_lsusb(config);
-    }
-
-    devices
-}
-
-/// Parse lsusb output as fallback. Uses bus:device as the unique ID.
-/// Filters out root hubs (vendor 1d6b = Linux Foundation virtual devices).
-fn parse_lsusb(config: &WolfUsbConfig) -> Vec<UsbDevice> {
-    let output = match Command::new("lsusb").output() {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-        _ => return Vec::new(),
-    };
-
-    let mut devices = Vec::new();
-    for line in output.lines() {
-        // Format: "Bus 001 Device 002: ID 1a2b:3c4d Manufacturer Product"
-        let parts: Vec<&str> = line.splitn(2, ": ").collect();
-        if parts.len() < 2 { continue; }
-
-        let bus_dev: Vec<&str> = parts[0].split_whitespace().collect();
-        let bus: u32 = bus_dev.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let addr: u32 = bus_dev.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
-        if bus == 0 || addr == 0 { continue; }
-
-        let id_desc = parts[1];
-        let (vid, pid, product) = if id_desc.starts_with("ID ") {
-            let rest = &id_desc[3..];
-            let id_parts: Vec<&str> = rest.splitn(2, ' ').collect();
-            let ids: Vec<&str> = id_parts[0].split(':').collect();
-            (
-                ids.first().unwrap_or(&"0000").to_string(),
-                ids.get(1).unwrap_or(&"0000").to_string(),
-                id_parts.get(1).unwrap_or(&"").trim().to_string(),
-            )
-        } else {
-            ("0000".to_string(), "0000".to_string(), id_desc.to_string())
-        };
-
-        // Skip root hubs and virtual USB devices (Linux Foundation = 1d6b)
-        if vid == "1d6b" { continue; }
-
-        // Use wolfusb-bus-device as unique ID (e.g. "wolfusb-1-2" for bus 1 device 2)
-        let busid = format!("wolfusb-{}-{}", bus, addr);
-
-        // Match assignment by BOTH busid AND usb_id (must match both to avoid cross-matching)
-        let usb_id = format!("{}:{}", vid, pid);
-        let assigned = config.assignments.iter()
-            .find(|a| a.busid == busid && a.usb_id == usb_id)
-            .map(|a| format!("{}:{} on {}", a.target_type, a.target_name, a.target_hostname));
-
-        devices.push(UsbDevice {
-            busid,
-            vendor_id: vid,
-            product_id: pid,
-            product,
-            assigned_to: assigned,
-        });
-    }
-    devices
-}
-
-// ─── usbip Export/Import (the actual sharing) ───
-
-/// Strip the "wolfusb-" prefix to get the real kernel busid for usbip commands
-fn real_busid(busid: &str) -> String {
-    busid.strip_prefix("wolfusb-").unwrap_or(busid).to_string()
-}
-
-/// Validate a real kernel busid format (digits, hyphens, dots only)
-fn validate_busid(busid: &str) -> Result<(), String> {
-    let real = real_busid(busid);
-    if real.is_empty() || !real.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '.') {
-        Err("Invalid bus ID format".to_string())
-    } else {
-        Ok(())
-    }
-}
-
-/// Export (bind) a USB device on this node so remote nodes can attach to it
-pub fn export_device(busid: &str) -> Result<String, String> {
-    let _ = ensure_usbip_modules();
-    validate_busid(busid)?;
-    let real = real_busid(busid);
-
-    // Ensure usbipd is running so remote nodes can connect
-    if let Err(e) = ensure_usbipd_running() {
-        warn!("WolfUSB: usbipd not running ({}), remote sharing may not work", e);
-    }
-
-    // Bind the device for sharing
-    let output = Command::new("usbip").args(["bind", "--busid", &real]).output()
-        .map_err(|e| format!("Failed to run usbip bind: {}", e))?;
-
-    if output.status.success() {
-        info!("WolfUSB: exported device {}", busid);
-        Ok(format!("Device {} exported for sharing", busid))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("already bound") {
-            Ok(format!("Device {} already exported", real))
-        } else {
-            Err(format!("Failed to export device {}: {}", busid, stderr))
-        }
-    }
-}
-
-/// Unexport (unbind) a USB device on this node
-pub fn unexport_device(busid: &str) -> Result<String, String> {
-    validate_busid(busid)?;
-    let real = real_busid(busid);
-
-    let output = Command::new("usbip").args(["unbind", "--busid", &real]).output()
-        .map_err(|e| format!("Failed to run usbip unbind: {}", e))?;
-
-    if output.status.success() {
-        info!("WolfUSB: unexported device {}", busid);
-        Ok(format!("Device {} unexported", busid))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("Failed to unexport device {}: {}", busid, stderr))
-    }
-}
-
-/// Attach a remote USB device to this node (creates a virtual USB device locally)
-pub fn attach_remote_device(remote_host: &str, busid: &str) -> Result<String, String> {
-    let _ = ensure_usbip_modules();
-    validate_busid(busid)?;
-    let real = real_busid(busid);
-
-    if !remote_host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == ':' || c == '-') {
-        return Err("Invalid remote host".to_string());
-    }
-
-    let output = Command::new("usbip").args(["attach", "--remote", remote_host, "--busid", &real]).output()
-        .map_err(|e| format!("Failed to run usbip attach: {}", e))?;
-
-    if output.status.success() {
-        info!("WolfUSB: attached {}:{} locally", remote_host, busid);
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        Ok(format!("Device {} attached from {}\n{}", busid, remote_host, stdout))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("Failed to attach {}:{}: {}", remote_host, busid, stderr))
-    }
-}
-
-/// Detach a virtual USB device from this node
-#[allow(dead_code)]
-pub fn detach_device(port: &str) -> Result<String, String> {
-    if !port.chars().all(|c| c.is_ascii_digit()) {
-        return Err("Invalid port number".to_string());
-    }
-
-    let output = Command::new("usbip").args(["detach", "--port", port]).output()
-        .map_err(|e| format!("Failed to run usbip detach: {}", e))?;
-
-    if output.status.success() {
-        info!("WolfUSB: detached port {}", port);
-        Ok(format!("Device detached from port {}", port))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("Failed to detach port {}: {}", port, stderr))
-    }
-}
-
-/// List currently attached (imported) virtual USB devices on this node
-pub fn list_attached() -> Vec<(String, String, String)> {
-    // Returns Vec<(port, busid, description)>
-    let output = match Command::new("usbip").args(["port"]).output() {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-        _ => return Vec::new(),
-    };
-
-    let mut result = Vec::new();
-    let mut current_port = String::new();
-
-    for line in output.lines() {
-        let trimmed = line.trim();
-        // Lines like: "Port 00: <Port in Use> at Full Speed(12Mbps)"
-        if trimmed.starts_with("Port ") {
-            if let Some(port_num) = trimmed.split(':').next().and_then(|s| s.strip_prefix("Port ")) {
-                current_port = port_num.trim().to_string();
-            }
-        }
-        // Lines like: "    1-1 -> usbip://192.168.1.100:3240/1-2"
-        // Or: "    vendor:product (class/subclass/protocol)"
-        if !current_port.is_empty() && trimmed.contains("->") {
-            let desc = trimmed.to_string();
-            result.push((current_port.clone(), String::new(), desc));
-            current_port.clear();
-        }
-    }
-
-    result
-}
-
-// ─── Cross-Node Assignment ───
+// ─── Assignment Operations ───
 
 /// Assign a USB device to a container/VM, potentially on a different node.
-///
-/// Flow:
-/// 1. On the source node: `usbip bind` to export the device
-/// 2. On the target node: `usbip attach` to create virtual device
-/// 3. Pass the virtual device into the container/VM
 pub fn assign_device(
     config: &mut WolfUsbConfig,
     busid: &str,
@@ -631,28 +459,20 @@ pub fn assign_device(
     // Remove any existing assignment for this device
     config.assignments.retain(|a| a.busid != busid || a.source_node_id != source_node_id);
 
-    // If the source device is on THIS node, bind it for sharing
-    if is_local_source {
-        export_device(busid)?;
-    }
-
+    // For local same-node assignments, passthrough directly
     let is_local_target = target_node_id == source_node_id
         || (target_node_id.is_empty() && is_local_source);
 
     let msg = if is_local_source && is_local_target {
-        // Same node — passthrough directly (no usbip needed)
         match local_passthrough(busid, target_type, target_name) {
             Ok(m) => format!("USB device {} assigned to {}:{} (local)\n{}", busid, target_type, target_name, m),
             Err(e) => {
                 warn!("WolfUSB: local passthrough failed: {}", e);
-                format!("USB device {} assigned to {}:{} (local passthrough pending: {})", busid, target_type, target_name, e)
+                format!("USB device {} assigned to {}:{} (passthrough pending: {})", busid, target_type, target_name, e)
             }
         }
     } else {
-        format!(
-            "USB device {} from {} assigned to {}:{} on {}",
-            busid, source_hostname, target_type, target_name, target_hostname
-        )
+        format!("USB device {} from {} assigned to {}:{} on {}", busid, source_hostname, target_type, target_name, target_hostname)
     };
 
     // Store the assignment
@@ -668,6 +488,7 @@ pub fn assign_device(
         target_node_id: target_node_id.to_string(),
         target_hostname: target_hostname.to_string(),
         active: true,
+        session_id: None,
         virtual_busid: None,
     });
     config.save().map_err(|e| format!("Failed to save config: {}", e))?;
@@ -687,26 +508,19 @@ pub fn unassign_device(config: &mut WolfUsbConfig, busid: &str, source_node_id: 
 
     match assignment {
         Some(a) => {
-            // Try to unbind on source if local
-            let _ = unexport_device(&a.busid);
+            // Release the device if we have a session
+            if let Some(sid) = a.session_id {
+                if let Err(e) = wolfusb_detach_device(&a.source_address, &a.busid, sid) {
+                    warn!("WolfUSB: detach failed (non-fatal): {}", e);
+                }
+            }
             Ok(format!("USB device {} unassigned from {}:{}", a.busid, a.target_type, a.target_name))
         }
         None => Err("Device was not assigned".to_string()),
     }
 }
 
-/// Find the /dev/bus/usb path for a given busid
-fn find_dev_path(busid: &str) -> Option<String> {
-    let real = real_busid(busid);
-    // Parse bus number from busid (e.g. "1-2" -> bus 1)
-    let bus: u32 = real.split('-').next()?.parse().ok()?;
-    // Find the device address using sysfs
-    let sysfs_path = format!("/sys/bus/usb/devices/{}/devnum", real);
-    let addr: u32 = std::fs::read_to_string(&sysfs_path).ok()?.trim().parse().ok()?;
-    Some(format!("/dev/bus/usb/{:03}/{:03}", bus, addr))
-}
-
-/// Execute the usbip attach on the target node and pass device into container.
+/// Attach a remote USB device and passthrough to a container.
 /// Called on the TARGET node (where the container/VM lives).
 pub fn attach_and_passthrough(
     source_address: &str,
@@ -714,48 +528,46 @@ pub fn attach_and_passthrough(
     target_type: &str,
     target_name: &str,
 ) -> Result<String, String> {
-    // Snapshot lsusb before attach so we can diff to find the new virtual device
-    let before = lsusb_device_paths();
+    // Attach via wolfusb protocol
+    let session_id = wolfusb_attach_device(source_address, busid)?;
 
-    // Step 1: Attach the remote device via usbip
-    let attach_result = attach_remote_device(source_address, busid)?;
+    // Update the assignment with the session_id
+    let mut config = WolfUsbConfig::load();
+    if let Some(a) = config.assignments.iter_mut().find(|a| a.busid == busid) {
+        a.session_id = Some(session_id);
+        a.active = true;
+        let _ = config.save();
+    }
 
-    // Step 2: Find the newly created virtual device by diffing lsusb
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    let dev_path = find_new_device_path(&before);
+    let mut result = format!("Attached to {} via wolfusb (session {})", busid, session_id);
 
-    let mut result = attach_result;
-
-    // Step 3: Pass into container/VM
-    match (target_type, &dev_path) {
-        ("docker", Some(path)) => {
-            match passthrough_to_docker(target_name, path) {
+    // For local passthrough (device is on this same node), pass through to container
+    if let Some(dev_path) = find_dev_path(busid) {
+        match target_type {
+            "docker" => match passthrough_to_docker(target_name, &dev_path) {
                 Ok(msg) => result.push_str(&format!("\n{}", msg)),
-                Err(e) => result.push_str(&format!("\nDocker passthrough failed: {}", e)),
-            }
-        }
-        ("lxc", Some(path)) => {
-            match passthrough_to_lxc(target_name, busid, path) {
+                Err(e) => result.push_str(&format!("\nDocker passthrough: {}", e)),
+            },
+            "lxc" => match passthrough_to_lxc(target_name, busid, &dev_path) {
                 Ok(msg) => result.push_str(&format!("\n{}", msg)),
-                Err(e) => result.push_str(&format!("\nLXC passthrough failed: {}", e)),
-            }
-        }
-        ("vm", Some(path)) => {
-            match passthrough_to_vm(target_name, busid, path) {
+                Err(e) => result.push_str(&format!("\nLXC passthrough: {}", e)),
+            },
+            "vm" => match passthrough_to_vm(target_name, busid, &dev_path) {
                 Ok(msg) => result.push_str(&format!("\n{}", msg)),
-                Err(e) => result.push_str(&format!("\nVM passthrough note: {}", e)),
-            }
+                Err(e) => result.push_str(&format!("\nVM passthrough: {}", e)),
+            },
+            _ => {}
         }
-        _ => {
-            result.push_str("\nNote: virtual device path not yet available. It may take a moment to appear.");
-        }
+    } else {
+        result.push_str(&format!("\nDevice claimed via wolfusb protocol on {}:3240", source_address));
     }
 
     Ok(result)
 }
 
-/// Pass a USB device into a local container/VM directly (same node, no usbip needed).
-/// Called when source and target are on the same node.
+// ─── Local Device Passthrough ───
+
+/// Pass a USB device into a local container/VM directly (same node)
 pub fn local_passthrough(
     busid: &str,
     target_type: &str,
@@ -774,7 +586,6 @@ pub fn local_passthrough(
 
 /// Passthrough a USB device into a Docker container by recreating it with --device
 fn passthrough_to_docker(container_name: &str, dev_path: &str) -> Result<String, String> {
-    // Check if container exists
     let inspect = Command::new("docker").args(["inspect", "--format", "{{.State.Running}}", container_name])
         .output().map_err(|e| format!("docker inspect failed: {}", e))?;
     if !inspect.status.success() {
@@ -792,18 +603,14 @@ fn passthrough_to_docker(container_name: &str, dev_path: &str) -> Result<String,
         }
     }
 
-    // Stop container if running
     if was_running {
         info!("WolfUSB: stopping {} to add USB device {}", container_name, dev_path);
         let _ = Command::new("docker").args(["stop", container_name]).output();
     }
 
-    // Get current config and recreate with the device added
-    // Use docker commit + run approach for safety
     let backup_name = format!("{}_wolfusb_old", container_name);
     let _ = Command::new("docker").args(["rm", "-f", &backup_name]).output();
 
-    // Rename current container
     let rename = Command::new("docker").args(["rename", container_name, &backup_name]).output()
         .map_err(|e| format!("Failed to rename container: {}", e))?;
     if !rename.status.success() {
@@ -811,7 +618,6 @@ fn passthrough_to_docker(container_name: &str, dev_path: &str) -> Result<String,
         return Err(format!("Failed to rename container: {}", String::from_utf8_lossy(&rename.stderr)));
     }
 
-    // Get full inspect config of the backup
     let insp = Command::new("docker").args(["inspect", &backup_name]).output()
         .map_err(|e| format!("Failed to inspect: {}", e))?;
     if !insp.status.success() {
@@ -821,13 +627,11 @@ fn passthrough_to_docker(container_name: &str, dev_path: &str) -> Result<String,
     }
     let insp_text = String::from_utf8_lossy(&insp.stdout);
     let inspect_arr: Vec<serde_json::Value> = serde_json::from_str(&insp_text).unwrap_or_default();
-    let inspect_val = inspect_arr.first().cloned().unwrap_or(serde_json::Value::Null);
+    let v = inspect_arr.first().cloned().unwrap_or(serde_json::Value::Null);
 
-    // Build docker create args from the inspected config
     let mut args = vec!["create".to_string(), "--name".to_string(), container_name.to_string()];
 
-    // Image
-    let image = inspect_val.pointer("/Config/Image").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let image = v.pointer("/Config/Image").and_then(|v| v.as_str()).unwrap_or("").to_string();
     if image.is_empty() {
         let _ = Command::new("docker").args(["rename", &backup_name, container_name]).output();
         if was_running { let _ = Command::new("docker").args(["start", container_name]).output(); }
@@ -835,56 +639,43 @@ fn passthrough_to_docker(container_name: &str, dev_path: &str) -> Result<String,
     }
 
     // Restart policy
-    let restart = inspect_val.pointer("/HostConfig/RestartPolicy/Name").and_then(|v| v.as_str()).unwrap_or("no");
-    let restart_count = inspect_val.pointer("/HostConfig/RestartPolicy/MaximumRetryCount").and_then(|v| v.as_i64()).unwrap_or(0);
+    let restart = v.pointer("/HostConfig/RestartPolicy/Name").and_then(|v| v.as_str()).unwrap_or("no");
+    let rc = v.pointer("/HostConfig/RestartPolicy/MaximumRetryCount").and_then(|v| v.as_i64()).unwrap_or(0);
     args.push("--restart".to_string());
-    args.push(if restart == "on-failure" && restart_count > 0 { format!("on-failure:{}", restart_count) } else { restart.to_string() });
+    args.push(if restart == "on-failure" && rc > 0 { format!("on-failure:{}", rc) } else { restart.to_string() });
 
-    // TTY/stdin
-    if inspect_val.pointer("/Config/Tty").and_then(|v| v.as_bool()).unwrap_or(false) { args.push("-t".to_string()); }
-    if inspect_val.pointer("/Config/OpenStdin").and_then(|v| v.as_bool()).unwrap_or(false) { args.push("-i".to_string()); }
+    if v.pointer("/Config/Tty").and_then(|v| v.as_bool()).unwrap_or(false) { args.push("-t".to_string()); }
+    if v.pointer("/Config/OpenStdin").and_then(|v| v.as_bool()).unwrap_or(false) { args.push("-i".to_string()); }
+    if v.pointer("/HostConfig/Privileged").and_then(|v| v.as_bool()).unwrap_or(false) { args.push("--privileged".to_string()); }
 
-    // Privileged
-    if inspect_val.pointer("/HostConfig/Privileged").and_then(|v| v.as_bool()).unwrap_or(false) {
-        args.push("--privileged".to_string());
-    }
+    let net = v.pointer("/HostConfig/NetworkMode").and_then(|v| v.as_str()).unwrap_or("default");
+    if net != "default" && net != "bridge" { args.push("--network".to_string()); args.push(net.to_string()); }
 
-    // Network mode
-    let net = inspect_val.pointer("/HostConfig/NetworkMode").and_then(|v| v.as_str()).unwrap_or("default");
-    if net != "default" && net != "bridge" {
-        args.push("--network".to_string()); args.push(net.to_string());
-    }
-
-    // Memory/CPU
-    if let Some(m) = inspect_val.pointer("/HostConfig/Memory").and_then(|v| v.as_i64()).filter(|m| *m > 0) {
+    if let Some(m) = v.pointer("/HostConfig/Memory").and_then(|v| v.as_i64()).filter(|m| *m > 0) {
         args.push("--memory".to_string()); args.push(format!("{}m", m / 1048576));
     }
-    if let Some(c) = inspect_val.pointer("/HostConfig/NanoCpus").and_then(|v| v.as_i64()).filter(|c| *c > 0) {
+    if let Some(c) = v.pointer("/HostConfig/NanoCpus").and_then(|v| v.as_i64()).filter(|c| *c > 0) {
         args.push("--cpus".to_string()); args.push(format!("{:.1}", c as f64 / 1e9));
     }
-
-    // SHM size (64MB = 67108864 is Docker default, skip if default)
-    if let Some(shm) = inspect_val.pointer("/HostConfig/ShmSize").and_then(|v| v.as_i64()).filter(|s| *s > 0 && *s != 67108864) {
+    if let Some(shm) = v.pointer("/HostConfig/ShmSize").and_then(|v| v.as_i64()).filter(|s| *s > 0 && *s != 67108864) {
         args.push("--shm-size".to_string()); args.push(format!("{}", shm));
     }
 
-    // User/workdir
-    let user = inspect_val.pointer("/Config/User").and_then(|v| v.as_str()).unwrap_or("");
+    let user = v.pointer("/Config/User").and_then(|v| v.as_str()).unwrap_or("");
     if !user.is_empty() { args.push("--user".to_string()); args.push(user.to_string()); }
-    let workdir = inspect_val.pointer("/Config/WorkingDir").and_then(|v| v.as_str()).unwrap_or("");
+    let workdir = v.pointer("/Config/WorkingDir").and_then(|v| v.as_str()).unwrap_or("");
     if !workdir.is_empty() { args.push("--workdir".to_string()); args.push(workdir.to_string()); }
 
-    // Capabilities
-    if let Some(caps) = inspect_val.pointer("/HostConfig/CapAdd").and_then(|v| v.as_array()) {
+    if let Some(caps) = v.pointer("/HostConfig/CapAdd").and_then(|v| v.as_array()) {
         for c in caps { if let Some(s) = c.as_str() { args.push("--cap-add".to_string()); args.push(s.to_string()); } }
     }
-    if let Some(caps) = inspect_val.pointer("/HostConfig/CapDrop").and_then(|v| v.as_array()) {
+    if let Some(caps) = v.pointer("/HostConfig/CapDrop").and_then(|v| v.as_array()) {
         for c in caps { if let Some(s) = c.as_str() { args.push("--cap-drop".to_string()); args.push(s.to_string()); } }
     }
 
     // Existing devices + new USB device
     let mut has_device = false;
-    if let Some(devs) = inspect_val.pointer("/HostConfig/Devices").and_then(|v| v.as_array()) {
+    if let Some(devs) = v.pointer("/HostConfig/Devices").and_then(|v| v.as_array()) {
         for d in devs {
             let host = d.get("PathOnHost").and_then(|v| v.as_str()).unwrap_or("");
             let ctr = d.get("PathInContainer").and_then(|v| v.as_str()).unwrap_or("");
@@ -895,28 +686,25 @@ fn passthrough_to_docker(container_name: &str, dev_path: &str) -> Result<String,
             }
         }
     }
-    // Add the WolfUSB device
     if !has_device {
         args.push("--device".to_string());
         args.push(format!("{}:{}", dev_path, dev_path));
     }
 
-    // Bind-mount volumes
-    let binds: Vec<String> = inspect_val.pointer("/HostConfig/Binds")
+    // Volumes
+    let binds: Vec<String> = v.pointer("/HostConfig/Binds")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
         .unwrap_or_default();
     for b in &binds { args.push("-v".to_string()); args.push(b.clone()); }
 
-    // Named volumes from Mounts (type=volume, skip if already in Binds)
-    if let Some(mounts) = inspect_val.pointer("/Mounts").and_then(|v| v.as_array()) {
+    if let Some(mounts) = v.pointer("/Mounts").and_then(|v| v.as_array()) {
         for mount in mounts {
             if mount.get("Type").and_then(|v| v.as_str()) != Some("volume") { continue; }
             let vol_name = mount.get("Name").and_then(|v| v.as_str()).unwrap_or("");
             let destination = mount.get("Destination").and_then(|v| v.as_str()).unwrap_or("");
             let rw = mount.get("RW").and_then(|v| v.as_bool()).unwrap_or(true);
             if vol_name.is_empty() || destination.is_empty() { continue; }
-            // Skip if already covered by a Binds entry
             if binds.iter().any(|b| b.starts_with(&format!("{}:", vol_name))) { continue; }
             let mode = if rw { "" } else { ":ro" };
             args.push("-v".to_string());
@@ -924,8 +712,7 @@ fn passthrough_to_docker(container_name: &str, dev_path: &str) -> Result<String,
         }
     }
 
-    // Port bindings
-    if let Some(bindings) = inspect_val.pointer("/HostConfig/PortBindings").and_then(|v| v.as_object()) {
+    if let Some(bindings) = v.pointer("/HostConfig/PortBindings").and_then(|v| v.as_object()) {
         for (container_port, host_list) in bindings {
             if let Some(arr) = host_list.as_array() {
                 for binding in arr {
@@ -944,18 +731,14 @@ fn passthrough_to_docker(container_name: &str, dev_path: &str) -> Result<String,
         }
     }
 
-    // Env vars
-    if let Some(envs) = inspect_val.pointer("/Config/Env").and_then(|v| v.as_array()) {
+    if let Some(envs) = v.pointer("/Config/Env").and_then(|v| v.as_array()) {
         for e in envs { if let Some(s) = e.as_str() { args.push("-e".to_string()); args.push(s.to_string()); } }
     }
-
-    // Labels
-    if let Some(labels) = inspect_val.pointer("/Config/Labels").and_then(|v| v.as_object()) {
-        for (k, v) in labels { args.push("--label".to_string()); args.push(format!("{}={}", k, v.as_str().unwrap_or(""))); }
+    if let Some(labels) = v.pointer("/Config/Labels").and_then(|v| v.as_object()) {
+        for (k, lv) in labels { args.push("--label".to_string()); args.push(format!("{}={}", k, lv.as_str().unwrap_or(""))); }
     }
 
-    // Entrypoint (only set --entrypoint if one was explicitly configured)
-    let entrypoint: Vec<String> = inspect_val.pointer("/Config/Entrypoint")
+    let entrypoint: Vec<String> = v.pointer("/Config/Entrypoint")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
         .unwrap_or_default();
@@ -965,18 +748,13 @@ fn passthrough_to_docker(container_name: &str, dev_path: &str) -> Result<String,
     }
 
     args.push(image);
-
-    // Entrypoint args beyond [0] — these go after the image
     for ep_arg in entrypoint.iter().skip(1) { args.push(ep_arg.clone()); }
-
-    // Cmd (only if no multi-part entrypoint, to avoid duplication)
     if entrypoint.len() <= 1 {
-        if let Some(cmds) = inspect_val.pointer("/Config/Cmd").and_then(|v| v.as_array()) {
+        if let Some(cmds) = v.pointer("/Config/Cmd").and_then(|v| v.as_array()) {
             for c in cmds { if let Some(s) = c.as_str() { args.push(s.to_string()); } }
         }
     }
 
-    // Create the new container
     let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let create = Command::new("docker").args(&args_ref).output()
         .map_err(|e| format!("docker create failed: {}", e))?;
@@ -986,13 +764,10 @@ fn passthrough_to_docker(container_name: &str, dev_path: &str) -> Result<String,
         warn!("WolfUSB: Docker recreate failed, rolling back: {}", stderr);
         let _ = Command::new("docker").args(["rename", &backup_name, container_name]).output();
         if was_running { let _ = Command::new("docker").args(["start", container_name]).output(); }
-        return Err(format!("Failed to recreate container with USB device: {}", stderr));
+        return Err(format!("Failed to recreate container: {}", stderr));
     }
 
-    // Remove the old container
     let _ = Command::new("docker").args(["rm", &backup_name]).output();
-
-    // Start if it was running
     if was_running {
         let _ = Command::new("docker").args(["start", container_name]).output();
     }
@@ -1002,21 +777,17 @@ fn passthrough_to_docker(container_name: &str, dev_path: &str) -> Result<String,
         if was_running { " and started" } else { "" }))
 }
 
-/// Passthrough a USB device into an LXC container by updating config and restarting
+/// Passthrough a USB device into an LXC container
 fn passthrough_to_lxc(container_name: &str, busid: &str, dev_path: &str) -> Result<String, String> {
-    // Find the LXC config file
     let config_path = if crate::containers::is_proxmox() {
-        // Proxmox uses pct set for device passthrough
         let output = Command::new("pct").args(["set", container_name, "--dev0",
             &format!("{},mode=0660", dev_path)]).output()
             .map_err(|e| format!("pct set failed: {}", e))?;
         if output.status.success() {
             info!("WolfUSB: LXC {} configured with USB device {} via pct", container_name, dev_path);
-            // Restart LXC to apply
             let _ = Command::new("pct").args(["reboot", container_name]).output();
             return Ok(format!("LXC '{}' configured with USB device {} and restarted", container_name, dev_path));
         }
-        // Fall through to manual config
         format!("/etc/pve/lxc/{}.conf", container_name)
     } else {
         format!("/var/lib/lxc/{}/config", container_name)
@@ -1026,17 +797,13 @@ fn passthrough_to_lxc(container_name: &str, busid: &str, dev_path: &str) -> Resu
         return Err(format!("LXC config not found at {}", config_path));
     }
 
-    // Check if device entry already exists
     let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
     if existing.contains(dev_path) {
         return Ok(format!("Device {} already configured in LXC {}", dev_path, container_name));
     }
 
-    // Append device config
     let entry = format!(
-        "\n# WolfUSB: USB device {} via usbip\n\
-         lxc.cgroup2.devices.allow = c 189:* rwm\n\
-         lxc.mount.entry = {} {} none bind,optional,create=file 0 0\n",
+        "\n# WolfUSB: USB device {}\nlxc.cgroup2.devices.allow = c 189:* rwm\nlxc.mount.entry = {} {} none bind,optional,create=file 0 0\n",
         busid, dev_path, dev_path.trim_start_matches('/')
     );
 
@@ -1044,7 +811,6 @@ fn passthrough_to_lxc(container_name: &str, busid: &str, dev_path: &str) -> Resu
         .and_then(|mut f| { use std::io::Write; f.write_all(entry.as_bytes()) })
         .map_err(|e| format!("Failed to update LXC config: {}", e))?;
 
-    // Restart the container to apply
     info!("WolfUSB: restarting LXC {} to apply USB device {}", container_name, dev_path);
     if crate::containers::is_proxmox() {
         let _ = Command::new("pct").args(["reboot", container_name]).output();
@@ -1057,57 +823,35 @@ fn passthrough_to_lxc(container_name: &str, busid: &str, dev_path: &str) -> Resu
     Ok(format!("LXC '{}' configured with USB device {} and restarted", container_name, dev_path))
 }
 
-/// Note USB device availability for a VM — VMs need manual config or will pick it up on next start
+/// Note USB device availability for a VM
 fn passthrough_to_vm(vm_name: &str, busid: &str, dev_path: &str) -> Result<String, String> {
-    // For VMs, USB passthrough is configured via vendor:product ID in the VM config
-    // The device is available at dev_path for the VM to use on next start
-    // We can't hotplug USB into a running QEMU VM safely without QMP, so we note it
     info!("WolfUSB: USB device {} ({}) available for VM {}", dev_path, busid, vm_name);
-    Ok(format!("USB device {} available for VM '{}'. Add it in the VM's Passthrough settings and restart the VM to apply.", dev_path, vm_name))
+    Ok(format!("USB device {} available for VM '{}'. Add it in the VM's Passthrough settings and restart the VM.", dev_path, vm_name))
 }
 
 // ─── Startup Restore & Container Event Hooks ───
 
-/// Called on WolfStack startup. Re-establishes all usbip binds and attaches
-/// for assignments where this node is the source or target.
+/// Called on WolfStack startup. Re-establishes all assignments.
 pub fn restore_assignments(self_node_id: &str) {
     let config = WolfUsbConfig::load();
     if !config.enabled || config.assignments.is_empty() { return; }
-    if !is_usbip_available() { return; }
-    let _ = ensure_usbip_modules();
+    if !is_wolfusb_available() { return; }
 
     info!("WolfUSB: restoring {} assignments on startup", config.assignments.len());
-
-    // Start usbipd if this node is a source for any assignments
-    let has_source_assignments = config.assignments.iter().any(|a| a.source_node_id == self_node_id);
-    if has_source_assignments {
-        if let Err(e) = ensure_usbipd_running() {
-            warn!("WolfUSB: failed to start usbipd on startup: {}", e);
-        }
-    }
+    ensure_wolfusb_server();
 
     for a in &config.assignments {
-        // Source side: re-export devices that are physically on this node
-        if a.source_node_id == self_node_id {
-            match export_device(&a.busid) {
-                Ok(msg) => info!("WolfUSB: re-exported {} — {}", a.busid, msg),
-                Err(e) => warn!("WolfUSB: failed to re-export {}: {}", a.busid, e),
-            }
-        }
-
-        // Target side: re-attach remote devices and passthrough to containers on this node
+        // Target side: re-attach remote devices for containers on this node
         if a.target_node_id == self_node_id && a.source_node_id != self_node_id {
             match attach_and_passthrough(&a.source_address, &a.busid, &a.target_type, &a.target_name) {
-                Ok(msg) => info!("WolfUSB: restored {}:{} — {}", a.source_address, a.busid, msg),
-                Err(e) => warn!("WolfUSB: failed to restore {}:{}: {}", a.source_address, a.busid, e),
+                Ok(msg) => info!("WolfUSB: restored {} — {}", a.busid, msg),
+                Err(e) => warn!("WolfUSB: failed to restore {}: {}", a.busid, e),
             }
         }
     }
 }
 
 /// Called when a container starts or restarts on this node.
-/// Checks if any WolfUSB assignments target this container and re-establishes
-/// the usbip connection if needed (handles container migration automatically).
 pub fn on_container_started(container_name: &str, container_type: &str, self_node_id: &str) {
     let mut config = WolfUsbConfig::load();
     if !config.enabled || config.assignments.is_empty() { return; }
@@ -1115,36 +859,25 @@ pub fn on_container_started(container_name: &str, container_type: &str, self_nod
     let mut changed = false;
 
     for a in &mut config.assignments {
-        // Find assignments targeting this container
-        if a.target_name != container_name || a.target_type != container_type {
-            continue;
-        }
+        if a.target_name != container_name || a.target_type != container_type { continue; }
 
-        // If the container is now on this node but the assignment says a different target node,
-        // the container has migrated — update the target and re-attach
         if a.target_node_id != self_node_id {
-            info!(
-                "WolfUSB: container {} migrated from {} to this node — re-routing USB {}",
-                container_name, a.target_hostname, a.busid
-            );
+            info!("WolfUSB: container {} migrated to this node — re-routing USB {}", container_name, a.busid);
             a.target_node_id = self_node_id.to_string();
-            // Get hostname for display
             a.target_hostname = hostname::get()
                 .map(|h| h.to_string_lossy().to_string())
                 .unwrap_or_else(|_| self_node_id.to_string());
             changed = true;
         }
 
-        // Re-attach the device and passthrough to the container
         if a.source_node_id != self_node_id {
             if !a.source_address.is_empty() {
                 match attach_and_passthrough(&a.source_address, &a.busid, &a.target_type, &a.target_name) {
-                    Ok(msg) => info!("WolfUSB: restored {} for container {} — {}", a.busid, container_name, msg),
+                    Ok(msg) => info!("WolfUSB: restored {} for {} — {}", a.busid, container_name, msg),
                     Err(e) => warn!("WolfUSB: failed to restore {} for {}: {}", a.busid, container_name, e),
                 }
             }
         } else {
-            // Local device — passthrough directly
             match local_passthrough(&a.busid, &a.target_type, &a.target_name) {
                 Ok(msg) => info!("WolfUSB: local passthrough {} for {} — {}", a.busid, container_name, msg),
                 Err(e) => warn!("WolfUSB: local passthrough {} for {} failed: {}", a.busid, container_name, e),
@@ -1152,19 +885,15 @@ pub fn on_container_started(container_name: &str, container_type: &str, self_nod
         }
     }
 
-    if changed {
-        let _ = config.save();
-    }
+    if changed { let _ = config.save(); }
 }
 
 /// Merge assignments from a remote node's config into ours.
-/// Called during cluster config sync so every node has the full assignment list.
 pub fn merge_remote_assignments(remote_assignments: &[UsbAssignment]) {
     let mut config = WolfUsbConfig::load();
     let mut changed = false;
 
     for ra in remote_assignments {
-        // Check if we already have this assignment
         let exists = config.assignments.iter().any(|a|
             a.busid == ra.busid && a.source_node_id == ra.source_node_id
         );
@@ -1172,7 +901,6 @@ pub fn merge_remote_assignments(remote_assignments: &[UsbAssignment]) {
             config.assignments.push(ra.clone());
             changed = true;
         } else {
-            // Update if the remote version is newer (target might have changed)
             if let Some(existing) = config.assignments.iter_mut().find(|a|
                 a.busid == ra.busid && a.source_node_id == ra.source_node_id
             ) {
@@ -1186,56 +914,16 @@ pub fn merge_remote_assignments(remote_assignments: &[UsbAssignment]) {
         }
     }
 
-    // Remove assignments that no longer exist on any remote node
-    // (Only remove if the source node is NOT us — we're authoritative for our own devices)
     let self_id = crate::agent::self_node_id();
     let remote_busids: Vec<(&str, &str)> = remote_assignments.iter()
         .map(|a| (a.busid.as_str(), a.source_node_id.as_str()))
         .collect();
     let before = config.assignments.len();
     config.assignments.retain(|a| {
-        // Keep our own source assignments
         if a.source_node_id == self_id { return true; }
-        // Keep assignments that exist in the remote set
         remote_busids.iter().any(|(b, s)| *b == a.busid && *s == a.source_node_id)
     });
     if config.assignments.len() != before { changed = true; }
 
-    if changed {
-        let _ = config.save();
-    }
-}
-
-/// Get all current /dev/bus/usb paths from lsusb (used for before/after diffing)
-fn lsusb_device_paths() -> Vec<String> {
-    let output = match Command::new("lsusb").output() {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
-    };
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut paths = Vec::new();
-    for line in text.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 4 {
-            let bus: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-            let addr: u32 = parts.get(3).and_then(|s| s.trim_end_matches(':').parse().ok()).unwrap_or(0);
-            if bus > 0 && addr > 0 {
-                paths.push(format!("/dev/bus/usb/{:03}/{:03}", bus, addr));
-            }
-        }
-    }
-    paths
-}
-
-/// Find newly appeared device path by comparing lsusb before and after an attach
-fn find_new_device_path(before: &[String]) -> Option<String> {
-    let after = lsusb_device_paths();
-    // Return the first path that wasn't in the before snapshot
-    for path in &after {
-        if !before.contains(path) {
-            return Some(path.clone());
-        }
-    }
-    // If no new device found (race or delay), try the highest-numbered one
-    after.last().cloned()
+    if changed { let _ = config.save(); }
 }
