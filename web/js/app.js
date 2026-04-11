@@ -13,6 +13,7 @@ const _syncedPrefKeys = [
     'wolfstack_dc_layout', 'wolfstack_dc_compact', 'wolfstack_dc_bg_image',
     'wolfstack_dc_bg_brightness', 'wolfstack_dc_bg_blur',
     'wolfstack_bookmarks', 'wolfstack_view_docker', 'wolfstack_view_lxc', 'wolfstack_view_vm',
+    'wolfstack_tasklog_closed',
 ];
 let _prefsLoaded = false;
 
@@ -7871,6 +7872,8 @@ function loadTaskLog() {
 }
 
 function showTaskLog() {
+    // Never show if user explicitly closed it
+    if (_taskLogUserClosed) return;
     // On mobile, task log is hidden by CSS — use toggleTaskLogMobile() instead
     if (isMobileView()) return;
     const footer = document.getElementById('task-log-footer');
@@ -7891,11 +7894,11 @@ function hideTaskLog() {
 function toggleTaskLogVisible() {
     if (_taskLogVisible) {
         _taskLogUserClosed = true;
-        localStorage.setItem('wolfstack_tasklog_closed', 'true');
+        savePref('wolfstack_tasklog_closed', 'true');
         hideTaskLog();
     } else {
         _taskLogUserClosed = false;
-        localStorage.removeItem('wolfstack_tasklog_closed');
+        removePref('wolfstack_tasklog_closed');
         showTaskLog();
     }
 }
@@ -34652,7 +34655,7 @@ async function refreshWolfUsbDevices() {
                 + '<th>Bus ID</th><th>Vendor:Product</th><th>Device</th><th>Status</th><th>Assign To</th>'
                 + '</tr></thead><tbody>';
             devices.forEach(function(d, idx) {
-                var safeId = (d.busid || '').replace(/[^a-zA-Z0-9\-\.]/g, '_');
+                var rowId = 'wolfusb-row-' + idx;
                 var statusCell = d.assigned_to
                     ? '<span style="background:rgba(34,197,94,0.15);color:#22c55e;padding:3px 10px;border-radius:6px;font-size:11px;font-weight:600;display:inline-block;">' + escapeHtml(d.assigned_to) + '</span>'
                     + '<br><button class="btn btn-sm" onclick="wolfusbUnassign(\'' + escapeAttr(d.busid) + '\',\'' + escapeAttr(sourceId) + '\')" style="margin-top:4px;padding:2px 8px;font-size:10px;background:rgba(239,68,68,0.1);color:#ef4444;border:1px solid rgba(239,68,68,0.2);border-radius:4px;">Remove</button>'
@@ -34665,9 +34668,9 @@ async function refreshWolfUsbDevices() {
                     + '<td>' + statusCell + '</td>'
                     + '<td>'
                     + '<div style="display:flex;gap:6px;align-items:center;">'
-                    + '<select id="wolfusb-tgt-' + safeId + '" class="form-control" style="font-size:11px;padding:5px 8px;min-width:180px;">'
+                    + '<select id="' + rowId + '" class="form-control" style="font-size:11px;padding:5px 8px;min-width:180px;">'
                     + '<option value="">— Select target —</option>' + targetOpts + '</select>'
-                    + '<button class="btn btn-sm btn-primary" onclick="wolfusbAssign(\'' + escapeAttr(d.busid) + '\',\'' + escapeAttr(d.product || 'USB Device') + '\',\'' + escapeAttr(d.vendor_id + ':' + d.product_id) + '\',\'' + escapeAttr(sourceId) + '\',\'' + escapeAttr(sourceHostname) + '\',\'' + escapeAttr(sourceAddr) + '\')" style="padding:5px 14px;font-size:11px;white-space:nowrap;">Assign</button>'
+                    + '<button class="btn btn-sm btn-primary" onclick="wolfusbAssignRow(' + idx + ',\'' + escapeAttr(d.busid) + '\',\'' + escapeAttr(d.product || 'USB Device') + '\',\'' + escapeAttr(d.vendor_id + ':' + d.product_id) + '\',\'' + escapeAttr(sourceId) + '\',\'' + escapeAttr(sourceHostname) + '\',\'' + escapeAttr(sourceAddr) + '\')" style="padding:5px 14px;font-size:11px;white-space:nowrap;">Assign</button>'
                     + '</div></td></tr>';
             });
             html += '</tbody></table>';
@@ -34733,9 +34736,8 @@ async function _wolfusbGetClusterTargets() {
     return opts;
 }
 
-async function wolfusbAssign(busid, label, usbId, sourceNodeId, sourceHostname, sourceAddr) {
-    var safeId = busid.replace(/[^a-zA-Z0-9\-\.]/g, '_');
-    var sel = document.getElementById('wolfusb-tgt-' + safeId);
+async function wolfusbAssignRow(rowIdx, busid, label, usbId, sourceNodeId, sourceHostname, sourceAddr) {
+    var sel = document.getElementById('wolfusb-row-' + rowIdx);
     if (!sel || !sel.value) { showToast('Select a target first', 'warning'); return; }
 
     // Parse "type|name|nodeId|hostname" from option value

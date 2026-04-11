@@ -275,10 +275,11 @@ fn parse_usbip_list_local(text: &str, config: &WolfUsbConfig) -> Vec<UsbDevice> 
         let trimmed = line.trim();
         // Lines like: " - busid 1-2 (046d:0825)"
         if trimmed.starts_with("- busid ") {
-            // Save previous device
-            if !current_busid.is_empty() {
+            // Save previous device (skip root hubs)
+            if !current_busid.is_empty() && current_vid != "1d6b" {
+                let usb_id = format!("{}:{}", current_vid, current_pid);
                 let assigned = config.assignments.iter()
-                    .find(|a| a.busid == current_busid)
+                    .find(|a| a.busid == current_busid && a.usb_id == usb_id)
                     .map(|a| format!("{}:{} on {}", a.target_type, a.target_name, a.target_hostname));
                 devices.push(UsbDevice {
                     busid: current_busid.clone(),
@@ -307,9 +308,10 @@ fn parse_usbip_list_local(text: &str, config: &WolfUsbConfig) -> Vec<UsbDevice> 
     }
 
     // Don't forget the last device
-    if !current_busid.is_empty() {
+    if !current_busid.is_empty() && current_vid != "1d6b" {
+        let usb_id = format!("{}:{}", current_vid, current_pid);
         let assigned = config.assignments.iter()
-            .find(|a| a.busid == current_busid)
+            .find(|a| a.busid == current_busid && a.usb_id == usb_id)
             .map(|a| format!("{}:{} on {}", a.target_type, a.target_name, a.target_hostname));
         devices.push(UsbDevice {
             busid: current_busid,
@@ -320,6 +322,9 @@ fn parse_usbip_list_local(text: &str, config: &WolfUsbConfig) -> Vec<UsbDevice> 
         });
     }
 
+    // Filter out root hubs from usbip list too
+    devices.retain(|d| d.vendor_id != "1d6b");
+
     // If usbip list was empty, fallback to lsusb
     if devices.is_empty() {
         return parse_lsusb(config);
@@ -328,7 +333,8 @@ fn parse_usbip_list_local(text: &str, config: &WolfUsbConfig) -> Vec<UsbDevice> 
     devices
 }
 
-/// Parse lsusb output as fallback (convert to busid format)
+/// Parse lsusb output as fallback. Uses bus:device as the unique ID.
+/// Filters out root hubs (vendor 1d6b = Linux Foundation virtual devices).
 fn parse_lsusb(config: &WolfUsbConfig) -> Vec<UsbDevice> {
     let output = match Command::new("lsusb").output() {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
@@ -337,12 +343,14 @@ fn parse_lsusb(config: &WolfUsbConfig) -> Vec<UsbDevice> {
 
     let mut devices = Vec::new();
     for line in output.lines() {
+        // Format: "Bus 001 Device 002: ID 1a2b:3c4d Manufacturer Product"
         let parts: Vec<&str> = line.splitn(2, ": ").collect();
         if parts.len() < 2 { continue; }
 
         let bus_dev: Vec<&str> = parts[0].split_whitespace().collect();
         let bus: u32 = bus_dev.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let _addr: u32 = bus_dev.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let addr: u32 = bus_dev.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+        if bus == 0 || addr == 0 { continue; }
 
         let id_desc = parts[1];
         let (vid, pid, product) = if id_desc.starts_with("ID ") {
@@ -358,11 +366,16 @@ fn parse_lsusb(config: &WolfUsbConfig) -> Vec<UsbDevice> {
             ("0000".to_string(), "0000".to_string(), id_desc.to_string())
         };
 
-        // Approximate busid from bus number (lsusb doesn't give the usbip busid directly)
-        let busid = format!("{}-1", bus);
+        // Skip root hubs and virtual USB devices (Linux Foundation = 1d6b)
+        if vid == "1d6b" { continue; }
 
+        // Use bus-device as unique ID (e.g. "1-2" for bus 1 device 2)
+        let busid = format!("{}-{}", bus, addr);
+
+        // Match assignment by BOTH busid AND usb_id (must match both to avoid cross-matching)
+        let usb_id = format!("{}:{}", vid, pid);
         let assigned = config.assignments.iter()
-            .find(|a| a.busid == busid || (a.usb_id == format!("{}:{}", vid, pid)))
+            .find(|a| a.busid == busid && a.usb_id == usb_id)
             .map(|a| format!("{}:{} on {}", a.target_type, a.target_name, a.target_hostname));
 
         devices.push(UsbDevice {
