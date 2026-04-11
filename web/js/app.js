@@ -34536,25 +34536,31 @@ async function loadWolfUsbPage() {
         var resp = await fetch(apiUrl('/api/wolfusb/status'));
         var status = await resp.json();
 
-        var html = '<div class="content-header"><h2>WolfUSB</h2><p style="color:var(--text-muted);font-size:13px;">Share USB devices across your cluster. Assign any USB device to any Docker container, LXC container, or VM on any node. Devices appear as real USB via <code>usbip</code>.</p></div>';
+        var html = '';
 
         if (!status.usbip_available) {
-            html += '<div class="card" style="margin-bottom:16px;"><div class="card-header">Install usbip Tools</div><div class="card-body">'
-                + '<p style="color:var(--text-secondary);margin-bottom:12px;">The <code>usbip</code> kernel tools are required for USB device sharing. They are part of the Linux kernel but need to be installed as a package.</p>'
-                + '<button class="btn btn-primary" onclick="installWolfUsb()" id="wolfusb-install-btn">Install usbip Tools</button>'
-                + '<div id="wolfusb-install-output" style="display:none;margin-top:12px;"></div>'
+            html += '<div class="card" style="margin-bottom:16px;"><div class="card-header">Setup Required</div><div class="card-body" style="text-align:center;padding:2rem;">'
+                + '<div style="font-size:2.5rem;margin-bottom:12px;">🔌</div>'
+                + '<h3 style="margin-bottom:8px;">Install USB/IP Tools</h3>'
+                + '<p style="color:var(--text-secondary);margin-bottom:16px;max-width:500px;margin-left:auto;margin-right:auto;">WolfUSB uses the Linux kernel\'s built-in <strong>usbip</strong> module to share USB devices across your network as real USB devices. The kernel tools need to be installed once.</p>'
+                + '<button class="btn btn-primary" onclick="installWolfUsb()" id="wolfusb-install-btn" style="padding:10px 24px;">Install usbip Tools</button>'
+                + '<div id="wolfusb-install-output" style="display:none;margin-top:16px;text-align:left;max-width:600px;margin-left:auto;margin-right:auto;"></div>'
+                + '<p style="color:var(--text-muted);font-size:11px;margin-top:16px;">Supports Debian, Ubuntu, Proxmox, Arch, Fedora, RHEL, and openSUSE.</p>'
                 + '</div></div>';
             el.innerHTML = html;
             return;
         }
 
-        // Config
-        html += '<div class="card" style="margin-bottom:16px;"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center;">'
-            + '<span>Configuration</span>'
-            + '<span style="font-size:11px;color:#22c55e;">usbip ready</span>'
-            + '</div><div class="card-body">'
-            + '<label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">'
-            + '<input type="checkbox" id="wolfusb-enabled" ' + (status.enabled ? 'checked' : '') + ' onchange="saveWolfUsbConfig()"> Enable USB sharing on this node</label>'
+        // Status bar
+        var statusColor = status.enabled ? '#22c55e' : 'var(--text-muted)';
+        var statusText = status.enabled ? 'Enabled' : 'Disabled';
+        html += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;padding:12px 16px;background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-sm);">'
+            + '<span style="font-size:1.5rem;">🔌</span>'
+            + '<div style="flex:1;"><strong style="font-size:14px;">WolfUSB</strong><br><span style="font-size:12px;color:var(--text-muted);">Share USB devices across your cluster via usbip</span></div>'
+            + '<div style="display:flex;align-items:center;gap:12px;">'
+            + '<span style="font-size:11px;color:' + statusColor + ';font-weight:600;">' + statusText + '</span>'
+            + '<label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">'
+            + '<input type="checkbox" id="wolfusb-enabled" ' + (status.enabled ? 'checked' : '') + ' onchange="saveWolfUsbConfig()"> Enable</label>'
             + '</div></div>';
 
         // Devices
@@ -34562,7 +34568,7 @@ async function loadWolfUsbPage() {
             + '<span>USB Devices on This Node</span>'
             + '<button class="btn btn-sm" onclick="refreshWolfUsbDevices()" style="padding:4px 12px;font-size:11px;">Refresh</button>'
             + '</div><div class="card-body" id="wolfusb-devices-body">'
-            + '<div style="color:var(--text-muted);font-size:12px;text-align:center;padding:12px;">Loading devices...</div>'
+            + '<div style="color:var(--text-muted);font-size:12px;text-align:center;padding:16px;">Loading devices...</div>'
             + '</div></div>';
 
         // Assignments
@@ -34582,17 +34588,31 @@ async function installWolfUsb() {
     var btn = document.getElementById('wolfusb-install-btn');
     var output = document.getElementById('wolfusb-install-output');
     if (btn) { btn.disabled = true; btn.textContent = 'Installing...'; }
-    if (output) { output.style.display = 'block'; output.innerHTML = '<pre style="background:var(--bg-primary);padding:12px;border-radius:8px;font-size:11px;max-height:300px;overflow:auto;">Installing usbip tools...</pre>'; }
+    if (output) {
+        output.style.display = 'block';
+        output.innerHTML = '<pre style="background:var(--bg-primary);padding:14px;border-radius:8px;font-size:11px;max-height:400px;overflow:auto;border:1px solid var(--border);line-height:1.6;">Installing usbip tools for your platform...\nThis may take a moment.\n</pre>';
+    }
     try {
         var resp = await fetch(apiUrl('/api/wolfusb/install'), { method: 'POST' });
         var data = await resp.json();
-        if (data.ok) { showToast('usbip tools installed', 'success'); loadWolfUsbPage(); }
-        else {
-            showToast('Install failed: ' + (data.error || ''), 'error');
-            if (output) output.querySelector('pre').textContent = data.error || 'Unknown error';
-            if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
+        if (data.ok) {
+            showToast('usbip tools installed successfully', 'success');
+            if (output) output.querySelector('pre').textContent = data.output || 'Installed successfully';
+            setTimeout(loadWolfUsbPage, 1500);
+        } else {
+            if (output) {
+                output.innerHTML = '<div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);border-radius:8px;padding:14px;">'
+                    + '<strong style="color:#ef4444;">Installation issue</strong>'
+                    + '<pre style="margin-top:8px;font-size:11px;white-space:pre-wrap;max-height:300px;overflow:auto;color:var(--text-secondary);">' + escapeHtml(data.error || 'Unknown error') + '</pre>'
+                    + '<p style="margin-top:10px;font-size:12px;color:var(--text-muted);">You can also install manually: <code>sudo apt install usbip</code> (Debian/Ubuntu) or <code>sudo pacman -S usbip</code> (Arch) or <code>sudo dnf install usbip-utils</code> (Fedora)</p>'
+                    + '</div>';
+            }
+            if (btn) { btn.disabled = false; btn.textContent = 'Retry Installation'; }
         }
-    } catch (e) { showToast('Install failed: ' + e.message, 'error'); if (btn) { btn.disabled = false; btn.textContent = 'Retry'; } }
+    } catch (e) {
+        showToast('Install failed: ' + e.message, 'error');
+        if (btn) { btn.disabled = false; btn.textContent = 'Retry Installation'; }
+    }
 }
 
 async function saveWolfUsbConfig() {
@@ -34617,7 +34637,7 @@ async function refreshWolfUsbDevices() {
         var assignments = data.assignments || [];
 
         if (devices.length === 0) {
-            body.innerHTML = '<div style="color:var(--text-muted);font-size:12px;text-align:center;padding:16px;">No USB devices detected.</div>';
+            body.innerHTML = '<div style="text-align:center;padding:24px;"><span style="font-size:2rem;display:block;margin-bottom:8px;">🔌</span><span style="color:var(--text-muted);font-size:13px;">No USB devices detected on this node.<br><span style="font-size:11px;">Plug in a USB device and click Refresh.</span></span></div>';
         } else {
             // Build cluster-wide target options (all nodes' containers/VMs)
             var targetOpts = await _wolfusbGetClusterTargets();
@@ -34629,24 +34649,25 @@ async function refreshWolfUsbDevices() {
             var sourceAddr = selfNode ? selfNode.address : '';
 
             var html = '<table class="data-table" style="width:100%;font-size:12px;"><thead><tr>'
-                + '<th>Bus ID</th><th>ID</th><th>Device</th><th>Assigned To</th><th style="width:320px;">Assign To</th>'
+                + '<th>Bus ID</th><th>Vendor:Product</th><th>Device</th><th>Status</th><th>Assign To</th>'
                 + '</tr></thead><tbody>';
             devices.forEach(function(d, idx) {
                 var safeId = (d.busid || '').replace(/[^a-zA-Z0-9\-\.]/g, '_');
-                var assignedBadge = d.assigned_to
-                    ? '<span style="background:rgba(34,197,94,0.15);color:#22c55e;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600;">' + escapeHtml(d.assigned_to) + '</span>'
-                    : '<span style="color:var(--text-muted);font-size:11px;">—</span>';
+                var statusCell = d.assigned_to
+                    ? '<span style="background:rgba(34,197,94,0.15);color:#22c55e;padding:3px 10px;border-radius:6px;font-size:11px;font-weight:600;display:inline-block;">' + escapeHtml(d.assigned_to) + '</span>'
+                    + '<br><button class="btn btn-sm" onclick="wolfusbUnassign(\'' + escapeAttr(d.busid) + '\',\'' + escapeAttr(sourceId) + '\')" style="margin-top:4px;padding:2px 8px;font-size:10px;background:rgba(239,68,68,0.1);color:#ef4444;border:1px solid rgba(239,68,68,0.2);border-radius:4px;">Remove</button>'
+                    : '<span style="color:var(--text-muted);font-size:11px;">Available</span>';
 
                 html += '<tr>'
-                    + '<td style="font-family:monospace;">' + escapeHtml(d.busid) + '</td>'
-                    + '<td style="font-family:monospace;">' + escapeHtml(d.vendor_id) + ':' + escapeHtml(d.product_id) + '</td>'
-                    + '<td>' + escapeHtml(d.product || 'Unknown') + '</td>'
-                    + '<td>' + assignedBadge + '</td>'
-                    + '<td><div style="display:flex;gap:6px;align-items:center;">'
-                    + '<select id="wolfusb-tgt-' + safeId + '" class="form-control" style="font-size:11px;padding:4px 8px;flex:1;">'
-                    + '<option value="">— Select —</option>' + targetOpts + '</select>'
-                    + '<button class="btn btn-sm" onclick="wolfusbAssign(\'' + escapeAttr(d.busid) + '\',\'' + escapeAttr(d.product || 'USB Device') + '\',\'' + escapeAttr(d.vendor_id + ':' + d.product_id) + '\',\'' + escapeAttr(sourceId) + '\',\'' + escapeAttr(sourceHostname) + '\',\'' + escapeAttr(sourceAddr) + '\')" style="padding:4px 10px;font-size:11px;">Assign</button>'
-                    + (d.assigned_to ? '<button class="btn btn-sm" onclick="wolfusbUnassign(\'' + escapeAttr(d.busid) + '\',\'' + escapeAttr(sourceId) + '\')" style="padding:4px 10px;font-size:11px;background:rgba(239,68,68,0.1);color:#ef4444;border-color:rgba(239,68,68,0.3);">Remove</button>' : '')
+                    + '<td style="font-family:monospace;white-space:nowrap;">' + escapeHtml(d.busid) + '</td>'
+                    + '<td style="font-family:monospace;white-space:nowrap;">' + escapeHtml(d.vendor_id) + ':' + escapeHtml(d.product_id) + '</td>'
+                    + '<td>' + escapeHtml(d.product || 'Unknown Device') + '</td>'
+                    + '<td>' + statusCell + '</td>'
+                    + '<td>'
+                    + '<div style="display:flex;gap:6px;align-items:center;">'
+                    + '<select id="wolfusb-tgt-' + safeId + '" class="form-control" style="font-size:11px;padding:5px 8px;min-width:180px;">'
+                    + '<option value="">— Select target —</option>' + targetOpts + '</select>'
+                    + '<button class="btn btn-sm btn-primary" onclick="wolfusbAssign(\'' + escapeAttr(d.busid) + '\',\'' + escapeAttr(d.product || 'USB Device') + '\',\'' + escapeAttr(d.vendor_id + ':' + d.product_id) + '\',\'' + escapeAttr(sourceId) + '\',\'' + escapeAttr(sourceHostname) + '\',\'' + escapeAttr(sourceAddr) + '\')" style="padding:5px 14px;font-size:11px;white-space:nowrap;">Assign</button>'
                     + '</div></td></tr>';
             });
             html += '</tbody></table>';

@@ -133,37 +133,92 @@ pub fn ensure_usbip_modules() -> Result<(), String> {
     Ok(())
 }
 
-/// Check if usbip tools are available
+/// Check if usbip is available (binary in PATH or kernel modules loaded)
 pub fn is_usbip_available() -> bool {
-    Command::new("which").arg("usbip").output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    // Check for binary via shell (more reliable than `which` across distros)
+    if Command::new("sh").args(["-c", "command -v usbip"]).output()
+        .map(|o| o.status.success()).unwrap_or(false)
+    {
+        return true;
+    }
+    // Check common paths directly
+    if std::path::Path::new("/usr/local/bin/usbip").exists()
+        || std::path::Path::new("/usr/sbin/usbip").exists()
+    {
+        return true;
+    }
+    // Check if kernel module is loaded
+    std::path::Path::new("/sys/module/usbip_host").exists()
 }
 
-/// Install usbip tools (part of linux-tools package)
+/// Install usbip tools — handles Arch, Debian, Ubuntu, Proxmox, Fedora, RHEL, openSUSE
 pub async fn install_usbip() -> Result<String, String> {
     info!("WolfUSB: installing usbip tools");
-    // Detect package manager and install
     let script = r#"
-        if command -v apt-get >/dev/null 2>&1; then
-            KERNEL=$(uname -r)
-            apt-get update -y && apt-get install -y linux-tools-generic linux-tools-$KERNEL 2>/dev/null || apt-get install -y usbip 2>/dev/null || true
-        elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y usbip
-        elif command -v pacman >/dev/null 2>&1; then
-            # usbip is included in the linux package on Arch
-            true
-        elif command -v zypper >/dev/null 2>&1; then
-            zypper install -y usbip
+KERNEL="$(uname -r)"
+echo "Kernel: $KERNEL"
+
+# ─── Arch / CachyOS / Manjaro ───
+if command -v pacman >/dev/null 2>&1; then
+    echo "Detected: Arch-based (pacman)"
+    pacman -S --noconfirm usbip 2>/dev/null || true
+
+# ─── Debian / Ubuntu / Proxmox VE ───
+elif command -v apt-get >/dev/null 2>&1; then
+    echo "Detected: Debian/Ubuntu-based (apt)"
+    apt-get update -y || true
+    # Debian, Proxmox: package is simply "usbip"
+    # Ubuntu: "usbip" or "linux-tools-generic" + "linux-tools-$KERNEL"
+    apt-get install -y usbip 2>/dev/null \
+        || apt-get install -y linux-tools-generic "linux-tools-$KERNEL" 2>/dev/null \
+        || apt-get install -y linux-tools-common 2>/dev/null \
+        || true
+
+# ─── Fedora / RHEL / Rocky / AlmaLinux ───
+elif command -v dnf >/dev/null 2>&1; then
+    echo "Detected: Fedora/RHEL-based (dnf)"
+    dnf install -y usbip-utils 2>/dev/null || true
+
+# ─── openSUSE ───
+elif command -v zypper >/dev/null 2>&1; then
+    echo "Detected: openSUSE (zypper)"
+    zypper install -y usbip-utils 2>/dev/null || zypper install -y usbip 2>/dev/null || true
+
+else
+    echo "ERROR: No supported package manager found"
+fi
+
+# ─── Load kernel modules ───
+modprobe usbip-core 2>/dev/null || true
+modprobe usbip-host 2>/dev/null || true
+modprobe vhci-hcd 2>/dev/null || true
+
+# ─── Persist modules across reboots ───
+mkdir -p /etc/modules-load.d
+printf 'usbip-core\nusbip-host\nvhci-hcd\n' > /etc/modules-load.d/wolfusb.conf 2>/dev/null || true
+
+# ─── Find binary if not in PATH (Ubuntu puts it under /usr/lib/linux-tools/) ───
+if ! command -v usbip >/dev/null 2>&1; then
+    for p in /usr/lib/linux-tools/"$KERNEL"/usbip /usr/lib/linux-tools/*/usbip /usr/sbin/usbip; do
+        if [ -x "$p" ]; then
+            echo "Found usbip at $p — creating symlink to /usr/local/bin/usbip"
+            ln -sf "$p" /usr/local/bin/usbip
+            break
         fi
-        # Verify
-        if command -v usbip >/dev/null 2>&1; then
-            echo "usbip installed successfully"
-            usbip version 2>/dev/null || true
-        else
-            echo "ERROR: usbip not found after install" >&2
-            exit 1
-        fi
+    done
+fi
+
+# ─── Verify ───
+if command -v usbip >/dev/null 2>&1; then
+    echo "OK: usbip installed at $(command -v usbip)"
+    usbip version 2>/dev/null || true
+elif [ -d /sys/module/usbip_host ]; then
+    echo "OK: usbip kernel modules loaded but binary not found in PATH"
+else
+    echo "WARNING: usbip installation may be incomplete"
+    echo "Modules in /lib/modules/$KERNEL/kernel/drivers/usb/usbip/:"
+    ls /lib/modules/"$KERNEL"/kernel/drivers/usb/usbip/ 2>/dev/null || echo "  (none)"
+fi
     "#;
 
     let output = tokio::process::Command::new("bash")
@@ -179,11 +234,14 @@ pub async fn install_usbip() -> Result<String, String> {
         String::from_utf8_lossy(&output.stderr)
     );
 
+    // Try loading modules after install
+    let _ = ensure_usbip_modules();
+
     if is_usbip_available() {
-        let _ = ensure_usbip_modules();
         Ok(combined)
     } else {
-        Err(format!("Installation failed:\n{}", combined))
+        // Even if the check fails, the script output tells the user what happened
+        Err(format!("Installation may have partially succeeded. Check output:\n{}", combined))
     }
 }
 
@@ -707,7 +765,7 @@ pub fn merge_remote_assignments(remote_assignments: &[UsbAssignment]) {
 
     // Remove assignments that no longer exist on any remote node
     // (Only remove if the source node is NOT us — we're authoritative for our own devices)
-    let self_id = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or_default();
+    let self_id = crate::agent::self_node_id();
     let remote_busids: Vec<(&str, &str)> = remote_assignments.iter()
         .map(|a| (a.busid.as_str(), a.source_node_id.as_str()))
         .collect();

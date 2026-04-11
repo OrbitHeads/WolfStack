@@ -800,9 +800,11 @@ impl AiAgent {
 fn load_knowledge_base() -> String {
     let mut knowledge = String::new();
 
+    let kb_dest = "/etc/wolfstack/knowledge/wolfstack-kb.md";
+
     // Load the expert knowledge base first (shipped with WolfStack)
     let kb_paths = [
-        "/etc/wolfstack/knowledge/wolfstack-kb.md",
+        kb_dest,
         "knowledge/wolfstack-kb.md",
         "../knowledge/wolfstack-kb.md",
     ];
@@ -810,9 +812,31 @@ fn load_knowledge_base() -> String {
         if let Ok(content) = std::fs::read_to_string(kb_path) {
             if !content.trim().is_empty() {
                 knowledge.push_str(&content);
-                tracing::info!("Loaded expert knowledge base from {}", kb_path);
+                tracing::info!("Loaded expert knowledge base from {} ({} bytes)", kb_path, content.len());
                 break;
             }
+        }
+    }
+
+    // If no knowledge base found, try downloading it from GitHub
+    if knowledge.is_empty() {
+        tracing::info!("AI knowledge base not found locally — downloading from GitHub...");
+        let _ = std::fs::create_dir_all("/etc/wolfstack/knowledge");
+        let url = "https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfStack/master/knowledge/wolfstack-kb.md";
+        match std::process::Command::new("curl")
+            .args(["-fsSL", "--connect-timeout", "10", "--max-time", "30", "-o", kb_dest, url])
+            .status()
+        {
+            Ok(s) if s.success() => {
+                if let Ok(content) = std::fs::read_to_string(kb_dest) {
+                    if !content.trim().is_empty() {
+                        tracing::info!("Downloaded AI knowledge base ({} bytes)", content.len());
+                        knowledge.push_str(&content);
+                    }
+                }
+            }
+            Ok(s) => tracing::warn!("Failed to download knowledge base (exit {})", s),
+            Err(e) => tracing::warn!("Failed to download knowledge base: {}", e),
         }
     }
 
