@@ -1101,6 +1101,7 @@ function selectServerView(nodeId, view) {
         'pve-resources': 'VMs & Containers',
         'mysql-editor': 'Database Manager',
         'terminal': 'Terminal',
+        'wolfusb': 'USB Sharing',
         'syslogs': 'System Logs',
         'security': 'Security',
         'ceph': 'Ceph',
@@ -1197,6 +1198,7 @@ function selectServerView(nodeId, view) {
     if (view === 'ceph') loadCephStatus().finally(() => hidePageLoadingOverlay(el));
     if (view === 'wolfkube') loadNodeWolfKube().finally(() => hidePageLoadingOverlay(el));
     if (view === 'wolfram') loadWolframStatus().finally(() => hidePageLoadingOverlay(el));
+    if (view === 'wolfusb') loadWolfUsbPage().finally(() => hidePageLoadingOverlay(el));
 }
 
 // ─── Server Tree ───
@@ -1305,73 +1307,76 @@ function buildServerTree(nodes) {
                         ${node.is_self ? '<span class="self-badge">this</span>' : `<span class="remove-server-btn" onclick="event.stopPropagation(); confirmRemoveServer('${node.id}', '${node.hostname}')" title="Remove server">🗑️</span>`}
                     </div>
                     <div class="server-node-children ${shouldExpandNode ? 'expanded' : ''}" id="children-${node.id}">
-                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="dashboard" onclick="selectServerView('${node.id}', 'dashboard')">
-                            <span class="icon">📊</span> Dashboard
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="backups" onclick="selectServerView('${node.id}', 'backups')">
+                            <span class="icon">💾</span> Backups
+                        </a>
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="ceph" onclick="selectServerView('${node.id}', 'ceph')">
+                            <span class="icon">🔵</span> Ceph
+                        </a>
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="certificates" onclick="selectServerView('${node.id}', 'certificates')">
+                            <span class="icon">🔒</span> Certificates
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="components" onclick="selectServerView('${node.id}', 'components')">
                             <span class="icon">📦</span> Components
                             <span class="badge" style="font-size:10px; padding:1px 6px;">${(node.components || []).filter(c => c.installed).length}</span>
                         </a>
-                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="services" onclick="selectServerView('${node.id}', 'services')">
-                            <span class="icon">⚡</span> Services
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="compose" onclick="selectServerView('${node.id}', 'compose')">
+                            <span class="icon">📋</span> Compose
+                        </a>
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="cron" onclick="selectServerView('${node.id}', 'cron')">
+                            <span class="icon">🕐</span> Cron Jobs
+                        </a>
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="dashboard" onclick="selectServerView('${node.id}', 'dashboard')">
+                            <span class="icon">📊</span> Dashboard
+                        </a>
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="mysql-editor" onclick="selectServerView('${node.id}', 'mysql-editor')">
+                            <span class="icon">🗄️</span> Database Manager
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="containers" onclick="selectServerView('${node.id}', 'containers')">
                             <span class="icon">🐳</span> Docker
                             ${node.docker_count ? `<span class="badge" style="font-size:10px; padding:1px 6px;">${node.docker_count}</span>` : ''}
                         </a>
-                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="compose" onclick="selectServerView('${node.id}', 'compose')">
-                            <span class="icon">📋</span> Compose
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="files" onclick="selectServerView('${node.id}', 'files')">
+                            <span class="icon">📂</span> Files
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="lxc" onclick="selectServerView('${node.id}', 'lxc')">
                             <span class="icon">📦</span> LXC
                             ${node.lxc_count ? `<span class="badge" style="font-size:10px; padding:1px 6px;">${node.lxc_count}</span>` : ''}
                         </a>
-                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="wolfkube" onclick="selectServerView('${node.id}', 'wolfkube')">
-                            <span class="icon">&#9784;</span> WolfKube
-                            <span class="badge k8s-pod-badge" data-node="${node.id}" style="font-size:10px; padding:1px 6px; display:none;"></span>
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="networking" onclick="selectServerView('${node.id}', 'networking')">
+                            <span class="icon">🌐</span> Networking
+                        </a>
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="security" onclick="selectServerView('${node.id}', 'security')">
+                            <span class="icon">🛡️</span> Security
+                        </a>
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="services" onclick="selectServerView('${node.id}', 'services')">
+                            <span class="icon">⚡</span> Services
+                        </a>
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="storage" onclick="selectServerView('${node.id}', 'storage')">
+                            <span class="icon">💾</span> Storage
+                        </a>
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="syslogs" onclick="selectServerView('${node.id}', 'syslogs')">
+                            <span class="icon">📋</span> System Logs
+                        </a>
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="terminal" onclick="selectServerView('${node.id}', 'terminal')">
+                            <span class="icon">💻</span> Terminal
+                        </a>
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="wolfusb" onclick="selectServerView('${node.id}', 'wolfusb')">
+                            <span class="icon">🔌</span> USB Sharing
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="vms" onclick="selectServerView('${node.id}', 'vms')">
                             <span class="icon">🖥️</span> Virtual Machines
                             ${node.vm_count ? `<span class="badge" style="font-size:10px; padding:1px 6px;">${node.vm_count}</span>` : ''}
                         </a>
-                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="storage" onclick="selectServerView('${node.id}', 'storage')">
-                            <span class="icon">💾</span> Storage
-                        </a>
-                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="ceph" onclick="selectServerView('${node.id}', 'ceph')">
-                            <span class="icon">🔵</span> Ceph
-                        </a>
-                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="files" onclick="selectServerView('${node.id}', 'files')">
-                            <span class="icon">📂</span> Files
-                        </a>
-                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="networking" onclick="selectServerView('${node.id}', 'networking')">
-                            <span class="icon">🌐</span> Networking
-                        </a>
-                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="backups" onclick="selectServerView('${node.id}', 'backups')">
-                            <span class="icon">💾</span> Backups
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="wolfkube" onclick="selectServerView('${node.id}', 'wolfkube')">
+                            <span class="icon">&#9784;</span> WolfKube
+                            <span class="badge k8s-pod-badge" data-node="${node.id}" style="font-size:10px; padding:1px 6px; display:none;"></span>
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="wolfnet" onclick="selectServerView('${node.id}', 'wolfnet')">
                             <span class="icon">🔗</span> WolfNet
                         </a>
-                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="certificates" onclick="selectServerView('${node.id}', 'certificates')">
-                            <span class="icon">🔒</span> Certificates
-                        </a>
-                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="cron" onclick="selectServerView('${node.id}', 'cron')">
-                            <span class="icon">🕐</span> Cron Jobs
-                        </a>
-                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="security" onclick="selectServerView('${node.id}', 'security')">
-                            <span class="icon">🛡️</span> Security
-                        </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="wolfram" onclick="selectServerView('${node.id}', 'wolfram')">
                             <span class="icon">🧠</span> Wolfram
-                        </a>
-                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="terminal" onclick="selectServerView('${node.id}', 'terminal')">
-                            <span class="icon">💻</span> Terminal
-                        </a>
-                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="syslogs" onclick="selectServerView('${node.id}', 'syslogs')">
-                            <span class="icon">📋</span> System Logs
-                        </a>
-                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="mysql-editor" onclick="selectServerView('${node.id}', 'mysql-editor')">
-                            <span class="icon">🗄️</span> Database Manager
                         </a>
                     </div>
                 </div>`;
@@ -34432,5 +34437,272 @@ async function wolframSaveConfig() {
         }
     } catch (e) {
         showToast('Failed to save config: ' + e.message, 'error');
+    }
+}
+
+// ═══════════════════════════════════════════════
+// ─── WolfUSB — USB over IP ───
+// ═══════════════════════════════════════════════
+
+async function loadWolfUsbPage() {
+    var el = document.getElementById('page-content');
+    if (!el) return;
+
+    el.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted);">Loading USB Sharing...</div>';
+
+    try {
+        var resp = await fetch(apiUrl('/api/wolfusb/status'));
+        var status = await resp.json();
+
+        var html = '<div class="content-header"><h2>USB Sharing</h2><p style="color:var(--text-muted);font-size:13px;">Share USB devices across your network with WolfUSB. Assign devices to Docker containers, LXC containers, and VMs.</p></div>';
+
+        // Installation status
+        if (!status.installed) {
+            html += '<div class="card" style="margin-bottom:16px;">'
+                + '<div class="card-header">Install WolfUSB</div>'
+                + '<div class="card-body">'
+                + '<p style="color:var(--text-secondary);margin-bottom:12px;">WolfUSB is not installed on this node. Install it to share USB devices over the network.</p>'
+                + '<button class="btn btn-primary" onclick="installWolfUsb()" id="wolfusb-install-btn">Install WolfUSB</button>'
+                + '<div id="wolfusb-install-output" style="display:none;margin-top:12px;"></div>'
+                + '</div></div>';
+            el.innerHTML = html;
+            return;
+        }
+
+        // Config section
+        html += '<div class="card" style="margin-bottom:16px;">'
+            + '<div class="card-header" style="display:flex;justify-content:space-between;align-items:center;">'
+            + '<span>Configuration</span>'
+            + '<div style="display:flex;gap:8px;align-items:center;">'
+            + '<span style="font-size:11px;color:' + (status.running ? '#22c55e' : 'var(--text-muted)') + ';">' + (status.running ? 'Running' : 'Stopped') + '</span>'
+            + (status.version ? '<span style="font-size:10px;color:var(--text-muted);">v' + escapeHtml(status.version) + '</span>' : '')
+            + '</div></div>'
+            + '<div class="card-body">'
+            + '<div class="form-row" style="display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:12px;align-items:end;">'
+            + '<div class="form-group"><label>Bind Address</label><input type="text" id="wolfusb-bind" class="form-control" value="' + escapeAttr(status.config.bind_address || '0.0.0.0') + '"></div>'
+            + '<div class="form-group"><label>Port</label><input type="number" id="wolfusb-port" class="form-control" value="' + (status.config.port || 3240) + '"></div>'
+            + '<div class="form-group"><label>Auth Key</label><input type="password" id="wolfusb-key" class="form-control" placeholder="Optional" value="' + (status.config.has_auth_key ? '••••••••' : '') + '"></div>'
+            + '<div class="form-group"><label>&nbsp;</label><div style="display:flex;gap:8px;">'
+            + '<label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;white-space:nowrap;"><input type="checkbox" id="wolfusb-enabled" ' + (status.config.enabled ? 'checked' : '') + '> Enabled</label>'
+            + '<button class="btn btn-primary" onclick="saveWolfUsbConfig()" style="padding:6px 16px;font-size:12px;">Save</button>'
+            + '</div></div>'
+            + '</div></div></div>';
+
+        // Devices section
+        html += '<div class="card" style="margin-bottom:16px;">'
+            + '<div class="card-header" style="display:flex;justify-content:space-between;align-items:center;">'
+            + '<span>USB Devices</span>'
+            + '<button class="btn btn-sm" onclick="refreshWolfUsbDevices()" style="padding:4px 12px;font-size:11px;">Refresh</button>'
+            + '</div>'
+            + '<div class="card-body" id="wolfusb-devices-body">'
+            + '<div style="color:var(--text-muted);font-size:12px;text-align:center;padding:12px;">Loading devices...</div>'
+            + '</div></div>';
+
+        // Assignments section
+        html += '<div class="card" style="margin-bottom:16px;">'
+            + '<div class="card-header">Active Assignments</div>'
+            + '<div class="card-body" id="wolfusb-assignments-body">'
+            + '<div style="color:var(--text-muted);font-size:12px;text-align:center;padding:12px;">Loading...</div>'
+            + '</div></div>';
+
+        el.innerHTML = html;
+
+        // Load devices
+        refreshWolfUsbDevices();
+    } catch (e) {
+        el.innerHTML = '<div style="color:var(--danger);padding:20px;">Failed to load WolfUSB: ' + escapeHtml(e.message) + '</div>';
+    }
+}
+
+async function installWolfUsb() {
+    var btn = document.getElementById('wolfusb-install-btn');
+    var output = document.getElementById('wolfusb-install-output');
+    if (btn) { btn.disabled = true; btn.textContent = 'Installing...'; }
+    if (output) { output.style.display = 'block'; output.innerHTML = '<pre style="background:var(--bg-primary);padding:12px;border-radius:8px;font-size:11px;max-height:300px;overflow:auto;">Installing WolfUSB...</pre>'; }
+
+    try {
+        var resp = await fetch(apiUrl('/api/wolfusb/install'), { method: 'POST' });
+        var data = await resp.json();
+        if (data.ok) {
+            showToast('WolfUSB installed successfully', 'success');
+            loadWolfUsbPage();
+        } else {
+            showToast('Installation failed: ' + (data.error || ''), 'error');
+            if (output) output.querySelector('pre').textContent = data.error || 'Unknown error';
+            if (btn) { btn.disabled = false; btn.textContent = 'Retry Install'; }
+        }
+    } catch (e) {
+        showToast('Install failed: ' + e.message, 'error');
+        if (btn) { btn.disabled = false; btn.textContent = 'Retry Install'; }
+    }
+}
+
+async function saveWolfUsbConfig() {
+    var config = {
+        enabled: document.getElementById('wolfusb-enabled')?.checked || false,
+        bind_address: document.getElementById('wolfusb-bind')?.value || '0.0.0.0',
+        port: parseInt(document.getElementById('wolfusb-port')?.value) || 3240,
+        auth_key: document.getElementById('wolfusb-key')?.value || '',
+    };
+
+    try {
+        var resp = await fetch(apiUrl('/api/wolfusb/config'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(config),
+        });
+        var data = await resp.json();
+        if (data.ok) {
+            showToast(data.warning || 'WolfUSB config saved', data.warning ? 'warning' : 'success');
+            loadWolfUsbPage();
+        } else {
+            showToast('Failed: ' + (data.error || ''), 'error');
+        }
+    } catch (e) {
+        showToast('Failed: ' + e.message, 'error');
+    }
+}
+
+async function refreshWolfUsbDevices() {
+    var body = document.getElementById('wolfusb-devices-body');
+    var assignBody = document.getElementById('wolfusb-assignments-body');
+    if (!body) return;
+
+    try {
+        var resp = await fetch(apiUrl('/api/wolfusb/devices'));
+        var data = await resp.json();
+        var devices = data.devices || [];
+        var assignments = data.assignments || [];
+
+        if (devices.length === 0) {
+            body.innerHTML = '<div style="color:var(--text-muted);font-size:12px;text-align:center;padding:16px;">No USB devices detected on this node.</div>';
+        } else {
+            // Build target options from local containers/VMs
+            var targetOpts = await _wolfusbGetTargets();
+
+            var html = '<table class="data-table" style="width:100%;font-size:12px;"><thead><tr>'
+                + '<th>Bus</th><th>Addr</th><th>ID</th><th>Device</th><th>Assigned To</th><th style="width:280px;">Assign</th>'
+                + '</tr></thead><tbody>';
+            devices.forEach(function(d) {
+                var vid = ('0000' + d.vendor_id.toString(16)).slice(-4);
+                var pid = ('0000' + d.product_id.toString(16)).slice(-4);
+                var assignedBadge = d.assigned_to
+                    ? '<span style="background:rgba(34,197,94,0.15);color:#22c55e;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600;">' + escapeHtml(d.assigned_to) + '</span>'
+                    : '<span style="color:var(--text-muted);font-size:11px;">—</span>';
+
+                html += '<tr>'
+                    + '<td>' + d.bus + '</td>'
+                    + '<td>' + d.address + '</td>'
+                    + '<td style="font-family:monospace;">' + vid + ':' + pid + '</td>'
+                    + '<td>' + escapeHtml(d.product || 'Unknown Device') + '</td>'
+                    + '<td>' + assignedBadge + '</td>'
+                    + '<td><div style="display:flex;gap:6px;align-items:center;">'
+                    + '<select id="wolfusb-target-' + d.bus + '-' + d.address + '" class="form-control" style="font-size:11px;padding:4px 8px;flex:1;">'
+                    + '<option value="">— Select target —</option>' + targetOpts + '</select>'
+                    + '<button class="btn btn-sm" onclick="wolfusbAssign(' + d.bus + ',' + d.address + ',\'' + escapeAttr(d.product || 'USB Device') + '\')" style="padding:4px 10px;font-size:11px;">Assign</button>'
+                    + (d.assigned_to ? '<button class="btn btn-sm" onclick="wolfusbUnassign(' + d.bus + ',' + d.address + ')" style="padding:4px 10px;font-size:11px;background:rgba(239,68,68,0.1);color:#ef4444;border-color:rgba(239,68,68,0.3);">Remove</button>' : '')
+                    + '</div></td></tr>';
+            });
+            html += '</tbody></table>';
+            body.innerHTML = html;
+        }
+
+        // Render assignments
+        if (assignBody) {
+            if (assignments.length === 0) {
+                assignBody.innerHTML = '<div style="color:var(--text-muted);font-size:12px;text-align:center;padding:12px;">No USB devices assigned yet.</div>';
+            } else {
+                var ahtml = '<table class="data-table" style="width:100%;font-size:12px;"><thead><tr><th>Device</th><th>Bus:Addr</th><th>Target</th><th></th></tr></thead><tbody>';
+                assignments.forEach(function(a) {
+                    var typeIcon = a.target_type === 'docker' ? '🐳' : a.target_type === 'lxc' ? '📦' : '🖥️';
+                    ahtml += '<tr>'
+                        + '<td>' + escapeHtml(a.label || 'USB Device') + '</td>'
+                        + '<td style="font-family:monospace;">' + a.bus + ':' + a.address + '</td>'
+                        + '<td>' + typeIcon + ' ' + escapeHtml(a.target_type) + ':' + escapeHtml(a.target_name) + '</td>'
+                        + '<td><button class="btn btn-sm" onclick="wolfusbUnassign(' + a.bus + ',' + a.address + ')" style="padding:3px 8px;font-size:10px;background:rgba(239,68,68,0.1);color:#ef4444;border-color:rgba(239,68,68,0.3);">Remove</button></td>'
+                        + '</tr>';
+                });
+                ahtml += '</tbody></table>';
+                assignBody.innerHTML = ahtml;
+            }
+        }
+    } catch (e) {
+        body.innerHTML = '<div style="color:var(--danger);font-size:12px;padding:12px;">Failed to load devices: ' + escapeHtml(e.message) + '</div>';
+    }
+}
+
+async function _wolfusbGetTargets() {
+    // Fetch Docker, LXC, and VM lists for the target dropdown
+    var opts = '';
+    try {
+        var results = await Promise.allSettled([
+            fetch(apiUrl('/api/containers/docker')).then(function(r) { return r.ok ? r.json() : []; }),
+            fetch(apiUrl('/api/containers/lxc')).then(function(r) { return r.ok ? r.json() : []; }),
+            fetch(apiUrl('/api/vms')).then(function(r) { return r.ok ? r.json() : []; }),
+        ]);
+        var docker = results[0].status === 'fulfilled' ? results[0].value : [];
+        var lxc = results[1].status === 'fulfilled' ? results[1].value : [];
+        var vms = results[2].status === 'fulfilled' ? results[2].value : [];
+
+        if (docker.length) {
+            opts += '<optgroup label="Docker Containers">';
+            docker.forEach(function(c) { opts += '<option value="docker:' + escapeAttr(c.name) + '">🐳 ' + escapeHtml(c.name) + '</option>'; });
+            opts += '</optgroup>';
+        }
+        if (lxc.length) {
+            opts += '<optgroup label="LXC Containers">';
+            lxc.forEach(function(c) { opts += '<option value="lxc:' + escapeAttr(c.name) + '">📦 ' + escapeHtml(c.name) + '</option>'; });
+            opts += '</optgroup>';
+        }
+        if (vms.length) {
+            opts += '<optgroup label="Virtual Machines">';
+            vms.forEach(function(v) { opts += '<option value="vm:' + escapeAttr(v.name) + '">🖥️ ' + escapeHtml(v.name) + '</option>'; });
+            opts += '</optgroup>';
+        }
+    } catch(e) {}
+    return opts;
+}
+
+async function wolfusbAssign(bus, addr, label) {
+    var sel = document.getElementById('wolfusb-target-' + bus + '-' + addr);
+    if (!sel || !sel.value) { showToast('Select a target first', 'warning'); return; }
+    var parts = sel.value.split(':');
+    var targetType = parts[0];
+    var targetName = parts.slice(1).join(':');
+
+    try {
+        var resp = await fetch(apiUrl('/api/wolfusb/assign'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ bus: bus, address: addr, label: label, target_type: targetType, target_name: targetName }),
+        });
+        var data = await resp.json();
+        if (data.ok) {
+            showToast(data.message || 'USB device assigned', 'success');
+            refreshWolfUsbDevices();
+        } else {
+            showToast('Failed: ' + (data.error || ''), 'error');
+        }
+    } catch (e) {
+        showToast('Failed: ' + e.message, 'error');
+    }
+}
+
+async function wolfusbUnassign(bus, addr) {
+    try {
+        var resp = await fetch(apiUrl('/api/wolfusb/unassign'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ bus: bus, address: addr }),
+        });
+        var data = await resp.json();
+        if (data.ok) {
+            showToast(data.message || 'Assignment removed', 'success');
+            refreshWolfUsbDevices();
+        } else {
+            showToast('Failed: ' + (data.error || ''), 'error');
+        }
+    } catch (e) {
+        showToast('Failed: ' + e.message, 'error');
     }
 }

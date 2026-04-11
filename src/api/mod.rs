@@ -9696,6 +9696,116 @@ pub async fn wolfflow_all_containers_exec(req: HttpRequest, state: web::Data<App
     }
 }
 
+// ─── WolfUSB API ───
+
+/// GET /api/wolfusb/status — installation status, service status, config
+pub async fn wolfusb_status(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let config = crate::wolfusb::WolfUsbConfig::load();
+    HttpResponse::Ok().json(serde_json::json!({
+        "installed": crate::wolfusb::is_installed(),
+        "version": crate::wolfusb::installed_version(),
+        "running": crate::wolfusb::is_running(),
+        "config": {
+            "enabled": config.enabled,
+            "bind_address": config.bind_address,
+            "port": config.port,
+            "has_auth_key": !config.auth_key.is_empty(),
+        },
+        "assignment_count": config.assignments.len(),
+    }))
+}
+
+/// POST /api/wolfusb/install — install WolfUSB from setup script
+pub async fn wolfusb_install(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match crate::wolfusb::install().await {
+        Ok(output) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "output": output })),
+        Err(e) => HttpResponse::Ok().json(serde_json::json!({ "ok": false, "error": e })),
+    }
+}
+
+/// GET /api/wolfusb/config — get full config
+pub async fn wolfusb_get_config(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let config = crate::wolfusb::WolfUsbConfig::load();
+    HttpResponse::Ok().json(&config)
+}
+
+/// POST /api/wolfusb/config — save config and optionally start/stop service
+pub async fn wolfusb_save_config(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let mut config = crate::wolfusb::WolfUsbConfig::load();
+
+    if let Some(v) = body.get("enabled").and_then(|v| v.as_bool()) { config.enabled = v; }
+    if let Some(v) = body.get("bind_address").and_then(|v| v.as_str()) { config.bind_address = v.to_string(); }
+    if let Some(v) = body.get("port").and_then(|v| v.as_u64()) { config.port = v as u16; }
+    if let Some(v) = body.get("auth_key").and_then(|v| v.as_str()) {
+        if !v.contains("••••") { config.auth_key = v.to_string(); }
+    }
+
+    if let Err(e) = config.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+
+    // Start or stop service based on enabled flag
+    if config.enabled && crate::wolfusb::is_installed() {
+        if let Err(e) = crate::wolfusb::start_service(&config) {
+            return HttpResponse::Ok().json(serde_json::json!({ "ok": true, "warning": format!("Config saved but failed to start service: {}", e) }));
+        }
+    } else if !config.enabled {
+        let _ = crate::wolfusb::stop_service();
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({ "ok": true }))
+}
+
+/// GET /api/wolfusb/devices — list USB devices on this node
+pub async fn wolfusb_devices(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let config = crate::wolfusb::WolfUsbConfig::load();
+    let devices = crate::wolfusb::list_local_devices(&config);
+    HttpResponse::Ok().json(serde_json::json!({
+        "devices": devices,
+        "assignments": config.assignments,
+    }))
+}
+
+/// POST /api/wolfusb/assign — assign a USB device to a container/VM
+pub async fn wolfusb_assign(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let mut config = crate::wolfusb::WolfUsbConfig::load();
+
+    let bus = body.get("bus").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+    let address = body.get("address").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+    let label = body.get("label").and_then(|v| v.as_str()).unwrap_or("");
+    let target_type = body.get("target_type").and_then(|v| v.as_str()).unwrap_or("");
+    let target_name = body.get("target_name").and_then(|v| v.as_str()).unwrap_or("");
+
+    if bus == 0 || target_type.is_empty() || target_name.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": "bus, target_type, and target_name are required" }));
+    }
+
+    match crate::wolfusb::assign_device(&mut config, bus, address, label, target_type, target_name) {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "message": msg })),
+        Err(e) => HttpResponse::Ok().json(serde_json::json!({ "ok": false, "error": e })),
+    }
+}
+
+/// POST /api/wolfusb/unassign — remove a USB device assignment
+pub async fn wolfusb_unassign(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let mut config = crate::wolfusb::WolfUsbConfig::load();
+
+    let bus = body.get("bus").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+    let address = body.get("address").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+
+    match crate::wolfusb::unassign_device(&mut config, bus, address) {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "message": msg })),
+        Err(e) => HttpResponse::Ok().json(serde_json::json!({ "ok": false, "error": e })),
+    }
+}
+
 // ─── MySQL Database Editor API ───
 
 /// GET /api/mysql/detect — check if MySQL is installed on this node
@@ -16092,6 +16202,14 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/wolfflow/container-exec", web::post().to(wolfflow_container_exec))
         .route("/api/wolfflow/all-containers-exec", web::post().to(wolfflow_all_containers_exec))
         .route("/api/wolfflow/infrastructure", web::get().to(wolfflow_infrastructure))
+        // WolfUSB — USB over IP
+        .route("/api/wolfusb/status", web::get().to(wolfusb_status))
+        .route("/api/wolfusb/install", web::post().to(wolfusb_install))
+        .route("/api/wolfusb/config", web::get().to(wolfusb_get_config))
+        .route("/api/wolfusb/config", web::post().to(wolfusb_save_config))
+        .route("/api/wolfusb/devices", web::get().to(wolfusb_devices))
+        .route("/api/wolfusb/assign", web::post().to(wolfusb_assign))
+        .route("/api/wolfusb/unassign", web::post().to(wolfusb_unassign))
         // VR Terminal
         .route("/api/vr-terminal/create", web::post().to(crate::vr_terminal::vr_term_create))
         .route("/api/vr-terminal/{id}/output", web::get().to(crate::vr_terminal::vr_term_output))

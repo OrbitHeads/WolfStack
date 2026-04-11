@@ -38,6 +38,7 @@ mod icons;
 mod tui;
 mod wolfflow;
 mod wolfnote;
+mod wolfusb;
 mod paths;
 mod compat;
 mod plugins;
