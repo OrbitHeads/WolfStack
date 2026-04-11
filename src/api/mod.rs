@@ -5135,16 +5135,47 @@ pub async fn ai_models(
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let config = state.ai_agent.config.lock().unwrap().clone();
     let provider = query.get("provider").map(|s| s.as_str()).unwrap_or(&config.provider);
-    let api_key = match provider {
-        "gemini" => &config.gemini_api_key,
-        _ => &config.claude_api_key,
-    };
-    if api_key.is_empty() {
-        return HttpResponse::Ok().json(serde_json::json!({ "models": [], "error": "No API key configured for this provider" }));
-    }
-    match state.ai_agent.list_models(provider, api_key).await {
-        Ok(models) => HttpResponse::Ok().json(serde_json::json!({ "models": models })),
-        Err(e) => HttpResponse::Ok().json(serde_json::json!({ "models": [], "error": e })),
+
+    // Local AI: fetch models from the local server's /v1/models endpoint
+    if provider == "local" {
+        if config.local_url.is_empty() {
+            return HttpResponse::Ok().json(serde_json::json!({ "models": ["llama3", "mistral", "codellama", "phi3", "gemma2", "qwen2"], "note": "Enter your local AI URL and save to auto-detect models" }));
+        }
+        let base = config.local_url.trim_end_matches('/');
+        let url = if base.ends_with("/v1") { format!("{}/models", base) } else { format!("{}/v1/models", base) };
+        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).danger_accept_invalid_certs(true).build().unwrap_or_default();
+        let mut req_builder = client.get(&url);
+        if !config.local_api_key.is_empty() {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", config.local_api_key));
+        }
+        match req_builder.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(data) = resp.json::<serde_json::Value>().await {
+                    let models: Vec<String> = data["data"].as_array()
+                        .or_else(|| data["models"].as_array())
+                        .map(|arr| arr.iter().filter_map(|m| m["id"].as_str().or_else(|| m["name"].as_str()).or_else(|| m.as_str()).map(|s| s.to_string())).collect())
+                        .unwrap_or_default();
+                    if !models.is_empty() {
+                        return HttpResponse::Ok().json(serde_json::json!({ "models": models }));
+                    }
+                }
+                HttpResponse::Ok().json(serde_json::json!({ "models": ["llama3", "mistral", "codellama"], "note": "Could not parse model list — showing defaults" }))
+            }
+            Ok(resp) => HttpResponse::Ok().json(serde_json::json!({ "models": ["llama3", "mistral"], "error": format!("Server returned {}", resp.status()) })),
+            Err(e) => HttpResponse::Ok().json(serde_json::json!({ "models": ["llama3", "mistral"], "error": format!("Cannot reach {}: {}", url, e) })),
+        }
+    } else {
+        let api_key = match provider {
+            "gemini" => &config.gemini_api_key,
+            _ => &config.claude_api_key,
+        };
+        if api_key.is_empty() {
+            return HttpResponse::Ok().json(serde_json::json!({ "models": [], "error": "No API key configured for this provider" }));
+        }
+        match state.ai_agent.list_models(provider, api_key).await {
+            Ok(models) => HttpResponse::Ok().json(serde_json::json!({ "models": models })),
+            Err(e) => HttpResponse::Ok().json(serde_json::json!({ "models": [], "error": e })),
+        }
     }
 }
 

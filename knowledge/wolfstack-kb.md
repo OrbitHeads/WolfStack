@@ -116,6 +116,16 @@
 - Cookie-based sessions (wolfstack_session cookie)
 - Inter-node auth: X-WolfStack-Secret header
 
+## AI Agent
+- Three providers: Claude (Anthropic), Gemini (Google), Local AI (self-hosted)
+- Local AI supports any OpenAI-compatible server: Ollama, LM Studio, LocalAI, vLLM, text-generation-webui, llama.cpp
+- Common local URLs: Ollama http://localhost:11434, LM Studio http://localhost:1234/v1, LocalAI http://localhost:8080/v1
+- Auto-detects available models from the local server's /v1/models endpoint
+- API key optional for most local servers
+- Expert knowledge base shipped with WolfStack — AI gives deep answers about the platform
+- AI can execute read-only commands on the server via [EXEC] tags
+- Health monitoring: periodic scans with AI-generated recommendations
+
 ## Enterprise Features
 - REST API keys (wsk_* tokens) with scoped permissions
 - Plugin system

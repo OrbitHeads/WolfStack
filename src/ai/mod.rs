@@ -25,10 +25,18 @@ const KNOWLEDGE_DIR_DEV: &str = "../wolfscale/web";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiConfig {
-    pub provider: String,         // "claude" or "gemini"
+    pub provider: String,         // "claude", "gemini", or "local"
     pub claude_api_key: String,
     pub gemini_api_key: String,
-    pub model: String,            // e.g. "claude-sonnet-4-20250514", "gemini-2.0-flash"
+    /// URL of a local/self-hosted AI server (OpenAI-compatible API)
+    /// Supports: Ollama (http://localhost:11434/v1), LM Studio (http://localhost:1234/v1),
+    /// LocalAI, vLLM, text-generation-webui, or any OpenAI-compatible endpoint
+    #[serde(default)]
+    pub local_url: String,
+    /// Optional API key for the local server (some require it, most don't)
+    #[serde(default)]
+    pub local_api_key: String,
+    pub model: String,            // e.g. "claude-sonnet-4-20250514", "gemini-2.0-flash", "llama3", "mistral"
     pub email_enabled: bool,
     pub email_to: String,
     pub smtp_host: String,
@@ -50,6 +58,8 @@ impl Default for AiConfig {
             provider: "claude".to_string(),
             claude_api_key: String::new(),
             gemini_api_key: String::new(),
+            local_url: String::new(),
+            local_api_key: String::new(),
             model: "claude-sonnet-4-20250514".to_string(),
             email_enabled: false,
             email_to: String::new(),
@@ -86,6 +96,8 @@ impl AiConfig {
             "provider": self.provider,
             "claude_api_key": mask_key(&self.claude_api_key),
             "gemini_api_key": mask_key(&self.gemini_api_key),
+            "local_url": self.local_url,
+            "local_api_key": mask_key(&self.local_api_key),
             "model": self.model,
             "email_enabled": self.email_enabled,
             "email_to": self.email_to,
@@ -97,19 +109,24 @@ impl AiConfig {
             "scan_schedule": self.scan_schedule,
             "has_claude_key": !self.claude_api_key.is_empty(),
             "has_gemini_key": !self.gemini_api_key.is_empty(),
+            "has_local_url": !self.local_url.is_empty(),
             "has_smtp_pass": !self.smtp_pass.is_empty(),
         })
     }
 
     fn active_key(&self) -> &str {
         match self.provider.as_str() {
+            "local" => if self.local_api_key.is_empty() { "local" } else { &self.local_api_key },
             "gemini" => &self.gemini_api_key,
             _ => &self.claude_api_key,
         }
     }
 
     pub fn is_configured(&self) -> bool {
-        !self.active_key().is_empty()
+        match self.provider.as_str() {
+            "local" => !self.local_url.is_empty(),
+            _ => !self.active_key().is_empty(),
+        }
     }
 }
 
@@ -197,6 +214,9 @@ impl AiAgent {
             let response = match config.provider.as_str() {
                 "gemini" => {
                     call_gemini(&self.client, &config.gemini_api_key, &config.model, &system_prompt, &history, &current_msg).await?
+                }
+                "local" => {
+                    call_local(&self.client, &config.local_url, &config.local_api_key, &config.model, &system_prompt, &history, &current_msg).await?
                 }
                 _ => {
                     call_claude(&self.client, &config.claude_api_key, &config.model, &system_prompt, &history, &current_msg).await?
@@ -419,6 +439,7 @@ impl AiAgent {
 
         let result = match config.provider.as_str() {
             "gemini" => call_gemini(&self.client, &config.gemini_api_key, &config.model, system, &[], &prompt).await,
+            "local" => call_local(&self.client, &config.local_url, &config.local_api_key, &config.model, system, &[], &prompt).await,
             _ => call_claude(&self.client, &config.claude_api_key, &config.model, system, &[], &prompt).await,
         };
 
@@ -521,6 +542,7 @@ impl AiAgent {
 
         let result = match config.provider.as_str() {
             "gemini" => call_gemini(&self.client, &config.gemini_api_key, &config.model, system, &[], issue_description).await,
+            "local" => call_local(&self.client, &config.local_url, &config.local_api_key, &config.model, system, &[], issue_description).await,
             _ => call_claude(&self.client, &config.claude_api_key, &config.model, system, &[], issue_description).await,
         };
 
@@ -936,6 +958,85 @@ fn build_system_prompt(knowledge: &str, server_context: &str) -> String {
 }
 
 // ─── LLM API Calls ───
+
+/// Call a local/self-hosted AI via the OpenAI-compatible chat completions API.
+/// Works with: Ollama, LM Studio, LocalAI, vLLM, text-generation-webui, llama.cpp server.
+async fn call_local(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    system: &str,
+    history: &[ChatMessage],
+    user_msg: &str,
+) -> Result<String, String> {
+    if base_url.is_empty() {
+        return Err("Local AI URL not configured — set it in Settings → AI Agent".to_string());
+    }
+
+    // Build the URL — append /chat/completions if not already present
+    let url = if base_url.ends_with("/chat/completions") {
+        base_url.to_string()
+    } else {
+        let base = base_url.trim_end_matches('/');
+        if base.ends_with("/v1") {
+            format!("{}/chat/completions", base)
+        } else {
+            format!("{}/v1/chat/completions", base)
+        }
+    };
+
+    let mut messages = vec![
+        serde_json::json!({"role": "system", "content": system})
+    ];
+
+    for msg in history {
+        messages.push(serde_json::json!({
+            "role": msg.role,
+            "content": msg.content
+        }));
+    }
+
+    messages.push(serde_json::json!({
+        "role": "user",
+        "content": user_msg
+    }));
+
+    let body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "max_tokens": 4096,
+        "temperature": 0.7,
+    });
+
+    let mut req = client.post(&url)
+        .header("content-type", "application/json")
+        .json(&body);
+
+    // Add API key if provided (some local servers need it, most don't)
+    if !api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", api_key));
+    }
+
+    let resp = req.send().await
+        .map_err(|e| format!("Local AI connection failed ({}): {}", url, e))?;
+
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| format!("Local AI response error: {}", e))?;
+
+    if !status.is_success() {
+        return Err(format!("Local AI returned {} — {}", status, text.chars().take(500).collect::<String>()));
+    }
+
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("Local AI JSON parse error: {}", e))?;
+
+    // OpenAI format: {"choices": [{"message": {"content": "..."}}]}
+    json["choices"][0]["message"]["content"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("Unexpected local AI response format: {}", text.chars().take(200).collect::<String>()))
+}
 
 async fn call_claude(
     client: &reqwest::Client,
