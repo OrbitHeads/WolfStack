@@ -5079,8 +5079,34 @@ pub async fn ai_chat(
                     ctx.push_str(&format!(", Context: {}", name));
                 }
             }
-            ctx.push_str("\nWhen the user says 'this server', 'this node', 'here', etc. they mean the node/view shown above.");
-            ctx.push_str("\nWhen proposing [ACTION] fixes, set target=\"local\" if the user is viewing a specific node (commands will run on the node they're viewing via the proxy), or target=\"all\" if they're at datacenter level.");
+            // Enumerate containers/VMs on the viewed node so the AI knows what's there
+            if body.node_id.as_ref().map(|s| !s.is_empty()).unwrap_or(false) {
+                let docker = crate::containers::docker_list_all();
+                if !docker.is_empty() {
+                    ctx.push_str("\n\nDocker containers on this node:");
+                    for c in &docker {
+                        ctx.push_str(&format!("\n  - {} [{}]", c.name, c.state));
+                    }
+                }
+                let lxc = crate::containers::lxc_list_all();
+                if !lxc.is_empty() {
+                    ctx.push_str("\n\nLXC containers on this node:");
+                    for c in &lxc {
+                        ctx.push_str(&format!("\n  - {} [{}]", c.name, c.state));
+                    }
+                }
+                let vms = state.vms.lock().unwrap().list_vms();
+                if !vms.is_empty() {
+                    ctx.push_str("\n\nVMs on this node:");
+                    for v in &vms {
+                        ctx.push_str(&format!("\n  - {} [{}]", v.name, if v.running { "running" } else { "stopped" }));
+                    }
+                }
+            }
+
+            ctx.push_str("\n\nWhen the user says 'this server', 'this node', 'here', etc. they mean the node/view shown above.");
+            ctx.push_str("\nThe user may be asking about a specific container, VM, or the host itself. If it's ambiguous, ask which one they mean.");
+            ctx.push_str("\nWhen proposing [ACTION] fixes, set target=\"local\" for commands on the host node. The user will choose the actual target (host, container, or VM) before approving.");
             ctx
         };
 
@@ -5139,6 +5165,11 @@ pub struct AiActionRequest {
     pub action_id: String,
     #[serde(default = "default_true")]
     pub approved: bool,
+    /// Optional: execute inside a specific container/VM instead of on the host
+    #[serde(default)]
+    pub container_runtime: Option<String>,  // "docker", "lxc", "vm"
+    #[serde(default)]
+    pub container_name: Option<String>,
 }
 
 fn default_true() -> bool { true }
@@ -5171,6 +5202,65 @@ pub async fn ai_action(
             })
             .collect()
     };
+
+    // If a container target is specified, execute inside the container instead of on the host
+    if let (Some(runtime), Some(name)) = (&body.container_runtime, &body.container_name) {
+        if !runtime.is_empty() && !name.is_empty() {
+            // Get the command from the pending action
+            let cmd = {
+                let pa = state.ai_agent.pending_actions.lock().unwrap();
+                pa.iter().find(|a| a.id == body.action_id && a.status == "pending")
+                    .map(|a| a.command.clone())
+            };
+            let cmd = match cmd {
+                Some(c) => c,
+                None => return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Action not found or expired" })),
+            };
+
+            // Mark as approved
+            {
+                let mut pa = state.ai_agent.pending_actions.lock().unwrap();
+                if let Some(a) = pa.iter_mut().find(|a| a.id == body.action_id) {
+                    a.status = "approved".to_string();
+                    a.approved_by = username.clone();
+                }
+            }
+
+            let action = crate::wolfflow::ActionType::RunCommand {
+                command: cmd,
+                timeout_secs: 30,
+            };
+            let ct = crate::wolfflow::ContainerTarget {
+                node_id: String::new(),
+                runtime: runtime.clone(),
+                name: name.clone(),
+            };
+
+            let result = crate::wolfflow::execute_action_in_container(&action, &ct).await;
+
+            // Update action status
+            {
+                let mut pa = state.ai_agent.pending_actions.lock().unwrap();
+                if let Some(a) = pa.iter_mut().find(|a| a.id == body.action_id) {
+                    match &result {
+                        Ok(o) => { a.status = "executed".to_string(); a.result = o.text.clone(); }
+                        Err(e) => { a.status = "failed".to_string(); a.result = e.clone(); }
+                    }
+                }
+            }
+
+            return match result {
+                Ok(output) => HttpResponse::Ok().json(serde_json::json!({
+                    "status": "executed",
+                    "output": output.text,
+                })),
+                Err(e) => HttpResponse::Ok().json(serde_json::json!({
+                    "status": "failed",
+                    "error": e,
+                })),
+            };
+        }
+    }
 
     match state.ai_agent.execute_action(&body.action_id, &username, &cluster_nodes, &state.cluster_secret).await {
         Ok(output) => HttpResponse::Ok().json(serde_json::json!({

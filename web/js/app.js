@@ -17798,11 +17798,35 @@ function toggleAiChat() {
     }
 }
 
+// Visible infrastructure cache for AI action target picker
+var _aiVisibleInfra = null;
+
+async function _aiRefreshVisibleInfra() {
+    // Fetch containers/VMs on the current node for the target picker
+    if (!currentNodeId) { _aiVisibleInfra = null; return; }
+    try {
+        var base = currentNodeId ? ('/api/nodes/' + currentNodeId + '/proxy/') : '/api/';
+        var results = await Promise.allSettled([
+            fetch(base + 'containers/docker').then(function(r) { return r.ok ? r.json() : []; }),
+            fetch(base + 'containers/lxc').then(function(r) { return r.ok ? r.json() : []; }),
+            fetch(base + 'vms').then(function(r) { return r.ok ? r.json() : []; }),
+        ]);
+        _aiVisibleInfra = {
+            docker: (results[0].status === 'fulfilled' ? results[0].value : []).map(function(c) { return { name: c.name, state: c.state }; }),
+            lxc: (results[1].status === 'fulfilled' ? results[1].value : []).map(function(c) { return { name: c.name, state: c.state }; }),
+            vms: (results[2].status === 'fulfilled' ? results[2].value : []).map(function(v) { return { name: v.name, state: v.running ? 'running' : 'stopped' }; }),
+        };
+    } catch(e) { _aiVisibleInfra = null; }
+}
+
 async function sendAiMessage() {
     var input = document.getElementById('ai-chat-input');
     var msg = (input.value || '').trim();
     if (!msg) return;
     input.value = '';
+
+    // Refresh visible infra for action target picker (fire-and-forget, non-blocking)
+    _aiRefreshVisibleInfra();
 
     var messages = document.getElementById('ai-chat-messages');
 
@@ -17919,7 +17943,23 @@ function renderAiAction(action) {
 
     // Sanitise action ID for safe embedding in HTML attributes and JS strings
     var safeId = action.id.replace(/[^a-zA-Z0-9\-]/g, '');
-    html += '<div style="display:flex;gap:8px;" id="ai-action-btns-' + safeId + '">'
+
+    // Build target picker — host + any containers/VMs on the current node
+    var targetOptions = '<option value="host">Host node</option>';
+    if (typeof _aiVisibleInfra !== 'undefined' && _aiVisibleInfra) {
+        (_aiVisibleInfra.docker || []).forEach(function(c) {
+            targetOptions += '<option value="docker:' + escapeAttr(c.name) + '">Docker: ' + escapeHtml(c.name) + '</option>';
+        });
+        (_aiVisibleInfra.lxc || []).forEach(function(c) {
+            targetOptions += '<option value="lxc:' + escapeAttr(c.name) + '">LXC: ' + escapeHtml(c.name) + '</option>';
+        });
+        (_aiVisibleInfra.vms || []).forEach(function(v) {
+            targetOptions += '<option value="vm:' + escapeAttr(v.name) + '">VM: ' + escapeHtml(v.name) + '</option>';
+        });
+    }
+
+    html += '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;" id="ai-action-btns-' + safeId + '">'
+        + '<select id="ai-action-target-' + safeId + '" style="padding:5px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg-primary);color:var(--text);font-size:11px;">' + targetOptions + '</select>'
         + '<button onclick="approveAiAction(\'' + safeId + '\')" style="padding:6px 16px;border-radius:6px;border:none;background:#22c55e;color:#fff;font-weight:700;font-size:12px;cursor:pointer;">Approve &amp; Run</button>'
         + '<button onclick="dismissAiAction(\'' + safeId + '\')" style="padding:6px 16px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-muted);font-weight:600;font-size:12px;cursor:pointer;">Dismiss</button>'
         + '</div>';
@@ -17933,31 +17973,55 @@ function renderAiAction(action) {
 async function approveAiAction(actionId) {
     var btns = document.getElementById('ai-action-btns-' + actionId);
     var resultEl = document.getElementById('ai-action-result-' + actionId);
-    if (btns) btns.innerHTML = '<span style="color:#f59e0b;font-size:12px;font-weight:600;">Executing...</span>';
 
-    try {
-        var resp = await fetch('/api/ai/action', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action_id: actionId, approved: true })
-        });
-        var data = await resp.json();
+    // Read the target picker
+    var targetSel = document.getElementById('ai-action-target-' + actionId);
+    var targetVal = targetSel ? targetSel.value : 'host';
 
-        if (data.status === 'executed') {
-            if (btns) btns.innerHTML = '<span style="color:#22c55e;font-size:12px;font-weight:600;">Executed successfully</span>';
-            if (resultEl && data.output) {
-                resultEl.style.display = 'block';
-                resultEl.innerHTML = '<pre style="background:var(--bg-primary);padding:8px 12px;border-radius:8px;font-size:11px;overflow-x:auto;max-height:200px;color:var(--text);margin:0;"><code>' + escapeHtml(data.output) + '</code></pre>';
-            }
-        } else {
-            if (btns) btns.innerHTML = '<span style="color:var(--danger);font-size:12px;font-weight:600;">Failed: ' + escapeHtml(data.error || 'Unknown error') + '</span>';
-        }
-    } catch (e) {
-        if (btns) btns.innerHTML = '<span style="color:var(--danger);font-size:12px;">Error: ' + escapeHtml(e.message) + '</span>';
+    // Get the command from the action card's code block
+    var actionCard = document.getElementById('ai-action-' + actionId);
+    var codeEl = actionCard ? actionCard.querySelector('code') : null;
+    var command = codeEl ? codeEl.textContent : '';
+
+    // Determine console type and name based on target
+    var consoleType = 'host';
+    var consoleName = '';
+    if (targetVal !== 'host') {
+        var parts = targetVal.split(':');
+        consoleType = parts[0]; // docker, lxc, vm
+        consoleName = parts.slice(1).join(':');
+    } else {
+        // Host terminal — use the current node hostname or 'host'
+        var _aiNode = currentNodeId ? allNodes.find(function(n) { return n.id === currentNodeId; }) : null;
+        consoleName = _aiNode ? _aiNode.hostname : 'host';
     }
 
-    var messages = document.getElementById('ai-chat-messages');
-    if (messages) messages.scrollTop = messages.scrollHeight;
+    // Mark the action as approved on the server (fire-and-forget for audit)
+    var payload = { action_id: actionId, approved: true };
+    if (targetVal !== 'host') {
+        payload.container_runtime = consoleType;
+        payload.container_name = consoleName;
+    }
+    fetch('/api/ai/action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+    }).catch(function() {});
+
+    // Open a console window with the command auto-typed
+    var url = '/console.html?type=' + encodeURIComponent(consoleType)
+        + '&name=' + encodeURIComponent(consoleName)
+        + '&cmd=' + encodeURIComponent(command);
+    if (currentNodeId) {
+        var node = allNodes.find(function(n) { return n.id === currentNodeId; });
+        if (node && !node.is_self) {
+            url += '&node_id=' + encodeURIComponent(node.id);
+        }
+    }
+    window.open(url, 'ai_action_' + actionId, 'width=960,height=600,menubar=no,toolbar=no');
+
+    var targetLabel = targetSel ? targetSel.options[targetSel.selectedIndex].text : 'Host node';
+    if (btns) btns.innerHTML = '<span style="color:#22c55e;font-size:12px;font-weight:600;">Opened terminal on ' + escapeHtml(targetLabel) + '</span>';
 }
 
 async function dismissAiAction(actionId) {

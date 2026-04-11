@@ -172,6 +172,14 @@
                 term.writeln('\x1b[32mConnected!\x1b[0m\r\n');
                 doFit();
                 term.focus();
+
+                // Auto-execute command if passed via ?cmd= parameter (from AI actions)
+                const autoCmd = params.get('cmd');
+                if (autoCmd) {
+                    setTimeout(() => {
+                        ws.send(autoCmd + '\n');
+                    }, 500); // brief delay to let the shell prompt appear
+                }
             };
 
             ws.onmessage = (event) => {
