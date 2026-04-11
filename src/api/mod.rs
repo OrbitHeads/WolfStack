@@ -9698,12 +9698,17 @@ pub async fn wolfflow_all_containers_exec(req: HttpRequest, state: web::Data<App
 
 // ─── User Preferences API ───
 
-fn user_prefs_path(username: &str) -> String {
-    // Sanitize username for safe filesystem path
+fn user_prefs_path(username: &str) -> Option<String> {
+    // Sanitize username — no dots (prevents ../ traversal), no slashes
     let safe: String = username.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect();
-    format!("{}/user-prefs/{}.json", crate::paths::get().config_dir, safe)
+    if safe.is_empty() || safe == "cluster-node" { return None; }
+    let path = format!("{}/user-prefs/{}.json", crate::paths::get().config_dir, safe);
+    // Verify the path is under the expected directory
+    let expected_dir = format!("{}/user-prefs/", crate::paths::get().config_dir);
+    if !path.starts_with(&expected_dir) { return None; }
+    Some(path)
 }
 
 /// GET /api/user/preferences — load the current user's preferences
@@ -9713,7 +9718,10 @@ pub async fn user_prefs_get(req: HttpRequest, state: web::Data<AppState>) -> Htt
         Err(resp) => return resp,
     };
 
-    let path = user_prefs_path(&username);
+    let path = match user_prefs_path(&username) {
+        Some(p) => p,
+        None => return HttpResponse::Forbidden().json(serde_json::json!({ "error": "Not a user account" })),
+    };
     match std::fs::read_to_string(&path) {
         Ok(data) => {
             match serde_json::from_str::<serde_json::Value>(&data) {
@@ -9732,8 +9740,11 @@ pub async fn user_prefs_save(req: HttpRequest, state: web::Data<AppState>, body:
         Err(resp) => return resp,
     };
 
-    let path = user_prefs_path(&username);
-    let dir = std::path::Path::new(&path).parent().unwrap();
+    let path = match user_prefs_path(&username) {
+        Some(p) => p,
+        None => return HttpResponse::Forbidden().json(serde_json::json!({ "error": "Not a user account" })),
+    };
+    let dir = std::path::Path::new(&path).parent().unwrap_or(std::path::Path::new("/tmp"));
     if let Err(e) = std::fs::create_dir_all(dir) {
         return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Failed to create dir: {}", e) }));
     }
@@ -9757,8 +9768,11 @@ pub async fn user_prefs_patch(req: HttpRequest, state: web::Data<AppState>, body
         Err(resp) => return resp,
     };
 
-    let path = user_prefs_path(&username);
-    let dir = std::path::Path::new(&path).parent().unwrap();
+    let path = match user_prefs_path(&username) {
+        Some(p) => p,
+        None => return HttpResponse::Forbidden().json(serde_json::json!({ "error": "Not a user account" })),
+    };
+    let dir = std::path::Path::new(&path).parent().unwrap_or(std::path::Path::new("/tmp"));
     let _ = std::fs::create_dir_all(dir);
 
     // Load existing
