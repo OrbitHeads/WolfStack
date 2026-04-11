@@ -139,13 +139,19 @@ pub async fn install() -> Result<String, String> {
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let combined = format!("{}\n{}", stdout, stderr);
 
-    if output.status.success() {
+    // Check if the binary actually exists (installer may exit non-zero due to
+    // harmless shell issues like unbound variables even when install succeeded)
+    if is_installed() {
         info!("WolfUSB: installed successfully");
-        Ok(format!("{}\n{}", stdout, stderr))
+        Ok(combined)
+    } else if output.status.success() {
+        info!("WolfUSB: installed successfully");
+        Ok(combined)
     } else {
         warn!("WolfUSB: installation failed");
-        Err(format!("Installation failed:\n{}\n{}", stdout, stderr))
+        Err(format!("Installation failed:\n{}", combined))
     }
 }
 
