@@ -17846,6 +17846,14 @@ async function sendAiMessage() {
             aiDiv.innerHTML = formatAiResponse(data.response || '');
         }
         messages.appendChild(aiDiv);
+
+        // Render proposed actions (if any)
+        if (data.actions && data.actions.length > 0) {
+            for (var i = 0; i < data.actions.length; i++) {
+                messages.appendChild(renderAiAction(data.actions[i]));
+            }
+        }
+
         if (statusEl) statusEl.textContent = 'Ready';
     } catch (e) {
         var t = document.getElementById('ai-typing');
@@ -17876,6 +17884,84 @@ function formatAiResponse(text) {
     // Lists: - item
     html = html.replace(/<br>- (.*?)(?=<br>|$)/g, '<br>• $1');
     return html;
+}
+
+function renderAiAction(action) {
+    var riskColors = { low: '#22c55e', medium: '#f59e0b', high: '#ef4444' };
+    var riskLabels = { low: 'LOW RISK', medium: 'MEDIUM RISK', high: 'HIGH RISK' };
+    var color = riskColors[action.risk] || riskColors.medium;
+    var label = riskLabels[action.risk] || 'MEDIUM RISK';
+
+    var card = document.createElement('div');
+    card.id = 'ai-action-' + action.id;
+    card.style.cssText = 'background:var(--bg-tertiary);border:1px solid ' + color + '40;border-radius:12px;padding:14px 16px;max-width:85%;align-self:flex-start;margin:4px 0;';
+
+    var html = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">'
+        + '<span style="background:' + color + '20;color:' + color + ';padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;">' + escapeHtml(label) + '</span>'
+        + '<strong style="font-size:13px;color:var(--text);">' + escapeHtml(action.title) + '</strong>';
+    if (action.target === 'all') html += '<span style="font-size:10px;color:var(--text-muted);background:var(--bg-primary);padding:2px 6px;border-radius:4px;">ALL NODES</span>';
+    html += '</div>';
+
+    if (action.explanation) {
+        html += '<div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">' + escapeHtml(action.explanation) + '</div>';
+    }
+
+    html += '<pre style="background:var(--bg-primary);padding:8px 12px;border-radius:8px;font-size:12px;overflow-x:auto;margin:0 0 10px;color:var(--text);"><code>' + escapeHtml(action.command) + '</code></pre>';
+
+    // Sanitise action ID for safe embedding in HTML attributes and JS strings
+    var safeId = action.id.replace(/[^a-zA-Z0-9\-]/g, '');
+    html += '<div style="display:flex;gap:8px;" id="ai-action-btns-' + safeId + '">'
+        + '<button onclick="approveAiAction(\'' + safeId + '\')" style="padding:6px 16px;border-radius:6px;border:none;background:#22c55e;color:#fff;font-weight:700;font-size:12px;cursor:pointer;">Approve &amp; Run</button>'
+        + '<button onclick="dismissAiAction(\'' + safeId + '\')" style="padding:6px 16px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-muted);font-weight:600;font-size:12px;cursor:pointer;">Dismiss</button>'
+        + '</div>';
+
+    html += '<div id="ai-action-result-' + safeId + '" style="display:none;margin-top:8px;"></div>';
+
+    card.innerHTML = html;
+    return card;
+}
+
+async function approveAiAction(actionId) {
+    var btns = document.getElementById('ai-action-btns-' + actionId);
+    var resultEl = document.getElementById('ai-action-result-' + actionId);
+    if (btns) btns.innerHTML = '<span style="color:#f59e0b;font-size:12px;font-weight:600;">Executing...</span>';
+
+    try {
+        var resp = await fetch('/api/ai/action', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action_id: actionId, approved: true })
+        });
+        var data = await resp.json();
+
+        if (data.status === 'executed') {
+            if (btns) btns.innerHTML = '<span style="color:#22c55e;font-size:12px;font-weight:600;">Executed successfully</span>';
+            if (resultEl && data.output) {
+                resultEl.style.display = 'block';
+                resultEl.innerHTML = '<pre style="background:var(--bg-primary);padding:8px 12px;border-radius:8px;font-size:11px;overflow-x:auto;max-height:200px;color:var(--text);margin:0;"><code>' + escapeHtml(data.output) + '</code></pre>';
+            }
+        } else {
+            if (btns) btns.innerHTML = '<span style="color:var(--danger);font-size:12px;font-weight:600;">Failed: ' + escapeHtml(data.error || 'Unknown error') + '</span>';
+        }
+    } catch (e) {
+        if (btns) btns.innerHTML = '<span style="color:var(--danger);font-size:12px;">Error: ' + escapeHtml(e.message) + '</span>';
+    }
+
+    var messages = document.getElementById('ai-chat-messages');
+    if (messages) messages.scrollTop = messages.scrollHeight;
+}
+
+async function dismissAiAction(actionId) {
+    var btns = document.getElementById('ai-action-btns-' + actionId);
+    if (btns) btns.innerHTML = '<span style="color:var(--text-muted);font-size:12px;">Dismissed</span>';
+
+    try {
+        await fetch('/api/ai/action', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action_id: actionId, approved: false })
+        });
+    } catch (e) { /* silent */ }
 }
 
 function openAiSettings() {

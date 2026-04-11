@@ -5066,12 +5066,97 @@ pub async fn ai_chat(
     };
 
     match state.ai_agent.chat(&body.message, &server_context, &cluster_nodes, &state.cluster_secret).await {
-        Ok(response) => HttpResponse::Ok().json(serde_json::json!({
-            "response": response,
-        })),
+        Ok((response, actions)) => {
+            let actions_json: Vec<serde_json::Value> = actions.iter().map(|a| {
+                serde_json::json!({
+                    "id": a.id,
+                    "title": a.title,
+                    "command": a.command,
+                    "risk": a.risk,
+                    "explanation": a.explanation,
+                    "target": a.node_target,
+                })
+            }).collect();
+            HttpResponse::Ok().json(serde_json::json!({
+                "response": response,
+                "actions": actions_json,
+            }))
+        }
         Err(e) => HttpResponse::Ok().json(serde_json::json!({
             "error": e,
         })),
+    }
+}
+
+/// POST /api/ai/action — approve or reject a proposed action
+#[derive(Deserialize)]
+pub struct AiActionRequest {
+    pub action_id: String,
+    #[serde(default = "default_true")]
+    pub approved: bool,
+}
+
+fn default_true() -> bool { true }
+
+pub async fn ai_action(
+    req: HttpRequest, state: web::Data<AppState>,
+    body: web::Json<AiActionRequest>,
+) -> HttpResponse {
+    let username = match require_auth(&req, &state) {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+
+    if !body.approved {
+        match state.ai_agent.reject_action(&body.action_id, &username) {
+            Ok(()) => return HttpResponse::Ok().json(serde_json::json!({ "status": "rejected" })),
+            Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+        }
+    }
+
+    // Build cluster nodes for remote execution
+    let cluster_nodes: Vec<(String, String, String, String)> = {
+        let nodes = state.cluster.get_all_nodes();
+        nodes.iter()
+            .filter(|n| !n.is_self && n.online && n.node_type != "proxmox")
+            .map(|n| {
+                let url1 = format!("http://{}:{}", n.address, n.port + 1);
+                let url2 = format!("http://{}:{}", n.address, n.port);
+                (n.id.clone(), n.hostname.clone(), url1, url2)
+            })
+            .collect()
+    };
+
+    match state.ai_agent.execute_action(&body.action_id, &username, &cluster_nodes, &state.cluster_secret).await {
+        Ok(output) => HttpResponse::Ok().json(serde_json::json!({
+            "status": "executed",
+            "output": output,
+        })),
+        Err(e) => HttpResponse::Ok().json(serde_json::json!({
+            "status": "failed",
+            "error": e,
+        })),
+    }
+}
+
+/// POST /api/ai/action/exec — execute an approved action command on a remote node (cluster proxy)
+pub async fn ai_action_exec(
+    req: HttpRequest, state: web::Data<AppState>,
+    body: web::Json<AiExecRequest>,
+) -> HttpResponse {
+    // Only allow inter-node auth (X-WolfStack-Secret) — not browser sessions
+    let secret_header = req.headers().get("X-WolfStack-Secret")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !crate::auth::validate_cluster_secret(secret_header, &state.cluster_secret)
+        && !crate::auth::validate_cluster_secret(secret_header, crate::auth::default_cluster_secret())
+    {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "Cluster auth required"}));
+    }
+
+    match crate::ai::execute_action_command(&body.command) {
+        Ok(output) => HttpResponse::Ok().json(serde_json::json!({ "output": output })),
+        Err(e) => HttpResponse::Ok().json(serde_json::json!({ "error": e })),
     }
 }
 
@@ -5107,6 +5192,18 @@ pub async fn ai_status(
     let last_check = state.ai_agent.last_health_check.lock().unwrap().clone();
     let alert_count = state.ai_agent.alerts.lock().unwrap().len();
     let history_count = state.ai_agent.chat_history.lock().unwrap().len();
+    let pending_actions: Vec<serde_json::Value> = {
+        let pa = state.ai_agent.pending_actions.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        pa.iter()
+            .filter(|a| a.status == "pending" && (now - a.created_at) < 600)
+            .map(|a| serde_json::json!({
+                "id": a.id, "title": a.title, "command": a.command,
+                "risk": a.risk, "explanation": a.explanation,
+                "target": a.node_target, "created_at": a.created_at,
+            }))
+            .collect()
+    };
 
     HttpResponse::Ok().json(serde_json::json!({
         "configured": config.is_configured(),
@@ -5116,6 +5213,7 @@ pub async fn ai_status(
         "alert_count": alert_count,
         "chat_message_count": history_count,
         "knowledge_base_size": state.ai_agent.knowledge_base.len(),
+        "pending_actions": pending_actions,
     }))
 }
 
@@ -5723,7 +5821,6 @@ pub struct CreateScheduleRequest {
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
-fn default_true() -> bool { true }
 
 /// GET /api/backups — list all backup entries
 pub async fn backup_list(
@@ -15676,6 +15773,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/ai/alerts", web::get().to(ai_alerts))
         .route("/api/ai/models", web::get().to(ai_models))
         .route("/api/ai/exec", web::post().to(ai_exec))
+        .route("/api/ai/action", web::post().to(ai_action))
+        .route("/api/ai/action/exec", web::post().to(ai_action_exec))
         .route("/api/ai/config/sync", web::post().to(ai_sync_config))
         .route("/api/ai/test-email", web::post().to(ai_test_email))
         // Ceph Cluster

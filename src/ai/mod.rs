@@ -156,12 +156,32 @@ pub struct AiAlert {
     pub hostname: String,
 }
 
+// ─── AI Actions (propose-then-execute) ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiAction {
+    pub id: String,
+    pub title: String,
+    pub command: String,
+    pub risk: String,           // "low", "medium", "high"
+    pub explanation: String,
+    #[serde(default)]
+    pub node_target: String,    // "local", "all", or a specific node hostname
+    pub status: String,         // "pending", "approved", "rejected", "executed", "failed"
+    pub created_at: i64,
+    #[serde(default)]
+    pub result: String,
+    #[serde(default)]
+    pub approved_by: String,
+}
+
 // ─── AI Agent State ───
 
 pub struct AiAgent {
     pub config: Mutex<AiConfig>,
     pub chat_history: Mutex<Vec<ChatMessage>>,
     pub alerts: Mutex<Vec<AiAlert>>,
+    pub pending_actions: Mutex<Vec<AiAction>>,
     pub last_health_check: Mutex<Option<String>>,
     pub knowledge_base: String,
     client: reqwest::Client,
@@ -177,13 +197,15 @@ impl AiAgent {
             config: Mutex::new(config),
             chat_history: Mutex::new(Vec::new()),
             alerts: Mutex::new(Vec::new()),
+            pending_actions: Mutex::new(Vec::new()),
             last_health_check: Mutex::new(None),
             knowledge_base,
             client: reqwest::Client::new(),
         }
     }
 
-    /// Chat with the AI — multi-turn with command execution support
+    /// Chat with the AI — multi-turn with command execution and action proposal support.
+    /// Returns (response_text, proposed_actions).
     /// cluster_nodes is a list of (node_id, hostname, base_url) for remote execution
     /// cluster_secret is used to authenticate with remote nodes via X-WolfStack-Secret
     pub async fn chat(
@@ -192,7 +214,7 @@ impl AiAgent {
         system_context: &str,
         cluster_nodes: &[(String, String, String, String)],  // (id, hostname, base_url_primary, base_url_fallback)
         cluster_secret: &str,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Vec<AiAction>), String> {
         let config = self.config.lock().unwrap().clone();
         if !config.is_configured() {
             return Err("AI not configured — please add an API key in AI Settings".to_string());
@@ -208,6 +230,7 @@ impl AiAgent {
 
         let mut current_msg = user_message.to_string();
         let mut final_response = String::new();
+        let mut last_response = String::new();
 
         // Multi-turn loop: AI can request commands, we execute and feed back
         for _round in 0..3 {
@@ -222,6 +245,8 @@ impl AiAgent {
                     call_claude(&self.client, &config.claude_api_key, &config.model, &system_prompt, &history, &current_msg).await?
                 }
             };
+
+            last_response = response.clone();
 
             // Check for [EXEC], [EXEC_ALL], or [WOLFNOTE] tags
             let has_exec = response.contains("[EXEC]") && response.contains("[/EXEC]");
@@ -345,17 +370,162 @@ impl AiAgent {
             history.push(ChatMessage { role: "user".to_string(), content: current_msg.clone(), timestamp: now });
         }
 
+        // Fallback: if the loop exhausted without a clean response, use the last thing the AI said
+        if final_response.is_empty() && !last_response.is_empty() {
+            final_response = last_response;
+        }
+
+        // Parse [ACTION] tags from the final response
+        let actions = parse_actions(&final_response);
+
+        // Store pending actions (expire old ones first)
+        {
+            let mut pa = self.pending_actions.lock().unwrap();
+            let now = chrono::Utc::now().timestamp();
+            // Expire actions older than 10 minutes
+            pa.retain(|a| a.status == "pending" && (now - a.created_at) < 600);
+            // Cap at 20 pending
+            if pa.len() + actions.len() > 20 {
+                let drain = (pa.len() + actions.len()).saturating_sub(20);
+                let drain = drain.min(pa.len());
+                pa.drain(..drain);
+            }
+            pa.extend(actions.clone());
+        }
+
+        // Strip [ACTION] tags from the displayed response (frontend renders them separately)
+        let clean_response = strip_action_tags(&final_response);
+
         // Store messages in history
         {
             let mut h = self.chat_history.lock().unwrap();
             let now = chrono::Utc::now().timestamp();
             h.push(ChatMessage { role: "user".to_string(), content: user_message.to_string(), timestamp: now });
-            h.push(ChatMessage { role: "assistant".to_string(), content: final_response.clone(), timestamp: now });
+            h.push(ChatMessage { role: "assistant".to_string(), content: clean_response.clone(), timestamp: now });
             // Keep last 100 messages
             if h.len() > 100 { let drain = h.len() - 100; h.drain(..drain); }
         }
 
-        Ok(final_response)
+        Ok((clean_response, actions))
+    }
+
+    /// Execute an approved action by ID. Returns the command output.
+    pub async fn execute_action(
+        &self,
+        action_id: &str,
+        approved_by: &str,
+        cluster_nodes: &[(String, String, String, String)],
+        cluster_secret: &str,
+    ) -> Result<String, String> {
+        let mut action = {
+            let mut pa = self.pending_actions.lock().unwrap();
+            let idx = pa.iter().position(|a| a.id == action_id)
+                .ok_or_else(|| "Action not found or expired".to_string())?;
+            if pa[idx].status != "pending" {
+                return Err(format!("Action already {}", pa[idx].status));
+            }
+            // Enforce 10-minute expiry
+            let now = chrono::Utc::now().timestamp();
+            if now - pa[idx].created_at > 600 {
+                pa[idx].status = "expired".to_string();
+                return Err("Action expired (older than 10 minutes)".to_string());
+            }
+            pa[idx].status = "approved".to_string();
+            pa[idx].approved_by = approved_by.to_string();
+            pa[idx].clone()
+        };
+
+        // Audit log
+        log_action_audit(&action, "approved", approved_by, "");
+
+        // Execute the command
+        let result = if action.node_target == "all" {
+            let hostname = hostname::get()
+                .map(|h| h.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "local".to_string());
+
+            let mut output = String::new();
+
+            // Local execution
+            match execute_action_command(&action.command) {
+                Ok(o) => output.push_str(&format!("=== {} (local) ===\n{}\n\n", hostname, o)),
+                Err(e) => output.push_str(&format!("=== {} (local) ===\nERROR: {}\n\n", hostname, e)),
+            }
+
+            // Remote execution
+            for (_node_id, node_hostname, url_primary, url_fallback) in cluster_nodes {
+                let urls = [url_primary.as_str(), url_fallback.as_str()];
+                let mut node_output = String::new();
+                for base_url in &urls {
+                    let remote_url = format!("{}/api/ai/action/exec", base_url);
+                    match self.client
+                        .post(&remote_url)
+                        .header("X-WolfStack-Secret", cluster_secret)
+                        .json(&serde_json::json!({ "command": action.command }))
+                        .timeout(Duration::from_secs(30))
+                        .send()
+                        .await
+                    {
+                        Ok(resp) => {
+                            let resp_text = resp.text().await.unwrap_or_default();
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&resp_text) {
+                                node_output = json["output"].as_str()
+                                    .or(json["error"].as_str())
+                                    .unwrap_or("(no output)")
+                                    .to_string();
+                            } else {
+                                node_output = format!("ERROR: Unexpected response: {}", resp_text.chars().take(200).collect::<String>());
+                            }
+                            break;
+                        }
+                        Err(e) => {
+                            node_output = format!("ERROR: {}", e);
+                        }
+                    }
+                }
+                output.push_str(&format!("=== {} ===\n{}\n\n", node_hostname, node_output));
+            }
+            Ok(output)
+        } else {
+            execute_action_command(&action.command)
+        };
+
+        // Update action status
+        {
+            let mut pa = self.pending_actions.lock().unwrap();
+            if let Some(a) = pa.iter_mut().find(|a| a.id == action_id) {
+                match &result {
+                    Ok(output) => {
+                        a.status = "executed".to_string();
+                        a.result = output.clone();
+                        action.result = output.clone();
+                    }
+                    Err(e) => {
+                        a.status = "failed".to_string();
+                        a.result = e.clone();
+                        action.result = e.clone();
+                    }
+                }
+            }
+        }
+
+        // Audit log result
+        log_action_audit(&action, &action.status, approved_by, &action.result);
+
+        result
+    }
+
+    /// Reject a pending action
+    pub fn reject_action(&self, action_id: &str, rejected_by: &str) -> Result<(), String> {
+        let mut pa = self.pending_actions.lock().unwrap();
+        let action = pa.iter_mut().find(|a| a.id == action_id)
+            .ok_or_else(|| "Action not found or expired".to_string())?;
+        if action.status != "pending" {
+            return Err(format!("Action already {}", action.status));
+        }
+        action.status = "rejected".to_string();
+        log_action_audit(action, "rejected", rejected_by, "");
+        Ok(())
     }
 
     /// List available models for the configured provider
@@ -431,11 +601,14 @@ impl AiAgent {
              by name (e.g. 'mysqld using 85% CPU', 'java consuming 4.2GB RAM'). Don't just say 'CPU is high' — say what's using it.\n\
              For Kubernetes clusters: flag unhealthy/NotReady nodes, failed or pending pods, pods with high restart counts \
              (10+), and any cluster that reports as UNHEALTHY. Include the cluster name and affected pod/node names.\n\n\
+             IMPORTANT: If you identify a fixable issue, propose the fix using ACTION tags:\n\
+             [ACTION id=\"unique-id\" title=\"Short Title\" risk=\"low|medium|high\" explain=\"Why this fixes it\" target=\"local\"]command[/ACTION]\n\
+             The admin will see these actions in the WolfStack dashboard AND in the alert email, and can approve them with one click.\n\n\
              Current server metrics:\n{}",
             metrics_summary
         );
 
-        let system = "You are a WolfStack server health monitoring agent. Be concise and technical. Only flag genuine issues.";
+        let system = "You are a WolfStack server health monitoring agent. Be concise and technical. Only flag genuine issues. Propose fixes with [ACTION] tags when possible.";
 
         let result = match config.provider.as_str() {
             "gemini" => call_gemini(&self.client, &config.gemini_api_key, &config.model, system, &[], &prompt).await,
@@ -456,6 +629,18 @@ impl AiAgent {
                         .map(|h| h.to_string_lossy().to_string())
                         .unwrap_or_else(|_| "unknown".to_string());
 
+                    // Parse proposed actions from the response
+                    let actions = parse_actions(&response);
+                    let clean_response = strip_action_tags(&response);
+
+                    // Store pending actions
+                    if !actions.is_empty() {
+                        let mut pa = self.pending_actions.lock().unwrap();
+                        let now = chrono::Utc::now().timestamp();
+                        pa.retain(|a| a.status == "pending" && (now - a.created_at) < 600);
+                        pa.extend(actions.clone());
+                    }
+
                     // Parse severity from response
                     let severity = if response.contains("CRITICAL") {
                         "critical"
@@ -468,7 +653,7 @@ impl AiAgent {
                     let alert = AiAlert {
                         timestamp: chrono::Utc::now().timestamp(),
                         severity: severity.to_string(),
-                        message: response.clone(),
+                        message: clean_response.clone(),
                         hostname: hostname.clone(),
                     };
 
@@ -480,10 +665,31 @@ impl AiAgent {
                         if alerts.len() > 200 { let drain = alerts.len() - 200; alerts.drain(..drain); }
                     }
 
-                    // Send email if configured
+                    // Send email if configured — include proposed actions
                     if config.email_enabled && !config.email_to.is_empty() {
                         let subject = format!("[WolfStack {}] {} Alert on {}", severity.to_uppercase(), severity.to_uppercase(), hostname);
-                        if let Err(e) = send_alert_email(&config, &subject, &response) {
+                        let email_body = if actions.is_empty() {
+                            clean_response.clone()
+                        } else {
+                            let mut body = clean_response.clone();
+                            body.push_str("\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+                            body.push_str("PROPOSED FIXES (approve in WolfStack dashboard)\n");
+                            body.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n");
+                            for a in &actions {
+                                let risk_label = match a.risk.as_str() {
+                                    "low" => "LOW RISK",
+                                    "high" => "HIGH RISK",
+                                    _ => "MEDIUM RISK",
+                                };
+                                body.push_str(&format!(
+                                    "[{}] {}\n  Command: {}\n  {}\n  → Open WolfStack dashboard to approve this action\n\n",
+                                    risk_label, a.title, a.command,
+                                    if a.explanation.is_empty() { String::new() } else { format!("Reason: {}", a.explanation) }
+                                ));
+                            }
+                            body
+                        };
+                        if let Err(e) = send_alert_email(&config, &subject, &email_body) {
                             warn!("Failed to send alert email: {}", e);
                         }
                     }
@@ -495,13 +701,13 @@ impl AiAgent {
                             "[WolfStack AI {}] Health alert on {}",
                             severity.to_uppercase(), hostname
                         );
-                        let body = response.clone();
+                        let body = clean_response.clone();
                         tokio::spawn(async move {
                             crate::alerting::send_alert(&alert_config, &title, &body).await;
                         });
                     }
 
-                    Some(response)
+                    Some(clean_response)
                 } else {
 
                     None
@@ -830,6 +1036,220 @@ pub fn execute_safe_command(cmd: &str) -> Result<String, String> {
     }
 }
 
+// ─── Action Parsing & Execution ───
+
+/// Advance to the next valid UTF-8 char boundary at or after `pos`
+fn next_char_boundary(s: &str, pos: usize) -> usize {
+    let mut i = pos;
+    while i < s.len() && !s.is_char_boundary(i) { i += 1; }
+    i
+}
+
+/// Parse [ACTION id="..." title="..." risk="..."]command[/ACTION] tags from AI response.
+/// Action IDs from the AI are ignored — we generate secure UUIDs server-side.
+fn parse_actions(response: &str) -> Vec<AiAction> {
+    let mut actions = Vec::new();
+    let now = chrono::Utc::now().timestamp();
+    let mut search_from = 0;
+
+    while search_from < response.len() {
+        let start = match response[search_from..].find("[ACTION ") {
+            Some(i) => search_from + i,
+            None => break,
+        };
+        // Find the closing ] of the opening tag
+        let tag_end = match response[start..].find(']') {
+            Some(i) => start + i,
+            None => break,
+        };
+        // Safe char-boundary advance past the ]
+        let after_tag = next_char_boundary(response, tag_end + 1);
+        if after_tag >= response.len() { break; }
+
+        // Find [/ACTION]
+        let content_end = match response[after_tag..].find("[/ACTION]") {
+            Some(i) => after_tag + i,
+            None => break,
+        };
+
+        let tag_header = &response[start..after_tag];
+        let command = response[after_tag..content_end].trim().to_string();
+
+        // Server-generated UUID — never trust AI-supplied IDs
+        let id = format!("act-{:08x}", (now as u32).wrapping_mul(actions.len() as u32 + 1).wrapping_add(command.len() as u32));
+        let title = extract_attr(tag_header, "title")
+            .unwrap_or_else(|| "Fix".to_string());
+        let risk = extract_attr(tag_header, "risk")
+            .unwrap_or_else(|| "medium".to_string());
+        let explanation = extract_attr(tag_header, "explain")
+            .unwrap_or_default();
+        let target = extract_attr(tag_header, "target")
+            .unwrap_or_else(|| "local".to_string());
+
+        if !command.is_empty() {
+            actions.push(AiAction {
+                id,
+                title,
+                command,
+                risk,
+                explanation,
+                node_target: target,
+                status: "pending".to_string(),
+                created_at: now,
+                result: String::new(),
+                approved_by: String::new(),
+            });
+        }
+
+        search_from = (content_end + 9).min(response.len());
+    }
+
+    actions
+}
+
+/// Strip [ACTION ...] ... [/ACTION] tags from text, leaving clean prose
+fn strip_action_tags(text: &str) -> String {
+    let mut result = text.to_string();
+    loop {
+        let start = match result.find("[ACTION ") {
+            Some(i) => i,
+            None => break,
+        };
+        let end = match result[start..].find("[/ACTION]") {
+            Some(i) => start + i + 9,
+            None => break,
+        };
+        result.replace_range(start..end, "");
+    }
+    // Clean up any double newlines left behind
+    while result.contains("\n\n\n") {
+        result = result.replace("\n\n\n", "\n\n");
+    }
+    result
+}
+
+/// Commands that are NEVER allowed even with user approval
+const CATASTROPHIC_PATTERNS: &[&str] = &[
+    "rm -rf /",
+    "rm -rf /*",
+    "dd if=/dev/zero of=/dev/sd",
+    "dd if=/dev/zero of=/dev/nvme",
+    "dd if=/dev/urandom of=/dev/sd",
+    "mkfs /dev/sd",
+    "mkfs /dev/nvme",
+    ":(){ :|:&",        // fork bomb
+    "> /dev/sd",
+    "chmod -R 777 /",
+    "chown -R",
+    "rm -rf /etc",
+    "rm -rf /var",
+    "rm -rf /usr",
+    "rm -rf /home",
+    "rm -rf /root",
+    "wget|sh",
+    "curl|sh",
+    "curl|bash",
+    "wget|bash",
+];
+
+/// Execute an action command (write-capable, user-approved).
+/// This allows commands that execute_safe_command blocks, but still prevents catastrophic ones.
+/// Uses a 30-second timeout to prevent hanging.
+pub fn execute_action_command(cmd: &str) -> Result<String, String> {
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        return Err("Empty command".to_string());
+    }
+
+    // Normalise whitespace for pattern matching (collapse multiple spaces)
+    let normalised = cmd.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+
+    // Block catastrophic patterns (checked against normalised form)
+    for pattern in CATASTROPHIC_PATTERNS {
+        if normalised.contains(pattern) {
+            return Err(format!("Command contains catastrophic pattern '{}' — blocked for safety", pattern));
+        }
+    }
+
+    // Block shell injection vectors
+    if cmd.contains('`') || cmd.contains("$(") || cmd.contains("<(") || cmd.contains(">(") {
+        return Err("Command/process substitution is not allowed in actions".to_string());
+    }
+
+    // Execute with a 30-second timeout using `timeout` command wrapper
+    let wrapped = format!("timeout 30 bash -c {}", shell_escape(cmd));
+
+    let output = StdCommand::new("bash")
+        .arg("-c")
+        .arg(&wrapped)
+        .output();
+
+    match output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let exit_code = out.status.code().unwrap_or(-1);
+
+            // exit code 124 = timeout killed the command
+            if exit_code == 124 {
+                return Err("Command timed out after 30 seconds and was killed".to_string());
+            }
+
+            let mut result = String::new();
+            if !stdout.is_empty() { result.push_str(&stdout); }
+            if !stderr.is_empty() {
+                if !result.is_empty() { result.push('\n'); }
+                result.push_str(&format!("[stderr]: {}", stderr));
+            }
+            if exit_code != 0 {
+                result.push_str(&format!("\n[exit code: {}]", exit_code));
+            }
+            if result.len() > 10_000 {
+                result.truncate(10_000);
+                result.push_str("\n[output truncated]");
+            }
+            if result.trim().is_empty() {
+                result = if exit_code == 0 {
+                    "(completed successfully)".to_string()
+                } else {
+                    format!("(no output, exit code: {})", exit_code)
+                };
+            }
+            Ok(result)
+        }
+        Err(e) => Err(format!("Failed to execute: {}", e)),
+    }
+}
+
+/// Shell-escape a string for safe embedding in a bash -c argument
+fn shell_escape(s: &str) -> String {
+    // Wrap in single quotes, escaping any embedded single quotes
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Write an audit log entry for an action
+fn log_action_audit(action: &AiAction, event: &str, user: &str, output: &str) {
+    let log_path = format!("{}/ai-actions.log", crate::paths::get().config_dir);
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+    let hostname = hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    // Sanitize fields to prevent log injection via newlines
+    let safe = |s: &str| s.replace('\n', "\\n").replace('\r', "\\r");
+    let entry = format!(
+        "[{}] {} | host={} user={} action_id={} title=\"{}\" risk={} target={} command=\"{}\" output_len={}\n",
+        timestamp, event.to_uppercase(), hostname, safe(user), safe(&action.id), safe(&action.title),
+        safe(&action.risk), safe(&action.node_target), safe(&action.command), output.len()
+    );
+
+    // Append to log file (best-effort)
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        use std::io::Write;
+        let _ = f.write_all(entry.as_bytes());
+    }
+}
+
 // ─── WolfNote Tag Handler ───
 
 /// Parse and execute [WOLFNOTE title="..."]content[/WOLFNOTE] tags in an AI response.
@@ -938,6 +1358,23 @@ fn build_system_prompt(knowledge: &str, server_context: &str) -> String {
          - You CANNOT execute commands on Proxmox nodes (they don't run WolfStack agents)\n\
          - Proxmox data is shown in the server state below; use it to answer questions about the infrastructure\n\
          - When reporting on the full infrastructure, include Proxmox node health data (CPU, RAM, disk)\n\n\
+         ## Proposed Actions (Fix It)\n\
+         When you identify a problem and know how to fix it, propose the fix using ACTION tags.\n\
+         The user will see each proposed action as a card with an Approve or Dismiss button.\n\
+         The command is ONLY executed after the user explicitly approves it.\n\n\
+         Format:\n\
+         `[ACTION id=\"unique-id\" title=\"Short Title\" risk=\"low|medium|high\" explain=\"Why this fixes it\" target=\"local|all\"]command here[/ACTION]`\n\n\
+         Rules:\n\
+         - Always explain what the command does and why it will fix the problem\n\
+         - Set risk appropriately: low = restarts/reloads, medium = config changes/installs, high = disk/network/user changes\n\
+         - Use target=\"all\" only when the fix needs to run on every cluster node\n\
+         - You can propose multiple actions — they are independent, user approves each one\n\
+         - NEVER tell the user to run a command manually if you can propose it as an action instead\n\
+         - Group related commands into a single action when they must run together\n\
+         - After diagnosing an issue, ALWAYS offer to fix it with an ACTION if a fix exists\n\n\
+         Examples:\n\
+         `[ACTION id=\"restart-nginx\" title=\"Restart Nginx\" risk=\"low\" explain=\"Nginx config is valid but the service needs a reload to pick up changes\" target=\"local\"]systemctl restart nginx[/ACTION]`\n\
+         `[ACTION id=\"fix-dns\" title=\"Fix DNS Resolver\" risk=\"medium\" explain=\"/etc/resolv.conf is empty, adding Google DNS as a fallback\" target=\"local\"]echo 'nameserver 8.8.8.8' >> /etc/resolv.conf[/ACTION]`\n\n\
          ## WolfNote Integration\n\
          You can create notes in the user's WolfNote account using this tag:\n\
          `[WOLFNOTE title=\"Note Title\"]Note content here (plain text or HTML)[/WOLFNOTE]`\n\n\
