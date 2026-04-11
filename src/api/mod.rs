@@ -9820,7 +9820,7 @@ pub async fn wolfusb_status(req: HttpRequest, state: web::Data<AppState>) -> Htt
     let available = crate::wolfusb::is_wolfusb_available();
     let version = if available { crate::wolfusb::get_wolfusb_version() } else { None };
     HttpResponse::Ok().json(serde_json::json!({
-        "usbip_available": available,
+        "wolfusb_available": available,
         "enabled": config.enabled,
         "assignment_count": config.assignments.len(),
         "version": version,

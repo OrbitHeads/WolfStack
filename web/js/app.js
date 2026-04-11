@@ -7864,10 +7864,8 @@ function loadTaskLog() {
                 }));
             }
         }
-        // Show the task log footer on load (only if user hasn't closed it)
         loadTaskLogHeight();
         renderTaskLog();
-        if (!_taskLogUserClosed && _taskLogEntries.length > 0) showTaskLog();
     } catch (_) {}
 }
 
@@ -8041,7 +8039,6 @@ function addTaskLogEntry(opts) {
     };
     _taskLogEntries.unshift(entry);
     if (_taskLogEntries.length > 1000) _taskLogEntries.length = 1000;
-    if (!_taskLogUserClosed) showTaskLog();
     updateTaskLogSpinner();
     renderTaskLog();
     saveTaskLog();
@@ -34541,12 +34538,12 @@ async function loadWolfUsbPage() {
 
         var html = '';
 
-        if (!status.usbip_available) {
+        if (!status.wolfusb_available) {
             html += '<div class="card" style="margin-bottom:16px;"><div class="card-header">Setup Required</div><div class="card-body" style="text-align:center;padding:2rem;">'
                 + '<div style="font-size:2.5rem;margin-bottom:12px;">🔌</div>'
-                + '<h3 style="margin-bottom:8px;">Install USB/IP Tools</h3>'
-                + '<p style="color:var(--text-secondary);margin-bottom:16px;max-width:500px;margin-left:auto;margin-right:auto;">WolfUSB uses the Linux kernel\'s built-in <strong>usbip</strong> module to share USB devices across your network as real USB devices. The kernel tools need to be installed once.</p>'
-                + '<button class="btn btn-primary" onclick="installWolfUsb()" id="wolfusb-install-btn" style="padding:10px 24px;">Install usbip Tools</button>'
+                + '<h3 style="margin-bottom:8px;">Install WolfUSB</h3>'
+                + '<p style="color:var(--text-secondary);margin-bottom:16px;max-width:500px;margin-left:auto;margin-right:auto;">WolfUSB shares USB devices across your cluster over the network. The wolfusb tools need to be installed once per node.</p>'
+                + '<button class="btn btn-primary" onclick="installWolfUsb()" id="wolfusb-install-btn" style="padding:10px 24px;">Install WolfUSB</button>'
                 + '<div id="wolfusb-install-output" style="display:none;margin-top:16px;text-align:left;max-width:600px;margin-left:auto;margin-right:auto;"></div>'
                 + '<p style="color:var(--text-muted);font-size:11px;margin-top:16px;">Supports Debian, Ubuntu, Proxmox, Arch, Fedora, RHEL, and openSUSE.</p>'
                 + '</div></div>';
@@ -34557,10 +34554,13 @@ async function loadWolfUsbPage() {
         // Status bar
         var statusColor = status.enabled ? '#22c55e' : 'var(--text-muted)';
         var statusText = status.enabled ? 'Enabled' : 'Disabled';
+        var versionText = status.version ? ' <span style="font-size:10px;color:var(--text-muted);font-weight:400;">(' + escapeHtml(status.version) + ')</span>' : '';
         html += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;padding:12px 16px;background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-sm);">'
             + '<span style="font-size:1.5rem;">🔌</span>'
-            + '<div style="flex:1;"><strong style="font-size:14px;">WolfUSB</strong><br><span style="font-size:12px;color:var(--text-muted);">Share USB devices across your cluster via usbip</span></div>'
-            + '<div style="display:flex;align-items:center;gap:12px;">'
+            + '<div style="flex:1;"><strong style="font-size:14px;">WolfUSB</strong>' + versionText + '<br><span style="font-size:12px;color:var(--text-muted);">Share USB devices across your cluster</span></div>'
+            + '<div style="display:flex;align-items:center;gap:8px;">'
+            + '<button class="btn btn-sm" onclick="installWolfUsb()" id="wolfusb-reinstall-btn" style="padding:3px 10px;font-size:10px;">Reinstall</button>'
+            + '<div id="wolfusb-install-output" style="display:none;"></div>'
             + '<span style="font-size:11px;color:' + statusColor + ';font-weight:600;">' + statusText + '</span>'
             + '<label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">'
             + '<input type="checkbox" id="wolfusb-enabled" ' + (status.enabled ? 'checked' : '') + ' onchange="saveWolfUsbConfig()"> Enable</label>'
@@ -34588,33 +34588,33 @@ async function loadWolfUsbPage() {
 }
 
 async function installWolfUsb() {
-    var btn = document.getElementById('wolfusb-install-btn');
+    var btn = document.getElementById('wolfusb-install-btn') || document.getElementById('wolfusb-reinstall-btn');
     var output = document.getElementById('wolfusb-install-output');
+    var originalText = btn ? btn.textContent : '';
     if (btn) { btn.disabled = true; btn.textContent = 'Installing...'; }
     if (output) {
         output.style.display = 'block';
-        output.innerHTML = '<pre style="background:var(--bg-primary);padding:14px;border-radius:8px;font-size:11px;max-height:400px;overflow:auto;border:1px solid var(--border);line-height:1.6;">Installing usbip tools for your platform...\nThis may take a moment.\n</pre>';
+        output.innerHTML = '<pre style="background:var(--bg-primary);padding:14px;border-radius:8px;font-size:11px;max-height:400px;overflow:auto;border:1px solid var(--border);line-height:1.6;">Installing WolfUSB...\nThis may take a moment.\n</pre>';
     }
     try {
         var resp = await fetch(apiUrl('/api/wolfusb/install'), { method: 'POST' });
         var data = await resp.json();
         if (data.ok) {
-            showToast('usbip tools installed successfully', 'success');
-            if (output) output.querySelector('pre').textContent = data.output || 'Installed successfully';
+            showToast('WolfUSB installed successfully', 'success');
+            if (output && output.querySelector('pre')) output.querySelector('pre').textContent = data.output || 'Installed successfully';
             setTimeout(loadWolfUsbPage, 1500);
         } else {
             if (output) {
                 output.innerHTML = '<div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);border-radius:8px;padding:14px;">'
                     + '<strong style="color:#ef4444;">Installation issue</strong>'
                     + '<pre style="margin-top:8px;font-size:11px;white-space:pre-wrap;max-height:300px;overflow:auto;color:var(--text-secondary);">' + escapeHtml(data.error || 'Unknown error') + '</pre>'
-                    + '<p style="margin-top:10px;font-size:12px;color:var(--text-muted);">You can also install manually: <code>sudo apt install usbip</code> (Debian/Ubuntu) or <code>sudo pacman -S usbip</code> (Arch) or <code>sudo dnf install usbip-utils</code> (Fedora)</p>'
                     + '</div>';
             }
-            if (btn) { btn.disabled = false; btn.textContent = 'Retry Installation'; }
+            if (btn) { btn.disabled = false; btn.textContent = originalText || 'Retry'; }
         }
     } catch (e) {
         showToast('Install failed: ' + e.message, 'error');
-        if (btn) { btn.disabled = false; btn.textContent = 'Retry Installation'; }
+        if (btn) { btn.disabled = false; btn.textContent = originalText || 'Retry'; }
     }
 }
 
@@ -34638,9 +34638,19 @@ async function refreshWolfUsbDevices() {
         var data = await resp.json();
         var devices = data.devices || [];
         var assignments = data.assignments || [];
+        var wolfusbWorking = data.wolfusb_working !== false;
+
+        // Show warning if wolfusb server isn't running
+        var warningHtml = '';
+        if (!wolfusbWorking) {
+            warningHtml = '<div style="background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;display:flex;align-items:center;gap:10px;">'
+                + '<span style="font-size:1.2rem;">&#9888;</span>'
+                + '<span style="font-size:12px;color:var(--text-secondary);"><strong>WolfUSB server not running</strong> — Install WolfUSB tools or start the wolfusb service to enable USB device sharing.</span>'
+                + '</div>';
+        }
 
         if (devices.length === 0) {
-            body.innerHTML = '<div style="text-align:center;padding:24px;"><span style="font-size:2rem;display:block;margin-bottom:8px;">🔌</span><span style="color:var(--text-muted);font-size:13px;">No USB devices detected on this node.<br><span style="font-size:11px;">Plug in a USB device and click Refresh.</span></span></div>';
+            body.innerHTML = warningHtml + '<div style="text-align:center;padding:24px;"><span style="font-size:2rem;display:block;margin-bottom:8px;">🔌</span><span style="color:var(--text-muted);font-size:13px;">No USB devices detected on this node.<br><span style="font-size:11px;">Plug in a USB device and click Refresh.</span></span></div>';
         } else {
             // Build cluster-wide target options (all nodes' containers/VMs)
             var targetOpts = await _wolfusbGetClusterTargets();
@@ -34651,7 +34661,7 @@ async function refreshWolfUsbDevices() {
             var sourceHostname = selfNode ? selfNode.hostname : '';
             var sourceAddr = selfNode ? selfNode.address : '';
 
-            var html = '<table class="data-table" style="width:100%;font-size:12px;"><thead><tr>'
+            var html = warningHtml + '<table class="data-table" style="width:100%;font-size:12px;"><thead><tr>'
                 + '<th>Bus ID</th><th>Vendor:Product</th><th>Device</th><th>Status</th><th>Assign To</th>'
                 + '</tr></thead><tbody>';
             devices.forEach(function(d, idx) {
