@@ -32630,8 +32630,10 @@ function wfTargetLabel(target) {
         return target;
     }
     if (target.scope === 'all_nodes') return 'All Nodes';
+    if (target.scope === 'everything') return 'Everything';
     if (target.scope === 'cluster') return 'Cluster: ' + (target.cluster_name || '');
     if (target.scope === 'nodes') return (target.node_ids || []).length + ' node(s)';
+    if (target.scope === 'containers') return (target.targets || []).length + ' container(s)';
     return 'Local';
 }
 
@@ -33381,16 +33383,25 @@ function selectWfWorkflowTarget() {
                 <input type="radio" name="wf-wftarget" value="all_nodes" ${scope === 'all_nodes' ? 'checked' : ''} onchange="wfWfTargetChanged()"> All cluster nodes
             </label>
             <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
+                <input type="radio" name="wf-wftarget" value="everything" ${scope === 'everything' ? 'checked' : ''} onchange="wfWfTargetChanged()"> Everything <span style="font-size:10px;color:var(--text-muted);">(all nodes + all containers/VMs)</span>
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
                 <input type="radio" name="wf-wftarget" value="cluster" ${scope === 'cluster' ? 'checked' : ''} onchange="wfWfTargetChanged()"> Specific cluster
             </label>
             <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
                 <input type="radio" name="wf-wftarget" value="nodes" ${scope === 'nodes' ? 'checked' : ''} onchange="wfWfTargetChanged()"> Specific nodes
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
+                <input type="radio" name="wf-wftarget" value="containers" ${scope === 'containers' ? 'checked' : ''} onchange="wfWfTargetChanged()"> Specific containers/VMs
             </label>
         </div>
         <div id="wf-wftarget-cluster" style="${scope === 'cluster' ? '' : 'display:none;'}margin-bottom:10px;">
             <input type="text" id="wf-wftarget-cluster-name" class="form-control" value="${escapeHtml((target && target.cluster_name) || '')}" placeholder="Cluster name" style="font-size:12px;">
         </div>
         <div id="wf-wftarget-nodes" style="${scope === 'nodes' ? '' : 'display:none;'}max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:8px;background:var(--bg-primary);">
+        </div>
+        <div id="wf-wftarget-containers" style="${scope === 'containers' ? '' : 'display:none;'}max-height:300px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:8px;background:var(--bg-primary);">
+            <div style="color:var(--text-muted);font-size:11px;text-align:center;padding:8px;">Loading infrastructure...</div>
         </div>
         <button class="btn" onclick="wfSaveWorkflowTarget()" style="margin-top:14px;width:100%;padding:8px;font-size:12px;background:var(--accent);color:#fff;border:1px solid var(--accent);border-radius:var(--radius-sm);">
             Apply Target
@@ -33428,8 +33439,29 @@ function wfWfTargetChanged() {
     const scope = sel.value;
     const cd = document.getElementById('wf-wftarget-cluster');
     const nd = document.getElementById('wf-wftarget-nodes');
+    const ctd = document.getElementById('wf-wftarget-containers');
     if (cd) cd.style.display = scope === 'cluster' ? '' : 'none';
     if (nd) nd.style.display = scope === 'nodes' ? '' : 'none';
+    if (ctd) {
+        ctd.style.display = scope === 'containers' ? '' : 'none';
+        if (scope === 'containers') wfLoadWfTargetInfra();
+    }
+}
+
+async function wfLoadWfTargetInfra() {
+    const div = document.getElementById('wf-wftarget-containers');
+    if (!div) return;
+    if (_wfInfraCache) { wfRenderInfraTree(div, _wfInfraCache); return; }
+    div.innerHTML = '<div style="color:var(--text-muted);font-size:11px;text-align:center;padding:12px;">Loading infrastructure...</div>';
+    try {
+        const resp = await fetch('/api/wolfflow/infrastructure', { credentials: 'include' });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        _wfInfraCache = await resp.json();
+        wfRenderInfraTree(div, _wfInfraCache);
+        setTimeout(() => { _wfInfraCache = null; }, 60000);
+    } catch(e) {
+        div.innerHTML = '<div style="color:var(--text-muted);font-size:11px;">Failed: ' + e.message + '</div>';
+    }
 }
 
 function wfSaveWorkflowTarget() {
@@ -33439,12 +33471,22 @@ function wfSaveWorkflowTarget() {
         wfEditorTarget = { scope: 'local' };
     } else if (scope === 'all_nodes') {
         wfEditorTarget = { scope: 'all_nodes' };
+    } else if (scope === 'everything') {
+        wfEditorTarget = { scope: 'everything' };
     } else if (scope === 'cluster') {
         const cn = document.getElementById('wf-wftarget-cluster-name');
         wfEditorTarget = { scope: 'cluster', cluster_name: cn ? cn.value.trim() : '' };
     } else if (scope === 'nodes') {
         const nodeIds = Array.from(document.querySelectorAll('.wf-wftarget-node-cb:checked')).map(cb => cb.value);
         wfEditorTarget = { scope: 'nodes', node_ids: nodeIds };
+    } else if (scope === 'containers') {
+        // Use the wf-ct-cb checkboxes in the wf-wftarget-containers div
+        const targets = Array.from(document.querySelectorAll('#wf-wftarget-containers .wf-ct-cb:checked')).map(cb => ({
+            node_id: cb.dataset.node,
+            runtime: cb.dataset.runtime,
+            name: cb.dataset.name,
+        }));
+        wfEditorTarget = { scope: 'containers', targets };
     }
     showToast('Workflow target updated', 'success');
     renderWolfFlowCanvas();
@@ -33573,9 +33615,11 @@ async function triggerWolfFlow(id) {
             wfName = wf.name || id;
             wfStepCount = (wf.steps || []).length;
             wfTarget = wf.target?.scope === 'all_nodes' ? 'all nodes' :
+                wf.target?.scope === 'everything' ? 'everything' :
                 wf.target?.scope === 'local' ? 'local' :
                 wf.target?.scope === 'cluster' ? wf.target.cluster_name :
                 wf.target?.scope === 'nodes' ? (wf.target.node_ids || []).length + ' nodes' :
+                wf.target?.scope === 'containers' ? (wf.target.targets || []).length + ' containers' :
                 wf.target?.scope || '?';
         }
     } catch(e) {}

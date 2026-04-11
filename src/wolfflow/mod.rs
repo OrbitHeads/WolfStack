@@ -272,6 +272,8 @@ pub enum Target {
         #[serde(default)]
         targets: Vec<ContainerTarget>,
     },
+    /// Execute on ALL nodes AND inside all their containers/VMs
+    Everything,
 }
 
 /// A specific container/VM/LXC target
@@ -1187,6 +1189,143 @@ async fn run_command(cmd: &str, args: &[&str], timeout_secs: u64) -> Result<Stri
     }
 }
 
+// ─── Container/VM Command Execution ───
+
+/// Execute a command inside a Docker container
+pub async fn exec_in_docker(container_name: &str, command: &str, timeout_secs: u64) -> Result<String, String> {
+    run_command("docker", &["exec", container_name, "sh", "-c", command], timeout_secs).await
+}
+
+/// Execute a command inside an LXC container
+pub async fn exec_in_lxc(container_name: &str, command: &str, timeout_secs: u64) -> Result<String, String> {
+    run_command("lxc-attach", &["-n", container_name, "--", "sh", "-c", command], timeout_secs).await
+}
+
+/// Execute a command inside a VM via SSH (best-effort).
+/// VMs are reached via their WolfNet IP or MAC-derived IP.
+pub async fn exec_in_vm(vm_name: &str, command: &str, timeout_secs: u64) -> Result<String, String> {
+    // Try to find the VM's IP from the local VM manager
+    let vms = crate::vms::manager::VmManager::new().list_vms();
+    let vm = vms.iter().find(|v| v.name == vm_name);
+
+    // Try WolfNet IP first, then fall back to MAC-based ARP lookup
+    let ip = vm.and_then(|v| v.wolfnet_ip.clone()).filter(|ip| !ip.is_empty());
+
+    let ip = match ip {
+        Some(ip) => ip,
+        None => {
+            // Try to find IP via ARP table using MAC address
+            if let Some(mac) = vm.and_then(|v| v.mac_address.clone()) {
+                let arp_output = run_command("bash", &["-c", &format!("ip neigh | grep -i '{}' | awk '{{print $1}}'", mac)], 5).await;
+                match arp_output {
+                    Ok(ip_str) if !ip_str.trim().is_empty() => ip_str.trim().to_string(),
+                    _ => return Err(format!("Cannot execute in VM '{}': no IP address found. Ensure the VM has a network connection.", vm_name)),
+                }
+            } else {
+                return Err(format!("Cannot execute in VM '{}': no MAC or IP address found.", vm_name));
+            }
+        }
+    };
+
+    // SSH with common options: no host key check, short timeout, try root first
+    let ssh_cmd = format!(
+        "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes root@{} {}",
+        ip, shell_quote(command)
+    );
+    run_command("bash", &["-c", &ssh_cmd], timeout_secs).await
+}
+
+/// Shell-quote a string for safe embedding in an SSH command
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Execute an action inside a specific container/VM on the local node.
+/// Wraps RunCommand to execute inside the target; other actions run on the host.
+pub async fn execute_action_in_container(
+    action: &ActionType,
+    ct: &ContainerTarget,
+) -> Result<StepOutput, String> {
+    // For RunCommand, execute inside the container
+    if let ActionType::RunCommand { command, timeout_secs } = action {
+        let result = match ct.runtime.as_str() {
+            "docker" => exec_in_docker(&ct.name, command, *timeout_secs).await,
+            "lxc" => exec_in_lxc(&ct.name, command, *timeout_secs).await,
+            "vm" => exec_in_vm(&ct.name, command, *timeout_secs).await,
+            _ => Err(format!("Unknown runtime: {}", ct.runtime)),
+        };
+        return result.map(plain_output);
+    }
+
+    // For RestartContainer targeting a specific container, just restart it
+    if let ActionType::RestartContainer { .. } = action {
+        let restart_action = ActionType::RestartContainer {
+            runtime: ct.runtime.clone(),
+            name: ct.name.clone(),
+        };
+        return execute_action_local(&restart_action).await;
+    }
+
+    // For DockerPrune targeting a docker container — run docker system prune in context
+    if let ActionType::DockerPrune = action {
+        if ct.runtime == "docker" {
+            // Prune unused resources on the host (not inside the container)
+            return execute_action_local(action).await;
+        }
+    }
+
+    // For other actions that don't make sense inside a container, run on the host
+    // (UpdatePackages inside a container, CleanLogs, etc.)
+    match ct.runtime.as_str() {
+        "docker" => {
+            // Wrap package updates etc. to run inside docker
+            let cmd = match action {
+                ActionType::UpdatePackages => Some("apt-get update -y && apt-get upgrade -y 2>/dev/null || dnf upgrade -y 2>/dev/null || true".to_string()),
+                ActionType::CleanLogs { .. } => Some("find /var/log -type f -name '*.log' -mtime +7 -delete 2>/dev/null; echo 'Logs cleaned'".to_string()),
+                ActionType::CheckDiskSpace { .. } => Some("df -h".to_string()),
+                _ => None,
+            };
+            if let Some(cmd) = cmd {
+                return exec_in_docker(&ct.name, &cmd, 300).await.map(plain_output);
+            }
+        }
+        "lxc" => {
+            let cmd = match action {
+                ActionType::UpdatePackages => Some("apt-get update -y && apt-get upgrade -y 2>/dev/null || dnf upgrade -y 2>/dev/null || true".to_string()),
+                ActionType::CleanLogs { max_size_mb } => {
+                    let size = max_size_mb.unwrap_or(500);
+                    Some(format!("journalctl --vacuum-size={}M 2>/dev/null || find /var/log -type f -name '*.log' -mtime +7 -delete; echo 'Logs cleaned'", size))
+                }
+                ActionType::CheckDiskSpace { .. } => Some("df -h".to_string()),
+                ActionType::RestartService { service_name } => Some(format!("systemctl restart {}", service_name)),
+                _ => None,
+            };
+            if let Some(cmd) = cmd {
+                return exec_in_lxc(&ct.name, &cmd, 300).await.map(plain_output);
+            }
+        }
+        "vm" => {
+            let cmd = match action {
+                ActionType::UpdatePackages => Some("apt-get update -y && apt-get upgrade -y 2>/dev/null || dnf upgrade -y 2>/dev/null || true".to_string()),
+                ActionType::CleanLogs { max_size_mb } => {
+                    let size = max_size_mb.unwrap_or(500);
+                    Some(format!("journalctl --vacuum-size={}M 2>/dev/null || echo 'no journalctl'", size))
+                }
+                ActionType::CheckDiskSpace { .. } => Some("df -h".to_string()),
+                ActionType::RestartService { service_name } => Some(format!("systemctl restart {}", service_name)),
+                _ => None,
+            };
+            if let Some(cmd) = cmd {
+                return exec_in_vm(&ct.name, &cmd, 300).await.map(plain_output);
+            }
+        }
+        _ => {}
+    }
+
+    // Fallback: action doesn't apply to containers — run on host
+    execute_action_local(action).await
+}
+
 // ═══════════════════════════════════════════════
 // ─── Workflow Execution ───
 // ═══════════════════════════════════════════════
@@ -1242,6 +1381,13 @@ fn resolve_targets(
                 }
             }
             result
+        }
+        Target::Everything => {
+            // All online WolfStack nodes — container execution is handled in the workflow runner
+            nodes.iter()
+                .filter(|n| n.online && n.node_type == "wolfstack")
+                .map(|n| (n.id.clone(), n.hostname.clone(), n.address.clone(), n.port, n.is_self))
+                .collect()
         }
     }
 }
@@ -1379,55 +1525,207 @@ pub async fn execute_workflow(
                 }
             }
 
-            // Execute on each target node in parallel
-            let mut step_futures = Vec::new();
-            for (node_id, node_hostname, node_address, node_port, is_self) in &targets {
-                let action = step.action.clone();
-                let step_name = step.name.clone();
-                let node_id = node_id.clone();
-                let node_hostname = node_hostname.clone();
-                let node_address = node_address.clone();
-                let node_port = *node_port;
-                let is_self = *is_self;
-                let secret = cluster_secret.to_string();
-                let client = http_client.clone();
+            // Determine if this step targets containers
+            let is_container_target = matches!(target, Target::Containers { .. });
+            let is_everything = matches!(target, Target::Everything);
 
-                step_futures.push(tokio::spawn(async move {
-                    let step_start = std::time::Instant::now();
-                    let started = Utc::now().to_rfc3339();
+            // Execute on each target node in parallel (skip for pure container targets)
+            let mut step_futures: Vec<tokio::task::JoinHandle<(StepResult, Option<StepOutput>)>> = Vec::new();
 
-                    let result = if is_self {
-                        execute_action_local(&action).await
-                    } else {
-                        execute_action_remote(&client, &node_address, node_port, &secret, &action).await
-                    };
+            if !is_container_target {
+                for (node_id, node_hostname, node_address, node_port, is_self) in &targets {
+                    let action = step.action.clone();
+                    let step_name = step.name.clone();
+                    let node_id = node_id.clone();
+                    let node_hostname = node_hostname.clone();
+                    let node_address = node_address.clone();
+                    let node_port = *node_port;
+                    let is_self = *is_self;
+                    let secret = cluster_secret.to_string();
+                    let client = http_client.clone();
 
-                    let elapsed = step_start.elapsed().as_millis() as u64;
-                    let finished = Utc::now().to_rfc3339();
+                    step_futures.push(tokio::spawn(async move {
+                        let step_start = std::time::Instant::now();
+                        let started = Utc::now().to_rfc3339();
 
-                    match result {
-                        Ok(output) => (StepResult {
-                            step_name,
-                            node_id,
-                            node_hostname,
-                            status: RunStatus::Completed,
-                            output: output.text.chars().take(5000).collect(),
-                            started_at: started,
-                            finished_at: finished,
-                            duration_ms: elapsed,
-                        }, Some(output)),
-                        Err(err) => (StepResult {
-                            step_name,
-                            node_id,
-                            node_hostname,
-                            status: RunStatus::Failed,
-                            output: err.chars().take(5000).collect(),
-                            started_at: started,
-                            finished_at: finished,
-                            duration_ms: elapsed,
-                        }, None),
+                        let result = if is_self {
+                            execute_action_local(&action).await
+                        } else {
+                            execute_action_remote(&client, &node_address, node_port, &secret, &action).await
+                        };
+
+                        let elapsed = step_start.elapsed().as_millis() as u64;
+                        let finished = Utc::now().to_rfc3339();
+
+                        match result {
+                            Ok(output) => (StepResult {
+                                step_name,
+                                node_id,
+                                node_hostname,
+                                status: RunStatus::Completed,
+                                output: output.text.chars().take(5000).collect(),
+                                started_at: started,
+                                finished_at: finished,
+                                duration_ms: elapsed,
+                            }, Some(output)),
+                            Err(err) => (StepResult {
+                                step_name,
+                                node_id,
+                                node_hostname,
+                                status: RunStatus::Failed,
+                                output: err.chars().take(5000).collect(),
+                                started_at: started,
+                                finished_at: finished,
+                                duration_ms: elapsed,
+                            }, None),
+                        }
+                    }));
+                }
+            }
+
+            // Container-targeted execution: run inside specific containers/VMs
+            if is_container_target || is_everything {
+                let container_targets = if is_container_target {
+                    // Explicit container list from the target
+                    match target {
+                        Target::Containers { targets: cts } => cts.clone(),
+                        _ => Vec::new(),
                     }
-                }));
+                } else {
+                    // Everything: we need to discover all containers on all target nodes
+                    // This is done by the remote nodes via the container-exec proxy
+                    Vec::new()
+                };
+
+                if is_container_target && !container_targets.is_empty() {
+                    // Execute inside each specific container
+                    for ct in &container_targets {
+                        let action = step.action.clone();
+                        let step_name = step.name.clone();
+                        let ct = ct.clone();
+                        let secret = cluster_secret.to_string();
+                        let client = http_client.clone();
+
+                        // Find the node for this container
+                        let node = targets.iter().find(|(id, _, _, _, _)| *id == ct.node_id).cloned();
+                        let (node_id, node_hostname, node_address, node_port, is_self) = match node {
+                            Some(n) => n,
+                            None => {
+                                // Try to find the node from cluster state
+                                let nodes = cluster.get_all_nodes();
+                                match nodes.iter().find(|n| n.id == ct.node_id && n.online) {
+                                    Some(n) => (n.id.clone(), n.hostname.clone(), n.address.clone(), n.port, n.is_self),
+                                    None => {
+                                        step_futures.push(tokio::spawn(async move {
+                                            (StepResult {
+                                                step_name,
+                                                node_id: ct.node_id.clone(),
+                                                node_hostname: format!("{}:{}", ct.runtime, ct.name),
+                                                status: RunStatus::Failed,
+                                                output: format!("Host node '{}' not found or offline", ct.node_id),
+                                                started_at: Utc::now().to_rfc3339(),
+                                                finished_at: Utc::now().to_rfc3339(),
+                                                duration_ms: 0,
+                                            }, None)
+                                        }));
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
+
+                        let display_name = format!("{}:{} on {}", ct.runtime, ct.name, node_hostname);
+
+                        step_futures.push(tokio::spawn(async move {
+                            let step_start = std::time::Instant::now();
+                            let started = Utc::now().to_rfc3339();
+
+                            let result = if is_self {
+                                execute_action_in_container(&action, &ct).await
+                            } else {
+                                // Remote: call the container-exec proxy
+                                execute_container_remote(&client, &node_address, node_port, &secret, &action, &ct).await
+                            };
+
+                            let elapsed = step_start.elapsed().as_millis() as u64;
+                            let finished = Utc::now().to_rfc3339();
+
+                            match result {
+                                Ok(output) => (StepResult {
+                                    step_name,
+                                    node_id,
+                                    node_hostname: display_name,
+                                    status: RunStatus::Completed,
+                                    output: output.text.chars().take(5000).collect(),
+                                    started_at: started,
+                                    finished_at: finished,
+                                    duration_ms: elapsed,
+                                }, Some(output)),
+                                Err(err) => (StepResult {
+                                    step_name,
+                                    node_id,
+                                    node_hostname: display_name,
+                                    status: RunStatus::Failed,
+                                    output: err.chars().take(5000).collect(),
+                                    started_at: started,
+                                    finished_at: finished,
+                                    duration_ms: elapsed,
+                                }, None),
+                            }
+                        }));
+                    }
+                } else if is_everything {
+                    // For "Everything": additionally execute inside all containers on each node
+                    // Run via remote proxy which discovers + executes in all containers
+                    for (node_id, node_hostname, node_address, node_port, is_self) in &targets {
+                        let action = step.action.clone();
+                        let step_name = step.name.clone();
+                        let node_id = node_id.clone();
+                        let node_hostname = node_hostname.clone();
+                        let node_address = node_address.clone();
+                        let node_port = *node_port;
+                        let is_self = *is_self;
+                        let secret = cluster_secret.to_string();
+                        let client = http_client.clone();
+
+                        step_futures.push(tokio::spawn(async move {
+                            let step_start = std::time::Instant::now();
+                            let started = Utc::now().to_rfc3339();
+
+                            let result = if is_self {
+                                execute_in_all_local_containers(&action).await
+                            } else {
+                                execute_all_containers_remote(&client, &node_address, node_port, &secret, &action).await
+                            };
+
+                            let elapsed = step_start.elapsed().as_millis() as u64;
+                            let finished = Utc::now().to_rfc3339();
+
+                            match result {
+                                Ok(output) => (StepResult {
+                                    step_name,
+                                    node_id,
+                                    node_hostname: format!("{} (containers)", node_hostname),
+                                    status: RunStatus::Completed,
+                                    output: output.text.chars().take(5000).collect(),
+                                    started_at: started,
+                                    finished_at: finished,
+                                    duration_ms: elapsed,
+                                }, Some(output)),
+                                Err(err) => (StepResult {
+                                    step_name,
+                                    node_id,
+                                    node_hostname: format!("{} (containers)", node_hostname),
+                                    status: RunStatus::Failed,
+                                    output: err.chars().take(5000).collect(),
+                                    started_at: started,
+                                    finished_at: finished,
+                                    duration_ms: elapsed,
+                                }, None),
+                            }
+                        }));
+                    }
+                }
             }
 
             // Collect results
@@ -1569,6 +1867,139 @@ pub async fn execute_workflow(
 }
 
 /// Execute an action on a remote node via the WolfFlow exec API endpoint.
+/// Execute an action inside all Docker/LXC containers and VMs on the local node.
+/// Returns a combined output summary.
+pub async fn execute_in_all_local_containers(action: &ActionType) -> Result<StepOutput, String> {
+    let mut outputs = Vec::new();
+
+    // Docker containers
+    let docker_containers = crate::containers::docker_list_all();
+    for c in &docker_containers {
+        let name = &c.name;
+        let ct = ContainerTarget { node_id: String::new(), runtime: "docker".to_string(), name: name.clone() };
+        match execute_action_in_container(action, &ct).await {
+            Ok(o) => outputs.push(format!("[docker:{}] {}", name, o.text)),
+            Err(e) => outputs.push(format!("[docker:{}] ERROR: {}", name, e)),
+        }
+    }
+
+    // LXC containers
+    let lxc_containers = crate::containers::lxc_list_all();
+    for c in &lxc_containers {
+        let name = &c.name;
+        let ct = ContainerTarget { node_id: String::new(), runtime: "lxc".to_string(), name: name.clone() };
+        match execute_action_in_container(action, &ct).await {
+            Ok(o) => outputs.push(format!("[lxc:{}] {}", name, o.text)),
+            Err(e) => outputs.push(format!("[lxc:{}] ERROR: {}", name, e)),
+        }
+    }
+
+    // VMs
+    let vms = crate::vms::manager::VmManager::new().list_vms();
+    for v in &vms {
+        if !v.running { continue; } // Only running VMs
+        let ct = ContainerTarget { node_id: String::new(), runtime: "vm".to_string(), name: v.name.clone() };
+        match execute_action_in_container(action, &ct).await {
+            Ok(o) => outputs.push(format!("[vm:{}] {}", v.name, o.text)),
+            Err(e) => outputs.push(format!("[vm:{}] ERROR: {}", v.name, e)),
+        }
+    }
+
+    if outputs.is_empty() {
+        Ok(plain_output("No containers or VMs found on this node".to_string()))
+    } else {
+        Ok(plain_output(outputs.join("\n")))
+    }
+}
+
+/// Execute an action inside a specific container on a remote node
+async fn execute_container_remote(
+    client: &Option<reqwest::Client>,
+    address: &str,
+    port: u16,
+    secret: &str,
+    action: &ActionType,
+    ct: &ContainerTarget,
+) -> Result<StepOutput, String> {
+    let client = client.as_ref().ok_or_else(|| "HTTP client not available".to_string())?;
+    let urls = crate::api::build_node_urls(address, port, "/api/wolfflow/container-exec");
+
+    let body = serde_json::json!({
+        "action": serde_json::to_value(action).map_err(|e| e.to_string())?,
+        "container": {
+            "node_id": ct.node_id,
+            "runtime": ct.runtime,
+            "name": ct.name,
+        }
+    });
+
+    for url in &urls {
+        match client.post(url)
+            .header("X-WolfStack-Secret", secret)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                let result = resp.json::<serde_json::Value>().await
+                    .map_err(|e| format!("Parse error: {}", e))?;
+                if let Some(error) = result.get("error").and_then(|e| e.as_str()) {
+                    return Err(error.to_string());
+                }
+                let text = result.get("output").and_then(|o| o.as_str()).unwrap_or("OK").to_string();
+                return Ok(StepOutput { text, data: Default::default() });
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body_text = resp.text().await.unwrap_or_default();
+                return Err(format!("Remote {} returned {}: {}", url, status, body_text));
+            }
+            Err(_) => continue,
+        }
+    }
+    Err(format!("Failed to reach node {}:{}", address, port))
+}
+
+/// Execute an action inside all containers on a remote node
+async fn execute_all_containers_remote(
+    client: &Option<reqwest::Client>,
+    address: &str,
+    port: u16,
+    secret: &str,
+    action: &ActionType,
+) -> Result<StepOutput, String> {
+    let client = client.as_ref().ok_or_else(|| "HTTP client not available".to_string())?;
+    let urls = crate::api::build_node_urls(address, port, "/api/wolfflow/all-containers-exec");
+
+    let body = serde_json::to_value(action).map_err(|e| e.to_string())?;
+
+    for url in &urls {
+        match client.post(url)
+            .header("X-WolfStack-Secret", secret)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                let result = resp.json::<serde_json::Value>().await
+                    .map_err(|e| format!("Parse error: {}", e))?;
+                if let Some(error) = result.get("error").and_then(|e| e.as_str()) {
+                    return Err(error.to_string());
+                }
+                let text = result.get("output").and_then(|o| o.as_str()).unwrap_or("OK").to_string();
+                return Ok(StepOutput { text, data: Default::default() });
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body_text = resp.text().await.unwrap_or_default();
+                return Err(format!("Remote {} returned {}: {}", url, status, body_text));
+            }
+            Err(_) => continue,
+        }
+    }
+    Err(format!("Failed to reach node {}:{}", address, port))
+}
+
 async fn execute_action_remote(
     client: &Option<reqwest::Client>,
     address: &str,

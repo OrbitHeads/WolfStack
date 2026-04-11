@@ -9547,6 +9547,42 @@ pub async fn wolfflow_exec(req: HttpRequest, state: web::Data<AppState>, body: w
     }
 }
 
+/// POST /api/wolfflow/container-exec — execute an action inside a specific container (cluster proxy)
+pub async fn wolfflow_container_exec(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let data = body.into_inner();
+    let action_val = data.get("action").cloned().unwrap_or(serde_json::Value::Null);
+    let ct_val = data.get("container").cloned().unwrap_or(serde_json::Value::Null);
+
+    let action: crate::wolfflow::ActionType = match serde_json::from_value(action_val) {
+        Ok(a) => a,
+        Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": format!("Invalid action: {}", e) })),
+    };
+    let ct: crate::wolfflow::ContainerTarget = match serde_json::from_value(ct_val) {
+        Ok(c) => c,
+        Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": format!("Invalid container target: {}", e) })),
+    };
+
+    match crate::wolfflow::execute_action_in_container(&action, &ct).await {
+        Ok(output) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "output": output.text })),
+        Err(err) => HttpResponse::Ok().json(serde_json::json!({ "ok": false, "error": err })),
+    }
+}
+
+/// POST /api/wolfflow/all-containers-exec — execute an action inside all containers on this node (cluster proxy)
+pub async fn wolfflow_all_containers_exec(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match serde_json::from_value::<crate::wolfflow::ActionType>(body.into_inner()) {
+        Ok(action) => {
+            match crate::wolfflow::execute_in_all_local_containers(&action).await {
+                Ok(output) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "output": output.text })),
+                Err(err) => HttpResponse::Ok().json(serde_json::json!({ "ok": false, "error": err })),
+            }
+        }
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": format!("Invalid action: {}", e) })),
+    }
+}
+
 // ─── MySQL Database Editor API ───
 
 /// GET /api/mysql/detect — check if MySQL is installed on this node
@@ -15939,6 +15975,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/wolfflow/runs/{id}", web::get().to(wolfflow_run_detail))
         .route("/api/wolfflow/toolbox", web::get().to(wolfflow_toolbox))
         .route("/api/wolfflow/exec", web::post().to(wolfflow_exec))
+        .route("/api/wolfflow/container-exec", web::post().to(wolfflow_container_exec))
+        .route("/api/wolfflow/all-containers-exec", web::post().to(wolfflow_all_containers_exec))
         .route("/api/wolfflow/infrastructure", web::get().to(wolfflow_infrastructure))
         // VR Terminal
         .route("/api/vr-terminal/create", web::post().to(crate::vr_terminal::vr_term_create))
