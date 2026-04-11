@@ -369,8 +369,8 @@ fn parse_lsusb(config: &WolfUsbConfig) -> Vec<UsbDevice> {
         // Skip root hubs and virtual USB devices (Linux Foundation = 1d6b)
         if vid == "1d6b" { continue; }
 
-        // Use bus-device as unique ID (e.g. "1-2" for bus 1 device 2)
-        let busid = format!("{}-{}", bus, addr);
+        // Use wolfusb-bus-device as unique ID (e.g. "wolfusb-1-2" for bus 1 device 2)
+        let busid = format!("wolfusb-{}-{}", bus, addr);
 
         // Match assignment by BOTH busid AND usb_id (must match both to avoid cross-matching)
         let usb_id = format!("{}:{}", vid, pid);
@@ -391,17 +391,29 @@ fn parse_lsusb(config: &WolfUsbConfig) -> Vec<UsbDevice> {
 
 // ─── usbip Export/Import (the actual sharing) ───
 
+/// Strip the "wolfusb-" prefix to get the real kernel busid for usbip commands
+fn real_busid(busid: &str) -> String {
+    busid.strip_prefix("wolfusb-").unwrap_or(busid).to_string()
+}
+
+/// Validate a real kernel busid format (digits, hyphens, dots only)
+fn validate_busid(busid: &str) -> Result<(), String> {
+    let real = real_busid(busid);
+    if real.is_empty() || !real.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '.') {
+        Err("Invalid bus ID format".to_string())
+    } else {
+        Ok(())
+    }
+}
+
 /// Export (bind) a USB device on this node so remote nodes can attach to it
 pub fn export_device(busid: &str) -> Result<String, String> {
     let _ = ensure_usbip_modules();
-
-    // Validate busid format (e.g. "1-2", "2-1.3")
-    if !busid.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '.') {
-        return Err("Invalid bus ID format".to_string());
-    }
+    validate_busid(busid)?;
+    let real = real_busid(busid);
 
     // Bind the device for sharing
-    let output = Command::new("usbip").args(["bind", "--busid", busid]).output()
+    let output = Command::new("usbip").args(["bind", "--busid", &real]).output()
         .map_err(|e| format!("Failed to run usbip bind: {}", e))?;
 
     if output.status.success() {
@@ -409,9 +421,8 @@ pub fn export_device(busid: &str) -> Result<String, String> {
         Ok(format!("Device {} exported for sharing", busid))
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // "already bound" is not an error
         if stderr.contains("already bound") {
-            Ok(format!("Device {} already exported", busid))
+            Ok(format!("Device {} already exported", real))
         } else {
             Err(format!("Failed to export device {}: {}", busid, stderr))
         }
@@ -420,11 +431,10 @@ pub fn export_device(busid: &str) -> Result<String, String> {
 
 /// Unexport (unbind) a USB device on this node
 pub fn unexport_device(busid: &str) -> Result<String, String> {
-    if !busid.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '.') {
-        return Err("Invalid bus ID format".to_string());
-    }
+    validate_busid(busid)?;
+    let real = real_busid(busid);
 
-    let output = Command::new("usbip").args(["unbind", "--busid", busid]).output()
+    let output = Command::new("usbip").args(["unbind", "--busid", &real]).output()
         .map_err(|e| format!("Failed to run usbip unbind: {}", e))?;
 
     if output.status.success() {
@@ -439,16 +449,14 @@ pub fn unexport_device(busid: &str) -> Result<String, String> {
 /// Attach a remote USB device to this node (creates a virtual USB device locally)
 pub fn attach_remote_device(remote_host: &str, busid: &str) -> Result<String, String> {
     let _ = ensure_usbip_modules();
+    validate_busid(busid)?;
+    let real = real_busid(busid);
 
-    if !busid.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '.') {
-        return Err("Invalid bus ID format".to_string());
-    }
-    // Validate host (alphanumeric, dots, colons for IPv6, hyphens)
     if !remote_host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == ':' || c == '-') {
         return Err("Invalid remote host".to_string());
     }
 
-    let output = Command::new("usbip").args(["attach", "--remote", remote_host, "--busid", busid]).output()
+    let output = Command::new("usbip").args(["attach", "--remote", remote_host, "--busid", &real]).output()
         .map_err(|e| format!("Failed to run usbip attach: {}", e))?;
 
     if output.status.success() {
@@ -606,10 +614,11 @@ pub fn unassign_device(config: &mut WolfUsbConfig, busid: &str, source_node_id: 
 
 /// Find the /dev/bus/usb path for a given busid
 fn find_dev_path(busid: &str) -> Option<String> {
+    let real = real_busid(busid);
     // Parse bus number from busid (e.g. "1-2" -> bus 1)
-    let bus: u32 = busid.split('-').next()?.parse().ok()?;
+    let bus: u32 = real.split('-').next()?.parse().ok()?;
     // Find the device address using sysfs
-    let sysfs_path = format!("/sys/bus/usb/devices/{}/devnum", busid);
+    let sysfs_path = format!("/sys/bus/usb/devices/{}/devnum", real);
     let addr: u32 = std::fs::read_to_string(&sysfs_path).ok()?.trim().parse().ok()?;
     Some(format!("/dev/bus/usb/{:03}/{:03}", bus, addr))
 }
