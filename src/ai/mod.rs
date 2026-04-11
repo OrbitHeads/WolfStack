@@ -1397,7 +1397,7 @@ fn build_system_prompt(knowledge: &str, server_context: &str) -> String {
          ## Containers, VMs & Docker\n\
          - The server state below includes Docker container names, LXC container names, and VM names for the local node\n\
          - For remote nodes, you can discover containers/VMs by using [EXEC_ALL] with commands like:\n\
-           `docker ps --format '{{.Names}} {{.Status}}'` for Docker containers\n\
+           `docker ps --format '{{{{.Names}}}} {{{{.Status}}}}'` for Docker containers\n\
            `lxc-ls -f` for LXC containers\n\
          - When the user asks about a specific container by name, identify which node it's on and target that node\n\
          - When proposing actions for containers, be specific about which container and which node\n\n\

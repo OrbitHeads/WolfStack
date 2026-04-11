@@ -5000,29 +5000,27 @@ pub async fn ai_chat(
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
 
-        let docker_count = crate::containers::docker_list_all().len();
-        let lxc_count = crate::containers::lxc_list_all().len();
-        let vm_count = state.vms.lock().unwrap().list_vms().len();
+        // Get local container/VM lists once (reuse for counts and names)
+        let local_docker_list = crate::containers::docker_list_all();
+        let local_lxc_list = crate::containers::lxc_list_all();
+        let local_vm_list = state.vms.lock().unwrap().list_vms();
+        let docker_count = local_docker_list.len();
+        let lxc_count = local_lxc_list.len();
+        let vm_count = local_vm_list.len();
         let components = crate::installer::get_all_status();
+
+        let local_docker: Vec<String> = local_docker_list.iter().map(|c| format!("{} [{}]", c.name, c.state)).collect();
+        let local_lxc: Vec<String> = local_lxc_list.iter().map(|c| format!("{} [{}]", c.name, c.state)).collect();
+        let local_vms: Vec<String> = local_vm_list.iter().map(|v| format!("{} [{}]", v.name, if v.running { "running" } else { "stopped" })).collect();
 
         let nodes = state.cluster.get_all_nodes();
 
-        // WolfStack nodes summary
-        let ws_nodes: Vec<&crate::agent::Node> = nodes.iter().filter(|n| n.node_type != "proxmox").collect();
+        // All nodes (including Proxmox nodes that have WolfStack agents)
+        let all_online: Vec<&crate::agent::Node> = nodes.iter().filter(|n| n.online).collect();
+        // PVE nodes for separate cluster grouping display
         let pve_nodes: Vec<&crate::agent::Node> = nodes.iter().filter(|n| n.node_type == "proxmox").collect();
 
-        // For the local node, get actual container/VM names
-        let local_docker: Vec<String> = crate::containers::docker_list_all().iter().map(|c| {
-            format!("{} [{}]", c.name, c.state)
-        }).collect();
-        let local_lxc: Vec<String> = crate::containers::lxc_list_all().iter().map(|c| {
-            format!("{} [{}]", c.name, c.state)
-        }).collect();
-        let local_vms: Vec<String> = state.vms.lock().unwrap().list_vms().iter().map(|v| {
-            format!("{} [{}]", v.name, if v.running { "running" } else { "stopped" })
-        }).collect();
-
-        let node_info = ws_nodes.iter().map(|n| {
+        let node_info = all_online.iter().map(|n| {
             let mut line = format!("  - {} ({}) [{}]", n.hostname, n.address,
                 if n.online { "online" } else { "offline" });
             if n.docker_count > 0 { line.push_str(&format!(" — {} Docker", n.docker_count)); }
@@ -5105,31 +5103,21 @@ pub async fn ai_chat(
                     ctx.push_str(&format!(", Context: {}", name));
                 }
             }
-            // Enumerate containers/VMs on the viewed node so the AI knows what's there
-            // For self node: use local data. For remote: the frontend sends its own infra cache.
+            // Enumerate containers/VMs on the viewed node (reuse already-fetched local data)
             if body.node_id.as_ref().map(|s| !s.is_empty()).unwrap_or(false) {
                 let is_self_node = nodes.iter().any(|n| n.is_self && Some(&n.id) == body.node_id.as_ref());
                 if is_self_node {
-                    let docker = crate::containers::docker_list_all();
-                    if !docker.is_empty() {
+                    if !local_docker.is_empty() {
                         ctx.push_str("\n\nDocker containers on this node:");
-                        for c in &docker {
-                            ctx.push_str(&format!("\n  - {} [{}]", c.name, c.state));
-                        }
+                        for name in &local_docker { ctx.push_str(&format!("\n  - {}", name)); }
                     }
-                    let lxc = crate::containers::lxc_list_all();
-                    if !lxc.is_empty() {
+                    if !local_lxc.is_empty() {
                         ctx.push_str("\n\nLXC containers on this node:");
-                        for c in &lxc {
-                            ctx.push_str(&format!("\n  - {} [{}]", c.name, c.state));
-                        }
+                        for name in &local_lxc { ctx.push_str(&format!("\n  - {}", name)); }
                     }
-                    let vms = state.vms.lock().unwrap().list_vms();
-                    if !vms.is_empty() {
+                    if !local_vms.is_empty() {
                         ctx.push_str("\n\nVMs on this node:");
-                        for v in &vms {
-                            ctx.push_str(&format!("\n  - {} [{}]", v.name, if v.running { "running" } else { "stopped" }));
-                        }
+                        for name in &local_vms { ctx.push_str(&format!("\n  - {}", name)); }
                     }
                 } else {
                     ctx.push_str("\n\n(Container/VM list for remote nodes is provided by the frontend target picker)");
@@ -5144,10 +5132,10 @@ pub async fn ai_chat(
 
         format!(
             "Hostname: {}\nLocal Docker containers: {}\nLocal LXC containers: {}\nLocal VMs: {}\n\
-             Components: {}\n\nWolfStack Nodes ({}):\n{}\n\nProxmox Clusters:\n{}{}",
+             Components: {}\n\nAll Nodes ({}):\n{}\n\nProxmox Clusters:\n{}{}",
             hostname, docker_count, lxc_count, vm_count,
             components.iter().map(|c| format!("{:?}: {}", c.component, if c.running { "running" } else { "stopped" })).collect::<Vec<_>>().join(", "),
-            ws_nodes.len(), node_info,
+            all_online.len(), node_info,
             pve_info,
             user_context,
         )
