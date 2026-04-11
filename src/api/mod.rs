@@ -9696,6 +9696,99 @@ pub async fn wolfflow_all_containers_exec(req: HttpRequest, state: web::Data<App
     }
 }
 
+// ─── User Preferences API ───
+
+fn user_prefs_path(username: &str) -> String {
+    // Sanitize username for safe filesystem path
+    let safe: String = username.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .collect();
+    format!("{}/user-prefs/{}.json", crate::paths::get().config_dir, safe)
+}
+
+/// GET /api/user/preferences — load the current user's preferences
+pub async fn user_prefs_get(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    let username = match require_auth(&req, &state) {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+
+    let path = user_prefs_path(&username);
+    match std::fs::read_to_string(&path) {
+        Ok(data) => {
+            match serde_json::from_str::<serde_json::Value>(&data) {
+                Ok(prefs) => HttpResponse::Ok().json(prefs),
+                Err(_) => HttpResponse::Ok().json(serde_json::json!({})),
+            }
+        }
+        Err(_) => HttpResponse::Ok().json(serde_json::json!({})),
+    }
+}
+
+/// POST /api/user/preferences — save the current user's preferences (full replace)
+pub async fn user_prefs_save(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    let username = match require_auth(&req, &state) {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+
+    let path = user_prefs_path(&username);
+    let dir = std::path::Path::new(&path).parent().unwrap();
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Failed to create dir: {}", e) }));
+    }
+
+    // Limit size to prevent abuse (64 KB should be plenty for preferences)
+    let json = serde_json::to_string_pretty(&body.into_inner()).unwrap_or_default();
+    if json.len() > 65536 {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Preferences too large (max 64 KB)" }));
+    }
+
+    match std::fs::write(&path, &json) {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Failed to save: {}", e) })),
+    }
+}
+
+/// PATCH /api/user/preferences — merge specific keys into existing preferences
+pub async fn user_prefs_patch(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    let username = match require_auth(&req, &state) {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+
+    let path = user_prefs_path(&username);
+    let dir = std::path::Path::new(&path).parent().unwrap();
+    let _ = std::fs::create_dir_all(dir);
+
+    // Load existing
+    let mut prefs: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|d| serde_json::from_str(&d).ok())
+        .unwrap_or_default();
+
+    // Merge incoming keys
+    if let Some(obj) = body.as_object() {
+        for (k, v) in obj {
+            if v.is_null() {
+                prefs.remove(k);
+            } else {
+                prefs.insert(k.clone(), v.clone());
+            }
+        }
+    }
+
+    let json = serde_json::to_string_pretty(&prefs).unwrap_or_default();
+    if json.len() > 65536 {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Preferences too large" }));
+    }
+
+    match std::fs::write(&path, &json) {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Failed to save: {}", e) })),
+    }
+}
+
 // ─── WolfUSB API ───
 
 /// GET /api/wolfusb/status — installation status, service status, config
@@ -16202,6 +16295,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/wolfflow/container-exec", web::post().to(wolfflow_container_exec))
         .route("/api/wolfflow/all-containers-exec", web::post().to(wolfflow_all_containers_exec))
         .route("/api/wolfflow/infrastructure", web::get().to(wolfflow_infrastructure))
+        // User Preferences
+        .route("/api/user/preferences", web::get().to(user_prefs_get))
+        .route("/api/user/preferences", web::post().to(user_prefs_save))
+        .route("/api/user/preferences", web::patch().to(user_prefs_patch))
         // WolfUSB — USB over IP
         .route("/api/wolfusb/status", web::get().to(wolfusb_status))
         .route("/api/wolfusb/install", web::post().to(wolfusb_install))

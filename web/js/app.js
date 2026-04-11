@@ -4,6 +4,88 @@
 
 // WolfStack Dashboard — app.js
 
+// ─── User Preferences (synced to server) ───
+
+// Keys that should be persisted server-side per user
+const _syncedPrefKeys = [
+    'wolfstack-theme', 'wolfstack-icon-theme', 'wolfstack-mono-icons', 'wolfstack-mono-preset',
+    'wolfstack_sidebar_collapsed', 'wolfstack_map_collapsed',
+    'wolfstack_dc_layout', 'wolfstack_dc_compact', 'wolfstack_dc_bg_image',
+    'wolfstack_dc_bg_brightness', 'wolfstack_dc_bg_blur',
+    'wolfstack_bookmarks', 'wolfstack_view_docker', 'wolfstack_view_lxc', 'wolfstack_view_vm',
+];
+let _prefsLoaded = false;
+
+// Load user preferences from server and apply to localStorage.
+// If the server has no saved prefs yet, upload current localStorage values
+// so existing users don't lose their bookmarks or theme on first sync.
+async function loadUserPreferences() {
+    try {
+        var resp = await fetch('/api/user/preferences');
+        if (!resp.ok) return;
+        var prefs = await resp.json();
+        if (!prefs || typeof prefs !== 'object') return;
+
+        var serverHasData = Object.keys(prefs).length > 0;
+
+        if (serverHasData) {
+            // Server has prefs — apply to localStorage
+            for (var key of _syncedPrefKeys) {
+                if (prefs[key] !== undefined && prefs[key] !== null) {
+                    localStorage.setItem(key, typeof prefs[key] === 'string' ? prefs[key] : JSON.stringify(prefs[key]));
+                }
+            }
+        } else {
+            // Server has nothing — upload current localStorage so existing users keep their settings
+            var upload = {};
+            var hasAnything = false;
+            for (var key of _syncedPrefKeys) {
+                var val = localStorage.getItem(key);
+                if (val !== null) {
+                    upload[key] = val;
+                    hasAnything = true;
+                }
+            }
+            if (hasAnything) {
+                fetch('/api/user/preferences', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(upload),
+                }).catch(function() {});
+            }
+        }
+        _prefsLoaded = true;
+    } catch (e) { /* silent — localStorage fallback works */ }
+}
+
+// Save a single preference to both localStorage and server
+function savePref(key, value) {
+    localStorage.setItem(key, value);
+    if (_syncedPrefKeys.includes(key)) {
+        var patch = {};
+        patch[key] = value;
+        fetch('/api/user/preferences', {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(patch),
+        }).catch(function() {});
+    }
+}
+
+// Remove a preference from both localStorage and server
+function removePref(key) {
+    localStorage.removeItem(key);
+    if (_syncedPrefKeys.includes(key)) {
+        var patch = {};
+        patch[key] = null;
+        fetch('/api/user/preferences', {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(patch),
+        }).catch(function() {});
+    }
+}
+
 // ─── State ───
 let currentPage = 'datacenter';
 let currentComponent = null;
@@ -33,7 +115,7 @@ function toggleSidebar() {
         // Desktop: toggle collapsed sidebar
         document.body.classList.toggle('sidebar-collapsed');
         const collapsed = document.body.classList.contains('sidebar-collapsed');
-        localStorage.setItem('wolfstack_sidebar_collapsed', collapsed ? '1' : '0');
+        savePref('wolfstack_sidebar_collapsed', collapsed ? '1' : '0');
     }
     // Invalidate map size + 3D topology after sidebar transition
     setTimeout(() => {
@@ -67,7 +149,7 @@ let mapCollapsed = localStorage.getItem('wolfstack_map_collapsed') === '1'; // d
 
 function toggleMapCollapse() {
     mapCollapsed = !mapCollapsed;
-    localStorage.setItem('wolfstack_map_collapsed', mapCollapsed ? '1' : '0');
+    savePref('wolfstack_map_collapsed', mapCollapsed ? '1' : '0');
     applyMapCollapse();
 }
 
@@ -530,7 +612,7 @@ function loadBookmarks() {
     catch { return []; }
 }
 function saveBookmarks(bookmarks) {
-    localStorage.setItem('wolfstack_bookmarks', JSON.stringify(bookmarks));
+    savePref('wolfstack_bookmarks', JSON.stringify(bookmarks));
 }
 function renderBookmarks() {
     const el = document.getElementById('bookmarks-list');
@@ -705,7 +787,7 @@ function toggleBgSettingsPanel() {
 
 function setDcLayout(layout) {
     dcLayout = layout;
-    localStorage.setItem('wolfstack_dc_layout', layout);
+    savePref('wolfstack_dc_layout', layout);
     const icon = document.getElementById('dc-layout-icon');
     const label = document.getElementById('dc-layout-label');
     if (icon) icon.textContent = layout === 'grid' ? '⊞' : '▥';
@@ -718,7 +800,7 @@ function setDcLayout(layout) {
 
 function toggleDcCompact(checked) {
     dcCompact = checked;
-    localStorage.setItem('wolfstack_dc_compact', checked ? '1' : '0');
+    savePref('wolfstack_dc_compact', checked ? '1' : '0');
     renderDatacenterOverview();
 }
 
@@ -732,7 +814,7 @@ function handleBgUpload(input) {
     const reader = new FileReader();
     reader.onload = (e) => {
         dcBgImage = e.target.result;
-        localStorage.setItem('wolfstack_dc_bg_image', dcBgImage);
+        savePref('wolfstack_dc_bg_image', dcBgImage);
         applyDcBackground();
     };
     reader.readAsDataURL(file);
@@ -740,13 +822,13 @@ function handleBgUpload(input) {
 
 function clearBgImage() {
     dcBgImage = '';
-    localStorage.removeItem('wolfstack_dc_bg_image');
+    removePref('wolfstack_dc_bg_image');
     applyDcBackground();
 }
 
 function updateBgBrightness(val) {
     dcBgBrightness = parseInt(val, 10);
-    localStorage.setItem('wolfstack_dc_bg_brightness', val);
+    savePref('wolfstack_dc_bg_brightness', val);
     const el = document.getElementById('dc-bg-bright-val');
     if (el) el.textContent = val + '%';
     applyDcBackground();
@@ -754,7 +836,7 @@ function updateBgBrightness(val) {
 
 function updateBgBlur(val) {
     dcBgBlur = parseInt(val, 10);
-    localStorage.setItem('wolfstack_dc_bg_blur', val);
+    savePref('wolfstack_dc_bg_blur', val);
     const el = document.getElementById('dc-bg-blur-val');
     if (el) el.textContent = val + 'px';
     applyDcBackground();
@@ -9836,6 +9918,7 @@ function tomlToggleRaw(component, displayName) {
 const POLL_FAST = isMobileView() ? 30000 : 15000;
 const POLL_SLOW = isMobileView() ? 120000 : 60000;
 let _currentPollSpeed = 'fast';
+loadUserPreferences(); // Load user preferences from server (async, non-blocking)
 fetchNodes();
 fetchMetricsHistory(); // Initial history load
 loadTaskLog(); // Restore task log from localStorage
@@ -11481,7 +11564,7 @@ function getContainerView(type) {
 }
 
 function setContainerView(type, view) {
-    localStorage.setItem(`wolfstack_view_${type}`, view);
+    savePref(`wolfstack_view_${type}`, view);
     applyContainerView(type);
     // Re-render the current data
     if (type === 'docker') loadDockerContainers();
@@ -22270,7 +22353,7 @@ function applyTheme(themeId) {
     }
 
     // Save preference
-    localStorage.setItem('wolfstack-theme', themeId);
+    savePref('wolfstack-theme', themeId);
 
     // Swap logo for light/dark backgrounds
     const lightThemes = ['light', 'arctic'];
@@ -22321,7 +22404,7 @@ function applyIconTheme(themeName) {
     document.body.appendChild(modal);
     modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
     document.getElementById('icon-theme-confirm-btn').onclick = function() {
-        localStorage.setItem('wolfstack-icon-theme', themeName);
+        savePref('wolfstack-icon-theme', themeName);
         location.reload();
     };
 }
@@ -22331,7 +22414,7 @@ async function initIconTheme() {
     // Migrate old "candy" key to "candy_emoji"
     if (currentIconTheme === 'candy') {
         currentIconTheme = 'candy_emoji';
-        localStorage.setItem('wolfstack-icon-theme', 'candy_emoji');
+        savePref('wolfstack-icon-theme', 'candy_emoji');
     }
     // Update icon theme selector UI
     document.querySelectorAll('.icon-theme-card').forEach(card => {
@@ -22532,12 +22615,12 @@ const MONO_PRESETS = [
 function toggleMonoIcons(enabled) {
     if (enabled) {
         document.documentElement.setAttribute('data-mono-icons', '');
-        localStorage.setItem('wolfstack-mono-icons', '1');
+        savePref('wolfstack-mono-icons', '1');
         const saved = localStorage.getItem('wolfstack-mono-preset') || 'Gray';
         applyMonoPreset(saved);
     } else {
         document.documentElement.removeAttribute('data-mono-icons');
-        localStorage.removeItem('wolfstack-mono-icons');
+        removePref('wolfstack-mono-icons');
     }
     const opts = document.getElementById('mono-icons-options');
     if (opts) opts.style.display = enabled ? '' : 'none';
@@ -22550,7 +22633,7 @@ function applyMonoPreset(name) {
     root.style.setProperty('--mono-hue', preset.hue + 'deg');
     root.style.setProperty('--mono-sat', preset.sat);
     root.style.setProperty('--mono-brightness', preset.brightness);
-    localStorage.setItem('wolfstack-mono-preset', preset.name);
+    savePref('wolfstack-mono-preset', preset.name);
     // Update active state on preset buttons
     document.querySelectorAll('.mono-preset-btn').forEach(btn => {
         btn.style.outline = btn.dataset.preset === preset.name ? '2px solid var(--accent)' : 'none';
