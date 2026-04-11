@@ -5133,13 +5133,12 @@ pub async fn ai_chat(
     };
 
     // Build cluster node list for remote command execution
+    // Include ALL online nodes (including Proxmox nodes that have WolfStack agents)
     let cluster_nodes: Vec<(String, String, String, String)> = {
         let nodes = state.cluster.get_all_nodes();
         nodes.iter()
-            .filter(|n| !n.is_self && n.online && n.node_type != "proxmox")
+            .filter(|n| !n.is_self && n.online)
             .map(|n| {
-                // When TLS is enabled, main port serves HTTPS; inter-node HTTP is on port+1.
-                // Try port+1 first (works for HTTPS nodes), fall back to original port (HTTP-only).
                 let url1 = format!("http://{}:{}", n.address, n.port + 1);
                 let url2 = format!("http://{}:{}", n.address, n.port);
                 (n.id.clone(), n.hostname.clone(), url1, url2)

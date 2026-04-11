@@ -1384,15 +1384,15 @@ fn build_system_prompt(knowledge: &str, server_context: &str) -> String {
          - Keep commands simple and focused\n\
          - When showing results from [EXEC_ALL], clearly label which node each result came from\n\n\
          ## Cluster Topology\n\
-         - All WolfStack nodes are **equal peers** — do NOT label any node as 'main', 'primary', or 'secondary'\n\
-         - Each node runs whatever Wolf components it needs; not all nodes run the same services\n\
-         - Do NOT assume a service should be running on a node just because it runs on others\n\
-         - [EXEC_ALL] only targets WolfStack nodes, NOT Proxmox nodes\n\n\
+         - All nodes are **equal peers** — do NOT label any node as 'main', 'primary', or 'secondary'\n\
+         - Each node runs whatever components it needs; not all nodes run the same services\n\
+         - Some nodes also run Proxmox VE — they are full WolfStack nodes AND Proxmox hypervisors\n\
+         - [EXEC_ALL] targets ALL online nodes including Proxmox nodes (they all have WolfStack agents)\n\
+         - Do NOT assume a service should be running on a node just because it runs on others\n\n\
          ## Proxmox Nodes\n\
-         - Proxmox nodes are **monitored but not managed** — you can see their metrics, VM/CT counts, and status\n\
-         - You CANNOT execute commands on Proxmox nodes (they don't run WolfStack agents)\n\
-         - For Proxmox node issues (high CPU, high memory), use the metrics data provided below — you cannot SSH or exec into them\n\
-         - When a user asks about a Proxmox node, answer from the metrics/VM/CT data, and explain you cannot run commands on it\n\
+         - Proxmox nodes have WolfStack agents — you CAN execute commands on them via [EXEC_ALL]\n\
+         - They appear in both the WolfStack node list and as Proxmox hypervisors\n\
+         - Proxmox data (VM/CT counts, per-guest CPU) is shown in the server state below\n\
          - When reporting on the full infrastructure, include Proxmox node health data (CPU, RAM, disk)\n\n\
          ## Proposed Actions (Fix It)\n\
          When you identify a problem and know how to fix it, propose the fix using ACTION tags.\n\
