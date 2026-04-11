@@ -329,6 +329,17 @@ async fn main() -> std::io::Result<()> {
             integrations: Arc::new(crate::integrations::IntegrationState::new(&cluster_secret)),
         });
 
+        // WolfUSB: restore USB device assignments on startup
+        {
+            let nid = node_id.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tokio::task::spawn_blocking(move || {
+                    wolfusb::restore_assignments(&nid);
+                }).await.ok();
+            });
+        }
+
         // Background: periodic self-monitoring update
         let state_clone = app_state.clone();
         let cluster_clone = cluster.clone();

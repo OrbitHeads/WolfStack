@@ -94,6 +94,14 @@ pub struct Node {
 
 fn default_node_type() -> String { "wolfstack".to_string() }
 
+/// Read this node's ID from the persisted file (cheap, no state needed)
+pub fn self_node_id() -> String {
+    std::fs::read_to_string(&crate::paths::get().node_id_file)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
 /// Cluster state
 pub struct ClusterState {
     pub nodes: RwLock<HashMap<String, Node>>,

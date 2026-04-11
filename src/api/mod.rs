@@ -9840,14 +9840,47 @@ pub async fn wolfusb_get_config(req: HttpRequest, state: web::Data<AppState>) ->
     HttpResponse::Ok().json(&config)
 }
 
-/// POST /api/wolfusb/config — save config
+/// POST /api/wolfusb/config — save config and sync to cluster
 pub async fn wolfusb_save_config(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let mut config = crate::wolfusb::WolfUsbConfig::load();
     if let Some(v) = body.get("enabled").and_then(|v| v.as_bool()) { config.enabled = v; }
     match config.save() {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Ok(_) => {
+            wolfusb_broadcast_sync(&state);
+            HttpResponse::Ok().json(serde_json::json!({ "ok": true }))
+        }
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// Broadcast WolfUSB assignments to all cluster nodes
+fn wolfusb_broadcast_sync(state: &web::Data<AppState>) {
+    let config = crate::wolfusb::WolfUsbConfig::load();
+    let cluster_secret = state.cluster_secret.clone();
+    let nodes = state.cluster.get_all_nodes();
+    let client = reqwest::Client::new();
+    let payload = serde_json::json!({ "assignments": config.assignments });
+
+    for node in nodes.iter().filter(|n| !n.is_self && n.online) {
+        let urls = crate::api::build_node_urls(&node.address, node.port, "/api/wolfusb/sync");
+        let secret = cluster_secret.clone();
+        let body = payload.clone();
+        let c = client.clone();
+        tokio::spawn(async move {
+            for url in &urls {
+                if c.post(url)
+                    .header("X-WolfStack-Secret", &secret)
+                    .json(&body)
+                    .timeout(std::time::Duration::from_secs(5))
+                    .send()
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+        });
     }
 }
 
@@ -9904,7 +9937,10 @@ pub async fn wolfusb_assign(req: HttpRequest, state: web::Data<AppState>, body: 
         target_node_id, target_hostname,
         is_local_source,
     ) {
-        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "message": msg })),
+        Ok(msg) => {
+            wolfusb_broadcast_sync(&state);
+            HttpResponse::Ok().json(serde_json::json!({ "ok": true, "message": msg }))
+        }
         Err(e) => HttpResponse::Ok().json(serde_json::json!({ "ok": false, "error": e })),
     }
 }
@@ -9918,9 +9954,22 @@ pub async fn wolfusb_unassign(req: HttpRequest, state: web::Data<AppState>, body
     let source_node_id = body.get("source_node_id").and_then(|v| v.as_str()).unwrap_or("");
 
     match crate::wolfusb::unassign_device(&mut config, busid, source_node_id) {
-        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "message": msg })),
+        Ok(msg) => {
+            wolfusb_broadcast_sync(&state);
+            HttpResponse::Ok().json(serde_json::json!({ "ok": true, "message": msg }))
+        }
         Err(e) => HttpResponse::Ok().json(serde_json::json!({ "ok": false, "error": e })),
     }
+}
+
+/// POST /api/wolfusb/sync — receive assignment list from a cluster node (merge into local config)
+pub async fn wolfusb_sync(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let assignments: Vec<crate::wolfusb::UsbAssignment> = body.get("assignments")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    crate::wolfusb::merge_remote_assignments(&assignments);
+    HttpResponse::Ok().json(serde_json::json!({ "ok": true }))
 }
 
 /// POST /api/wolfusb/attach — attach a remote USB device and pass into container (called on target node)
@@ -16351,6 +16400,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/wolfusb/assign", web::post().to(wolfusb_assign))
         .route("/api/wolfusb/unassign", web::post().to(wolfusb_unassign))
         .route("/api/wolfusb/attach", web::post().to(wolfusb_attach))
+        .route("/api/wolfusb/sync", web::post().to(wolfusb_sync))
         // VR Terminal
         .route("/api/vr-terminal/create", web::post().to(crate::vr_terminal::vr_term_create))
         .route("/api/vr-terminal/{id}/output", web::get().to(crate::vr_terminal::vr_term_output))

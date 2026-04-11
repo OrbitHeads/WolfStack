@@ -599,6 +599,132 @@ pub fn attach_and_passthrough(
     Ok(result)
 }
 
+// ─── Startup Restore & Container Event Hooks ───
+
+/// Called on WolfStack startup. Re-establishes all usbip binds and attaches
+/// for assignments where this node is the source or target.
+pub fn restore_assignments(self_node_id: &str) {
+    let config = WolfUsbConfig::load();
+    if !config.enabled || config.assignments.is_empty() { return; }
+    if !is_usbip_available() { return; }
+    let _ = ensure_usbip_modules();
+
+    info!("WolfUSB: restoring {} assignments on startup", config.assignments.len());
+
+    for a in &config.assignments {
+        // Source side: re-export devices that are physically on this node
+        if a.source_node_id == self_node_id {
+            match export_device(&a.busid) {
+                Ok(msg) => info!("WolfUSB: re-exported {} — {}", a.busid, msg),
+                Err(e) => warn!("WolfUSB: failed to re-export {}: {}", a.busid, e),
+            }
+        }
+
+        // Target side: re-attach remote devices for containers on this node
+        if a.target_node_id == self_node_id && a.source_node_id != self_node_id {
+            match attach_remote_device(&a.source_address, &a.busid) {
+                Ok(msg) => info!("WolfUSB: re-attached {}:{} — {}", a.source_address, a.busid, msg),
+                Err(e) => warn!("WolfUSB: failed to re-attach {}:{}: {}", a.source_address, a.busid, e),
+            }
+        }
+    }
+}
+
+/// Called when a container starts or restarts on this node.
+/// Checks if any WolfUSB assignments target this container and re-establishes
+/// the usbip connection if needed (handles container migration automatically).
+pub fn on_container_started(container_name: &str, container_type: &str, self_node_id: &str) {
+    let mut config = WolfUsbConfig::load();
+    if !config.enabled || config.assignments.is_empty() { return; }
+
+    let mut changed = false;
+
+    for a in &mut config.assignments {
+        // Find assignments targeting this container
+        if a.target_name != container_name || a.target_type != container_type {
+            continue;
+        }
+
+        // If the container is now on this node but the assignment says a different target node,
+        // the container has migrated — update the target and re-attach
+        if a.target_node_id != self_node_id {
+            info!(
+                "WolfUSB: container {} migrated from {} to this node — re-routing USB {}",
+                container_name, a.target_hostname, a.busid
+            );
+            a.target_node_id = self_node_id.to_string();
+            // Get hostname for display
+            a.target_hostname = hostname::get()
+                .map(|h| h.to_string_lossy().to_string())
+                .unwrap_or_else(|_| self_node_id.to_string());
+            changed = true;
+        }
+
+        // Re-attach the device if it's from a remote node
+        if a.source_node_id != self_node_id {
+            if !a.source_address.is_empty() {
+                match attach_remote_device(&a.source_address, &a.busid) {
+                    Ok(_) => info!("WolfUSB: re-attached {} for container {}", a.busid, container_name),
+                    Err(e) => warn!("WolfUSB: failed to re-attach {} for {}: {}", a.busid, container_name, e),
+                }
+            }
+        }
+    }
+
+    if changed {
+        let _ = config.save();
+    }
+}
+
+/// Merge assignments from a remote node's config into ours.
+/// Called during cluster config sync so every node has the full assignment list.
+pub fn merge_remote_assignments(remote_assignments: &[UsbAssignment]) {
+    let mut config = WolfUsbConfig::load();
+    let mut changed = false;
+
+    for ra in remote_assignments {
+        // Check if we already have this assignment
+        let exists = config.assignments.iter().any(|a|
+            a.busid == ra.busid && a.source_node_id == ra.source_node_id
+        );
+        if !exists {
+            config.assignments.push(ra.clone());
+            changed = true;
+        } else {
+            // Update if the remote version is newer (target might have changed)
+            if let Some(existing) = config.assignments.iter_mut().find(|a|
+                a.busid == ra.busid && a.source_node_id == ra.source_node_id
+            ) {
+                if existing.target_node_id != ra.target_node_id
+                    || existing.target_name != ra.target_name
+                {
+                    *existing = ra.clone();
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    // Remove assignments that no longer exist on any remote node
+    // (Only remove if the source node is NOT us — we're authoritative for our own devices)
+    let self_id = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or_default();
+    let remote_busids: Vec<(&str, &str)> = remote_assignments.iter()
+        .map(|a| (a.busid.as_str(), a.source_node_id.as_str()))
+        .collect();
+    let before = config.assignments.len();
+    config.assignments.retain(|a| {
+        // Keep our own source assignments
+        if a.source_node_id == self_id { return true; }
+        // Keep assignments that exist in the remote set
+        remote_busids.iter().any(|(b, s)| *b == a.busid && *s == a.source_node_id)
+    });
+    if config.assignments.len() != before { changed = true; }
+
+    if changed {
+        let _ = config.save();
+    }
+}
+
 /// Find the /dev/bus/usb path for a recently attached virtual USB device
 fn find_virtual_dev_path(_busid: &str) -> Option<String> {
     // After usbip attach, the virtual device gets a new bus/addr

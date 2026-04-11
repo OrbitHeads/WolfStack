@@ -2543,6 +2543,10 @@ pub fn docker_start(container: &str) -> Result<String, String> {
         }
     }
 
+    // WolfUSB: re-attach any USB devices assigned to this container
+    let self_id = crate::agent::self_node_id();
+    crate::wolfusb::on_container_started(container, "docker", &self_id);
+
     Ok(result)
 }
 
@@ -2553,7 +2557,10 @@ pub fn docker_stop(container: &str) -> Result<String, String> {
 
 /// Restart a Docker container
 pub fn docker_restart(container: &str) -> Result<String, String> {
-    run_docker_cmd(&["restart", container])
+    let result = run_docker_cmd(&["restart", container])?;
+    let self_id = crate::agent::self_node_id();
+    crate::wolfusb::on_container_started(container, "docker", &self_id);
+    Ok(result)
 }
 
 /// Remove a Docker container
@@ -3763,8 +3770,11 @@ pub fn lxc_start(container: &str) -> Result<String, String> {
     if result.is_ok() {
         lxc_apply_wolfnet(container);
         lxc_post_start_setup(container);
+        // WolfUSB: re-attach any USB devices assigned to this container
+        let self_id = crate::agent::self_node_id();
+        crate::wolfusb::on_container_started(container, "lxc", &self_id);
     }
-    
+
     result
 }
 
