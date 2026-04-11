@@ -38,13 +38,22 @@ pub struct WolfUsbConfig {
 fn default_bind() -> String { "0.0.0.0".to_string() }
 fn default_port() -> u16 { 3240 }
 
+fn generate_auth_key() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let hostname = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or_default();
+    let raw = format!("{:x}{}{:x}", seed, hostname, seed.wrapping_mul(0x517cc1b727220a95));
+    // Take 32 hex chars
+    raw.chars().filter(|c| c.is_ascii_hexdigit()).take(32).collect()
+}
+
 impl Default for WolfUsbConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             bind_address: default_bind(),
             port: default_port(),
-            auth_key: String::new(),
+            auth_key: generate_auth_key(),
             assignments: Vec::new(),
         }
     }
@@ -52,10 +61,21 @@ impl Default for WolfUsbConfig {
 
 impl WolfUsbConfig {
     pub fn load() -> Self {
-        match std::fs::read_to_string(&config_path()) {
+        let mut config: Self = match std::fs::read_to_string(&config_path()) {
             Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
-            Err(_) => Self::default(),
+            Err(_) => {
+                // First run — save defaults (with generated auth key)
+                let c = Self::default();
+                let _ = c.save();
+                return c;
+            }
+        };
+        // Backfill auth key if config exists but key is empty
+        if config.auth_key.is_empty() {
+            config.auth_key = generate_auth_key();
+            let _ = config.save();
         }
+        config
     }
 
     pub fn save(&self) -> Result<(), String> {
