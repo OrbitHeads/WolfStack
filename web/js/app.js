@@ -34445,7 +34445,7 @@ async function wolframSaveConfig() {
 // ═══════════════════════════════════════════════
 
 async function loadWolfUsbPage() {
-    var el = document.getElementById('page-content');
+    var el = document.getElementById('page-wolfusb');
     if (!el) return;
 
     el.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted);">Loading USB Sharing...</div>';
