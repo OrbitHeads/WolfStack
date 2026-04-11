@@ -61,21 +61,18 @@ impl Default for WolfUsbConfig {
 
 impl WolfUsbConfig {
     pub fn load() -> Self {
-        let mut config: Self = match std::fs::read_to_string(&config_path()) {
-            Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+        match std::fs::read_to_string(&config_path()) {
+            Ok(data) => {
+                // Existing config — use as-is (don't change auth key)
+                serde_json::from_str(&data).unwrap_or_default()
+            }
             Err(_) => {
                 // First run — save defaults (with generated auth key)
                 let c = Self::default();
                 let _ = c.save();
-                return c;
+                c
             }
-        };
-        // Backfill auth key if config exists but key is empty
-        if config.auth_key.is_empty() {
-            config.auth_key = generate_auth_key();
-            let _ = config.save();
         }
-        config
     }
 
     pub fn save(&self) -> Result<(), String> {
