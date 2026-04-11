@@ -33344,7 +33344,7 @@ function updateWolfFlowStepFromPanel() {
             const nodeIds = Array.from(document.querySelectorAll('.wf-prop-node-cb:checked')).map(cb => cb.value);
             step.target_override = { scope: 'nodes', node_ids: nodeIds };
         } else if (scope === 'containers') {
-            const targets = Array.from(document.querySelectorAll('.wf-ct-cb:checked')).map(cb => ({
+            const targets = Array.from(document.querySelectorAll('#wf-prop-target-containers .wf-ct-cb:checked')).map(cb => ({
                 node_id: cb.dataset.node,
                 runtime: cb.dataset.runtime,
                 name: cb.dataset.name,

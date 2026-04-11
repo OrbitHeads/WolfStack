@@ -802,15 +802,7 @@ pub async fn execute_action_local(action: &ActionType) -> Result<StepOutput, Str
         }
 
         ActionType::RestartService { service_name } => {
-            // Validate service name to prevent injection
-            if service_name.contains(';')
-                || service_name.contains('&')
-                || service_name.contains('|')
-                || service_name.contains('`')
-                || service_name.contains('$')
-            {
-                return Err("Invalid service name".to_string());
-            }
+            validate_service_name(service_name)?;
             run_command("systemctl", &["restart", service_name], 60).await.map(plain_output)
         }
 
@@ -1216,9 +1208,22 @@ pub async fn exec_in_vm(vm_name: &str, command: &str, timeout_secs: u64) -> Resu
         None => {
             // Try to find IP via ARP table using MAC address
             if let Some(mac) = vm.and_then(|v| v.mac_address.clone()) {
-                let arp_output = run_command("bash", &["-c", &format!("ip neigh | grep -i '{}' | awk '{{print $1}}'", mac)], 5).await;
+                // Validate MAC format to prevent injection (must be XX:XX:XX:XX:XX:XX)
+                if !mac.chars().all(|c| c.is_ascii_hexdigit() || c == ':') || mac.len() != 17 {
+                    return Err(format!("Cannot execute in VM '{}': invalid MAC address format.", vm_name));
+                }
+                let arp_output = run_command("grep", &["-i", &mac, "/proc/net/arp"], 5).await;
                 match arp_output {
-                    Ok(ip_str) if !ip_str.trim().is_empty() => ip_str.trim().to_string(),
+                    Ok(line) if !line.trim().is_empty() => {
+                        // ARP table format: IP HWtype Flags HWaddress Mask Iface
+                        let ip_str = line.split_whitespace().next().unwrap_or("");
+                        // Validate as IPv4
+                        if ip_str.parse::<std::net::Ipv4Addr>().is_ok() {
+                            ip_str.to_string()
+                        } else {
+                            return Err(format!("Cannot execute in VM '{}': ARP lookup returned invalid IP.", vm_name));
+                        }
+                    }
                     _ => return Err(format!("Cannot execute in VM '{}': no IP address found. Ensure the VM has a network connection.", vm_name)),
                 }
             } else {
@@ -1227,17 +1232,35 @@ pub async fn exec_in_vm(vm_name: &str, command: &str, timeout_secs: u64) -> Resu
         }
     };
 
+    // Validate IP before using in SSH command
+    if ip.parse::<std::net::Ipv4Addr>().is_err() && ip.parse::<std::net::Ipv6Addr>().is_err() {
+        return Err(format!("Cannot execute in VM '{}': invalid IP address '{}'", vm_name, ip));
+    }
+
     // SSH with common options: no host key check, short timeout, try root first
-    let ssh_cmd = format!(
-        "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes root@{} {}",
-        ip, shell_quote(command)
-    );
-    run_command("bash", &["-c", &ssh_cmd], timeout_secs).await
+    run_command("ssh", &[
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "ConnectTimeout=5",
+        "-o", "BatchMode=yes",
+        &format!("root@{}", ip),
+        "sh", "-c", command,
+    ], timeout_secs).await
 }
 
 /// Shell-quote a string for safe embedding in an SSH command
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Validate a service name against shell metacharacters
+fn validate_service_name(name: &str) -> Result<(), String> {
+    if name.contains(';') || name.contains('&') || name.contains('|')
+        || name.contains('`') || name.contains('$') || name.contains(' ')
+    {
+        Err("Invalid service name".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 /// Execute an action inside a specific container/VM on the local node.
@@ -1297,7 +1320,10 @@ pub async fn execute_action_in_container(
                     Some(format!("journalctl --vacuum-size={}M 2>/dev/null || find /var/log -type f -name '*.log' -mtime +7 -delete; echo 'Logs cleaned'", size))
                 }
                 ActionType::CheckDiskSpace { .. } => Some("df -h".to_string()),
-                ActionType::RestartService { service_name } => Some(format!("systemctl restart {}", service_name)),
+                ActionType::RestartService { service_name } => {
+                    validate_service_name(service_name)?;
+                    Some(format!("systemctl restart {}", service_name))
+                }
                 _ => None,
             };
             if let Some(cmd) = cmd {
@@ -1312,7 +1338,10 @@ pub async fn execute_action_in_container(
                     Some(format!("journalctl --vacuum-size={}M 2>/dev/null || echo 'no journalctl'", size))
                 }
                 ActionType::CheckDiskSpace { .. } => Some("df -h".to_string()),
-                ActionType::RestartService { service_name } => Some(format!("systemctl restart {}", service_name)),
+                ActionType::RestartService { service_name } => {
+                    validate_service_name(service_name)?;
+                    Some(format!("systemctl restart {}", service_name))
+                }
                 _ => None,
             };
             if let Some(cmd) = cmd {
