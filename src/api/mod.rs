@@ -4842,6 +4842,11 @@ pub async fn ai_save_config(
                 config.gemini_api_key = v.to_string();
             }
         }
+        if let Some(v) = body.get("openrouter_api_key").and_then(|v| v.as_str()) {
+            if !v.contains("••••") && !v.is_empty() {
+                config.openrouter_api_key = v.to_string();
+            }
+        }
         if let Some(v) = body.get("model").and_then(|v| v.as_str()) {
             config.model = v.to_string();
         }
