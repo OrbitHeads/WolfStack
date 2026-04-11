@@ -17825,8 +17825,8 @@ async function sendAiMessage() {
     if (!msg) return;
     input.value = '';
 
-    // Refresh visible infra for action target picker (fire-and-forget, non-blocking)
-    _aiRefreshVisibleInfra();
+    // Refresh visible infra for action target picker (await so picker is populated before actions render)
+    await _aiRefreshVisibleInfra();
 
     var messages = document.getElementById('ai-chat-messages');
 
@@ -17978,11 +17978,6 @@ async function approveAiAction(actionId) {
     var targetSel = document.getElementById('ai-action-target-' + actionId);
     var targetVal = targetSel ? targetSel.value : 'host';
 
-    // Get the command from the action card's code block
-    var actionCard = document.getElementById('ai-action-' + actionId);
-    var codeEl = actionCard ? actionCard.querySelector('code') : null;
-    var command = codeEl ? codeEl.textContent : '';
-
     // Determine console type and name based on target
     var consoleType = 'host';
     var consoleName = '';
@@ -17996,22 +17991,19 @@ async function approveAiAction(actionId) {
         consoleName = _aiNode ? _aiNode.hostname : 'host';
     }
 
-    // Mark the action as approved on the server (fire-and-forget for audit)
-    var payload = { action_id: actionId, approved: true };
-    if (targetVal !== 'host') {
-        payload.container_runtime = consoleType;
-        payload.container_name = consoleName;
-    }
-    fetch('/api/ai/action', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-    }).catch(function() {});
+    // Mark the action as approved on the server first (required before terminal can fetch the command)
+    try {
+        await fetch('/api/ai/action', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action_id: actionId, approved: true })
+        });
+    } catch(e) {}
 
-    // Open a console window with the command auto-typed
+    // Open a console window — passes action_id, NOT the raw command (server-side lookup prevents injection)
     var url = '/console.html?type=' + encodeURIComponent(consoleType)
         + '&name=' + encodeURIComponent(consoleName)
-        + '&cmd=' + encodeURIComponent(command);
+        + '&action_id=' + encodeURIComponent(actionId);
     if (currentNodeId) {
         var node = allNodes.find(function(n) { return n.id === currentNodeId; });
         if (node && !node.is_self) {

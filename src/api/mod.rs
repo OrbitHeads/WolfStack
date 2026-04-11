@@ -5080,27 +5080,33 @@ pub async fn ai_chat(
                 }
             }
             // Enumerate containers/VMs on the viewed node so the AI knows what's there
+            // For self node: use local data. For remote: the frontend sends its own infra cache.
             if body.node_id.as_ref().map(|s| !s.is_empty()).unwrap_or(false) {
-                let docker = crate::containers::docker_list_all();
-                if !docker.is_empty() {
-                    ctx.push_str("\n\nDocker containers on this node:");
-                    for c in &docker {
-                        ctx.push_str(&format!("\n  - {} [{}]", c.name, c.state));
+                let is_self_node = nodes.iter().any(|n| n.is_self && Some(&n.id) == body.node_id.as_ref());
+                if is_self_node {
+                    let docker = crate::containers::docker_list_all();
+                    if !docker.is_empty() {
+                        ctx.push_str("\n\nDocker containers on this node:");
+                        for c in &docker {
+                            ctx.push_str(&format!("\n  - {} [{}]", c.name, c.state));
+                        }
                     }
-                }
-                let lxc = crate::containers::lxc_list_all();
-                if !lxc.is_empty() {
-                    ctx.push_str("\n\nLXC containers on this node:");
-                    for c in &lxc {
-                        ctx.push_str(&format!("\n  - {} [{}]", c.name, c.state));
+                    let lxc = crate::containers::lxc_list_all();
+                    if !lxc.is_empty() {
+                        ctx.push_str("\n\nLXC containers on this node:");
+                        for c in &lxc {
+                            ctx.push_str(&format!("\n  - {} [{}]", c.name, c.state));
+                        }
                     }
-                }
-                let vms = state.vms.lock().unwrap().list_vms();
-                if !vms.is_empty() {
-                    ctx.push_str("\n\nVMs on this node:");
-                    for v in &vms {
-                        ctx.push_str(&format!("\n  - {} [{}]", v.name, if v.running { "running" } else { "stopped" }));
+                    let vms = state.vms.lock().unwrap().list_vms();
+                    if !vms.is_empty() {
+                        ctx.push_str("\n\nVMs on this node:");
+                        for v in &vms {
+                            ctx.push_str(&format!("\n  - {} [{}]", v.name, if v.running { "running" } else { "stopped" }));
+                        }
                     }
+                } else {
+                    ctx.push_str("\n\n(Container/VM list for remote nodes is provided by the frontend target picker)");
                 }
             }
 
@@ -5165,11 +5171,6 @@ pub struct AiActionRequest {
     pub action_id: String,
     #[serde(default = "default_true")]
     pub approved: bool,
-    /// Optional: execute inside a specific container/VM instead of on the host
-    #[serde(default)]
-    pub container_runtime: Option<String>,  // "docker", "lxc", "vm"
-    #[serde(default)]
-    pub container_name: Option<String>,
 }
 
 fn default_true() -> bool { true }
@@ -5203,65 +5204,6 @@ pub async fn ai_action(
             .collect()
     };
 
-    // If a container target is specified, execute inside the container instead of on the host
-    if let (Some(runtime), Some(name)) = (&body.container_runtime, &body.container_name) {
-        if !runtime.is_empty() && !name.is_empty() {
-            // Get the command from the pending action
-            let cmd = {
-                let pa = state.ai_agent.pending_actions.lock().unwrap();
-                pa.iter().find(|a| a.id == body.action_id && a.status == "pending")
-                    .map(|a| a.command.clone())
-            };
-            let cmd = match cmd {
-                Some(c) => c,
-                None => return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Action not found or expired" })),
-            };
-
-            // Mark as approved
-            {
-                let mut pa = state.ai_agent.pending_actions.lock().unwrap();
-                if let Some(a) = pa.iter_mut().find(|a| a.id == body.action_id) {
-                    a.status = "approved".to_string();
-                    a.approved_by = username.clone();
-                }
-            }
-
-            let action = crate::wolfflow::ActionType::RunCommand {
-                command: cmd,
-                timeout_secs: 30,
-            };
-            let ct = crate::wolfflow::ContainerTarget {
-                node_id: String::new(),
-                runtime: runtime.clone(),
-                name: name.clone(),
-            };
-
-            let result = crate::wolfflow::execute_action_in_container(&action, &ct).await;
-
-            // Update action status
-            {
-                let mut pa = state.ai_agent.pending_actions.lock().unwrap();
-                if let Some(a) = pa.iter_mut().find(|a| a.id == body.action_id) {
-                    match &result {
-                        Ok(o) => { a.status = "executed".to_string(); a.result = o.text.clone(); }
-                        Err(e) => { a.status = "failed".to_string(); a.result = e.clone(); }
-                    }
-                }
-            }
-
-            return match result {
-                Ok(output) => HttpResponse::Ok().json(serde_json::json!({
-                    "status": "executed",
-                    "output": output.text,
-                })),
-                Err(e) => HttpResponse::Ok().json(serde_json::json!({
-                    "status": "failed",
-                    "error": e,
-                })),
-            };
-        }
-    }
-
     match state.ai_agent.execute_action(&body.action_id, &username, &cluster_nodes, &state.cluster_secret).await {
         Ok(output) => HttpResponse::Ok().json(serde_json::json!({
             "status": "executed",
@@ -5270,6 +5212,31 @@ pub async fn ai_action(
         Err(e) => HttpResponse::Ok().json(serde_json::json!({
             "status": "failed",
             "error": e,
+        })),
+    }
+}
+
+/// GET /api/ai/action/command?id=xxx — retrieve the command for an approved action (one-time, for terminal auto-exec)
+pub async fn ai_action_command(
+    req: HttpRequest, state: web::Data<AppState>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    let action_id = match query.get("id") {
+        Some(id) => id.clone(),
+        None => return HttpResponse::BadRequest().json(serde_json::json!({"error": "Missing id parameter"})),
+    };
+
+    let pa = state.ai_agent.pending_actions.lock().unwrap();
+    // Only return command for approved actions (approved by the POST /api/ai/action call)
+    match pa.iter().find(|a| a.id == action_id && a.status == "approved") {
+        Some(a) => HttpResponse::Ok().json(serde_json::json!({
+            "command": a.command,
+            "title": a.title,
+        })),
+        None => HttpResponse::NotFound().json(serde_json::json!({
+            "error": "Action not found, not approved, or expired"
         })),
     }
 }
@@ -15945,6 +15912,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/ai/models", web::get().to(ai_models))
         .route("/api/ai/exec", web::post().to(ai_exec))
         .route("/api/ai/action", web::post().to(ai_action))
+        .route("/api/ai/action/command", web::get().to(ai_action_command))
         .route("/api/ai/action/exec", web::post().to(ai_action_exec))
         .route("/api/ai/config/sync", web::post().to(ai_sync_config))
         .route("/api/ai/test-email", web::post().to(ai_test_email))
