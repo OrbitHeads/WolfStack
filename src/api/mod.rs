@@ -4972,6 +4972,15 @@ pub async fn ai_test_email(
 #[derive(Deserialize)]
 pub struct AiChatRequest {
     pub message: String,
+    /// The node ID the user is currently viewing (null/empty = datacenter level)
+    #[serde(default)]
+    pub node_id: Option<String>,
+    /// The page/view the user is currently on (e.g. "dashboard", "containers", "vms", "networking")
+    #[serde(default)]
+    pub view: Option<String>,
+    /// Friendly name of what the user is looking at (e.g. node hostname, container name)
+    #[serde(default)]
+    pub context_name: Option<String>,
 }
 
 pub async fn ai_chat(
@@ -5040,13 +5049,49 @@ pub async fn ai_chat(
             }).collect::<Vec<_>>().join("\n")
         };
 
+        // Build user navigation context
+        let user_context = {
+            let mut ctx = String::new();
+            if let Some(ref nid) = body.node_id {
+                if !nid.is_empty() {
+                    let target_node = nodes.iter().find(|n| n.id == *nid);
+                    if let Some(tn) = target_node {
+                        ctx.push_str(&format!("\n\nUSER IS CURRENTLY VIEWING: Node '{}' ({})", tn.hostname, tn.address));
+                        if tn.node_type == "proxmox" {
+                            ctx.push_str(" [Proxmox VE node]");
+                        }
+                    } else {
+                        ctx.push_str(&format!("\n\nUSER IS CURRENTLY VIEWING: Node ID '{}'", nid));
+                    }
+                } else {
+                    ctx.push_str("\n\nUSER IS CURRENTLY VIEWING: Datacenter overview (all nodes)");
+                }
+            } else {
+                ctx.push_str("\n\nUSER IS CURRENTLY VIEWING: Datacenter overview (all nodes)");
+            }
+            if let Some(ref view) = body.view {
+                if !view.is_empty() {
+                    ctx.push_str(&format!(", Page: {}", view));
+                }
+            }
+            if let Some(ref name) = body.context_name {
+                if !name.is_empty() {
+                    ctx.push_str(&format!(", Context: {}", name));
+                }
+            }
+            ctx.push_str("\nWhen the user says 'this server', 'this node', 'here', etc. they mean the node/view shown above.");
+            ctx.push_str("\nWhen proposing [ACTION] fixes, set target=\"local\" if the user is viewing a specific node (commands will run on the node they're viewing via the proxy), or target=\"all\" if they're at datacenter level.");
+            ctx
+        };
+
         format!(
             "Hostname: {}\nLocal Docker containers: {}\nLocal LXC containers: {}\nLocal VMs: {}\n\
-             Components: {}\n\nWolfStack Nodes ({}):\n{}\n\nProxmox Clusters:\n{}",
+             Components: {}\n\nWolfStack Nodes ({}):\n{}\n\nProxmox Clusters:\n{}{}",
             hostname, docker_count, lxc_count, vm_count,
             components.iter().map(|c| format!("{:?}: {}", c.component, if c.running { "running" } else { "stopped" })).collect::<Vec<_>>().join(", "),
             ws_nodes.len(), node_info,
             pve_info,
+            user_context,
         )
     };
 

@@ -17825,10 +17825,19 @@ async function sendAiMessage() {
     if (statusEl) statusEl.textContent = 'Thinking...';
 
     try {
+        // Build navigation context so the AI knows what the user is looking at
+        var chatPayload = { message: msg };
+        if (currentNodeId) {
+            chatPayload.node_id = currentNodeId;
+            var _aiNode = allNodes.find(function(n) { return n.id === currentNodeId; });
+            if (_aiNode) chatPayload.context_name = _aiNode.hostname || currentNodeId;
+        }
+        if (currentPage) chatPayload.view = currentPage;
+
         var resp = await fetch('/api/ai/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message: msg })
+            body: JSON.stringify(chatPayload)
         });
         var data = await resp.json();
 
