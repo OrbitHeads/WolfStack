@@ -1301,11 +1301,17 @@ fn qmp_add_usb_host(socket_path: &str, vendor_id: &str, product_id: &str) -> Res
     let pid = u64::from_str_radix(product_id.trim_start_matches("0x"), 16)
         .map_err(|e| format!("invalid product_id '{}': {}", product_id, e))?;
     let id = format!("wolfusb_{}_{}", vendor_id, product_id);
+    // Hot-plug onto the xhci bus — VMs started by wolfstack v16.29+ have
+    // qemu-xhci and this is where usb-host devices live. For older VMs
+    // that only had `-usb` (UHCI 1.1), the QMP call will fail with an
+    // invalid bus error; the caller then falls back to stop-and-restart
+    // which picks up the new xhci startup.
     let cmd = serde_json::json!({
         "execute": "device_add",
         "arguments": {
             "driver": "usb-host",
             "id": id,
+            "bus": "xhci.0",
             "vendorid": vid,
             "productid": pid,
         }

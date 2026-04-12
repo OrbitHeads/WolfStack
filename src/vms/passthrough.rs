@@ -387,16 +387,18 @@ pub fn find_conflicts(target: &VmConfig, others: &[VmConfig]) -> Vec<String> {
 /// already on the command line (the native start path already does).
 pub fn append_qemu_passthrough_args(cmd: &mut Command, config: &VmConfig) -> Result<(), String> {
     for u in &config.usb_devices {
+        // All usb-host devices attach to the xhci bus (see manager.rs VM
+        // startup). xhci handles every USB speed from low through superspeed+
+        // so UVC webcams, USB 3 storage, HID, everything works.
         let spec = if let Some(ref hb) = u.host_bus {
             if !hb.is_empty() {
-                // hostbus/hostport form: "1-4" → hostbus=1,hostport=4
                 let (bus, port) = match hb.split_once('-') {
                     Some((b, p)) => (b, p),
                     None => return Err(format!("Invalid host_bus format '{}', expected 'bus-port'", hb)),
                 };
-                format!("usb-host,hostbus={},hostport={}", bus, port)
+                format!("usb-host,bus=xhci.0,hostbus={},hostport={}", bus, port)
             } else {
-                format!("usb-host,vendorid=0x{},productid=0x{}", u.vendor_id, u.product_id)
+                format!("usb-host,bus=xhci.0,vendorid=0x{},productid=0x{}", u.vendor_id, u.product_id)
             }
         } else {
             if u.vendor_id.len() != 4 || u.product_id.len() != 4 {
@@ -405,7 +407,7 @@ pub fn append_qemu_passthrough_args(cmd: &mut Command, config: &VmConfig) -> Res
                     u.vendor_id, u.product_id
                 ));
             }
-            format!("usb-host,vendorid=0x{},productid=0x{}", u.vendor_id, u.product_id)
+            format!("usb-host,bus=xhci.0,vendorid=0x{},productid=0x{}", u.vendor_id, u.product_id)
         };
         cmd.arg("-device").arg(spec);
     }

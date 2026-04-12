@@ -1235,12 +1235,20 @@ impl VmManager {
         // Remove any stale socket from a previous run.
         let _ = std::fs::remove_file(&qmp_path);
 
+        // USB controller setup:
+        //   - qemu-xhci = USB 3.0 xHCI, handles full/low/high/super-speed.
+        //     Windows 10/11 has native xHCI drivers so this Just Works™.
+        //   - The default `-usb` line only provides a USB 1.1 UHCI hub, which
+        //     can't enumerate USB 2.0 High-Speed (480 Mb/s) devices like
+        //     webcams — they appear to QEMU but never reach the guest.
+        // usb-tablet is attached to xHCI so cursor sync works out of the box.
         cmd.arg("-name").arg(name)
            .arg("-m").arg(format!("{}M", config.memory_mb))
            .arg("-smp").arg(format!("{}", config.cpus))
            .arg("-drive").arg(format!("file={},format=qcow2,if={},index=0", actual_disk.display(), os_disk_if))
            .arg("-vnc").arg(&vnc_arg)
-           .arg("-usb").arg("-device").arg("usb-tablet")
+           .arg("-device").arg("qemu-xhci,id=xhci")
+           .arg("-device").arg("usb-tablet,bus=xhci.0")
            .arg("-vga").arg("std")
            .arg("-qmp").arg(format!("unix:{},server,nowait", qmp_path))
            .arg("-daemonize");
