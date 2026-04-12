@@ -9819,11 +9819,18 @@ pub async fn wolfusb_status(req: HttpRequest, state: web::Data<AppState>) -> Htt
     let config = crate::wolfusb::WolfUsbConfig::load();
     let available = crate::wolfusb::is_wolfusb_available();
     let version = if available { crate::wolfusb::get_wolfusb_version() } else { None };
+    let kmod = crate::wolfusb::kernel_module_status();
     HttpResponse::Ok().json(serde_json::json!({
         "wolfusb_available": available,
         "enabled": config.enabled,
         "assignment_count": config.assignments.len(),
         "version": version,
+        "kernel_modules": {
+            "vhci_hcd_loaded": kmod.vhci_hcd_loaded,
+            "usbip_host_loaded": kmod.usbip_host_loaded,
+            "fully_ready": kmod.is_fully_ready(),
+            "install_hint": kmod.install_hint,
+        },
     }))
 }
 

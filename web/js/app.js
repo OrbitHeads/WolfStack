@@ -34562,6 +34562,22 @@ async function loadWolfUsbPage() {
             + '<input type="checkbox" id="wolfusb-enabled" ' + (status.enabled ? 'checked' : '') + ' onchange="saveWolfUsbConfig()"> Enable</label>'
             + '</div></div>';
 
+        // Kernel module health banner. The wolfusb binary by itself is useless
+        // without vhci_hcd (client role) and usbip_host (server role) modules.
+        // Operators who upgrade via "/reinstall" won't see setup.sh's stderr,
+        // so flag the issue prominently in the UI.
+        if (status.kernel_modules && !status.kernel_modules.fully_ready) {
+            var missing = [];
+            if (!status.kernel_modules.vhci_hcd_loaded) missing.push('vhci_hcd (mount remote devices)');
+            if (!status.kernel_modules.usbip_host_loaded) missing.push('usbip_host (share local devices)');
+            html += '<div class="card" style="margin-bottom:16px;border-left:4px solid #f59e0b;">'
+                + '<div class="card-header" style="color:#f59e0b;">⚠ USB/IP Kernel Modules Missing</div>'
+                + '<div class="card-body" style="font-size:13px;line-height:1.5;">'
+                + '<p style="margin:0 0 8px 0;">This node is missing: <strong>' + missing.map(escapeHtml).join(', ') + '</strong>. WolfUSB will not work until the required kernel modules are loaded.</p>'
+                + '<p style="margin:0;color:var(--text-secondary);">' + escapeHtml(status.kernel_modules.install_hint || '') + '</p>'
+                + '</div></div>';
+        }
+
         // Devices
         html += '<div class="card" style="margin-bottom:16px;"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center;">'
             + '<span>USB Devices on This Node</span>'

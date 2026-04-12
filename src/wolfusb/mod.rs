@@ -160,6 +160,85 @@ pub fn get_wolfusb_version() -> Option<String> {
     }
 }
 
+/// Kernel-side capability check for USB/IP passthrough.
+///
+/// WolfUSB relies on two in-tree Linux kernel modules:
+///   - `vhci_hcd`: CLIENT side (target node) — virtual USB host controller
+///     that presents remote devices as local USB devices.
+///   - `usbip_host`: SERVER side (source node) — wolfusb hands the authenticated
+///     TCP socket here; the kernel then drives every URB type including
+///     isochronous (needed for webcams, USB audio, TV tuners).
+///
+/// These live in the "kernel-modules-extra" style package on most distros and
+/// aren't installed by default. A node that's missing one can still act in
+/// the other role, but a node missing both can't do USB passthrough at all.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct KernelModuleStatus {
+    /// True if /sys/devices/platform/vhci_hcd.0 exists (client role works).
+    pub vhci_hcd_loaded: bool,
+    /// True if /sys/bus/usb/drivers/usbip-host exists (server role works).
+    pub usbip_host_loaded: bool,
+    /// Per-distro install hint shown to the operator when a module is missing.
+    pub install_hint: String,
+}
+
+impl KernelModuleStatus {
+    pub fn is_fully_ready(&self) -> bool {
+        self.vhci_hcd_loaded && self.usbip_host_loaded
+    }
+}
+
+pub fn kernel_module_status() -> KernelModuleStatus {
+    let vhci = std::path::Path::new("/sys/devices/platform/vhci_hcd.0").is_dir();
+    let host = std::path::Path::new("/sys/bus/usb/drivers/usbip-host").is_dir();
+    let hint = if vhci && host {
+        String::new()
+    } else {
+        distro_install_hint()
+    };
+    KernelModuleStatus {
+        vhci_hcd_loaded: vhci,
+        usbip_host_loaded: host,
+        install_hint: hint,
+    }
+}
+
+fn distro_install_hint() -> String {
+    let os = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+    let id_line = os.lines().find(|l| l.starts_with("ID=")).unwrap_or("");
+    let like_line = os
+        .lines()
+        .find(|l| l.starts_with("ID_LIKE="))
+        .unwrap_or("");
+    let haystack = format!("{} {}", id_line, like_line).to_lowercase();
+    if haystack.contains("arch") || haystack.contains("manjaro")
+        || haystack.contains("cachyos") || haystack.contains("endeavouros")
+    {
+        "Arch-family kernels ship these modules by default. If missing, run \
+         `sudo modprobe vhci-hcd usbip-host` — the package is the standard `linux` kernel.".into()
+    } else if haystack.contains("fedora") || haystack.contains("rhel")
+        || haystack.contains("centos") || haystack.contains("rocky")
+        || haystack.contains("alma")
+    {
+        "Run `sudo dnf install kernel-modules-extra` and reboot. WolfStack's \
+         setup.sh normally handles this — re-run `curl ... | sudo bash` to install.".into()
+    } else if haystack.contains("debian") || haystack.contains("ubuntu")
+        || haystack.contains("mint") || haystack.contains("pop")
+        || haystack.contains("raspbian")
+    {
+        "Run `sudo apt install linux-modules-extra-$(uname -r)` then \
+         `sudo modprobe vhci-hcd usbip-host`. WolfStack's setup.sh normally \
+         handles this — re-run the installer to fix.".into()
+    } else if haystack.contains("suse") || haystack.contains("sles") {
+        "Run `sudo zypper install kernel-default-extra` and reboot.".into()
+    } else {
+        "Install your distro's kernel-modules-extra package, or rebuild the \
+         kernel with CONFIG_USBIP_CORE, CONFIG_USBIP_VHCI_HCD, \
+         CONFIG_USBIP_HOST enabled. Container-optimised cloud kernels (GCP \
+         COS, Bottlerocket, Flatcar) don't support USB passthrough.".into()
+    }
+}
+
 /// Run a wolfusb command with the cluster secret as auth key
 fn run_wolfusb(args: &[&str]) -> Result<String, String> {
     let binary = find_wolfusb_binary()
