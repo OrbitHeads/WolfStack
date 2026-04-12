@@ -9917,7 +9917,23 @@ pub async fn wolfusb_cluster_devices(
     if let Err(resp) = require_auth(&req, &state) {
         return resp;
     }
-    let nodes = state.cluster.get_all_nodes();
+    // Skip nodes that are known-offline (last heartbeat > 5 min). The
+    // cluster state can retain stale entries for nodes that were removed,
+    // renamed, or permanently taken offline; querying them produces
+    // spurious "Unreachable" warnings for nodes that aren't part of the
+    // cluster anymore. We don't trust Node.online alone because it can
+    // be stuck on True if the polling loop never managed to contact the
+    // node to mark it false.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let nodes: Vec<_> = state
+        .cluster
+        .get_all_nodes()
+        .into_iter()
+        .filter(|n| n.is_self || (n.online && now.saturating_sub(n.last_seen) < 300))
+        .collect();
     let config = crate::wolfusb::WolfUsbConfig::load();
     let secret = state.cluster_secret.clone();
     let client = reqwest::Client::new();
