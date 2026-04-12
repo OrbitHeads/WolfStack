@@ -274,20 +274,53 @@ echo "Installing Proxmox Backup Client..."
 if command -v proxmox-backup-client >/dev/null 2>&1; then
     echo "✓ proxmox-backup-client already installed"
 elif [ "$PKG_MANAGER" = "apt" ]; then
-    # Add Proxmox PBS repo for Debian/Ubuntu
-    PBS_REPO_FILE="/etc/apt/sources.list.d/pbs-client.list"
-    if [ ! -f "$PBS_REPO_FILE" ]; then
-        CODENAME="bookworm"
-        echo "deb http://download.proxmox.com/debian/pbs $CODENAME pbs-no-subscription" > "$PBS_REPO_FILE"
-        curl -fsSL "https://enterprise.proxmox.com/debian/proxmox-release-${CODENAME}.gpg" \
-            -o /etc/apt/trusted.gpg.d/proxmox-release-${CODENAME}.gpg 2>/dev/null || true
-        apt update -qq 2>/dev/null || true
+    # Detect actual Debian/Ubuntu codename — Proxmox publishes packages for
+    # bullseye, bookworm, trixie. If we detect an Ubuntu codename (e.g. noble,
+    # jammy) we pick the closest Debian equivalent.
+    CODENAME=""
+    if [ -r /etc/os-release ]; then
+        . /etc/os-release
+        CODENAME="${VERSION_CODENAME:-}"
     fi
-    apt install -y proxmox-backup-client 2>/dev/null || \
-    apt install -y --allow-unauthenticated proxmox-backup-client 2>/dev/null || {
-        echo "⚠ Could not install proxmox-backup-client from repo."
-        echo "  You can install it manually later: apt install proxmox-backup-client"
-    }
+    [ -z "$CODENAME" ] && CODENAME=$(lsb_release -sc 2>/dev/null || echo "")
+
+    # Map Ubuntu codenames to the closest Debian release
+    case "$CODENAME" in
+        noble|oracular|plucky) CODENAME="trixie" ;;  # Ubuntu 24.04+/25.04 → Debian 13
+        jammy|lunar|mantic) CODENAME="bookworm" ;;    # Ubuntu 22.04-23.10 → Debian 12
+        focal|impish) CODENAME="bullseye" ;;           # Ubuntu 20.04-21.10 → Debian 11
+        trixie|bookworm|bullseye) ;;                   # Debian: use as-is
+        *)
+            # Unknown codename — try trixie first (newest), fallback handled below
+            echo "  ⚠ Unknown codename '$CODENAME' — trying trixie..."
+            CODENAME="trixie"
+            ;;
+    esac
+
+    # Add Proxmox PBS repo
+    PBS_REPO_FILE="/etc/apt/sources.list.d/pbs-client.list"
+    echo "  Using Proxmox PBS repo for: $CODENAME"
+    echo "deb http://download.proxmox.com/debian/pbs $CODENAME pbs-no-subscription" > "$PBS_REPO_FILE"
+    curl -fsSL "https://enterprise.proxmox.com/debian/proxmox-release-${CODENAME}.gpg" \
+        -o /etc/apt/trusted.gpg.d/proxmox-release-${CODENAME}.gpg 2>/dev/null || true
+
+    if apt update -qq 2>/dev/null && apt install -y proxmox-backup-client 2>/dev/null; then
+        echo "✓ proxmox-backup-client installed from $CODENAME repo"
+    elif [ "$CODENAME" != "bookworm" ]; then
+        # Fallback: try bookworm (most compatible)
+        echo "  ⚠ $CODENAME install failed — falling back to bookworm"
+        echo "deb http://download.proxmox.com/debian/pbs bookworm pbs-no-subscription" > "$PBS_REPO_FILE"
+        curl -fsSL "https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg" \
+            -o /etc/apt/trusted.gpg.d/proxmox-release-bookworm.gpg 2>/dev/null || true
+        apt update -qq 2>/dev/null || true
+        if apt install -y proxmox-backup-client 2>/dev/null; then
+            echo "✓ proxmox-backup-client installed from bookworm repo (fallback)"
+        else
+            echo "⚠ Could not install proxmox-backup-client. Try: apt install proxmox-backup-client"
+        fi
+    else
+        echo "⚠ Could not install proxmox-backup-client. Try: apt install proxmox-backup-client"
+    fi
 else
     # For Fedora, RHEL, Arch, etc: download the .deb from Proxmox and extract the binary
     # The proxmox-backup-client binary is statically linked and works on any Linux
@@ -295,9 +328,15 @@ else
     PBS_TMP=$(mktemp -d)
     ARCH=$(dpkg --print-architecture 2>/dev/null || (uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/'))
 
-    # Find the latest proxmox-backup-client .deb URL from the Proxmox repo
-    PBS_PKG_URL="http://download.proxmox.com/debian/pbs/dists/bookworm/pbs-no-subscription/binary-${ARCH}/"
-    PBS_DEB=$(curl -fsSL "$PBS_PKG_URL" 2>/dev/null | grep -oP 'proxmox-backup-client_[^"]+\.deb' | sort -V | tail -1)
+    # Try trixie first (newest), fall back to bookworm
+    PBS_CODENAME="trixie"
+    PBS_PKG_URL="http://download.proxmox.com/debian/pbs/dists/${PBS_CODENAME}/pbs-no-subscription/binary-${ARCH}/"
+    PBS_DEB=$(curl -fsSL "$PBS_PKG_URL" 2>/dev/null | grep -oP 'proxmox-backup-client_[^"]+\.deb' | grep -v dbgsym | sort -V | tail -1)
+    if [ -z "$PBS_DEB" ]; then
+        PBS_CODENAME="bookworm"
+        PBS_PKG_URL="http://download.proxmox.com/debian/pbs/dists/${PBS_CODENAME}/pbs-no-subscription/binary-${ARCH}/"
+        PBS_DEB=$(curl -fsSL "$PBS_PKG_URL" 2>/dev/null | grep -oP 'proxmox-backup-client_[^"]+\.deb' | grep -v dbgsym | sort -V | tail -1)
+    fi
 
     if [ -n "$PBS_DEB" ]; then
         echo "  Downloading $PBS_DEB..."
