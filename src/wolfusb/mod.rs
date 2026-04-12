@@ -972,23 +972,67 @@ fn passthrough_to_docker(container_name: &str, dev_path: &str) -> Result<String,
         for c in caps { if let Some(s) = c.as_str() { args.push("--cap-drop".to_string()); args.push(s.to_string()); } }
     }
 
-    // Existing devices + new USB device
-    let mut has_device = false;
+    // Preserve existing --device mounts, and bind the whole /dev/bus/usb
+    // tree. Binding a single /dev/bus/usb/BBB/DDD path is fragile: many
+    // USB devices re-enumerate with a different device number when they
+    // load firmware (Google Coral: 1a6e:089a → 18d1:9302 after edgetpu
+    // loads), or when the wolfusb-mount systemd unit restarts after a
+    // blip. The container would lose access and the app (Frigate, etc.)
+    // goes into a crash loop. Binding the whole tree + allowing all USB
+    // devices at the cgroup level makes it robust to re-enumeration.
+    let mut has_usb_bus = false;
     if let Some(devs) = v.pointer("/HostConfig/Devices").and_then(|v| v.as_array()) {
         for d in devs {
             let host = d.get("PathOnHost").and_then(|v| v.as_str()).unwrap_or("");
             let ctr = d.get("PathInContainer").and_then(|v| v.as_str()).unwrap_or("");
-            if !host.is_empty() {
-                args.push("--device".to_string());
-                args.push(format!("{}:{}", host, ctr));
-                if host == dev_path { has_device = true; }
+            if host.is_empty() {
+                continue;
+            }
+            // Skip specific /dev/bus/usb/XXX/YYY paths — the tree-bind
+            // below supersedes them and keeping both creates conflicts
+            // when the device number changes.
+            if host.starts_with("/dev/bus/usb/") {
+                continue;
+            }
+            args.push("--device".to_string());
+            args.push(format!("{}:{}", host, ctr));
+            if host == "/dev/bus/usb" {
+                has_usb_bus = true;
             }
         }
     }
-    if !has_device {
+    if !has_usb_bus {
         args.push("--device".to_string());
-        args.push(format!("{}:{}", dev_path, dev_path));
+        args.push("/dev/bus/usb:/dev/bus/usb".to_string());
     }
+
+    // Preserve existing cgroup rules, then ensure USB (major 189) is
+    // allowed for any minor. Without this, Docker's default device cgroup
+    // blocks access to USB devices that weren't present at container
+    // creation, even if they're bind-mounted in later.
+    let mut has_usb_cgroup = false;
+    if let Some(rules) = v
+        .pointer("/HostConfig/DeviceCgroupRules")
+        .and_then(|v| v.as_array())
+    {
+        for r in rules {
+            if let Some(s) = r.as_str() {
+                args.push("--device-cgroup-rule".to_string());
+                args.push(s.to_string());
+                let norm = s.split_whitespace().collect::<Vec<_>>().join(" ");
+                if norm.contains("c 189:") || norm.contains("c *:") {
+                    has_usb_cgroup = true;
+                }
+            }
+        }
+    }
+    if !has_usb_cgroup {
+        args.push("--device-cgroup-rule".to_string());
+        args.push("c 189:* rmw".to_string());
+    }
+    // dev_path is recorded but not passed as a specific --device; the
+    // /dev/bus/usb tree-bind covers it and stays valid through re-enum.
+    let _ = dev_path;
 
     // Volumes
     let binds: Vec<String> = v.pointer("/HostConfig/Binds")
@@ -1097,13 +1141,26 @@ fn passthrough_to_lxc(container_name: &str, busid: &str, dev_path: &str) -> Resu
     }
 
     let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
-    if existing.contains(dev_path) {
-        return Ok(format!("Device {} already configured in LXC {}", dev_path, container_name));
+    // Look for our WolfUSB block — idempotent. Matching just on dev_path is
+    // too narrow because the path changes if the device re-enumerates.
+    if existing.contains("# WolfUSB: USB tree bind") {
+        return Ok(format!(
+            "USB tree-bind already configured in LXC {}",
+            container_name
+        ));
     }
 
+    // Bind the whole /dev/bus/usb tree rather than a single path. The
+    // specific dev_path can change when the device re-enumerates (Google
+    // Coral switches from 1a6e:089a to 18d1:9302 after edgetpu firmware
+    // loads, with a new device number), and binding the tree stays valid
+    // regardless. Cgroup rule for USB major 189 lets the container read
+    // whichever device number the kernel assigns.
     let entry = format!(
-        "\n# WolfUSB: USB device {}\nlxc.cgroup2.devices.allow = c 189:* rwm\nlxc.mount.entry = {} {} none bind,optional,create=file 0 0\n",
-        busid, dev_path, dev_path.trim_start_matches('/')
+        "\n# WolfUSB: USB tree bind ({} initial path {})\n\
+         lxc.cgroup2.devices.allow = c 189:* rwm\n\
+         lxc.mount.entry = /dev/bus/usb dev/bus/usb none bind,optional,create=dir 0 0\n",
+        busid, dev_path
     );
 
     std::fs::OpenOptions::new().append(true).open(&config_path)
