@@ -271,117 +271,156 @@ echo "✓ System dependencies installed"
 echo ""
 echo "Installing Proxmox Backup Client..."
 
-if command -v proxmox-backup-client >/dev/null 2>&1; then
-    echo "✓ proxmox-backup-client already installed"
-elif [ "$PKG_MANAGER" = "apt" ]; then
-    # Detect actual Debian/Ubuntu codename — Proxmox publishes packages for
-    # bullseye, bookworm, trixie. If we detect an Ubuntu codename (e.g. noble,
-    # jammy) we pick the closest Debian equivalent.
-    CODENAME=""
+# Helper: detect the best PBS codename to use based on current OS
+pbs_detect_codename() {
+    local codename=""
     if [ -r /etc/os-release ]; then
         . /etc/os-release
-        CODENAME="${VERSION_CODENAME:-}"
+        codename="${VERSION_CODENAME:-}"
     fi
-    [ -z "$CODENAME" ] && CODENAME=$(lsb_release -sc 2>/dev/null || echo "")
-
-    # Map Ubuntu codenames to the closest Debian release
-    case "$CODENAME" in
-        noble|oracular|plucky) CODENAME="trixie" ;;  # Ubuntu 24.04+/25.04 → Debian 13
-        jammy|lunar|mantic) CODENAME="bookworm" ;;    # Ubuntu 22.04-23.10 → Debian 12
-        focal|impish) CODENAME="bullseye" ;;           # Ubuntu 20.04-21.10 → Debian 11
-        trixie|bookworm|bullseye) ;;                   # Debian: use as-is
-        *)
-            # Unknown codename — try trixie first (newest), fallback handled below
-            echo "  ⚠ Unknown codename '$CODENAME' — trying trixie..."
-            CODENAME="trixie"
-            ;;
+    [ -z "$codename" ] && codename=$(lsb_release -sc 2>/dev/null || echo "")
+    case "$codename" in
+        # Debian — use as-is (proxmox publishes for these)
+        trixie|bookworm|bullseye) echo "$codename" ;;
+        # Ubuntu codenames mapped to closest Debian
+        noble|oracular|plucky) echo "trixie" ;;       # 24.04+/25.04 → Debian 13
+        jammy|lunar|mantic)    echo "bookworm" ;;     # 22.04–23.10 → Debian 12
+        focal|impish)          echo "bullseye" ;;     # 20.04–21.10 → Debian 11
+        # Unknown/everything else — trixie is newest; extraction will fallback
+        *) echo "trixie" ;;
     esac
+}
 
-    # Add Proxmox PBS repo
-    PBS_REPO_FILE="/etc/apt/sources.list.d/pbs-client.list"
+# Helper: extract proxmox-backup-client binary from Debian .deb
+# Used on non-Debian systems (Fedora, Arch fallback, openSUSE)
+pbs_extract_from_deb() {
+    local codename="$1"
+    local arch="${2:-amd64}"
+    local tmp
+    tmp=$(mktemp -d)
+    local base_url="http://download.proxmox.com/debian/pbs/dists/${codename}/pbs-no-subscription/binary-${arch}/"
+    local deb_name
+    deb_name=$(curl -fsSL "$base_url" 2>/dev/null | grep -oP 'proxmox-backup-client_[^"]+\.deb' | grep -v dbgsym | sort -V | tail -1)
+    if [ -z "$deb_name" ]; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    echo "  Downloading $deb_name (${codename}/${arch})..." >&2
+    if ! curl -fsSL "${base_url}${deb_name}" -o "${tmp}/${deb_name}" 2>/dev/null; then
+        rm -rf "$tmp"; return 1
+    fi
+    ( cd "$tmp" && ar x "$deb_name" 2>/dev/null ) || { rm -rf "$tmp"; return 1; }
+    local data_tar
+    data_tar=$(ls "$tmp"/data.tar.* 2>/dev/null | head -1)
+    [ -z "$data_tar" ] && { rm -rf "$tmp"; return 1; }
+    case "$data_tar" in
+        *.zst) zstd -d -q "$data_tar" -o "$tmp/data.tar" 2>/dev/null || { rm -rf "$tmp"; return 1; } ;;
+        *.xz)  xz -d -k "$data_tar" 2>/dev/null || { rm -rf "$tmp"; return 1; } ;;
+        *.gz)  gzip -dk "$data_tar" 2>/dev/null || { rm -rf "$tmp"; return 1; } ;;
+    esac
+    if ! tar -C "$tmp" -xf "$tmp/data.tar" ./usr/bin/proxmox-backup-client 2>/dev/null; then
+        rm -rf "$tmp"; return 1
+    fi
+    install -m 0755 "$tmp/usr/bin/proxmox-backup-client" /usr/local/bin/proxmox-backup-client
+    rm -rf "$tmp"
+    return 0
+}
+
+pbs_install_success=false
+
+if command -v proxmox-backup-client >/dev/null 2>&1; then
+    echo "✓ proxmox-backup-client already installed ($(proxmox-backup-client --version 2>&1 | head -1))"
+    pbs_install_success=true
+
+elif command -v apt-get >/dev/null 2>&1; then
+    # ─── Debian / Ubuntu / Proxmox VE ──────────────────────────────────────
+    CODENAME=$(pbs_detect_codename)
     echo "  Using Proxmox PBS repo for: $CODENAME"
-    echo "deb http://download.proxmox.com/debian/pbs $CODENAME pbs-no-subscription" > "$PBS_REPO_FILE"
+    mkdir -p /etc/apt/sources.list.d /etc/apt/trusted.gpg.d
+    echo "deb http://download.proxmox.com/debian/pbs $CODENAME pbs-no-subscription" > /etc/apt/sources.list.d/pbs-client.list
     curl -fsSL "https://enterprise.proxmox.com/debian/proxmox-release-${CODENAME}.gpg" \
-        -o /etc/apt/trusted.gpg.d/proxmox-release-${CODENAME}.gpg 2>/dev/null || true
+        -o "/etc/apt/trusted.gpg.d/proxmox-release-${CODENAME}.gpg" 2>/dev/null || true
 
-    if apt update -qq 2>/dev/null && apt install -y proxmox-backup-client 2>/dev/null; then
+    if apt-get update -qq 2>/dev/null && apt-get install -y proxmox-backup-client 2>/dev/null; then
         echo "✓ proxmox-backup-client installed from $CODENAME repo"
+        pbs_install_success=true
     elif [ "$CODENAME" != "bookworm" ]; then
-        # Fallback: try bookworm (most compatible)
-        echo "  ⚠ $CODENAME install failed — falling back to bookworm"
-        echo "deb http://download.proxmox.com/debian/pbs bookworm pbs-no-subscription" > "$PBS_REPO_FILE"
+        echo "  ⚠ $CODENAME install failed — trying bookworm repo"
+        echo "deb http://download.proxmox.com/debian/pbs bookworm pbs-no-subscription" > /etc/apt/sources.list.d/pbs-client.list
         curl -fsSL "https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg" \
-            -o /etc/apt/trusted.gpg.d/proxmox-release-bookworm.gpg 2>/dev/null || true
-        apt update -qq 2>/dev/null || true
-        if apt install -y proxmox-backup-client 2>/dev/null; then
-            echo "✓ proxmox-backup-client installed from bookworm repo (fallback)"
-        else
-            echo "⚠ Could not install proxmox-backup-client. Try: apt install proxmox-backup-client"
+            -o "/etc/apt/trusted.gpg.d/proxmox-release-bookworm.gpg" 2>/dev/null || true
+        if apt-get update -qq 2>/dev/null && apt-get install -y proxmox-backup-client 2>/dev/null; then
+            echo "✓ proxmox-backup-client installed from bookworm repo"
+            pbs_install_success=true
         fi
-    else
-        echo "⚠ Could not install proxmox-backup-client. Try: apt install proxmox-backup-client"
     fi
+
+elif command -v pacman >/dev/null 2>&1; then
+    # ─── Arch / CachyOS / Manjaro ──────────────────────────────────────────
+    # Required libraries for the binary: libfuse3, openssl 3, acl, zstd
+    pacman -S --needed --noconfirm fuse3 openssl acl zstd 2>/dev/null || true
+
+    # Try AUR helper first (paru or yay) — builds clean Arch package
+    AUR_HELPER=""
+    for h in paru yay; do
+        if command -v "$h" >/dev/null 2>&1; then AUR_HELPER="$h"; break; fi
+    done
+    if [ -n "$AUR_HELPER" ] && [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+        echo "  Using $AUR_HELPER to build proxmox-backup-client-bin from AUR..."
+        if su - "$SUDO_USER" -c "$AUR_HELPER -S --needed --noconfirm proxmox-backup-client-bin" 2>/dev/null; then
+            pbs_install_success=true
+        fi
+    fi
+    if [ "$pbs_install_success" != "true" ]; then
+        echo "  Falling back to Debian .deb extraction..."
+        if pbs_extract_from_deb trixie amd64 || pbs_extract_from_deb bookworm amd64; then
+            echo "✓ proxmox-backup-client installed to /usr/local/bin/"
+            pbs_install_success=true
+        fi
+    fi
+
+elif command -v dnf >/dev/null 2>&1; then
+    # ─── Fedora / RHEL / Rocky / AlmaLinux ─────────────────────────────────
+    dnf install -y fuse3 openssl libacl zstd 2>/dev/null || true
+    ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+    if pbs_extract_from_deb trixie "$ARCH" || pbs_extract_from_deb bookworm "$ARCH"; then
+        echo "✓ proxmox-backup-client installed to /usr/local/bin/"
+        pbs_install_success=true
+    fi
+
+elif command -v zypper >/dev/null 2>&1; then
+    # ─── openSUSE ──────────────────────────────────────────────────────────
+    zypper install -y fuse3 openssl libacl1 libzstd1 2>/dev/null || true
+    ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+    if pbs_extract_from_deb trixie "$ARCH" || pbs_extract_from_deb bookworm "$ARCH"; then
+        echo "✓ proxmox-backup-client installed to /usr/local/bin/"
+        pbs_install_success=true
+    fi
+
 else
-    # For Fedora, RHEL, Arch, etc: download the .deb from Proxmox and extract the binary
-    # The proxmox-backup-client binary is statically linked and works on any Linux
-    echo "  Non-Debian system detected — extracting proxmox-backup-client from Proxmox .deb..."
-    PBS_TMP=$(mktemp -d)
-    ARCH=$(dpkg --print-architecture 2>/dev/null || (uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/'))
-
-    # Try trixie first (newest), fall back to bookworm
-    PBS_CODENAME="trixie"
-    PBS_PKG_URL="http://download.proxmox.com/debian/pbs/dists/${PBS_CODENAME}/pbs-no-subscription/binary-${ARCH}/"
-    PBS_DEB=$(curl -fsSL "$PBS_PKG_URL" 2>/dev/null | grep -oP 'proxmox-backup-client_[^"]+\.deb' | grep -v dbgsym | sort -V | tail -1)
-    if [ -z "$PBS_DEB" ]; then
-        PBS_CODENAME="bookworm"
-        PBS_PKG_URL="http://download.proxmox.com/debian/pbs/dists/${PBS_CODENAME}/pbs-no-subscription/binary-${ARCH}/"
-        PBS_DEB=$(curl -fsSL "$PBS_PKG_URL" 2>/dev/null | grep -oP 'proxmox-backup-client_[^"]+\.deb' | grep -v dbgsym | sort -V | tail -1)
+    # ─── Unknown distro — try generic .deb extract ─────────────────────────
+    ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+    if pbs_extract_from_deb trixie "$ARCH" || pbs_extract_from_deb bookworm "$ARCH"; then
+        echo "✓ proxmox-backup-client installed to /usr/local/bin/"
+        pbs_install_success=true
     fi
-
-    if [ -n "$PBS_DEB" ]; then
-        echo "  Downloading $PBS_DEB..."
-        if curl -fsSL "${PBS_PKG_URL}${PBS_DEB}" -o "${PBS_TMP}/${PBS_DEB}" 2>/dev/null; then
-            # Extract .deb: ar extracts data.tar, then we pull the binary out
-            cd "$PBS_TMP"
-            ar x "$PBS_DEB" 2>/dev/null
-            # data.tar may be .zst, .xz, or .gz compressed
-            DATA_TAR=$(ls data.tar.* 2>/dev/null | head -1)
-            if [ -n "$DATA_TAR" ]; then
-                case "$DATA_TAR" in
-                    *.zst) zstd -d "$DATA_TAR" -o data.tar 2>/dev/null || true ;;
-                    *.xz)  xz -d "$DATA_TAR" 2>/dev/null || true ;;
-                    *.gz)  gzip -d "$DATA_TAR" 2>/dev/null || true ;;
-                esac
-                if [ -f data.tar ]; then
-                    tar xf data.tar ./usr/bin/proxmox-backup-client 2>/dev/null && \
-                        cp -f usr/bin/proxmox-backup-client /usr/local/bin/proxmox-backup-client && \
-                        chmod +x /usr/local/bin/proxmox-backup-client && \
-                        echo "✓ proxmox-backup-client installed to /usr/local/bin/"
-                else
-                    echo "⚠ Failed to decompress PBS package data."
-                fi
-            else
-                echo "⚠ Could not find data archive in PBS .deb package."
-            fi
-            cd - > /dev/null
-        else
-            echo "⚠ Failed to download PBS package."
-        fi
-    else
-        echo "⚠ Could not find proxmox-backup-client .deb for architecture: $ARCH"
-        echo "  PBS integration will not be available. Install manually if needed."
-    fi
-    rm -rf "$PBS_TMP"
 fi
 
-# Fix libfuse3 soname mismatch: proxmox-backup-client expects libfuse3.so.3
-# but some distros (CachyOS, newer Arch) ship soname 4 (libfuse3.so.4)
+if [ "$pbs_install_success" != "true" ]; then
+    echo "⚠ Could not install proxmox-backup-client. PBS integration will be unavailable."
+    echo "  You can install manually later. See: https://pbs.proxmox.com/docs/backup-client.html"
+fi
+
+# Fix libfuse3 soname: proxmox-backup-client links against libfuse3.so.3
+# but some distros (CachyOS, rolling Arch) have soname 4 (libfuse3.so.4)
 if command -v proxmox-backup-client >/dev/null 2>&1; then
-    if [ ! -e /usr/lib/libfuse3.so.3 ] && [ -e /usr/lib/libfuse3.so.4 ]; then
-        FUSE3_REAL=$(readlink -f /usr/lib/libfuse3.so.4)
-        ln -sf "$FUSE3_REAL" /usr/lib/libfuse3.so.3
-        echo "✓ Created libfuse3.so.3 symlink (soname compatibility fix)"
-    fi
+    for libdir in /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu; do
+        if [ ! -e "$libdir/libfuse3.so.3" ] && [ -e "$libdir/libfuse3.so.4" ]; then
+            FUSE3_REAL=$(readlink -f "$libdir/libfuse3.so.4")
+            ln -sf "$FUSE3_REAL" "$libdir/libfuse3.so.3"
+            echo "  ✓ Created $libdir/libfuse3.so.3 symlink (soname compat)"
+        fi
+    done
 fi
 
 # ─── Configure FUSE for storage mounts ──────────────────────────────────────
