@@ -688,9 +688,10 @@ else
 
     if [ ! -f "/etc/wolfnet/config.toml" ]; then
         # Auto-assign a cluster IP based on the last octet of the host IP
-        HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}' \
-            || ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' \
-            || ip -4 addr show scope global 2>/dev/null | awk '/inet / {split($2,a,"/"); print a[1]; exit}')
+        HOST_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}')
+        [ -z "$HOST_IP" ] && HOST_IP=$(ip -4 addr show scope global 2>/dev/null | awk '/inet / {split($2,a,"/"); print a[1]; exit}')
+        [ -z "$HOST_IP" ] && HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+        [ -z "$HOST_IP" ] && HOST_IP=$(hostname -i 2>/dev/null | awk '{print $1}')
         LAST_OCTET=$(echo "$HOST_IP" | awk -F. '{print $4}')
         # Ensure last octet is valid (1-254); default to 1 if detection fails
         if [ -z "$LAST_OCTET" ] || [ "$LAST_OCTET" -lt 1 ] 2>/dev/null || [ "$LAST_OCTET" -gt 254 ] 2>/dev/null; then
@@ -1259,12 +1260,22 @@ fi
 
 # ─── Done ────────────────────────────────────────────────────────────────────
 echo ""
-# Portable: `hostname -I` is a GNU-only extension, not on Arch/BSD
+# Portable IP detection — `hostname -I` is GNU-only; Arch/BSD use `hostname -i`
+# `ip` is the most reliable fallback on modern Linux.
 get_primary_ip() {
-    hostname -I 2>/dev/null | awk '{print $1}' \
-        || ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' \
-        || ip -4 addr show scope global 2>/dev/null | awk '/inet / {split($2,a,"/"); print a[1]; exit}' \
-        || echo "localhost"
+    # Try `ip route get` first — works on everything with iproute2
+    local ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}')
+    if [ -n "$ip" ]; then echo "$ip"; return; fi
+    # Fallback: first global IPv4 address from `ip addr`
+    ip=$(ip -4 addr show scope global 2>/dev/null | awk '/inet / {split($2,a,"/"); print a[1]; exit}')
+    if [ -n "$ip" ]; then echo "$ip"; return; fi
+    # Fallback: GNU `hostname -I`
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    if [ -n "$ip" ]; then echo "$ip"; return; fi
+    # Fallback: non-GNU `hostname -i`
+    ip=$(hostname -i 2>/dev/null | awk '{print $1}')
+    if [ -n "$ip" ] && [ "$ip" != "127.0.0.1" ]; then echo "$ip"; return; fi
+    echo "localhost"
 }
 
 echo "  🐺 Installation Complete!"
