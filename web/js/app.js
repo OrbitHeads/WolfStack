@@ -34539,13 +34539,11 @@ async function loadWolfUsbPage() {
         var html = '';
 
         if (!status.wolfusb_available) {
-            html += '<div class="card" style="margin-bottom:16px;"><div class="card-header">Setup Required</div><div class="card-body" style="text-align:center;padding:2rem;">'
+            html += '<div class="card" style="margin-bottom:16px;"><div class="card-header">WolfUSB Unavailable</div><div class="card-body" style="text-align:center;padding:2rem;">'
                 + '<div style="font-size:2.5rem;margin-bottom:12px;">🔌</div>'
-                + '<h3 style="margin-bottom:8px;">Install WolfUSB</h3>'
-                + '<p style="color:var(--text-secondary);margin-bottom:16px;max-width:500px;margin-left:auto;margin-right:auto;">WolfUSB shares USB devices across your cluster over the network. The wolfusb tools need to be installed once per node.</p>'
-                + '<button class="btn btn-primary" onclick="installWolfUsb()" id="wolfusb-install-btn" style="padding:10px 24px;">Install WolfUSB</button>'
-                + '<div id="wolfusb-install-output" style="display:none;margin-top:16px;text-align:left;max-width:600px;margin-left:auto;margin-right:auto;"></div>'
-                + '<p style="color:var(--text-muted);font-size:11px;margin-top:16px;">Supports Debian, Ubuntu, Proxmox, Arch, Fedora, RHEL, and openSUSE.</p>'
+                + '<h3 style="margin-bottom:8px;">WolfUSB not installed</h3>'
+                + '<p style="color:var(--text-secondary);margin-bottom:12px;max-width:500px;margin-left:auto;margin-right:auto;">WolfUSB is installed automatically with WolfStack. Run the WolfStack installer or update to install it on this node.</p>'
+                + '<p style="color:var(--text-muted);font-size:11px;">Manual: <code>curl -fsSL https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfStack/master/setup.sh | sudo bash</code></p>'
                 + '</div></div>';
             el.innerHTML = html;
             return;
@@ -34558,9 +34556,7 @@ async function loadWolfUsbPage() {
         html += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;padding:12px 16px;background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-sm);">'
             + '<span style="font-size:1.5rem;">🔌</span>'
             + '<div style="flex:1;"><strong style="font-size:14px;">WolfUSB</strong>' + versionText + '<br><span style="font-size:12px;color:var(--text-muted);">Share USB devices across your cluster</span></div>'
-            + '<div style="display:flex;align-items:center;gap:8px;">'
-            + '<button class="btn btn-sm" onclick="installWolfUsb()" id="wolfusb-reinstall-btn" style="padding:3px 10px;font-size:10px;">Reinstall</button>'
-            + '<div id="wolfusb-install-output" style="display:none;"></div>'
+            + '<div style="display:flex;align-items:center;gap:12px;">'
             + '<span style="font-size:11px;color:' + statusColor + ';font-weight:600;">' + statusText + '</span>'
             + '<label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">'
             + '<input type="checkbox" id="wolfusb-enabled" ' + (status.enabled ? 'checked' : '') + ' onchange="saveWolfUsbConfig()"> Enable</label>'

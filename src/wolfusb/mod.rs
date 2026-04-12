@@ -210,53 +210,74 @@ fn run_wolfusb_with_fallback(args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// Ensure the wolfusb server is running on this node
+const WOLFUSB_SERVICE_UNIT: &str = "[Unit]\n\
+Description=WolfUSB Server\n\
+After=network.target\n\
+\n\
+[Service]\n\
+Type=simple\n\
+EnvironmentFile=-/etc/wolfusb/wolfusb.env\n\
+ExecStart=/usr/local/bin/wolfusb server --bind ${WOLFUSB_BIND:-0.0.0.0} --port ${WOLFUSB_PORT:-3240}\n\
+Restart=on-failure\n\
+RestartSec=5\n\
+\n\
+[Install]\n\
+WantedBy=multi-user.target\n";
+
+/// Ensure the wolfusb server is running on this node with the cluster secret as its auth key.
+/// Called at startup and whenever the cluster secret changes. Rewrites the env file and
+/// restarts the service if the key doesn't match.
 pub fn ensure_wolfusb_server() {
-    // Check if already running via systemctl
-    if let Ok(o) = Command::new("systemctl").args(["is-active", "--quiet", "wolfusb"]).status() {
-        if o.success() { return; } // Already running
+    use std::os::unix::fs::PermissionsExt;
+
+    if !is_wolfusb_available() {
+        warn!("WolfUSB: wolfusb binary not found — USB sharing unavailable");
+        return;
     }
 
-    // Check if port 3240 is already in use
-    if let Ok(o) = Command::new("sh")
-        .args(["-c", "ss -tlnp 2>/dev/null | grep -q ':3240 '"])
-        .status()
-    {
-        if o.success() { return; } // Something already listening
-    }
-
-    // Write the cluster secret to the wolfusb env file so systemd picks it up
     let secret = get_secret();
-    if !secret.is_empty() {
-        let _ = std::fs::create_dir_all("/etc/wolfusb");
-        let env_content = format!("WOLFUSB_BIND=0.0.0.0\nWOLFUSB_PORT=3240\nWOLFUSB_KEY={}\n", secret);
-        let _ = std::fs::write("/etc/wolfusb/wolfusb.env", &env_content);
+    if secret.is_empty() {
+        return;
     }
 
-    // Try systemctl start first
-    if let Ok(o) = Command::new("systemctl").args(["start", "wolfusb"]).status() {
-        if o.success() {
-            info!("WolfUSB: started wolfusb server via systemctl");
+    // Write env file with current cluster secret
+    let _ = std::fs::create_dir_all("/etc/wolfusb");
+    let env_content = format!("WOLFUSB_BIND=0.0.0.0\nWOLFUSB_PORT=3240\nWOLFUSB_KEY={}\n", secret);
+    let existing = std::fs::read_to_string("/etc/wolfusb/wolfusb.env").unwrap_or_default();
+    let key_changed = existing != env_content;
+    if key_changed {
+        if let Err(e) = std::fs::write("/etc/wolfusb/wolfusb.env", &env_content) {
+            warn!("WolfUSB: failed to write env file: {}", e);
             return;
         }
+        let _ = std::fs::set_permissions("/etc/wolfusb/wolfusb.env",
+            std::fs::Permissions::from_mode(0o600));
+        info!("WolfUSB: updated /etc/wolfusb/wolfusb.env with cluster secret");
     }
 
-    // Fallback: spawn directly
-    if let Some(binary) = find_wolfusb_binary() {
-        let mut cmd = Command::new(&binary);
-        cmd.args(["server", "--port", "3240"]);
-        if !secret.is_empty() {
-            cmd.arg("--key").arg(secret);
+    // Ensure systemd unit exists and is correct
+    let unit_path = "/etc/systemd/system/wolfusb.service";
+    let unit_existing = std::fs::read_to_string(unit_path).unwrap_or_default();
+    if unit_existing != WOLFUSB_SERVICE_UNIT {
+        if let Err(e) = std::fs::write(unit_path, WOLFUSB_SERVICE_UNIT) {
+            warn!("WolfUSB: failed to write systemd unit: {}", e);
+        } else {
+            let _ = Command::new("systemctl").arg("daemon-reload").status();
+            let _ = Command::new("systemctl").args(["enable", "wolfusb"]).status();
         }
-        match cmd.stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(_) => info!("WolfUSB: spawned wolfusb server directly on port 3240"),
-            Err(e) => warn!("WolfUSB: failed to start wolfusb server: {}", e),
-        }
+    }
+
+    // Restart if key changed, otherwise just ensure it's running
+    if key_changed {
+        info!("WolfUSB: restarting wolfusb service to apply new key");
+        let _ = Command::new("systemctl").args(["restart", "wolfusb"]).status();
     } else {
-        warn!("WolfUSB: wolfusb binary not found — USB sharing unavailable");
+        // Start if not already running
+        let active = Command::new("systemctl").args(["is-active", "--quiet", "wolfusb"])
+            .status().map(|s| s.success()).unwrap_or(false);
+        if !active {
+            let _ = Command::new("systemctl").args(["start", "wolfusb"]).status();
+        }
     }
 }
 
@@ -388,11 +409,23 @@ fn wolfusb_detach_device(source_address: &str, busid: &str, session_id: u64) -> 
 
 // ─── Install ───
 
-/// Install or upgrade the wolfusb binary and set up the systemd service
+/// Shell-escape a string for use inside single quotes
+fn shell_escape_single(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+
+
+/// Install or upgrade the wolfusb binary and set up the systemd service.
+/// Writes the cluster secret to /etc/wolfusb/wolfusb.env as WOLFUSB_KEY so
+/// the wolfusb server uses the same auth key as WolfStack.
 pub async fn install_wolfusb() -> Result<String, String> {
     info!("WolfUSB: installing/upgrading wolfusb");
-    let script = r#"
+    let secret = get_secret().to_string();
+    let script = format!(r#"
 set -e
+
+WOLFUSB_KEY_VALUE={secret_shell}
 
 # ─── Install libusb (required by wolfusb) ───
 if command -v pacman >/dev/null 2>&1; then
@@ -436,9 +469,18 @@ mkdir -p /etc/udev/rules.d
 echo 'SUBSYSTEM=="usb", MODE="0666", GROUP="plugdev"' > /etc/udev/rules.d/99-wolfusb.rules
 udevadm control --reload-rules 2>/dev/null || true
 
-# ─── Install systemd service ───
-if [ ! -f /etc/systemd/system/wolfusb.service ]; then
-    cat > /etc/systemd/system/wolfusb.service << 'UNIT'
+# ─── Write env file with cluster secret as auth key ───
+mkdir -p /etc/wolfusb
+cat > /etc/wolfusb/wolfusb.env << ENV
+WOLFUSB_BIND=0.0.0.0
+WOLFUSB_PORT=3240
+WOLFUSB_KEY=${{WOLFUSB_KEY_VALUE}}
+ENV
+chmod 600 /etc/wolfusb/wolfusb.env
+echo "Wrote /etc/wolfusb/wolfusb.env with cluster auth key"
+
+# ─── Install/overwrite systemd service (always, so EnvironmentFile is correct) ───
+cat > /etc/systemd/system/wolfusb.service << 'UNIT'
 [Unit]
 Description=WolfUSB Server
 After=network.target
@@ -446,22 +488,21 @@ After=network.target
 [Service]
 Type=simple
 EnvironmentFile=-/etc/wolfusb/wolfusb.env
-ExecStart=/usr/local/bin/wolfusb server --bind ${WOLFUSB_BIND:-0.0.0.0} --port ${WOLFUSB_PORT:-3240}
+ExecStart=/usr/local/bin/wolfusb server --bind ${{WOLFUSB_BIND:-0.0.0.0}} --port ${{WOLFUSB_PORT:-3240}}
 Restart=on-failure
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 UNIT
-    systemctl daemon-reload
-fi
+systemctl daemon-reload
 
-# ─── Enable and start ───
+# ─── Enable and start (service will pick up the new WOLFUSB_KEY) ───
 systemctl enable wolfusb 2>/dev/null || true
-systemctl start wolfusb 2>/dev/null || true
+systemctl restart wolfusb 2>/dev/null || systemctl start wolfusb 2>/dev/null || true
 
 echo "OK: wolfusb installation complete"
-    "#;
+"#, secret_shell = shell_escape_single(&secret));
 
     let output = tokio::process::Command::new("bash")
         .arg("-c")

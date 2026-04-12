@@ -988,6 +988,79 @@ echo "✓ wolfstack installed to /usr/local/bin/wolfstack"
 # AI knowledge base is now compiled into the binary — no separate install needed
 echo "✓ AI knowledge base embedded in binary"
 
+# ─── Install WolfUSB ────────────────────────────────────────────────────────
+echo ""
+echo "Installing WolfUSB..."
+
+# Install libusb (required by wolfusb)
+if command -v pacman >/dev/null 2>&1; then
+    pacman -S --noconfirm libusb 2>/dev/null || true
+elif command -v apt-get >/dev/null 2>&1; then
+    apt-get install -y libusb-1.0-0 2>/dev/null || true
+elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y libusbx 2>/dev/null || dnf install -y libusb1 2>/dev/null || true
+elif command -v zypper >/dev/null 2>&1; then
+    zypper install -y libusb-1_0-0 2>/dev/null || true
+fi
+
+# Stop service for upgrade
+systemctl stop wolfusb 2>/dev/null || true
+
+# Install/update wolfusb binary via its official setup.sh (handles platform detection)
+if curl -fsSL https://raw.githubusercontent.com/wolfsoftwaresystemsltd/wolfusb/main/setup.sh | bash; then
+    echo "  ✓ WolfUSB binary installed"
+else
+    echo "  ⚠ WolfUSB install failed (non-critical)"
+fi
+
+# Configure WolfUSB with the cluster secret as its auth key
+mkdir -p /etc/wolfusb
+CLUSTER_SECRET_FILE="/etc/wolfstack/custom-cluster-secret"
+if [ -f "$CLUSTER_SECRET_FILE" ] && [ -s "$CLUSTER_SECRET_FILE" ]; then
+    WOLFUSB_KEY_VALUE=$(cat "$CLUSTER_SECRET_FILE" | tr -d '\n\r')
+else
+    # Use the compiled-in default (wolfstack will use this as well)
+    WOLFUSB_KEY_VALUE="wsk_a7f3b9e2c1d4f6a8b0e3d5c7f9a1b3d5e7f9a1c3b5d7e9f0a2b4c6d8e0f1a3"
+fi
+cat > /etc/wolfusb/wolfusb.env << ENV
+WOLFUSB_BIND=0.0.0.0
+WOLFUSB_PORT=3240
+WOLFUSB_KEY=${WOLFUSB_KEY_VALUE}
+ENV
+chmod 600 /etc/wolfusb/wolfusb.env
+
+# Install systemd unit
+cat > /etc/systemd/system/wolfusb.service << 'UNIT'
+[Unit]
+Description=WolfUSB Server
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/wolfusb/wolfusb.env
+ExecStart=/usr/local/bin/wolfusb server --bind ${WOLFUSB_BIND:-0.0.0.0} --port ${WOLFUSB_PORT:-3240}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# Udev rules for USB device access
+mkdir -p /etc/udev/rules.d
+echo 'SUBSYSTEM=="usb", MODE="0666", GROUP="plugdev"' > /etc/udev/rules.d/99-wolfusb.rules
+udevadm control --reload-rules 2>/dev/null || true
+
+systemctl daemon-reload
+systemctl enable wolfusb 2>/dev/null || true
+systemctl restart wolfusb 2>/dev/null || systemctl start wolfusb 2>/dev/null || true
+
+if systemctl is-active --quiet wolfusb 2>/dev/null; then
+    echo "  ✓ WolfUSB service running on port 3240"
+else
+    echo "  ⚠ WolfUSB service not running — check: journalctl -u wolfusb -n 20"
+fi
+
 # ─── Install web UI ─────────────────────────────────────────────────────────
 echo ""
 echo "Installing web UI..."
