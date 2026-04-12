@@ -216,8 +216,10 @@ After=network.target\n\
 \n\
 [Service]\n\
 Type=simple\n\
+Environment=WOLFUSB_BIND=0.0.0.0\n\
+Environment=WOLFUSB_PORT=3240\n\
 EnvironmentFile=-/etc/wolfusb/wolfusb.env\n\
-ExecStart=/usr/local/bin/wolfusb server --bind ${WOLFUSB_BIND:-0.0.0.0} --port ${WOLFUSB_PORT:-3240}\n\
+ExecStart=/usr/local/bin/wolfusb server --bind ${WOLFUSB_BIND} --port ${WOLFUSB_PORT}\n\
 Restart=on-failure\n\
 RestartSec=5\n\
 \n\
