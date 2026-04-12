@@ -9906,6 +9906,89 @@ pub async fn wolfusb_devices(req: HttpRequest, state: web::Data<AppState>) -> Ht
     }))
 }
 
+/// GET /api/wolfusb/cluster_devices — aggregate USB devices from every node.
+/// Users pick the device they want and the target they want in one view; the
+/// backend records the real source node automatically, no matter which node's
+/// dashboard they're looking at.
+pub async fn wolfusb_cluster_devices(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) {
+        return resp;
+    }
+    let nodes = state.cluster.get_all_nodes();
+    let config = crate::wolfusb::WolfUsbConfig::load();
+    let secret = state.cluster_secret.clone();
+    let client = reqwest::Client::new();
+
+    // Collect the local node's devices first.
+    let (local_devices, local_ok) =
+        crate::wolfusb::list_local_devices_with_status(&config);
+    let mut out: Vec<serde_json::Value> = Vec::new();
+
+    for node in &nodes {
+        let entry = if node.is_self {
+            serde_json::json!({
+                "node_id": node.id,
+                "hostname": node.hostname,
+                "address": node.address,
+                "is_self": true,
+                "reachable": true,
+                "wolfusb_working": local_ok,
+                "devices": local_devices,
+            })
+        } else {
+            // Remote node — fetch via inter-node endpoint using cluster secret.
+            let urls = build_node_urls(&node.address, node.port, "/api/wolfusb/devices");
+            let mut remote_devices: Vec<serde_json::Value> = Vec::new();
+            let mut reachable = false;
+            let mut wolfusb_working = false;
+            for url in &urls {
+                match client
+                    .get(url)
+                    .header("X-WolfStack-Secret", &secret)
+                    .timeout(std::time::Duration::from_secs(5))
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        if let Ok(j) = resp.json::<serde_json::Value>().await {
+                            remote_devices = j
+                                .get("devices")
+                                .and_then(|v| v.as_array())
+                                .cloned()
+                                .unwrap_or_default();
+                            wolfusb_working = j
+                                .get("wolfusb_working")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            reachable = true;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            serde_json::json!({
+                "node_id": node.id,
+                "hostname": node.hostname,
+                "address": node.address,
+                "is_self": false,
+                "reachable": reachable,
+                "wolfusb_working": wolfusb_working,
+                "devices": remote_devices,
+            })
+        };
+        out.push(entry);
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "nodes": out,
+        "assignments": config.assignments,
+    }))
+}
+
 /// POST /api/wolfusb/assign — assign a USB device to a container/VM (cluster-wide)
 pub async fn wolfusb_assign(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
@@ -16448,6 +16531,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/wolfusb/config", web::get().to(wolfusb_get_config))
         .route("/api/wolfusb/config", web::post().to(wolfusb_save_config))
         .route("/api/wolfusb/devices", web::get().to(wolfusb_devices))
+        .route("/api/wolfusb/cluster_devices", web::get().to(wolfusb_cluster_devices))
         .route("/api/wolfusb/assign", web::post().to(wolfusb_assign))
         .route("/api/wolfusb/unassign", web::post().to(wolfusb_unassign))
         .route("/api/wolfusb/attach", web::post().to(wolfusb_attach))

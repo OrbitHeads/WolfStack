@@ -382,6 +382,17 @@ struct WolfUsbDeviceIdJson {
     address: u8,
 }
 
+/// Returns true if a USB bus number is a virtual vhci_hcd controller.
+/// We skip those because devices on them are already being served by another
+/// node — listing them as "local" here would let the user double-mount the
+/// same physical device and save an incorrect source in the assignment.
+fn is_virtual_bus(bus_number: u8) -> bool {
+    let link = format!("/sys/bus/usb/devices/usb{}", bus_number);
+    std::fs::read_link(&link)
+        .map(|p| p.to_string_lossy().contains("vhci_hcd"))
+        .unwrap_or(false)
+}
+
 /// List USB devices on this node. Returns (devices, wolfusb_working).
 pub fn list_local_devices_with_status(config: &WolfUsbConfig) -> (Vec<UsbDevice>, bool) {
     // Try with key first, fall back to without key
@@ -391,6 +402,7 @@ pub fn list_local_devices_with_status(config: &WolfUsbConfig) -> (Vec<UsbDevice>
                 Ok(raw_devices) => {
                     let devices = raw_devices.into_iter()
                         .filter(|d| d.vendor_id != 0x1d6b) // Filter root hubs
+                        .filter(|d| !is_virtual_bus(d.device_id.bus_number))
                         .map(|d| {
                             let busid = format!("wolfusb-{}-{}", d.device_id.bus_number, d.device_id.address);
                             let usb_id = format!("{:04x}:{:04x}", d.vendor_id, d.product_id);
@@ -717,6 +729,11 @@ pub fn attach_and_passthrough(
     install_mount_unit(&unit_name, source_address, busid)?;
 
     let _ = Command::new("systemctl").args(["daemon-reload"]).status();
+    // `enable` so the mount auto-starts on reboot without needing wolfstack
+    // to re-run restore_assignments. Combined with Restart=on-failure in the
+    // unit itself, this makes USB passthrough survive reboots, network blips,
+    // and server restarts on either end.
+    let _ = Command::new("systemctl").args(["enable", &unit_name]).status();
     let start = Command::new("systemctl").args(["restart", &unit_name]).status()
         .map_err(|e| format!("Failed to start mount unit: {}", e))?;
     if !start.success() {

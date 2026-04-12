@@ -34578,12 +34578,14 @@ async function loadWolfUsbPage() {
                 + '</div></div>';
         }
 
-        // Devices
+        // Devices — cluster-wide view so users can pick a device on any node
+        // and a target on any node in one place, without having to navigate
+        // per-node WolfUSB pages.
         html += '<div class="card" style="margin-bottom:16px;"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center;">'
-            + '<span>USB Devices on This Node</span>'
+            + '<span>USB Devices (Cluster-Wide)</span>'
             + '<button class="btn btn-sm" onclick="refreshWolfUsbDevices()" style="padding:4px 12px;font-size:11px;">Refresh</button>'
             + '</div><div class="card-body" id="wolfusb-devices-body">'
-            + '<div style="color:var(--text-muted);font-size:12px;text-align:center;padding:16px;">Loading devices...</div>'
+            + '<div style="color:var(--text-muted);font-size:12px;text-align:center;padding:16px;">Loading devices from all nodes...</div>'
             + '</div></div>';
 
         // Assignments
@@ -34646,44 +34648,70 @@ async function refreshWolfUsbDevices() {
     if (!body) return;
 
     try {
-        var resp = await fetch(apiUrl('/api/wolfusb/devices'));
+        // Cluster-wide view: aggregate every node's USB devices so the user
+        // picks the right physical source in one place. Backend records the
+        // real source node on assign — no more cross-wiring source/target.
+        var resp = await fetch(apiUrl('/api/wolfusb/cluster_devices'));
         var data = await resp.json();
-        var devices = data.devices || [];
+        var nodesData = data.nodes || [];
         var assignments = data.assignments || [];
-        var wolfusbWorking = data.wolfusb_working !== false;
 
-        // Show warning if wolfusb server isn't running
+        // Flatten but keep source info per device.
+        var rows = [];
+        nodesData.forEach(function(n) {
+            (n.devices || []).forEach(function(d) {
+                rows.push({
+                    busid: d.busid,
+                    vendor_id: d.vendor_id,
+                    product_id: d.product_id,
+                    product: d.product,
+                    assigned_to: d.assigned_to,
+                    source_node_id: n.node_id,
+                    source_hostname: n.hostname,
+                    source_address: n.address,
+                    source_is_self: n.is_self,
+                    source_reachable: n.reachable,
+                    source_wolfusb_working: n.wolfusb_working,
+                });
+            });
+        });
+
+        // Warning for nodes that can't share (wolfusb down or unreachable).
         var warningHtml = '';
-        if (!wolfusbWorking) {
-            warningHtml = '<div style="background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;display:flex;align-items:center;gap:10px;">'
-                + '<span style="font-size:1.2rem;">&#9888;</span>'
-                + '<span style="font-size:12px;color:var(--text-secondary);"><strong>WolfUSB server not running</strong> — Install WolfUSB tools or start the wolfusb service to enable USB device sharing.</span>'
-                + '</div>';
+        var problemNodes = nodesData.filter(function(n) { return n.reachable && !n.wolfusb_working; });
+        var unreachable = nodesData.filter(function(n) { return !n.reachable; });
+        if (problemNodes.length > 0 || unreachable.length > 0) {
+            var msgs = [];
+            if (problemNodes.length > 0) {
+                msgs.push('<strong>WolfUSB not running on:</strong> ' + problemNodes.map(function(n) { return escapeHtml(n.hostname); }).join(', '));
+            }
+            if (unreachable.length > 0) {
+                msgs.push('<strong>Unreachable:</strong> ' + unreachable.map(function(n) { return escapeHtml(n.hostname); }).join(', '));
+            }
+            warningHtml = '<div style="background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.3);border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:12px;color:var(--text-secondary);">'
+                + '⚠ ' + msgs.join(' · ') + '</div>';
         }
 
-        if (devices.length === 0) {
-            body.innerHTML = warningHtml + '<div style="text-align:center;padding:24px;"><span style="font-size:2rem;display:block;margin-bottom:8px;">🔌</span><span style="color:var(--text-muted);font-size:13px;">No USB devices detected on this node.<br><span style="font-size:11px;">Plug in a USB device and click Refresh.</span></span></div>';
+        if (rows.length === 0) {
+            body.innerHTML = warningHtml + '<div style="text-align:center;padding:24px;"><span style="font-size:2rem;display:block;margin-bottom:8px;">🔌</span><span style="color:var(--text-muted);font-size:13px;">No USB devices detected in the cluster.<br><span style="font-size:11px;">Plug in a USB device on any node and click Refresh.</span></span></div>';
         } else {
-            // Build cluster-wide target options (all nodes' containers/VMs)
             var targetOpts = await _wolfusbGetClusterTargets();
 
-            // Get current node info for source fields
-            var selfNode = allNodes.find(function(n) { return n.is_self; }) || allNodes.find(function(n) { return n.id === currentNodeId; });
-            var sourceId = selfNode ? selfNode.id : '';
-            var sourceHostname = selfNode ? selfNode.hostname : '';
-            var sourceAddr = selfNode ? selfNode.address : '';
-
             var html = warningHtml + '<table class="data-table" style="width:100%;font-size:12px;"><thead><tr>'
-                + '<th>Bus ID</th><th>Vendor:Product</th><th>Device</th><th>Status</th><th>Assign To</th>'
+                + '<th>Source Node</th><th>Bus ID</th><th>Vendor:Product</th><th>Device</th><th>Status</th><th>Assign To</th>'
                 + '</tr></thead><tbody>';
-            devices.forEach(function(d, idx) {
+            rows.forEach(function(d, idx) {
                 var rowId = 'wolfusb-row-' + idx;
+                var sourceBadge = d.source_is_self
+                    ? '<span style="background:rgba(59,130,246,0.15);color:#3b82f6;padding:2px 8px;border-radius:4px;font-size:11px;">' + escapeHtml(d.source_hostname) + ' (this node)</span>'
+                    : '<span style="background:rgba(139,92,246,0.12);color:#a78bfa;padding:2px 8px;border-radius:4px;font-size:11px;">' + escapeHtml(d.source_hostname) + '</span>';
                 var statusCell = d.assigned_to
                     ? '<span style="background:rgba(34,197,94,0.15);color:#22c55e;padding:3px 10px;border-radius:6px;font-size:11px;font-weight:600;display:inline-block;">' + escapeHtml(d.assigned_to) + '</span>'
-                    + '<br><button class="btn btn-sm" onclick="wolfusbUnassign(\'' + escapeAttr(d.busid) + '\',\'' + escapeAttr(sourceId) + '\')" style="margin-top:4px;padding:2px 8px;font-size:10px;background:rgba(239,68,68,0.1);color:#ef4444;border:1px solid rgba(239,68,68,0.2);border-radius:4px;">Remove</button>'
+                    + '<br><button class="btn btn-sm" onclick="wolfusbUnassign(\'' + escapeAttr(d.busid) + '\',\'' + escapeAttr(d.source_node_id) + '\')" style="margin-top:4px;padding:2px 8px;font-size:10px;background:rgba(239,68,68,0.1);color:#ef4444;border:1px solid rgba(239,68,68,0.2);border-radius:4px;">Remove</button>'
                     : '<span style="color:var(--text-muted);font-size:11px;">Available</span>';
 
                 html += '<tr>'
+                    + '<td>' + sourceBadge + '</td>'
                     + '<td style="font-family:monospace;white-space:nowrap;">' + escapeHtml(d.busid) + '</td>'
                     + '<td style="font-family:monospace;white-space:nowrap;">' + escapeHtml(d.vendor_id) + ':' + escapeHtml(d.product_id) + '</td>'
                     + '<td>' + escapeHtml(d.product || 'Unknown Device') + '</td>'
@@ -34692,7 +34720,7 @@ async function refreshWolfUsbDevices() {
                     + '<div style="display:flex;gap:6px;align-items:center;">'
                     + '<select id="' + rowId + '" class="form-control" style="font-size:11px;padding:5px 8px;min-width:180px;">'
                     + '<option value="">— Select target —</option>' + targetOpts + '</select>'
-                    + '<button class="btn btn-sm btn-primary" onclick="wolfusbAssignRow(' + idx + ',\'' + escapeAttr(d.busid) + '\',\'' + escapeAttr(d.product || 'USB Device') + '\',\'' + escapeAttr(d.vendor_id + ':' + d.product_id) + '\',\'' + escapeAttr(sourceId) + '\',\'' + escapeAttr(sourceHostname) + '\',\'' + escapeAttr(sourceAddr) + '\')" style="padding:5px 14px;font-size:11px;white-space:nowrap;">Assign</button>'
+                    + '<button class="btn btn-sm btn-primary" onclick="wolfusbAssignRow(' + idx + ',\'' + escapeAttr(d.busid) + '\',\'' + escapeAttr(d.product || 'USB Device') + '\',\'' + escapeAttr(d.vendor_id + ':' + d.product_id) + '\',\'' + escapeAttr(d.source_node_id) + '\',\'' + escapeAttr(d.source_hostname) + '\',\'' + escapeAttr(d.source_address) + '\')" style="padding:5px 14px;font-size:11px;white-space:nowrap;">Assign</button>'
                     + '</div></td></tr>';
             });
             html += '</tbody></table>';
