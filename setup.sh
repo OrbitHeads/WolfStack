@@ -688,7 +688,9 @@ else
 
     if [ ! -f "/etc/wolfnet/config.toml" ]; then
         # Auto-assign a cluster IP based on the last octet of the host IP
-        HOST_IP=$(hostname -I | awk '{print $1}')
+        HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}' \
+            || ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' \
+            || ip -4 addr show scope global 2>/dev/null | awk '/inet / {split($2,a,"/"); print a[1]; exit}')
         LAST_OCTET=$(echo "$HOST_IP" | awk -F. '{print $4}')
         # Ensure last octet is valid (1-254); default to 1 if detection fails
         if [ -z "$LAST_OCTET" ] || [ "$LAST_OCTET" -lt 1 ] 2>/dev/null || [ "$LAST_OCTET" -gt 254 ] 2>/dev/null; then
@@ -1257,9 +1259,17 @@ fi
 
 # ─── Done ────────────────────────────────────────────────────────────────────
 echo ""
+# Portable: `hostname -I` is a GNU-only extension, not on Arch/BSD
+get_primary_ip() {
+    hostname -I 2>/dev/null | awk '{print $1}' \
+        || ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' \
+        || ip -4 addr show scope global 2>/dev/null | awk '/inet / {split($2,a,"/"); print a[1]; exit}' \
+        || echo "localhost"
+}
+
 echo "  🐺 Installation Complete!"
 echo "  ─────────────────────────────────────"
-echo "  Dashboard:  http://$(hostname -I | awk '{print $1}'):${WS_PORT}"
+echo "  Dashboard:  http://$(get_primary_ip):${WS_PORT}"
 echo "  Login:      Use your Linux system username and password"
 echo ""
 echo "  Manage:"
