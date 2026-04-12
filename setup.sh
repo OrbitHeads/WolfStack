@@ -1135,22 +1135,85 @@ mkdir -p /etc/udev/rules.d
 echo 'SUBSYSTEM=="usb", MODE="0666", GROUP="plugdev"' > /etc/udev/rules.d/99-wolfusb.rules
 udevadm control --reload-rules 2>/dev/null || true
 
-# Load USB/IP kernel modules:
-#   - vhci-hcd: on the CLIENT (target) side — virtual USB host controller.
-#   - usbip-host: on the SERVER (source) side — wolfusb hands the authenticated
-#     TCP socket to this driver so the kernel handles all URB traffic (including
-#     isochronous, needed for webcams and USB audio).
-# Every wolfstack node is both potential client and server, so load both.
-modprobe vhci-hcd 2>/dev/null || modprobe vhci_hcd 2>/dev/null || true
-modprobe usbip-host 2>/dev/null || modprobe usbip_host 2>/dev/null || true
+# USB/IP kernel module setup.
+# Each wolfstack node is both a potential client (needs vhci-hcd) AND server
+# (needs usbip-host). On most distros these live in a "kernel-modules-extra"
+# style package that ISN'T installed by default. First try loading; if that
+# fails, install the right package for the distro, then try again.
+wolfusb_try_modprobe() {
+    modprobe vhci-hcd 2>/dev/null || modprobe vhci_hcd 2>/dev/null || true
+    modprobe usbip-host 2>/dev/null || modprobe usbip_host 2>/dev/null || true
+    [ -d /sys/devices/platform/vhci_hcd.0 ] && \
+        [ -d /sys/bus/usb/drivers/usbip-host ]
+}
+
+wolfusb_install_modules_pkg() {
+    # Read distro once
+    local ID="" LIKE=""
+    if [ -r /etc/os-release ]; then
+        ID=$(. /etc/os-release && echo "${ID:-}")
+        LIKE=$(. /etc/os-release && echo "${ID_LIKE:-}")
+    fi
+    case "$ID $LIKE" in
+        *arch*|*manjaro*|*cachyos*|*endeavouros*)
+            # Arch: modules come with the kernel package; nothing extra needed.
+            return 1
+            ;;
+        *fedora*|*rhel*|*centos*|*rocky*|*alma*)
+            # Fedora/RHEL family: kernel-modules-extra
+            dnf install -y kernel-modules-extra 2>/dev/null || \
+                yum install -y kernel-modules-extra 2>/dev/null || return 1
+            ;;
+        *debian*|*ubuntu*|*pop*|*linuxmint*|*elementary*|*raspbian*)
+            # Debian/Ubuntu family: linux-modules-extra-$(uname -r)
+            # Fall back to the meta-package when the exact kernel build isn't
+            # available (common with third-party/self-built kernels).
+            apt-get update 2>/dev/null || true
+            apt-get install -y "linux-modules-extra-$(uname -r)" 2>/dev/null || \
+                apt-get install -y linux-modules-extra-generic 2>/dev/null || \
+                apt-get install -y linux-image-extra-"$(uname -r)" 2>/dev/null || \
+                return 1
+            ;;
+        *suse*|*sles*|*opensuse*)
+            zypper install -y kernel-default-extra 2>/dev/null || return 1
+            ;;
+        *alpine*)
+            # Alpine's default kernel (linux-lts/linux-virt) has usbip built in
+            # for some image variants, missing on others. Try the modules pkg.
+            apk add --no-cache linux-lts 2>/dev/null || return 1
+            ;;
+        *)
+            # Unknown distro — can't guess the package name
+            return 1
+            ;;
+    esac
+    return 0
+}
+
 mkdir -p /etc/modules-load.d
 printf 'vhci-hcd\nusbip-core\nusbip-host\n' > /etc/modules-load.d/wolfusb.conf
-if [ -d /sys/devices/platform/vhci_hcd.0 ]; then
-    echo "  ✓ vhci-hcd kernel module loaded (virtual USB devices enabled)"
+
+if ! wolfusb_try_modprobe; then
+    echo "  USB/IP kernel modules not available — installing modules package..."
+    if wolfusb_install_modules_pkg && wolfusb_try_modprobe; then
+        :  # success
+    fi
+fi
+
+if [ -d /sys/devices/platform/vhci_hcd.0 ] && \
+   [ -d /sys/bus/usb/drivers/usbip-host ]; then
+    echo "  ✓ USB/IP kernel modules loaded (vhci-hcd + usbip-host)"
+    echo "    Node can both share local USB devices and mount remote ones."
 else
-    echo "  ⚠ vhci-hcd kernel module not loaded — virtual USB devices unavailable"
-    echo "     Install with: dnf install kernel-modules-extra (Fedora/RHEL)"
-    echo "                or: apt install linux-modules-extra-\$(uname -r) (Debian/Ubuntu)"
+    echo "  ⚠ USB/IP kernel modules unavailable on this kernel."
+    echo "    Remote USB device passthrough will not work until these are"
+    echo "    installed. Try:"
+    echo "      Fedora/RHEL:   dnf install kernel-modules-extra && reboot"
+    echo "      Debian/Ubuntu: apt install linux-modules-extra-\$(uname -r)"
+    echo "      openSUSE:      zypper install kernel-default-extra && reboot"
+    echo "      Arch:          usually already present; ensure stock linux kernel"
+    echo "    Container/cloud-optimised kernels (GCP COS, Bottlerocket, etc.)"
+    echo "    generally cannot run usbip-host and are not supported."
 fi
 
 systemctl daemon-reload
