@@ -371,7 +371,9 @@ fn find_dev_path(busid: &str) -> Option<String> {
     }
 }
 
-/// Attach to a remote USB device via the wolfusb protocol
+/// Attach to a remote USB device via wolfusb attach command.
+/// Legacy path retained for compatibility — the new mount-based flow doesn't use this.
+#[allow(dead_code)]
 fn wolfusb_attach_device(source_address: &str, busid: &str) -> Result<u64, String> {
     let (bus, addr) = parse_busid(busid)?;
     let server = format!("{}:3240", source_address);
@@ -599,6 +601,14 @@ pub fn unassign_device(config: &mut WolfUsbConfig, busid: &str, source_node_id: 
 
     match assignment {
         Some(a) => {
+            // Stop the mount unit (if one exists for this assignment)
+            let unit_name = format!("wolfusb-mount@{}-{}.service",
+                a.busid.replace('-', "_"), a.target_name);
+            let _ = Command::new("systemctl").args(["stop", &unit_name]).status();
+            let _ = Command::new("systemctl").args(["disable", &unit_name]).status();
+            let _ = std::fs::remove_file(format!("/etc/systemd/system/{}", unit_name));
+            let _ = Command::new("systemctl").arg("daemon-reload").status();
+
             // Release the device if we have a session
             if let Some(sid) = a.session_id {
                 if let Err(e) = wolfusb_detach_device(&a.source_address, &a.busid, sid) {
@@ -619,41 +629,128 @@ pub fn attach_and_passthrough(
     target_type: &str,
     target_name: &str,
 ) -> Result<String, String> {
-    // Attach via wolfusb protocol
-    let session_id = wolfusb_attach_device(source_address, busid)?;
+    // Snapshot existing USB devices so we can detect the new virtual one
+    let before = lsusb_snapshot();
 
-    // Update the assignment with the session_id
+    // Start `wolfusb mount` as a long-lived systemd unit so it survives
+    // wolfstack restarts and gets auto-restart on failure.
+    let unit_name = format!("wolfusb-mount@{}-{}.service", busid.replace('-', "_"), target_name);
+    install_mount_unit(&unit_name, source_address, busid)?;
+
+    let _ = Command::new("systemctl").args(["daemon-reload"]).status();
+    let start = Command::new("systemctl").args(["restart", &unit_name]).status()
+        .map_err(|e| format!("Failed to start mount unit: {}", e))?;
+    if !start.success() {
+        return Err(format!("Failed to start {}", unit_name));
+    }
+
+    // Wait up to 5 seconds for the virtual USB device to appear
+    let mut dev_path = None;
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Some(new_path) = find_new_device(&before) {
+            dev_path = Some(new_path);
+            break;
+        }
+    }
+
+    let dev_path = match dev_path {
+        Some(p) => p,
+        None => {
+            return Err(format!(
+                "Virtual USB device did not appear after mount. \
+                 Check: journalctl -u {} -n 30",
+                unit_name
+            ));
+        }
+    };
+
+    // Update the assignment with the virtual dev path
     let mut config = WolfUsbConfig::load();
     if let Some(a) = config.assignments.iter_mut().find(|a| a.busid == busid) {
-        a.session_id = Some(session_id);
+        a.virtual_busid = Some(dev_path.clone());
         a.active = true;
         let _ = config.save();
     }
 
-    let mut result = format!("Attached to {} via wolfusb (session {})", busid, session_id);
+    let mut result = format!("Mounted virtual USB device at {}", dev_path);
 
-    // For local passthrough (device is on this same node), pass through to container
-    if let Some(dev_path) = find_dev_path(busid) {
-        match target_type {
-            "docker" => match passthrough_to_docker(target_name, &dev_path) {
-                Ok(msg) => result.push_str(&format!("\n{}", msg)),
-                Err(e) => result.push_str(&format!("\nDocker passthrough: {}", e)),
-            },
-            "lxc" => match passthrough_to_lxc(target_name, busid, &dev_path) {
-                Ok(msg) => result.push_str(&format!("\n{}", msg)),
-                Err(e) => result.push_str(&format!("\nLXC passthrough: {}", e)),
-            },
-            "vm" => match passthrough_to_vm(target_name, busid, &dev_path) {
-                Ok(msg) => result.push_str(&format!("\n{}", msg)),
-                Err(e) => result.push_str(&format!("\nVM passthrough: {}", e)),
-            },
-            _ => {}
-        }
-    } else {
-        result.push_str(&format!("\nDevice claimed via wolfusb protocol on {}:3240", source_address));
+    // Pass into container/VM
+    match target_type {
+        "docker" => match passthrough_to_docker(target_name, &dev_path) {
+            Ok(msg) => result.push_str(&format!("\n{}", msg)),
+            Err(e) => result.push_str(&format!("\nDocker passthrough: {}", e)),
+        },
+        "lxc" => match passthrough_to_lxc(target_name, busid, &dev_path) {
+            Ok(msg) => result.push_str(&format!("\n{}", msg)),
+            Err(e) => result.push_str(&format!("\nLXC passthrough: {}", e)),
+        },
+        "vm" => match passthrough_to_vm(target_name, busid, &dev_path) {
+            Ok(msg) => result.push_str(&format!("\n{}", msg)),
+            Err(e) => result.push_str(&format!("\nVM passthrough: {}", e)),
+        },
+        _ => {}
     }
 
     Ok(result)
+}
+
+/// Snapshot current USB devices for before/after diff
+fn lsusb_snapshot() -> Vec<String> {
+    let output = match Command::new("lsusb").output() {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut paths = Vec::new();
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 4 {
+            let bus: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let addr: u32 = parts.get(3).and_then(|s| s.trim_end_matches(':').parse().ok()).unwrap_or(0);
+            if bus > 0 && addr > 0 {
+                paths.push(format!("/dev/bus/usb/{:03}/{:03}", bus, addr));
+            }
+        }
+    }
+    paths
+}
+
+/// Find a USB device that appeared since `before` was snapshotted
+fn find_new_device(before: &[String]) -> Option<String> {
+    let after = lsusb_snapshot();
+    after.into_iter().find(|p| !before.contains(p))
+}
+
+/// Install a systemd unit for `wolfusb mount` so it runs as a supervised daemon
+fn install_mount_unit(unit_name: &str, source_address: &str, busid: &str) -> Result<(), String> {
+    let (bus, addr) = parse_busid(busid)?;
+    let secret = get_secret();
+    let unit_path = format!("/etc/systemd/system/{}", unit_name);
+    let key_arg = if secret.is_empty() {
+        String::new()
+    } else {
+        format!("--key '{}' ", secret.replace('\'', "'\\''"))
+    };
+    let unit_content = format!(
+        "[Unit]\n\
+         Description=WolfUSB Mount ({} from {})\n\
+         After=network.target wolfusb.service\n\
+         Wants=wolfusb.service\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart=/usr/local/bin/wolfusb mount --server {}:3240 --bus {} --addr {} {}\n\
+         Restart=on-failure\n\
+         RestartSec=5\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        busid, source_address, source_address, bus, addr, key_arg
+    );
+    std::fs::write(&unit_path, unit_content)
+        .map_err(|e| format!("Failed to write mount unit: {}", e))?;
+    Ok(())
 }
 
 // ─── Local Device Passthrough ───

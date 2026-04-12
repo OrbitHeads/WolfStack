@@ -1057,6 +1057,18 @@ mkdir -p /etc/udev/rules.d
 echo 'SUBSYSTEM=="usb", MODE="0666", GROUP="plugdev"' > /etc/udev/rules.d/99-wolfusb.rules
 udevadm control --reload-rules 2>/dev/null || true
 
+# Load vhci-hcd kernel module (required for virtual USB devices on target nodes)
+modprobe vhci-hcd 2>/dev/null || modprobe vhci_hcd 2>/dev/null || true
+mkdir -p /etc/modules-load.d
+printf 'vhci-hcd\nusbip-core\n' > /etc/modules-load.d/wolfusb.conf
+if [ -d /sys/devices/platform/vhci_hcd.0 ]; then
+    echo "  ✓ vhci-hcd kernel module loaded (virtual USB devices enabled)"
+else
+    echo "  ⚠ vhci-hcd kernel module not loaded — virtual USB devices unavailable"
+    echo "     Install with: dnf install kernel-modules-extra (Fedora/RHEL)"
+    echo "                or: apt install linux-modules-extra-\$(uname -r) (Debian/Ubuntu)"
+fi
+
 systemctl daemon-reload
 systemctl enable wolfusb 2>/dev/null || true
 systemctl restart wolfusb 2>/dev/null || systemctl start wolfusb 2>/dev/null || true
