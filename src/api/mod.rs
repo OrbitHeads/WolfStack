@@ -9906,6 +9906,37 @@ pub async fn wolfusb_devices(req: HttpRequest, state: web::Data<AppState>) -> Ht
     }))
 }
 
+/// Pick the first non-loopback, non-wildcard IPv4 address on this host.
+/// Used to fill in the self-node's connectable address when nodes.json has
+/// it stored as a bind wildcard (0.0.0.0), which isn't routable from peers.
+fn pick_routable_address() -> Option<String> {
+    // Try tailscale first since wolfstack clusters usually use it.
+    if let Ok(out) = std::process::Command::new("tailscale").arg("ip").arg("-4").output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() && !s.starts_with("127.") {
+                return Some(s.lines().next().unwrap_or("").to_string());
+            }
+        }
+    }
+    // Fall back to `ip -4 route get 1.1.1.1` to find the egress interface's IP.
+    if let Ok(out) = std::process::Command::new("ip")
+        .args(["-4", "route", "get", "1.1.1.1"])
+        .output()
+    {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            if let Some(src) = s.split("src ").nth(1) {
+                let addr = src.split_whitespace().next().unwrap_or("");
+                if !addr.is_empty() && !addr.starts_with("127.") {
+                    return Some(addr.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// GET /api/wolfusb/cluster_devices — aggregate USB devices from every node.
 /// Users pick the device they want and the target they want in one view; the
 /// backend records the real source node automatically, no matter which node's
@@ -9945,10 +9976,22 @@ pub async fn wolfusb_cluster_devices(
 
     for node in &nodes {
         let entry = if node.is_self {
+            // If the self node's stored address is a bind wildcard (0.0.0.0
+            // or ::) it's not connectable from other nodes — pick the first
+            // routable IP we can find so the assignment's source_address
+            // is usable when a remote node tries to mount from us.
+            let advertised_address = if node.address == "0.0.0.0"
+                || node.address == "::"
+                || node.address.is_empty()
+            {
+                pick_routable_address().unwrap_or_else(|| node.address.clone())
+            } else {
+                node.address.clone()
+            };
             serde_json::json!({
                 "node_id": node.id,
                 "hostname": node.hostname,
-                "address": node.address,
+                "address": advertised_address,
                 "is_self": true,
                 "reachable": true,
                 "wolfusb_working": local_ok,
@@ -10050,9 +10093,33 @@ pub async fn wolfusb_assign(req: HttpRequest, state: web::Data<AppState>, body: 
         Ok(msg) => {
             wolfusb_broadcast_sync(&state);
 
-            // If the target is a REMOTE node, trigger the attach on that node
+            // Trigger the actual mount+passthrough. Four cases:
+            //   1. source=self, target=self  → assign_device already did local_passthrough
+            //   2. source=self, target=remote → nothing to mount here; target pulls from us
+            //   3. source=remote, target=self → WE need to mount the remote device here
+            //   4. source=remote, target=remote → forward to target to do case 3
             let is_local_target = target_node_id == self_id || target_node_id.is_empty();
-            if !is_local_target && !target_node_id.is_empty() {
+            let is_cross_node_source = !is_local_source && !effective_address.is_empty();
+
+            if is_local_target && is_cross_node_source {
+                // Case 3: we're the target and the source is elsewhere. Run
+                // attach_and_passthrough locally so the wolfusb-mount@ unit
+                // gets installed, enabled, started, and the device gets
+                // passed into the LXC/Docker/VM target.
+                let src_addr = effective_address.clone();
+                let busid_s = busid.to_string();
+                let target_type_s = target_type.to_string();
+                let target_name_s = target_name.to_string();
+                tokio::task::spawn_blocking(move || {
+                    match crate::wolfusb::attach_and_passthrough(
+                        &src_addr, &busid_s, &target_type_s, &target_name_s,
+                    ) {
+                        Ok(m) => tracing::info!("WolfUSB: local attach done — {}", m),
+                        Err(e) => tracing::warn!("WolfUSB: local attach failed — {}", e),
+                    }
+                });
+            } else if !is_local_target && !target_node_id.is_empty() {
+                // Case 4: target is a different node — forward the attach call.
                 let nodes = state.cluster.get_all_nodes();
                 if let Some(target_node) = nodes.iter().find(|n| n.id == target_node_id) {
                     let urls = crate::api::build_node_urls(&target_node.address, target_node.port, "/api/wolfusb/attach");

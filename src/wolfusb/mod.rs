@@ -1109,8 +1109,115 @@ fn passthrough_to_lxc(container_name: &str, busid: &str, dev_path: &str) -> Resu
 
 /// Note USB device availability for a VM
 fn passthrough_to_vm(vm_name: &str, busid: &str, dev_path: &str) -> Result<String, String> {
-    info!("WolfUSB: USB device {} ({}) available for VM {}", dev_path, busid, vm_name);
-    Ok(format!("USB device {} available for VM '{}'. Add it in the VM's Passthrough settings and restart the VM.", dev_path, vm_name))
+    // Parse the USB vendor:product from the assignment so we can add it to
+    // the VM's saved passthrough list. `busid` is in our wolfstack prefix form
+    // (wolfusb-B-A); the real vendor/product lives in sysfs.
+    let (vendor_id, product_id) = read_usb_ids_from_devpath(dev_path)
+        .ok_or_else(|| format!("Could not read vendor/product from {}", dev_path))?;
+
+    // Load VM config, add the device (idempotent), save.
+    let vm_config_path = format!("/var/lib/wolfstack/vms/{}.json", vm_name);
+    let mut config: serde_json::Value = match std::fs::read_to_string(&vm_config_path) {
+        Ok(s) => serde_json::from_str(&s)
+            .map_err(|e| format!("Failed to parse {}: {}", vm_config_path, e))?,
+        Err(_) => {
+            // VM config missing — fall back to the old advisory behaviour so
+            // Proxmox/libvirt-managed VMs still get a useful message.
+            info!("WolfUSB: USB device {} ({}) available for VM {}", dev_path, busid, vm_name);
+            return Ok(format!(
+                "USB device {} available for VM '{}'. Add it in the VM's \
+                 Passthrough settings and restart the VM.",
+                dev_path, vm_name
+            ));
+        }
+    };
+
+    let entry = serde_json::json!({
+        "vendor_id": vendor_id,
+        "product_id": product_id,
+        "host_bus": serde_json::Value::Null,
+        "label": format!("WolfUSB: {}", busid),
+    });
+
+    let usb_devices = config.get_mut("usb_devices")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| "VM config missing usb_devices array".to_string())?;
+
+    let already = usb_devices.iter().any(|d| {
+        d.get("vendor_id").and_then(|v| v.as_str()) == Some(vendor_id.as_str())
+            && d.get("product_id").and_then(|v| v.as_str()) == Some(product_id.as_str())
+    });
+    if !already {
+        usb_devices.push(entry);
+    }
+
+    std::fs::write(
+        &vm_config_path,
+        serde_json::to_string_pretty(&config)
+            .map_err(|e| format!("Failed to serialize VM config: {}", e))?,
+    )
+    .map_err(|e| format!("Failed to write {}: {}", vm_config_path, e))?;
+
+    info!(
+        "WolfUSB: added {}:{} to VM '{}' passthrough list",
+        vendor_id, product_id, vm_name
+    );
+
+    // Best-effort: if the VM is running, stop it so the next autostart
+    // or manual start picks up the new passthrough. Hot-plug via QMP would
+    // be better but our native QEMU spawns don't currently enable QMP.
+    let running = Command::new("pgrep")
+        .args(["-af", &format!("qemu-system.*-name {}", vm_name)])
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false);
+
+    if running {
+        info!(
+            "WolfUSB: VM '{}' is running — stopping so it restarts with the \
+             new USB passthrough (auto_start=true will bring it back up).",
+            vm_name
+        );
+        let _ = Command::new("pkill")
+            .args(["-f", &format!("qemu-system.*-name {}", vm_name)])
+            .status();
+        Ok(format!(
+            "USB device {} added to VM '{}' passthrough list; VM stopped for \
+             restart. It will restart automatically if auto_start is enabled.",
+            dev_path, vm_name
+        ))
+    } else {
+        Ok(format!(
+            "USB device {} added to VM '{}' passthrough list. Start the VM \
+             to attach it.",
+            dev_path, vm_name
+        ))
+    }
+}
+
+/// Read idVendor and idProduct from a /dev/bus/usb/XXX/YYY device path by
+/// walking sysfs. Returns ("vvvv", "pppp") hex without 0x prefix, as stored
+/// in VmConfig.usb_devices — matches how the UI saves manual VM USB entries.
+fn read_usb_ids_from_devpath(dev_path: &str) -> Option<(String, String)> {
+    // /dev/bus/usb/XXX/YYY → look up matching sysfs device.
+    let parts: Vec<&str> = dev_path.trim_start_matches("/dev/bus/usb/").split('/').collect();
+    if parts.len() != 2 { return None; }
+    let bus: u32 = parts[0].parse().ok()?;
+    let devnum: u32 = parts[1].parse().ok()?;
+    for entry in std::fs::read_dir("/sys/bus/usb/devices").ok()? {
+        let Ok(e) = entry else { continue };
+        let path = e.path();
+        let sys_bus = std::fs::read_to_string(path.join("busnum"))
+            .ok().and_then(|s| s.trim().parse::<u32>().ok());
+        let sys_dev = std::fs::read_to_string(path.join("devnum"))
+            .ok().and_then(|s| s.trim().parse::<u32>().ok());
+        if sys_bus == Some(bus) && sys_dev == Some(devnum) {
+            let v = std::fs::read_to_string(path.join("idVendor")).ok()?.trim().to_string();
+            let p = std::fs::read_to_string(path.join("idProduct")).ok()?.trim().to_string();
+            return Some((v, p));
+        }
+    }
+    None
 }
 
 // ─── Startup Restore & Container Event Hooks ───
