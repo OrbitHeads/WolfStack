@@ -688,7 +688,8 @@ else
 
     if [ ! -f "/etc/wolfnet/config.toml" ]; then
         # Auto-assign a cluster IP based on the last octet of the host IP
-        HOST_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}')
+        HOST_IP=$(ip -4 route show default 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
+        [ -z "$HOST_IP" ] && HOST_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
         [ -z "$HOST_IP" ] && HOST_IP=$(ip -4 addr show scope global 2>/dev/null | awk '/inet / {split($2,a,"/"); print a[1]; exit}')
         [ -z "$HOST_IP" ] && HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
         [ -z "$HOST_IP" ] && HOST_IP=$(hostname -i 2>/dev/null | awk '{print $1}')
@@ -1263,16 +1264,20 @@ echo ""
 # Portable IP detection — `hostname -I` is GNU-only; Arch/BSD use `hostname -i`
 # `ip` is the most reliable fallback on modern Linux.
 get_primary_ip() {
-    # Try `ip route get` first — works on everything with iproute2
-    local ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}')
+    local ip=""
+    # Default route src (works without internet connectivity)
+    ip=$(ip -4 route show default 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
     if [ -n "$ip" ]; then echo "$ip"; return; fi
-    # Fallback: first global IPv4 address from `ip addr`
+    # Route to public IP (needs connectivity, but works everywhere)
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
+    if [ -n "$ip" ]; then echo "$ip"; return; fi
+    # First global IPv4 (may be VPN/tailscale, but beats nothing)
     ip=$(ip -4 addr show scope global 2>/dev/null | awk '/inet / {split($2,a,"/"); print a[1]; exit}')
     if [ -n "$ip" ]; then echo "$ip"; return; fi
-    # Fallback: GNU `hostname -I`
+    # GNU hostname -I
     ip=$(hostname -I 2>/dev/null | awk '{print $1}')
     if [ -n "$ip" ]; then echo "$ip"; return; fi
-    # Fallback: non-GNU `hostname -i`
+    # Non-GNU hostname -i
     ip=$(hostname -i 2>/dev/null | awk '{print $1}')
     if [ -n "$ip" ] && [ "$ip" != "127.0.0.1" ]; then echo "$ip"; return; fi
     echo "localhost"
