@@ -1135,10 +1135,16 @@ mkdir -p /etc/udev/rules.d
 echo 'SUBSYSTEM=="usb", MODE="0666", GROUP="plugdev"' > /etc/udev/rules.d/99-wolfusb.rules
 udevadm control --reload-rules 2>/dev/null || true
 
-# Load vhci-hcd kernel module (required for virtual USB devices on target nodes)
+# Load USB/IP kernel modules:
+#   - vhci-hcd: on the CLIENT (target) side — virtual USB host controller.
+#   - usbip-host: on the SERVER (source) side — wolfusb hands the authenticated
+#     TCP socket to this driver so the kernel handles all URB traffic (including
+#     isochronous, needed for webcams and USB audio).
+# Every wolfstack node is both potential client and server, so load both.
 modprobe vhci-hcd 2>/dev/null || modprobe vhci_hcd 2>/dev/null || true
+modprobe usbip-host 2>/dev/null || modprobe usbip_host 2>/dev/null || true
 mkdir -p /etc/modules-load.d
-printf 'vhci-hcd\nusbip-core\n' > /etc/modules-load.d/wolfusb.conf
+printf 'vhci-hcd\nusbip-core\nusbip-host\n' > /etc/modules-load.d/wolfusb.conf
 if [ -d /sys/devices/platform/vhci_hcd.0 ]; then
     echo "  ✓ vhci-hcd kernel module loaded (virtual USB devices enabled)"
 else
