@@ -1227,6 +1227,14 @@ impl VmManager {
         };
         write_log(&format!("OS disk bus: {} (if={})", config.os_disk_bus, os_disk_if));
         
+        // QMP (QEMU Monitor Protocol) socket — lets wolfstack hot-plug/unplug
+        // USB devices on a running VM without a restart. Path is unique per
+        // VM name so we can find it later. Unix socket in a world-writable
+        // spot with filename that only root writes.
+        let qmp_path = format!("/run/wolfstack-qmp-{}.sock", name);
+        // Remove any stale socket from a previous run.
+        let _ = std::fs::remove_file(&qmp_path);
+
         cmd.arg("-name").arg(name)
            .arg("-m").arg(format!("{}M", config.memory_mb))
            .arg("-smp").arg(format!("{}", config.cpus))
@@ -1234,6 +1242,7 @@ impl VmManager {
            .arg("-vnc").arg(&vnc_arg)
            .arg("-usb").arg("-device").arg("usb-tablet")
            .arg("-vga").arg("std")
+           .arg("-qmp").arg(format!("unix:{},server,nowait", qmp_path))
            .arg("-daemonize");
 
         // ARM64 requires the 'virt' machine type and UEFI firmware (no legacy BIOS)

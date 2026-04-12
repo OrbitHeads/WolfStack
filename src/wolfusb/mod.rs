@@ -1109,20 +1109,26 @@ fn passthrough_to_lxc(container_name: &str, busid: &str, dev_path: &str) -> Resu
 
 /// Note USB device availability for a VM
 fn passthrough_to_vm(vm_name: &str, busid: &str, dev_path: &str) -> Result<String, String> {
-    // Parse the USB vendor:product from the assignment so we can add it to
-    // the VM's saved passthrough list. `busid` is in our wolfstack prefix form
-    // (wolfusb-B-A); the real vendor/product lives in sysfs.
+    // Parse the USB vendor:product from the assignment.
     let (vendor_id, product_id) = read_usb_ids_from_devpath(dev_path)
         .ok_or_else(|| format!("Could not read vendor/product from {}", dev_path))?;
 
-    // Load VM config, add the device (idempotent), save.
+    // Is this a Proxmox-managed VM? wolfstack can drive Proxmox hosts via
+    // the `qm` CLI — those VMs live in /etc/pve/qemu-server/<vmid>.conf,
+    // not in our native VM directory. If the VM name matches a qm entry,
+    // use `qm set --usb<slot> host=vid:pid` which does a live hot-plug on
+    // Proxmox 7+ (no restart needed).
+    if let Some(vmid) = find_proxmox_vmid(vm_name) {
+        return passthrough_to_proxmox_vm(vmid, vm_name, &vendor_id, &product_id, dev_path);
+    }
+
+    // Native wolfstack VM path.
     let vm_config_path = format!("/var/lib/wolfstack/vms/{}.json", vm_name);
     let mut config: serde_json::Value = match std::fs::read_to_string(&vm_config_path) {
         Ok(s) => serde_json::from_str(&s)
             .map_err(|e| format!("Failed to parse {}: {}", vm_config_path, e))?,
         Err(_) => {
-            // VM config missing — fall back to the old advisory behaviour so
-            // Proxmox/libvirt-managed VMs still get a useful message.
+            // Unknown VM (neither native nor Proxmox) — fall back to advisory.
             info!("WolfUSB: USB device {} ({}) available for VM {}", dev_path, busid, vm_name);
             return Ok(format!(
                 "USB device {} available for VM '{}'. Add it in the VM's \
@@ -1163,36 +1169,231 @@ fn passthrough_to_vm(vm_name: &str, busid: &str, dev_path: &str) -> Result<Strin
         vendor_id, product_id, vm_name
     );
 
-    // Best-effort: if the VM is running, stop it so the next autostart
-    // or manual start picks up the new passthrough. Hot-plug via QMP would
-    // be better but our native QEMU spawns don't currently enable QMP.
+    // If the VM is running, try to hot-plug the device via QMP so the user
+    // doesn't have to reboot Windows. Falls back to stop-and-autostart if
+    // QMP isn't available (e.g. VMs spawned before v16.27 didn't have a
+    // QMP socket).
     let running = Command::new("pgrep")
         .args(["-af", &format!("qemu-system.*-name {}", vm_name)])
         .output()
         .map(|o| !o.stdout.is_empty())
         .unwrap_or(false);
 
-    if running {
-        info!(
-            "WolfUSB: VM '{}' is running — stopping so it restarts with the \
-             new USB passthrough (auto_start=true will bring it back up).",
-            vm_name
-        );
-        let _ = Command::new("pkill")
-            .args(["-f", &format!("qemu-system.*-name {}", vm_name)])
-            .status();
-        Ok(format!(
-            "USB device {} added to VM '{}' passthrough list; VM stopped for \
-             restart. It will restart automatically if auto_start is enabled.",
-            dev_path, vm_name
-        ))
-    } else {
-        Ok(format!(
+    if !running {
+        return Ok(format!(
             "USB device {} added to VM '{}' passthrough list. Start the VM \
              to attach it.",
             dev_path, vm_name
-        ))
+        ));
     }
+
+    let qmp_path = format!("/run/wolfstack-qmp-{}.sock", vm_name);
+    if std::path::Path::new(&qmp_path).exists() {
+        match qmp_add_usb_host(&qmp_path, &vendor_id, &product_id) {
+            Ok(()) => {
+                info!(
+                    "WolfUSB: hot-plugged {}:{} into VM '{}' via QMP",
+                    vendor_id, product_id, vm_name
+                );
+                return Ok(format!(
+                    "USB device {} hot-plugged into running VM '{}'. Windows \
+                     should detect it as a newly-connected device within a \
+                     few seconds.",
+                    dev_path, vm_name
+                ));
+            }
+            Err(e) => {
+                warn!(
+                    "WolfUSB: QMP hot-plug failed for VM '{}' ({}), falling \
+                     back to restart",
+                    vm_name, e
+                );
+            }
+        }
+    }
+
+    // Fallback: stop the VM; auto_start brings it back with the new config.
+    info!(
+        "WolfUSB: VM '{}' has no QMP socket — stopping so it restarts with \
+         the new USB passthrough (auto_start=true will bring it back up).",
+        vm_name
+    );
+    let _ = Command::new("pkill")
+        .args(["-f", &format!("qemu-system.*-name {}", vm_name)])
+        .status();
+    Ok(format!(
+        "USB device {} added to VM '{}' passthrough list; VM stopped for \
+         restart. It will restart automatically if auto_start is enabled. \
+         (For hot-plug without restart, the VM must be started under \
+         wolfstack v16.27+ which enables a QMP socket.)",
+        dev_path, vm_name
+    ))
+}
+
+/// Send a single command to QEMU's QMP socket and return its response. We
+/// do the capability-negotiation handshake first (QMP requires it before
+/// any real command).
+fn qmp_send(socket_path: &str, command: &serde_json::Value) -> Result<serde_json::Value, String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(socket_path)
+        .map_err(|e| format!("QMP connect failed: {}", e))?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok();
+
+    let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+    // First line is the QMP greeting — discard.
+    let mut greeting = String::new();
+    reader.read_line(&mut greeting).map_err(|e| e.to_string())?;
+
+    // Negotiate capabilities.
+    writeln!(stream, "{{\"execute\":\"qmp_capabilities\"}}")
+        .map_err(|e| e.to_string())?;
+    let mut caps = String::new();
+    reader.read_line(&mut caps).map_err(|e| e.to_string())?;
+
+    // Send the real command.
+    let cmd_line = command.to_string();
+    writeln!(stream, "{}", cmd_line).map_err(|e| e.to_string())?;
+    let mut resp_line = String::new();
+    reader.read_line(&mut resp_line).map_err(|e| e.to_string())?;
+    let resp: serde_json::Value = serde_json::from_str(resp_line.trim())
+        .map_err(|e| format!("QMP returned non-JSON: {} ({})", resp_line, e))?;
+    if let Some(err) = resp.get("error") {
+        return Err(format!("QMP error: {}", err));
+    }
+    Ok(resp)
+}
+
+/// Hot-plug a USB device identified by vendor:product into a running QEMU
+/// via its QMP socket.
+fn qmp_add_usb_host(socket_path: &str, vendor_id: &str, product_id: &str) -> Result<(), String> {
+    let id = format!("wolfusb_{}_{}", vendor_id, product_id);
+    let cmd = serde_json::json!({
+        "execute": "device_add",
+        "arguments": {
+            "driver": "usb-host",
+            "id": id,
+            "vendorid": format!("0x{}", vendor_id),
+            "productid": format!("0x{}", product_id),
+        }
+    });
+    qmp_send(socket_path, &cmd)?;
+    Ok(())
+}
+
+/// Look up a Proxmox VM id by name. Proxmox keys VMs by numeric VMID; the
+/// human-friendly `name:` field is set via `qm set --name`. We match on both
+/// so the user can reference either.
+fn find_proxmox_vmid(vm_name: &str) -> Option<u32> {
+    // `qm list` is only present on Proxmox hosts. Missing = not Proxmox.
+    let out = Command::new("qm").arg("list").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines().skip(1) {
+        // Format: "VMID   NAME   STATUS   MEM(MB)  BOOTDISK(GB)  PID"
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 2 {
+            continue;
+        }
+        let vmid: u32 = match fields[0].parse() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if fields[1] == vm_name || fields[0] == vm_name {
+            return Some(vmid);
+        }
+    }
+    None
+}
+
+/// Hot-plug a USB device into a Proxmox-managed VM. Proxmox 7+ turns
+/// `qm set --usbN host=vid:pid` on a running VM into a live device_add
+/// via QMP internally, so no restart needed.
+fn passthrough_to_proxmox_vm(
+    vmid: u32,
+    vm_name: &str,
+    vendor_id: &str,
+    product_id: &str,
+    dev_path: &str,
+) -> Result<String, String> {
+    let vmid_str = vmid.to_string();
+
+    // Find the first free usb slot (usb0..usb4). Skip slots already holding
+    // a different device — don't overwrite existing passthroughs.
+    let cfg = Command::new("qm")
+        .args(["config", &vmid_str])
+        .output()
+        .map_err(|e| format!("qm config failed: {}", e))?;
+    if !cfg.status.success() {
+        return Err(format!(
+            "qm config {} failed: {}",
+            vmid,
+            String::from_utf8_lossy(&cfg.stderr).trim()
+        ));
+    }
+    let cfg_text = String::from_utf8_lossy(&cfg.stdout);
+    let wanted = format!("host={}:{}", vendor_id, product_id);
+
+    // Already assigned? Idempotent success.
+    if cfg_text
+        .lines()
+        .any(|l| l.starts_with("usb") && l.contains(&wanted))
+    {
+        return Ok(format!(
+            "USB device {} is already attached to Proxmox VM {} ({})",
+            dev_path, vm_name, vmid
+        ));
+    }
+
+    let mut free_slot: Option<u8> = None;
+    for i in 0..5u8 {
+        let prefix = format!("usb{}:", i);
+        if !cfg_text.lines().any(|l| l.starts_with(&prefix)) {
+            free_slot = Some(i);
+            break;
+        }
+    }
+    let slot = free_slot.ok_or_else(|| {
+        format!(
+            "All 5 USB slots on Proxmox VM {} are occupied; remove one \
+             before adding another.",
+            vmid
+        )
+    })?;
+
+    let out = Command::new("qm")
+        .args([
+            "set",
+            &vmid_str,
+            &format!("--usb{}", slot),
+            &wanted,
+        ])
+        .output()
+        .map_err(|e| format!("qm set failed: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "qm set --usb{} {} failed: {}",
+            slot,
+            wanted,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+
+    info!(
+        "WolfUSB: attached {} ({}:{}) to Proxmox VM {} as usb{}",
+        dev_path, vendor_id, product_id, vmid, slot
+    );
+    Ok(format!(
+        "USB device {} attached to Proxmox VM '{}' ({}) as usb{}. Hot-plug \
+         is live on Proxmox 7+; on older Proxmox versions you may need to \
+         reboot the VM.",
+        dev_path, vm_name, vmid, slot
+    ))
 }
 
 /// Read idVendor and idProduct from a /dev/bus/usb/XXX/YYY device path by
