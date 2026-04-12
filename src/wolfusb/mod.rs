@@ -1268,16 +1268,22 @@ fn qmp_send(socket_path: &str, command: &serde_json::Value) -> Result<serde_json
 }
 
 /// Hot-plug a USB device identified by vendor:product into a running QEMU
-/// via its QMP socket.
+/// via its QMP socket. QMP expects vendorid/productid as unsigned integers,
+/// not strings like "0x03f0" — older QEMU accepted strings but >= 10 rejects
+/// them with "Parameter 'productid' expects uint64".
 fn qmp_add_usb_host(socket_path: &str, vendor_id: &str, product_id: &str) -> Result<(), String> {
+    let vid = u64::from_str_radix(vendor_id.trim_start_matches("0x"), 16)
+        .map_err(|e| format!("invalid vendor_id '{}': {}", vendor_id, e))?;
+    let pid = u64::from_str_radix(product_id.trim_start_matches("0x"), 16)
+        .map_err(|e| format!("invalid product_id '{}': {}", product_id, e))?;
     let id = format!("wolfusb_{}_{}", vendor_id, product_id);
     let cmd = serde_json::json!({
         "execute": "device_add",
         "arguments": {
             "driver": "usb-host",
             "id": id,
-            "vendorid": format!("0x{}", vendor_id),
-            "productid": format!("0x{}", product_id),
+            "vendorid": vid,
+            "productid": pid,
         }
     });
     qmp_send(socket_path, &cmd)?;
