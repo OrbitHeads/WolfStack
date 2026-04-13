@@ -137,6 +137,10 @@ pub struct FileLocations {
     // ── Web UI ────────────────────────────────────
     #[serde(default = "default_web_dir")]
     pub web_dir: String,
+
+    // ── Ports ─────────────────────────────────────
+    #[serde(default = "default_ports_config")]
+    pub ports_config: String,
 }
 
 // ── Default value functions ──────────────────────────
@@ -202,6 +206,8 @@ fn default_pbs_config() -> String { "/etc/wolfstack/pbs/config.json".into() }
 fn default_wolfnote_config() -> String { "/etc/wolfstack/wolfnote.json".into() }
 
 fn default_web_dir() -> String { "/opt/wolfstack/web".into() }
+
+fn default_ports_config() -> String { "/etc/wolfstack/ports.json".into() }
 
 impl Default for FileLocations {
     fn default() -> Self {

@@ -40,6 +40,7 @@ mod wolfflow;
 mod wolfnote;
 mod wolfusb;
 mod paths;
+mod ports;
 mod compat;
 mod plugins;
 #[allow(dead_code)]
@@ -56,9 +57,9 @@ use tracing::{info, warn};
 #[derive(Parser)]
 #[command(name = "wolfstack", version, about = "Server management for the Wolf software suite")]
 struct Cli {
-    /// Port to listen on
-    #[arg(short, long, default_value_t = 8553)]
-    port: u16,
+    /// Port to listen on (overrides ports.json `api`; defaults to 8553)
+    #[arg(short, long)]
+    port: Option<u16>,
 
     /// Bind address
     #[arg(short, long, default_value = "0.0.0.0")]
@@ -144,6 +145,16 @@ async fn main() -> std::io::Result<()> {
         return Ok(());
     }
 
+    // Load persistent port config; CLI --port still overrides the API port
+    // for one-off launches. inter_node defaults to api+1 for fresh installs.
+    let mut port_cfg = ports::PortConfig::load();
+    let api_port: u16 = cli.port.unwrap_or(port_cfg.api);
+    let inter_node_port: u16 = port_cfg.inter_node;
+    // Status-port auto-fallback: try the configured port, scan upward if taken.
+    // Persists the chosen port back to ports.json so restarts are stable.
+    let status_port: u16 = ports::reserve_status_port(&cli.bind, port_cfg.status, 8550..=8599);
+    port_cfg.status = status_port;
+
     // Load or generate node ID
     let node_id_file = paths::get().node_id_file;
     let node_id = if let Ok(content) = std::fs::read_to_string(&node_id_file) {
@@ -167,7 +178,7 @@ async fn main() -> std::io::Result<()> {
     info!("  ──────────────────────────────────");
     info!("  Node ID:    {}", node_id);
     info!("  Hostname:   {}", hostname);
-    info!("  Dashboard:  http://{}:{}", cli.bind, cli.port);
+    info!("  Dashboard:  http://{}:{}", cli.bind, api_port);
     info!("  (C)Copyright Wolf Software Systems Ltd — https://wolf.uk.com");
     info!("  By Paul Clevett and my mate Claude - I have Autism");
     // Seed LXC storage paths from any mounted storage that has LXC containers
@@ -242,7 +253,7 @@ async fn main() -> std::io::Result<()> {
     let cluster = Arc::new(agent::ClusterState::new(
         node_id.clone(),
         cli.bind.clone(),
-        cli.port,
+        api_port,
     ));
 
     // Initialize VM manager
@@ -1802,9 +1813,9 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
             info!("  🔒 TLS enabled");
             info!("     Cert: {}", cert_path);
             info!("     Key:  {}", key_path);
-            info!("     HTTPS: https://{}:{}", cli.bind, cli.port);
-            info!("     HTTP (inter-node): http://{}:{}", cli.bind, cli.port + 1);
-            info!("     Status pages: http://{}:8550", cli.bind);
+            info!("     HTTPS: https://{}:{}", cli.bind, api_port);
+            info!("     HTTP (inter-node): http://{}:{}", cli.bind, inter_node_port);
+            info!("     Status pages: http://{}:{}", cli.bind, status_port);
             info!("");
 
             // Clone web_dir for second closure
@@ -1813,7 +1824,7 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
             let app_state3 = app_state.clone();
 
             // Start HTTPS server on main port + HTTP server on port+1 for inter-node
-            let https_bind = format!("{}:{}", cli.bind, cli.port);
+            let https_bind = format!("{}:{}", cli.bind, api_port);
             let https_server = HttpServer::new(move || {
                 App::new()
                     .app_data(app_state.clone())
@@ -1830,7 +1841,7 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
             })?
             .run();
 
-            let http_bind = format!("{}:{}", cli.bind, cli.port + 1);
+            let http_bind = format!("{}:{}", cli.bind, inter_node_port);
             let http_server = HttpServer::new(move || {
                 App::new()
                     .app_data(app_state2.clone())
@@ -1847,8 +1858,8 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
             })?
             .run();
 
-            // Dedicated status page listener — plain HTTP on port 8550
-            let sp_bind = format!("{}:8550", cli.bind);
+            // Dedicated status page listener — plain HTTP on the configured status port
+            let sp_bind = format!("{}:{}", cli.bind, status_port);
             let sp_server = HttpServer::new(move || {
                 App::new()
                     .app_data(app_state3.clone())
@@ -1880,8 +1891,8 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
             } else {
                 info!("  ⚡ HTTP mode (no TLS certificates found)");
             }
-            info!("     Dashboard: http://{}:{}", cli.bind, cli.port);
-            info!("     Status pages: http://{}:8550", cli.bind);
+            info!("     Dashboard: http://{}:{}", cli.bind, api_port);
+            info!("     Status pages: http://{}:{}", cli.bind, status_port);
             info!("     Tip: Use the Certificates page to request a Let's Encrypt certificate");
             info!("");
 
@@ -1897,11 +1908,11 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                     .route("/", web::get().to(index_handler))
                     .service(actix_files::Files::new("/", &web_dir).index_file("login.html"))
             })
-            .bind(format!("{}:{}", cli.bind, cli.port))?
+            .bind(format!("{}:{}", cli.bind, api_port))?
             .run();
 
-            // Dedicated status page listener — plain HTTP on port 8550
-            let sp_bind = format!("{}:8550", cli.bind);
+            // Dedicated status page listener — plain HTTP on the configured status port
+            let sp_bind = format!("{}:{}", cli.bind, status_port);
             let sp_server = HttpServer::new(move || {
                 App::new()
                     .app_data(app_state2.clone())

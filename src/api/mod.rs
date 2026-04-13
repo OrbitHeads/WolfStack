@@ -3460,6 +3460,34 @@ pub async fn wolfnet_network_status(req: HttpRequest, state: web::Data<AppState>
     HttpResponse::Ok().json(status)
 }
 
+/// GET /api/ports — return this node's persistent port config (api/inter_node/status).
+pub async fn get_ports(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    HttpResponse::Ok().json(crate::ports::PortConfig::load())
+}
+
+/// POST /api/ports — update this node's persistent port config.
+/// Changes take effect on next restart; we don't try to rebind live listeners.
+pub async fn set_ports(req: HttpRequest, state: web::Data<AppState>, body: web::Json<crate::ports::PortConfig>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let cfg = body.into_inner();
+    // Sanity: reject anything outside the unprivileged range to avoid foot-guns.
+    for (name, p) in [("api", cfg.api), ("inter_node", cfg.inter_node), ("status", cfg.status)] {
+        if p < 1024 {
+            return HttpResponse::BadRequest()
+                .json(serde_json::json!({"error": format!("{} port {} is in the privileged range (<1024)", name, p)}));
+        }
+    }
+    if cfg.api == cfg.inter_node || cfg.api == cfg.status || cfg.inter_node == cfg.status {
+        return HttpResponse::BadRequest()
+            .json(serde_json::json!({"error": "api, inter_node and status ports must all differ"}));
+    }
+    if let Err(e) = cfg.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e}));
+    }
+    HttpResponse::Ok().json(serde_json::json!({"saved": true, "restart_required": true}))
+}
+
 /// GET /api/wolfnet/used-ips — returns WolfNet IPs in use on this node
 /// Requires cluster auth — used for inter-node route discovery
 pub async fn wolfnet_used_ips_endpoint(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
@@ -16637,6 +16665,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // Agent (cluster-secret auth — inter-node communication)
         .route("/api/agent/status", web::get().to(agent_status))
         .route("/api/agent/storage/apply", web::post().to(agent_storage_apply))
+        .route("/api/ports", web::get().to(get_ports))
+        .route("/api/ports", web::post().to(set_ports))
         .route("/api/agent/cluster-name", web::post().to(agent_set_cluster_name))
         .route("/api/agent/wolfnet-routes", web::post().to(agent_set_wolfnet_routes))
         .route("/api/wolfnet/used-ips", web::get().to(wolfnet_used_ips_endpoint))

@@ -7481,6 +7481,28 @@ function openNodeSettings(nodeId) {
                     <input type="text" class="form-control" id="node-settings-pve-fingerprint" value="${node.pve_fingerprint || ''}">
                 </div>` : ''}
 
+                ${isSelf ? `<div id="node-ports-section" style="background:var(--bg-secondary,#161622);border:1px solid var(--border,#333);border-radius:8px;padding:14px 16px;margin-top:12px;">
+                    <div style="font-weight:600;font-size:13px;color:var(--text,#fff);margin-bottom:8px;">🔌 Node Ports</div>
+                    <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.4);border-radius:6px;padding:8px 10px;margin-bottom:10px;font-size:11px;color:#fca5a5;line-height:1.45;">
+                        ⚠️ Changing the <b>API</b> or <b>inter-node</b> port will disconnect this node from the cluster until peers learn the new port. Only change these if you have a specific reason (firewall conflict, port collision). The <b>status</b> port is safe to change.
+                    </div>
+                    <div style="display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font-size:12px;">
+                        <span style="color:var(--text-muted);">API (HTTPS / dashboard)</span>
+                        <input type="number" class="form-control" id="node-ports-api" min="1024" max="65535" style="font-family:'JetBrains Mono',monospace;font-size:12px;padding:4px 8px;width:120px;">
+                        <span style="color:var(--text-muted);font-size:11px;">8553</span>
+                        <span style="color:var(--text-muted);">Inter-node (HTTP, TLS only)</span>
+                        <input type="number" class="form-control" id="node-ports-inter" min="1024" max="65535" style="font-family:'JetBrains Mono',monospace;font-size:12px;padding:4px 8px;width:120px;">
+                        <span style="color:var(--text-muted);font-size:11px;">8554</span>
+                        <span style="color:var(--text-muted);">Status pages (public)</span>
+                        <input type="number" class="form-control" id="node-ports-status" min="1024" max="65535" style="font-family:'JetBrains Mono',monospace;font-size:12px;padding:4px 8px;width:120px;">
+                        <span style="color:var(--text-muted);font-size:11px;">8550</span>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;">
+                        <small style="color:var(--text-muted);">Saved values take effect on next WolfStack restart.</small>
+                        <button type="button" class="btn btn-sm" onclick="saveNodePorts()">Save Ports</button>
+                    </div>
+                </div>` : ''}
+
                 ${!isSelf ? `<div style="background:var(--bg-secondary,#161622);border:1px solid var(--border,#333);border-radius:8px;padding:14px 16px;margin-top:12px;">
                     <div style="display:flex;align-items:center;justify-content:space-between;">
                         <div>
@@ -7509,6 +7531,47 @@ function openNodeSettings(nodeId) {
 
     // Fetch version info asynchronously
     loadNodeVersionInfo(node);
+    // Populate the port settings panel for the local node
+    if (node.is_self) loadNodePorts();
+}
+
+async function loadNodePorts() {
+    try {
+        const resp = await fetch('/api/ports');
+        if (!resp.ok) return;
+        const cfg = await resp.json();
+        const a = document.getElementById('node-ports-api');
+        const i = document.getElementById('node-ports-inter');
+        const s = document.getElementById('node-ports-status');
+        if (a) a.value = cfg.api;
+        if (i) i.value = cfg.inter_node;
+        if (s) s.value = cfg.status;
+    } catch (e) {}
+}
+
+async function saveNodePorts() {
+    const api = parseInt(document.getElementById('node-ports-api').value, 10);
+    const inter_node = parseInt(document.getElementById('node-ports-inter').value, 10);
+    const status = parseInt(document.getElementById('node-ports-status').value, 10);
+    if (!api || !inter_node || !status) {
+        showToast('All three port fields are required', 'error');
+        return;
+    }
+    try {
+        const resp = await fetch('/api/ports', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ api, inter_node, status }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+            showToast(data.error || 'Failed to save ports', 'error');
+            return;
+        }
+        showToast('Ports saved — restart WolfStack to apply', 'success');
+    } catch (e) {
+        showToast('Failed to save ports: ' + e, 'error');
+    }
 }
 
 async function loadNodeVersionInfo(node) {
