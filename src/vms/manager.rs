@@ -590,6 +590,14 @@ impl VmManager {
             }
         }
 
+        // Extra disks — PVE allocates them from the same storage pool as scsi0.
+        // scsi0 is taken, so numbering starts at scsi1.
+        for (i, vol) in config.extra_disks.iter().enumerate() {
+            let slot = i + 1;
+            args.push(format!("--scsi{}", slot));
+            args.push(format!("{}:{}", storage, vol.size_gb));
+        }
+
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let output = Command::new("qm")
             .args(&args_ref)
@@ -2351,6 +2359,17 @@ impl VmManager {
 
         if config.bios_type == "ovmf" {
             args.extend(["--boot".to_string(), "uefi".to_string()]);
+        }
+
+        // Extra disks — virt-install accepts multiple --disk flags. The
+        // files are created by virt-install itself when size is given.
+        for vol in &config.extra_disks {
+            let vol_path = vol.file_path();
+            args.push("--disk".to_string());
+            args.push(format!(
+                "path={},size={},format={},bus={}",
+                vol_path.display(), vol.size_gb, vol.format, vol.bus
+            ));
         }
 
         let output = Command::new("virt-install").args(&args).output()
