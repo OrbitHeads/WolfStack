@@ -732,12 +732,22 @@ pub fn cleanup_stale_wolfnet_routes() {
             let (bridge_dev, gw) = docker_bridge_info(name);
             bridge_devs.insert(bridge_dev);
 
-            // Add route for WolfNet subnet via the Docker gateway (idempotent)
-            // Skip src hint for containers without a WolfNet IP — they'll use their Docker IP
-            // and the host MASQUERADE rule will rewrite it
-            let _ = Command::new("nsenter")
-                .args(["--target", &pid_out, "--net", "ip", "route", "replace", &wn_subnet, "via", &gw])
-                .output();
+            // Add route for WolfNet subnet via the Docker gateway (idempotent).
+            // If the container has a WolfNet IP, include `src <wolfnet_ip>` so the
+            // kernel uses it as the source address — otherwise this `replace` would
+            // clobber the src hint set by the per-WolfNet-IP loop above, leaving
+            // traffic sourced from the container's Docker IP (breaks TCP/MTU paths).
+            let wolfnet_ip = docker_effective_wolfnet_ip(name);
+            let mut args: Vec<String> = vec![
+                "--target".into(), pid_out.clone(), "--net".into(),
+                "ip".into(), "route".into(), "replace".into(),
+                wn_subnet.clone(), "via".into(), gw.clone(),
+            ];
+            if let Some(ref ip) = wolfnet_ip {
+                args.push("src".into());
+                args.push(ip.clone());
+            }
+            let _ = Command::new("nsenter").args(&args).output();
         }
     }
 
