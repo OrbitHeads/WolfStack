@@ -1706,7 +1706,18 @@ impl VmManager {
                 .args(["-f", &format!("dnsmasq.*--interface={}", tap)])
                 .output();
 
-            // Start dnsmasq as DHCP server — offers exactly one IP (the VM's WolfNet IP)
+            // Start dnsmasq as DHCP server — offers exactly one IP (the VM's WolfNet IP).
+            //
+            // Each TAP gets its own lease file at /run/dnsmasq-<tap>.leases.
+            // Without this every wolfstack dnsmasq instance on the host shared
+            // the default /var/lib/misc/dnsmasq.leases, so a lease written by
+            // an old (now-deleted) VM for the same IP would persist and the
+            // new instance would refuse to hand that IP to a fresh MAC —
+            // making recycled WolfNet IPs silently fail to DHCP.
+            // We wipe the per-TAP lease file at start so there's never a
+            // cross-VM ghost: each VM's dnsmasq begins with a clean slate.
+            let lease_file = format!("/run/dnsmasq-{}.leases", tap);
+            let _ = std::fs::remove_file(&lease_file);
             let dns_server = "8.8.8.8";
             let dnsmasq_result = Command::new("dnsmasq")
                 .args([
@@ -1719,6 +1730,7 @@ impl VmManager {
                     "--no-resolv",
                     &format!("--server={}", dns_server),
                     &format!("--pid-file=/run/dnsmasq-{}.pid", tap),
+                    &format!("--dhcp-leasefile={}", lease_file),
                 ])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -1741,6 +1753,9 @@ impl VmManager {
             let _ = Command::new("kill").arg(pid.trim()).output();
             let _ = std::fs::remove_file(format!("/run/dnsmasq-{}.pid", tap));
         }
+        // Remove the per-TAP lease file so a future VM with a different MAC
+        // won't be blocked by a ghost lease entry.
+        let _ = std::fs::remove_file(format!("/run/dnsmasq-{}.leases", tap));
 
         let _ = Command::new("ip").args(["link", "set", tap, "down"]).output();
         let _ = Command::new("ip").args(["tuntap", "del", "dev", tap, "mode", "tap"]).output();
