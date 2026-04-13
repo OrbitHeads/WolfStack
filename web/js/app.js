@@ -21537,6 +21537,7 @@ function renderAppStoreGrid() {
         if (app.docker) targets.push('Docker');
         if (app.lxc) targets.push('LXC');
         if (app.bare_metal) targets.push('Host');
+        if (app.vm) targets.push('VM');
 
         const docsLink = app.website ? `<a href="${escapeHtml(app.website)}" target="_blank" rel="noopener" title="Documentation" style="color:var(--text-muted); font-size:16px; text-decoration:none; padding:4px 6px; border-radius:6px; transition:color 0.2s, background 0.2s;" onmouseover="this.style.color='var(--accent-light)'; this.style.background='var(--accent-glow)'" onmouseout="this.style.color='var(--text-muted)'; this.style.background='none'">🔗</a>` : '';
 
@@ -21618,6 +21619,7 @@ function renderAppStoreTable() {
         if (app.docker) targets.push('<span class="appstore-target-badge">Docker</span>');
         if (app.lxc) targets.push('<span class="appstore-target-badge">LXC</span>');
         if (app.bare_metal) targets.push('<span class="appstore-target-badge">Host</span>');
+        if (app.vm) targets.push('<span class="appstore-target-badge">VM</span>');
         if (app.docker && k8sClusters.length > 0) targets.push('<span class="appstore-target-badge" style="background:rgba(50,108,229,0.12);color:#326ce5;border-color:rgba(50,108,229,0.3);">K8s</span>');
         const docsLink = app.website ? `<a href="${escapeHtml(app.website)}" target="_blank" rel="noopener" title="Docs" style="color:var(--text-muted); font-size:14px; text-decoration:none; margin-right:6px;">🔗</a>` : '';
 
@@ -21762,6 +21764,7 @@ function rebuildAppStoreTargets(app) {
         if (app.lxc) targets.push({ key: 'lxc', label: '📦 LXC' });
     }
     if (app.bare_metal) targets.push({ key: 'bare_metal', label: '🖥️ Host' });
+    if (app.vm) targets.push({ key: 'vm', label: '💿 VM' });
 
     // Keep current target if still valid, else default to first
     if (!targets.some(t => t.key === appStoreInstallTarget)) {
@@ -21984,6 +21987,41 @@ async function executeAppStoreInstall() {
     const selectedNodeId = document.getElementById('appstore-install-host').value;
     const selectedNode = allNodes.find(n => n.id === selectedNodeId);
     const appName = (appStoreApps.find(a => a.id === appStoreInstallAppId) || {}).name || appStoreInstallAppId;
+
+    // Handle VM installs separately — no install script, just a single
+    // synchronous API call that downloads the ISO, creates the VM, and
+    // starts it. The user only had to pick storage; everything else
+    // (memory, cores, disk, WolfNet IP) comes from the manifest / auto-alloc.
+    if (appStoreInstallTarget === 'vm') {
+        closeAppStoreInstallModal();
+        showToast(`${appName}: downloading ISO and creating VM — this may take a few minutes…`, 'info', 8000);
+        try {
+            const installUrl = (!selectedNode || selectedNode.is_self)
+                ? `/api/appstore/apps/${appStoreInstallAppId}/install`
+                : `/api/nodes/${selectedNodeId}/proxy/appstore/apps/${appStoreInstallAppId}/install`;
+            // install_vm reads storage_path from user_inputs — fold the
+            // dropdown selection in so the VM lands on the chosen storage.
+            const vmInputs = { ...userInputs };
+            if (storagePath) vmInputs.storage_path = storagePath;
+            const resp = await fetch(installUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    container_name: name,
+                    target: 'vm',
+                    inputs: vmInputs,
+                }),
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) throw new Error(data.error || 'VM install failed');
+            showToast(data.message || `${appName} VM created!`, 'success', 10000);
+            taskLog('App install (VM): ' + appName);
+        } catch (e) {
+            showToast('VM install failed: ' + e.message, 'error');
+            taskLog('App install (VM): ' + appName, 'failed');
+        }
+        return;
+    }
 
     // Handle Kubernetes deploy separately
     if (appStoreInstallTarget === 'kubernetes') {
