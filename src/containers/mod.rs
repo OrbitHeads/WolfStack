@@ -393,13 +393,19 @@ pub fn invalidate_count_caches() {
 }
 
 /// Invalidate all container list/stats caches (call after create/delete/start/stop).
-#[allow(dead_code)]
 pub fn invalidate_list_caches() {
     *DOCKER_LIST_CACHE.lock().unwrap() = None;
     *DOCKER_STATS_CACHE.lock().unwrap() = None;
     *DOCKER_IMAGES_CACHE.lock().unwrap() = None;
     *LXC_LIST_CACHE.lock().unwrap() = None;
     *LXC_STATS_CACHE.lock().unwrap() = None;
+}
+
+/// Invalidate just the Docker list cache. Used by write paths that change
+/// docker-side metadata (autostart, memory, cpus, wolfnet IP, env) so the
+/// UI doesn't read back the pre-change snapshot for the next 5 seconds.
+pub fn invalidate_docker_list_cache() {
+    *DOCKER_LIST_CACHE.lock().unwrap() = None;
 }
 
 /// Count Docker containers (cached for 5s).
@@ -2596,12 +2602,15 @@ pub fn docker_start(container: &str) -> Result<String, String> {
     let self_id = crate::agent::self_node_id();
     crate::wolfusb::on_container_started(container, "docker", &self_id);
 
+    invalidate_docker_list_cache();
     Ok(result)
 }
 
 /// Stop a Docker container
 pub fn docker_stop(container: &str) -> Result<String, String> {
-    run_docker_cmd(&["stop", container])
+    let result = run_docker_cmd(&["stop", container])?;
+    invalidate_docker_list_cache();
+    Ok(result)
 }
 
 /// Restart a Docker container
@@ -2609,24 +2618,32 @@ pub fn docker_restart(container: &str) -> Result<String, String> {
     let result = run_docker_cmd(&["restart", container])?;
     let self_id = crate::agent::self_node_id();
     crate::wolfusb::on_container_started(container, "docker", &self_id);
+    invalidate_docker_list_cache();
     Ok(result)
 }
 
 /// Remove a Docker container
 pub fn docker_remove(container: &str) -> Result<String, String> {
     let result = run_docker_cmd(&["rm", "-f", container]);
-    if result.is_ok() { invalidate_count_caches(); }
+    if result.is_ok() {
+        invalidate_count_caches();
+        invalidate_docker_list_cache();
+    }
     result
 }
 
 /// Pause a Docker container
 pub fn docker_pause(container: &str) -> Result<String, String> {
-    run_docker_cmd(&["pause", container])
+    let result = run_docker_cmd(&["pause", container])?;
+    invalidate_docker_list_cache();
+    Ok(result)
 }
 
 /// Unpause a Docker container
 pub fn docker_unpause(container: &str) -> Result<String, String> {
-    run_docker_cmd(&["unpause", container])
+    let result = run_docker_cmd(&["unpause", container])?;
+    invalidate_docker_list_cache();
+    Ok(result)
 }
 
 /// List Docker images
@@ -2702,6 +2719,11 @@ pub fn docker_update_config(container: &str, autostart: Option<bool>, memory_mb:
     if messages.is_empty() {
         return Ok("No changes requested".to_string());
     }
+
+    // Drop the cached list so the next GET reflects the new config (otherwise
+    // the UI re-renders the autostart checkbox / memory / cpus from the stale
+    // 5-second cache and the user's change appears to revert on refresh).
+    invalidate_docker_list_cache();
 
     Ok(messages.join("; "))
 }
