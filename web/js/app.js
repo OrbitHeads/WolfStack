@@ -1382,14 +1382,17 @@ function buildServerTree(nodes) {
             const shouldExpandNode = expandedNodes.has(node.id);
             html += `
                 <div class="server-tree-node" style="margin-left: 8px;">
-                    <div class="server-node-header" data-node-id="${node.id}" onclick="toggleServerNode('${node.id}')" style="padding-left: 8px;">
-                        <span class="tree-toggle ${shouldExpandNode ? 'expanded' : ''}" id="toggle-${node.id}">▶</span>
+                    <div class="server-node-header" data-node-id="${node.id}" onclick="openServerNode('${node.id}')" style="padding-left: 8px;">
+                        <span class="tree-toggle ${shouldExpandNode ? 'expanded' : ''}" id="toggle-${node.id}" onclick="event.stopPropagation(); toggleServerNode('${node.id}')">▶</span>
                         <span class="server-dot ${node.online ? 'online' : 'offline'}"></span>
                         <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${node.hostname}</span>
                         <span class="remove-server-btn" onclick="event.stopPropagation(); openNodeSettings('${node.id}')" title="Node settings" style="margin-left:4px;">⚙️</span>
                         ${node.is_self ? '<span class="self-badge">this</span>' : `<span class="remove-server-btn" onclick="event.stopPropagation(); confirmRemoveServer('${node.id}', '${node.hostname}')" title="Remove server">🗑️</span>`}
                     </div>
                     <div class="server-node-children ${shouldExpandNode ? 'expanded' : ''}" id="children-${node.id}">
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="dashboard" onclick="selectServerView('${node.id}', 'dashboard')">
+                            <span class="icon">📊</span> Dashboard
+                        </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="backups" onclick="selectServerView('${node.id}', 'backups')">
                             <span class="icon">💾</span> Backups
                         </a>
@@ -1408,9 +1411,6 @@ function buildServerTree(nodes) {
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="cron" onclick="selectServerView('${node.id}', 'cron')">
                             <span class="icon">🕐</span> Cron Jobs
-                        </a>
-                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="dashboard" onclick="selectServerView('${node.id}', 'dashboard')">
-                            <span class="icon">📊</span> Dashboard
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="mysql-editor" onclick="selectServerView('${node.id}', 'mysql-editor')">
                             <span class="icon">🗄️</span> Database Manager
@@ -1497,8 +1497,8 @@ function buildServerTree(nodes) {
             const shouldExpandNode = expandedNodes.has(node.id);
             html += `
                 <div class="server-tree-node" style="margin-left: 8px;">
-                    <div class="server-node-header" data-node-id="${node.id}" onclick="toggleServerNode('${node.id}')" style="padding-left: 8px;">
-                        <span class="tree-toggle ${shouldExpandNode ? 'expanded' : ''}" id="toggle-${node.id}">▶</span>
+                    <div class="server-node-header" data-node-id="${node.id}" onclick="openServerNode('${node.id}')" style="padding-left: 8px;">
+                        <span class="tree-toggle ${shouldExpandNode ? 'expanded' : ''}" id="toggle-${node.id}" onclick="event.stopPropagation(); toggleServerNode('${node.id}')">▶</span>
                         <span class="server-dot ${node.online ? 'online' : 'offline'}"></span>
                         <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${node.pve_node_name || node.hostname}</span>
                     </div>
@@ -1541,6 +1541,16 @@ function toggleServerNode(nodeId) {
         children.classList.toggle('expanded');
         toggle.classList.toggle('expanded');
     }
+}
+
+function openServerNode(nodeId) {
+    const children = document.getElementById(`children-${nodeId}`);
+    const toggle = document.getElementById(`toggle-${nodeId}`);
+    if (children && !children.classList.contains('expanded')) {
+        children.classList.add('expanded');
+        if (toggle) toggle.classList.add('expanded');
+    }
+    selectServerView(nodeId, 'dashboard');
 }
 
 function filterSidebarNodes() {
