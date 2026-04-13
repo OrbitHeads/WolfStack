@@ -171,13 +171,29 @@ pub fn update_wolfnet_routes(new_routes: &std::collections::HashMap<String, Stri
 /// when a VM/container is deleted so the IP becomes immediately available
 /// for a new allocation instead of lingering in the cache until the next
 /// reconcile cycle.
+///
+/// Also invalidates the WOLFNET_IPS_CACHE so the very next reconcile cycle
+/// re-reads fresh data from disk. Without this, the reconcile reads stale
+/// cache that still contains the freed IP and re-inserts it into the route
+/// table, which makes the IP unavailable for reuse for the cache TTL window.
 pub fn release_wolfnet_ip(ip: &str) {
     if ip.is_empty() {
         return;
     }
-    let mut cache = WOLFNET_ROUTES.lock().unwrap();
-    if cache.remove(ip).is_some() {
-        flush_routes_to_disk(&cache);
+    let removed = {
+        let mut cache = WOLFNET_ROUTES.lock().unwrap();
+        let removed = cache.remove(ip).is_some();
+        if removed {
+            flush_routes_to_disk(&cache);
+        }
+        removed
+    };
+    // Always invalidate the IPs cache — even if the IP wasn't in
+    // WOLFNET_ROUTES (not every VM/container IP ends up in the route
+    // table immediately), the caller is telling us the underlying
+    // source of truth (VM config, container labels, etc.) has changed.
+    invalidate_wolfnet_ips_cache();
+    if removed {
         info!("WolfNet: released route for {}", ip);
     }
 }
@@ -486,6 +502,14 @@ pub fn wolfnet_used_ips_cached() -> Vec<String> {
     let val = wolfnet_used_ips();
     *cache = Some((val.clone(), Instant::now()));
     val
+}
+
+/// Invalidate the WolfNet used-IPs cache so the next call recomputes.
+/// Called after a VM/container is deleted so the reconcile cycle doesn't
+/// treat the freed IP as still-in-use for up to 5s (long enough for a user
+/// to recreate a VM with the same IP and get rejected).
+pub fn invalidate_wolfnet_ips_cache() {
+    *WOLFNET_IPS_CACHE.lock().unwrap() = None;
 }
 
 // ─── LXC Storage Paths Registry ───
