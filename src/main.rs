@@ -146,14 +146,18 @@ async fn main() -> std::io::Result<()> {
     }
 
     // Load persistent port config; CLI --port still overrides the API port
-    // for one-off launches. inter_node defaults to api+1 for fresh installs.
-    let mut port_cfg = ports::PortConfig::load();
+    // for one-off launches and pulls inter_node along with it (api+1) so the
+    // pair stays coherent — matches the previous behaviour where inter_node
+    // was always derived from --port.
+    let port_cfg = ports::PortConfig::load();
     let api_port: u16 = cli.port.unwrap_or(port_cfg.api);
-    let inter_node_port: u16 = port_cfg.inter_node;
+    let inter_node_port: u16 = match cli.port {
+        Some(p) => p + 1,
+        None => port_cfg.inter_node,
+    };
     // Status-port auto-fallback: try the configured port, scan upward if taken.
     // Persists the chosen port back to ports.json so restarts are stable.
     let status_port: u16 = ports::reserve_status_port(&cli.bind, port_cfg.status, 8550..=8599);
-    port_cfg.status = status_port;
 
     // Load or generate node ID
     let node_id_file = paths::get().node_id_file;
