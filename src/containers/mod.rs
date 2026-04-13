@@ -3036,6 +3036,7 @@ pub fn docker_recreate_with_env(container: &str, new_env: &[String]) -> Result<S
         docker_start(&name)?;
     }
 
+    invalidate_docker_list_cache();
     Ok(format!("Container '{}' recreated with updated environment variables{}", name,
         if was_running { " and started" } else { "" }))
 }
@@ -6589,6 +6590,7 @@ pub fn docker_create(name: &str, image: &str, ports: &[String], env: &[String], 
             .unwrap_or_default();
 
         invalidate_count_caches();
+        invalidate_docker_list_cache();
         Ok(format!("Container '{}' created ({}){}", name, &id[..12.min(id.len())], wolfnet_msg))
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
