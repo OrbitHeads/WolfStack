@@ -2041,6 +2041,14 @@ impl VmManager {
     }
 
     pub fn delete_vm(&self, name: &str) -> Result<(), String> {
+        // Release the VM's WolfNet IP from the route cache so it becomes
+        // available for the next allocation. Without this, the IP stays
+        // in WOLFNET_ROUTES / routes.json until the next poll cycle, and
+        // a VM recreated immediately afterwards would see the IP as
+        // "still in use" and get empty / a different address.
+        let released_ip: Option<String> =
+            self.get_vm(name).and_then(|c| c.wolfnet_ip.clone());
+
         // On Proxmox, delegate to qm destroy
         if containers::is_proxmox() {
             let vmid = self.qm_vmid_by_name(name)
@@ -2052,6 +2060,7 @@ impl VmManager {
             if output.status.success() {
                 // Also clean up any WolfStack tracking config
                 let _ = fs::remove_file(self.vm_config_path(name));
+                if let Some(ip) = released_ip { containers::release_wolfnet_ip(&ip); }
                 return Ok(());
             }
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2065,12 +2074,14 @@ impl VmManager {
             let output = Command::new("virsh").args(["undefine", name, "--nvram"]).output()
                 .map_err(|e| format!("Failed to run virsh undefine: {}", e))?;
             if output.status.success() {
+                if let Some(ip) = released_ip { containers::release_wolfnet_ip(&ip); }
                 return Ok(());
             }
             // Retry without --nvram for non-UEFI VMs
             let output2 = Command::new("virsh").args(["undefine", name]).output()
                 .map_err(|e| format!("Failed to run virsh undefine: {}", e))?;
             if output2.status.success() {
+                if let Some(ip) = released_ip { containers::release_wolfnet_ip(&ip); }
                 return Ok(());
             }
             let stderr = String::from_utf8_lossy(&output2.stderr);
@@ -2100,6 +2111,10 @@ impl VmManager {
         let _ = fs::remove_file(self.vm_disk_path(name));  // fallback default path
         let _ = fs::remove_file(self.base_dir.join(format!("{}.runtime.json", name)));
         let _ = fs::remove_file(self.base_dir.join(format!("{}.log", name)));
+
+        if let Some(ip) = released_ip {
+            containers::release_wolfnet_ip(&ip);
+        }
 
         Ok(())
     }

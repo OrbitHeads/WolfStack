@@ -15,7 +15,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::sync::Mutex;
 use std::time::Instant;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 /// One-time WolfNet networking initialization — called at WolfStack startup.
 /// Sets kernel parameters and iptables rules needed for container traffic to flow through wolfnet0.
@@ -165,6 +165,21 @@ pub fn update_wolfnet_routes(new_routes: &std::collections::HashMap<String, Stri
         flush_routes_to_disk(&cache);
     }
     changed
+}
+
+/// Remove a single WolfNet IP from the route cache and flush to disk. Called
+/// when a VM/container is deleted so the IP becomes immediately available
+/// for a new allocation instead of lingering in the cache until the next
+/// reconcile cycle.
+pub fn release_wolfnet_ip(ip: &str) {
+    if ip.is_empty() {
+        return;
+    }
+    let mut cache = WOLFNET_ROUTES.lock().unwrap();
+    if cache.remove(ip).is_some() {
+        flush_routes_to_disk(&cache);
+        info!("WolfNet: released route for {}", ip);
+    }
 }
 
 /// Replace the entire route table with the given complete set of routes.
@@ -4979,8 +4994,12 @@ pub fn next_available_wolfnet_ip() -> Option<String> {
         }
     }
 
-    // Scan VM configs for WolfNet IPs
-    if let Ok(entries) = std::fs::read_dir("/etc/wolfstack/vms") {
+    // Scan VM configs for WolfNet IPs. The VM manager stores configs under
+    // /var/lib/wolfstack/vms (VmManager::base_dir). We previously looked at
+    // /etc/wolfstack/vms, which never existed, so this scan silently added
+    // nothing — meaning allocated VM IPs were treated as free and the next
+    // allocator call could hand out a colliding address.
+    if let Ok(entries) = std::fs::read_dir("/var/lib/wolfstack/vms") {
         for entry in entries.flatten() {
             if let Ok(content) = std::fs::read_to_string(entry.path()) {
                 if let Ok(vm) = serde_json::from_str::<serde_json::Value>(&content) {
