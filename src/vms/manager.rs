@@ -1123,6 +1123,16 @@ impl VmManager {
         if containers::is_proxmox() {
             let vmid = self.qm_vmid_by_name(name)
                 .ok_or_else(|| format!("VM '{}' not found in Proxmox", name))?;
+
+            // Pre-flight the config before calling qm start. PVE silently
+            // tolerates a missing `memory:` field on create/edit, then spams
+            // 'Use of uninitialized value in multiplication' from pvestatd
+            // and fails to boot the VM with no useful error. Catch the
+            // common broken configs here with a clear message instead.
+            if let Err(e) = validate_pve_config(vmid) {
+                return Err(format!("VM '{}' (vmid {}) config is invalid: {}", name, vmid, e));
+            }
+
             let output = Command::new("qm").args(["start", &vmid.to_string()]).output()
                 .map_err(|e| format!("Failed to run qm start: {}", e))?;
             if output.status.success() {
@@ -3030,4 +3040,61 @@ pub fn import_vm(archive_path: &str, new_name: Option<&str>, storage: Option<&st
 /// Clean up an export archive
 pub fn export_cleanup(archive_path: &str) {
     let _ = fs::remove_file(archive_path);
+}
+
+/// Pre-flight a Proxmox VM config before `qm start`.
+///
+/// Reads `/etc/pve/qemu-server/<vmid>.conf` and confirms the fields that PVE
+/// silently blank-tolerates but can't actually boot without. Returns the
+/// problem in plain English so the UI/CLI can surface it instead of the
+/// generic pvestatd warning.
+pub fn validate_pve_config(vmid: u32) -> Result<(), String> {
+    let path = format!("/etc/pve/qemu-server/{}.conf", vmid);
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read {}: {}", path, e))?;
+
+    // Walk the top-level section only — snapshots appear as [snap-name]
+    // headers and carry their own memory/cores which we do not validate.
+    let mut memory: Option<i64> = None;
+    let mut cores: Option<i64> = None;
+    let mut has_boot_target = false;
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        if line.starts_with('[') { break; } // start of snapshot section
+        if let Some((k, v)) = line.split_once(':') {
+            let key = k.trim();
+            let val = v.trim();
+            match key {
+                "memory" => memory = val.parse::<i64>().ok(),
+                "cores" => cores = val.parse::<i64>().ok(),
+                _ => {
+                    // Any scsi/virtio/ide/sata block device counts as a
+                    // bootable target. efidisk0 is just EFI vars, not boot.
+                    let is_disk = ["scsi", "virtio", "ide", "sata"].iter().any(|prefix| {
+                        key.starts_with(prefix)
+                            && key.len() > prefix.len()
+                            && key[prefix.len()..].chars().all(|c| c.is_ascii_digit())
+                    });
+                    if is_disk && !val.is_empty() { has_boot_target = true; }
+                }
+            }
+        }
+    }
+
+    match memory {
+        None => return Err("missing `memory:` line (e.g. `memory: 512`)".into()),
+        Some(m) if m <= 0 => return Err(format!("`memory: {}` must be greater than 0", m)),
+        _ => {}
+    }
+    match cores {
+        // PVE defaults `cores` to 1 when absent, so only reject explicitly-
+        // blank or zero values.
+        Some(c) if c <= 0 => return Err(format!("`cores: {}` must be greater than 0", c)),
+        _ => {}
+    }
+    if !has_boot_target {
+        return Err("no disk attached (need at least one of scsi0/virtio0/ide0/sata0)".into());
+    }
+    Ok(())
 }
