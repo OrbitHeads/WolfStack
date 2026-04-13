@@ -6961,7 +6961,7 @@ function openPveClusterSettings(clusterName) {
                 <div class="form-group">
                     <label>Token ID</label>
                     <input type="text" class="form-control" id="pve-settings-token-id"
-                        placeholder="root@pam!wolfstack" value="${first.pve_token ? first.pve_token.split('=')[0] + '!' + first.pve_token.split('!')[1]?.split('=')[0] : ''}">
+                        placeholder="root@pam!wolfstack" value="${first.pve_token ? first.pve_token.split('=')[0] : ''}">
                     <small style="color: var(--text-muted);">Leave blank to keep current</small>
                 </div>
                 <div class="form-group">
