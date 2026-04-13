@@ -53,12 +53,21 @@ pub struct LxcTarget {
 pub struct VmTarget {
     /// Direct URL to the installer ISO
     pub iso_url: String,
-    /// Memory in MB
+    /// Memory in MB (default; user can override)
     pub memory_mb: u32,
-    /// vCPU count
+    /// vCPU count (default; user can override)
     pub cores: u32,
-    /// OS disk size in GB
+    /// OS disk size in GB (default; user can override)
     pub disk_gb: u32,
+    /// Optional data-disk default size in GB. Apps like PBS want a small
+    /// OS disk plus a large backup-storage disk; this sets the default
+    /// size the UI suggests when one is presented. `None` means the app
+    /// only needs a single disk and no data-disk field is shown.
+    #[serde(default)]
+    pub data_disk_gb: Option<u32>,
+    /// Human-readable label for the data disk field (e.g. "Backup storage")
+    #[serde(default)]
+    pub data_disk_label: Option<String>,
     /// VGA mode — "std" for graphical installers
     #[serde(default = "default_vm_vga")]
     pub vga: String,
@@ -536,16 +545,59 @@ fn install_vm(
         .filter(|s| !s.trim().is_empty())
         .cloned();
 
+    // Allow the user to override the manifest defaults. Parsed as u32; fall
+    // back to the manifest default on parse error / empty / zero so the form
+    // can't accidentally create a 0-byte VM.
+    let parse_u32 = |key: &str, default: u32| -> u32 {
+        user_inputs
+            .get(key)
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(default)
+    };
+    let cores = parse_u32("cores", vm.cores);
+    let memory_mb = parse_u32("memory_mb", vm.memory_mb);
+    let disk_gb = parse_u32("disk_gb", vm.disk_gb);
+    // Data disk: only attach one if the manifest opted in. 0 means "no data
+    // disk" even if the manifest default was set — gives the user an explicit
+    // opt-out in the UI.
+    let data_disk_gb: Option<u32> = if vm.data_disk_gb.is_some() {
+        user_inputs
+            .get("data_disk_gb")
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .or(vm.data_disk_gb)
+            .filter(|&v| v > 0)
+    } else {
+        None
+    };
+
     let mut cfg = crate::vms::manager::VmConfig::new(
         vm_name.to_string(),
-        vm.cores,
-        vm.memory_mb,
-        vm.disk_gb,
+        cores,
+        memory_mb,
+        disk_gb,
     );
     cfg.iso_path = Some(iso_path);
     cfg.wolfnet_ip = wolfnet_ip.clone();
-    cfg.storage_path = storage_path;
+    cfg.storage_path = storage_path.clone();
     cfg.auto_start = false;
+
+    // Attach a second disk for bulk data storage (e.g. PBS backups). Lives
+    // on the same storage pool the OS disk was placed on — users who want a
+    // different location for backups can add another disk via the VM edit
+    // dialog after install.
+    if let Some(sz) = data_disk_gb {
+        let disk_storage = storage_path
+            .clone()
+            .unwrap_or_else(|| "/var/lib/wolfstack/vms".to_string());
+        cfg.extra_disks.push(crate::vms::manager::StorageVolume {
+            name: format!("{}-data", vm_name),
+            size_gb: sz,
+            storage_path: disk_storage,
+            format: "qcow2".to_string(),
+            bus: "virtio".to_string(),
+        });
+    }
 
     let vmm = crate::vms::manager::VmManager::new();
     vmm.create_vm(cfg)?;
@@ -1019,10 +1071,34 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
                 iso_url: "https://enterprise.proxmox.com/iso/proxmox-backup-server_latest.iso".into(),
                 memory_mb: 4096,
                 cores: 2,
-                disk_gb: 32,
+                // Small OS disk (PBS installs in ~4 GB — 16 gives plenty of headroom)
+                disk_gb: 16,
+                // Separate data disk for backups — 200 GB default, user should
+                // usually crank this up to match their workload.
+                data_disk_gb: Some(200),
+                data_disk_label: Some("Backup storage disk (GB)".into()),
                 vga: "std".into(),
             }),
-            user_inputs: vec![],
+            user_inputs: vec![
+                UserInput {
+                    id: "disk_gb".into(),
+                    label: "OS disk (GB)".into(),
+                    input_type: "number".into(),
+                    default: Some("16".into()),
+                    required: false,
+                    placeholder: Some("16".into()),
+                    options: vec![],
+                },
+                UserInput {
+                    id: "data_disk_gb".into(),
+                    label: "Backup storage disk (GB)".into(),
+                    input_type: "number".into(),
+                    default: Some("200".into()),
+                    required: false,
+                    placeholder: Some("200".into()),
+                    options: vec![],
+                },
+            ],
         },
 
         AppManifest {

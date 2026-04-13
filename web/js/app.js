@@ -21718,13 +21718,19 @@ function openAppStoreInstallModal(appId) {
     // Build user input fields
     const inputsEl = document.getElementById('appstore-install-inputs');
     if (app.user_inputs && app.user_inputs.length > 0) {
-        inputsEl.innerHTML = app.user_inputs.map(inp => `
+        inputsEl.innerHTML = app.user_inputs.map(inp => {
+            const htmlType = inp.input_type === 'password' ? 'password'
+                           : inp.input_type === 'number' ? 'number'
+                           : 'text';
+            const extraAttrs = inp.input_type === 'number' ? 'min="1" step="1"' : '';
+            return `
             <div style="margin-bottom:12px;">
                 <label style="font-size:13px; font-weight:500; display:block; margin-bottom:4px; color:var(--text-secondary);">${escapeHtml(inp.label)}</label>
-                <input type="${inp.input_type === 'password' ? 'password' : 'text'}" class="form-control appstore-user-input"
+                <input type="${htmlType}" ${extraAttrs} class="form-control appstore-user-input"
                     data-key="${escapeHtml(inp.id)}" placeholder="${escapeHtml(inp.placeholder || inp.default || '')}" value="${escapeHtml(inp.default || '')}">
             </div>
-        `).join('');
+            `;
+        }).join('');
     } else {
         inputsEl.innerHTML = '';
     }
