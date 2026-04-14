@@ -1656,7 +1656,40 @@ impl VmManager {
     }
 
     /// Set up host-side routing and forwarding for WolfNet IP through a TAP
+    /// Install dnsmasq if missing — required for VM TAP DHCP to work.
+    /// Without this the VM boots but DHCPDISCOVER gets no reply, and the
+    /// guest OS has no IP. Runs the same per-distro install we use for
+    /// the CIFS/NFS mount helpers, but here it's a silent background fix
+    /// rather than an interactive prompt (the VM is already starting).
+    fn ensure_dnsmasq_installed(&self) {
+        if Path::new("/usr/sbin/dnsmasq").exists() || Path::new("/sbin/dnsmasq").exists() {
+            return;
+        }
+        let (pkg_mgr, pkg_name) = match crate::installer::detect_distro() {
+            crate::installer::DistroFamily::Debian => ("apt-get", "dnsmasq-base"),
+            crate::installer::DistroFamily::RedHat => ("dnf", "dnsmasq"),
+            crate::installer::DistroFamily::Suse => ("zypper", "dnsmasq"),
+            crate::installer::DistroFamily::Arch => ("pacman", "dnsmasq"),
+            crate::installer::DistroFamily::Unknown => ("apt-get", "dnsmasq-base"),
+        };
+        info!("dnsmasq not found — installing {} via {} so VM DHCP will work", pkg_name, pkg_mgr);
+        let args: Vec<&str> = match pkg_mgr {
+            "pacman" => vec!["-Sy", "--noconfirm", pkg_name],
+            "zypper" => vec!["--non-interactive", "install", pkg_name],
+            _ => vec!["install", "-y", pkg_name],
+        };
+        let result = Command::new(pkg_mgr).args(&args).output();
+        match result {
+            Ok(o) if o.status.success() => info!("Installed {} — DHCP will now work for new VMs", pkg_name),
+            Ok(o) => warn!("Failed to install {}: {}", pkg_name, String::from_utf8_lossy(&o.stderr).trim()),
+            Err(e) => warn!("Failed to run {}: {}", pkg_mgr, e),
+        }
+    }
+
     fn setup_wolfnet_routing(&self, tap: &str, wolfnet_ip: &str) -> Result<(), String> {
+        // Make sure dnsmasq is there before we try to use it further down.
+        self.ensure_dnsmasq_installed();
+
         let wn_iface = networking::detect_wolfnet_iface().unwrap_or_else(|| "wolfnet0".to_string());
 
         // Enable per-interface forwarding on TAP + WolfNet
@@ -2366,6 +2399,13 @@ impl VmManager {
 
     /// Create a VM via libvirt (virt-install)
     fn virsh_create(&self, config: &VmConfig) -> Result<(), String> {
+        // Make sure the `default` network is active before attaching a VM
+        // to it. On some libvirtd installs it's defined but stopped, which
+        // results in a VM with a NIC but no DHCP (the guest never gets an
+        // IP). Autostart it too so it survives host reboots.
+        let _ = Command::new("virsh").args(["net-start", "default"]).output();
+        let _ = Command::new("virsh").args(["net-autostart", "default"]).output();
+
         let storage_dir = config.storage_path.as_deref().unwrap_or("/var/lib/libvirt/images");
         let disk_path = format!("{}/{}.qcow2", storage_dir, config.name);
 

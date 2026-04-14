@@ -671,11 +671,19 @@ fn install_vm(
     vmm.start_vm(vm_name)?;
 
     let ip_msg = wolfnet_ip
-        .map(|ip| format!(" WolfNet IP {} assigned — set this statically inside the guest installer.", ip))
-        .unwrap_or_else(|| String::from(" (WolfNet unavailable — guest will need LAN DHCP.)"));
+        .map(|ip| format!(" WolfNet IP {} will be served via DHCP to the VM's NIC (TAP backend).", ip))
+        .unwrap_or_else(|| String::from(" (no WolfNet IP assigned — guest will use user-mode NAT.)"));
+    // Nudge the user past the PBS installer's "Automatic installation"
+    // menu entry, which needs an answer file we don't ship and drops to
+    // a debug shell when DHCP doesn't find one.
+    let installer_tip = if app.id == "pbs" {
+        " Open VNC to finish setup: at the PBS installer menu pick **Install Proxmox Backup Server (Graphical)** — NOT 'Automatic installation' (that one needs an answer file)."
+    } else {
+        " Open VNC to complete the installer."
+    };
     Ok(format!(
-        "{} VM '{}' created and started. Open VNC to complete the installer.{}",
-        app.name, vm_name, ip_msg
+        "{} VM '{}' created and started.{}{}",
+        app.name, vm_name, installer_tip, ip_msg
     ))
 }
 
@@ -1129,7 +1137,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
             name: "Proxmox Backup Server".into(),
             icon: "💾".into(),
             category: "Backup".into(),
-            description: "Dedicated backup server for VMs, containers, and files. Installs as a KVM VM with a WolfNet IP auto-assigned.".into(),
+            description: "Dedicated backup server for VMs, containers, and files. Installs as a KVM VM with a WolfNet IP auto-assigned via DHCP. In the installer menu pick 'Install Proxmox Backup Server (Graphical)' — skip 'Automatic installation' which needs an answer file.".into(),
             website: Some("https://www.proxmox.com/proxmox-backup-server".into()),
             docker: None,
             lxc: None,
