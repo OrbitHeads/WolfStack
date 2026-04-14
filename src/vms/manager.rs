@@ -1927,6 +1927,11 @@ impl VmManager {
                     for flag in ["rxvlan", "txvlan", "rx-vlan-filter"] {
                         let _ = Command::new("ethtool").args(["-K", iface, flag, "off"]).output();
                     }
+                    // Some drivers (r8169, some Intel) hard-pin
+                    // rx-vlan-filter on and refuse to let ethtool change it.
+                    // Kick off a passive learner that registers VLAN VIDs
+                    // with the hardware filter table as the guest uses them.
+                    crate::vms::vlan_learner::start_if_needed(iface);
                     info!("Passthrough: {} already in bridge {} (hw VLAN offload disabled on NIC)", iface, bridge_name);
                     return Ok(bridge_name.to_string());
                 }
@@ -1996,6 +2001,8 @@ impl VmManager {
         for flag in ["rxvlan", "txvlan", "rx-vlan-filter"] {
             let _ = Command::new("ethtool").args(["-K", iface, flag, "off"]).output();
         }
+        // Fallback for drivers that hard-pin rx-vlan-filter on.
+        crate::vms::vlan_learner::start_if_needed(iface);
         // Keep bridge vlan_filtering off (the kernel default) so it acts
         // as a transparent dumb switch for tagged frames. Being explicit
         // here guards against the case where some host-side tool flipped
@@ -2078,6 +2085,7 @@ impl VmManager {
         for flag in ["rxvlan", "txvlan", "rx-vlan-filter"] {
             let _ = Command::new("ethtool").args(["-K", iface, flag, "off"]).output();
         }
+        crate::vms::vlan_learner::start_if_needed(iface);
         let _ = std::fs::write(format!("/sys/class/net/{}/bridge/vlan_filtering", bridge_name), "0");
         let _ = Command::new("ip").args(["link", "set", iface, "master", &bridge_name]).output();
         let _ = Command::new("ip").args(["link", "set", iface, "up"]).output();
@@ -2213,6 +2221,11 @@ impl VmManager {
                     }
                 }
             }
+            // Some NICs hard-pin rx-vlan-filter on and ethtool can't flip
+            // it. Ensure a passive VID learner is running — it'll register
+            // VIDs with the hardware filter table as guests use them.
+            // Idempotent; no-op for NICs that don't need it.
+            crate::vms::vlan_learner::start_if_needed(iface);
         }
     }
 

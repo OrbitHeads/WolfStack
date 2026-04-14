@@ -3615,12 +3615,15 @@ pub async fn cluster_browser_start(
         crate::cluster_browser::start_session(&user, &homepage)
     }).await;
 
+    // External URL: use the host the browser is currently connected to,
+    // not the WolfNet IP — for users on a public domain
+    // (e.g. cynthia.wolfterritories.org) the WolfNet IP is unreachable.
+    let connect_host = client_facing_host(&req).unwrap_or_else(|| host_ip.clone());
+
     match result {
         Ok(Ok(session)) => HttpResponse::Ok().json(serde_json::json!({
             "session": session,
-            // Connect URL the frontend opens — the linuxserver/firefox
-            // image's KasmVNC web UI lives at the root of the mapped port.
-            "connect_url": format!("http://{}:{}", host_ip, session.web_port),
+            "connect_url": format!("http://{}:{}", connect_host, session.web_port),
         })),
         Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})),
@@ -3662,6 +3665,8 @@ pub async fn cluster_browser_start_stream(
         urlencoding_simple(&user)
     );
     let homepage = body.homepage.clone().filter(|s| !s.trim().is_empty()).unwrap_or(default_homepage);
+    // External connect URL: same reasoning as cluster_browser_start.
+    let connect_host = client_facing_host(&req).unwrap_or_else(|| host_ip.clone());
 
     let (std_tx, std_rx) = std::sync::mpsc::channel::<String>();
     let (tok_tx, mut tok_rx) = tokio::sync::mpsc::channel::<String>(256);
@@ -3670,11 +3675,10 @@ pub async fn cluster_browser_start_stream(
         let result = crate::cluster_browser::start_session_streamed(&user, &homepage, std_tx.clone());
         match result {
             Ok(session) => {
-                let host = local_wolfnet_ip().unwrap_or_else(|| "127.0.0.1".into());
                 let payload = serde_json::json!({
                     "session": session,
                     // Plain HTTP — KasmVNC inside the container is HTTP only.
-                    "connect_url": format!("http://{}:{}", host, session.web_port),
+                    "connect_url": format!("http://{}:{}", connect_host, session.web_port),
                 });
                 let _ = std_tx.send(format!("[done] {}", payload));
             }
@@ -3739,6 +3743,29 @@ pub async fn cluster_browser_homepage(
         .insert_header(("Content-Type", "text/html; charset=utf-8"))
         .insert_header(("Cache-Control", "no-cache"))
         .body(html)
+}
+
+/// Hostname the user's browser is currently talking to, derived from the
+/// request's `Host` header (or `X-Forwarded-Host` if a reverse proxy is
+/// in front of us). Used to build externally-reachable URLs (cluster
+/// browser session popup, etc.) — using `local_wolfnet_ip()` for those
+/// fails for anyone outside the WolfNet who reached the dashboard via a
+/// public domain. Strips the port — the caller is going to append its
+/// own. Returns None if no usable header is present.
+fn client_facing_host(req: &HttpRequest) -> Option<String> {
+    let raw = req.headers().get("X-Forwarded-Host")
+        .or_else(|| req.headers().get("Host"))
+        .and_then(|v| v.to_str().ok())?;
+    // X-Forwarded-Host may be a comma-separated list; take the first.
+    let first = raw.split(',').next()?.trim();
+    // Strip :port if present — careful with IPv6 literals "[::1]:8553".
+    let host = if first.starts_with('[') {
+        // IPv6 literal: keep through the closing bracket
+        first.split(']').next().map(|s| format!("{}]", s)).unwrap_or_else(|| first.to_string())
+    } else {
+        first.split(':').next().unwrap_or(first).to_string()
+    };
+    if host.is_empty() { None } else { Some(host) }
 }
 
 fn local_wolfnet_ip() -> Option<String> {
