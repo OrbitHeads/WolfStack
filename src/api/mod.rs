@@ -10754,6 +10754,71 @@ pub async fn prepare_install_package(
     }))
 }
 
+/// POST /api/appstore/apps/{id}/install-stream — VM-target streaming install
+/// Emits progress lines as Server-Sent Events so the UI can show download
+/// bytes / elapsed time / stage transitions in a task-log entry instead of
+/// freezing on a single blocking POST for several minutes.
+pub async fn appstore_install_stream(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<AppInstallRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let app_id = path.into_inner();
+
+    let Some(app) = appstore::get_app(&app_id) else {
+        return HttpResponse::NotFound().json(serde_json::json!({"error": format!("App '{}' not found", app_id)}));
+    };
+    if app.vm.is_none() {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "This app has no VM target"}));
+    }
+
+    let mut inputs = body.inputs.clone();
+    inputs.insert("CONTAINER_NAME".to_string(), body.container_name.clone());
+    let container_name = body.container_name.clone();
+
+    // std::sync::mpsc because install_vm_streamed runs in a blocking thread
+    // and needs a Send Sender. Bridge to tokio so the SSE stream can await.
+    let (std_tx, std_rx) = std::sync::mpsc::channel::<String>();
+    let (tok_tx, mut tok_rx) = tokio::sync::mpsc::channel::<String>(256);
+
+    // Worker: do the install, close the channel when done.
+    std::thread::spawn(move || {
+        let result = appstore::install_vm_streamed(&app, &container_name, &inputs, std_tx.clone());
+        // Final marker — success or error, both go through the stream.
+        match result {
+            Ok(msg) => { let _ = std_tx.send(format!("[done] {}", msg)); }
+            Err(e)  => { let _ = std_tx.send(format!("[error] {}", e)); }
+        }
+        // std_tx dropping here signals EOF to the bridge.
+    });
+
+    // Bridge blocking recv() -> tokio channel.
+    tokio::task::spawn_blocking(move || {
+        while let Ok(msg) = std_rx.recv() {
+            if tok_tx.blocking_send(msg).is_err() { break; }
+        }
+    });
+
+    let stream = async_stream::stream! {
+        while let Some(msg) = tok_rx.recv().await {
+            // Embed as SSE data. Newlines inside a message get mapped to
+            // `\ndata: ` so the client sees a single event with multi-line
+            // body; keeps any future multi-line messages intact.
+            let event = format!("data: {}\n\n", msg.replace('\n', "\ndata: "));
+            yield Ok::<_, actix_web::Error>(actix_web::web::Bytes::from(event));
+        }
+    };
+
+    HttpResponse::Ok()
+        .insert_header(("Content-Type", "text/event-stream"))
+        .insert_header(("Cache-Control", "no-cache"))
+        .insert_header(("Connection", "keep-alive"))
+        .insert_header(("X-Accel-Buffering", "no"))
+        .streaming(stream)
+}
+
 /// POST /api/appstore/apps/{id}/prepare-install — generate install script for live terminal
 pub async fn appstore_prepare_install(
     req: HttpRequest,
@@ -16816,6 +16881,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/appstore/apps/{id}", web::get().to(appstore_get))
         .route("/api/appstore/apps/{id}/install", web::post().to(appstore_install))
         .route("/api/appstore/apps/{id}/prepare-install", web::post().to(appstore_prepare_install))
+        .route("/api/appstore/apps/{id}/install-stream", web::post().to(appstore_install_stream))
         .route("/api/system/prepare-install-package", web::post().to(prepare_install_package))
         .route("/api/appstore/installed", web::get().to(appstore_installed))
         .route("/api/appstore/installed/{id}", web::delete().to(appstore_uninstall))

@@ -6376,7 +6376,9 @@ async function vmAction(name, action, btn) {
     if (btn) btn.innerHTML = '<span style="display:inline-block;width:16px;height:16px;border:2px solid rgba(255,255,255,0.2);border-top-color:#fff;border-radius:50%;animation:spin 0.7s linear infinite;"></span>';
 
     try {
-        const actionVerb = action === 'stop' ? 'Stopping' : action === 'force_stop' ? 'Force stopping' : action.charAt(0).toUpperCase() + action.slice(1) + 'ing';
+        const actionVerb = action === 'stop' ? 'Stopping' :
+                           action === 'force-stop' ? 'Force stopping' :
+                           action.charAt(0).toUpperCase() + action.slice(1) + 'ing';
         showToast(`${actionVerb} VM...`, 'info');
         const resp = await fetch(apiUrl(`/api/vms/${name}/action`), {
             method: 'POST',
@@ -6385,10 +6387,18 @@ async function vmAction(name, action, btn) {
         });
         const data = await resp.json();
         if (resp.ok) {
-            const pastTense = action === 'stop' ? 'stopped' : action === 'force_stop' ? 'force stopped' : `${action}ed`;
+            const pastTense = action === 'stop' ? 'stopped' :
+                              action === 'force-stop' ? 'force stopped' :
+                              `${action}ed`;
             showToast(`VM ${pastTense}`, 'success');
             taskLog('VM ' + action + ': ' + name);
-            setTimeout(loadVms, 2000);
+            // Graceful stop is backgrounded on the backend — poll the list
+            // a few times so the UI catches the state flip as soon as the
+            // guest finishes ACPI shutdown, without having to wait the
+            // full qm shutdown --timeout.
+            setTimeout(loadVms, 1000);
+            setTimeout(loadVms, 3000);
+            setTimeout(loadVms, 8000);
         } else {
             showToast(data.error || 'Action failed', 'error');
             taskLog('VM ' + action + ': ' + name, 'failed');
@@ -22203,31 +22213,81 @@ async function executeAppStoreInstall() {
     // (memory, cores, disk, WolfNet IP) comes from the manifest / auto-alloc.
     if (appStoreInstallTarget === 'vm') {
         closeAppStoreInstallModal();
-        showToast(`${appName}: downloading ISO and creating VM — this may take a few minutes…`, 'info', 8000);
+        const vmInputs = { ...userInputs };
+        if (storagePath) vmInputs.storage_path = storagePath;
+        const installUrl = (!selectedNode || selectedNode.is_self)
+            ? `/api/appstore/apps/${appStoreInstallAppId}/install-stream`
+            : `/api/nodes/${selectedNodeId}/proxy/appstore/apps/${appStoreInstallAppId}/install-stream`;
+
+        // Open a running task-log entry so the user can watch progress in
+        // the footer without a modal pinned to the screen. Expand it so
+        // the download-progress lines are visible straight away.
+        const taskId = addTaskLogEntry({
+            description: `Installing ${appName} (VM)…`,
+            status: 'running',
+            logLines: ['Connecting to install stream…'],
+            type: 'info',
+        });
+        const entry = _taskLogEntries.find(e => e.id === taskId);
+        if (entry) entry.expanded = true;
+        showTaskLog?.();
+
         try {
-            const installUrl = (!selectedNode || selectedNode.is_self)
-                ? `/api/appstore/apps/${appStoreInstallAppId}/install`
-                : `/api/nodes/${selectedNodeId}/proxy/appstore/apps/${appStoreInstallAppId}/install`;
-            // install_vm reads storage_path from user_inputs — fold the
-            // dropdown selection in so the VM lands on the chosen storage.
-            const vmInputs = { ...userInputs };
-            if (storagePath) vmInputs.storage_path = storagePath;
             const resp = await fetch(installUrl, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    container_name: name,
-                    target: 'vm',
-                    inputs: vmInputs,
-                }),
+                headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+                body: JSON.stringify({ container_name: name, target: 'vm', inputs: vmInputs }),
             });
-            const data = await resp.json().catch(() => ({}));
-            if (!resp.ok) throw new Error(data.error || 'VM install failed');
-            showToast(data.message || `${appName} VM created!`, 'success', 10000);
-            taskLog('App install (VM): ' + appName);
+            if (!resp.ok || !resp.body) {
+                const data = await resp.json().catch(() => ({}));
+                throw new Error(data.error || `HTTP ${resp.status}`);
+            }
+            const reader = resp.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let finalMsg = '';
+            let failed = false;
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                // SSE frames are separated by blank lines.
+                let sep;
+                while ((sep = buffer.indexOf('\n\n')) !== -1) {
+                    const frame = buffer.slice(0, sep);
+                    buffer = buffer.slice(sep + 2);
+                    const lines = frame.split('\n')
+                        .filter(l => l.startsWith('data:'))
+                        .map(l => l.slice(5).trimStart());
+                    if (lines.length === 0) continue;
+                    const text = lines.join('\n');
+                    if (text.startsWith('[done] ')) {
+                        finalMsg = text.slice(7);
+                    } else if (text.startsWith('[error] ')) {
+                        failed = true;
+                        finalMsg = text.slice(8);
+                        updateTaskLogEntry(taskId, { logLine: `ERROR: ${finalMsg}` });
+                    } else {
+                        // Live progress — update the description so the
+                        // footer shows the latest line, and append to the
+                        // log so history is preserved.
+                        updateTaskLogEntry(taskId, {
+                            description: `Installing ${appName}: ${text.split('\n')[0]}`,
+                            logLine: text,
+                        });
+                    }
+                }
+            }
+            if (failed) {
+                updateTaskLogEntry(taskId, { status: 'failed', description: `Install failed: ${appName}` });
+                showToast(`VM install failed: ${finalMsg}`, 'error');
+            } else {
+                updateTaskLogEntry(taskId, { status: 'completed', description: `${appName} VM ready — see log for next steps` });
+                showToast(finalMsg || `${appName} VM created!`, 'success', 10000);
+            }
         } catch (e) {
+            updateTaskLogEntry(taskId, { status: 'failed', logLine: `ERROR: ${e.message}` });
             showToast('VM install failed: ' + e.message, 'error');
-            taskLog('App install (VM): ' + appName, 'failed');
         }
         return;
     }

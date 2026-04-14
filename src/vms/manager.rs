@@ -2093,26 +2093,33 @@ impl VmManager {
     /// plug). Graceful is the default for user-initiated stop actions;
     /// internal callers that need a fast, definite stop pass true.
     pub fn stop_vm(&self, name: &str, force: bool) -> Result<(), String> {
-        // On Proxmox: graceful = `qm shutdown` (ACPI, waits up to 30 s);
-        // force = `qm stop` (immediate)
+        // On Proxmox: force = `qm stop` (immediate, block).
+        // Graceful = `qm shutdown --timeout 60` backgrounded so the HTTP
+        // response returns immediately — previously we blocked up to 30 s
+        // waiting, which made the dashboard look frozen.
         if containers::is_proxmox() {
             let vmid = self.qm_vmid_by_name(name)
                 .ok_or_else(|| format!("VM '{}' not found in Proxmox", name))?;
-            let (cmd_args, label): (Vec<String>, &str) = if force {
-                (vec!["stop".into(), vmid.to_string()], "qm stop")
-            } else {
-                (
-                    vec!["shutdown".into(), vmid.to_string(), "--timeout".into(), "30".into()],
-                    "qm shutdown",
-                )
-            };
-            let output = Command::new("qm").args(&cmd_args).output()
-                .map_err(|e| format!("Failed to run {}: {}", label, e))?;
-            if output.status.success() {
-                return Ok(());
+            if force {
+                let output = Command::new("qm").args(["stop", &vmid.to_string()]).output()
+                    .map_err(|e| format!("Failed to run qm stop: {}", e))?;
+                if output.status.success() {
+                    return Ok(());
+                }
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("qm stop failed: {}", stderr.trim()));
             }
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("{} failed: {}", label, stderr.trim()));
+            // Graceful path — fire-and-forget. Send ACPI via `qm shutdown`
+            // in a detached thread; ignore the wait-for-shutdown return
+            // status since the HTTP caller will poll VM state for the
+            // actual stopped transition.
+            let vmid_str = vmid.to_string();
+            std::thread::spawn(move || {
+                let _ = Command::new("qm")
+                    .args(["shutdown", &vmid_str, "--timeout", "60"])
+                    .output();
+            });
+            return Ok(());
         }
         // On libvirt: graceful = `virsh shutdown` (ACPI, fire-and-forget);
         // force = `virsh destroy` (immediate)

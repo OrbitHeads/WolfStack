@@ -549,6 +549,284 @@ fn resolve_latest_iso(original_url: &str) -> Option<String> {
     Some(format!("{}{}", base, latest))
 }
 
+/// Streaming variant of install_vm. Emits progress lines into the given
+/// channel so an SSE endpoint can forward them to the UI — download bytes
+/// polled every second from the partial file, allocation/create/start
+/// stages each emit a line. Same work as install_vm otherwise; we keep
+/// both so non-streaming callers (tests, node-to-node) stay simple.
+pub fn install_vm_streamed(
+    app: &AppManifest,
+    vm_name: &str,
+    user_inputs: &HashMap<String, String>,
+    tx: std::sync::mpsc::Sender<String>,
+) -> Result<String, String> {
+    let vm = app.vm.as_ref()
+        .ok_or("This app doesn't support VM installation")?;
+
+    let _ = tx.send(format!("Installing {} as a VM", app.name));
+
+    let iso_dir = "/var/lib/wolfstack/iso";
+    std::fs::create_dir_all(iso_dir)
+        .map_err(|e| format!("Failed to create ISO dir: {}", e))?;
+    let iso_path = format!("{}/{}.iso", iso_dir, app.id);
+
+    if std::path::Path::new(&iso_path).exists() {
+        let _ = tx.send(format!(
+            "ISO already cached at {} — reusing (skipping download)",
+            iso_path
+        ));
+    } else {
+        // Try the manifest URL; fall back to the directory-index resolver if it 404s.
+        let first_err = download_iso_with_progress(&vm.iso_url, &iso_path, &tx).err();
+        if let Some(err) = first_err {
+            let _ = std::fs::remove_file(&iso_path);
+            let _ = tx.send(format!(
+                "First URL failed ({}). Scraping parent directory for a newer version...",
+                err
+            ));
+            match resolve_latest_iso(&vm.iso_url) {
+                Some(resolved) => {
+                    let _ = tx.send(format!("Resolved newer ISO URL: {}", resolved));
+                    if let Err(e) = download_iso_with_progress(&resolved, &iso_path, &tx) {
+                        let _ = std::fs::remove_file(&iso_path);
+                        return Err(format!(
+                            "Failed to download ISO from {} (also tried {}): {}",
+                            vm.iso_url, resolved, e
+                        ));
+                    }
+                }
+                None => {
+                    return Err(format!(
+                        "Failed to download ISO from {} (couldn't resolve a newer version either): {}",
+                        vm.iso_url, err
+                    ));
+                }
+            }
+        }
+        let _ = tx.send(format!("ISO downloaded to {}", iso_path));
+    }
+
+    let _ = tx.send("Allocating WolfNet IP...".into());
+    let wolfnet_ip = crate::containers::next_available_wolfnet_ip();
+    if let Some(ref ip) = wolfnet_ip {
+        let _ = tx.send(format!("Allocated WolfNet IP {}", ip));
+    } else {
+        let _ = tx.send("No WolfNet IP available — guest will use user-mode NAT".into());
+    }
+
+    let storage_path = user_inputs
+        .get("storage_path")
+        .filter(|s| !s.trim().is_empty())
+        .cloned();
+
+    let parse_u32 = |key: &str, default: u32| -> u32 {
+        user_inputs
+            .get(key)
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(default)
+    };
+    let cores = parse_u32("cores", vm.cores);
+    let memory_mb = parse_u32("memory_mb", vm.memory_mb);
+    let disk_gb = parse_u32("disk_gb", vm.disk_gb);
+    let data_disk_gb: Option<u32> = if vm.data_disk_gb.is_some() {
+        user_inputs
+            .get("data_disk_gb")
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .or(vm.data_disk_gb)
+            .filter(|&v| v > 0)
+    } else {
+        None
+    };
+
+    let mut cfg = crate::vms::manager::VmConfig::new(
+        vm_name.to_string(),
+        cores,
+        memory_mb,
+        disk_gb,
+    );
+    cfg.iso_path = Some(iso_path);
+    cfg.wolfnet_ip = wolfnet_ip.clone();
+    cfg.storage_path = storage_path.clone();
+    cfg.auto_start = false;
+
+    if let Some(sz) = data_disk_gb {
+        let disk_storage = storage_path
+            .clone()
+            .unwrap_or_else(|| "/var/lib/wolfstack/vms".to_string());
+        cfg.extra_disks.push(crate::vms::manager::StorageVolume {
+            name: format!("{}-data", vm_name),
+            size_gb: sz,
+            storage_path: disk_storage,
+            format: "qcow2".to_string(),
+            bus: "virtio".to_string(),
+        });
+        let _ = tx.send(format!("Added data disk: {} GB", sz));
+    }
+
+    let _ = tx.send(format!(
+        "Creating VM '{}' ({} cores, {} MB RAM, {} GB OS disk)...",
+        vm_name, cores, memory_mb, disk_gb
+    ));
+    let vmm = crate::vms::manager::VmManager::new();
+    vmm.create_vm(cfg)?;
+    let _ = tx.send("VM created. Starting...".into());
+    vmm.start_vm(vm_name)?;
+    let _ = tx.send("VM running.".into());
+
+    // PBS installer step-by-step so users don't get stuck on the
+    // "Management Network Configuration" screen typing random numbers.
+    // Our dnsmasq on the TAP offers exactly one DHCP lease, but the PBS
+    // installer sometimes shows default placeholders (192.168.100.x)
+    // instead of reading the DHCP reply — easier to just tell the user
+    // what to paste in.
+    if app.id == "pbs" {
+        let _ = tx.send(
+            "═══════════════════════════════════════════════════════════════".into()
+        );
+        let _ = tx.send(
+            "PBS installer next steps (open VNC on the VM):".into()
+        );
+        let _ = tx.send(
+            "  1. Installer boot menu → pick 'Install Proxmox Backup Server (Graphical)'."
+                .into(),
+        );
+        let _ = tx.send(
+            "     Do NOT pick 'Automatic installation' — that needs an answer file we don't ship."
+                .into(),
+        );
+        let _ = tx.send(
+            "  2. Target harddisk → pick the smaller disk (the OS disk). Use ZFS/ext4 defaults."
+                .into(),
+        );
+        let _ = tx.send(
+            "  3. Country/timezone/password/email → your choice.".into(),
+        );
+        if let Some(ref ip) = wolfnet_ip {
+            let parts: Vec<&str> = ip.split('.').collect();
+            let gw = if parts.len() == 4 {
+                format!("{}.{}.{}.254", parts[0], parts[1], parts[2])
+            } else {
+                "(ask: wolfstack shows the gateway on the VM's details page)".into()
+            };
+            let _ = tx.send(
+                "  4. Management Network Configuration → if the installer shows 192.168.100.x, overwrite with:".into(),
+            );
+            let _ = tx.send(format!("       IP Address (CIDR):  {}/24", ip));
+            let _ = tx.send(format!("       Gateway:            {}", gw));
+            let _ = tx.send(        "       DNS Server:         8.8.8.8  (or your preferred DNS)".into());
+        } else {
+            let _ = tx.send(
+                "  4. Management Network Configuration → use the IP/gateway your network provides (no WolfNet IP was allocated)".into(),
+            );
+        }
+        let _ = tx.send(
+            "  5. Review → Install. When it reboots, unset the ISO in VM Settings so it boots from disk."
+                .into(),
+        );
+        let _ = tx.send(
+            "═══════════════════════════════════════════════════════════════".into()
+        );
+    } else {
+        let _ = tx.send("Open VNC to complete the installer.".into());
+    }
+
+    let done_msg = format!("{} VM '{}' created and started.", app.name, vm_name);
+    let _ = tx.send(done_msg.clone());
+    Ok(done_msg)
+}
+
+/// Download a URL to `dest` via wget, emitting byte-progress events every
+/// second to `tx` by polling the partial file size. Returns Err with
+/// wget's stderr on non-zero exit. total_bytes comes from a HEAD probe —
+/// if the server doesn't cooperate, progress shows bytes-only.
+fn download_iso_with_progress(
+    url: &str,
+    dest: &str,
+    tx: &std::sync::mpsc::Sender<String>,
+) -> Result<(), String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let _ = tx.send(format!("Downloading {}...", url));
+
+    // Best-effort HEAD for total size. Many mirrors support this; Proxmox's
+    // does. If we don't get Content-Length we just skip the percentage.
+    let total_bytes: Option<u64> = std::process::Command::new("curl")
+        .args(["-sIL", url])
+        .output()
+        .ok()
+        .and_then(|o| {
+            let text = String::from_utf8_lossy(&o.stdout).to_string();
+            // Walk every Content-Length header (redirects emit several).
+            // Prefer the last one, which describes the final resource.
+            text.lines()
+                .filter_map(|l| {
+                    let lower = l.to_ascii_lowercase();
+                    if lower.starts_with("content-length:") {
+                        l.splitn(2, ':').nth(1).and_then(|v| v.trim().parse::<u64>().ok())
+                    } else {
+                        None
+                    }
+                })
+                .last()
+        });
+
+    if let Some(sz) = total_bytes {
+        let _ = tx.send(format!("Total size: {} MB", sz / 1_048_576));
+    }
+
+    // Fire wget. -q silences its own progress; we poll the file ourselves.
+    let mut child = std::process::Command::new("wget")
+        .args(["-q", "-O", dest, url])
+        .spawn()
+        .map_err(|e| format!("Failed to run wget: {}", e))?;
+
+    // Progress poller — runs until `done` flips, emits a line per second.
+    let done = Arc::new(AtomicBool::new(false));
+    let done_clone = done.clone();
+    let dest_clone = dest.to_string();
+    let tx_clone = tx.clone();
+    let started = Instant::now();
+    let poller = std::thread::spawn(move || {
+        let mut last_bytes: u64 = 0;
+        while !done_clone.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_secs(1));
+            if done_clone.load(Ordering::Relaxed) { break; }
+            let size = std::fs::metadata(&dest_clone).map(|m| m.len()).unwrap_or(0);
+            if size == 0 { continue; }
+            let mb = size / 1_048_576;
+            let rate_bps = size.saturating_sub(last_bytes); // per second (we sleep 1s)
+            last_bytes = size;
+            let rate_mbs = rate_bps as f64 / 1_048_576.0;
+            let elapsed = started.elapsed().as_secs();
+            let msg = if let Some(total) = total_bytes {
+                let pct = (size as f64 / total as f64 * 100.0).min(100.0) as u32;
+                format!(
+                    "Downloading: {} MB / {} MB ({}%) at {:.1} MB/s — {}s elapsed",
+                    mb, total / 1_048_576, pct, rate_mbs, elapsed
+                )
+            } else {
+                format!(
+                    "Downloading: {} MB at {:.1} MB/s — {}s elapsed",
+                    mb, rate_mbs, elapsed
+                )
+            };
+            if tx_clone.send(msg).is_err() { break; }
+        }
+    });
+
+    let status = child.wait().map_err(|e| format!("wget wait failed: {}", e))?;
+    done.store(true, Ordering::Relaxed);
+    let _ = poller.join();
+
+    if !status.success() {
+        return Err(format!("wget exited with status {:?}", status.code()));
+    }
+    Ok(())
+}
+
 /// Install an ISO-based VM app. The only user choice is the storage location
 /// (defaults to /var/lib/wolfstack/vms). Everything else — memory, cores, disk
 /// size, WolfNet IP allocation, TAP setup, VNC — comes from the manifest +
