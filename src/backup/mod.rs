@@ -988,6 +988,34 @@ fn ensure_mount_helper(binary: &str, debian_pkg: &str, redhat_pkg: &str) -> Resu
 /// Mount (idempotently) an NFS export for backups and return the local
 /// path that store_local should write into. Reuses the existing export
 /// if already mounted.
+/// Validate a backup storage config by exercising whatever setup step the
+/// type actually needs. Used by the "test destination" endpoint so the UI
+/// can catch problems (missing mount helper, bad credentials) at save time
+/// rather than letting a scheduled backup fail in the background hours
+/// later. Returns Ok on success; on failure the error string may carry the
+/// standard MISSING_PACKAGE marker that the frontend knows how to prompt
+/// on.
+pub fn test_storage(storage: &BackupStorage) -> Result<String, String> {
+    match storage.storage_type {
+        StorageType::Nfs => ensure_nfs_mounted(storage).map(|p| format!("NFS mount OK at {}", p)),
+        StorageType::Smb => ensure_smb_mounted(storage).map(|p| format!("SMB mount OK at {}", p)),
+        StorageType::Local | StorageType::Wolfdisk => {
+            if storage.path.is_empty() {
+                return Err("path is required".into());
+            }
+            std::fs::create_dir_all(&storage.path)
+                .map_err(|e| format!("Failed to create {}: {}", storage.path, e))?;
+            Ok(format!("OK — writes will go to {}", storage.path))
+        }
+        // S3 / Remote / PBS each have their own connectivity concerns; they
+        // aren't wired through this check yet because their failure modes
+        // don't benefit from the MISSING_PACKAGE install prompt.
+        StorageType::S3 | StorageType::Remote | StorageType::Pbs => {
+            Ok(format!("{} destinations are not pre-tested", storage.storage_type))
+        }
+    }
+}
+
 fn ensure_nfs_mounted(storage: &BackupStorage) -> Result<String, String> {
     if storage.nfs_source.is_empty() {
         return Err("NFS source is not configured (expected `server:/export`)".into());

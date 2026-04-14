@@ -16627,6 +16627,12 @@ async function backupSelected() {
     }
 
     const storage = await getSelectedStorage();
+    // Pre-flight the destination — pops the install-in-terminal prompt if
+    // mount.cifs / mount.nfs is missing so the backup doesn't silently
+    // fail downstream with a MISSING_PACKAGE error the user never sees.
+    if (!(await ensureBackupStorageReady(storage))) {
+        return;
+    }
     const storageLabel = storage.type === 'pbs' ? `PBS (${storage.pbs_server})` : (storage.path || storage.type);
 
     // Get the cluster name and node for the current node
@@ -16837,6 +16843,12 @@ async function createSchedule() {
         enabled: true,
     };
 
+    // Pre-flight the destination when it's a mount-based type. Catches
+    // missing cifs-utils / nfs-common at save time so the user can accept
+    // the install-in-terminal prompt, rather than finding out hours later
+    // when the scheduled backup fails in the background.
+    if (!(await ensureBackupStorageReady(storage))) return;
+
     closeModal();
     try {
         const res = await fetch(apiUrl('/api/backups/schedules'), {
@@ -16851,6 +16863,38 @@ async function createSchedule() {
         showToast(`Schedule error: ${e.message}`, 'error');
     }
     loadBackups();
+}
+
+/// Run the backup destination through POST /api/backups/test-storage. On
+/// success returns true — caller continues. On a MISSING_PACKAGE error
+/// pops the install-in-terminal confirm, then retries after the install
+/// window closes. On any other error, shows a toast and returns false so
+/// the caller aborts the save.
+async function ensureBackupStorageReady(storage) {
+    if (!storage) return true;
+    // Skip the test for destination types that don't have a pre-flight path.
+    const type = (storage.type || '').toLowerCase();
+    if (type !== 'nfs' && type !== 'smb' && type !== 'local' && type !== 'wolfdisk') return true;
+    try {
+        const res = await fetch('/api/backups/test-storage', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ storage }),
+        });
+        const data = await res.json();
+        if (res.ok) return true;
+        const parsed = parseMissingPackageError(data.error || '');
+        if (parsed) {
+            const installed = await offerPackageInstall(parsed);
+            if (!installed) return false;
+            return ensureBackupStorageReady(storage); // retry once after install
+        }
+        showToast(`Destination check failed: ${data.error || res.status}`, 'error');
+        return false;
+    } catch (e) {
+        showToast(`Destination check error: ${e.message}`, 'error');
+        return false;
+    }
 }
 
 async function deleteSchedule(id) {

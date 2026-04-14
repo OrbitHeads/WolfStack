@@ -707,20 +707,26 @@ pub const MISSING_PACKAGE_MARKER: &str = "MISSING_PACKAGE|";
 /// mount helper binary. Used by the API to build the install command for
 /// the live-terminal install flow.
 pub fn package_for_helper(binary: &str) -> Option<(&'static str, &'static str)> {
+    use crate::installer::DistroFamily;
     let distro = crate::installer::detect_distro();
-    let (pkg_mgr, debian_pkg, redhat_pkg) = match binary {
-        "mount.nfs" => ("ignored", "nfs-common", "nfs-utils"),
-        "mount.cifs" => ("ignored", "cifs-utils", "cifs-utils"),
-        _ => return None,
-    };
-    let _ = pkg_mgr;
-    Some(match distro {
-        crate::installer::DistroFamily::Debian => ("apt-get", debian_pkg),
-        crate::installer::DistroFamily::RedHat => ("dnf", redhat_pkg),
-        crate::installer::DistroFamily::Suse => ("zypper", redhat_pkg),
-        crate::installer::DistroFamily::Arch => ("pacman", redhat_pkg),
-        crate::installer::DistroFamily::Unknown => ("apt-get", debian_pkg),
-    })
+    // Package names differ per distro; SUSE in particular calls the NFS
+    // client package `nfs-client` rather than `nfs-utils`. Spell it out
+    // rather than share a single "redhat_pkg" for all three RPM-ish families.
+    match (binary, &distro) {
+        ("mount.nfs", DistroFamily::Debian)  => Some(("apt-get", "nfs-common")),
+        ("mount.nfs", DistroFamily::RedHat)  => Some(("dnf",     "nfs-utils")),
+        ("mount.nfs", DistroFamily::Suse)    => Some(("zypper",  "nfs-client")),
+        ("mount.nfs", DistroFamily::Arch)    => Some(("pacman",  "nfs-utils")),
+        ("mount.nfs", DistroFamily::Unknown) => Some(("apt-get", "nfs-common")),
+
+        ("mount.cifs", DistroFamily::Debian)  => Some(("apt-get", "cifs-utils")),
+        ("mount.cifs", DistroFamily::RedHat)  => Some(("dnf",     "cifs-utils")),
+        ("mount.cifs", DistroFamily::Suse)    => Some(("zypper",  "cifs-utils")),
+        ("mount.cifs", DistroFamily::Arch)    => Some(("pacman",  "cifs-utils")),
+        ("mount.cifs", DistroFamily::Unknown) => Some(("apt-get", "cifs-utils")),
+
+        _ => None,
+    }
 }
 
 fn check_mount_helper(binary: &str, debian_pkg: &str, redhat_pkg: &str) -> Result<(), String> {

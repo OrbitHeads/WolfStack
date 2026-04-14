@@ -6185,6 +6185,27 @@ pub async fn backup_schedules_list(
     HttpResponse::Ok().json(backup::list_schedules())
 }
 
+/// POST /api/backups/test-storage — try to set up the destination (mount
+/// NFS/SMB, create local dir, etc.) without actually backing anything up.
+/// Lets the UI pre-validate a schedule before saving it and surface a
+/// MISSING_PACKAGE marker at save time — otherwise the user only sees
+/// failures hours later in the backup history.
+#[derive(Deserialize)]
+pub struct TestStorageRequest {
+    pub storage: backup::BackupStorage,
+}
+
+pub async fn backup_test_storage(
+    req: HttpRequest, state: web::Data<AppState>,
+    body: web::Json<TestStorageRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    match backup::test_storage(&body.storage) {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({"ok": true, "message": msg})),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({"error": e})),
+    }
+}
+
 /// POST /api/backups/schedules — create or update a schedule
 pub async fn backup_schedule_create(
     req: HttpRequest, state: web::Data<AppState>,
@@ -16662,6 +16683,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/backups/targets", web::get().to(backup_targets))
         .route("/api/backups/schedules", web::get().to(backup_schedules_list))
         .route("/api/backups/schedules", web::post().to(backup_schedule_create))
+        .route("/api/backups/test-storage", web::post().to(backup_test_storage))
         .route("/api/backups/schedules/{id}", web::delete().to(backup_schedule_delete))
         .route("/api/backups/import", web::post().to(backup_import))
         // PBS (Proxmox Backup Server) — must be before {id} routes
