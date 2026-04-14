@@ -20,6 +20,8 @@ pub fn config(cfg: &mut web::ServiceConfig) {
             .route("/adopt-libvirt", web::post().to(adopt_libvirt))
             .route("/{name}/action", web::post().to(vm_action))
             .route("/{name}/logs", web::get().to(vm_logs))
+            .route("/{name}/serial-status", web::get().to(vm_serial_status))
+            .route("/{name}/add-serial", web::post().to(vm_add_serial))
             .route("/{name}/migrate", web::post().to(vm_migrate))
             .route("/{name}/migrate-external", web::post().to(vm_migrate_external))
             .route("/{name}/volumes", web::post().to(add_volume))
@@ -271,12 +273,253 @@ async fn vm_logs(req: HttpRequest, state: web::Data<AppState>, path: web::Path<S
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let name = path.into_inner();
     let manager = state.vms.lock().unwrap();
-    
+
     let log_path = manager.base_dir.join(format!("{}.log", name));
     let log_content = std::fs::read_to_string(&log_path)
         .unwrap_or_else(|_| "No logs available for this VM.".to_string());
-    
+
     HttpResponse::Ok().json(serde_json::json!({ "name": name, "logs": log_content }))
+}
+
+/// GET /api/vms/{name}/serial-status — is this VM wired up for a serial
+/// console (so `qm terminal` / `virsh console` / socat-to-serial-sock
+/// actually has somewhere to attach)? Frontend calls this before opening
+/// the terminal window so it can pop an "add serial console?" prompt when
+/// missing, instead of dropping the user into a dead WebSocket.
+async fn vm_serial_status(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let name = path.into_inner();
+
+    let backend = if crate::containers::is_proxmox() {
+        "pve"
+    } else if crate::containers::is_libvirt() {
+        "libvirt"
+    } else {
+        "standalone"
+    };
+
+    let configured: bool;
+    let running: bool;
+    match backend {
+        "pve" => {
+            let manager = state.vms.lock().unwrap();
+            let vmid = manager.qm_vmid_by_name(&name);
+            drop(manager);
+            let Some(vmid) = vmid else {
+                return HttpResponse::NotFound().json(serde_json::json!({"error": format!("VM '{}' not found", name)}));
+            };
+            // `qm config` lists current config; a `serial0:` line means an
+            // emulated UART is wired to a socket we can attach to.
+            let cfg = std::process::Command::new("qm")
+                .args(["config", &vmid.to_string()])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            configured = cfg.lines().any(|l| l.trim_start().starts_with("serial0:"));
+            // Running = has an associated qemu process per `qm status`.
+            let status = std::process::Command::new("qm")
+                .args(["status", &vmid.to_string()])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            running = status.contains("running");
+        }
+        "libvirt" => {
+            let xml = std::process::Command::new("virsh")
+                .args(["dumpxml", &name])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            // `virsh console` wants a matching <serial>/<console> pair.
+            // Some libvirt versions auto-mirror one from the other, but
+            // the conservative answer is "both present". If either is
+            // missing, vm_add_serial() will top up just the missing half.
+            configured = xml.contains("<serial ") && xml.contains("<console ");
+            let state = std::process::Command::new("virsh")
+                .args(["domstate", &name])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            running = state.trim() == "running";
+        }
+        _ => {
+            // Standalone QEMU. Three distinct states:
+            //  - not running → configured=false,running=false ("start it first")
+            //  - running, new QEMU spawn (has -chardev socket) → both true
+            //  - running, old QEMU spawn from before the serial-socket wiring
+            //    → process up, socket missing. Report running=true so the
+            //    frontend skips the "start it first" path and falls into
+            //    the "add serial console?" prompt (which returns a clear
+            //    "restart the VM" message for standalone).
+            let sock = format!("/var/lib/wolfstack/vms/{}.serial.sock", name);
+            let sock_exists = std::path::Path::new(&sock).exists();
+            let process_running = {
+                let m = state.vms.lock().unwrap();
+                m.check_running(&name)
+            };
+            running = process_running;
+            configured = sock_exists;
+        }
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "backend": backend,
+        "configured": configured,
+        "running": running,
+        "hint": "If the terminal stays blank after opening, the guest may need `console=ttyS0` on its kernel cmdline and a getty on ttyS0 — same setup as bare-metal serial consoles."
+    }))
+}
+
+/// POST /api/vms/{name}/add-serial — add a serial console device to a VM
+/// that doesn't have one. Takes effect on next boot for running VMs;
+/// applies immediately for stopped ones. Standalone QEMU VMs already get
+/// a serial socket at create time, so this endpoint only handles the
+/// PVE and libvirt paths where a pre-existing VM may be missing one.
+async fn vm_add_serial(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let name = path.into_inner();
+
+    if crate::containers::is_proxmox() {
+        let vmid = {
+            let m = state.vms.lock().unwrap();
+            m.qm_vmid_by_name(&name)
+        };
+        let Some(vmid) = vmid else {
+            return HttpResponse::NotFound().json(serde_json::json!({"error": format!("VM '{}' not found in Proxmox", name)}));
+        };
+        // Check running-ness so we can tell the user whether a reboot is
+        // needed for the new device to show up in the guest.
+        let running = std::process::Command::new("qm")
+            .args(["status", &vmid.to_string()])
+            .output().ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default()
+            .contains("running");
+
+        let output = std::process::Command::new("qm")
+            .args(["set", &vmid.to_string(), "--serial0", "socket"])
+            .output()
+            .map_err(|e| format!("Failed to run qm set: {}", e));
+        match output {
+            Ok(o) if o.status.success() => {
+                HttpResponse::Ok().json(serde_json::json!({
+                    "ok": true,
+                    "message": "serial0 added (socket)",
+                    "requires_reboot": running,
+                }))
+            }
+            Ok(o) => HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("qm set failed: {}", String::from_utf8_lossy(&o.stderr).trim())
+            })),
+            Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
+        }
+    } else if crate::containers::is_libvirt() {
+        // libvirt: a working serial setup wants a matching <serial>/<console>
+        // pair — some libvirt versions auto-mirror, others reject a console
+        // without an associated serial. We probe what's already there and
+        // attach each missing half separately. Console devices aren't
+        // hot-pluggable so we always write to the persisted XML (`--config`)
+        // and tell the caller to reboot if the domain is currently up.
+        let running = std::process::Command::new("virsh")
+            .args(["domstate", &name])
+            .output().ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default()
+            .trim()
+            .to_string() == "running";
+
+        let xml_dump = std::process::Command::new("virsh")
+            .args(["dumpxml", &name])
+            .output().ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        let has_serial = xml_dump.contains("<serial ");
+        let has_console = xml_dump.contains("<console ");
+
+        // Build a list of (label, xml) pieces to attach. Skip anything
+        // that's already present to avoid "device already exists" errors.
+        let mut pieces: Vec<(&str, &str)> = Vec::new();
+        if !has_serial {
+            pieces.push(("serial",  "<serial type='pty'><target port='0'/></serial>"));
+        }
+        if !has_console {
+            pieces.push(("console", "<console type='pty'><target type='serial' port='0'/></console>"));
+        }
+
+        // Shouldn't happen (caller checks configured=false before calling)
+        // but handle gracefully if everything's already wired.
+        if pieces.is_empty() {
+            return HttpResponse::Ok().json(serde_json::json!({
+                "ok": true,
+                "message": "serial + console already configured",
+                "requires_reboot": false,
+            }));
+        }
+
+        let mut errors: Vec<String> = Vec::new();
+        let mut attached: Vec<&str> = Vec::new();
+        for (label, xml) in &pieces {
+            let xml_path = format!("/tmp/wolfstack-{}-{}.xml", label, uuid::Uuid::new_v4());
+            if let Err(e) = std::fs::write(&xml_path, xml) {
+                errors.push(format!("write {} xml: {}", label, e));
+                continue;
+            }
+            let out = std::process::Command::new("virsh")
+                .args(["attach-device", &name, &xml_path, "--config"])
+                .output();
+            let _ = std::fs::remove_file(&xml_path);
+            match out {
+                Ok(o) if o.status.success() => attached.push(label),
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    // libvirt uses varying wording for "this device already
+                    // exists in the config" — treat any such response as a
+                    // no-op success rather than a hard failure.
+                    let lower = stderr.to_lowercase();
+                    if lower.contains("already exist") || lower.contains("duplicate") {
+                        attached.push(label);
+                    } else {
+                        errors.push(format!("{}: {}", label, stderr.trim()));
+                    }
+                }
+                Err(e) => errors.push(format!("{}: {}", label, e)),
+            }
+        }
+
+        if !errors.is_empty() {
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("virsh attach-device failed: {}", errors.join("; "))
+            }));
+        }
+        HttpResponse::Ok().json(serde_json::json!({
+            "ok": true,
+            "message": format!("attached: {}", attached.join(", ")),
+            "requires_reboot": running,
+        }))
+    } else {
+        // Standalone QEMU wires the serial socket at start time (since the
+        // change that added `-chardev socket ... -serial chardev:serial0`
+        // to the spawn args). A running VM without a socket is one that
+        // was started by an older WolfStack — stop and start it to pick
+        // up the new args.
+        let running = {
+            let m = state.vms.lock().unwrap();
+            m.check_running(&name)
+        };
+        if running {
+            HttpResponse::BadRequest().json(serde_json::json!({
+                "error": "This VM was started before serial-console support was added. Stop and start it again to enable the terminal."
+            }))
+        } else {
+            HttpResponse::BadRequest().json(serde_json::json!({
+                "error": "Start the VM first — standalone QEMU creates its serial socket at boot time."
+            }))
+        }
+    }
 }
 
 // ─── Storage Volume Endpoints ───

@@ -116,9 +116,58 @@ async fn console_session(
             ));
         }
         "vm" => {
-            // Connect to QEMU serial console via socat
-            let serial_sock = format!("/var/lib/wolfstack/vms/{}.serial.sock", name);
-            cmd.arg(format!("socat -,raw,echo=0 UNIX-CONNECT:{}", serial_sock));
+            // Three backends, one frontend route. The guest still needs a
+            // serial console configured in its OS (e.g. `console=ttyS0` on
+            // the kernel cmdline) for anything to appear — if not, the user
+            // sees a blank terminal, which is expected.
+            let _ = session.text(
+                "\x1b[36m[wolfstack] Serial terminal — if blank, the guest needs \
+                 `console=ttyS0` on its kernel cmdline and a getty on ttyS0.\x1b[0m\r\n"
+            ).await;
+            if crate::containers::is_proxmox() {
+                // Resolve name -> vmid via `qm list`. Done here directly
+                // because console_session doesn't carry AppState, and the
+                // lookup is a one-shot subprocess anyway.
+                let vmid: Option<u32> = std::process::Command::new("qm")
+                    .arg("list")
+                    .output()
+                    .ok()
+                    .and_then(|out| {
+                        let text = String::from_utf8_lossy(&out.stdout).to_string();
+                        text.lines().skip(1).find_map(|line| {
+                            let parts: Vec<&str> = line.split_whitespace().collect();
+                            if parts.get(1).map(|n| *n == name).unwrap_or(false) {
+                                parts.first().and_then(|s| s.parse().ok())
+                            } else {
+                                None
+                            }
+                        })
+                    });
+                match vmid {
+                    Some(id) => {
+                        cmd.arg(format!("qm terminal {}", id));
+                    }
+                    None => {
+                        let _ = session.text(format!(
+                            "\r\n\x1b[31mVM '{}' not found in `qm list`.\x1b[0m\r\n",
+                            name
+                        )).await;
+                        let _ = session.close(None).await;
+                        return;
+                    }
+                }
+            } else if crate::containers::is_libvirt() {
+                // --force disconnects any existing console holder so the
+                // web session doesn't get stuck behind a stale attachment.
+                // Positional domain first, flag after — libvirt is
+                // lenient about order but some wrappers aren't.
+                cmd.arg(format!("virsh console {} --force", name));
+            } else {
+                // Standalone QEMU path: connect to the -chardev socket file
+                // that the wrapper script sets up for each VM.
+                let serial_sock = format!("/var/lib/wolfstack/vms/{}.serial.sock", name);
+                cmd.arg(format!("socat -,raw,echo=0 UNIX-CONNECT:{}", serial_sock));
+            }
         }
         "pve-vm" => {
             // Deprecated — PVE VM consoles now use VNC via /ws/pve-vnc/{vmid}

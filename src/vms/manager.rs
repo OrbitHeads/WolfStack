@@ -175,6 +175,12 @@ pub struct VmConfig {
     /// BIOS type: "seabios" (legacy) or "ovmf" (UEFI/EFI)
     #[serde(default = "default_bios_type")]
     pub bios_type: String,
+    /// Node that currently owns this VM. Populated when the VM is created
+    /// and rewritten when it's migrated; lets the cluster view render VMs
+    /// as first-class members under the right host without a manual Scan
+    /// pass. `None` on older configs until the next write.
+    #[serde(default)]
+    pub host_id: Option<String>,
 }
 
 fn default_net_model() -> String { "virtio".to_string() }
@@ -205,6 +211,7 @@ impl VmConfig {
             pci_devices: Vec::new(),
             vmid: None,
             bios_type: "seabios".to_string(),
+            host_id: None,
         }
     }
 }
@@ -383,13 +390,14 @@ impl VmManager {
                     pci_devices,
                     vmid: Some(vmid),
                     bios_type: "seabios".to_string(),
+                    host_id: Some(crate::agent::self_node_id()),
                 })
             })
             .collect()
     }
 
     /// Look up a Proxmox VMID by VM name via `qm list`
-    fn qm_vmid_by_name(&self, name: &str) -> Option<u32> {
+    pub fn qm_vmid_by_name(&self, name: &str) -> Option<u32> {
         let output = Command::new("qm").arg("list").output().ok()?;
         let text = String::from_utf8_lossy(&output.stdout);
         for line in text.lines().skip(1) {
@@ -439,6 +447,13 @@ impl VmManager {
         if config.cpus == 0 { config.cpus = 1; }
         if config.memory_mb == 0 { config.memory_mb = 1024; }
         if config.disk_size_gb == 0 { config.disk_size_gb = 10; }
+
+        // Stamp the creating node's ID so the cluster view can associate
+        // VMs with their host without needing the Scan pass. Overwritten
+        // at migrate time by import_vm() below.
+        if config.host_id.is_none() {
+            config.host_id = Some(crate::agent::self_node_id());
+        }
 
         // Validate WolfNet IP if provided
         if let Some(ref ip) = config.wolfnet_ip {
@@ -1260,6 +1275,14 @@ impl VmManager {
         //     can't enumerate USB 2.0 High-Speed (480 Mb/s) devices like
         //     webcams — they appear to QEMU but never reach the guest.
         // usb-tablet is attached to xHCI so cursor sync works out of the box.
+        // Serial console over a Unix socket — console.rs attaches to this
+        // with socat when the user clicks the Terminal button. Without
+        // this, the Terminal button would fail with "No such file or
+        // directory" because nothing listens on the socket. Remove any
+        // stale socket from a previous run so server=on can bind fresh.
+        let serial_sock = format!("/var/lib/wolfstack/vms/{}.serial.sock", name);
+        let _ = std::fs::remove_file(&serial_sock);
+
         cmd.arg("-name").arg(name)
            .arg("-m").arg(format!("{}M", config.memory_mb))
            .arg("-smp").arg(format!("{}", config.cpus))
@@ -1268,6 +1291,8 @@ impl VmManager {
            .arg("-device").arg("qemu-xhci,id=xhci")
            .arg("-device").arg("usb-tablet,bus=xhci.0")
            .arg("-vga").arg("std")
+           .arg("-chardev").arg(format!("socket,id=serial0,path={},server=on,wait=off", serial_sock))
+           .arg("-serial").arg("chardev:serial0")
            .arg("-qmp").arg(format!("unix:{},server,nowait", qmp_path))
            .arg("-daemonize");
 
@@ -2170,7 +2195,7 @@ impl VmManager {
         Ok(())
     }
 
-    fn check_running(&self, name: &str) -> bool {
+    pub fn check_running(&self, name: &str) -> bool {
         // Check both x86_64 and aarch64 QEMU binaries (for PiMox / ARM hosts)
         for qemu_bin in &["qemu-system-x86_64", "qemu-system-aarch64"] {
             let output = Command::new("pgrep")
@@ -2335,6 +2360,7 @@ impl VmManager {
             pci_devices,
             vmid: None,
             bios_type,
+            host_id: Some(crate::agent::self_node_id()),
         })
     }
 
@@ -2662,6 +2688,7 @@ impl VmManager {
             pci_devices,
             vmid: None,
             bios_type: discovered.bios_type,
+            host_id: Some(crate::agent::self_node_id()),
         };
 
         // Save config
@@ -2945,6 +2972,10 @@ pub fn import_vm(archive_path: &str, new_name: Option<&str>, storage: Option<&st
     config.storage_path = dest_storage.map(|s| s.to_string());
     config.vmid = None;
     config.mac_address = Some(generate_mac()); // new MAC to avoid conflicts
+    // Rewrite the ownership tag so the cluster view sees the VM under its
+    // new host as soon as the import finishes. Without this, migrated VMs
+    // would still claim the source host until the next manual Scan.
+    config.host_id = Some(crate::agent::self_node_id());
     // Passthrough devices are host-specific; the target host may not even have
     // matching hardware, so clear them.
     config.usb_devices.clear();

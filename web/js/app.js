@@ -3435,8 +3435,9 @@ function renderVms(vms) {
                     <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="showVmLogs('${vm.name}')" title="Logs">📋</button>
                     ${vm.running ?
                 `${vm.vmid
-                    ? `<button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="openPveVmConsole('${vm.vmid}', '${vm.name}')" title="Console">🖥️</button>`
-                    : (vm.vnc_ws_port ? `<button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="openVmVnc('${vm.name}', ${vm.vnc_ws_port})" title="Console">🖥️</button>` : '')}
+                    ? `<button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="openPveVmConsole('${vm.vmid}', '${vm.name}')" title="VNC Console">🖥️</button>`
+                    : (vm.vnc_ws_port ? `<button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="openVmVnc('${vm.name}', ${vm.vnc_ws_port})" title="VNC Console">🖥️</button>` : '')}
+                         <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="openVmConsole('${vm.name}')" title="Serial terminal (guest must have serial console enabled)">💻</button>
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#ef4444;" onclick="vmAction('${vm.name}', 'stop', this)" title="Stop (graceful ACPI shutdown)">⏹️</button>
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#b91c1c;" onclick="if (confirm('Force-stop ${vm.name}? The guest will not shut down cleanly — unsaved data may be lost.')) vmAction('${vm.name}', 'force-stop', this)" title="Force Stop (power off immediately)">⛔</button>` :
                 `<button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="showVmSettings('${vm.name}')" title="Settings">⚙️</button>
@@ -11911,6 +11912,7 @@ function renderVmCards(vms) {
                 <button class="btn btn-sm" style="${!isRunning ? bd : bs}" ${!isRunning ? 'disabled' : `onclick="vmAction('${vm.name}','stop',this)"`} title="Stop (graceful ACPI shutdown)">⏹️</button>
                 <button class="btn btn-sm" style="${!isRunning ? bd : bs}color:#b91c1c;" ${!isRunning ? 'disabled' : `onclick="if (confirm('Force-stop ${vm.name}? The guest will not shut down cleanly — unsaved data may be lost.')) vmAction('${vm.name}','force-stop',this)"`} title="Force Stop (power off immediately)">⛔</button>
                 ${vncLink ? `<button class="btn btn-sm" style="${bs}" onclick="window.open('${vncLink}')" title="VNC">🖥️</button>` : ''}
+                <button class="btn btn-sm" style="${!isRunning ? bd : bs}" ${!isRunning ? 'disabled' : `onclick="openVmConsole('${vm.name}')"`} title="Serial terminal (guest must have serial console enabled)">💻</button>
                 <button class="btn btn-sm" style="${bs}" onclick="showVmSettings('${vm.name}')" title="Settings">⚙️</button>
                 <button class="btn btn-sm" style="${bs}" onclick="showVmLogs('${vm.name}')" title="Logs">📜</button>
                 <button class="btn btn-sm" style="${bs}" onclick="migrateVm('${vm.name}')" title="Migrate">🚀</button>
@@ -15558,8 +15560,86 @@ function openLxcConsole(vmidOrName, displayName) {
     openConsole('lxc', vmidOrName);
 }
 
-function openVmConsole(name) {
+async function openVmConsole(name) {
+    // Pre-flight the serial console setup so the user doesn't get dropped
+    // into a dead WebSocket. Three outcomes:
+    //   - VM isn't running → show a friendly "start it first" message.
+    //   - VM running but has no serial device → offer to add one.
+    //   - VM running with serial wired → open the terminal.
+    try {
+        const resp = await fetch(apiUrl(`/api/vms/${encodeURIComponent(name)}/serial-status`));
+        if (resp.ok) {
+            const st = await resp.json();
+            if (!st.running) {
+                showToast(`VM '${name}' isn't running — start it first, then open the terminal.`, 'info', 6000);
+                return;
+            }
+            if (!st.configured) {
+                const added = await offerAddSerialConsole(name, st);
+                if (!added) return;
+            }
+        }
+    } catch (e) {
+        // If the pre-flight endpoint fails, fall through to opening the
+        // console anyway — old WolfStack builds won't have /serial-status
+        // and we don't want to block those users.
+    }
     openConsole('vm', name);
+}
+
+/// Modal offering to add a serial console device to a VM. Returns true if
+/// the user confirmed and the add succeeded (so the caller can continue
+/// opening the terminal), false on cancel or error.
+function offerAddSerialConsole(name, status) {
+    return new Promise((resolve) => {
+        const backendLabel = status.backend === 'pve' ? 'Proxmox' :
+                             status.backend === 'libvirt' ? 'libvirt' : 'standalone';
+        const rebootNote = status.running
+            ? `<p style="color:#f59e0b;margin:8px 0 0;"><strong>Note:</strong> the VM is running, so the new console device won't be visible to the guest until you reboot it.</p>`
+            : `<p style="color:#9ca3af;margin:8px 0 0;">The VM is stopped — the change takes effect on the next boot.</p>`;
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay active';
+        overlay.style.zIndex = '10000';
+        overlay.innerHTML = `
+            <div class="modal" style="max-width:480px;">
+                <div class="modal-header">
+                    <h3>Add serial console?</h3>
+                </div>
+                <div class="modal-body" style="font-size:13px;line-height:1.5;">
+                    <p style="margin-top:0;">VM <code style="background:var(--bg-secondary);padding:2px 6px;border-radius:3px;">${escapeHtml(name)}</code> (${escapeHtml(backendLabel)}) doesn't have a serial console device configured, so the terminal has nothing to attach to.</p>
+                    <p>WolfStack can add one for you (<code>qm set --serial0 socket</code> on Proxmox, or a <code>&lt;console&gt;</code> device on libvirt). Once the device exists the guest still needs <code>console=ttyS0</code> on its kernel cmdline plus a getty on <code>ttyS0</code> — same as a physical serial console.</p>
+                    ${rebootNote}
+                </div>
+                <div class="modal-footer">
+                    <button class="btn" id="add-serial-cancel">Cancel</button>
+                    <button class="btn btn-primary" id="add-serial-ok">Add console device</button>
+                </div>
+            </div>`;
+        document.body.appendChild(overlay);
+        overlay.querySelector('#add-serial-cancel').onclick = () => { overlay.remove(); resolve(false); };
+        overlay.querySelector('#add-serial-ok').onclick = async () => {
+            overlay.remove();
+            try {
+                const res = await fetch(apiUrl(`/api/vms/${encodeURIComponent(name)}/add-serial`), { method: 'POST' });
+                const data = await res.json();
+                if (!res.ok) {
+                    showToast(data.error || 'Failed to add serial console', 'error');
+                    resolve(false);
+                    return;
+                }
+                if (data.requires_reboot) {
+                    showToast('Serial console added — reboot the VM to use it.', 'info', 8000);
+                    resolve(false); // don't open terminal yet; it'll be useless until reboot
+                } else {
+                    showToast('Serial console added.', 'success');
+                    resolve(true);
+                }
+            } catch (e) {
+                showToast('Add serial console error: ' + e.message, 'error');
+                resolve(false);
+            }
+        };
+    });
 }
 
 async function openPveVmConsole(vmid, displayName) {
