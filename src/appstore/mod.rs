@@ -674,6 +674,21 @@ pub fn install_vm_streamed(
     vmm.start_vm(vm_name)?;
     let _ = tx.send("VM running.".into());
 
+    // Free the ISO once the VM is up. PBS ISOs are ~1 GB, OPNsense ~700 MB,
+    // pfSense ~500 MB — they pile up quickly across a busy install history.
+    // The running QEMU process keeps an open fd to the file, so the bytes
+    // aren't reclaimed until the user reboots/stops the VM (which they'll
+    // do post-install anyway). Re-installing the same app re-downloads the
+    // ISO; the user opted into that trade by asking for cleanup.
+    let iso_at = format!("/var/lib/wolfstack/iso/{}.iso", app.id);
+    if let Ok(meta) = std::fs::metadata(&iso_at) {
+        let mb = meta.len() / 1_048_576;
+        match std::fs::remove_file(&iso_at) {
+            Ok(_) => { let _ = tx.send(format!("Cleaned up ISO ({} MB freed once the VM stops/reboots)", mb)); }
+            Err(e) => { let _ = tx.send(format!("Note: couldn't remove ISO {}: {}", iso_at, e)); }
+        }
+    }
+
     // PBS installer step-by-step so users don't get stuck on the
     // "Management Network Configuration" screen typing random numbers.
     // Our dnsmasq on the TAP offers exactly one DHCP lease, but the PBS
@@ -715,10 +730,32 @@ pub fn install_vm_streamed(
             let _ = tx.send(format!("       IP Address (CIDR):  {}/24", ip));
             let _ = tx.send(format!("       Gateway:            {}", gw));
             let _ = tx.send(        "       DNS Server:         8.8.8.8  (or your preferred DNS)".into());
+            // Structured marker so the frontend can show a sticky modal
+            // with copy-to-clipboard fields. The task-log view is great
+            // for live progress but easy to scroll past — the modal
+            // stays up until the user acknowledges it.
+            let payload = serde_json::json!({
+                "vm_name": vm_name,
+                "ip": ip,
+                "cidr": format!("{}/24", ip),
+                "gateway": gw,
+                "dns": "8.8.8.8",
+                "vnc_hint": format!("Open VNC on VM '{}' to start the installer", vm_name),
+            });
+            let _ = tx.send(format!("[pbs-network] {}", payload));
         } else {
             let _ = tx.send(
                 "  4. Management Network Configuration → use the IP/gateway your network provides (no WolfNet IP was allocated)".into(),
             );
+            let payload = serde_json::json!({
+                "vm_name": vm_name,
+                "ip": null,
+                "cidr": null,
+                "gateway": null,
+                "dns": "8.8.8.8",
+                "vnc_hint": format!("Open VNC on VM '{}' to start the installer (no WolfNet IP — use the IP your network provides)", vm_name),
+            });
+            let _ = tx.send(format!("[pbs-network] {}", payload));
         }
         let _ = tx.send(
             "  5. Review → Install. When it reboots, unset the ISO in VM Settings so it boots from disk."
@@ -947,6 +984,10 @@ fn install_vm(
     let vmm = crate::vms::manager::VmManager::new();
     vmm.create_vm(cfg)?;
     vmm.start_vm(vm_name)?;
+
+    // Same ISO cleanup as install_vm_streamed — see comment there.
+    let iso_at = format!("/var/lib/wolfstack/iso/{}.iso", app.id);
+    let _ = std::fs::remove_file(&iso_at);
 
     let ip_msg = wolfnet_ip
         .map(|ip| format!(" WolfNet IP {} will be served via DHCP to the VM's NIC (TAP backend).", ip))

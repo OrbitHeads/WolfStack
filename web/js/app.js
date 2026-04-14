@@ -15600,6 +15600,50 @@ async function openVmConsole(name) {
 /// Modal offering to add a serial console device to a VM. Returns true if
 /// the user confirmed and the add succeeded (so the caller can continue
 /// opening the terminal), false on cancel or error.
+/// Sticky post-install modal that shows the IP / gateway / DNS the user
+/// needs to type into the PBS installer's "Management Network
+/// Configuration" screen. Has copy-to-clipboard buttons per field so the
+/// user can paste the values one at a time. Stays up until dismissed.
+function showPbsNetworkModal(appName, net) {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay active';
+    overlay.style.zIndex = '10000';
+    const escapeAttr = s => String(s == null ? '' : s).replace(/"/g, '&quot;');
+    const row = (label, value) => value
+        ? `<tr>
+             <td style="padding:6px 10px;color:var(--text-muted);font-size:13px;">${escapeHtml(label)}</td>
+             <td style="padding:6px 10px;font-family:'JetBrains Mono',monospace;font-size:13px;">
+               <span style="background:var(--bg-secondary);padding:3px 8px;border-radius:4px;">${escapeHtml(value)}</span>
+               <button class="btn btn-sm" style="margin-left:8px;font-size:11px;padding:2px 8px;"
+                 onclick="navigator.clipboard.writeText('${escapeAttr(value)}'); showToast('Copied: ${escapeAttr(value)}', 'success', 1500);">Copy</button>
+             </td>
+           </tr>`
+        : '';
+    overlay.innerHTML = `
+        <div class="modal" style="max-width:540px;">
+            <div class="modal-header">
+                <h3>${escapeHtml(appName)} VM ready — finish in VNC</h3>
+                <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">×</button>
+            </div>
+            <div class="modal-body" style="font-size:13px;line-height:1.5;">
+                <p style="margin-top:0;">${escapeHtml(net.vnc_hint || 'Open the VM in VNC to start the installer.')}</p>
+                <p>When the PBS installer reaches the <strong>Management Network Configuration</strong> screen it shows placeholder values (often <code>192.168.100.x</code>). Overwrite them with these:</p>
+                <table style="width:100%;border-collapse:collapse;background:var(--bg-card);border:1px solid var(--border);border-radius:8px;overflow:hidden;margin:12px 0;">
+                    <tbody>
+                        ${row('IP Address (CIDR)', net.cidr || net.ip)}
+                        ${row('Gateway', net.gateway)}
+                        ${row('DNS Server', net.dns)}
+                    </tbody>
+                </table>
+                <p style="color:var(--text-muted);font-size:12px;margin-bottom:0;">After install reboots the VM, open <strong>VM Settings</strong> and clear the ISO field so it boots from disk next time.</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-primary" onclick="this.closest('.modal-overlay').remove()">Got it</button>
+            </div>
+        </div>`;
+    document.body.appendChild(overlay);
+}
+
 function offerAddSerialConsole(name, status) {
     return new Promise((resolve) => {
         const backendLabel = status.backend === 'pve' ? 'Proxmox' :
@@ -22219,6 +22263,18 @@ async function executeAppStoreInstall() {
             ? `/api/appstore/apps/${appStoreInstallAppId}/install-stream`
             : `/api/nodes/${selectedNodeId}/proxy/appstore/apps/${appStoreInstallAppId}/install-stream`;
 
+        // Toast so the user gets immediate visible feedback even before the
+        // first SSE event (HEAD probe + wget spawn can take a couple of
+        // seconds). Long duration since the install runs for minutes.
+        showToast(`Installing ${appName} (VM) — watch progress in the task log at the bottom`, 'info', 8000);
+
+        // Force the task-log footer open even if the user had previously
+        // closed it. Without this override, the install runs invisibly:
+        // the entry gets added, but showTaskLog() short-circuits when
+        // _taskLogUserClosed is true and the user sees nothing.
+        _taskLogUserClosed = false;
+        try { savePref('wolfstack_tasklog_closed', 'false'); } catch (e) {}
+
         // Open a running task-log entry so the user can watch progress in
         // the footer without a modal pinned to the screen. Expand it so
         // the download-progress lines are visible straight away.
@@ -22230,7 +22286,8 @@ async function executeAppStoreInstall() {
         });
         const entry = _taskLogEntries.find(e => e.id === taskId);
         if (entry) entry.expanded = true;
-        showTaskLog?.();
+        showTaskLog();
+        renderTaskLog();
 
         try {
             const resp = await fetch(installUrl, {
@@ -22247,6 +22304,7 @@ async function executeAppStoreInstall() {
             let buffer = '';
             let finalMsg = '';
             let failed = false;
+            let pbsNetwork = null; // captured from [pbs-network] marker
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
@@ -22267,6 +22325,12 @@ async function executeAppStoreInstall() {
                         failed = true;
                         finalMsg = text.slice(8);
                         updateTaskLogEntry(taskId, { logLine: `ERROR: ${finalMsg}` });
+                    } else if (text.startsWith('[pbs-network] ')) {
+                        // Structured payload — parse and stash for the
+                        // post-install modal. We still log the line so the
+                        // task log keeps a history.
+                        try { pbsNetwork = JSON.parse(text.slice(14)); } catch (e) {}
+                        updateTaskLogEntry(taskId, { logLine: 'Network config captured for post-install modal' });
                     } else {
                         // Live progress — update the description so the
                         // footer shows the latest line, and append to the
@@ -22284,6 +22348,7 @@ async function executeAppStoreInstall() {
             } else {
                 updateTaskLogEntry(taskId, { status: 'completed', description: `${appName} VM ready — see log for next steps` });
                 showToast(finalMsg || `${appName} VM created!`, 'success', 10000);
+                if (pbsNetwork) showPbsNetworkModal(appName, pbsNetwork);
             }
         } catch (e) {
             updateTaskLogEntry(taskId, { status: 'failed', logLine: `ERROR: ${e.message}` });
