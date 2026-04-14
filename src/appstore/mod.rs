@@ -664,6 +664,28 @@ pub fn install_vm_streamed(
         let _ = tx.send(format!("Added data disk: {} GB", sz));
     }
 
+    // Firewall apps (OPNsense) need a WAN NIC in addition to the LAN one
+    // on WolfNet. Bridge the second NIC onto the host's primary interface
+    // so it gets an IP from the upstream router — that's the "external"
+    // side of the firewall. net0 (WolfNet) remains LAN = vtnet0 inside
+    // the guest; this new NIC = net1 = vtnet1 = WAN.
+    let wan_interface: Option<String> = if app.id == "opnsense" {
+        let iface = crate::networking::detect_primary_interface();
+        cfg.extra_nics.push(crate::vms::manager::NicConfig {
+            model: "virtio".into(),
+            mac: None,
+            bridge: None,
+            passthrough_interface: Some(iface.clone()),
+        });
+        let _ = tx.send(format!(
+            "Added WAN NIC bridged to host interface '{}' (vtnet1 inside the guest)",
+            iface
+        ));
+        Some(iface)
+    } else {
+        None
+    };
+
     let _ = tx.send(format!(
         "Creating VM '{}' ({} cores, {} MB RAM, {} GB OS disk)...",
         vm_name, cores, memory_mb, disk_gb
@@ -689,94 +711,175 @@ pub fn install_vm_streamed(
         }
     }
 
-    // PBS installer step-by-step so users don't get stuck on the
-    // "Management Network Configuration" screen typing random numbers.
-    // Our dnsmasq on the TAP offers exactly one DHCP lease, but the PBS
-    // installer sometimes shows default placeholders (192.168.100.x)
-    // instead of reading the DHCP reply — easier to just tell the user
-    // what to paste in.
-    if app.id == "pbs" {
-        let _ = tx.send(
-            "═══════════════════════════════════════════════════════════════".into()
-        );
-        let _ = tx.send(
-            "PBS installer next steps (open VNC on the VM):".into()
-        );
-        let _ = tx.send(
-            "  1. Installer boot menu → pick 'Install Proxmox Backup Server (Graphical)'."
-                .into(),
-        );
-        let _ = tx.send(
-            "     Do NOT pick 'Automatic installation' — that needs an answer file we don't ship."
-                .into(),
-        );
-        let _ = tx.send(
-            "  2. Target harddisk → pick the smaller disk (the OS disk). Use ZFS/ext4 defaults."
-                .into(),
-        );
-        let _ = tx.send(
-            "  3. Country/timezone/password/email → your choice.".into(),
-        );
-        if let Some(ref ip) = wolfnet_ip {
-            let parts: Vec<&str> = ip.split('.').collect();
-            let gw = if parts.len() == 4 {
-                format!("{}.{}.{}.254", parts[0], parts[1], parts[2])
-            } else {
-                "(ask: wolfstack shows the gateway on the VM's details page)".into()
-            };
-            let _ = tx.send(
-                "  4. Management Network Configuration → if the installer shows 192.168.100.x, overwrite with:".into(),
-            );
-            let _ = tx.send(format!("       IP Address (CIDR):  {}/24", ip));
-            let _ = tx.send(format!("       Gateway:            {}", gw));
-            let _ = tx.send(        "       DNS Server:         8.8.8.8  (or your preferred DNS)".into());
-            // Structured marker so the frontend can show a sticky modal
-            // with copy-to-clipboard fields. The task-log view is great
-            // for live progress but easy to scroll past — the modal
-            // stays up until the user acknowledges it.
-            let payload = serde_json::json!({
-                "vm_name": vm_name,
-                "ip": ip,
-                "cidr": format!("{}/24", ip),
-                "gateway": gw,
-                "dns": "8.8.8.8",
-                "vnc_hint": format!("Open VNC on VM '{}' to start the installer", vm_name),
-            });
-            let _ = tx.send(format!("[pbs-network] {}", payload));
+    // Every VM install emits a structured `[vm-network]` payload so the
+    // frontend can show a sticky "your VM's IP details" modal BEFORE the
+    // user opens VNC. The task log mirrors the same info for history.
+    // Per-app `steps` cover the installer-specific bits (static-IP prompts
+    // for PBS/PVE/Harvester/TrueNAS/OPNsense; DHCP auto-pickup for the
+    // rest).
+    let gateway = wolfnet_ip.as_ref().and_then(|ip| {
+        let parts: Vec<&str> = ip.split('.').collect();
+        if parts.len() == 4 {
+            Some(format!("{}.{}.{}.254", parts[0], parts[1], parts[2]))
         } else {
-            let _ = tx.send(
-                "  4. Management Network Configuration → use the IP/gateway your network provides (no WolfNet IP was allocated)".into(),
-            );
-            let payload = serde_json::json!({
-                "vm_name": vm_name,
-                "ip": null,
-                "cidr": null,
-                "gateway": null,
-                "dns": "8.8.8.8",
-                "vnc_hint": format!("Open VNC on VM '{}' to start the installer (no WolfNet IP — use the IP your network provides)", vm_name),
-            });
-            let _ = tx.send(format!("[pbs-network] {}", payload));
+            None
         }
-        let _ = tx.send(
-            "  5. Review → Install. When it reboots, unset the ISO in VM Settings so it boots from disk."
-                .into(),
-        );
-        let _ = tx.send(
-            "═══════════════════════════════════════════════════════════════".into()
-        );
-    } else {
-        let _ = tx.send("Open VNC to complete the installer.".into());
+    });
+
+    let (installer_mode, steps): (&str, Vec<String>) = match app.id.as_str() {
+        "pbs" => ("static", vec![
+            "Installer boot menu - 'Install Proxmox Backup Server (Graphical)'. NOT 'Automatic installation' (that needs an answer file).".into(),
+            "Target harddisk - pick the smaller disk (OS disk). ZFS/ext4 defaults.".into(),
+            "Country/timezone/password/email - your choice.".into(),
+            "Management Network Configuration - enter the IP/gateway/DNS shown below (overwrite any 192.168.100.x placeholders).".into(),
+            "Review - Install. When it reboots, unset the ISO in VM Settings.".into(),
+        ]),
+        "proxmox-ve" => ("static", vec![
+            "Installer boot menu - 'Install Proxmox VE (Graphical)'.".into(),
+            "Target harddisk - defaults are fine. Country/timezone/password/email.".into(),
+            "Management Network Configuration - enter the IP/gateway/DNS shown below.".into(),
+            "Review - Install. When it reboots, unset the ISO in VM Settings.".into(),
+            "WebGUI at https://<IP>:8006 - login 'root' + your install password.".into(),
+        ]),
+        "opnsense" => ("static", vec![
+            "Two NICs are attached: vtnet0 = LAN (on WolfNet, IP below), vtnet1 = WAN (bridged to your host's uplink, DHCP from upstream).".into(),
+            "Wait ~60s for the live console login prompt.".into(),
+            "Log in as 'installer' / 'opnsense' to start the guided installer.".into(),
+            "Keymap - Continue - pick ZFS or UFS - pick the disk - Install.".into(),
+            "Set the root password. Reboot. Unset the ISO in VM Settings.".into(),
+            "After reboot: console option 1 'Assign interfaces' - confirm LAN=vtnet0, WAN=vtnet1.".into(),
+            "Console option 2 'Set interface IP address' - set LAN (vtnet0) to the IP/gateway below (NOT the default 192.168.1.1). Leave WAN as DHCP.".into(),
+            "WebGUI at https://<LAN-IP> - login 'root' / 'opnsense' (change on first login).".into(),
+        ]),
+        "harvester" => ("static", vec![
+            "Installer boot menu - 'Harvester Installer'.".into(),
+            "'Create a new Harvester cluster' on the first node.".into(),
+            "Management interface - use the IP/gateway/DNS shown below. Cluster VIP needs a separate free IP (not the same as management).".into(),
+            "Set a cluster token (remember it for adding more nodes) and admin password.".into(),
+            "WebGUI at https://<VIP> - initial bootstrap takes 10-15 minutes after reboot.".into(),
+        ]),
+        "truenas-scale" => ("dhcp", vec![
+            "Installer menu - 'Install/Upgrade'. Pick the smaller (boot) disk.".into(),
+            "Choose 'Administrative user' (default 'truenas_admin'). Set its password.".into(),
+            "EFI/swap defaults. Install and reboot. Unset the ISO in VM Settings.".into(),
+            "First boot gets a DHCP lease (the IP below). To set it static: console menu option 1 'Configure Network Interfaces' and enter the values below.".into(),
+            "WebGUI at http://<IP> - login 'truenas_admin' + your password. Configure the data disk under Storage.".into(),
+        ]),
+        // Everyone else - Ubuntu/Debian/Mint/Fedora/Rocky/Alma/Alpine/
+        // EndeavourOS/CachyOS installers all default to DHCP, so they pick
+        // up the WolfNet lease automatically. The IP is shown so the user
+        // knows where to reach the VM after install.
+        _ => ("dhcp", vec![
+            "The installer defaults to DHCP - it will pick up the IP shown below automatically.".into(),
+            "Follow the installer prompts (keyboard, timezone, disk, user account).".into(),
+            "After install reboots, the VM is reachable at the IP below (SSH / WebGUI).".into(),
+            "Unset the ISO in VM Settings so subsequent boots skip the installer.".into(),
+        ]),
+    };
+
+    let sep = "=".repeat(63);
+    let _ = tx.send(sep.clone());
+    let _ = tx.send(format!("{} installer - open VNC on the VM:", app.name));
+    for (i, step) in steps.iter().enumerate() {
+        let _ = tx.send(format!("  {}. {}", i + 1, step));
     }
+    if let Some(ref ip) = wolfnet_ip {
+        let gw = gateway.clone().unwrap_or_else(|| "(see VM details)".into());
+        let _ = tx.send(format!(
+            "  Network: IP {}/24  Gateway {}  DNS 8.8.8.8",
+            ip, gw
+        ));
+    } else {
+        let _ = tx.send(
+            "  Network: no WolfNet IP allocated - use the IP/gateway your network provides".into(),
+        );
+    }
+    let _ = tx.send(sep);
+
+    // Structured payload picked up by the frontend and rendered as a
+    // sticky modal. Emitted for EVERY VM install.
+    // Extra NICs (e.g. OPNsense WAN) — shown as a secondary row in the
+    // modal so the user understands the guest has more than one interface
+    // and which is which.
+    let extra_nics = wan_interface.as_ref().map(|iface| {
+        serde_json::json!([{
+            "label": "WAN (vtnet1)",
+            "description": format!(
+                "Bridged to host interface '{}'. Gets its IP via DHCP from your upstream network — this is the firewall's external side.",
+                iface
+            ),
+            "mode": "dhcp",
+        }])
+    });
+
+    let payload = serde_json::json!({
+        "app_id": app.id,
+        "app_name": app.name,
+        "vm_name": vm_name,
+        "ip": wolfnet_ip,
+        "cidr": wolfnet_ip.as_ref().map(|ip| format!("{}/24", ip)),
+        "gateway": gateway,
+        "dns": "8.8.8.8",
+        "installer_mode": installer_mode,
+        "steps": steps,
+        "extra_nics": extra_nics,
+        "vnc_hint": format!("Open VNC on VM '{}' to start the installer", vm_name),
+    });
+    let _ = tx.send(format!("[vm-network] {}", payload));
 
     let done_msg = format!("{} VM '{}' created and started.", app.name, vm_name);
     let _ = tx.send(done_msg.clone());
     Ok(done_msg)
 }
 
+/// If `url` ends in a compressed-archive suffix we can decompress,
+/// return that suffix (including the leading dot). OPNsense ships
+/// `.iso.bz2`, Alpine physical images can be `.iso.gz`, HAOS-style
+/// qcow2 images use `.xz`. The downloader uses this to fetch to
+/// `{dest}{suffix}` and then decompress to `{dest}`.
+fn compressed_suffix(url: &str) -> Option<&'static str> {
+    if url.ends_with(".bz2") { Some(".bz2") }
+    else if url.ends_with(".xz") { Some(".xz") }
+    else if url.ends_with(".gz") { Some(".gz") }
+    else { None }
+}
+
+/// Decompress `compressed` (e.g. foo.iso.bz2) in place, producing the
+/// file with the suffix stripped (foo.iso). The underlying tool
+/// (bunzip2/xz/gunzip) already writes to the suffix-stripped name and
+/// removes the input, so this helper just runs the tool and checks
+/// status. The `-f` flag lets it overwrite an existing target from a
+/// previous interrupted install.
+fn decompress_in_place(compressed: &str, suffix: &str) -> Result<(), String> {
+    let (cmd, args): (&str, Vec<&str>) = match suffix {
+        ".bz2" => ("bunzip2", vec!["-f", compressed]),
+        ".xz"  => ("xz",      vec!["-d", "-f", compressed]),
+        ".gz"  => ("gunzip",  vec!["-f", compressed]),
+        other  => return Err(format!("decompress: unknown suffix {}", other)),
+    };
+    let output = std::process::Command::new(cmd)
+        .args(&args)
+        .output()
+        .map_err(|e| format!("failed to run {}: {}", cmd, e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} exited with status {:?}: {}",
+            cmd,
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 /// Download a URL to `dest` via wget, emitting byte-progress events every
 /// second to `tx` by polling the partial file size. Returns Err with
 /// wget's stderr on non-zero exit. total_bytes comes from a HEAD probe —
 /// if the server doesn't cooperate, progress shows bytes-only.
+///
+/// If `url` ends in `.bz2`/`.xz`/`.gz`, the compressed archive is downloaded
+/// to `{dest}{suffix}` and decompressed in place, so callers always get a
+/// plain `.iso` at `dest` regardless of the wire format.
 fn download_iso_with_progress(
     url: &str,
     dest: &str,
@@ -787,6 +890,12 @@ fn download_iso_with_progress(
     use std::time::{Duration, Instant};
 
     let _ = tx.send(format!("Downloading {}...", url));
+
+    let suffix = compressed_suffix(url);
+    let wget_target = match suffix {
+        Some(sfx) => format!("{}{}", dest, sfx),
+        None => dest.to_string(),
+    };
 
     // Best-effort HEAD for total size. Many mirrors support this; Proxmox's
     // does. If we don't get Content-Length we just skip the percentage.
@@ -816,14 +925,14 @@ fn download_iso_with_progress(
 
     // Fire wget. -q silences its own progress; we poll the file ourselves.
     let mut child = std::process::Command::new("wget")
-        .args(["-q", "-O", dest, url])
+        .args(["-q", "-O", &wget_target, url])
         .spawn()
         .map_err(|e| format!("Failed to run wget: {}", e))?;
 
     // Progress poller — runs until `done` flips, emits a line per second.
     let done = Arc::new(AtomicBool::new(false));
     let done_clone = done.clone();
-    let dest_clone = dest.to_string();
+    let dest_clone = wget_target.clone();
     let tx_clone = tx.clone();
     let started = Instant::now();
     let poller = std::thread::spawn(move || {
@@ -859,8 +968,27 @@ fn download_iso_with_progress(
     let _ = poller.join();
 
     if !status.success() {
+        // Function contract: on failure, leave no partial files behind.
+        // Otherwise the next call's "already cached?" check at the callsite
+        // would see a partial file and skip the retry.
+        let _ = std::fs::remove_file(&wget_target);
+        let _ = std::fs::remove_file(dest);
         return Err(format!("wget exited with status {:?}", status.code()));
     }
+
+    if let Some(sfx) = suffix {
+        let _ = tx.send(format!("Decompressing {} archive...", sfx));
+        if let Err(e) = decompress_in_place(&wget_target, sfx) {
+            // bunzip2/xz/gunzip may have written partial output to `dest`
+            // before failing; and `wget_target` is only removed on success.
+            // Clean both so the next install retries from scratch.
+            let _ = std::fs::remove_file(&wget_target);
+            let _ = std::fs::remove_file(dest);
+            return Err(e);
+        }
+        let _ = tx.send("Decompression complete.".into());
+    }
+
     Ok(())
 }
 
@@ -887,32 +1015,49 @@ fn install_vm(
         // manifest URL can't be fetched, scrape the directory index for the
         // newest matching ISO and retry. Same idea as apt-get's "fetch the
         // index, pick the newest version, download".
+        // wget_and_decompress: fetch a URL to `iso_path`, handling the
+        // `.bz2`/`.xz`/`.gz` wrapper that OPNsense and a few others use.
+        let wget_and_decompress = |url: &str| -> Result<(), String> {
+            let sfx = compressed_suffix(url);
+            let target = match sfx {
+                Some(s) => format!("{}{}", iso_path, s),
+                None => iso_path.clone(),
+            };
+            let out = std::process::Command::new("wget")
+                .args(["-q", "-O", &target, url])
+                .output()
+                .map_err(|e| format!("Failed to run wget: {}", e))?;
+            if !out.status.success() {
+                let _ = std::fs::remove_file(&target);
+                let _ = std::fs::remove_file(&iso_path);
+                return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+            }
+            if let Some(s) = sfx {
+                if let Err(e) = decompress_in_place(&target, s) {
+                    // Partial decompressed output may exist at `iso_path`;
+                    // remove both so the next install retries from scratch.
+                    let _ = std::fs::remove_file(&target);
+                    let _ = std::fs::remove_file(&iso_path);
+                    return Err(e);
+                }
+            }
+            Ok(())
+        };
+
         let mut effective_url = vm.iso_url.clone();
-        let first = std::process::Command::new("wget")
-            .args(["-q", "-O", &iso_path, &effective_url])
-            .output()
-            .map_err(|e| format!("Failed to run wget: {}", e))?;
-        if !first.status.success() {
-            let _ = std::fs::remove_file(&iso_path);
+        if let Err(first_err) = wget_and_decompress(&effective_url) {
             if let Some(resolved) = resolve_latest_iso(&vm.iso_url) {
                 effective_url = resolved;
-                let retry = std::process::Command::new("wget")
-                    .args(["-q", "-O", &iso_path, &effective_url])
-                    .output()
-                    .map_err(|e| format!("Failed to run wget: {}", e))?;
-                if !retry.status.success() {
-                    let _ = std::fs::remove_file(&iso_path);
+                if let Err(retry_err) = wget_and_decompress(&effective_url) {
                     return Err(format!(
                         "Failed to download ISO from {} (also tried {}): {}",
-                        vm.iso_url, effective_url,
-                        String::from_utf8_lossy(&retry.stderr).trim()
+                        vm.iso_url, effective_url, retry_err
                     ));
                 }
             } else {
                 return Err(format!(
                     "Failed to download ISO from {} (couldn't resolve latest version either): {}",
-                    vm.iso_url,
-                    String::from_utf8_lossy(&first.stderr).trim()
+                    vm.iso_url, first_err
                 ));
             }
         }
@@ -1495,6 +1640,427 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
                     placeholder: Some("200".into()),
                     options: vec![],
                 },
+            ],
+        },
+
+        // ─── ISO-based VM apps ───
+        // Firewall, hypervisors, NAS, Linux server distros. All install as
+        // KVM VMs via the PBS pattern: download ISO, create VM, auto-start,
+        // user finishes the installer over VNC. URLs are pinned to a known
+        // version; `resolve_latest_iso` handles Proxmox-style directory
+        // scrapes if the pin 404s. OPNsense ships .iso.bz2 — the downloader
+        // decompresses in place.
+
+        AppManifest {
+            id: "opnsense".into(),
+            name: "OPNsense".into(),
+            icon: "🛡️".into(),
+            category: "Firewall".into(),
+            description: "Open-source firewall & routing platform (FreeBSD-based). Installs from a compressed DVD ISO (.iso.bz2 — decompressed automatically). In the live installer log in as 'installer' / 'opnsense' to run the guided installer. Default WebGUI creds after install: 'root' / 'opnsense' — change on first login.".into(),
+            website: Some("https://opnsense.org".into()),
+            docker: None, lxc: None, bare_metal: None,
+            vm: Some(VmTarget {
+                iso_url: "https://mirror.dns-root.de/opnsense/releases/26.1.2/OPNsense-26.1.2-dvd-amd64.iso.bz2".into(),
+                memory_mb: 2048,
+                cores: 2,
+                disk_gb: 20,
+                data_disk_gb: None,
+                data_disk_label: None,
+                vga: "std".into(),
+            }),
+            user_inputs: vec![
+                UserInput { id: "cores".into(), label: "CPU cores".into(), input_type: "number".into(), default: Some("2".into()), required: false, placeholder: Some("2".into()), options: vec![] },
+                UserInput { id: "memory_mb".into(), label: "Memory (MB)".into(), input_type: "number".into(), default: Some("2048".into()), required: false, placeholder: Some("2048".into()), options: vec![] },
+                UserInput { id: "disk_gb".into(), label: "Disk (GB)".into(), input_type: "number".into(), default: Some("20".into()), required: false, placeholder: Some("20".into()), options: vec![] },
+            ],
+        },
+
+        AppManifest {
+            id: "proxmox-ve".into(),
+            name: "Proxmox VE".into(),
+            icon: "🧱".into(),
+            category: "Virtualization".into(),
+            description: "Complete server virtualization platform (KVM + LXC) with web GUI, live migration, and clustering. Nested virtualization should be enabled on the host for the guest to run VMs. In the installer pick the graphical option and follow the prompts.".into(),
+            website: Some("https://www.proxmox.com/proxmox-ve".into()),
+            docker: None, lxc: None, bare_metal: None,
+            vm: Some(VmTarget {
+                iso_url: "https://enterprise.proxmox.com/iso/proxmox-ve_9.1-1.iso".into(),
+                memory_mb: 8192,
+                cores: 4,
+                disk_gb: 64,
+                data_disk_gb: Some(200),
+                data_disk_label: Some("VM storage disk (GB)".into()),
+                vga: "std".into(),
+            }),
+            user_inputs: vec![
+                UserInput { id: "cores".into(), label: "CPU cores".into(), input_type: "number".into(), default: Some("4".into()), required: false, placeholder: Some("4".into()), options: vec![] },
+                UserInput { id: "memory_mb".into(), label: "Memory (MB)".into(), input_type: "number".into(), default: Some("8192".into()), required: false, placeholder: Some("8192".into()), options: vec![] },
+                UserInput { id: "disk_gb".into(), label: "OS disk (GB)".into(), input_type: "number".into(), default: Some("64".into()), required: false, placeholder: Some("64".into()), options: vec![] },
+                UserInput { id: "data_disk_gb".into(), label: "VM storage disk (GB)".into(), input_type: "number".into(), default: Some("200".into()), required: false, placeholder: Some("200".into()), options: vec![] },
+            ],
+        },
+
+        AppManifest {
+            id: "harvester".into(),
+            name: "Harvester".into(),
+            icon: "🌾".into(),
+            category: "Virtualization".into(),
+            description: "SUSE/Rancher hyper-converged infrastructure (Kubernetes + KubeVirt). MINIMUM SPECS: 8 CPU cores, 32 GB RAM, 250 GB disk, and nested virtualization enabled on the host. Defaults match the minimum — you can lower them for evaluation but the installer may refuse.".into(),
+            website: Some("https://harvesterhci.io".into()),
+            docker: None, lxc: None, bare_metal: None,
+            vm: Some(VmTarget {
+                iso_url: "https://releases.rancher.com/harvester/v1.7.1/harvester-v1.7.1-amd64.iso".into(),
+                memory_mb: 32768,
+                cores: 8,
+                disk_gb: 250,
+                data_disk_gb: None,
+                data_disk_label: None,
+                vga: "std".into(),
+            }),
+            user_inputs: vec![
+                UserInput { id: "cores".into(), label: "CPU cores (min 8)".into(), input_type: "number".into(), default: Some("8".into()), required: false, placeholder: Some("8".into()), options: vec![] },
+                UserInput { id: "memory_mb".into(), label: "Memory MB (min 32768)".into(), input_type: "number".into(), default: Some("32768".into()), required: false, placeholder: Some("32768".into()), options: vec![] },
+                UserInput { id: "disk_gb".into(), label: "Disk GB (min 250)".into(), input_type: "number".into(), default: Some("250".into()), required: false, placeholder: Some("250".into()), options: vec![] },
+            ],
+        },
+
+        AppManifest {
+            id: "truenas-scale".into(),
+            name: "TrueNAS Community Edition".into(),
+            icon: "🗄️".into(),
+            category: "Storage".into(),
+            description: "Open-source NAS with ZFS, snapshots, replication, and a full web UI. Official minimum is 16 GB RAM. The OS installs to the small boot disk; the large data disk becomes your storage pool (configure after install under Storage → Pools).".into(),
+            website: Some("https://www.truenas.com/truenas-community-edition/".into()),
+            docker: None, lxc: None, bare_metal: None,
+            vm: Some(VmTarget {
+                iso_url: "https://download.sys.truenas.net/TrueNAS-SCALE-Goldeye/25.10.2.1/TrueNAS-SCALE-25.10.2.1.iso".into(),
+                memory_mb: 16384,
+                cores: 4,
+                disk_gb: 32,
+                data_disk_gb: Some(500),
+                data_disk_label: Some("Storage pool disk (GB)".into()),
+                vga: "std".into(),
+            }),
+            user_inputs: vec![
+                UserInput { id: "cores".into(), label: "CPU cores".into(), input_type: "number".into(), default: Some("4".into()), required: false, placeholder: Some("4".into()), options: vec![] },
+                UserInput { id: "memory_mb".into(), label: "Memory MB (min 16384)".into(), input_type: "number".into(), default: Some("16384".into()), required: false, placeholder: Some("16384".into()), options: vec![] },
+                UserInput { id: "disk_gb".into(), label: "Boot disk (GB)".into(), input_type: "number".into(), default: Some("32".into()), required: false, placeholder: Some("32".into()), options: vec![] },
+                UserInput { id: "data_disk_gb".into(), label: "Storage pool disk (GB)".into(), input_type: "number".into(), default: Some("500".into()), required: false, placeholder: Some("500".into()), options: vec![] },
+            ],
+        },
+
+        AppManifest {
+            id: "ubuntu-server".into(),
+            name: "Ubuntu Server 24.04 LTS".into(),
+            icon: "🐧".into(),
+            category: "Operating System".into(),
+            description: "Ubuntu Server 24.04 LTS (Noble Numbat). Long-term support through 2029, subiquity text-mode installer. Defaults sized for a lightweight server workload — scale up for database / app workloads.".into(),
+            website: Some("https://ubuntu.com/server".into()),
+            docker: None, lxc: None, bare_metal: None,
+            vm: Some(VmTarget {
+                iso_url: "https://releases.ubuntu.com/24.04/ubuntu-24.04.4-live-server-amd64.iso".into(),
+                memory_mb: 2048,
+                cores: 2,
+                disk_gb: 25,
+                data_disk_gb: None,
+                data_disk_label: None,
+                vga: "std".into(),
+            }),
+            user_inputs: vec![
+                UserInput { id: "cores".into(), label: "CPU cores".into(), input_type: "number".into(), default: Some("2".into()), required: false, placeholder: Some("2".into()), options: vec![] },
+                UserInput { id: "memory_mb".into(), label: "Memory (MB)".into(), input_type: "number".into(), default: Some("2048".into()), required: false, placeholder: Some("2048".into()), options: vec![] },
+                UserInput { id: "disk_gb".into(), label: "Disk (GB)".into(), input_type: "number".into(), default: Some("25".into()), required: false, placeholder: Some("25".into()), options: vec![] },
+            ],
+        },
+
+        AppManifest {
+            id: "debian-server".into(),
+            name: "Debian 13 (netinst)".into(),
+            icon: "🌀".into(),
+            category: "Operating System".into(),
+            description: "Debian 13 'Trixie' network installer. The ISO is small (~750 MB) because packages are pulled over the network during install — the VM needs outbound internet to finish. Pick a mirror close to you when prompted.".into(),
+            website: Some("https://www.debian.org".into()),
+            docker: None, lxc: None, bare_metal: None,
+            vm: Some(VmTarget {
+                iso_url: "https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-13.4.0-amd64-netinst.iso".into(),
+                memory_mb: 1024,
+                cores: 1,
+                disk_gb: 20,
+                data_disk_gb: None,
+                data_disk_label: None,
+                vga: "std".into(),
+            }),
+            user_inputs: vec![
+                UserInput { id: "cores".into(), label: "CPU cores".into(), input_type: "number".into(), default: Some("1".into()), required: false, placeholder: Some("1".into()), options: vec![] },
+                UserInput { id: "memory_mb".into(), label: "Memory (MB)".into(), input_type: "number".into(), default: Some("1024".into()), required: false, placeholder: Some("1024".into()), options: vec![] },
+                UserInput { id: "disk_gb".into(), label: "Disk (GB)".into(), input_type: "number".into(), default: Some("20".into()), required: false, placeholder: Some("20".into()), options: vec![] },
+            ],
+        },
+
+        AppManifest {
+            id: "rocky-linux".into(),
+            name: "Rocky Linux 9".into(),
+            icon: "🪨".into(),
+            category: "Operating System".into(),
+            description: "Enterprise Linux rebuild (bug-for-bug compatible with RHEL 9). Community-driven, led by one of the original CentOS founders. Uses the Anaconda graphical installer.".into(),
+            website: Some("https://rockylinux.org".into()),
+            docker: None, lxc: None, bare_metal: None,
+            vm: Some(VmTarget {
+                iso_url: "https://download.rockylinux.org/pub/rocky/9/isos/x86_64/Rocky-9-latest-x86_64-minimal.iso".into(),
+                memory_mb: 2048,
+                cores: 2,
+                disk_gb: 20,
+                data_disk_gb: None,
+                data_disk_label: None,
+                vga: "std".into(),
+            }),
+            user_inputs: vec![
+                UserInput { id: "cores".into(), label: "CPU cores".into(), input_type: "number".into(), default: Some("2".into()), required: false, placeholder: Some("2".into()), options: vec![] },
+                UserInput { id: "memory_mb".into(), label: "Memory (MB)".into(), input_type: "number".into(), default: Some("2048".into()), required: false, placeholder: Some("2048".into()), options: vec![] },
+                UserInput { id: "disk_gb".into(), label: "Disk (GB)".into(), input_type: "number".into(), default: Some("20".into()), required: false, placeholder: Some("20".into()), options: vec![] },
+            ],
+        },
+
+        AppManifest {
+            id: "almalinux".into(),
+            name: "AlmaLinux 9".into(),
+            icon: "🏔️".into(),
+            category: "Operating System".into(),
+            description: "Enterprise Linux rebuild (1:1 binary compatible with RHEL 9). Backed by CloudLinux and the AlmaLinux Foundation. Uses the Anaconda graphical installer.".into(),
+            website: Some("https://almalinux.org".into()),
+            docker: None, lxc: None, bare_metal: None,
+            vm: Some(VmTarget {
+                iso_url: "https://repo.almalinux.org/almalinux/9/isos/x86_64/AlmaLinux-9-latest-x86_64-minimal.iso".into(),
+                memory_mb: 2048,
+                cores: 2,
+                disk_gb: 20,
+                data_disk_gb: None,
+                data_disk_label: None,
+                vga: "std".into(),
+            }),
+            user_inputs: vec![
+                UserInput { id: "cores".into(), label: "CPU cores".into(), input_type: "number".into(), default: Some("2".into()), required: false, placeholder: Some("2".into()), options: vec![] },
+                UserInput { id: "memory_mb".into(), label: "Memory (MB)".into(), input_type: "number".into(), default: Some("2048".into()), required: false, placeholder: Some("2048".into()), options: vec![] },
+                UserInput { id: "disk_gb".into(), label: "Disk (GB)".into(), input_type: "number".into(), default: Some("20".into()), required: false, placeholder: Some("20".into()), options: vec![] },
+            ],
+        },
+
+        AppManifest {
+            id: "fedora-server".into(),
+            name: "Fedora Server 43".into(),
+            icon: "🎩".into(),
+            category: "Operating System".into(),
+            description: "Fedora Server — community-driven, leading-edge kernel and toolchain, six-month release cadence. Uses the Anaconda graphical installer. Typically what RHEL becomes in a year or two.".into(),
+            website: Some("https://fedoraproject.org/server/".into()),
+            docker: None, lxc: None, bare_metal: None,
+            vm: Some(VmTarget {
+                iso_url: "https://download.fedoraproject.org/pub/fedora/linux/releases/43/Server/x86_64/iso/Fedora-Server-dvd-x86_64-43-1.6.iso".into(),
+                memory_mb: 2048,
+                cores: 2,
+                disk_gb: 20,
+                data_disk_gb: None,
+                data_disk_label: None,
+                vga: "std".into(),
+            }),
+            user_inputs: vec![
+                UserInput { id: "cores".into(), label: "CPU cores".into(), input_type: "number".into(), default: Some("2".into()), required: false, placeholder: Some("2".into()), options: vec![] },
+                UserInput { id: "memory_mb".into(), label: "Memory (MB)".into(), input_type: "number".into(), default: Some("2048".into()), required: false, placeholder: Some("2048".into()), options: vec![] },
+                UserInput { id: "disk_gb".into(), label: "Disk (GB)".into(), input_type: "number".into(), default: Some("20".into()), required: false, placeholder: Some("20".into()), options: vec![] },
+            ],
+        },
+
+        AppManifest {
+            id: "alpine".into(),
+            name: "Alpine Linux (virt)".into(),
+            icon: "🏕️".into(),
+            category: "Operating System".into(),
+            description: "Security-oriented, lightweight (~67 MB ISO) Linux based on musl libc and BusyBox. The 'virt' flavour is stripped down for VM use. At the login prompt use 'root' (no password) and run 'setup-alpine' to install.".into(),
+            website: Some("https://alpinelinux.org".into()),
+            docker: None, lxc: None, bare_metal: None,
+            vm: Some(VmTarget {
+                iso_url: "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/alpine-virt-3.23.3-x86_64.iso".into(),
+                memory_mb: 512,
+                cores: 1,
+                disk_gb: 4,
+                data_disk_gb: None,
+                data_disk_label: None,
+                vga: "std".into(),
+            }),
+            user_inputs: vec![
+                UserInput { id: "cores".into(), label: "CPU cores".into(), input_type: "number".into(), default: Some("1".into()), required: false, placeholder: Some("1".into()), options: vec![] },
+                UserInput { id: "memory_mb".into(), label: "Memory (MB)".into(), input_type: "number".into(), default: Some("512".into()), required: false, placeholder: Some("512".into()), options: vec![] },
+                UserInput { id: "disk_gb".into(), label: "Disk (GB)".into(), input_type: "number".into(), default: Some("4".into()), required: false, placeholder: Some("4".into()), options: vec![] },
+            ],
+        },
+
+        // Desktop Linux variants — larger RAM/disk defaults because they
+        // run a full desktop environment. All installable over VNC.
+
+        AppManifest {
+            id: "ubuntu-desktop".into(),
+            name: "Ubuntu Desktop 24.04 LTS".into(),
+            icon: "🖥️".into(),
+            category: "Desktop OS".into(),
+            description: "Ubuntu Desktop 24.04 LTS with GNOME. Long-term support through 2029. The live ISO also installs — pick 'Install Ubuntu' from the welcome dialog.".into(),
+            website: Some("https://ubuntu.com/desktop".into()),
+            docker: None, lxc: None, bare_metal: None,
+            vm: Some(VmTarget {
+                iso_url: "https://releases.ubuntu.com/24.04/ubuntu-24.04.4-desktop-amd64.iso".into(),
+                memory_mb: 4096,
+                cores: 2,
+                disk_gb: 40,
+                data_disk_gb: None,
+                data_disk_label: None,
+                vga: "std".into(),
+            }),
+            user_inputs: vec![
+                UserInput { id: "cores".into(), label: "CPU cores".into(), input_type: "number".into(), default: Some("2".into()), required: false, placeholder: Some("2".into()), options: vec![] },
+                UserInput { id: "memory_mb".into(), label: "Memory (MB)".into(), input_type: "number".into(), default: Some("4096".into()), required: false, placeholder: Some("4096".into()), options: vec![] },
+                UserInput { id: "disk_gb".into(), label: "Disk (GB)".into(), input_type: "number".into(), default: Some("40".into()), required: false, placeholder: Some("40".into()), options: vec![] },
+            ],
+        },
+
+        AppManifest {
+            id: "linux-mint".into(),
+            name: "Linux Mint 22.3 (Cinnamon)".into(),
+            icon: "🌿".into(),
+            category: "Desktop OS".into(),
+            description: "Ubuntu-LTS-based desktop with the Cinnamon environment. Friendly defaults for new Linux users, supported through 2029. Live ISO includes an installer icon on the desktop.".into(),
+            website: Some("https://linuxmint.com".into()),
+            docker: None, lxc: None, bare_metal: None,
+            vm: Some(VmTarget {
+                iso_url: "https://mirrors.edge.kernel.org/linuxmint/stable/22.3/linuxmint-22.3-cinnamon-64bit.iso".into(),
+                memory_mb: 4096,
+                cores: 2,
+                disk_gb: 40,
+                data_disk_gb: None,
+                data_disk_label: None,
+                vga: "std".into(),
+            }),
+            user_inputs: vec![
+                UserInput { id: "cores".into(), label: "CPU cores".into(), input_type: "number".into(), default: Some("2".into()), required: false, placeholder: Some("2".into()), options: vec![] },
+                UserInput { id: "memory_mb".into(), label: "Memory (MB)".into(), input_type: "number".into(), default: Some("4096".into()), required: false, placeholder: Some("4096".into()), options: vec![] },
+                UserInput { id: "disk_gb".into(), label: "Disk (GB)".into(), input_type: "number".into(), default: Some("40".into()), required: false, placeholder: Some("40".into()), options: vec![] },
+            ],
+        },
+
+        AppManifest {
+            id: "fedora-workstation".into(),
+            name: "Fedora Workstation 43".into(),
+            icon: "🎨".into(),
+            category: "Desktop OS".into(),
+            description: "Fedora Workstation with GNOME — showcase for newest GNOME, kernel, and toolchain. Red Hat's upstream desktop platform. Live ISO includes a 'Install to Hard Drive' shortcut.".into(),
+            website: Some("https://fedoraproject.org/workstation/".into()),
+            docker: None, lxc: None, bare_metal: None,
+            vm: Some(VmTarget {
+                iso_url: "https://download.fedoraproject.org/pub/fedora/linux/releases/43/Workstation/x86_64/iso/Fedora-Workstation-Live-43-1.6.x86_64.iso".into(),
+                memory_mb: 4096,
+                cores: 2,
+                disk_gb: 40,
+                data_disk_gb: None,
+                data_disk_label: None,
+                vga: "std".into(),
+            }),
+            user_inputs: vec![
+                UserInput { id: "cores".into(), label: "CPU cores".into(), input_type: "number".into(), default: Some("2".into()), required: false, placeholder: Some("2".into()), options: vec![] },
+                UserInput { id: "memory_mb".into(), label: "Memory (MB)".into(), input_type: "number".into(), default: Some("4096".into()), required: false, placeholder: Some("4096".into()), options: vec![] },
+                UserInput { id: "disk_gb".into(), label: "Disk (GB)".into(), input_type: "number".into(), default: Some("40".into()), required: false, placeholder: Some("40".into()), options: vec![] },
+            ],
+        },
+
+        AppManifest {
+            id: "kubuntu".into(),
+            name: "Kubuntu 24.04 LTS".into(),
+            icon: "🅺".into(),
+            category: "Desktop OS".into(),
+            description: "Ubuntu 24.04 LTS with the KDE Plasma desktop. Officially recognised Ubuntu flavour, LTS through 2029. Pick 'Install Kubuntu' from the welcome dialog.".into(),
+            website: Some("https://kubuntu.org".into()),
+            docker: None, lxc: None, bare_metal: None,
+            vm: Some(VmTarget {
+                iso_url: "https://cdimage.ubuntu.com/kubuntu/releases/24.04/release/kubuntu-24.04.4-desktop-amd64.iso".into(),
+                memory_mb: 4096,
+                cores: 2,
+                disk_gb: 40,
+                data_disk_gb: None,
+                data_disk_label: None,
+                vga: "std".into(),
+            }),
+            user_inputs: vec![
+                UserInput { id: "cores".into(), label: "CPU cores".into(), input_type: "number".into(), default: Some("2".into()), required: false, placeholder: Some("2".into()), options: vec![] },
+                UserInput { id: "memory_mb".into(), label: "Memory (MB)".into(), input_type: "number".into(), default: Some("4096".into()), required: false, placeholder: Some("4096".into()), options: vec![] },
+                UserInput { id: "disk_gb".into(), label: "Disk (GB)".into(), input_type: "number".into(), default: Some("40".into()), required: false, placeholder: Some("40".into()), options: vec![] },
+            ],
+        },
+
+        AppManifest {
+            id: "debian-desktop".into(),
+            name: "Debian 13 GNOME (live)".into(),
+            icon: "🌀".into(),
+            category: "Desktop OS".into(),
+            description: "Debian 13 'Trixie' live+installer image with GNOME. Unlike netinst, packages are on the ISO — no network needed to complete install. Click 'Install Debian' inside the live session.".into(),
+            website: Some("https://www.debian.org".into()),
+            docker: None, lxc: None, bare_metal: None,
+            vm: Some(VmTarget {
+                iso_url: "https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/debian-live-13.4.0-amd64-gnome.iso".into(),
+                memory_mb: 4096,
+                cores: 2,
+                disk_gb: 40,
+                data_disk_gb: None,
+                data_disk_label: None,
+                vga: "std".into(),
+            }),
+            user_inputs: vec![
+                UserInput { id: "cores".into(), label: "CPU cores".into(), input_type: "number".into(), default: Some("2".into()), required: false, placeholder: Some("2".into()), options: vec![] },
+                UserInput { id: "memory_mb".into(), label: "Memory (MB)".into(), input_type: "number".into(), default: Some("4096".into()), required: false, placeholder: Some("4096".into()), options: vec![] },
+                UserInput { id: "disk_gb".into(), label: "Disk (GB)".into(), input_type: "number".into(), default: Some("40".into()), required: false, placeholder: Some("40".into()), options: vec![] },
+            ],
+        },
+
+        AppManifest {
+            id: "endeavouros".into(),
+            name: "EndeavourOS".into(),
+            icon: "🚀".into(),
+            category: "Desktop OS".into(),
+            description: "Arch Linux rolling release with an easy Calamares installer and a choice of desktop environments at install time. Closer to pure Arch than most derivatives — ideal for learning the AUR, pacman, and rolling updates.".into(),
+            website: Some("https://endeavouros.com".into()),
+            docker: None, lxc: None, bare_metal: None,
+            vm: Some(VmTarget {
+                iso_url: "https://mirror.alpix.eu/endeavouros/iso/EndeavourOS_Titan-2026.03.06.iso".into(),
+                memory_mb: 4096,
+                cores: 2,
+                disk_gb: 40,
+                data_disk_gb: None,
+                data_disk_label: None,
+                vga: "std".into(),
+            }),
+            user_inputs: vec![
+                UserInput { id: "cores".into(), label: "CPU cores".into(), input_type: "number".into(), default: Some("2".into()), required: false, placeholder: Some("2".into()), options: vec![] },
+                UserInput { id: "memory_mb".into(), label: "Memory (MB)".into(), input_type: "number".into(), default: Some("4096".into()), required: false, placeholder: Some("4096".into()), options: vec![] },
+                UserInput { id: "disk_gb".into(), label: "Disk (GB)".into(), input_type: "number".into(), default: Some("40".into()), required: false, placeholder: Some("40".into()), options: vec![] },
+            ],
+        },
+
+        AppManifest {
+            id: "cachyos".into(),
+            name: "CachyOS".into(),
+            icon: "⚡".into(),
+            category: "Desktop OS".into(),
+            description: "Performance-optimised Arch Linux derivative — packages compiled with x86-64-v3/v4 and full LTO, BORE CPU scheduler, and a choice of desktops (KDE, GNOME, Xfce, i3, Hyprland...) at install. ~10% faster than vanilla Arch in their benchmarks.".into(),
+            website: Some("https://cachyos.org".into()),
+            docker: None, lxc: None, bare_metal: None,
+            vm: Some(VmTarget {
+                iso_url: "https://sourceforge.net/projects/cachyos-arch/files/gui-installer/desktop/260308/cachyos-desktop-linux-260308.iso/download".into(),
+                memory_mb: 4096,
+                cores: 2,
+                disk_gb: 40,
+                data_disk_gb: None,
+                data_disk_label: None,
+                vga: "std".into(),
+            }),
+            user_inputs: vec![
+                UserInput { id: "cores".into(), label: "CPU cores".into(), input_type: "number".into(), default: Some("2".into()), required: false, placeholder: Some("2".into()), options: vec![] },
+                UserInput { id: "memory_mb".into(), label: "Memory (MB)".into(), input_type: "number".into(), default: Some("4096".into()), required: false, placeholder: Some("4096".into()), options: vec![] },
+                UserInput { id: "disk_gb".into(), label: "Disk (GB)".into(), input_type: "number".into(), default: Some("40".into()), required: false, placeholder: Some("40".into()), options: vec![] },
             ],
         },
 

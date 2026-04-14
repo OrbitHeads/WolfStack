@@ -476,7 +476,7 @@ fn set_dns_resolv_conf(nameservers: &[String], search_domains: &[String]) -> Res
 }
 
 /// Detect primary network interface
-fn detect_primary_interface() -> String {
+pub fn detect_primary_interface() -> String {
     // Use `ip route` to find the default route interface
     if let Ok(out) = Command::new("ip").args(["route", "show", "default"]).output() {
         let text = String::from_utf8_lossy(&out.stdout);

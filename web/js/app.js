@@ -15616,11 +15616,15 @@ async function openVmConsole(name) {
 /// needs to type into the PBS installer's "Management Network
 /// Configuration" screen. Has copy-to-clipboard buttons per field so the
 /// user can paste the values one at a time. Stays up until dismissed.
-function showPbsNetworkModal(appName, net) {
+function showVmNetworkModal(appName, net) {
+    // Sticky modal shown after every VM install, BEFORE the user opens
+    // VNC. Surfaces the WolfNet IP/gateway/DNS so they (a) know where to
+    // reach the VM and (b) have values to paste if the installer prompts
+    // for a static config.
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay active';
     overlay.style.zIndex = '10000';
-    const escapeAttr = s => String(s == null ? '' : s).replace(/"/g, '&quot;');
+    const escapeAttr = s => String(s == null ? '' : s).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     const row = (label, value) => value
         ? `<tr>
              <td style="padding:6px 10px;color:var(--text-muted);font-size:13px;">${escapeHtml(label)}</td>
@@ -15631,22 +15635,58 @@ function showPbsNetworkModal(appName, net) {
              </td>
            </tr>`
         : '';
+
+    const steps = Array.isArray(net.steps) ? net.steps : [];
+    const stepsHtml = steps.length
+        ? `<ol style="padding-left:20px;margin:8px 0 14px;">
+               ${steps.map(s => `<li style="margin:4px 0;">${escapeHtml(s)}</li>`).join('')}
+           </ol>`
+        : '';
+
+    // Multi-NIC VMs (e.g. OPNsense WAN + LAN) — render a compact block
+    // under the main IP table so the user sees both interfaces up-front.
+    const extraNics = Array.isArray(net.extra_nics) ? net.extra_nics : [];
+    const extraNicsHtml = extraNics.length
+        ? `<div style="margin:4px 0 14px;padding:10px 12px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;">
+               <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px;">Additional interfaces</div>
+               ${extraNics.map(n => `
+                   <div style="margin:4px 0;font-size:13px;">
+                     <strong>${escapeHtml(n.label || 'NIC')}</strong>
+                     <span style="color:var(--text-muted);"> — ${escapeHtml(n.description || '')}</span>
+                   </div>
+               `).join('')}
+           </div>`
+        : '';
+
+    // `installer_mode` tells the modal which framing line to show above
+    // the IP table. "static" = installer prompts you; "dhcp" = installer
+    // auto-configures and the IP is just for reaching the VM later.
+    const mode = net.installer_mode || (net.ip ? 'dhcp' : 'static');
+    const modeLine = !net.ip
+        ? '<p style="color:#f59e0b;">No WolfNet IP was allocated — the VM will use user-mode NAT. Configure the network with whatever your upstream router provides.</p>'
+        : mode === 'static'
+            ? '<p>This installer asks for a static IP. When it does, enter these values:</p>'
+            : '<p>The installer defaults to DHCP and will pick up this IP automatically. Use it to reach the VM after install:</p>';
+
     overlay.innerHTML = `
-        <div class="modal" style="max-width:540px;">
+        <div class="modal" style="max-width:620px;">
             <div class="modal-header">
-                <h3>${escapeHtml(appName)} VM ready — finish in VNC</h3>
+                <h3>${escapeHtml(appName)} VM ready — IP details before you open VNC</h3>
                 <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">×</button>
             </div>
             <div class="modal-body" style="font-size:13px;line-height:1.5;">
                 <p style="margin-top:0;">${escapeHtml(net.vnc_hint || 'Open the VM in VNC to start the installer.')}</p>
-                <p>When the PBS installer reaches the <strong>Management Network Configuration</strong> screen it shows placeholder values (often <code>192.168.100.x</code>). Overwrite them with these:</p>
-                <table style="width:100%;border-collapse:collapse;background:var(--bg-card);border:1px solid var(--border);border-radius:8px;overflow:hidden;margin:12px 0;">
+                ${modeLine}
+                <table style="width:100%;border-collapse:collapse;background:var(--bg-card);border:1px solid var(--border);border-radius:8px;overflow:hidden;margin:12px 0 8px;">
                     <tbody>
-                        ${row('IP Address (CIDR)', net.cidr || net.ip)}
+                        ${row(extraNics.length ? 'LAN Address (CIDR)' : 'IP Address (CIDR)', net.cidr || net.ip)}
                         ${row('Gateway', net.gateway)}
                         ${row('DNS Server', net.dns)}
                     </tbody>
                 </table>
+                ${extraNicsHtml}
+                ${steps.length ? '<p style="margin-bottom:4px;"><strong>Installer steps:</strong></p>' : ''}
+                ${stepsHtml}
                 <p style="color:var(--text-muted);font-size:12px;margin-bottom:0;">After install reboots the VM, open <strong>VM Settings</strong> and clear the ISO field so it boots from disk next time.</p>
             </div>
             <div class="modal-footer">
@@ -22316,7 +22356,7 @@ async function executeAppStoreInstall() {
             let buffer = '';
             let finalMsg = '';
             let failed = false;
-            let pbsNetwork = null; // captured from [pbs-network] marker
+            let vmNetwork = null; // captured from [vm-network] marker — IP details for post-install modal
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
@@ -22337,12 +22377,12 @@ async function executeAppStoreInstall() {
                         failed = true;
                         finalMsg = text.slice(8);
                         updateTaskLogEntry(taskId, { logLine: `ERROR: ${finalMsg}` });
-                    } else if (text.startsWith('[pbs-network] ')) {
+                    } else if (text.startsWith('[vm-network] ')) {
                         // Structured payload — parse and stash for the
                         // post-install modal. We still log the line so the
                         // task log keeps a history.
-                        try { pbsNetwork = JSON.parse(text.slice(14)); } catch (e) {}
-                        updateTaskLogEntry(taskId, { logLine: 'Network config captured for post-install modal' });
+                        try { vmNetwork = JSON.parse(text.slice(13)); } catch (e) {}
+                        updateTaskLogEntry(taskId, { logLine: 'IP details captured — modal will show before you open VNC' });
                     } else {
                         // Live progress — update the description so the
                         // footer shows the latest line, and append to the
@@ -22360,7 +22400,7 @@ async function executeAppStoreInstall() {
             } else {
                 updateTaskLogEntry(taskId, { status: 'completed', description: `${appName} VM ready — see log for next steps` });
                 showToast(finalMsg || `${appName} VM created!`, 'success', 10000);
-                if (pbsNetwork) showPbsNetworkModal(appName, pbsNetwork);
+                if (vmNetwork) showVmNetworkModal(appName, vmNetwork);
             }
         } catch (e) {
             updateTaskLogEntry(taskId, { status: 'failed', logLine: `ERROR: ${e.message}` });
