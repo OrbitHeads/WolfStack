@@ -33373,10 +33373,10 @@ function renderClusterServices(grouped) {
                         <div style="flex:1;min-width:0;">
                             <div style="font-weight:600;font-size:13px;">${escapeHtml(s.name)}${s.manual ? ' <span style="font-size:9px;background:rgba(99,102,241,0.15);color:#818cf8;padding:1px 5px;border-radius:3px;">pinned</span>' : ''}</div>
                             <div style="font-size:11px;color:var(--text-muted);font-family:'JetBrains Mono',monospace;word-break:break-all;">${escapeHtml(s.url)}</div>
-                            <div style="margin-top:6px;display:flex;gap:4px;">
-                                <a class="btn btn-sm" href="${escapeAttr(s.url)}" target="_blank" rel="noopener" style="font-size:11px;">↗ Open</a>
-                                <button class="btn btn-sm" style="font-size:11px;color:#ef4444;" onclick="clusterServiceDelete('${escapeAttr(s.id)}')" title="Forget this service">×</button>
-                            </div>
+                            <div style="margin-top:6px;font-size:10px;color:var(--text-muted);">Open in the Cluster Browser to reach this — your local browser isn't on WolfNet.</div>
+                            ${s.manual ? `<div style="margin-top:6px;display:flex;gap:4px;">
+                                <button class="btn btn-sm" style="font-size:11px;color:#ef4444;" onclick="clusterServiceDelete('${escapeAttr(s.id)}')" title="Unpin this URL">× Unpin</button>
+                            </div>` : ''}
                         </div>
                     </div>`).join('')}
             </div>

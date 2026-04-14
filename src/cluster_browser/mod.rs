@@ -284,7 +284,12 @@ fn spawn_container(user: &str, homepage: &str) -> Result<BrowserSession, String>
     // services grid the moment Firefox finishes booting.
     let firefox_cli = format!("--new-window {}", homepage);
 
-    let port_mapping = format!("{}:3000", web_port);
+    // linuxserver/baseimage-kasmvnc serves HTTPS on container port 3000
+    // (with a self-signed cert) and plain HTTP on 3001. We map the HTTP
+    // side so the browser doesn't refuse to load the KasmVNC JS over an
+    // untrusted cert and so the popup tab works on first click without
+    // the user clicking through a cert warning.
+    let port_mapping = format!("{}:3001", web_port);
     let env_homepage = format!("FIREFOX_CLI={}", firefox_cli);
     let volume_mount = format!("{}:/config", volume_name);
 
