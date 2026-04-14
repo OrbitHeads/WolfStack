@@ -1871,7 +1871,18 @@ impl VmManager {
                 // Verify the master is actually a bridge (not a bond, etc.)
                 let bridge_check = format!("/sys/class/net/{}/bridge", bridge_name);
                 if Path::new(&bridge_check).exists() {
-                    info!("Passthrough: {} already in bridge {}", iface, bridge_name);
+                    // Idempotent re-apply of the VLAN pass-through fix so
+                    // existing passthrough bridges — created by an older
+                    // WolfStack that didn't know to disable hw offloads —
+                    // inherit the fix without needing to be torn down.
+                    for flag in ["rxvlan", "txvlan", "rx-vlan-filter"] {
+                        let _ = Command::new("ethtool").args(["-K", iface, flag, "off"]).output();
+                    }
+                    let _ = std::fs::write(
+                        format!("/sys/class/net/{}/bridge/vlan_filtering", bridge_name),
+                        "0",
+                    );
+                    info!("Passthrough: {} already in bridge {} (re-applied VLAN pass-through settings)", iface, bridge_name);
                     return Ok(bridge_name.to_string());
                 }
                 warn!("Passthrough: {} has master '{}' but it is not a bridge — creating new bridge", iface, bridge_name);
@@ -1926,6 +1937,25 @@ impl VmManager {
 
         // Flush IPs from physical interface (will be moved to the bridge)
         let _ = Command::new("ip").args(["addr", "flush", "dev", iface]).output();
+
+        // Disable hardware VLAN offloads BEFORE enslaving so VLAN-tagged
+        // frames pass through transparently. Without this, most drivers
+        // strip incoming 802.1Q tags in hardware (rxvlan) and the bridge
+        // delivers untagged frames to the guest — so an OPNsense VM doing
+        // VLAN trunking on its vtnetN sees no tags, and VLAN interfaces
+        // never get traffic. Also disable the tag filter in case the NIC
+        // drops tagged frames it doesn't have a matching filter for.
+        // Failures are benign: some drivers (virtio, etc.) don't expose
+        // these knobs and ethtool returns non-zero — the VM stack doesn't
+        // need the flag flipped in that case.
+        for flag in ["rxvlan", "txvlan", "rx-vlan-filter"] {
+            let _ = Command::new("ethtool").args(["-K", iface, flag, "off"]).output();
+        }
+        // Keep bridge vlan_filtering off (the kernel default) so it acts
+        // as a transparent dumb switch for tagged frames. Being explicit
+        // here guards against the case where some host-side tool flipped
+        // it on globally.
+        let _ = std::fs::write(format!("/sys/class/net/{}/bridge/vlan_filtering", bridge_name), "0");
 
         // Add physical interface to bridge
         let out = Command::new("ip").args(["link", "set", iface, "master", &bridge_name]).output()
@@ -1996,6 +2026,14 @@ impl VmManager {
         // Create immediately with ip commands (pvesh config only takes effect on reboot/ifreload)
         let _ = Command::new("ip").args(["link", "add", &bridge_name, "type", "bridge"]).output();
         let _ = Command::new("ip").args(["addr", "flush", "dev", iface]).output();
+        // Same VLAN-offload fix as the standalone path: stop the NIC's
+        // hardware stripping 802.1Q tags before frames reach the bridge.
+        // OPNsense + VLAN trunking was a reported failure mode before
+        // this was applied. See create_linux_passthrough_bridge.
+        for flag in ["rxvlan", "txvlan", "rx-vlan-filter"] {
+            let _ = Command::new("ethtool").args(["-K", iface, flag, "off"]).output();
+        }
+        let _ = std::fs::write(format!("/sys/class/net/{}/bridge/vlan_filtering", bridge_name), "0");
         let _ = Command::new("ip").args(["link", "set", iface, "master", &bridge_name]).output();
         let _ = Command::new("ip").args(["link", "set", iface, "up"]).output();
         let _ = Command::new("ip").args(["link", "set", &bridge_name, "up"]).output();
