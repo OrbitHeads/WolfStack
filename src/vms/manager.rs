@@ -181,6 +181,13 @@ pub struct VmConfig {
     /// pass. `None` on older configs until the next write.
     #[serde(default)]
     pub host_id: Option<String>,
+    /// If true, the manager will NOT add the default net0 NIC (neither
+    /// WolfNet TAP nor user-mode NAT). All connectivity must come from
+    /// `extra_nics`, and extra_nics[0] becomes net0 (vtnet0) in the
+    /// guest. Used by firewall appliances (OPNsense with physical LAN
+    /// passthrough) that don't want a dangling unused NAT interface.
+    #[serde(default)]
+    pub skip_default_nic: bool,
 }
 
 fn default_net_model() -> String { "virtio".to_string() }
@@ -212,6 +219,7 @@ impl VmConfig {
             vmid: None,
             bios_type: "seabios".to_string(),
             host_id: None,
+            skip_default_nic: false,
         }
     }
 }
@@ -391,6 +399,7 @@ impl VmManager {
                     vmid: Some(vmid),
                     bios_type: "seabios".to_string(),
                     host_id: Some(crate::agent::self_node_id()),
+                    skip_default_nic: false,
                 })
             })
             .collect()
@@ -1416,42 +1425,53 @@ impl VmManager {
         // Networking: VMs configure their own IP inside the guest OS.
         // If WolfNet IP is set, try TAP networking for direct L2 access.
         // Otherwise (or if TAP fails), use user-mode networking which always works.
+        // Exception: `skip_default_nic` skips net0 entirely — extra_nics[0]
+        // becomes net0 (vtnet0) instead. Used by firewall appliances that
+        // want the first guest interface to be a physical passthrough.
         let mut using_tap = false;
-        if let Some(ref wolfnet_ip) = config.wolfnet_ip {
-            let tap = Self::tap_name(name);
-            write_log(&format!("Attempting TAP networking for WolfNet IP {} (configure this IP inside the guest OS)", wolfnet_ip));
-            
-            match self.setup_tap(&tap) {
-                Ok(_) => {
-                    write_log(&format!("TAP '{}' created successfully", tap));
-                    cmd.arg("-netdev").arg(format!("tap,id=net0,ifname={},script=no,downscript=no", tap))
-                       .arg("-device").arg(&nic_arg);
-                    
-                    if let Err(e) = self.setup_wolfnet_routing(&tap, wolfnet_ip) {
-                        write_log(&format!("WolfNet routing warning: {} (VM will still start)", e));
-                    } else {
-                        write_log(&format!("WolfNet routing configured for {} via {}", wolfnet_ip, tap));
+        let mut default_nic_used = false;
+        if !config.skip_default_nic {
+            if let Some(ref wolfnet_ip) = config.wolfnet_ip {
+                let tap = Self::tap_name(name);
+                write_log(&format!("Attempting TAP networking for WolfNet IP {} (configure this IP inside the guest OS)", wolfnet_ip));
+
+                match self.setup_tap(&tap) {
+                    Ok(_) => {
+                        write_log(&format!("TAP '{}' created successfully", tap));
+                        cmd.arg("-netdev").arg(format!("tap,id=net0,ifname={},script=no,downscript=no", tap))
+                           .arg("-device").arg(&nic_arg);
+
+                        if let Err(e) = self.setup_wolfnet_routing(&tap, wolfnet_ip) {
+                            write_log(&format!("WolfNet routing warning: {} (VM will still start)", e));
+                        } else {
+                            write_log(&format!("WolfNet routing configured for {} via {}", wolfnet_ip, tap));
+                        }
+                        using_tap = true;
+                        default_nic_used = true;
                     }
-                    using_tap = true;
-
-                }
-                Err(e) => {
-                    write_log(&format!("TAP setup failed: {} — falling back to user-mode networking", e));
-                    write_log("Note: You can still configure the WolfNet IP inside the guest OS manually");
-
+                    Err(e) => {
+                        write_log(&format!("TAP setup failed: {} — falling back to user-mode networking", e));
+                        write_log("Note: You can still configure the WolfNet IP inside the guest OS manually");
+                    }
                 }
             }
-        }
-        
-        if !using_tap {
-            write_log("Networking: user-mode (NAT, VM can access host network)");
-            cmd.arg("-netdev").arg("user,id=net0")
-               .arg("-device").arg(&nic_arg);
+
+            if !using_tap {
+                write_log("Networking: user-mode (NAT, VM can access host network)");
+                cmd.arg("-netdev").arg("user,id=net0")
+                   .arg("-device").arg(&nic_arg);
+                default_nic_used = true;
+            }
+        } else {
+            write_log("Networking: skip_default_nic set — net0 will come from extra_nics[0]");
         }
 
-        // Extra NICs (net1, net2, ...) — e.g. OPNsense WAN+LAN, multi-homed servers
+        // Extra NICs — numbering depends on whether net0 was taken by the
+        // default block above. With `skip_default_nic`, extra_nics[0]
+        // becomes net0 (vtnet0); otherwise it's net1 (vtnet1), etc.
+        let base_net_idx = if default_nic_used { 1 } else { 0 };
         for (i, nic) in config.extra_nics.iter().enumerate() {
-            let idx = i + 1; // net1, net2, ...
+            let idx = base_net_idx + i;
             let net_id = format!("net{}", idx);
             let dev = match nic.model.as_str() {
                 "e1000" => "e1000",
@@ -2599,6 +2619,7 @@ impl VmManager {
             vmid: None,
             bios_type,
             host_id: Some(crate::agent::self_node_id()),
+            skip_default_nic: false,
         })
     }
 
@@ -2943,6 +2964,7 @@ impl VmManager {
             vmid: None,
             bios_type: discovered.bios_type,
             host_id: Some(crate::agent::self_node_id()),
+            skip_default_nic: false,
         };
 
         // Save config

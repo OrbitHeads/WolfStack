@@ -607,7 +607,7 @@ pub fn install_vm_streamed(
     }
 
     let _ = tx.send("Allocating WolfNet IP...".into());
-    let wolfnet_ip = crate::containers::next_available_wolfnet_ip();
+    let mut wolfnet_ip = crate::containers::next_available_wolfnet_ip();
     if let Some(ref ip) = wolfnet_ip {
         let _ = tx.send(format!("Allocated WolfNet IP {}", ip));
     } else {
@@ -664,24 +664,66 @@ pub fn install_vm_streamed(
         let _ = tx.send(format!("Added data disk: {} GB", sz));
     }
 
-    // Firewall apps (OPNsense) need a WAN NIC in addition to the LAN one
-    // on WolfNet. Bridge the second NIC onto the host's primary interface
-    // so it gets an IP from the upstream router — that's the "external"
-    // side of the firewall. net0 (WolfNet) remains LAN = vtnet0 inside
-    // the guest; this new NIC = net1 = vtnet1 = WAN.
+    // Firewall apps (OPNsense) need a WAN NIC in addition to the LAN one.
+    // Two LAN modes are supported:
+    //
+    //   A. Default (lan_interface unset): LAN = WolfNet TAP (net0 = vtnet0
+    //      with a DHCP-assigned WolfNet IP). Good for staging/learning;
+    //      limited in practice because WolfNet is point-to-point routed
+    //      rather than a shared L2 segment, so other WolfStack VMs can't
+    //      reach the firewall's WebGUI via LAN.
+    //
+    //   B. Physical LAN passthrough (lan_interface set to a host iface
+    //      name): LAN = that physical NIC (net1 = vtnet0), WolfNet TAP
+    //      is skipped entirely. OPNsense serves a real L2 LAN segment
+    //      on that physical interface. User assigns LAN IP manually in
+    //      the installer/console (typically 192.168.1.1/24).
+    //
+    // WAN is always a passthrough of the host's default-route interface.
+    let lan_interface: Option<String> = user_inputs.get("lan_interface")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let wan_interface: Option<String> = if app.id == "opnsense" {
-        let iface = crate::networking::detect_primary_interface();
+        let wan = crate::networking::detect_primary_interface();
+
+        // Mode B: physical LAN passthrough. Drop WolfNet, add LAN first
+        // (so it becomes vtnet0) and WAN second (vtnet1).
+        if let Some(lan) = lan_interface.as_ref() {
+            if lan == &wan {
+                return Err(format!(
+                    "LAN and WAN interfaces are the same ('{}'). OPNsense needs two distinct physical NICs — or leave lan_interface blank to use WolfNet for LAN.",
+                    lan
+                ));
+            }
+            cfg.wolfnet_ip = None;       // mode B skips WolfNet for LAN
+            cfg.skip_default_nic = true; // and skips the net0 NAT fallback,
+                                         // so extra_nics[0] becomes vtnet0
+            wolfnet_ip = None;           // (and clear from the payload/modal)
+            cfg.extra_nics.push(crate::vms::manager::NicConfig {
+                model: "virtio".into(),
+                mac: None,
+                bridge: None,
+                passthrough_interface: Some(lan.clone()),
+            });
+            let _ = tx.send(format!(
+                "LAN NIC = physical interface '{}' (vtnet0 inside the guest) — configure LAN IP manually via OPNsense console",
+                lan
+            ));
+        }
+
+        // WAN is always added. In mode A it becomes vtnet1 (after WolfNet
+        // net0); in mode B it becomes vtnet1 (after the LAN extra NIC).
         cfg.extra_nics.push(crate::vms::manager::NicConfig {
             model: "virtio".into(),
             mac: None,
             bridge: None,
-            passthrough_interface: Some(iface.clone()),
+            passthrough_interface: Some(wan.clone()),
         });
         let _ = tx.send(format!(
-            "Added WAN NIC bridged to host interface '{}' (vtnet1 inside the guest)",
-            iface
+            "WAN NIC bridged to host interface '{}' (vtnet1 inside the guest)",
+            wan
         ));
-        Some(iface)
+        Some(wan)
     } else {
         None
     };
@@ -741,16 +783,45 @@ pub fn install_vm_streamed(
             "Review - Install. When it reboots, unset the ISO in VM Settings.".into(),
             "WebGUI at https://<IP>:8006 - login 'root' + your install password.".into(),
         ]),
-        "opnsense" => ("static", vec![
-            "Two NICs are attached: vtnet0 = LAN (on WolfNet, IP below), vtnet1 = WAN (bridged to your host's uplink, DHCP from upstream).".into(),
-            "Wait ~60s for the live console login prompt.".into(),
-            "Log in as 'installer' / 'opnsense' to start the guided installer.".into(),
-            "Keymap - Continue - pick ZFS or UFS - pick the disk - Install.".into(),
-            "Set the root password. Reboot. Unset the ISO in VM Settings.".into(),
-            "After reboot: console option 1 'Assign interfaces' - confirm LAN=vtnet0, WAN=vtnet1.".into(),
-            "Console option 2 'Set interface IP address' - set LAN (vtnet0) to the IP/gateway below (NOT the default 192.168.1.1). Leave WAN as DHCP.".into(),
-            "WebGUI at https://<LAN-IP> - login 'root' / 'opnsense' (change on first login).".into(),
-        ]),
+        "opnsense" => {
+            // Steps vary by LAN mode:
+            //   A (WolfNet LAN)      — user pastes WolfNet IP into OPNsense
+            //                          console so the WebGUI is reachable
+            //                          from the host at that IP. WolfNet is
+            //                          point-to-point, so OTHER VMs on
+            //                          WolfNet cannot reach the WebGUI
+            //                          directly — this mode is for staging.
+            //   B (physical LAN NIC) — user picks their own LAN IP (e.g.
+            //                          192.168.1.1), the firewall serves
+            //                          that real L2 segment. Production use.
+            let steps: Vec<String> = if lan_interface.is_some() {
+                vec![
+                    format!("LAN = physical NIC '{}' (vtnet0), WAN = physical NIC '{}' (vtnet1). OPNsense serves a real L2 LAN segment on the LAN NIC.",
+                        lan_interface.as_ref().unwrap(),
+                        wan_interface.as_ref().map(|s| s.as_str()).unwrap_or("?")),
+                    "Wait ~60s for the live console login prompt.".into(),
+                    "Log in as 'installer' / 'opnsense' to start the guided installer.".into(),
+                    "Keymap - Continue - pick ZFS or UFS - pick the disk - Install.".into(),
+                    "Set the root password. Reboot. Unset the ISO in VM Settings.".into(),
+                    "Console option 1 'Assign interfaces' - confirm LAN=vtnet0, WAN=vtnet1.".into(),
+                    "Console option 2 'Set interface IP address' - set LAN to whatever subnet you want (typically 192.168.1.1/24). Leave WAN as DHCP.".into(),
+                    "Any device plugged into the physical LAN NIC will now get a DHCP lease from OPNsense on that subnet.".into(),
+                    "WebGUI at https://<LAN-IP> - login 'root' / 'opnsense' (change on first login).".into(),
+                ]
+            } else {
+                vec![
+                    "LAN = WolfNet TAP (vtnet0), WAN = physical uplink (vtnet1). NOTE: WolfNet is point-to-point — OTHER WolfStack VMs cannot reach this firewall's WebGUI on the LAN side. For production use, set 'lan_interface' to pass a physical NIC through as LAN.".into(),
+                    "Wait ~60s for the live console login prompt.".into(),
+                    "Log in as 'installer' / 'opnsense' to start the guided installer.".into(),
+                    "Keymap - Continue - pick ZFS or UFS - pick the disk - Install.".into(),
+                    "Set the root password. Reboot. Unset the ISO in VM Settings.".into(),
+                    "Console option 1 'Assign interfaces' - confirm LAN=vtnet0, WAN=vtnet1.".into(),
+                    "Console option 2 'Set interface IP address' - set LAN (vtnet0) to the IP/gateway below (NOT the default 192.168.1.1). Leave WAN as DHCP.".into(),
+                    "WebGUI at https://<LAN-IP> from the host itself (ssh in + curl, or VNC). From other WolfStack VMs use the WolfNet IP directly.".into(),
+                ]
+            };
+            ("static", steps)
+        },
         "harvester" => ("static", vec![
             "Installer boot menu - 'Harvester Installer'.".into(),
             "'Create a new Harvester cluster' on the first node.".into(),
@@ -798,19 +869,35 @@ pub fn install_vm_streamed(
 
     // Structured payload picked up by the frontend and rendered as a
     // sticky modal. Emitted for EVERY VM install.
-    // Extra NICs (e.g. OPNsense WAN) — shown as a secondary row in the
-    // modal so the user understands the guest has more than one interface
-    // and which is which.
-    let extra_nics = wan_interface.as_ref().map(|iface| {
-        serde_json::json!([{
+    // Extra NICs (e.g. OPNsense WAN, and in LAN-passthrough mode also
+    // the LAN NIC) — shown as a secondary block in the modal so the
+    // user understands the guest has multiple interfaces and which is
+    // which.
+    let extra_nics = if let Some(wan) = wan_interface.as_ref() {
+        let mut nics = Vec::new();
+        if let Some(lan) = lan_interface.as_ref() {
+            // Mode B: LAN is a physical NIC; include it first (vtnet0).
+            nics.push(serde_json::json!({
+                "label": "LAN (vtnet0)",
+                "description": format!(
+                    "Bridged to physical host interface '{}'. Configure a LAN IP in the OPNsense console (typically 192.168.1.1/24). Any device plugged into that NIC gets DHCP from the firewall.",
+                    lan
+                ),
+                "mode": "manual",
+            }));
+        }
+        nics.push(serde_json::json!({
             "label": "WAN (vtnet1)",
             "description": format!(
                 "Bridged to host interface '{}'. Gets its IP via DHCP from your upstream network — this is the firewall's external side.",
-                iface
+                wan
             ),
             "mode": "dhcp",
-        }])
-    });
+        }));
+        Some(serde_json::Value::Array(nics))
+    } else {
+        None
+    };
 
     let payload = serde_json::json!({
         "app_id": app.id,
@@ -844,6 +931,56 @@ fn compressed_suffix(url: &str) -> Option<&'static str> {
     else { None }
 }
 
+/// Any ISO under this size is assumed to be a truncated download, an HTML
+/// error page, or a captive-portal redirect. Every ISO we actually ship
+/// is 65 MB+ (Alpine virt is the smallest at ~67 MB), so 10 MB is a safe
+/// lower bound that catches every real failure mode we've seen in the
+/// wild.
+const MIN_ISO_SIZE_BYTES: u64 = 10 * 1_048_576;
+
+/// Check a host tool exists before we need it. `bunzip2`, `xz`, `gunzip`
+/// are pre-installed on almost every Linux but we'd rather fail fast with
+/// a clear message than download a 500 MB archive and then discover we
+/// can't decompress it. Returns the path to the tool if found, None if
+/// missing.
+fn find_tool(tool: &str) -> Option<String> {
+    std::process::Command::new("which")
+        .arg(tool)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Decompressor binary name for a given suffix, plus a user-facing
+/// package hint for the "please install X" error message.
+fn decompressor_for(suffix: &str) -> Option<(&'static str, &'static str)> {
+    match suffix {
+        ".bz2" => Some(("bunzip2", "bzip2")),
+        ".xz"  => Some(("xz",      "xz-utils / xz")),
+        ".gz"  => Some(("gunzip",  "gzip")),
+        _ => None,
+    }
+}
+
+/// Bytes available on the filesystem holding `path`. Returns None if we
+/// can't determine it (older systems without GNU df --output). The check
+/// is best-effort: we never refuse to try on uncertainty, only on hard
+/// evidence of insufficient space.
+fn available_disk_bytes(path: &str) -> Option<u64> {
+    let out = std::process::Command::new("df")
+        .args(["--output=avail", "-B1", path])
+        .output()
+        .ok()?;
+    if !out.status.success() { return None; }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines().nth(1).and_then(|l| l.trim().parse::<u64>().ok())
+}
+
+/// Human-friendly megabyte rendering for error messages.
+fn mb(bytes: u64) -> String { format!("{} MB", bytes / 1_048_576) }
+
 /// Decompress `compressed` (e.g. foo.iso.bz2) in place, producing the
 /// file with the suffix stripped (foo.iso). The underlying tool
 /// (bunzip2/xz/gunzip) already writes to the suffix-stripped name and
@@ -872,14 +1009,19 @@ fn decompress_in_place(compressed: &str, suffix: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Download a URL to `dest` via wget, emitting byte-progress events every
-/// second to `tx` by polling the partial file size. Returns Err with
-/// wget's stderr on non-zero exit. total_bytes comes from a HEAD probe —
-/// if the server doesn't cooperate, progress shows bytes-only.
+/// Download a URL to `dest` via wget with full diagnostics, progress,
+/// sanity checks, and compressed-archive handling. Designed to make the
+/// failure modes we've actually seen in production (silent zero-byte
+/// wget "success", HTML captive-portal pages, missing bunzip2, disk
+/// full mid-download) impossible to hit without a clear error message.
 ///
-/// If `url` ends in `.bz2`/`.xz`/`.gz`, the compressed archive is downloaded
-/// to `{dest}{suffix}` and decompressed in place, so callers always get a
-/// plain `.iso` at `dest` regardless of the wire format.
+/// Returns Err with a diagnostic string on any failure. On success,
+/// `dest` is guaranteed to be a file of at least MIN_ISO_SIZE_BYTES.
+/// On failure, any partial files at `dest` or `{dest}{suffix}` are
+/// removed so a retry starts clean.
+///
+/// If `url` ends in `.bz2`/`.xz`/`.gz` the compressed archive is
+/// downloaded to `{dest}{suffix}` and decompressed in place.
 fn download_iso_with_progress(
     url: &str,
     dest: &str,
@@ -889,24 +1031,35 @@ fn download_iso_with_progress(
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    let _ = tx.send(format!("Downloading {}...", url));
-
+    // ── Preflight: tool availability ──
+    // If we need a decompressor, check it's on $PATH before burning
+    // 500 MB of bandwidth on an archive we can't open.
     let suffix = compressed_suffix(url);
+    if let Some(sfx) = suffix {
+        let (tool, pkg) = decompressor_for(sfx).unwrap();
+        if find_tool(tool).is_none() {
+            return Err(format!(
+                "'{}' is not installed on this host, but the ISO URL is {}. Install the '{}' package and retry.",
+                tool, sfx, pkg
+            ));
+        }
+    }
+    if find_tool("wget").is_none() {
+        return Err("'wget' is not installed on this host. Install the 'wget' package and retry.".into());
+    }
+
     let wget_target = match suffix {
         Some(sfx) => format!("{}{}", dest, sfx),
         None => dest.to_string(),
     };
 
-    // Best-effort HEAD for total size. Many mirrors support this; Proxmox's
-    // does. If we don't get Content-Length we just skip the percentage.
+    // ── HEAD for total size (best-effort) ──
     let total_bytes: Option<u64> = std::process::Command::new("curl")
         .args(["-sIL", url])
         .output()
         .ok()
         .and_then(|o| {
             let text = String::from_utf8_lossy(&o.stdout).to_string();
-            // Walk every Content-Length header (redirects emit several).
-            // Prefer the last one, which describes the final resource.
             text.lines()
                 .filter_map(|l| {
                     let lower = l.to_ascii_lowercase();
@@ -919,13 +1072,53 @@ fn download_iso_with_progress(
                 .last()
         });
 
-    if let Some(sz) = total_bytes {
-        let _ = tx.send(format!("Total size: {} MB", sz / 1_048_576));
+    // ── Preflight: disk space ──
+    // Need: compressed archive size + decompressed size + 10% slack.
+    // For `.bz2` typical ratio is 2x, `.xz` up to 5x, `.gz` ~3x. Pick
+    // the worst case per suffix so we err on the side of caution. If
+    // we don't know total_bytes (server didn't send Content-Length)
+    // we skip the check and rely on the post-download size validation.
+    let parent = std::path::Path::new(dest).parent()
+        .and_then(|p| p.to_str())
+        .unwrap_or("/");
+    if let (Some(sz), Some(free)) = (total_bytes, available_disk_bytes(parent)) {
+        let decompressed_multiplier = match suffix {
+            Some(".bz2") => 3,   // compressed + ~2x decompressed
+            Some(".xz")  => 6,   // compressed + ~5x decompressed
+            Some(".gz")  => 4,   // compressed + ~3x decompressed
+            _ => 1,              // no decompression
+        };
+        let needed = sz.saturating_mul(decompressed_multiplier) + sz / 10;
+        if free < needed {
+            return Err(format!(
+                "Not enough free disk space at {}. Need ~{} (download + decompression + 10% slack), have {}. Free some space and retry.",
+                parent, mb(needed), mb(free)
+            ));
+        }
+        let _ = tx.send(format!(
+            "Disk check: {} free at {} ({} needed). OK.",
+            mb(free), parent, mb(needed)
+        ));
     }
 
-    // Fire wget. -q silences its own progress; we poll the file ourselves.
+    if let Some(sz) = total_bytes {
+        let _ = tx.send(format!("Downloading {} ({})...", url, mb(sz)));
+    } else {
+        let _ = tx.send(format!("Downloading {} (size unknown)...", url));
+    }
+
+    // ── Fetch ──
+    // Drop -q so wget's own diagnostics are captured. Use -nv
+    // (non-verbose) to silence per-byte chatter but keep error
+    // messages. Redirect stderr to a log file so we can surface it on
+    // failure — without this, silent 0-exit partial downloads are
+    // indistinguishable from success.
+    let log_path = format!("{}.wget.log", wget_target);
+    let log_file = std::fs::File::create(&log_path)
+        .map_err(|e| format!("Failed to create wget log file: {}", e))?;
     let mut child = std::process::Command::new("wget")
-        .args(["-q", "-O", &wget_target, url])
+        .args(["-nv", "--tries=3", "--timeout=60", "-O", &wget_target, url])
+        .stderr(log_file.try_clone().map_err(|e| format!("Failed to clone log fd: {}", e))?)
         .spawn()
         .map_err(|e| format!("Failed to run wget: {}", e))?;
 
@@ -942,8 +1135,8 @@ fn download_iso_with_progress(
             if done_clone.load(Ordering::Relaxed) { break; }
             let size = std::fs::metadata(&dest_clone).map(|m| m.len()).unwrap_or(0);
             if size == 0 { continue; }
-            let mb = size / 1_048_576;
-            let rate_bps = size.saturating_sub(last_bytes); // per second (we sleep 1s)
+            let mb_size = size / 1_048_576;
+            let rate_bps = size.saturating_sub(last_bytes);
             last_bytes = size;
             let rate_mbs = rate_bps as f64 / 1_048_576.0;
             let elapsed = started.elapsed().as_secs();
@@ -951,12 +1144,12 @@ fn download_iso_with_progress(
                 let pct = (size as f64 / total as f64 * 100.0).min(100.0) as u32;
                 format!(
                     "Downloading: {} MB / {} MB ({}%) at {:.1} MB/s — {}s elapsed",
-                    mb, total / 1_048_576, pct, rate_mbs, elapsed
+                    mb_size, total / 1_048_576, pct, rate_mbs, elapsed
                 )
             } else {
                 format!(
                     "Downloading: {} MB at {:.1} MB/s — {}s elapsed",
-                    mb, rate_mbs, elapsed
+                    mb_size, rate_mbs, elapsed
                 )
             };
             if tx_clone.send(msg).is_err() { break; }
@@ -967,26 +1160,63 @@ fn download_iso_with_progress(
     done.store(true, Ordering::Relaxed);
     let _ = poller.join();
 
-    if !status.success() {
-        // Function contract: on failure, leave no partial files behind.
-        // Otherwise the next call's "already cached?" check at the callsite
-        // would see a partial file and skip the retry.
+    // Read wget's stderr log for diagnostics — needed whether we
+    // succeeded or not (a "successful" wget might still have written
+    // an HTML error page, which we catch below via size validation).
+    let wget_log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&log_path);
+
+    // Cleanup helper — the function's contract is "no partial files
+    // on Err". Without this, a retry would see the stale file at
+    // `dest` or `wget_target` and skip the download.
+    let cleanup = || {
         let _ = std::fs::remove_file(&wget_target);
         let _ = std::fs::remove_file(dest);
-        return Err(format!("wget exited with status {:?}", status.code()));
+    };
+
+    if !status.success() {
+        cleanup();
+        let tail = wget_log.lines().rev().take(5).collect::<Vec<_>>();
+        let tail_rev: Vec<&str> = tail.into_iter().rev().collect();
+        return Err(format!(
+            "wget failed (exit {:?}). Last output: {}",
+            status.code(),
+            if tail_rev.is_empty() { "(no output captured)".to_string() } else { tail_rev.join(" | ") }
+        ));
     }
 
+    // ── Post-download size sanity check ──
+    // wget can exit 0 with a tiny HTML error page (captive portals,
+    // Cloudflare blocks, mirror-moved redirects to HTML indexes).
+    // Every ISO we ship is 65 MB+, so anything below 10 MB is a
+    // broken download, not a valid image.
+    let downloaded_size = std::fs::metadata(&wget_target)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if downloaded_size < MIN_ISO_SIZE_BYTES {
+        cleanup();
+        return Err(format!(
+            "Downloaded file from {} is only {} — expected an ISO (>{}). The mirror likely returned an error page or the URL has moved. Check the URL manually.",
+            url, mb(downloaded_size), mb(MIN_ISO_SIZE_BYTES)
+        ));
+    }
+
+    // ── Decompress (if needed) and re-validate size ──
     if let Some(sfx) = suffix {
-        let _ = tx.send(format!("Decompressing {} archive...", sfx));
+        let _ = tx.send(format!("Decompressing {} archive ({} MB)...", sfx, downloaded_size / 1_048_576));
         if let Err(e) = decompress_in_place(&wget_target, sfx) {
-            // bunzip2/xz/gunzip may have written partial output to `dest`
-            // before failing; and `wget_target` is only removed on success.
-            // Clean both so the next install retries from scratch.
-            let _ = std::fs::remove_file(&wget_target);
-            let _ = std::fs::remove_file(dest);
-            return Err(e);
+            cleanup();
+            return Err(format!("Decompression failed: {}", e));
         }
-        let _ = tx.send("Decompression complete.".into());
+        let decompressed_size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+        if decompressed_size < MIN_ISO_SIZE_BYTES {
+            cleanup();
+            return Err(format!(
+                "Decompressed output at {} is only {} — expected an ISO. The archive is corrupt or the source was wrong.",
+                dest, mb(decompressed_size)
+            ));
+        }
+        let _ = tx.send(format!("Decompression complete ({} MB).", decompressed_size / 1_048_576));
     }
 
     Ok(())
@@ -1010,45 +1240,17 @@ fn install_vm(
         .map_err(|e| format!("Failed to create ISO dir: {}", e))?;
     let iso_path = format!("{}/{}.iso", iso_dir, app.id);
     if !std::path::Path::new(&iso_path).exists() {
-        // Proxmox doesn't ship a stable `_latest.iso` alias — the file name
-        // carries the version (e.g. `proxmox-backup-server_4.1-1.iso`). If the
-        // manifest URL can't be fetched, scrape the directory index for the
-        // newest matching ISO and retry. Same idea as apt-get's "fetch the
-        // index, pick the newest version, download".
-        // wget_and_decompress: fetch a URL to `iso_path`, handling the
-        // `.bz2`/`.xz`/`.gz` wrapper that OPNsense and a few others use.
-        let wget_and_decompress = |url: &str| -> Result<(), String> {
-            let sfx = compressed_suffix(url);
-            let target = match sfx {
-                Some(s) => format!("{}{}", iso_path, s),
-                None => iso_path.clone(),
-            };
-            let out = std::process::Command::new("wget")
-                .args(["-q", "-O", &target, url])
-                .output()
-                .map_err(|e| format!("Failed to run wget: {}", e))?;
-            if !out.status.success() {
-                let _ = std::fs::remove_file(&target);
-                let _ = std::fs::remove_file(&iso_path);
-                return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-            }
-            if let Some(s) = sfx {
-                if let Err(e) = decompress_in_place(&target, s) {
-                    // Partial decompressed output may exist at `iso_path`;
-                    // remove both so the next install retries from scratch.
-                    let _ = std::fs::remove_file(&target);
-                    let _ = std::fs::remove_file(&iso_path);
-                    return Err(e);
-                }
-            }
-            Ok(())
-        };
-
+        // Delegate to the streaming downloader (preflight checks, size
+        // validation, disk-space guard, wget diagnostics) — it does all
+        // the same work, and a discarded channel is cheap enough.
+        // Proxmox-style fallback: if the pinned URL 404s, scrape the
+        // parent directory for a newer version and retry.
+        let (tx, _rx) = std::sync::mpsc::channel::<String>();
         let mut effective_url = vm.iso_url.clone();
-        if let Err(first_err) = wget_and_decompress(&effective_url) {
+        if let Err(first_err) = download_iso_with_progress(&effective_url, &iso_path, &tx) {
             if let Some(resolved) = resolve_latest_iso(&vm.iso_url) {
                 effective_url = resolved;
-                if let Err(retry_err) = wget_and_decompress(&effective_url) {
+                if let Err(retry_err) = download_iso_with_progress(&effective_url, &iso_path, &tx) {
                     return Err(format!(
                         "Failed to download ISO from {} (also tried {}): {}",
                         vm.iso_url, effective_url, retry_err
@@ -1656,7 +1858,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
             name: "OPNsense".into(),
             icon: "🛡️".into(),
             category: "Firewall".into(),
-            description: "Open-source firewall & routing platform (FreeBSD-based). Installs from a compressed DVD ISO (.iso.bz2 — decompressed automatically). In the live installer log in as 'installer' / 'opnsense' to run the guided installer. Default WebGUI creds after install: 'root' / 'opnsense' — change on first login.".into(),
+            description: "Open-source firewall & routing platform (FreeBSD-based). Always gets a WAN NIC bridged to the host's uplink. LAN has TWO modes: leave 'LAN NIC' blank for WolfNet (quick/staging — but other WolfStack VMs cannot reach the WebGUI because WolfNet is point-to-point-routed, not a shared LAN), or set 'LAN NIC' to a spare physical host interface to get a real L2 LAN segment (production use). Live installer login 'installer' / 'opnsense'; WebGUI defaults 'root' / 'opnsense' — change on first login.".into(),
             website: Some("https://opnsense.org".into()),
             docker: None, lxc: None, bare_metal: None,
             vm: Some(VmTarget {
@@ -1672,6 +1874,15 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
                 UserInput { id: "cores".into(), label: "CPU cores".into(), input_type: "number".into(), default: Some("2".into()), required: false, placeholder: Some("2".into()), options: vec![] },
                 UserInput { id: "memory_mb".into(), label: "Memory (MB)".into(), input_type: "number".into(), default: Some("2048".into()), required: false, placeholder: Some("2048".into()), options: vec![] },
                 UserInput { id: "disk_gb".into(), label: "Disk (GB)".into(), input_type: "number".into(), default: Some("20".into()), required: false, placeholder: Some("20".into()), options: vec![] },
+                UserInput {
+                    id: "lan_interface".into(),
+                    label: "LAN NIC (optional, blank = WolfNet)".into(),
+                    input_type: "text".into(),
+                    default: None,
+                    required: false,
+                    placeholder: Some("e.g. enp2s0 — spare host NIC for the firewall's LAN side".into()),
+                    options: vec![],
+                },
             ],
         },
 
