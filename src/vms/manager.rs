@@ -600,8 +600,14 @@ impl VmManager {
                 // On Proxmox, ISOs are referred to as storage:iso/filename.iso
                 args.push("--ide2".to_string());
                 args.push(format!("{},media=cdrom", iso));
+                // Boot order: disk first, CD as fallback. On first boot the
+                // disk is empty so SeaBIOS/OVMF falls through to the CD and
+                // the installer runs. After install, the disk has a
+                // bootloader and is preferred — the user doesn't have to
+                // manually detach the ISO to stop the installer launching
+                // again on every reboot.
                 args.push("--boot".to_string());
-                args.push("order=ide2;scsi0".to_string());
+                args.push("order=scsi0;ide2".to_string());
             }
         }
 
@@ -1522,11 +1528,16 @@ impl VmManager {
             }
         }
 
-        // Boot order: always explicit so OVMF (UEFI) doesn't default to PXE
+        // Boot order: always explicit so OVMF (UEFI) doesn't default to PXE.
+        // When boot media is present (install ISO), put the disk first with
+        // CD/USB as fallback (`cd` = c then d). On first boot the disk is
+        // empty so SeaBIOS/OVMF falls through to the install media; after
+        // install the disk has a bootloader and is preferred — no need to
+        // manually detach the ISO to stop the installer launching again.
         if has_boot_media {
-            cmd.arg("-boot").arg("order=dc");  // CD/USB first, then disk (installation)
+            cmd.arg("-boot").arg("order=cd");  // Disk first, CD/USB fallback
         } else {
-            cmd.arg("-boot").arg("order=c");   // Disk first (normal boot)
+            cmd.arg("-boot").arg("order=c");   // Disk only
         }
 
         // USB/PCI passthrough — append -device usb-host,... and -device vfio-pci,...
@@ -2479,6 +2490,13 @@ impl VmManager {
         } else if let Some(ref iso) = config.iso_path {
             if !iso.is_empty() {
                 args.extend(["--cdrom".to_string(), iso.clone()]);
+                // Boot order: disk first, CD as fallback. virt-install's
+                // default with --cdrom is CD-only, which means the VM
+                // boots back into the installer on every reboot — even
+                // after the OS is installed. Telling libvirt to prefer
+                // hd lets the empty-disk first-boot fall through to the
+                // CD, then subsequent boots find the bootloader on disk.
+                args.extend(["--boot".to_string(), "hd,cdrom".to_string()]);
             } else {
                 return Err("An ISO or import image is required to create a VM via libvirt".to_string());
             }
@@ -2487,6 +2505,8 @@ impl VmManager {
         }
 
         if config.bios_type == "ovmf" {
+            // UEFI flag may already have been appended above; re-emit with
+            // the uefi keyword so libvirt picks the right firmware.
             args.extend(["--boot".to_string(), "uefi".to_string()]);
         }
 
