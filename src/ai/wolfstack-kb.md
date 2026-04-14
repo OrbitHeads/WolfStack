@@ -3,15 +3,44 @@
 ## Architecture
 - Single Rust binary (actix-web 4), no database, no containers needed
 - Config persisted as JSON files in /etc/wolfstack/
-- Default port: 8553 (HTTPS), 8554 (HTTP fallback)
+- Default ports: 8553 (HTTPS / dashboard), 8554 (HTTP inter-node, TLS-only installs), 8550 (public status pages)
 - Requires root (reads /etc/shadow for auth)
 - Background tasks: self-monitoring (2s), node polling (10s), status page checks (30s), session cleanup (300s), backup scheduling (60s)
+
+## Ports Configuration
+- Per-node ports persisted to /etc/wolfstack/ports.json as `{ api, inter_node, status }`
+- UI: sidebar → gear icon on a node → Node Ports panel (local node only)
+- CLI `--port N` still overrides the API port and pulls inter_node = N+1 with it
+- Status port auto-fallback: if the configured status port is taken on boot, WolfStack scans 8550-8599 for a free one, binds there, persists the new port to ports.json, warns in logs
+- API and inter_node ports hard-fail if taken (silent move would break peer polling)
+- Common status-port collision: WolfDisk also defaults to 8550; auto-fallback moves WolfStack's status page aside
 
 ## VM Management (Native QEMU, Proxmox, Libvirt)
 - Three backends: native QEMU (builds command line directly), Proxmox (qm commands), libvirt (virsh)
 - Auto-detected: `is_proxmox()` checks for `pct`, `is_libvirt()` checks `virsh uri`
 - VM configs stored in /var/lib/wolfstack/vms/{name}.json
 - Disk images in /var/lib/wolfstack/vms/{name}.qcow2
+- VmConfig carries `host_id: Option<String>` — the node that owns the VM. Stamped on create, rewritten by import_vm on migration target. Lets the cluster view render VMs as first-class members without a manual Scan.
+
+### Serial Terminal
+- Click the 💻 Terminal button on any running VM to open a WebSocket serial console
+- Backend dispatches per platform: PVE runs `qm terminal <vmid>`, libvirt runs `virsh console <name> --force`, standalone QEMU uses socat to /var/lib/wolfstack/vms/{name}.serial.sock
+- Standalone QEMU spawn wires `-chardev socket,id=serial0,path=<sock>,server=on,wait=off -serial chardev:serial0` automatically so the socket exists for socat to attach to
+- Frontend pre-flights via GET /api/vms/{name}/serial-status — three outcomes:
+  1. Not running → toast "start it first"
+  2. Running but no serial device → Add-serial modal pops, POSTs /add-serial to wire one up
+  3. Running + configured → opens terminal
+- POST /api/vms/{name}/add-serial handles the fix:
+  - PVE: `qm set <vmid> --serial0 socket` (reboot needed if running)
+  - libvirt: dumpxml, attach only missing `<serial>` / `<console>` fragments via `virsh attach-device --config`, treats "already exists" as success
+  - standalone: error message — restart the VM to pick up the new -chardev args
+- Guest-side requirement (cannot be fixed from host): `console=ttyS0` on kernel cmdline + a getty on ttyS0. Terminal prints this hint at the top on every open.
+
+### Stop vs Force Stop
+- Running VMs have two stop buttons with distinct semantics
+- Stop (`action: "stop"`, `force=false`): graceful ACPI — `qm shutdown --timeout 30`, `virsh shutdown`, or SIGTERM
+- Force Stop (`action: "force-stop"`, `force=true`): immediate — `qm stop`, `virsh destroy`, or SIGKILL. Confirm dialog warns about unsaved data loss.
+- Internal callers that need a guaranteed halt (migration export, VM delete) still pass force=true
 
 ### Import Disk Image
 - When creating a VM, the "Import Disk Image" field accepts a path to an existing QCOW2, IMG, VMDK, VDI, or VHD file
@@ -57,8 +86,16 @@
 - Does NOT use WireGuard kernel modules — only needs /dev/net/tun
 - LAN auto-discovery on port 9601, tunnel traffic on port 9600
 - Join flow: `wolfnet invite` on existing node → token → `wolfnet join <token>` on new node
-- Docker container available for NAS platforms (Unraid, Synology, TrueNAS)
+- Docker image published to `ghcr.io/wolfsoftwaresystemsltd/wolfnet:latest` (multi-arch: linux/amd64 + linux/arm64)
+- For NAS platforms (Unraid, Synology, TrueNAS), use the satellite compose file at docker/docker-compose.satellite.yml in the WolfStack repo — bundles WolfNet + WolfDisk
 - Gateway mode: NAT traffic through a WolfNet peer
+
+## WolfDisk (Distributed Filesystem)
+- Rust FUSE-based replicated/shared storage across nodes
+- Docker image published to `ghcr.io/wolfsoftwaresystemsltd/wolfdisk:latest` (multi-arch)
+- Runs as native systemd service on Linux hosts (compile-from-source via setup.sh) or as a Docker container on NAS boxes
+- Default bind port 8550 — conflicts with WolfStack's status page when both are on the same host; WolfStack's status-port auto-fallback resolves this
+- Satellite compose pairs WolfDisk with WolfNet for NAS deployments
 
 ## WolfFlow (Workflow Automation)
 - Visual drag-and-drop editor with 16 action types
@@ -91,12 +128,27 @@
 - Docker: commit + save + volume backup
 - LXC: full container backup
 - VM: disk image backup
-- S3/NFS/local destinations
+- Seven destination types: Local, S3, Remote (WolfStack node), WolfDisk, PBS (Proxmox Backup Server), NFS, SMB/CIFS
+- NFS/SMB backups mount the share idempotently at /mnt/wolfstack-backup/<kind>-<sanitised-source>/ and write through like Local
+- SMB fields on BackupStorage: smb_source (//server/share or \\server\share — normalised), smb_subpath, smb_username, smb_password, smb_domain, smb_options. Defaults to SMB 3.0.
+- NFS fields: nfs_source (server:/export), nfs_options (defaults to rw,soft,timeo=50)
+- Pre-flight at save time: `POST /api/backups/test-storage` exercises the mount path without doing a real backup, so missing-package errors surface at schedule save instead of silently failing later
+- The backup runs hidden in a background task, so the UI wouldn't otherwise see MISSING_PACKAGE errors until the first run
 
 ## Storage
-- S3, NFS, SSHFS mount management
+- Mount types: S3, NFS, SMB/CIFS, SSHFS, Directory (bind mount), WolfDisk
+- SMB/CIFS: guest or username/password/domain auth. Defaults to SMB 3.0 (matches Synology/QNAP defaults). `smb_options` can override e.g. `vers=2.1` for older NAS firmware.
+- Source normalisation: `\\server\share` gets converted to `//server/share` automatically
 - Auto-mount on boot
 - Global mounts replicate across cluster nodes
+
+## Auto-install for Mount Helpers
+- When a mount needs `mount.cifs` (cifs-utils) or `mount.nfs` (nfs-common/nfs-utils/nfs-client) and it's missing, WolfStack does NOT silently apt-get
+- Mount helpers return a structured error `MISSING_PACKAGE|<binary>|<debian_pkg>|<redhat_pkg>` that the frontend parses
+- UI pops a confirm modal: "Install cifs-utils? Run the install in a terminal window." Nothing installs without confirmation.
+- On confirm: POST /api/system/prepare-install-package returns a session_id, frontend opens /console.html?type=pkg-install&name=<id> showing the install live
+- Per-distro package names + package managers: Debian apt-get nfs-common/cifs-utils, RedHat dnf nfs-utils/cifs-utils, SUSE zypper nfs-client/cifs-utils, Arch pacman nfs-utils/cifs-utils, Unknown falls back to Debian
+- Detected via `/etc/arch-release`, `/etc/debian_version`, `/etc/redhat-release`, `/etc/SuSE-release`, plus `/etc/os-release` fallback
 
 ## Alerting
 - Threshold alerting with email notifications
@@ -105,8 +157,24 @@
 
 ## App Store
 - 510+ one-click applications
-- Docker, LXC, and bare-metal deployment
+- Four install targets: Docker, LXC, bare-metal, VM
 - User input fields for configuration (passwords, domains, etc.)
+- Install modal detects which targets the manifest supports and shows matching pills
+- Ports/env/memory sections auto-hide for non-Docker targets
+
+### VM Target (ISO-Based Apps)
+- For apps that want a whole OS (PBS, pfSense, OPNsense, Home Assistant OS, etc.)
+- VmTarget fields: iso_url, memory_mb, cores, disk_gb, optional data_disk_gb + data_disk_label, vga
+- install_vm: downloads ISO to /var/lib/wolfstack/iso/<app_id>.iso (cached, reused across installs), auto-allocates a WolfNet IP, creates the VM via VmManager::create_vm, starts it
+- User overrides via user_inputs: disk_gb, data_disk_gb, memory_mb, cores. Manifest defaults kick in if missing/zero/unparseable.
+- Data disk: when manifest's data_disk_gb is Some, install_vm pushes a StorageVolume onto extra_disks. Works on all three backends: qm_create adds `--scsi{N} <storage>:<size>`, virsh_create appends `--disk path=...,size=N,format=qcow2,bus=virtio`, standalone QEMU creates the volume file and attaches via -drive.
+- ISO fetch: tries the manifest URL first; if wget fails (404), calls resolve_latest_iso which scrapes the parent directory's HTML index and picks the newest file matching the same stem. Handles Proxmox's no-`_latest.iso`-alias quirk.
+
+### Proxmox Backup Server (PBS) entry
+- First VM-target app in the catalogue
+- Defaults: 16 GB OS disk, 200 GB data disk, 4 GB RAM, 2 cores
+- User picks storage in the install modal; everything else auto
+- Points user to open VNC for the PBS installer, then add PBS as a backup destination cluster-wide via its WolfNet IP
 
 ## Authentication
 - Linux crypt() against /etc/shadow (default)
@@ -166,6 +234,24 @@ Check if the handler binary is compatible: `file /etc/wolfstack/plugins/{id}/bin
 
 ### WolfHost "could not reach WolfStack API"
 WolfHost tries HTTPS:8553 then HTTP:8554. Also tries both custom and default cluster secrets. Restart WolfHost handler after WolfStack upgrade.
+
+### VM terminal opens but is blank
+Guest OS doesn't have a serial console enabled. Fix on the guest: add `console=ttyS0` (or `console=ttyS0,115200`) to the kernel command line, enable `systemd-getty@ttyS0.service` on systemd distros. The host side is wired automatically on all three backends.
+
+### "VM not found in qm list" when opening terminal
+PVE-only. The VM exists in the WolfStack UI but not in `qm list`. Usually means the VM was created outside Proxmox or the PVE DB is out of sync. Check `qm list` from the host shell — if the name's not there, WolfStack can't resolve a vmid for `qm terminal`.
+
+### "Add serial console?" prompt on a PVE VM created in the Proxmox web UI
+PVE VMs created outside WolfStack often lack `serial0: socket`. The prompt offers `qm set <vmid> --serial0 socket` — requires a reboot to take effect if the VM is currently running. Proxmox web UI doesn't expose the flag, so this is the fastest way to enable it.
+
+### "Standalone VM was started before serial-console support was added"
+A VM running from before the v16.40 QEMU spawn change doesn't have the -chardev socket wired. Stop + start the VM (not restart — the socket is created at spawn time).
+
+### SMB backup to Synology/QNAP hangs or fails
+Most consumer NAS defaults to SMB 3.0 (WolfStack's default). Older firmware may need `vers=2.1` in the smb_options field. Guest share permissions must allow the user you configured, or mark the share as guest-accessible and leave username blank.
+
+### "MISSING_PACKAGE|mount.cifs|..." error
+cifs-utils (or nfs-common/nfs-utils/nfs-client) not installed on the host. WolfStack never auto-installs — accept the confirm prompt to run the install in a live terminal. If you dismissed the prompt, just retry the mount or save the backup destination again and click through.
 
 ### Home Assistant VM setup
 1. Import the HAOS QCOW2 image via "Import Disk Image" when creating VM
