@@ -1106,7 +1106,7 @@ function selectView(page) {
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     document.querySelector(`.nav-item[data-page="${page}"]`)?.classList.add('active');
 
-    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow' };
+    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', 'cluster-browser': 'Cluster Browser' };
     document.getElementById('page-title').textContent = titles[page] || page;
 
     if (page === 'datacenter') {
@@ -1140,6 +1140,8 @@ function selectView(page) {
         initTopology3D();
     } else if (page === 'wolfflow') {
         loadWolfFlowList();
+    } else if (page === 'cluster-browser') {
+        loadClusterBrowser();
     }
 
     // Restore task log toggle button when leaving topology
@@ -33112,6 +33114,225 @@ const wfActionIcons = {
     unifi_action:       '\u{1F4F6}',
     integration_action: '\u{1F517}',
 };
+
+// ═══ Cluster Browser ═══════════════════════════════════════════════════════
+// One-page UI for managing browser sessions running inside the cluster, plus
+// the auto-discovered web services list (which seeds the in-container
+// browser's homepage). Uses the SAME credentials as the WolfStack dashboard
+// — no auth fork.
+
+async function loadClusterBrowser() {
+    await Promise.all([loadClusterBrowserSessions(), loadClusterServices()]);
+}
+
+async function loadClusterBrowserSessions() {
+    const grid = document.getElementById('cluster-browser-sessions');
+    if (!grid) return;
+    try {
+        const resp = await fetch(apiUrl('/api/cluster-browser/sessions'));
+        const sessions = resp.ok ? await resp.json() : [];
+        if (!Array.isArray(sessions) || sessions.length === 0) {
+            grid.innerHTML = `<div style="color:var(--text-muted);font-size:13px;">No sessions running. Click <b>Start browser session</b> to launch one.</div>`;
+            return;
+        }
+        grid.innerHTML = sessions.map(s => {
+            const started = new Date(s.started_at * 1000).toLocaleString();
+            const url = clusterBrowserConnectUrl(s);
+            return `
+            <div style="border:1px solid var(--border);border-radius:10px;padding:14px;background:var(--bg-card);">
+                <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+                    <span style="font-size:22px;">🦊</span>
+                    <strong style="flex:1;">Browser ${escapeHtml(s.id)}</strong>
+                </div>
+                <div style="font-size:12px;color:var(--text-muted);margin-bottom:4px;">Started: ${escapeHtml(started)}</div>
+                <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px;">User: ${escapeHtml(s.user)} · Port: ${s.web_port}</div>
+                <div style="display:flex;gap:6px;">
+                    <button class="btn btn-sm btn-primary" onclick="window.open('${escapeAttr(url)}', '_blank', 'width=1280,height=800')">🖥️ Open</button>
+                    <button class="btn btn-sm" onclick="clusterBrowserStop('${escapeAttr(s.id)}')">⏹️ Stop</button>
+                </div>
+            </div>`;
+        }).join('');
+    } catch (e) {
+        grid.innerHTML = `<div style="color:#ef4444;font-size:13px;">Failed to load sessions: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+/// Build the URL the user opens to access a browser session. Uses the
+/// current WolfStack host — the KasmVNC web UI is mapped to that host's
+/// random port. If the user is on the LAN they hit it directly; if
+/// they're remote, they'd need WolfStack to be reachable on that port
+/// too (future enhancement: proxy through WolfStack).
+function clusterBrowserConnectUrl(session) {
+    return `${location.protocol}//${location.hostname}:${session.web_port}`;
+}
+
+async function clusterBrowserStart() {
+    const btn = event?.target;
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Starting…'; }
+    try {
+        const resp = await fetch(apiUrl('/api/cluster-browser/sessions'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({}),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+            showToast(data.error || `HTTP ${resp.status}`, 'error');
+            return;
+        }
+        showToast('Browser session started', 'success', 4000);
+        // KasmVNC inside the container needs a few seconds to bind its
+        // web port. Tiny stagger so the new tab doesn't open onto a
+        // "connection refused" page on the first try.
+        const url = clusterBrowserConnectUrl(data.session);
+        setTimeout(() => window.open(url, '_blank', 'width=1280,height=800'), 2500);
+        loadClusterBrowserSessions();
+    } catch (e) {
+        showToast('Failed to start session: ' + e.message, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '🚀 Start browser session'; }
+    }
+}
+
+async function clusterBrowserStop(id) {
+    if (!(await showConfirm(`Stop browser session ${id}?`))) return;
+    try {
+        const resp = await fetch(apiUrl(`/api/cluster-browser/sessions/${encodeURIComponent(id)}`), { method: 'DELETE' });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            showToast(data.error || `HTTP ${resp.status}`, 'error');
+            return;
+        }
+        showToast('Session stopped', 'success', 3000);
+        loadClusterBrowserSessions();
+    } catch (e) {
+        showToast('Failed to stop session: ' + e.message, 'error');
+    }
+}
+
+async function loadClusterServices() {
+    const grid = document.getElementById('cluster-services-grid');
+    if (!grid) return;
+    try {
+        const resp = await fetch(apiUrl('/api/cluster-services'));
+        const data = resp.ok ? await resp.json() : { grouped: [] };
+        renderClusterServices(data.grouped || []);
+    } catch (e) {
+        grid.innerHTML = `<div style="color:#ef4444;font-size:13px;">Failed to load services: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function renderClusterServices(grouped) {
+    const grid = document.getElementById('cluster-services-grid');
+    if (!grid) return;
+    if (grouped.length === 0) {
+        grid.innerHTML = `<div style="color:var(--text-muted);font-size:13px;padding:24px;text-align:center;background:var(--bg-secondary);border-radius:8px;">No services discovered yet. Sweep runs every 5 minutes — click <b>Rescan services</b> for an immediate pass, or <b>+ Add custom URL</b> to pin one we missed.</div>`;
+        return;
+    }
+    grid.innerHTML = grouped.map(([category, services]) => `
+        <div style="margin-bottom:18px;">
+            <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-muted);margin-bottom:8px;">${escapeHtml(category)}</div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;">
+                ${services.map(s => `
+                    <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:12px;display:flex;align-items:flex-start;gap:10px;">
+                        <div style="font-size:24px;line-height:1;">${escapeHtml(s.icon)}</div>
+                        <div style="flex:1;min-width:0;">
+                            <div style="font-weight:600;font-size:13px;">${escapeHtml(s.name)}${s.manual ? ' <span style="font-size:9px;background:rgba(99,102,241,0.15);color:#818cf8;padding:1px 5px;border-radius:3px;">pinned</span>' : ''}</div>
+                            <div style="font-size:11px;color:var(--text-muted);font-family:'JetBrains Mono',monospace;word-break:break-all;">${escapeHtml(s.url)}</div>
+                            <div style="margin-top:6px;display:flex;gap:4px;">
+                                <a class="btn btn-sm" href="${escapeAttr(s.url)}" target="_blank" rel="noopener" style="font-size:11px;">↗ Open</a>
+                                <button class="btn btn-sm" style="font-size:11px;color:#ef4444;" onclick="clusterServiceDelete('${escapeAttr(s.id)}')" title="Forget this service">×</button>
+                            </div>
+                        </div>
+                    </div>`).join('')}
+            </div>
+        </div>
+    `).join('');
+}
+
+async function clusterServicesSweep() {
+    const btn = event?.target;
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Scanning…'; }
+    try {
+        showToast('Scanning WolfNet IPs for web services…', 'info', 4000);
+        const resp = await fetch(apiUrl('/api/cluster-services/sweep'), { method: 'POST' });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        showToast(`Scan complete — ${(data.services || []).length} services found`, 'success', 4000);
+        loadClusterServices();
+    } catch (e) {
+        showToast('Sweep failed: ' + e.message, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '🔄 Rescan services'; }
+    }
+}
+
+async function clusterServiceDelete(id) {
+    try {
+        const resp = await fetch(apiUrl(`/api/cluster-services/${encodeURIComponent(id)}`), { method: 'DELETE' });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        loadClusterServices();
+    } catch (e) {
+        showToast('Failed to remove: ' + e.message, 'error');
+    }
+}
+
+function openAddManualServiceDialog() {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay active';
+    overlay.style.zIndex = '10000';
+    overlay.innerHTML = `
+        <div class="modal" style="max-width:480px;">
+            <div class="modal-header">
+                <h3>Add custom service</h3>
+                <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">×</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>Name</label>
+                    <input type="text" class="form-control" id="add-svc-name" placeholder="My Cool App">
+                </div>
+                <div class="form-group">
+                    <label>URL</label>
+                    <input type="text" class="form-control" id="add-svc-url" placeholder="http://10.100.10.42:7000">
+                </div>
+                <div class="form-group">
+                    <label>Category</label>
+                    <input type="text" class="form-control" id="add-svc-category" value="Other">
+                </div>
+                <div class="form-group">
+                    <label>Icon (emoji, optional)</label>
+                    <input type="text" class="form-control" id="add-svc-icon" placeholder="🌐">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+                <button class="btn btn-primary" onclick="submitAddManualService()">Add</button>
+            </div>
+        </div>`;
+    document.body.appendChild(overlay);
+}
+
+async function submitAddManualService() {
+    const name = document.getElementById('add-svc-name').value.trim();
+    const url = document.getElementById('add-svc-url').value.trim();
+    const category = document.getElementById('add-svc-category').value.trim() || 'Other';
+    const icon = document.getElementById('add-svc-icon').value.trim();
+    if (!name || !url) { showToast('Name and URL required', 'error'); return; }
+    try {
+        const resp = await fetch(apiUrl('/api/cluster-services/manual'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, url, category, icon }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Failed', 'error'); return; }
+        document.querySelectorAll('.modal-overlay').forEach(m => m.remove());
+        loadClusterServices();
+    } catch (e) {
+        showToast('Failed: ' + e.message, 'error');
+    }
+}
 
 // ─── List View ───
 

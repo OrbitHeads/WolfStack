@@ -136,6 +136,11 @@
                     style="display:flex;align-items:center;justify-content:center;width:40px;height:40px;padding:0;border-radius:10px;">
                     <span class="icon" style="margin:0;font-size:20px;">⚡</span>
                 </a>
+                <a class="nav-item" data-page="cluster-browser" onclick="selectView('cluster-browser')"
+                    title="Cluster Browser — open cluster web apps without a VPN"
+                    style="display:flex;align-items:center;justify-content:center;width:40px;height:40px;padding:0;border-radius:10px;">
+                    <span class="icon" style="margin:0;font-size:20px;">🌐</span>
+                </a>
             </div>
             <div class="nav-section">
                 <div class="nav-section-title">Servers</div>
@@ -1561,6 +1566,42 @@
                 </div>
             </div>
 
+        </div>
+
+        <!-- ═══ Cluster Browser Page ═══ -->
+        <div id="page-cluster-browser" class="page-view" style="display:none;">
+            <div class="card" style="margin-bottom:16px;">
+                <div class="card-body" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
+                    <div>
+                        <h2 style="margin:0;display:flex;align-items:center;gap:10px;"><span style="font-size:28px;">🌐</span>Cluster Browser</h2>
+                        <p style="margin:6px 0 0;color:var(--text-muted);font-size:13px;">A real Firefox running on a cluster node. From your browser, log into WolfStack from anywhere &mdash; click open and you're inside the cluster network. No VPN, no per-app proxy, no DNS work.</p>
+                    </div>
+                    <div style="display:flex;gap:8px;">
+                        <button class="btn" onclick="clusterServicesSweep()" title="Re-scan WolfNet IPs for web services">🔄 Rescan services</button>
+                        <button class="btn btn-primary" onclick="clusterBrowserStart()">🚀 Start browser session</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card" style="margin-bottom:16px;">
+                <div class="card-body">
+                    <h3 style="margin:0 0 12px;">Active sessions</h3>
+                    <div id="cluster-browser-sessions" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;">
+                        <div style="color:var(--text-muted);font-size:13px;">Loading…</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-body">
+                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+                        <h3 style="margin:0;">Discovered web services</h3>
+                        <button class="btn btn-sm" onclick="openAddManualServiceDialog()">+ Add custom URL</button>
+                    </div>
+                    <p style="color:var(--text-muted);font-size:12px;margin:0 0 12px;">Auto-detected from a periodic scan of WolfNet IPs. These also appear on the homepage of every Cluster Browser session.</p>
+                    <div id="cluster-services-grid"><div style="color:var(--text-muted);font-size:13px;">Loading…</div></div>
+                </div>
+            </div>
         </div>
 
         <!-- ═══ Issues Page ═══ -->

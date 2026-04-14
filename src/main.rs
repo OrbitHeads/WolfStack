@@ -41,6 +41,8 @@ mod wolfnote;
 mod wolfusb;
 mod paths;
 mod ports;
+mod services_discovery;
+mod cluster_browser;
 mod compat;
 mod plugins;
 #[allow(dead_code)]
@@ -465,6 +467,15 @@ async fn main() -> std::io::Result<()> {
                 backup::check_schedules();
             }
         });
+
+        // Background: cluster service discovery sweep (every 5 min) —
+        // walks WolfNet IPs, probes common HTTP ports, identifies
+        // well-known apps. Powers the Cluster Browser homepage.
+        tokio::spawn(services_discovery::run_loop());
+
+        // Background: cluster browser session reconciliation (every 60s)
+        // — prunes ghost sessions whose container died.
+        tokio::spawn(cluster_browser::run_reconcile_loop());
 
         // Background: WolfFlow scheduler (every 60s)
         {
