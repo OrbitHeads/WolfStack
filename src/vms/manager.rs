@@ -2080,6 +2080,86 @@ impl VmManager {
         nic.bridge.clone().filter(|b| !b.is_empty())
     }
 
+    /// Re-apply hardware VLAN offload disable on every NIC currently used
+    /// for passthrough. `ethtool -K` settings are session-local — when the
+    /// link bounces (NetworkManager refresh, hostname-network restart, cable
+    /// flap, driver reload) the kernel resets offloads to driver defaults,
+    /// which on most NICs flips `rxvlan` back on. That silently breaks
+    /// VLAN-trunked guests (e.g. OPNsense): the first DHCP handshake works,
+    /// then once anything cycles the link, incoming 802.1Q tags are stripped
+    /// in hardware and the guest never sees them again. Run this on a timer
+    /// so the fix stays sticky.
+    ///
+    /// Sources of truth for "is this a passthrough NIC":
+    ///   1. VM JSON configs in base_dir — `extra_nics[].passthrough_interface`
+    ///   2. Slaves of any `br-pt-*` bridge currently in /sys/class/net
+    /// We deliberately do NOT touch slaves of admin-named bridges (`vmbr0`,
+    /// `br0`, etc.) because we can't tell them apart from the admin's own
+    /// bridge config — the Proxmox passthrough path uses `vmbr{N}` too, but
+    /// missing the offload re-apply on Proxmox is safer than clobbering an
+    /// admin's deliberate offload settings.
+    pub fn reapply_passthrough_offloads(&self) {
+        use std::collections::HashSet;
+        let mut ifaces: HashSet<String> = HashSet::new();
+
+        // Source 1: VM config JSON files in base_dir
+        if let Ok(entries) = fs::read_dir(&self.base_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                if let Ok(content) = fs::read_to_string(&path) {
+                    if let Ok(vm) = serde_json::from_str::<VmConfig>(&content) {
+                        for nic in &vm.extra_nics {
+                            if let Some(ref pt) = nic.passthrough_interface {
+                                if !pt.is_empty() {
+                                    ifaces.insert(pt.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Source 2: live br-pt-* bridges — covers VMs created by an older
+        // WolfStack whose config we may have lost, or interfaces enslaved
+        // by hand to one of our bridges.
+        if let Ok(entries) = fs::read_dir("/sys/class/net") {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if !name_str.starts_with("br-pt-") {
+                    continue;
+                }
+                let brif = format!("/sys/class/net/{}/brif", name_str);
+                if let Ok(slaves) = fs::read_dir(&brif) {
+                    for slave in slaves.flatten() {
+                        if let Some(s) = slave.file_name().to_str() {
+                            ifaces.insert(s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        for iface in &ifaces {
+            // Validate before shelling out — same rule as ensure_passthrough_bridge
+            if iface.is_empty() || iface.len() > 15
+                || !iface.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+            {
+                continue;
+            }
+            if !Path::new(&format!("/sys/class/net/{}", iface)).exists() {
+                continue;
+            }
+            for flag in ["rxvlan", "txvlan", "rx-vlan-filter"] {
+                let _ = Command::new("ethtool").args(["-K", iface, flag, "off"]).output();
+            }
+        }
+    }
+
     /// Clean up TAP interfaces for extra NICs
     fn cleanup_extra_nic_taps(&self, name: &str, nics: &[NicConfig]) {
         for (i, nic) in nics.iter().enumerate() {

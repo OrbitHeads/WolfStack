@@ -447,6 +447,22 @@ async fn main() -> std::io::Result<()> {
             }
         });
 
+        // Background: re-apply hardware VLAN offload disable on passthrough
+        // NICs (every 30s). `ethtool -K` is session-local — when a NIC link
+        // bounces (NM refresh, hostname-network restart, cable flap, driver
+        // reload) the kernel resets offloads to driver defaults. Without
+        // this, OPNsense + VLAN trunking gets a few good DHCP handshakes
+        // then silently breaks once anything cycles the link.
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                tokio::task::spawn_blocking(|| {
+                    let m = vms::manager::VmManager::new();
+                    m.reapply_passthrough_offloads();
+                }).await.ok();
+            }
+        });
+
         // Background: session + login rate limiter + reset token cleanup
         let sessions_cleanup = sessions.clone();
         let login_limiter_cleanup = app_state.login_limiter.clone();
