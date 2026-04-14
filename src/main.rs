@@ -468,10 +468,11 @@ async fn main() -> std::io::Result<()> {
             }
         });
 
-        // Background: cluster service discovery sweep (every 5 min) —
-        // walks WolfNet IPs, probes common HTTP ports, identifies
-        // well-known apps. Powers the Cluster Browser homepage.
-        tokio::spawn(services_discovery::run_loop());
+        // Cluster service discovery — runs on demand only (triggered
+        // by the Cluster Browser page on load). Restore the previous
+        // sweep's cache from disk so the first API hit returns
+        // something instead of an empty list.
+        services_discovery::restore_cache();
 
         // Background: cluster browser session reconciliation (every 60s)
         // — prunes ghost sessions whose container died.

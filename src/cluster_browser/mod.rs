@@ -113,16 +113,23 @@ fn allocate_port() -> Option<u16> {
     None
 }
 
+/// Whether the image is already cached locally. Cheap pre-flight so
+/// callers can decide whether to surface a "downloading, please wait"
+/// state vs. a quick start.
+pub fn image_present() -> bool {
+    Command::new("docker")
+        .args(["image", "inspect", IMAGE])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Pull the image if not already present. The first session start
 /// otherwise blocks for several minutes silently — pre-pulling lets
 /// the API caller see "pulling image" log lines via docker pull's
 /// stdout (we just block on it).
 fn ensure_image() -> Result<(), String> {
-    let inspect = Command::new("docker")
-        .args(["image", "inspect", IMAGE])
-        .output()
-        .map_err(|e| format!("docker image inspect failed: {}", e))?;
-    if inspect.status.success() {
+    if image_present() {
         return Ok(());
     }
     info!("cluster_browser: pulling image {}", IMAGE);
@@ -140,12 +147,125 @@ fn ensure_image() -> Result<(), String> {
     Ok(())
 }
 
+/// Pull the image with progress events streamed to `tx`. Used by the
+/// SSE start endpoint so the user sees "Downloading layer 4/7…" rather
+/// than a silent multi-minute spinner. Parses docker pull's line-based
+/// layer status (one event per layer state change), plus emits a
+/// 5-second heartbeat with elapsed time so the UI never looks frozen.
+fn pull_image_with_progress(tx: &std::sync::mpsc::Sender<String>) -> Result<(), String> {
+    use std::io::{BufRead, BufReader};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    if image_present() {
+        let _ = tx.send("Browser image already cached — starting straight away.".into());
+        return Ok(());
+    }
+    let _ = tx.send(format!(
+        "Downloading browser image {} (one-time, around 700 MB) — please wait...",
+        IMAGE
+    ));
+
+    // Spawn docker pull with stdout piped so we can read line by line.
+    // Each layer prints its own status line as it makes progress, and
+    // docker emits a final "Status: Downloaded newer image" at the end.
+    let mut child = std::process::Command::new("docker")
+        .args(["pull", IMAGE])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to run docker pull: {}", e))?;
+
+    let stdout = child.stdout.take().ok_or("docker pull stdout missing")?;
+
+    // Heartbeat thread — emits "still downloading (Xs elapsed)" every 5 s
+    // so an in-progress layer download (which only logs at completion) doesn't
+    // make the UI look frozen.
+    let started = Instant::now();
+    let done = Arc::new(AtomicBool::new(false));
+    let done_hb = done.clone();
+    let tx_hb = tx.clone();
+    let heartbeat = std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(5));
+            if done_hb.load(Ordering::Relaxed) { break; }
+            let elapsed = started.elapsed().as_secs();
+            if tx_hb.send(format!("Still downloading... ({}s elapsed)", elapsed)).is_err() { break; }
+        }
+    });
+
+    // Stream stdout line-by-line. docker pull emits short status lines
+    // ("Pulling fs layer", "Downloading", "Verifying Checksum",
+    // "Download complete", "Extracting", "Pull complete").
+    let reader = BufReader::new(stdout);
+    let mut layers_pulled: u32 = 0;
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+        // Only forward state-change lines, not the verbose progress-bar
+        // updates docker writes with carriage returns. The line-based
+        // reader already strips most of those.
+        if trimmed.contains("Pull complete") {
+            layers_pulled += 1;
+            let _ = tx.send(format!("Layer {} downloaded ({})", layers_pulled, &trimmed[..12.min(trimmed.len())]));
+        } else if trimmed.starts_with("Status:") || trimmed.starts_with("Digest:") {
+            let _ = tx.send(trimmed.to_string());
+        } else if trimmed.contains("Pulling from") {
+            let _ = tx.send(trimmed.to_string());
+        }
+        // Other lines (per-layer "Downloading [...]" with byte counts)
+        // are skipped to avoid flooding the SSE stream.
+    }
+
+    let status = child.wait().map_err(|e| format!("docker pull wait: {}", e))?;
+    done.store(true, Ordering::Relaxed);
+    let _ = heartbeat.join();
+
+    if !status.success() {
+        return Err(format!("docker pull {} failed (exit {:?})", IMAGE, status.code()));
+    }
+    let _ = tx.send(format!(
+        "Browser image ready ({} layers pulled in {}s).",
+        layers_pulled,
+        started.elapsed().as_secs()
+    ));
+    Ok(())
+}
+
+/// Streaming variant of start_session — emits docker pull progress
+/// (layers downloaded, heartbeat) plus container start status into the
+/// supplied channel. The non-streaming `start_session` below calls this
+/// with a discard channel so both paths share one implementation.
+pub fn start_session_streamed(
+    user: &str,
+    homepage: &str,
+    tx: std::sync::mpsc::Sender<String>,
+) -> Result<BrowserSession, String> {
+    pull_image_with_progress(&tx)?;
+    let _ = tx.send("Starting browser container...".into());
+    let session = spawn_container(user, homepage)?;
+    let _ = tx.send(format!("Container running on port {}", session.web_port));
+    Ok(session)
+}
+
 /// Spin up a new browser session for `user`. Returns the session
 /// metadata; the caller is responsible for telling the user where to
 /// connect (the KasmVNC web UI is served from
 /// `http://<wolfstack-host>:<web_port>`).
 pub fn start_session(user: &str, homepage: &str) -> Result<BrowserSession, String> {
     ensure_image()?;
+    spawn_container(user, homepage)
+}
+
+/// Internal helper — does the actual `docker run`. Assumes the image
+/// has already been pulled. Used by both the streaming and non-
+/// streaming start paths.
+fn spawn_container(user: &str, homepage: &str) -> Result<BrowserSession, String> {
     let id = random_id();
     let container_name = format!("wolfstack-browser-{}", id);
     let web_port = allocate_port().ok_or("No free port in 33000-33999 range")?;
@@ -265,10 +385,12 @@ pub fn reconcile() {
 
 /// Render the homepage HTML — a grid of the discovered services with
 /// click-to-open links. Loaded by the in-container Firefox at startup
-/// via the FIREFOX_CLI env var. Self-contained — no JS, no external
-/// fonts, no auth so it just renders inside a fresh browser profile.
-pub fn render_homepage() -> String {
-    let groups = crate::services_discovery::grouped();
+/// via the FIREFOX_CLI env var. Self-contained — no JS framework, no
+/// external fonts, no auth so it just renders inside a fresh browser
+/// profile. Pass `user` to also include that user's pinned manual
+/// entries; pass `""` to render auto-discovered only.
+pub fn render_homepage(user: &str) -> String {
+    let groups = crate::services_discovery::grouped_for(user);
     let mut body = String::with_capacity(4096);
     body.push_str(r#"<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>WolfStack — Cluster Services</title>
 <style>

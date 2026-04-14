@@ -3490,26 +3490,34 @@ pub async fn set_ports(req: HttpRequest, state: web::Data<AppState>, body: web::
 
 // ─── Cluster Services Discovery ─────────────────────────────────────────
 
-/// GET /api/cluster-services — list every web service we've discovered
-/// across the cluster (auto-discovered + manually added).
+/// GET /api/cluster-services — every web service this user can see:
+/// the cluster-wide auto-discovered list + their own pinned manual URLs.
+/// Other users' pinned URLs are not returned.
 pub async fn cluster_services_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let user = match require_auth(&req, &state) {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
     HttpResponse::Ok().json(serde_json::json!({
-        "services": crate::services_discovery::cached(),
-        "grouped": crate::services_discovery::grouped(),
+        "services": crate::services_discovery::list_for_user(&user),
+        "grouped":  crate::services_discovery::grouped_for(&user),
     }))
 }
 
-/// POST /api/cluster-services/sweep — kick off an immediate discovery
-/// sweep instead of waiting for the next periodic one. Useful right
-/// after the user spins up a new container they want to see in the
-/// browser homepage.
+/// POST /api/cluster-services/sweep — run a fresh discovery scan now.
+/// Discovery is on-demand (no periodic loop), so the page calls this
+/// when it loads. Returns once the sweep has finished, with the new
+/// merged list for the requesting user.
 pub async fn cluster_services_sweep(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let user = match require_auth(&req, &state) {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
     let _ = tokio::task::spawn_blocking(crate::services_discovery::run_sweep).await;
     HttpResponse::Ok().json(serde_json::json!({
         "ok": true,
-        "services": crate::services_discovery::cached(),
+        "services": crate::services_discovery::list_for_user(&user),
+        "grouped":  crate::services_discovery::grouped_for(&user),
     }))
 }
 
@@ -3525,15 +3533,18 @@ pub struct AddManualServiceRequest {
 
 fn default_other_category() -> String { "Other".to_string() }
 
-/// POST /api/cluster-services/manual — pin a service we didn't auto-detect
-/// (custom port, weird URL). Stays through discovery sweeps.
+/// POST /api/cluster-services/manual — pin a service against the
+/// requesting user. Other users won't see this entry.
 pub async fn cluster_services_add_manual(
     req: HttpRequest, state: web::Data<AppState>,
     body: web::Json<AddManualServiceRequest>,
 ) -> HttpResponse {
-    if let Err(resp) = require_auth(&req, &state) { return resp; }
-    match crate::services_discovery::add_manual(
-        body.name.clone(), body.url.clone(), body.icon.clone(), body.category.clone(),
+    let user = match require_auth(&req, &state) {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+    match crate::services_discovery::add_manual_for_user(
+        &user, body.name.clone(), body.url.clone(), body.icon.clone(), body.category.clone(),
     ) {
         Ok(svc) => HttpResponse::Ok().json(svc),
         Err(e) => HttpResponse::BadRequest().json(serde_json::json!({"error": e})),
@@ -3543,12 +3554,15 @@ pub async fn cluster_services_add_manual(
 pub async fn cluster_services_delete(
     req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>,
 ) -> HttpResponse {
-    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let user = match require_auth(&req, &state) {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
     let id = path.into_inner();
-    if crate::services_discovery::remove(&id) {
+    if crate::services_discovery::remove_manual_for_user(&user, &id) {
         HttpResponse::Ok().json(serde_json::json!({"removed": true}))
     } else {
-        HttpResponse::NotFound().json(serde_json::json!({"error": "not found"}))
+        HttpResponse::NotFound().json(serde_json::json!({"error": "not found in your pinned list"}))
     }
 }
 
@@ -3579,11 +3593,22 @@ pub async fn cluster_browser_start(
         Err(resp) => return resp,
     };
     // Default homepage = our /cluster-home on the host's WolfNet IP so
-    // the in-container Firefox can reach it. Users can override with a
-    // different URL (e.g. straight to a service they want).
+    // the in-container Firefox can reach it. Use plain HTTP — when
+    // WolfStack runs HTTPS the cert is usually self-signed, and a
+    // freshly-launched Firefox profile balks at that. The inter_node
+    // port is always plain HTTP on TLS-enabled installs and serves the
+    // same /cluster-home route, so target that. On non-TLS installs
+    // the api port is itself HTTP, so fall back to it.
     let host_ip = local_wolfnet_ip().unwrap_or_else(|| "127.0.0.1".into());
     let port_cfg = crate::ports::PortConfig::load();
-    let default_homepage = format!("https://{}:{}/cluster-home", host_ip, port_cfg.api);
+    let homepage_port = if state.tls_enabled { port_cfg.inter_node } else { port_cfg.api };
+    // Embed the user as a query param so /cluster-home renders that
+    // user's pinned URLs alongside the cluster-wide discovered list.
+    let default_homepage = format!(
+        "http://{}:{}/cluster-home?user={}",
+        host_ip, homepage_port,
+        urlencoding_simple(&user)
+    );
     let homepage = body.homepage.clone().filter(|s| !s.trim().is_empty()).unwrap_or(default_homepage);
 
     let result = tokio::task::spawn_blocking(move || {
@@ -3602,6 +3627,82 @@ pub async fn cluster_browser_start(
     }
 }
 
+/// GET /api/cluster-browser/image-status — quick "is the browser image
+/// pre-pulled on this node?" so the UI can show "First run will download
+/// ~700 MB" if not.
+pub async fn cluster_browser_image_status(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    HttpResponse::Ok().json(serde_json::json!({
+        "image_present": crate::cluster_browser::image_present(),
+    }))
+}
+
+/// POST /api/cluster-browser/sessions/start-stream — same as /sessions
+/// but streams `docker pull` progress (image download, layers, container
+/// start) as Server-Sent Events so the user has visible feedback during
+/// the multi-minute first-time pull instead of a silent spinner.
+/// Final event: `[done] {json}` with the connect_url.
+pub async fn cluster_browser_start_stream(
+    req: HttpRequest, state: web::Data<AppState>,
+    body: web::Json<StartBrowserRequest>,
+) -> HttpResponse {
+    let user = match require_auth(&req, &state) {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+
+    let host_ip = local_wolfnet_ip().unwrap_or_else(|| "127.0.0.1".into());
+    let port_cfg = crate::ports::PortConfig::load();
+    let homepage_port = if state.tls_enabled { port_cfg.inter_node } else { port_cfg.api };
+    // Embed the user as a query param so /cluster-home renders that
+    // user's pinned URLs alongside the cluster-wide discovered list.
+    let default_homepage = format!(
+        "http://{}:{}/cluster-home?user={}",
+        host_ip, homepage_port,
+        urlencoding_simple(&user)
+    );
+    let homepage = body.homepage.clone().filter(|s| !s.trim().is_empty()).unwrap_or(default_homepage);
+
+    let (std_tx, std_rx) = std::sync::mpsc::channel::<String>();
+    let (tok_tx, mut tok_rx) = tokio::sync::mpsc::channel::<String>(256);
+
+    std::thread::spawn(move || {
+        let result = crate::cluster_browser::start_session_streamed(&user, &homepage, std_tx.clone());
+        match result {
+            Ok(session) => {
+                let host = local_wolfnet_ip().unwrap_or_else(|| "127.0.0.1".into());
+                let payload = serde_json::json!({
+                    "session": session,
+                    // Plain HTTP — KasmVNC inside the container is HTTP only.
+                    "connect_url": format!("http://{}:{}", host, session.web_port),
+                });
+                let _ = std_tx.send(format!("[done] {}", payload));
+            }
+            Err(e) => { let _ = std_tx.send(format!("[error] {}", e)); }
+        }
+    });
+
+    tokio::task::spawn_blocking(move || {
+        while let Ok(msg) = std_rx.recv() {
+            if tok_tx.blocking_send(msg).is_err() { break; }
+        }
+    });
+
+    let stream = async_stream::stream! {
+        while let Some(msg) = tok_rx.recv().await {
+            let event = format!("data: {}\n\n", msg.replace('\n', "\ndata: "));
+            yield Ok::<_, actix_web::Error>(actix_web::web::Bytes::from(event));
+        }
+    };
+
+    HttpResponse::Ok()
+        .insert_header(("Content-Type", "text/event-stream"))
+        .insert_header(("Cache-Control", "no-cache"))
+        .insert_header(("Connection", "keep-alive"))
+        .insert_header(("X-Accel-Buffering", "no"))
+        .streaming(stream)
+}
+
 pub async fn cluster_browser_stop(
     req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>,
 ) -> HttpResponse {
@@ -3617,15 +3718,23 @@ pub async fn cluster_browser_stop(
     }
 }
 
-/// GET /cluster-home — the homepage HTML that the in-container Firefox
-/// loads at startup. Lists discovered services as click-cards plus an
-/// open-URL bar at the top. Intentionally unauthenticated: the Firefox
-/// inside the container has a fresh profile and no cookies, and the
-/// page only exposes information that's already visible to anything
-/// on the WolfNet routing fabric. The URLs are useless without WolfNet
-/// access in the first place.
-pub async fn cluster_browser_homepage(_req: HttpRequest, _state: web::Data<AppState>) -> HttpResponse {
-    let html = crate::cluster_browser::render_homepage();
+/// GET /cluster-home[?user=alice] — the homepage HTML that the
+/// in-container Firefox loads at startup. Lists discovered services as
+/// click-cards plus an open-URL bar at the top. Intentionally
+/// unauthenticated: the Firefox inside the container has a fresh
+/// profile and no cookies, and the page only exposes information
+/// that's already visible to anything on the WolfNet routing fabric.
+/// The optional `user` query param scopes the homepage to that user's
+/// pinned manual URLs in addition to auto-discovered services — the
+/// session-start endpoint embeds the user in the homepage URL when it
+/// spawns the container so each user lands on their own grid.
+pub async fn cluster_browser_homepage(
+    req: HttpRequest, _state: web::Data<AppState>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+) -> HttpResponse {
+    let _ = req; // intentional — unauthenticated by design
+    let user = query.get("user").map(|s| s.as_str()).unwrap_or("");
+    let html = crate::cluster_browser::render_homepage(user);
     HttpResponse::Ok()
         .insert_header(("Content-Type", "text/html; charset=utf-8"))
         .insert_header(("Cache-Control", "no-cache"))
@@ -3642,6 +3751,23 @@ fn local_wolfnet_ip() -> Option<String> {
         .and_then(|l| l.trim().split_whitespace().nth(1))
         .and_then(|s| s.split('/').next())
         .map(|s| s.to_string())
+}
+
+/// Minimal percent-encoder for the `user` query param embedded in the
+/// in-container browser's homepage URL. Avoids pulling in a full
+/// urlencoding crate just for one call site. Encodes everything that
+/// isn't alphanumeric or `-_.` (RFC 3986 unreserved-ish).
+fn urlencoding_simple(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.as_bytes() {
+        let c = *byte;
+        if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c == b'.' || c == b'~' {
+            out.push(c as char);
+        } else {
+            out.push_str(&format!("%{:02X}", c));
+        }
+    }
+    out
 }
 
 /// GET /api/wolfnet/used-ips — returns WolfNet IPs in use on this node
@@ -16986,7 +17112,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/cluster-services/{id}", web::delete().to(cluster_services_delete))
         .route("/api/cluster-browser/sessions", web::get().to(cluster_browser_list))
         .route("/api/cluster-browser/sessions", web::post().to(cluster_browser_start))
+        .route("/api/cluster-browser/sessions/start-stream", web::post().to(cluster_browser_start_stream))
         .route("/api/cluster-browser/sessions/{id}", web::delete().to(cluster_browser_stop))
+        .route("/api/cluster-browser/image-status", web::get().to(cluster_browser_image_status))
         .route("/cluster-home", web::get().to(cluster_browser_homepage))
         .route("/api/agent/cluster-name", web::post().to(agent_set_cluster_name))
         .route("/api/agent/wolfnet-routes", web::post().to(agent_set_wolfnet_routes))

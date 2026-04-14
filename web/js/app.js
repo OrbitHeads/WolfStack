@@ -33122,7 +33122,42 @@ const wfActionIcons = {
 // — no auth fork.
 
 async function loadClusterBrowser() {
+    // Show cached results first so the page is never blank, then kick
+    // off a fresh sweep in the background — discovery is on-demand
+    // (no periodic loop), so each page visit refreshes the list.
     await Promise.all([loadClusterBrowserSessions(), loadClusterServices()]);
+    triggerClusterServicesSweep({ silent: true });
+}
+
+/// Run a discovery sweep without blocking the UI. Shows a small "scanning"
+/// note above the services grid so the user knows something's happening.
+/// Pass { silent: true } from auto-triggers to suppress the toast.
+async function triggerClusterServicesSweep({ silent = false } = {}) {
+    const grid = document.getElementById('cluster-services-grid');
+    if (grid) {
+        // Inject a small live banner so the user knows a scan is in flight.
+        // Cheap to re-add on every call; removed when we re-render.
+        const banner = document.createElement('div');
+        banner.id = 'cluster-services-sweep-banner';
+        banner.style.cssText = 'background:rgba(99,102,241,0.10);border:1px solid rgba(99,102,241,0.3);border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:12px;color:#a5b4fc;display:flex;align-items:center;gap:10px;';
+        banner.innerHTML = `<span style="display:inline-block;width:14px;height:14px;border:2px solid rgba(99,102,241,0.25);border-top-color:#818cf8;border-radius:50%;animation:spin 0.7s linear infinite;"></span> Scanning the cluster for web services…`;
+        const old = document.getElementById('cluster-services-sweep-banner');
+        if (old) old.remove();
+        grid.parentElement?.insertBefore(banner, grid);
+    }
+    if (!silent) showToast('Scanning the cluster for web services…', 'info', 4000);
+    try {
+        const resp = await fetch(apiUrl('/api/cluster-services/sweep'), { method: 'POST' });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        const count = (data.services || []).length;
+        renderClusterServices(data.grouped || []);
+        if (!silent) showToast(`Scan complete — ${count} services found`, 'success', 4000);
+    } catch (e) {
+        if (!silent) showToast('Sweep failed: ' + e.message, 'error');
+    } finally {
+        document.getElementById('cluster-services-sweep-banner')?.remove();
+    }
 }
 
 async function loadClusterBrowserSessions() {
@@ -33157,41 +33192,140 @@ async function loadClusterBrowserSessions() {
     }
 }
 
-/// Build the URL the user opens to access a browser session. Uses the
-/// current WolfStack host — the KasmVNC web UI is mapped to that host's
-/// random port. If the user is on the LAN they hit it directly; if
-/// they're remote, they'd need WolfStack to be reachable on that port
-/// too (future enhancement: proxy through WolfStack).
+/// Build the URL the user opens to access a browser session. The
+/// linuxserver/firefox image's KasmVNC web UI binds plain HTTP on
+/// container port 3000 — even when WolfStack itself runs on HTTPS,
+/// the session port is HTTP. Hard-code the scheme rather than mirror
+/// `location.protocol`, otherwise the popup tries https:// and gets
+/// "ERR_SSL_PROTOCOL_ERROR".
 function clusterBrowserConnectUrl(session) {
-    return `${location.protocol}//${location.hostname}:${session.web_port}`;
+    return `http://${location.hostname}:${session.web_port}`;
 }
 
 async function clusterBrowserStart() {
     const btn = event?.target;
     if (btn) { btn.disabled = true; btn.textContent = '⏳ Starting…'; }
+
+    // Progress modal so the user sees what's going on. First-time start
+    // pulls a ~700 MB browser image; we'd otherwise spin silently for
+    // several minutes with no feedback.
+    const overlay = clusterBrowserProgressModal();
+    const setStatus = overlay.setStatus;
+    const appendLine = overlay.appendLine;
+    setStatus('Connecting to install stream…');
+
     try {
-        const resp = await fetch(apiUrl('/api/cluster-browser/sessions'), {
+        const resp = await fetch(apiUrl('/api/cluster-browser/sessions/start-stream'), {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
             body: JSON.stringify({}),
         });
-        const data = await resp.json();
-        if (!resp.ok) {
-            showToast(data.error || `HTTP ${resp.status}`, 'error');
+        if (!resp.ok || !resp.body) {
+            const d = await resp.json().catch(() => ({}));
+            throw new Error(d.error || `HTTP ${resp.status}`);
+        }
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        let session = null;
+        let connectUrl = null;
+        let failed = null;
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            let sep;
+            while ((sep = buf.indexOf('\n\n')) !== -1) {
+                const frame = buf.slice(0, sep); buf = buf.slice(sep + 2);
+                const text = frame.split('\n').filter(l => l.startsWith('data:'))
+                    .map(l => l.slice(5).trimStart()).join('\n');
+                if (!text) continue;
+                if (text.startsWith('[done] ')) {
+                    try {
+                        const payload = JSON.parse(text.slice(7));
+                        session = payload.session;
+                        connectUrl = payload.connect_url || clusterBrowserConnectUrl(session);
+                    } catch (e) {}
+                } else if (text.startsWith('[error] ')) {
+                    failed = text.slice(8);
+                    appendLine(`ERROR: ${failed}`);
+                } else {
+                    setStatus(text.split('\n')[0]);
+                    appendLine(text);
+                }
+            }
+        }
+        if (failed) {
+            setStatus(`Failed: ${failed}`);
+            overlay.markFailed();
+            showToast('Failed to start session: ' + failed, 'error');
             return;
         }
+        setStatus('Browser ready — opening in a new window…');
         showToast('Browser session started', 'success', 4000);
-        // KasmVNC inside the container needs a few seconds to bind its
-        // web port. Tiny stagger so the new tab doesn't open onto a
-        // "connection refused" page on the first try.
-        const url = clusterBrowserConnectUrl(data.session);
-        setTimeout(() => window.open(url, '_blank', 'width=1280,height=800'), 2500);
         loadClusterBrowserSessions();
+        // KasmVNC inside the container takes a few seconds to bind its
+        // web port. Stagger the popup so it doesn't land on
+        // "connection refused" on the first try.
+        const url = connectUrl || (session ? clusterBrowserConnectUrl(session) : null);
+        if (url) {
+            setTimeout(() => {
+                window.open(url, '_blank', 'width=1280,height=800');
+                overlay.close();
+            }, 3000);
+        } else {
+            overlay.close();
+        }
     } catch (e) {
+        setStatus('Failed: ' + e.message);
+        overlay.markFailed();
         showToast('Failed to start session: ' + e.message, 'error');
     } finally {
         if (btn) { btn.disabled = false; btn.textContent = '🚀 Start browser session'; }
     }
+}
+
+/// Build a sticky progress modal with status header + scrolling log.
+/// Returns { setStatus(text), appendLine(line), markFailed(), close() }.
+function clusterBrowserProgressModal() {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay active';
+    overlay.style.zIndex = '10000';
+    overlay.innerHTML = `
+        <div class="modal" style="max-width:560px;">
+            <div class="modal-header">
+                <h3>🌐 Starting Cluster Browser</h3>
+            </div>
+            <div class="modal-body" style="font-size:13px;line-height:1.5;">
+                <div style="display:flex;align-items:center;gap:10px;background:var(--bg-secondary);padding:14px 16px;border-radius:8px;margin-bottom:12px;">
+                    <span class="cb-spinner" style="display:inline-block;width:18px;height:18px;border:2px solid rgba(255,255,255,0.18);border-top-color:#818cf8;border-radius:50%;animation:spin 0.7s linear infinite;"></span>
+                    <strong id="cb-status" style="flex:1;color:var(--text);">Preparing…</strong>
+                </div>
+                <p style="margin:0 0 8px;color:var(--text-muted);font-size:12px;">First time on this node? The browser image is ~700 MB and pulled once. Subsequent sessions start in seconds.</p>
+                <pre id="cb-log" style="margin:0;background:#0a0c12;color:#cbd2de;border:1px solid var(--border);border-radius:8px;padding:12px;height:220px;overflow-y:auto;font-family:'JetBrains Mono',ui-monospace,monospace;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-all;"></pre>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" id="cb-close" onclick="this.closest('.modal-overlay').remove()" style="display:none;">Close</button>
+            </div>
+        </div>`;
+    document.body.appendChild(overlay);
+    const statusEl = overlay.querySelector('#cb-status');
+    const logEl = overlay.querySelector('#cb-log');
+    const closeBtn = overlay.querySelector('#cb-close');
+    const spinner = overlay.querySelector('.cb-spinner');
+    return {
+        setStatus(text) { if (statusEl) statusEl.textContent = text; },
+        appendLine(line) {
+            if (!logEl) return;
+            logEl.textContent += (logEl.textContent ? '\n' : '') + line;
+            logEl.scrollTop = logEl.scrollHeight;
+        },
+        markFailed() {
+            if (spinner) { spinner.style.borderTopColor = '#ef4444'; spinner.style.animation = 'none'; }
+            if (closeBtn) closeBtn.style.display = '';
+        },
+        close() { overlay.remove(); },
+    };
 }
 
 async function clusterBrowserStop(id) {
@@ -33253,18 +33387,8 @@ function renderClusterServices(grouped) {
 async function clusterServicesSweep() {
     const btn = event?.target;
     if (btn) { btn.disabled = true; btn.textContent = '⏳ Scanning…'; }
-    try {
-        showToast('Scanning WolfNet IPs for web services…', 'info', 4000);
-        const resp = await fetch(apiUrl('/api/cluster-services/sweep'), { method: 'POST' });
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        const data = await resp.json();
-        showToast(`Scan complete — ${(data.services || []).length} services found`, 'success', 4000);
-        loadClusterServices();
-    } catch (e) {
-        showToast('Sweep failed: ' + e.message, 'error');
-    } finally {
-        if (btn) { btn.disabled = false; btn.textContent = '🔄 Rescan services'; }
-    }
+    await triggerClusterServicesSweep({ silent: false });
+    if (btn) { btn.disabled = false; btn.textContent = '🔄 Rescan services'; }
 }
 
 async function clusterServiceDelete(id) {

@@ -21,7 +21,20 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
-const SERVICES_FILE: &str = "/etc/wolfstack/cluster-services.json";
+/// Auto-discovered services — shared across all WolfStack users on this
+/// node. Rewritten by every sweep.
+const DISCOVERED_FILE: &str = "/etc/wolfstack/cluster-services-discovered.json";
+/// Per-user pinned URLs go under this dir as `<sanitised-username>.json`.
+/// Splitting from the discovery file means a user's pinned services
+/// don't show up in another user's UI, and it survives discovery sweeps
+/// rewriting the discovered list.
+const MANUAL_DIR: &str = "/etc/wolfstack/cluster-services-by-user";
+
+/// Backwards-compat: pre-v17.0.6 wrote everything (discovered +
+/// manual) into one shared file. Read it once on first sweep so an
+/// upgrade doesn't lose anyone's pinned URLs — they get migrated into
+/// a special "_legacy" user file the first time the sweep runs.
+const LEGACY_SHARED_FILE: &str = "/etc/wolfstack/cluster-services.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredService {
@@ -80,34 +93,74 @@ const PROBE_PORTS: &[(u16, &str)] = &[
     (32400, "http"),   // Plex
 ];
 
-/// In-memory cache of the most recent sweep. Cheaper than re-reading
-/// the JSON every API call.
-static LAST_RESULT: Mutex<Vec<DiscoveredService>> = Mutex::new(Vec::new());
+/// In-memory cache of the most recent auto-discovery sweep.
+/// Manual per-user entries are NOT cached here — they're loaded from
+/// disk on demand so we don't need a per-user cache invalidation path.
+static LAST_DISCOVERED: Mutex<Vec<DiscoveredService>> = Mutex::new(Vec::new());
 
+/// Auto-discovered services only (shared). Doesn't include any user's
+/// pinned manual URLs — call list_for_user for that.
 pub fn cached() -> Vec<DiscoveredService> {
-    LAST_RESULT.lock().unwrap().clone()
+    LAST_DISCOVERED.lock().unwrap().clone()
 }
 
-pub fn load_persisted() -> Vec<DiscoveredService> {
-    std::fs::read_to_string(SERVICES_FILE)
+pub fn load_discovered_from_disk() -> Vec<DiscoveredService> {
+    std::fs::read_to_string(DISCOVERED_FILE)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
 
-fn save_persisted(services: &[DiscoveredService]) {
+fn save_discovered(services: &[DiscoveredService]) {
     let _ = std::fs::create_dir_all("/etc/wolfstack");
     if let Ok(json) = serde_json::to_string_pretty(services) {
-        let _ = std::fs::write(SERVICES_FILE, json);
+        let _ = std::fs::write(DISCOVERED_FILE, json);
     }
+}
+
+fn sanitise_user(user: &str) -> String {
+    user.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .collect()
+}
+
+fn manual_file_for(user: &str) -> String {
+    format!("{}/{}.json", MANUAL_DIR, sanitise_user(user))
+}
+
+fn load_manual_for(user: &str) -> Vec<DiscoveredService> {
+    std::fs::read_to_string(manual_file_for(user))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_manual_for(user: &str, services: &[DiscoveredService]) -> Result<(), String> {
+    std::fs::create_dir_all(MANUAL_DIR).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(services).map_err(|e| e.to_string())?;
+    std::fs::write(manual_file_for(user), json).map_err(|e| e.to_string())
+}
+
+/// Discovered services + the given user's pinned manual URLs.
+/// Used by the WolfStack UI when an authenticated user lists services.
+pub fn list_for_user(user: &str) -> Vec<DiscoveredService> {
+    let mut out = cached();
+    out.extend(load_manual_for(user));
+    out
 }
 
 pub fn id_for(ip: &str, port: u16) -> String {
     format!("{}-{}", ip.replace('.', "-"), port)
 }
 
-/// All WolfNet IPs we know about: routes.json keys (containers/VMs)
-/// plus the local host's WolfNet IP itself.
+/// All WolfNet IPs we know about, gathered from three sources:
+///  1. routes.json keys: container/VM WolfNet IPs known to wolfnetd
+///  2. routes.json values: host WolfNet IPs that own those containers
+///  3. /etc/wolfnet/config.toml peers: every WolfNet member, including
+///     hosts that have no containers (would otherwise be invisible to
+///     discovery — bare WolfStack nodes running services natively, NAS
+///     boxes joined as WolfNet satellites, etc.)
+///  4. The local host's own WolfNet IP
 fn all_wolfnet_ips() -> HashSet<String> {
     let mut ips = HashSet::new();
     if let Ok(content) = std::fs::read_to_string("/var/run/wolfnet/routes.json") {
@@ -118,8 +171,20 @@ fn all_wolfnet_ips() -> HashSet<String> {
             }
         }
     }
-    // Include the local host's WolfNet IP too so the user can hit
-    // services running on the WolfStack node.
+    // WolfNet peer table — covers hosts even when they have no containers.
+    if let Ok(content) = std::fs::read_to_string("/etc/wolfnet/config.toml") {
+        if let Ok(toml_val) = content.parse::<toml::Value>() {
+            if let Some(peers) = toml_val.get("peers").and_then(|p| p.as_array()) {
+                for peer in peers {
+                    if let Some(ip) = peer.get("allowed_ip").and_then(|v| v.as_str()) {
+                        if !ip.is_empty() {
+                            ips.insert(ip.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
     if let Some(local) = local_wolfnet_ip() {
         ips.insert(local);
     }
@@ -245,9 +310,11 @@ fn probe(ip: &str, port: u16, scheme: &str) -> Option<DiscoveredService> {
 }
 
 /// Run one full discovery sweep across every known WolfNet IP × the
-/// curated port list. Merges results with manually-added entries and
-/// updates the cache + JSON file.
+/// curated port list. Persists results to the shared discovered file
+/// (manual per-user entries live separately and aren't touched here).
 pub fn run_sweep() {
+    migrate_legacy_if_present();
+
     let ips = all_wolfnet_ips();
     if ips.is_empty() {
         debug!("services_discovery: no WolfNet IPs known yet, skipping sweep");
@@ -264,26 +331,44 @@ pub fn run_sweep() {
         }
     }
 
-    // Preserve manually-added entries even if their target isn't
-    // currently responding — admins that pin a service want it to
-    // stay pinned.
-    let existing = load_persisted();
-    for old in existing {
-        if old.manual && !found.iter().any(|s| s.id == old.id) {
-            found.push(old);
-        }
-    }
-
-    info!("services_discovery: found {} services", found.len());
-    save_persisted(&found);
-    *LAST_RESULT.lock().unwrap() = found;
+    info!("services_discovery: found {} auto-discovered services", found.len());
+    save_discovered(&found);
+    *LAST_DISCOVERED.lock().unwrap() = found;
 }
 
-/// Add a manual entry the discovery sweep didn't pick up. Idempotent —
-/// an existing entry with the same id is replaced.
-pub fn add_manual(name: String, url: String, icon: String, category: String) -> Result<DiscoveredService, String> {
-    // reqwest re-exports the `url` crate; reach through that so we
-    // don't add a separate dep just for parse.
+/// One-shot upgrade path: if pre-v17.0.6 cluster-services.json exists,
+/// split it into the new auto-discovered + a "_legacy" user manual file
+/// so admins don't lose their pinned URLs across the upgrade. The
+/// legacy file is renamed to `.migrated` so we don't re-run this every
+/// sweep.
+fn migrate_legacy_if_present() {
+    let legacy = std::path::Path::new(LEGACY_SHARED_FILE);
+    if !legacy.exists() { return; }
+    let content = match std::fs::read_to_string(legacy) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let entries: Vec<DiscoveredService> = match serde_json::from_str(&content) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let (auto, manual): (Vec<_>, Vec<_>) = entries.into_iter().partition(|s| !s.manual);
+    if !auto.is_empty() { save_discovered(&auto); }
+    if !manual.is_empty() {
+        // Park them under a "_legacy" user — admins can copy/re-add to
+        // their own account from there. Doesn't auto-attribute, since
+        // the old file had no user info.
+        let _ = save_manual_for("_legacy", &manual);
+    }
+    let renamed = format!("{}.migrated", LEGACY_SHARED_FILE);
+    let _ = std::fs::rename(legacy, renamed);
+    info!("services_discovery: migrated legacy cluster-services.json — manual entries parked under user '_legacy'");
+}
+
+/// Pin a manual entry against `user`. Stored at
+/// /etc/wolfstack/cluster-services-by-user/<user>.json so other users
+/// don't see this user's pinned URLs in their lists.
+pub fn add_manual_for_user(user: &str, name: String, url: String, icon: String, category: String) -> Result<DiscoveredService, String> {
     let parsed = reqwest::Url::parse(&url).map_err(|e| format!("Invalid URL: {}", e))?;
     let host = parsed.host_str().ok_or("URL has no host")?.to_string();
     let port = parsed.port_or_known_default().ok_or("URL has no port")?;
@@ -292,7 +377,7 @@ pub fn add_manual(name: String, url: String, icon: String, category: String) -> 
     let svc = DiscoveredService {
         id: id_for(&host, port),
         name,
-        url: url.clone(),
+        url,
         host_ip: host,
         port,
         scheme,
@@ -301,45 +386,45 @@ pub fn add_manual(name: String, url: String, icon: String, category: String) -> 
         manual: true,
         last_seen: now,
     };
-    let mut current = load_persisted();
+    let mut current = load_manual_for(user);
     current.retain(|s| s.id != svc.id);
     current.push(svc.clone());
-    save_persisted(&current);
-    *LAST_RESULT.lock().unwrap() = current;
+    save_manual_for(user, &current)?;
     Ok(svc)
 }
 
-pub fn remove(id: &str) -> bool {
-    let mut current = load_persisted();
+/// Remove a pinned entry from `user`'s file. Won't touch other users'
+/// pinned entries with the same id, and won't touch auto-discovered
+/// entries (those come back on the next sweep anyway).
+pub fn remove_manual_for_user(user: &str, id: &str) -> bool {
+    let mut current = load_manual_for(user);
     let before = current.len();
     current.retain(|s| s.id != id);
     if current.len() == before { return false; }
-    save_persisted(&current);
-    *LAST_RESULT.lock().unwrap() = current;
+    save_manual_for(user, &current).ok();
     true
 }
 
-/// Background loop — kicks off a sweep every 5 minutes. Called from
-/// main.rs as a tokio task; keeps re-running for the life of the daemon.
-pub async fn run_loop() {
-    // Restore the cache from disk so the API returns something useful
-    // before the first sweep finishes.
-    let initial = load_persisted();
-    *LAST_RESULT.lock().unwrap() = initial;
-    // Initial delay so we don't slam the network at startup.
-    tokio::time::sleep(Duration::from_secs(30)).await;
-    loop {
-        // Discovery is blocking I/O — push it onto a blocking thread so
-        // the tokio runtime stays responsive.
-        let _ = tokio::task::spawn_blocking(run_sweep).await;
-        tokio::time::sleep(Duration::from_secs(300)).await;
-    }
+/// Restore the on-disk cache into memory at daemon startup so the first
+/// API call after a restart returns the previous sweep's results
+/// immediately, rather than an empty list. Discovery now runs purely on
+/// demand (triggered by the Cluster Browser page load via the /sweep
+/// endpoint), so there's no periodic loop to spawn.
+pub fn restore_cache() {
+    let initial = load_discovered_from_disk();
+    *LAST_DISCOVERED.lock().unwrap() = initial;
 }
 
-/// Group services by category for the homepage. Keeps insertion order
-/// of categories stable based on first occurrence.
-pub fn grouped() -> Vec<(String, Vec<DiscoveredService>)> {
-    let services = cached();
+/// Group services by category. Pass the requesting user to include
+/// their pinned manual entries; pass an empty string for auto-discovered
+/// only (used by the unauth /cluster-home renderer when no user
+/// query-param was provided).
+pub fn grouped_for(user: &str) -> Vec<(String, Vec<DiscoveredService>)> {
+    let services = if user.is_empty() {
+        cached()
+    } else {
+        list_for_user(user)
+    };
     if services.is_empty() {
         return Vec::new();
     }
