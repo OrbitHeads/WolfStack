@@ -2,13 +2,14 @@
 // (C)Copyright Wolf Software Systems Ltd
 // https://wolf.uk.com
 
-//! Storage Manager — mount and manage S3, NFS, directory, and WolfDisk storage
+//! Storage Manager — mount and manage S3, NFS, SMB/CIFS, directory, and WolfDisk storage
 //!
 //! Supports:
 //! - S3 storage via rust-s3 (pure Rust, native, works on IBM Power/ppc64le)
 //! - S3 storage via s3fs-fuse (fallback)
 //! - SSHFS mounts via sshfs
 //! - NFS storage via mount -t nfs
+//! - SMB/CIFS storage via mount -t cifs (Synology/QNAP NAS with default SMB shares)
 //! - Local directory bind mounts
 //! - WolfDisk mounts via wolfdisk CLI
 //! - Global mounts replicated across the cluster
@@ -31,9 +32,25 @@ const MOUNT_BASE: &str = "/mnt/wolfstack";
 pub enum MountType {
     S3,
     Nfs,
+    Smb,
     Directory,
     Wolfdisk,
     Sshfs,
+}
+
+/// Per-mount SMB/CIFS credentials + options. Kept separate from S3Config so
+/// the two don't share a struct shape for no reason. `password` is stored in
+/// /etc/wolfstack/storage.json in plain text (same policy as S3 secrets) —
+/// file is root-owned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmbConfig {
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    /// Optional AD domain / workgroup
+    #[serde(default)]
+    pub domain: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +87,12 @@ pub struct StorageMount {
     pub s3_config: Option<S3Config>,
     #[serde(default)]
     pub nfs_options: Option<String>,
+    /// CIFS mount options (e.g. "vers=3.0,sec=ntlmssp"). Appended to the
+    /// auto-built credentials options when the mount is CIFS/SMB.
+    #[serde(default)]
+    pub smb_options: Option<String>,
+    #[serde(default)]
+    pub smb_config: Option<SmbConfig>,
     #[serde(default = "default_status")]
     pub status: String,
     #[serde(default)]
@@ -177,6 +200,7 @@ pub fn mount_storage(id: &str) -> Result<String, String> {
     let result = match config.mounts[idx].mount_type {
         MountType::S3 => mount_s3(&config.mounts[idx]),
         MountType::Nfs => mount_nfs(&config.mounts[idx]),
+        MountType::Smb => mount_smb(&config.mounts[idx]),
         MountType::Directory => mount_directory(&config.mounts[idx]),
         MountType::Wolfdisk => mount_wolfdisk(&config.mounts[idx]),
         MountType::Sshfs => mount_sshfs(&config.mounts[idx]),
@@ -381,6 +405,26 @@ pub fn update_mount(id: &str, updates: serde_json::Value) -> Result<StorageMount
     }
     if let Some(nfs_opts) = updates.get("nfs_options").and_then(|v| v.as_str()) {
         mount.nfs_options = if nfs_opts.is_empty() { None } else { Some(nfs_opts.to_string()) };
+    }
+    if let Some(smb_opts) = updates.get("smb_options").and_then(|v| v.as_str()) {
+        mount.smb_options = if smb_opts.is_empty() { None } else { Some(smb_opts.to_string()) };
+    }
+    if let Some(smb_updates) = updates.get("smb_config") {
+        let smb = mount.smb_config.get_or_insert_with(|| SmbConfig {
+            username: String::new(), password: String::new(), domain: String::new(),
+        });
+        if let Some(v) = smb_updates.get("username").and_then(|v| v.as_str()) {
+            smb.username = v.to_string();
+        }
+        if let Some(v) = smb_updates.get("password").and_then(|v| v.as_str()) {
+            // Matches S3 pattern — only overwrite when the UI actually sent a new value
+            if v != "••••••••" {
+                smb.password = v.to_string();
+            }
+        }
+        if let Some(v) = smb_updates.get("domain").and_then(|v| v.as_str()) {
+            smb.domain = v.to_string();
+        }
     }
     
     // Apply S3 config updates
@@ -686,6 +730,75 @@ fn mount_nfs(mount: &StorageMount) -> Result<String, String> {
         Ok("NFS storage mounted".to_string())
     } else {
         Err(format!("NFS mount failed: {}", String::from_utf8_lossy(&output.stderr)))
+    }
+}
+
+fn mount_smb(mount: &StorageMount) -> Result<String, String> {
+    // Ensure mount.cifs is present. cifs-utils lives in different packages
+    // per distro — same layout as mount_nfs above.
+    if !Path::new("/sbin/mount.cifs").exists() && !Path::new("/usr/sbin/mount.cifs").exists() {
+        let distro = crate::installer::detect_distro();
+        let (pkg_mgr, pkg_name) = match distro {
+            crate::installer::DistroFamily::Debian => ("apt-get", "cifs-utils"),
+            crate::installer::DistroFamily::RedHat => ("dnf", "cifs-utils"),
+            crate::installer::DistroFamily::Suse => ("zypper", "cifs-utils"),
+            crate::installer::DistroFamily::Arch => ("pacman", "cifs-utils"),
+            crate::installer::DistroFamily::Unknown => ("apt-get", "cifs-utils"),
+        };
+        let install = Command::new(pkg_mgr)
+            .args(["install", "-y", pkg_name])
+            .output()
+            .map_err(|e| format!("Failed to install {}: {}", pkg_name, e))?;
+        if !install.status.success() {
+            return Err(format!("Failed to install {}: {}",
+                pkg_name, String::from_utf8_lossy(&install.stderr)));
+        }
+    }
+
+    // Normalise the source — users are likely to type the Windows-style
+    // `\\server\share` from Synology/QNAP admin UIs. CIFS wants `//server/share`.
+    let source = mount.source.replace('\\', "/");
+    let source = if source.starts_with("//") { source } else { format!("//{}", source.trim_start_matches('/')) };
+
+    // Build the credentials half of the -o string. Falls back to guest
+    // mount if no username is configured (common on open Synology shares).
+    let cfg = mount.smb_config.as_ref();
+    let mut opt_parts: Vec<String> = Vec::new();
+    match cfg {
+        Some(c) if !c.username.is_empty() => {
+            opt_parts.push(format!("username={}", c.username));
+            opt_parts.push(format!("password={}", c.password));
+            if !c.domain.is_empty() {
+                opt_parts.push(format!("domain={}", c.domain));
+            }
+        }
+        _ => {
+            opt_parts.push("guest".to_string());
+        }
+    }
+    // Friendly defaults — uid/gid=0 so root owns the mount, file/dir perms
+    // let WolfStack and operators read/write, vers=3.0 matches Synology and
+    // modern QNAP defaults. User-supplied smb_options are appended verbatim
+    // and override (later values win in CIFS option parsing).
+    opt_parts.push("uid=0".to_string());
+    opt_parts.push("gid=0".to_string());
+    opt_parts.push("file_mode=0660".to_string());
+    opt_parts.push("dir_mode=0770".to_string());
+    opt_parts.push("vers=3.0".to_string());
+    if let Some(extra) = mount.smb_options.as_deref().filter(|s| !s.is_empty()) {
+        opt_parts.push(extra.to_string());
+    }
+    let options = opt_parts.join(",");
+
+    let output = Command::new("mount")
+        .args(["-t", "cifs", "-o", &options, &source, &mount.mount_point])
+        .output()
+        .map_err(|e| format!("Failed to run mount: {}", e))?;
+
+    if output.status.success() {
+        Ok("SMB storage mounted".to_string())
+    } else {
+        Err(format!("SMB mount failed: {}", String::from_utf8_lossy(&output.stderr)))
     }
 }
 
@@ -1047,6 +1160,8 @@ fn rclone_section_to_mount(
         auto_mount: false,
         s3_config: Some(s3_config),
         nfs_options: None,
+        smb_options: None,
+        smb_config: None,
         status: "unmounted".to_string(),
         error_message: None,
         created_at: Utc::now().to_rfc3339(),

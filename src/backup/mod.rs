@@ -68,6 +68,11 @@ pub enum StorageType {
     Remote,
     Wolfdisk,
     Pbs,
+    /// NFS export — direct backup destination. Mounted on-demand at
+    /// /mnt/wolfstack-backup/<id>/ and written through like Local.
+    Nfs,
+    /// SMB/CIFS share — as Nfs but for Synology/QNAP and Windows NAS boxes.
+    Smb,
 }
 
 impl std::fmt::Display for StorageType {
@@ -78,6 +83,8 @@ impl std::fmt::Display for StorageType {
             Self::Remote => write!(f, "remote"),
             Self::Wolfdisk => write!(f, "wolfdisk"),
             Self::Pbs => write!(f, "pbs"),
+            Self::Nfs => write!(f, "nfs"),
+            Self::Smb => write!(f, "smb"),
         }
     }
 }
@@ -131,6 +138,29 @@ pub struct BackupStorage {
     /// PBS namespace (optional, for organizing backups)
     #[serde(default)]
     pub pbs_namespace: String,
+    // ── NFS direct backup destination ─────────────────
+    /// `server:/export` — same syntax as `mount -t nfs`.
+    #[serde(default)]
+    pub nfs_source: String,
+    /// Mount options; empty string uses the default `rw,soft,timeo=50`.
+    #[serde(default)]
+    pub nfs_options: String,
+    // ── SMB/CIFS direct backup destination ────────────
+    /// `//server/share` (Windows-style `\\server\share` is normalised).
+    #[serde(default)]
+    pub smb_source: String,
+    /// Subdirectory under the share root to write backups into.
+    #[serde(default)]
+    pub smb_subpath: String,
+    #[serde(default)]
+    pub smb_username: String,
+    #[serde(default)]
+    pub smb_password: String,
+    #[serde(default)]
+    pub smb_domain: String,
+    /// Extra CIFS mount options, e.g. `vers=2.1` for older NAS.
+    #[serde(default)]
+    pub smb_options: String,
 }
 
 #[allow(dead_code)]
@@ -203,6 +233,14 @@ impl Default for BackupStorage {
             pbs_password: String::new(),
             pbs_fingerprint: String::new(),
             pbs_namespace: String::new(),
+            nfs_source: String::new(),
+            nfs_options: String::new(),
+            smb_source: String::new(),
+            smb_subpath: String::new(),
+            smb_username: String::new(),
+            smb_password: String::new(),
+            smb_domain: String::new(),
+            smb_options: String::new(),
         }
     }
 }
@@ -902,7 +940,116 @@ fn store_backup_with_notes(local_path: &Path, storage: &BackupStorage, filename:
         StorageType::Remote => store_remote(local_path, &storage.remote_url, filename),
         StorageType::Wolfdisk => store_local(local_path, &storage.path, filename),
         StorageType::Pbs => store_pbs_with_notes(local_path, storage, filename, notes),
+        StorageType::Nfs => {
+            let dir = ensure_nfs_mounted(storage)?;
+            store_local(local_path, &dir, filename)
+        }
+        StorageType::Smb => {
+            let dir = ensure_smb_mounted(storage)?;
+            store_local(local_path, &dir, filename)
+        }
     }
+}
+
+/// Build the stable per-destination mount point. Destinations are
+/// identified by the source spec so two backup configs pointing at the
+/// same share reuse one mount.
+fn nas_mount_dir(kind: &str, source: &str, subpath: &str) -> String {
+    // Slashes and colons can't live in a dirname — replace with `_`.
+    let key: String = source.chars().map(|c| match c {
+        '/' | ':' | '\\' | ' ' => '_',
+        _ => c,
+    }).collect();
+    let mut p = format!("/mnt/wolfstack-backup/{}-{}", kind, key);
+    if !subpath.is_empty() {
+        p.push('/');
+        p.push_str(subpath.trim_matches('/'));
+    }
+    p
+}
+
+/// Mount (idempotently) an NFS export for backups and return the local
+/// path that store_local should write into. Reuses the existing export
+/// if already mounted.
+fn ensure_nfs_mounted(storage: &BackupStorage) -> Result<String, String> {
+    if storage.nfs_source.is_empty() {
+        return Err("NFS source is not configured (expected `server:/export`)".into());
+    }
+    let dir = nas_mount_dir("nfs", &storage.nfs_source, "");
+    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create mount dir {}: {}", dir, e))?;
+    if is_mounted(&dir) {
+        return Ok(dir);
+    }
+    let options = if storage.nfs_options.is_empty() { "rw,soft,timeo=50" } else { storage.nfs_options.as_str() };
+    let output = std::process::Command::new("mount")
+        .args(["-t", "nfs", "-o", options, &storage.nfs_source, &dir])
+        .output()
+        .map_err(|e| format!("Failed to run mount: {}", e))?;
+    if !output.status.success() {
+        return Err(format!("NFS mount failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    Ok(dir)
+}
+
+/// SMB/CIFS equivalent of ensure_nfs_mounted. Handles optional subpath
+/// so a single share can host multiple backup trees.
+fn ensure_smb_mounted(storage: &BackupStorage) -> Result<String, String> {
+    if storage.smb_source.is_empty() {
+        return Err("SMB source is not configured (expected `//server/share`)".into());
+    }
+    // Normalise Windows-style backslashes.
+    let source = storage.smb_source.replace('\\', "/");
+    let source = if source.starts_with("//") { source } else { format!("//{}", source.trim_start_matches('/')) };
+
+    let root = nas_mount_dir("smb", &source, "");
+    fs::create_dir_all(&root).map_err(|e| format!("Failed to create mount dir {}: {}", root, e))?;
+    if !is_mounted(&root) {
+        let mut opt_parts: Vec<String> = Vec::new();
+        if !storage.smb_username.is_empty() {
+            opt_parts.push(format!("username={}", storage.smb_username));
+            opt_parts.push(format!("password={}", storage.smb_password));
+            if !storage.smb_domain.is_empty() {
+                opt_parts.push(format!("domain={}", storage.smb_domain));
+            }
+        } else {
+            opt_parts.push("guest".into());
+        }
+        opt_parts.push("uid=0".into());
+        opt_parts.push("gid=0".into());
+        opt_parts.push("file_mode=0660".into());
+        opt_parts.push("dir_mode=0770".into());
+        opt_parts.push("vers=3.0".into());
+        if !storage.smb_options.is_empty() {
+            opt_parts.push(storage.smb_options.clone());
+        }
+        let options = opt_parts.join(",");
+        let output = std::process::Command::new("mount")
+            .args(["-t", "cifs", "-o", &options, &source, &root])
+            .output()
+            .map_err(|e| format!("Failed to run mount: {}", e))?;
+        if !output.status.success() {
+            return Err(format!("SMB mount failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
+        }
+    }
+    // Optional subpath inside the share — create if missing.
+    let dest = if storage.smb_subpath.is_empty() {
+        root
+    } else {
+        let sub = storage.smb_subpath.trim_matches('/');
+        let p = format!("{}/{}", root, sub);
+        fs::create_dir_all(&p).map_err(|e| format!("Failed to create subpath {}: {}", p, e))?;
+        p
+    };
+    Ok(dest)
+}
+
+fn is_mounted(path: &str) -> bool {
+    std::fs::read_to_string("/proc/mounts")
+        .map(|s| s.lines().any(|l| {
+            let parts: Vec<&str> = l.split_whitespace().collect();
+            parts.len() >= 2 && parts[1] == path
+        }))
+        .unwrap_or(false)
 }
 
 /// Store backup to local path
@@ -1198,6 +1345,24 @@ fn retrieve_backup(entry: &BackupEntry) -> Result<PathBuf, String> {
         },
         StorageType::Pbs => {
             retrieve_from_pbs(entry, &local_path)?;
+        },
+        StorageType::Nfs => {
+            let dir = ensure_nfs_mounted(&entry.storage)?;
+            let source = Path::new(&dir).join(&entry.filename);
+            if !source.exists() {
+                return Err(format!("Backup file not found: {}", source.display()));
+            }
+            fs::copy(&source, &local_path)
+                .map_err(|e| format!("Failed to copy backup: {}", e))?;
+        },
+        StorageType::Smb => {
+            let dir = ensure_smb_mounted(&entry.storage)?;
+            let source = Path::new(&dir).join(&entry.filename);
+            if !source.exists() {
+                return Err(format!("Backup file not found: {}", source.display()));
+            }
+            fs::copy(&source, &local_path)
+                .map_err(|e| format!("Failed to copy backup: {}", e))?;
         },
     }
 
@@ -1856,6 +2021,14 @@ fn storage_label(storage: &BackupStorage) -> String {
         StorageType::Remote => format!("remote: {}", storage.remote_url),
         StorageType::Wolfdisk => format!("WolfDisk: {}", storage.path),
         StorageType::Pbs => format!("PBS: {}", storage.pbs_server),
+        StorageType::Nfs => format!("NFS: {}", storage.nfs_source),
+        StorageType::Smb => {
+            if storage.smb_subpath.is_empty() {
+                format!("SMB: {}", storage.smb_source)
+            } else {
+                format!("SMB: {}/{}", storage.smb_source, storage.smb_subpath.trim_matches('/'))
+            }
+        }
     }
 }
 
@@ -1875,7 +2048,19 @@ pub fn delete_backup(id: &str) -> Result<String, String> {
                 let _ = fs::remove_file(&path);
             }
         },
-        _ => {} // S3 and Remote deletion not implemented yet
+        StorageType::Nfs => {
+            if let Ok(dir) = ensure_nfs_mounted(&entry.storage) {
+                let path = Path::new(&dir).join(&entry.filename);
+                if path.exists() { let _ = fs::remove_file(&path); }
+            }
+        },
+        StorageType::Smb => {
+            if let Ok(dir) = ensure_smb_mounted(&entry.storage) {
+                let path = Path::new(&dir).join(&entry.filename);
+                if path.exists() { let _ = fs::remove_file(&path); }
+            }
+        },
+        _ => {} // S3, Remote, PBS deletion not implemented yet
     }
 
     save_config(&config)?;
@@ -2316,6 +2501,16 @@ pub fn check_schedules() {
                         StorageType::Local | StorageType::Wolfdisk => {
                             let path = Path::new(&entry.storage.path).join(&entry.filename);
                             let _ = fs::remove_file(&path);
+                        },
+                        StorageType::Nfs => {
+                            if let Ok(dir) = ensure_nfs_mounted(&entry.storage) {
+                                let _ = fs::remove_file(Path::new(&dir).join(&entry.filename));
+                            }
+                        },
+                        StorageType::Smb => {
+                            if let Ok(dir) = ensure_smb_mounted(&entry.storage) {
+                                let _ = fs::remove_file(Path::new(&dir).join(&entry.filename));
+                            }
                         },
                         StorageType::Pbs => {
                             // PBS handles its own garbage collection / pruning

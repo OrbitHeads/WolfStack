@@ -6947,6 +6947,10 @@ pub struct CreateMountRequest {
     pub s3_config: Option<storage::S3Config>,
     #[serde(default)]
     pub nfs_options: Option<String>,
+    #[serde(default)]
+    pub smb_options: Option<String>,
+    #[serde(default)]
+    pub smb_config: Option<storage::SmbConfig>,
     #[serde(default = "default_do_mount")]
     pub do_mount: bool,
 }
@@ -6972,6 +6976,8 @@ pub async fn storage_create_mount(
         auto_mount: body.auto_mount,
         s3_config: body.s3_config.clone(),
         nfs_options: body.nfs_options.clone(),
+        smb_options: body.smb_options.clone(),
+        smb_config: body.smb_config.clone(),
         status: "unmounted".to_string(),
         error_message: None,
         created_at: String::new(),
@@ -11166,6 +11172,7 @@ pub async fn k8s_storage_overview(req: HttpRequest, state: web::Data<AppState>, 
         .map(|m| {
             let type_label = match m.mount_type {
                 crate::storage::MountType::Nfs => "NFS",
+                crate::storage::MountType::Smb => "SMB",
                 crate::storage::MountType::Sshfs => "SSHFS",
                 crate::storage::MountType::Directory => "Directory",
                 crate::storage::MountType::S3 => "S3",
