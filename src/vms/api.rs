@@ -252,7 +252,12 @@ async fn vm_action(req: HttpRequest, state: web::Data<AppState>, path: web::Path
     
     let result = match body.action.as_str() {
         "start" => manager.start_vm(&name),
-        "stop" => manager.stop_vm(&name),
+        // Graceful ACPI shutdown — tries to let the guest close cleanly.
+        // qm / virsh / SIGTERM variants depending on backend.
+        "stop" => manager.stop_vm(&name, false),
+        // Power-yank — equivalent to the old `stop` behaviour. For when
+        // the guest is wedged or the user needs an immediate halt.
+        "force-stop" => manager.stop_vm(&name, true),
         _ => Err(format!("Unknown action: {}", body.action)),
     };
     
@@ -406,7 +411,7 @@ async fn vm_migrate(
     // Stop VM temporarily for a consistent export, then restart
     {
         let manager = state.vms.lock().unwrap();
-        if let Err(e) = manager.stop_vm(&name) {
+        if let Err(e) = manager.stop_vm(&name, true) {
             tracing::warn!("Failed to stop VM '{}' before migration: {}", name, e);
         }
     }
@@ -538,7 +543,7 @@ async fn vm_migrate_external(
     // Stop VM temporarily for a consistent export, then restart
     {
         let manager = state.vms.lock().unwrap();
-        if let Err(e) = manager.stop_vm(&name) {
+        if let Err(e) = manager.stop_vm(&name, true) {
             tracing::warn!("Failed to stop VM '{}' before migration: {}", name, e);
         }
     }

@@ -3437,7 +3437,8 @@ function renderVms(vms) {
                 `${vm.vmid
                     ? `<button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="openPveVmConsole('${vm.vmid}', '${vm.name}')" title="Console">🖥️</button>`
                     : (vm.vnc_ws_port ? `<button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="openVmVnc('${vm.name}', ${vm.vnc_ws_port})" title="Console">🖥️</button>` : '')}
-                         <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#ef4444;" onclick="vmAction('${vm.name}', 'stop', this)" title="Stop">⏹️</button>` :
+                         <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#ef4444;" onclick="vmAction('${vm.name}', 'stop', this)" title="Stop (graceful ACPI shutdown)">⏹️</button>
+                         <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#b91c1c;" onclick="if (confirm('Force-stop ${vm.name}? The guest will not shut down cleanly — unsaved data may be lost.')) vmAction('${vm.name}', 'force-stop', this)" title="Force Stop (power off immediately)">⛔</button>` :
                 `<button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="showVmSettings('${vm.name}')" title="Settings">⚙️</button>
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#3b82f6;" onclick="migrateVm('${vm.name}')" title="Migrate">🚀</button>
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#22c55e;" onclick="vmAction('${vm.name}', 'start', this)" title="Start">▶️</button>
@@ -11830,7 +11831,8 @@ function renderVmCards(vms) {
         return `<div style="background:var(--bg-card);border:1px solid var(--border);border-left:4px solid ${borderColor};border-radius:10px;overflow:hidden;">
             <div style="display:flex;flex-wrap:wrap;padding:6px 8px;background:var(--bg-secondary);border-bottom:1px solid var(--border);gap:1px;">
                 <button class="btn btn-sm" style="${isRunning ? bd : bs}" ${isRunning ? 'disabled' : `onclick="vmAction('${vm.name}','start',this)"`} title="Start">▶️</button>
-                <button class="btn btn-sm" style="${!isRunning ? bd : bs}" ${!isRunning ? 'disabled' : `onclick="vmAction('${vm.name}','stop',this)"`} title="Stop">⏹️</button>
+                <button class="btn btn-sm" style="${!isRunning ? bd : bs}" ${!isRunning ? 'disabled' : `onclick="vmAction('${vm.name}','stop',this)"`} title="Stop (graceful ACPI shutdown)">⏹️</button>
+                <button class="btn btn-sm" style="${!isRunning ? bd : bs}color:#b91c1c;" ${!isRunning ? 'disabled' : `onclick="if (confirm('Force-stop ${vm.name}? The guest will not shut down cleanly — unsaved data may be lost.')) vmAction('${vm.name}','force-stop',this)"`} title="Force Stop (power off immediately)">⛔</button>
                 ${vncLink ? `<button class="btn btn-sm" style="${bs}" onclick="window.open('${vncLink}')" title="VNC">🖥️</button>` : ''}
                 <button class="btn btn-sm" style="${bs}" onclick="showVmSettings('${vm.name}')" title="Settings">⚙️</button>
                 <button class="btn btn-sm" style="${bs}" onclick="showVmLogs('${vm.name}')" title="Logs">📜</button>

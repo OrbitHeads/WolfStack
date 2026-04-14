@@ -1992,23 +1992,38 @@ impl VmManager {
             .args(["-t", "nat", "-D", "POSTROUTING", "-s", &format!("{}/32", wolfnet_ip), "-j", "MASQUERADE"]).output();
     }
 
-    pub fn stop_vm(&self, name: &str) -> Result<(), String> {
-        // On Proxmox, delegate to qm stop
+    /// Stop a VM. `force = false` asks the guest to shut down gracefully
+    /// (ACPI / SIGTERM); `force = true` yanks the power (like pulling the
+    /// plug). Graceful is the default for user-initiated stop actions;
+    /// internal callers that need a fast, definite stop pass true.
+    pub fn stop_vm(&self, name: &str, force: bool) -> Result<(), String> {
+        // On Proxmox: graceful = `qm shutdown` (ACPI, waits up to 30 s);
+        // force = `qm stop` (immediate)
         if containers::is_proxmox() {
             let vmid = self.qm_vmid_by_name(name)
                 .ok_or_else(|| format!("VM '{}' not found in Proxmox", name))?;
-            let output = Command::new("qm").args(["stop", &vmid.to_string()]).output()
-                .map_err(|e| format!("Failed to run qm stop: {}", e))?;
+            let (cmd_args, label): (Vec<String>, &str) = if force {
+                (vec!["stop".into(), vmid.to_string()], "qm stop")
+            } else {
+                (
+                    vec!["shutdown".into(), vmid.to_string(), "--timeout".into(), "30".into()],
+                    "qm shutdown",
+                )
+            };
+            let output = Command::new("qm").args(&cmd_args).output()
+                .map_err(|e| format!("Failed to run {}: {}", label, e))?;
             if output.status.success() {
                 return Ok(());
             }
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("qm stop failed: {}", stderr.trim()));
+            return Err(format!("{} failed: {}", label, stderr.trim()));
         }
-        // On libvirt, delegate to virsh destroy (immediate stop, like qm stop)
+        // On libvirt: graceful = `virsh shutdown` (ACPI, fire-and-forget);
+        // force = `virsh destroy` (immediate)
         if containers::is_libvirt() {
-            let output = Command::new("virsh").args(["destroy", name]).output()
-                .map_err(|e| format!("Failed to run virsh destroy: {}", e))?;
+            let (action, label) = if force { ("destroy", "virsh destroy") } else { ("shutdown", "virsh shutdown") };
+            let output = Command::new("virsh").args([action, name]).output()
+                .map_err(|e| format!("Failed to run {}: {}", label, e))?;
             if output.status.success() {
                 return Ok(());
             }
@@ -2017,13 +2032,15 @@ impl VmManager {
             if stderr.contains("not running") || stderr.contains("not found") {
                 return Ok(());
             }
-            return Err(format!("virsh stop failed: {}", stderr.trim()));
+            return Err(format!("{} failed: {}", label, stderr.trim()));
         }
 
         // Read config to get WolfNet IP for cleanup
         let config = self.get_vm(name);
 
+        let signal = if force { "-9" } else { "-15" };
         let output = Command::new("pkill")
+            .arg(signal)
             .arg("-f")
             .arg(format!("qemu-system-x86_64.*-name {}", name))
             .output()
@@ -2122,7 +2139,8 @@ impl VmManager {
         }
 
         if self.check_running(name) {
-            let _ = self.stop_vm(name);
+            // Deleting — force stop is correct here, no point waiting for ACPI
+            let _ = self.stop_vm(name, true);
         }
 
         // Load config to find extra disk files to clean up
