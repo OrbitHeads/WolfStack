@@ -13,7 +13,7 @@ const _syncedPrefKeys = [
     'wolfstack_dc_layout', 'wolfstack_dc_compact', 'wolfstack_dc_bg_image',
     'wolfstack_dc_bg_brightness', 'wolfstack_dc_bg_blur',
     'wolfstack_bookmarks', 'wolfstack_view_docker', 'wolfstack_view_lxc', 'wolfstack_view_vm',
-    'wolfstack_tasklog_closed',
+    'wolfstack_tasklog_closed', 'wolfstack_hidden_features',
 ];
 let _prefsLoaded = false;
 
@@ -3385,12 +3385,15 @@ function renderVms(vms) {
     if (!table || !empty) return;
 
     if (vms.length === 0) {
-        table.parentElement.style.display = 'none';
+        // Clear stale rows — applyContainerView re-shows the <table> for
+        // table-view, so leaving display:none on the parent isn't enough;
+        // an old <tr> from the previous render would reappear next to the
+        // empty message (e.g. after deleting the last VM).
+        table.innerHTML = '';
         empty.style.display = 'block';
         return;
     }
 
-    table.parentElement.style.display = '';
     empty.style.display = 'none';
 
     table.innerHTML = vms.map(vm => {
@@ -10082,7 +10085,14 @@ function tomlToggleRaw(component, displayName) {
 const POLL_FAST = isMobileView() ? 30000 : 15000;
 const POLL_SLOW = isMobileView() ? 120000 : 60000;
 let _currentPollSpeed = 'fast';
-loadUserPreferences(); // Load user preferences from server (async, non-blocking)
+// Apply any cached sidebar-hide prefs synchronously so users don't see the
+// hidden items flash in before the server returns.
+try {
+    const cachedHidden = JSON.parse(localStorage.getItem('wolfstack_hidden_features') || '[]');
+    if (Array.isArray(cachedHidden) && cachedHidden.length) applySidebarHidePrefs(cachedHidden);
+} catch (e) {}
+
+loadUserPreferences().then(loadHiddenFeatures); // sync prefs then apply sidebar hides
 fetchNodes();
 fetchMetricsHistory(); // Initial history load
 loadTaskLog(); // Restore task log from localStorage
@@ -23205,7 +23215,9 @@ function switchSettingsTab(tabName) {
     });
 
     // Lazy-load data when switching tabs
-    if (tabName === 'icons') {
+    if (tabName === 'sidebar') {
+        renderSidebarPrefs();
+    } else if (tabName === 'icons') {
         loadIconPacks();
     } else if (tabName === 'ai') {
         loadAiConfig();
@@ -23227,6 +23239,130 @@ function switchSettingsTab(tabName) {
     } else if (tabName === 'apikeys') {
         loadApiKeysTab();
     }
+}
+
+// ─── Sidebar Menu Customisation (per-user) ───
+//
+// Storage piggybacks on the existing per-user preferences system
+// (/api/user/preferences) — `wolfstack_hidden_features` is a JSON array of
+// feature keys. We hide matching nav items via a single dynamic <style> tag
+// rather than mutating each element, so prefs stay applied even after the
+// server tree re-renders.
+
+const SIDEBAR_FEATURES = [
+    { group: 'Datacenter Views', items: [
+        { key: 'appstore',         label: '🛍️ App Store' },
+        { key: 'issues',           label: '⚠️ Issues' },
+        { key: 'global-wolfnet',   label: '🌐 Global WolfNet View' },
+        { key: 'topology',         label: '🖥️ 3D Server Room' },
+        { key: 'wolfflow',         label: '⚡ WolfFlow' },
+        { key: 'cluster-browser',  label: '🌐 Cluster Browser' },
+    ]},
+    { group: 'Per-Server Features', items: [
+        { key: 'backups',       label: '💾 Backups' },
+        { key: 'ceph',          label: '🔵 Ceph' },
+        { key: 'certificates',  label: '🔒 Certificates' },
+        { key: 'compose',       label: '📋 Compose' },
+        { key: 'cron',          label: '🕐 Cron Jobs' },
+        { key: 'mysql-editor',  label: '🗄️ Database Manager' },
+        { key: 'containers',    label: '🐳 Docker' },
+        { key: 'files',         label: '📂 Files' },
+        { key: 'lxc',           label: '📦 LXC' },
+        { key: 'networking',    label: '🌐 Networking' },
+        { key: 'security',      label: '🛡️ Security' },
+        { key: 'services',      label: '⚡ Services' },
+        { key: 'storage',       label: '💾 Storage' },
+        { key: 'syslogs',       label: '📋 System Logs' },
+        { key: 'terminal',      label: '💻 Terminal' },
+        { key: 'vms',           label: '🖥️ Virtual Machines' },
+        { key: 'wolfkube',      label: '☸ WolfKube (Kubernetes)' },
+        { key: 'wolfnet',       label: '🔗 WolfNet' },
+        { key: 'wolfusb',       label: '🔌 WolfUSB' },
+        { key: 'wolfram',       label: '🧠 Wolfram' },
+    ]},
+];
+
+let currentHiddenFeatures = [];
+
+function applySidebarHidePrefs(hidden) {
+    currentHiddenFeatures = Array.isArray(hidden) ? hidden : [];
+    let styleTag = document.getElementById('sidebar-pref-style');
+    if (!styleTag) {
+        styleTag = document.createElement('style');
+        styleTag.id = 'sidebar-pref-style';
+        document.head.appendChild(styleTag);
+    }
+    if (currentHiddenFeatures.length === 0) {
+        styleTag.textContent = '';
+        return;
+    }
+    const selectors = [];
+    currentHiddenFeatures.forEach(key => {
+        const safe = String(key).replace(/"/g, '');
+        selectors.push(`.nav-item[data-page="${safe}"]`);
+        selectors.push(`.nav-item[data-view="${safe}"]`);
+    });
+    styleTag.textContent = selectors.join(',\n') + ' { display: none !important; }';
+}
+
+function readHiddenFeaturesLocal() {
+    try {
+        const raw = localStorage.getItem('wolfstack_hidden_features');
+        const arr = raw ? JSON.parse(raw) : [];
+        return Array.isArray(arr) ? arr : [];
+    } catch (e) { return []; }
+}
+
+function loadHiddenFeatures() {
+    // The synced-prefs system in loadUserPreferences() will pull this key
+    // from the server into localStorage on app boot — this just reads what
+    // it already populated and applies the CSS.
+    applySidebarHidePrefs(readHiddenFeaturesLocal());
+}
+
+function renderSidebarPrefs() {
+    const grid = document.getElementById('sidebar-prefs-grid');
+    if (!grid) return;
+    const hidden = new Set(currentHiddenFeatures);
+    grid.innerHTML = SIDEBAR_FEATURES.map(group => `
+        <div style="grid-column:1/-1;margin-top:8px;">
+            <div style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-muted);margin-bottom:6px;">${group.group}</div>
+        </div>
+        ${group.items.map(it => `
+            <label style="display:flex;align-items:center;gap:8px;padding:6px 10px;border:1px solid var(--border);border-radius:6px;cursor:pointer;background:var(--bg-card);">
+                <input type="checkbox" data-feature-key="${it.key}" ${hidden.has(it.key) ? '' : 'checked'}>
+                <span style="font-size:13px;">${it.label}</span>
+            </label>
+        `).join('')}
+    `).join('');
+}
+
+function persistHiddenFeatures(hidden) {
+    const json = JSON.stringify(hidden);
+    localStorage.setItem('wolfstack_hidden_features', json);
+    // PATCH the synced-prefs endpoint so other browsers/sessions for this
+    // user pick it up next time loadUserPreferences() runs.
+    fetch('/api/user/preferences', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ wolfstack_hidden_features: json }),
+    }).catch(() => {});
+}
+
+function saveSidebarPrefs() {
+    const checkboxes = document.querySelectorAll('#sidebar-prefs-grid input[type="checkbox"][data-feature-key]');
+    const hidden = [];
+    checkboxes.forEach(cb => { if (!cb.checked) hidden.push(cb.dataset.featureKey); });
+    persistHiddenFeatures(hidden);
+    applySidebarHidePrefs(hidden);
+    showToast('Sidebar preferences saved', 'success');
+}
+
+function resetSidebarPrefs() {
+    persistHiddenFeatures([]);
+    applySidebarHidePrefs([]);
+    renderSidebarPrefs();
+    showToast('All features visible', 'success');
 }
 
 // ─── Plugin System ───

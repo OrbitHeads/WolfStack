@@ -1672,6 +1672,40 @@ impl VmManager {
     /// guest OS has no IP. Runs the same per-distro install we use for
     /// the CIFS/NFS mount helpers, but here it's a silent background fix
     /// rather than an interactive prompt (the VM is already starting).
+    /// Make sure `ethtool` is on the host. Without it, the VLAN-passthrough
+    /// fix (`ethtool -K rxvlan/txvlan/rx-vlan-filter off`) can't run — the
+    /// Command::new("ethtool") calls return ENOENT and we silently swallow
+    /// the failure with `let _ = …`. Stripped-down installs (especially
+    /// minimal Debian, container-host distros, custom-built images) often
+    /// don't ship it. Symptom is the same as a real VLAN-stripping bug:
+    /// first DHCP works, later ones don't, and there's no error in the log.
+    fn ensure_ethtool_installed() {
+        if Path::new("/usr/sbin/ethtool").exists() || Path::new("/sbin/ethtool").exists()
+            || Path::new("/usr/bin/ethtool").exists() || Path::new("/bin/ethtool").exists()
+        {
+            return;
+        }
+        let (pkg_mgr, pkg_name) = match crate::installer::detect_distro() {
+            crate::installer::DistroFamily::Debian => ("apt-get", "ethtool"),
+            crate::installer::DistroFamily::RedHat => ("dnf", "ethtool"),
+            crate::installer::DistroFamily::Suse => ("zypper", "ethtool"),
+            crate::installer::DistroFamily::Arch => ("pacman", "ethtool"),
+            crate::installer::DistroFamily::Unknown => ("apt-get", "ethtool"),
+        };
+        info!("ethtool not found — installing {} via {} so VLAN passthrough fix can apply", pkg_name, pkg_mgr);
+        let args: Vec<&str> = match pkg_mgr {
+            "pacman" => vec!["-Sy", "--noconfirm", pkg_name],
+            "zypper" => vec!["--non-interactive", "install", pkg_name],
+            _ => vec!["install", "-y", pkg_name],
+        };
+        let result = Command::new(pkg_mgr).args(&args).output();
+        match result {
+            Ok(o) if o.status.success() => info!("Installed {} — VLAN passthrough offload-disable will now apply", pkg_name),
+            Ok(o) => warn!("Failed to install {}: {}", pkg_name, String::from_utf8_lossy(&o.stderr).trim()),
+            Err(e) => warn!("Failed to run {}: {}", pkg_mgr, e),
+        }
+    }
+
     fn ensure_dnsmasq_installed(&self) {
         if Path::new("/usr/sbin/dnsmasq").exists() || Path::new("/sbin/dnsmasq").exists() {
             return;
@@ -2100,6 +2134,10 @@ impl VmManager {
     /// admin's deliberate offload settings.
     pub fn reapply_passthrough_offloads(&self) {
         use std::collections::HashSet;
+        // Make sure the binary actually exists before we silently shell out
+        // to it 30s/forever. ensure_ethtool_installed() returns immediately
+        // if it's already present, so this is cheap on the steady-state path.
+        Self::ensure_ethtool_installed();
         let mut ifaces: HashSet<String> = HashSet::new();
 
         // Source 1: VM config JSON files in base_dir
@@ -2155,7 +2193,25 @@ impl VmManager {
                 continue;
             }
             for flag in ["rxvlan", "txvlan", "rx-vlan-filter"] {
-                let _ = Command::new("ethtool").args(["-K", iface, flag, "off"]).output();
+                match Command::new("ethtool").args(["-K", iface, flag, "off"]).output() {
+                    Ok(o) if o.status.success() => {}
+                    Ok(o) => {
+                        // Surface real failures (driver doesn't support flag,
+                        // permission denied, NIC went away). Driver-doesn't-
+                        // support is benign — it just means the offload was
+                        // never on in the first place; logging at debug avoids
+                        // spamming every 30s.
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        tracing::debug!("ethtool -K {} {} off failed: {}", iface, flag, stderr.trim());
+                    }
+                    Err(e) => {
+                        // ENOENT — ethtool isn't installed. ensure_ethtool_installed()
+                        // tried at the top of this function; if we got here it
+                        // means install failed. Log loudly so the user sees it.
+                        warn!("ethtool not runnable ({}) — VLAN passthrough fix cannot apply on {}. Install ethtool manually.", e, iface);
+                        return;
+                    }
+                }
             }
         }
     }

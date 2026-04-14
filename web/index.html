@@ -3898,6 +3898,7 @@
                     <div class="settings-tabs">
                         <button class="settings-tab-btn active" onclick="switchSettingsTab('appearance')">🎨
                             Appearance</button>
+                        <button class="settings-tab-btn" onclick="switchSettingsTab('sidebar')">🧭 Sidebar</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('icons')">🖼️ Icons</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('alerting')">🔔 Alerting</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('ai')">🤖 AI Agent</button>
@@ -4194,6 +4195,23 @@
                             </div>
                         </div>
 
+                    </div>
+
+                    <!-- ─── Sidebar Tab — per-user menu customisation ─── -->
+                    <div id="settings-tab-sidebar" class="settings-tab-panel">
+                        <h4 style="margin:0 0 4px 0; font-size:16px; font-weight:600;">Sidebar Menu Customisation</h4>
+                        <p style="font-size:13px; color:var(--text-muted); margin:0 0 20px 0;">
+                            Hide features you don't use to declutter the sidebar. This only affects what <em>you</em> see &mdash;
+                            other users keep their own preferences, and nothing is uninstalled. Hidden features are still reachable
+                            by direct URL.
+                        </p>
+                        <div id="sidebar-prefs-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:8px 16px;">
+                            <!-- Populated by renderSidebarPrefs() -->
+                        </div>
+                        <div style="margin-top:20px;display:flex;gap:8px;">
+                            <button class="btn btn-primary" onclick="saveSidebarPrefs()">Save</button>
+                            <button class="btn btn-secondary" onclick="resetSidebarPrefs()">Show All</button>
+                        </div>
                     </div>
 
                     <!-- ─── Icons Tab ─── -->
