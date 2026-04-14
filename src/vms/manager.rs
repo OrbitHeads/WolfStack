@@ -1871,18 +1871,18 @@ impl VmManager {
                 // Verify the master is actually a bridge (not a bond, etc.)
                 let bridge_check = format!("/sys/class/net/{}/bridge", bridge_name);
                 if Path::new(&bridge_check).exists() {
-                    // Idempotent re-apply of the VLAN pass-through fix so
-                    // existing passthrough bridges — created by an older
-                    // WolfStack that didn't know to disable hw offloads —
-                    // inherit the fix without needing to be torn down.
+                    // Re-apply the NIC-level fix on existing bridges so a
+                    // setup created by an older WolfStack (or by the user)
+                    // inherits it without needing teardown. We do NOT touch
+                    // the bridge's vlan_filtering on reuse — if the admin
+                    // deliberately configured 802.1Q filtering with proper
+                    // per-port VID maps, clobbering it would break their
+                    // isolation. Only newly-created bridges get the
+                    // explicit vlan_filtering=0 write.
                     for flag in ["rxvlan", "txvlan", "rx-vlan-filter"] {
                         let _ = Command::new("ethtool").args(["-K", iface, flag, "off"]).output();
                     }
-                    let _ = std::fs::write(
-                        format!("/sys/class/net/{}/bridge/vlan_filtering", bridge_name),
-                        "0",
-                    );
-                    info!("Passthrough: {} already in bridge {} (re-applied VLAN pass-through settings)", iface, bridge_name);
+                    info!("Passthrough: {} already in bridge {} (hw VLAN offload disabled on NIC)", iface, bridge_name);
                     return Ok(bridge_name.to_string());
                 }
                 warn!("Passthrough: {} has master '{}' but it is not a bridge — creating new bridge", iface, bridge_name);
