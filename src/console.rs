@@ -39,6 +39,7 @@ pub async fn console_ws(
             }
         }
     } else if container_type != "install" && container_type != "appstore-install" && container_type != "k8s-provision"
+        && container_type != "pkg-install"
         && !crate::auth::is_safe_name(&container_name)
     {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({
@@ -349,9 +350,14 @@ async fn console_session(
                 }
             }
         }
-        "appstore-install" | "k8s-provision" => {
-            // Script-based install — name is the session ID from prepare-install/prepare-provision API
-            let prefix = if ctype == "k8s-provision" { "wolfstack-k8s-provision" } else { "wolfstack-appinstall" };
+        "appstore-install" | "k8s-provision" | "pkg-install" => {
+            // Script-based install — name is the session ID from
+            // prepare-install / prepare-provision / prepare-install-package
+            let prefix = match ctype.as_str() {
+                "k8s-provision" => "wolfstack-k8s-provision",
+                "pkg-install" => "wolfstack-pkginstall",
+                _ => "wolfstack-appinstall",
+            };
             let script_path = format!("/tmp/{}-{}.sh", prefix, name);
             if !std::path::Path::new(&script_path).exists() {
                 let _ = session.text(format!(
@@ -440,7 +446,7 @@ async fn console_session(
     // PTY file descriptors, which prevents the PTY reader from getting EOF even
     // after the main script finishes. By watching the child directly, we can close
     // the session promptly when the script completes.
-    let is_script_session = ctype == "install" || ctype == "appstore-install" || ctype == "k8s-provision";
+    let is_script_session = ctype == "install" || ctype == "appstore-install" || ctype == "k8s-provision" || ctype == "pkg-install";
     let (child_exit_tx, mut child_exit_rx) = tokio::sync::oneshot::channel::<()>();
     let mut child_opt = Some(child);
     let child_exit_handle = if is_script_session {
@@ -545,6 +551,7 @@ pub async fn remote_console_ws(
 
     // Validate name to prevent command injection
     if ctype != "install" && ctype != "appstore-install" && ctype != "k8s-provision" && ctype != "pve-vnc"
+        && ctype != "pkg-install"
         && !crate::auth::is_safe_name(&name)
     {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({

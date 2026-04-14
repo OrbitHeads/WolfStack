@@ -968,6 +968,23 @@ fn nas_mount_dir(kind: &str, source: &str, subpath: &str) -> String {
     p
 }
 
+/// Check whether the helper package that provides a userspace mount tool
+/// (`mount.nfs`, `mount.cifs`) is installed. When missing, emit the
+/// standard MISSING_PACKAGE marker (see storage::MISSING_PACKAGE_MARKER)
+/// so the API + UI can prompt the user and run the install in a live
+/// terminal instead of doing it silently from a mount request.
+fn ensure_mount_helper(binary: &str, debian_pkg: &str, redhat_pkg: &str) -> Result<(), String> {
+    if std::path::Path::new(&format!("/sbin/{}", binary)).exists()
+        || std::path::Path::new(&format!("/usr/sbin/{}", binary)).exists()
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "{}{}|{}|{}",
+        crate::storage::MISSING_PACKAGE_MARKER, binary, debian_pkg, redhat_pkg
+    ))
+}
+
 /// Mount (idempotently) an NFS export for backups and return the local
 /// path that store_local should write into. Reuses the existing export
 /// if already mounted.
@@ -975,6 +992,7 @@ fn ensure_nfs_mounted(storage: &BackupStorage) -> Result<String, String> {
     if storage.nfs_source.is_empty() {
         return Err("NFS source is not configured (expected `server:/export`)".into());
     }
+    ensure_mount_helper("mount.nfs", "nfs-common", "nfs-utils")?;
     let dir = nas_mount_dir("nfs", &storage.nfs_source, "");
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create mount dir {}: {}", dir, e))?;
     if is_mounted(&dir) {
@@ -997,6 +1015,7 @@ fn ensure_smb_mounted(storage: &BackupStorage) -> Result<String, String> {
     if storage.smb_source.is_empty() {
         return Err("SMB source is not configured (expected `//server/share`)".into());
     }
+    ensure_mount_helper("mount.cifs", "cifs-utils", "cifs-utils")?;
     // Normalise Windows-style backslashes.
     let source = storage.smb_source.replace('\\', "/");
     let source = if source.starts_with("//") { source } else { format!("//{}", source.trim_start_matches('/')) };

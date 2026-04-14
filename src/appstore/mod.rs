@@ -504,6 +504,51 @@ fn install_bare_metal(
     Ok(format!("{} installed on host", app.name))
 }
 
+/// Given an ISO URL that 404s (e.g. an invalidated `_latest.iso` alias),
+/// scrape the parent directory's HTML index and pick the newest file
+/// matching the same base name. Works for Proxmox's enterprise ISO
+/// directory and any Apache-style auto-index of a flat folder. Returns
+/// None if the parent directory can't be fetched or no ISOs match.
+fn resolve_latest_iso(original_url: &str) -> Option<String> {
+    // Split `https://host/dir/file.iso` into (`https://host/dir/`, `file`)
+    let last_slash = original_url.rfind('/')?;
+    let base = &original_url[..=last_slash];
+    let file = &original_url[last_slash + 1..];
+    // Strip a trailing `_latest.iso` or `_<version>.iso` to get the stem.
+    let stem = file
+        .strip_suffix(".iso")?
+        .rsplit_once('_')
+        .map(|(s, _)| s)
+        .unwrap_or(file);
+
+    let output = std::process::Command::new("wget")
+        .args(["-q", "-O", "-", base])
+        .output()
+        .ok()?;
+    if !output.status.success() { return None; }
+    let html = String::from_utf8_lossy(&output.stdout);
+
+    // Find every `href="<stem>_<ver>.iso"` in the listing.
+    let needle = format!("{}_", stem);
+    let mut candidates: Vec<&str> = Vec::new();
+    for part in html.split("href=\"").skip(1) {
+        if let Some(end) = part.find('"') {
+            let href = &part[..end];
+            if href.starts_with(&needle) && href.ends_with(".iso") {
+                candidates.push(href);
+            }
+        }
+    }
+    if candidates.is_empty() { return None; }
+    // `sort -V` equivalent — the filenames are of the form `stem_M.N-R.iso`
+    // which sorts correctly lexicographically when the numeric parts are
+    // zero-padded; in practice Proxmox uses simple single-digit majors, so
+    // a lexical sort picks the right version. Good enough for now.
+    candidates.sort();
+    let latest = candidates.last()?;
+    Some(format!("{}{}", base, latest))
+}
+
 /// Install an ISO-based VM app. The only user choice is the storage location
 /// (defaults to /var/lib/wolfstack/vms). Everything else — memory, cores, disk
 /// size, WolfNet IP allocation, TAP setup, VNC — comes from the manifest +
@@ -522,17 +567,39 @@ fn install_vm(
         .map_err(|e| format!("Failed to create ISO dir: {}", e))?;
     let iso_path = format!("{}/{}.iso", iso_dir, app.id);
     if !std::path::Path::new(&iso_path).exists() {
-        let output = std::process::Command::new("wget")
-            .args(["-q", "-O", &iso_path, &vm.iso_url])
+        // Proxmox doesn't ship a stable `_latest.iso` alias — the file name
+        // carries the version (e.g. `proxmox-backup-server_4.1-1.iso`). If the
+        // manifest URL can't be fetched, scrape the directory index for the
+        // newest matching ISO and retry. Same idea as apt-get's "fetch the
+        // index, pick the newest version, download".
+        let mut effective_url = vm.iso_url.clone();
+        let first = std::process::Command::new("wget")
+            .args(["-q", "-O", &iso_path, &effective_url])
             .output()
             .map_err(|e| format!("Failed to run wget: {}", e))?;
-        if !output.status.success() {
+        if !first.status.success() {
             let _ = std::fs::remove_file(&iso_path);
-            return Err(format!(
-                "Failed to download ISO from {}: {}",
-                vm.iso_url,
-                String::from_utf8_lossy(&output.stderr)
-            ));
+            if let Some(resolved) = resolve_latest_iso(&vm.iso_url) {
+                effective_url = resolved;
+                let retry = std::process::Command::new("wget")
+                    .args(["-q", "-O", &iso_path, &effective_url])
+                    .output()
+                    .map_err(|e| format!("Failed to run wget: {}", e))?;
+                if !retry.status.success() {
+                    let _ = std::fs::remove_file(&iso_path);
+                    return Err(format!(
+                        "Failed to download ISO from {} (also tried {}): {}",
+                        vm.iso_url, effective_url,
+                        String::from_utf8_lossy(&retry.stderr).trim()
+                    ));
+                }
+            } else {
+                return Err(format!(
+                    "Failed to download ISO from {} (couldn't resolve latest version either): {}",
+                    vm.iso_url,
+                    String::from_utf8_lossy(&first.stderr).trim()
+                ));
+            }
         }
     }
 
@@ -1068,7 +1135,10 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
             lxc: None,
             bare_metal: None,
             vm: Some(VmTarget {
-                iso_url: "https://enterprise.proxmox.com/iso/proxmox-backup-server_latest.iso".into(),
+                // Known-good pin; install_vm auto-resolves a newer version
+                // by scraping the directory index if this 404s (Proxmox ships
+                // no stable `_latest.iso` alias — file name carries the ver).
+                iso_url: "https://enterprise.proxmox.com/iso/proxmox-backup-server_4.1-1.iso".into(),
                 memory_mb: 4096,
                 cores: 2,
                 // Small OS disk (PBS installs in ~4 GB — 16 gives plenty of headroom)

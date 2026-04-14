@@ -10670,6 +10670,69 @@ pub async fn appstore_install(
     }
 }
 
+/// POST /api/system/prepare-install-package — write a shell script that
+/// installs a single OS package (currently just the mount-helper packages
+/// nfs-common / cifs-utils) and return a session_id the UI opens as a
+/// live-terminal console so the user can watch the install run.
+#[derive(Deserialize)]
+pub struct PreparePkgInstallRequest {
+    /// One of the `mount.*` binaries the user needs — e.g. "mount.cifs".
+    pub binary: String,
+}
+
+pub async fn prepare_install_package(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<PreparePkgInstallRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    let (pkg_mgr, pkg_name) = match crate::storage::package_for_helper(&body.binary) {
+        Some(v) => v,
+        None => return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": format!("No known package provides '{}'", body.binary)
+        })),
+    };
+
+    let session_id = format!("pkg-{}-{}",
+        pkg_name,
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_secs()
+    );
+    let script_path = format!("/tmp/wolfstack-pkginstall-{}.sh", session_id);
+
+    // Escaped script; `-y` so apt/dnf/zypper don't block on confirmation,
+    // and `--noconfirm` for pacman. set -e so the first failure stops the
+    // run instead of muddying the terminal with cascaded errors.
+    let install_cmd = match pkg_mgr {
+        "apt-get" => format!("apt-get update && apt-get install -y {}", pkg_name),
+        "dnf" => format!("dnf install -y {}", pkg_name),
+        "zypper" => format!("zypper --non-interactive install {}", pkg_name),
+        "pacman" => format!("pacman -Sy --noconfirm {}", pkg_name),
+        other => format!("{} install -y {}", other, pkg_name),
+    };
+    let script = format!(
+        "#!/bin/bash\nset -e\n\
+         printf '\\033[1;36m━━━ Installing %s (provides %s) ━━━\\033[0m\\n\\n' '{pkg}' '{bin}'\n\
+         {cmd}\n\
+         printf '\\n\\033[1;32m✓ %s installed\\033[0m\\n' '{pkg}'\n",
+        pkg = pkg_name, bin = body.binary, cmd = install_cmd
+    );
+
+    if let Err(e) = std::fs::write(&script_path, script) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("Failed to write install script: {}", e)
+        }));
+    }
+    let _ = std::process::Command::new("chmod").args(["+x", &script_path]).output();
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "session_id": session_id,
+        "package": pkg_name,
+        "command": install_cmd,
+    }))
+}
+
 /// POST /api/appstore/apps/{id}/prepare-install — generate install script for live terminal
 pub async fn appstore_prepare_install(
     req: HttpRequest,
@@ -16731,6 +16794,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/appstore/apps/{id}", web::get().to(appstore_get))
         .route("/api/appstore/apps/{id}/install", web::post().to(appstore_install))
         .route("/api/appstore/apps/{id}/prepare-install", web::post().to(appstore_prepare_install))
+        .route("/api/system/prepare-install-package", web::post().to(prepare_install_package))
         .route("/api/appstore/installed", web::get().to(appstore_installed))
         .route("/api/appstore/installed/{id}", web::delete().to(appstore_uninstall))
         // System

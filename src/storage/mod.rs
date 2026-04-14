@@ -697,27 +697,49 @@ fn mount_s3_via_rust_s3(mount: &StorageMount, s3: &S3Config) -> Result<String, S
     }
 }
 
-fn mount_nfs(mount: &StorageMount) -> Result<String, String> {
-    // Ensure nfs-common is installed
-    if !Path::new("/sbin/mount.nfs").exists() && !Path::new("/usr/sbin/mount.nfs").exists() {
+/// Sentinel prefix for mount-helper-missing errors. The storage/backup API
+/// endpoints parse this out so the UI can offer a "install now" prompt
+/// rather than just printing a cryptic mount(8) failure to the user.
+/// Format: `MISSING_PACKAGE|<binary>|<debian_pkg>|<redhat_pkg>`
+pub const MISSING_PACKAGE_MARKER: &str = "MISSING_PACKAGE|";
 
-        let distro = crate::installer::detect_distro();
-        let (pkg_mgr, pkg_name) = match distro {
-            crate::installer::DistroFamily::Debian => ("apt-get", "nfs-common"),
-            crate::installer::DistroFamily::RedHat => ("dnf", "nfs-utils"),
-            crate::installer::DistroFamily::Suse => ("zypper", "nfs-client"),
-            crate::installer::DistroFamily::Arch => ("pacman", "nfs-utils"),
-            crate::installer::DistroFamily::Unknown => ("apt-get", "nfs-common"),
-        };
-        let install = Command::new(pkg_mgr)
-            .args(["install", "-y", pkg_name])
-            .output()
-            .map_err(|e| format!("Failed to install {}: {}", pkg_name, e))?;
-        if !install.status.success() {
-            return Err(format!("Failed to install {}: {}",
-                pkg_name, String::from_utf8_lossy(&install.stderr)));
-        }
+/// Return the distro-specific package manager / package name for a given
+/// mount helper binary. Used by the API to build the install command for
+/// the live-terminal install flow.
+pub fn package_for_helper(binary: &str) -> Option<(&'static str, &'static str)> {
+    let distro = crate::installer::detect_distro();
+    let (pkg_mgr, debian_pkg, redhat_pkg) = match binary {
+        "mount.nfs" => ("ignored", "nfs-common", "nfs-utils"),
+        "mount.cifs" => ("ignored", "cifs-utils", "cifs-utils"),
+        _ => return None,
+    };
+    let _ = pkg_mgr;
+    Some(match distro {
+        crate::installer::DistroFamily::Debian => ("apt-get", debian_pkg),
+        crate::installer::DistroFamily::RedHat => ("dnf", redhat_pkg),
+        crate::installer::DistroFamily::Suse => ("zypper", redhat_pkg),
+        crate::installer::DistroFamily::Arch => ("pacman", redhat_pkg),
+        crate::installer::DistroFamily::Unknown => ("apt-get", debian_pkg),
+    })
+}
+
+fn check_mount_helper(binary: &str, debian_pkg: &str, redhat_pkg: &str) -> Result<(), String> {
+    if Path::new(&format!("/sbin/{}", binary)).exists()
+        || Path::new(&format!("/usr/sbin/{}", binary)).exists()
+    {
+        return Ok(());
     }
+    Err(format!(
+        "{}{}|{}|{}",
+        MISSING_PACKAGE_MARKER, binary, debian_pkg, redhat_pkg
+    ))
+}
+
+fn mount_nfs(mount: &StorageMount) -> Result<String, String> {
+    // Prerequisite: mount.nfs must exist. If not, hand control back to the
+    // frontend so it can put up a confirm dialog and run the install in a
+    // live terminal — we deliberately do NOT silently apt-get here.
+    check_mount_helper("mount.nfs", "nfs-common", "nfs-utils")?;
     
     let options = mount.nfs_options.as_deref().unwrap_or("rw,soft,timeo=50");
     
@@ -734,26 +756,10 @@ fn mount_nfs(mount: &StorageMount) -> Result<String, String> {
 }
 
 fn mount_smb(mount: &StorageMount) -> Result<String, String> {
-    // Ensure mount.cifs is present. cifs-utils lives in different packages
-    // per distro — same layout as mount_nfs above.
-    if !Path::new("/sbin/mount.cifs").exists() && !Path::new("/usr/sbin/mount.cifs").exists() {
-        let distro = crate::installer::detect_distro();
-        let (pkg_mgr, pkg_name) = match distro {
-            crate::installer::DistroFamily::Debian => ("apt-get", "cifs-utils"),
-            crate::installer::DistroFamily::RedHat => ("dnf", "cifs-utils"),
-            crate::installer::DistroFamily::Suse => ("zypper", "cifs-utils"),
-            crate::installer::DistroFamily::Arch => ("pacman", "cifs-utils"),
-            crate::installer::DistroFamily::Unknown => ("apt-get", "cifs-utils"),
-        };
-        let install = Command::new(pkg_mgr)
-            .args(["install", "-y", pkg_name])
-            .output()
-            .map_err(|e| format!("Failed to install {}: {}", pkg_name, e))?;
-        if !install.status.success() {
-            return Err(format!("Failed to install {}: {}",
-                pkg_name, String::from_utf8_lossy(&install.stderr)));
-        }
-    }
+    // Prerequisite: mount.cifs. Same policy as mount_nfs — surface a
+    // machine-readable "missing package" error the frontend can turn into
+    // a confirm-and-run-in-terminal prompt.
+    check_mount_helper("mount.cifs", "cifs-utils", "cifs-utils")?;
 
     // Normalise the source — users are likely to type the Windows-style
     // `\\server\share` from Synology/QNAP admin UIs. CIFS wants `//server/share`.

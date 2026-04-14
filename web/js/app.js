@@ -4351,6 +4351,18 @@ async function mountStorage(id) {
         document.getElementById('mount-progress-detail').textContent = data.message || '';
         taskLog('Mounted storage: ' + name);
     } catch (e) {
+        // Missing helper tool (cifs-utils / nfs-common) — offer to install it
+        // in a live terminal instead of printing a cryptic mount(8) error.
+        const parsed = parseMissingPackageError(e.message);
+        if (parsed) {
+            document.getElementById('mount-progress-modal').classList.remove('active');
+            const installed = await offerPackageInstall(parsed);
+            if (installed) {
+                // Re-try the mount after install finishes
+                return mountStorage(id, name);
+            }
+            return;
+        }
         // Error
         document.getElementById('mount-progress-spinner').textContent = '❌';
         document.getElementById('mount-progress-status').textContent = 'Mount Failed';
@@ -4360,6 +4372,71 @@ async function mountStorage(id) {
     }
     // Show OK button
     document.getElementById('mount-progress-footer').style.display = '';
+}
+
+/// Parse "MISSING_PACKAGE|<bin>|<debian_pkg>|<redhat_pkg>" out of an error.
+function parseMissingPackageError(msg) {
+    if (!msg) return null;
+    const m = msg.match(/MISSING_PACKAGE\|([^|]+)\|([^|]+)\|([^|\s]+)/);
+    if (!m) return null;
+    return { binary: m[1], debianPkg: m[2], redhatPkg: m[3] };
+}
+
+/// Show a confirm modal offering to install a missing package in a live
+/// terminal. Returns a promise that resolves `true` after the user watched
+/// the install terminal (so the caller can re-try whatever needed it), or
+/// `false` if they cancelled.
+function offerPackageInstall({ binary, debianPkg }) {
+    return new Promise((resolve) => {
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay active';
+        overlay.style.zIndex = '10000';
+        overlay.innerHTML = `
+            <div class="modal" style="max-width:460px;">
+                <div class="modal-header">
+                    <h3>Install ${escapeHtml(debianPkg)}?</h3>
+                </div>
+                <div class="modal-body" style="font-size:13px;line-height:1.5;">
+                    <p style="margin-top:0;">WolfStack needs <code style="background:var(--bg-secondary);padding:2px 6px;border-radius:3px;">${escapeHtml(binary)}</code> to complete this action, which is provided by the <strong>${escapeHtml(debianPkg)}</strong> package. It isn't installed yet.</p>
+                    <p>Click <strong>Install</strong> to run the install in a terminal window so you can see what's happening. Nothing will be installed without your confirmation.</p>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn" id="pkg-install-cancel">Cancel</button>
+                    <button class="btn btn-primary" id="pkg-install-ok">Install in terminal</button>
+                </div>
+            </div>`;
+        document.body.appendChild(overlay);
+
+        const cleanup = (ok) => { overlay.remove(); resolve(ok); };
+        overlay.querySelector('#pkg-install-cancel').onclick = () => cleanup(false);
+        overlay.querySelector('#pkg-install-ok').onclick = async () => {
+            overlay.remove();
+            try {
+                const resp = await fetch('/api/system/prepare-install-package', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ binary }),
+                });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    showToast(data.error || 'Failed to prepare install', 'error');
+                    resolve(false);
+                    return;
+                }
+                const url = `/console.html?type=pkg-install&name=${encodeURIComponent(data.session_id)}`;
+                const w = window.open(url, 'pkg_install_' + data.session_id, 'width=820,height=420,menubar=no,toolbar=no,scrollbars=yes,resizable=yes');
+                // Wait for the console window to close — that's our signal
+                // the install finished (success OR failure; the retry will
+                // tell the user which).
+                const poll = setInterval(() => {
+                    if (!w || w.closed) { clearInterval(poll); resolve(true); }
+                }, 500);
+            } catch (e) {
+                showToast('Install prepare failed: ' + e.message, 'error');
+                resolve(false);
+            }
+        };
+    });
 }
 
 function closeMountProgress() {
