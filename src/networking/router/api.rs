@@ -1191,6 +1191,173 @@ fn which(cmd: &str) -> bool {
         .map(|s| s.success()).unwrap_or(false)
 }
 
+// ─── WAN connections (DHCP / Static / PPPoE) ───
+
+pub async fn list_wan(req: HttpRequest, state: S) -> HttpResponse {
+    auth_or_return!(req, state);
+    let cfg = state.router.config.read().unwrap();
+    // Mask passwords on the way out — never roundtrip plaintext to UI.
+    let masked: Vec<wan::WanConnection> = cfg.wan_connections.iter().map(|c| {
+        let mut clone = c.clone();
+        if let wan::WanMode::Pppoe(ref mut p) = clone.mode {
+            if !p.password.is_empty() { p.password = "***".into(); }
+        }
+        clone
+    }).collect();
+    HttpResponse::Ok().json(masked)
+}
+
+pub async fn create_wan(req: HttpRequest, state: S, body: web::Json<wan::WanConnection>) -> HttpResponse {
+    auth_or_return!(req, state);
+    let mut conn = body.into_inner();
+    if conn.id.is_empty() { conn.id = gen_id("wan"); }
+    if let Err(e) = wan::validate(&conn) {
+        return HttpResponse::BadRequest().body(e);
+    }
+    {
+        let mut cfg = state.router.config.write().unwrap();
+        cfg.wan_connections.retain(|c| c.id != conn.id);
+        cfg.wan_connections.push(conn.clone());
+        if let Err(e) = cfg.save() {
+            return HttpResponse::InternalServerError().body(e);
+        }
+    }
+    if conn.node_id == crate::agent::self_node_id() || conn.node_id.is_empty() {
+        // PPPoE prerequisite: ppp + pppoe packages.
+        if matches!(conn.mode, wan::WanMode::Pppoe(_)) {
+            ensure_pppoe_installed_async();
+        }
+        if let Err(e) = wan::apply(&conn) {
+            tracing::warn!("WAN apply failed for {}: {}", conn.name, e);
+        }
+    }
+    replicate_config_to_cluster(state);
+    HttpResponse::Ok().json(&conn)
+}
+
+pub async fn update_wan(
+    req: HttpRequest, state: S,
+    path: web::Path<String>, body: web::Json<wan::WanConnection>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let id = path.into_inner();
+    let mut updated = body.into_inner();
+    if updated.id != id {
+        return HttpResponse::BadRequest().body("id mismatch");
+    }
+    if let Err(e) = wan::validate(&updated) {
+        return HttpResponse::BadRequest().body(e);
+    }
+    // Preserve the existing password if the UI sent the masked "***"
+    // sentinel (PUT bodies don't carry plaintext passwords back).
+    {
+        let mut cfg = state.router.config.write().unwrap();
+        if let wan::WanMode::Pppoe(ref mut new_p) = updated.mode {
+            if new_p.password == "***" {
+                if let Some(existing) = cfg.wan_connections.iter().find(|c| c.id == id) {
+                    if let wan::WanMode::Pppoe(ref old_p) = existing.mode {
+                        new_p.password = old_p.password.clone();
+                    }
+                }
+            }
+        }
+        let idx = match cfg.wan_connections.iter().position(|c| c.id == id) {
+            Some(i) => i,
+            None => return HttpResponse::NotFound().body("not found"),
+        };
+        cfg.wan_connections[idx] = updated.clone();
+        if let Err(e) = cfg.save() {
+            return HttpResponse::InternalServerError().body(e);
+        }
+    }
+    if updated.node_id == crate::agent::self_node_id() || updated.node_id.is_empty() {
+        let _ = wan::apply(&updated);
+    }
+    replicate_config_to_cluster(state);
+    HttpResponse::Ok().json(&updated)
+}
+
+pub async fn delete_wan(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
+    auth_or_return!(req, state);
+    let id = path.into_inner();
+    let removed = {
+        let mut cfg = state.router.config.write().unwrap();
+        let r = cfg.wan_connections.iter().position(|c| c.id == id)
+            .map(|i| cfg.wan_connections.remove(i));
+        if let Err(e) = cfg.save() {
+            return HttpResponse::InternalServerError().body(e);
+        }
+        r
+    };
+    if let Some(c) = removed {
+        if matches!(c.mode, wan::WanMode::Pppoe(_)) {
+            let _ = wan::pppoe_purge(&c);
+        }
+    }
+    replicate_config_to_cluster(state);
+    HttpResponse::Ok().body("deleted")
+}
+
+pub async fn wan_status(req: HttpRequest, state: S) -> HttpResponse {
+    auth_or_return!(req, state);
+    let cfg = state.router.config.read().unwrap();
+    let self_id = crate::agent::self_node_id();
+    let entries: Vec<serde_json::Value> = cfg.wan_connections.iter()
+        .filter(|c| c.node_id == self_id || c.node_id.is_empty())
+        .map(|c| {
+            let (iface, ip) = match &c.mode {
+                wan::WanMode::Pppoe(_) => wan::pppoe_status(c)
+                    .map(|(i, p)| (Some(i), Some(p)))
+                    .unwrap_or((None, None)),
+                _ => (None, None),
+            };
+            serde_json::json!({
+                "id": c.id, "name": c.name, "interface": c.interface,
+                "enabled": c.enabled,
+                "live_iface": iface, "live_ip": ip,
+            })
+        }).collect();
+    HttpResponse::Ok().json(entries)
+}
+
+/// Spawn a background task that ensures `ppp` and `pppoe` are
+/// installed. Used right after a PPPoE connection is created so the
+/// first apply has the binaries it needs.
+fn ensure_pppoe_installed_async() {
+    tokio::spawn(async {
+        for tool in ["pppd", "pppoe"] {
+            let installed = std::process::Command::new("which").arg(tool)
+                .status().map(|s| s.success()).unwrap_or(false);
+            if installed { continue; }
+            // pkg name = same as binary on Debian/Ubuntu (ppp + pppoe);
+            // RHEL family uses `ppp` and `rp-pppoe`. Try the common
+            // package names — we don't require strict success here.
+            let pkg_candidates: &[&str] = match tool {
+                "pppd"  => &["ppp"],
+                "pppoe" => &["pppoe", "rp-pppoe"],
+                _ => &[],
+            };
+            for pkg in pkg_candidates {
+                if which_install(pkg).await { break; }
+            }
+        }
+    });
+}
+
+async fn which_install(pkg: &str) -> bool {
+    let mgr = if which("apt-get") { Some(("apt-get", vec!["install", "-y", pkg])) }
+        else if which("dnf")     { Some(("dnf", vec!["install", "-y", pkg])) }
+        else if which("yum")     { Some(("yum", vec!["install", "-y", pkg])) }
+        else if which("pacman")  { Some(("pacman", vec!["-Sy", "--noconfirm", pkg])) }
+        else if which("zypper")  { Some(("zypper", vec!["install", "-y", pkg])) }
+        else { None };
+    let (cmd, args) = match mgr { Some(p) => p, None => return false };
+    tokio::process::Command::new(cmd).args(&args)
+        .env("DEBIAN_FRONTEND", "noninteractive")
+        .output().await
+        .map(|o| o.status.success()).unwrap_or(false)
+}
+
 // ─── Mount ───
 
 pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
@@ -1218,5 +1385,10 @@ pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
         .route("/api/router/managed-overview", web::get().to(get_managed_overview))
         .route("/api/router/host-snapshot", web::get().to(get_host_snapshot))
         .route("/api/router/capture", web::post().to(packet_capture))
-        .route("/api/router/install-tool", web::post().to(install_tool));
+        .route("/api/router/install-tool", web::post().to(install_tool))
+        .route("/api/router/wan",          web::get().to(list_wan))
+        .route("/api/router/wan",          web::post().to(create_wan))
+        .route("/api/router/wan/{id}",     web::put().to(update_wan))
+        .route("/api/router/wan/{id}",     web::delete().to(delete_wan))
+        .route("/api/router/wan-status",   web::get().to(wan_status));
 }

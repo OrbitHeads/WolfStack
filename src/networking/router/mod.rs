@@ -28,6 +28,7 @@ pub mod dhcp;
 pub mod dns;
 pub mod topology;
 pub mod api;
+pub mod wan;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -304,6 +305,9 @@ pub struct RouterConfig {
     pub lans: Vec<LanSegment>,
     #[serde(default)]
     pub rules: Vec<FirewallRule>,
+    /// WAN uplink configurations — DHCP, static, or PPPoE per port.
+    #[serde(default)]
+    pub wan_connections: Vec<wan::WanConnection>,
     /// Global setting: apply rules immediately or require explicit "Apply".
     /// Homelabbers will want immediate; sysadmins will want explicit so
     /// they can stage changes.

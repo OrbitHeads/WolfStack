@@ -5759,6 +5759,7 @@
                         <button class="wr-tab" data-tab="lans" onclick="wrSelectTab('lans')">🌐 DHCP / LANs</button>
                         <button class="wr-tab" data-tab="leases" onclick="wrSelectTab('leases')">📡 DHCP Leases</button>
                         <button class="wr-tab" data-tab="zones" onclick="wrSelectTab('zones')">🎯 Zones</button>
+                        <button class="wr-tab" data-tab="wan" onclick="wrSelectTab('wan')">🌍 WAN / PPPoE</button>
                         <button class="wr-tab" data-tab="connections" onclick="wrSelectTab('connections')">🔗 Connections</button>
                         <button class="wr-tab" data-tab="packets" onclick="wrSelectTab('packets')">📡 Packets</button>
                         <button class="wr-tab" data-tab="logs" onclick="wrSelectTab('logs')">📜 Logs</button>
@@ -5826,6 +5827,16 @@
                     <div id="wr-tab-zones" class="wr-tab-panel" style="padding:16px; display:none;">
                         <div style="font-size:12px; color:var(--text-muted); margin-bottom:12px;">Assign each interface to a zone. Rules use zone names, so you don't have to remember which NIC is WAN today.</div>
                         <div id="wr-zones-grid"></div>
+                    </div>
+
+                    <div id="wr-tab-wan" class="wr-tab-panel" style="padding:16px; display:none;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                            <div style="font-size:12px; color:var(--text-muted);">
+                                Configure WAN uplinks: <strong>DHCP</strong> (most cable/fibre with a router-mode modem), <strong>Static</strong> (hard-coded IP), or <strong>PPPoE</strong> (ADSL/VDSL/fibre with a bridged ONT — ISPs like Telekom, BT, Orange, etc). For PPPoE the host's <code>ppp</code> + <code>pppoe</code> packages will be auto-installed on first save.
+                            </div>
+                            <button class="btn btn-sm btn-primary" onclick="wrShowWanEditor()">+ WAN connection</button>
+                        </div>
+                        <div id="wr-wan-list" style="display:grid; gap:12px;"></div>
                     </div>
 
                     <div id="wr-tab-connections" class="wr-tab-panel" style="padding:16px; display:none;">

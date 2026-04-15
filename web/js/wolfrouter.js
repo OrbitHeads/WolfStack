@@ -241,6 +241,7 @@
         if (tab === 'lans')         wrRenderLans();
         if (tab === 'leases')       wrRenderLeases();
         if (tab === 'zones')        wrRenderZones();
+        if (tab === 'wan')          wrRenderWan();
         if (tab === 'connections')  wrRenderConnections();
         if (tab === 'packets')      wrRenderPackets();
         if (tab === 'logs')         wrRenderLogs();
@@ -862,6 +863,225 @@
             if (errBox) { errBox.style.display = 'block'; errBox.textContent = 'Network error: ' + (e.message || e); }
         }
     }
+
+    // ─── WAN connections (DHCP / Static / PPPoE) ─────────────
+
+    async function wrRenderWan() {
+        const list = document.getElementById('wr-wan-list');
+        if (!list) return;
+        let conns = [];
+        let status = [];
+        try {
+            const [r, sR] = await Promise.all([
+                fetch(wrUrl('/api/router/wan')),
+                fetch(wrUrl('/api/router/wan-status')),
+            ]);
+            if (r.ok) conns = await r.json();
+            if (sR.ok) status = await sR.json();
+        } catch (e) {}
+        const statusById = Object.fromEntries(status.map(s => [s.id, s]));
+        if (!conns.length) {
+            list.innerHTML = `<div style="text-align:center; color:var(--text-muted); padding:30px;">
+                No WAN connections yet. WolfRouter doesn't manage your existing DHCP — you only need to add an entry here for <strong>PPPoE</strong> dialers or <strong>static-IP overrides</strong>.
+            </div>`;
+            return;
+        }
+        list.innerHTML = conns.map(c => {
+            const live = statusById[c.id] || {};
+            const modeLabel = c.mode.mode || 'unknown';
+            const modeColor = { dhcp: '#3b82f6', static: '#94a3b8', pppoe: '#a855f7' }[modeLabel] || '#94a3b8';
+            const liveBadge = live.live_iface
+                ? `<span style="color:#22c55e;">⬤ UP</span> on <code>${escHtml(live.live_iface)}</code> · ${escHtml(live.live_ip || '')}`
+                : (c.enabled ? '<span style="color:#fbbf24;">⬤ down / connecting</span>' : '<span style="color:var(--text-muted);">○ disabled</span>');
+            const modeDetail = (() => {
+                if (modeLabel === 'pppoe') {
+                    const p = c.mode.config || {};
+                    return `user <code>${escHtml(p.username)}</code> · MTU ${p.mtu || 1492}`;
+                }
+                if (modeLabel === 'static') {
+                    const s = c.mode.config || {};
+                    return `<code>${escHtml(s.address_cidr)}</code> via <code>${escHtml(s.gateway)}</code>`;
+                }
+                return '(host DHCP client)';
+            })();
+            return `<div style="padding:14px; border:1px solid var(--border); border-radius:8px; background:var(--bg-card);">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                    <div>
+                        <strong style="font-size:15px;">${escHtml(c.name)}</strong>
+                        <span class="badge" style="background:${modeColor}22; color:${modeColor}; margin-left:6px; font-size:10px; padding:2px 8px;">${modeLabel.toUpperCase()}</span>
+                    </div>
+                    <div style="display:flex; gap:6px;">
+                        <button class="btn btn-sm" onclick="wrShowWanEditor('${c.id}')">Edit</button>
+                        <button class="btn btn-sm" onclick="wrDeleteWan('${c.id}')">Delete</button>
+                    </div>
+                </div>
+                <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:8px; font-size:12px; color:var(--text-muted);">
+                    <div>Interface: <code>${escHtml(c.interface)}</code></div>
+                    <div>${modeDetail}</div>
+                    <div>${liveBadge}</div>
+                </div>
+            </div>`;
+        }).join('');
+    }
+
+    function wrShowWanEditor(id) {
+        const existing = id ? null : null;  // we re-fetch below for fresh data
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay active';
+        overlay.style.zIndex = '10000';
+        overlay.innerHTML = `
+            <div class="modal" style="max-width:640px;">
+                <div class="modal-header">
+                    <h3>${id ? 'Edit' : 'New'} WAN connection</h3>
+                    <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">×</button>
+                </div>
+                <div class="modal-body" style="font-size:13px;">
+                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+                        <label>Name<input id="wr-w-name" class="form-control" placeholder="ISP uplink"/></label>
+                        <label>Interface<select id="wr-w-iface" class="form-control"></select></label>
+                        <label>Mode
+                            <select id="wr-w-mode" class="form-control" onchange="wrToggleWanModeFields()">
+                                <option value="dhcp">DHCP (most ISPs / cable / fibre router)</option>
+                                <option value="static">Static IP</option>
+                                <option value="pppoe">PPPoE (ADSL / VDSL / fibre with bridged ONT)</option>
+                            </select>
+                        </label>
+                        <label style="display:flex; align-items:center; gap:6px;">
+                            <input type="checkbox" id="wr-w-enabled" checked/> Enabled (start on save)
+                        </label>
+                    </div>
+
+                    <div id="wr-w-static" style="display:none; margin-top:10px;">
+                        <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+                            <label>Address (CIDR)<input id="wr-w-addr" class="form-control" placeholder="203.0.113.10/24"/></label>
+                            <label>Gateway<input id="wr-w-gw" class="form-control" placeholder="203.0.113.1"/></label>
+                            <label style="grid-column:1/-1;">DNS servers (comma-separated)<input id="wr-w-dns" class="form-control" placeholder="1.1.1.1, 9.9.9.9"/></label>
+                        </div>
+                    </div>
+
+                    <div id="wr-w-pppoe" style="display:none; margin-top:10px;">
+                        <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+                            <label>Username<input id="wr-w-user" class="form-control" placeholder="user@isp.example"/></label>
+                            <label>Password<input id="wr-w-pass" type="password" class="form-control" placeholder="••••••"/></label>
+                            <label>Service name (optional)<input id="wr-w-svc" class="form-control" placeholder="leave blank for most ISPs"/></label>
+                            <label>MTU<input id="wr-w-mtu" type="number" class="form-control" value="1492" min="576" max="1500"/></label>
+                            <label>LCP echo interval (s, 0=off)<input id="wr-w-lcp" type="number" class="form-control" value="30" min="0" max="600"/></label>
+                            <label style="display:flex; align-items:center; gap:6px;">
+                                <input type="checkbox" id="wr-w-persist" checked/> Auto-reconnect on link drops
+                            </label>
+                        </div>
+                        <div style="margin-top:10px; padding:10px; background:rgba(168,85,247,0.08); border:1px solid rgba(168,85,247,0.3); border-radius:6px; font-size:12px; color:var(--text-muted);">
+                            On save, WolfRouter writes <code>/etc/ppp/peers/wolfrouter-{id}</code> + secrets (mode 0600), auto-installs the <code>ppp</code> + <code>pppoe</code> packages if missing, then calls <code>pppd</code> to bring the link up. The resulting <code>ppp0</code> appears in the rack view as the WAN port.
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+                    <button class="btn btn-primary" onclick="wrSaveWan('${id || ''}')">${id ? 'Save' : 'Create'}</button>
+                </div>
+            </div>`;
+        document.body.appendChild(overlay);
+
+        // Populate iface dropdown from local-node interfaces.
+        const ifSel = document.getElementById('wr-w-iface');
+        const ifaces = new Set();
+        for (const n of (wrState.topology?.nodes || [])) {
+            for (const i of (n.interfaces || [])) ifaces.add(i.name);
+        }
+        ifSel.innerHTML = Array.from(ifaces).sort().map(i => `<option value="${escHtml(i)}">${escHtml(i)}</option>`).join('') || '<option value="">(no interfaces)</option>';
+
+        // Load existing values if editing.
+        if (id) {
+            fetch(wrUrl('/api/router/wan')).then(r => r.json()).then(arr => {
+                const c = arr.find(x => x.id === id);
+                if (!c) return;
+                document.getElementById('wr-w-name').value = c.name;
+                document.getElementById('wr-w-iface').value = c.interface;
+                document.getElementById('wr-w-mode').value = c.mode?.mode || 'dhcp';
+                document.getElementById('wr-w-enabled').checked = c.enabled !== false;
+                if (c.mode?.mode === 'static') {
+                    document.getElementById('wr-w-addr').value = c.mode.config?.address_cidr || '';
+                    document.getElementById('wr-w-gw').value = c.mode.config?.gateway || '';
+                    document.getElementById('wr-w-dns').value = (c.mode.config?.dns || []).join(', ');
+                } else if (c.mode?.mode === 'pppoe') {
+                    document.getElementById('wr-w-user').value = c.mode.config?.username || '';
+                    // Password masked from server — leave blank; will preserve on save.
+                    document.getElementById('wr-w-pass').value = c.mode.config?.password === '***' ? '***' : '';
+                    document.getElementById('wr-w-svc').value = c.mode.config?.service_name || '';
+                    document.getElementById('wr-w-mtu').value = c.mode.config?.mtu || 1492;
+                    document.getElementById('wr-w-lcp').value = c.mode.config?.lcp_echo_interval ?? 30;
+                    document.getElementById('wr-w-persist').checked = c.mode.config?.persist !== false;
+                }
+                wrToggleWanModeFields();
+            });
+        } else {
+            wrToggleWanModeFields();
+        }
+    }
+    window.wrShowWanEditor = wrShowWanEditor;
+
+    function wrToggleWanModeFields() {
+        const m = document.getElementById('wr-w-mode').value;
+        document.getElementById('wr-w-static').style.display = m === 'static' ? 'block' : 'none';
+        document.getElementById('wr-w-pppoe').style.display = m === 'pppoe' ? 'block' : 'none';
+    }
+    window.wrToggleWanModeFields = wrToggleWanModeFields;
+
+    async function wrSaveWan(id) {
+        const name = document.getElementById('wr-w-name').value.trim();
+        const iface = document.getElementById('wr-w-iface').value.trim();
+        const mode = document.getElementById('wr-w-mode').value;
+        const enabled = document.getElementById('wr-w-enabled').checked;
+        if (!name || !iface) { alert('Name and interface are required'); return; }
+        let modeBlock = { mode: 'dhcp' };
+        if (mode === 'static') {
+            modeBlock = {
+                mode: 'static',
+                config: {
+                    address_cidr: document.getElementById('wr-w-addr').value.trim(),
+                    gateway: document.getElementById('wr-w-gw').value.trim(),
+                    dns: document.getElementById('wr-w-dns').value.split(',').map(s => s.trim()).filter(Boolean),
+                },
+            };
+        } else if (mode === 'pppoe') {
+            modeBlock = {
+                mode: 'pppoe',
+                config: {
+                    username: document.getElementById('wr-w-user').value.trim(),
+                    password: document.getElementById('wr-w-pass').value,
+                    service_name: document.getElementById('wr-w-svc').value.trim(),
+                    mtu: parseInt(document.getElementById('wr-w-mtu').value, 10) || 1492,
+                    mru: parseInt(document.getElementById('wr-w-mtu').value, 10) || 1492,
+                    persist: document.getElementById('wr-w-persist').checked,
+                    lcp_echo_interval: parseInt(document.getElementById('wr-w-lcp').value, 10) || 0,
+                    lcp_echo_failure: 4,
+                },
+            };
+        }
+        const body = {
+            id: id || '',
+            name, interface: iface, mode: modeBlock, enabled,
+            node_id: wrState.topology?.nodes?.[0]?.node_id || '',
+            description: '',
+        };
+        const url = wrUrl(id ? '/api/router/wan/' + id : '/api/router/wan');
+        const method = id ? 'PUT' : 'POST';
+        const r = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        if (!r.ok) { alert('Save failed: ' + await r.text()); return; }
+        document.querySelector('.modal-overlay')?.remove();
+        await wrLoadAll();
+        wrRenderWan();
+    }
+    window.wrSaveWan = wrSaveWan;
+
+    async function wrDeleteWan(id) {
+        if (!confirm('Delete this WAN connection? Any PPPoE link will be torn down.')) return;
+        await fetch(wrUrl('/api/router/wan/' + id), { method: 'DELETE' });
+        await wrLoadAll();
+        wrRenderWan();
+    }
+    window.wrDeleteWan = wrDeleteWan;
+    window.wrRenderWan = wrRenderWan;
 
     // ─── Packets (tcpdump) tab ───────────────────────────────
 
