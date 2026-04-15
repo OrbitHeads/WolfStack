@@ -5836,10 +5836,13 @@
 
                     <div id="wr-tab-packets" class="wr-tab-panel" style="padding:16px; display:none;">
                         <div style="font-size:12px; color:var(--text-muted); margin-bottom:12px;">
-                            Wireshark-style packet capture via <code>tcpdump</code>. Pick an interface, optionally add a BPF filter (e.g. <code>tcp port 80</code>, <code>icmp</code>, <code>host 8.8.8.8</code>), choose how many packets to grab.
+                            Wireshark-style packet capture via <code>tcpdump</code>. Pick a node, an interface, optionally a BPF filter (e.g. <code>tcp port 80</code>, <code>icmp</code>, <code>host 8.8.8.8</code>).
                         </div>
-                        <div style="display:grid; grid-template-columns: 1fr 2fr 100px 100px auto; gap:8px; margin-bottom:12px; align-items:end;">
-                            <label>Interface
+                        <div style="display:grid; grid-template-columns: 160px 160px 1fr 90px 90px auto; gap:8px; margin-bottom:12px; align-items:end;">
+                            <label>Node
+                                <select id="wr-pcap-node" class="form-control" style="font-size:13px;" onchange="wrRenderPackets()"></select>
+                            </label>
+                            <label>Interface (UP only)
                                 <select id="wr-pcap-iface" class="form-control" style="font-size:13px;"></select>
                             </label>
                             <label>BPF filter (optional)
@@ -5850,12 +5853,29 @@
                                     <option>10</option><option selected>100</option><option>500</option><option>1000</option><option>5000</option>
                                 </select>
                             </label>
-                            <label>Timeout (s)
+                            <label>Timeout s
                                 <input id="wr-pcap-timeout" type="number" class="form-control" value="30" min="1" max="120" style="font-size:13px;"/>
                             </label>
                             <button id="wr-pcap-go" class="btn btn-primary" onclick="wrStartCapture()" style="height:34px;">▶ Capture</button>
                         </div>
-                        <pre id="wr-pcap-output" style="font-family:var(--font-mono); font-size:11px; background:#0a0f18; color:#cbd5e1; padding:10px; border-radius:6px; max-height:480px; overflow:auto; min-height:120px; border:1px solid var(--border);"></pre>
+                        <div id="wr-pcap-status" style="font-size:12px; color:var(--text-muted); margin-bottom:8px;"></div>
+                        <div id="wr-pcap-result" style="overflow:auto; max-height:520px; border:1px solid var(--border); border-radius:6px;">
+                            <table class="data-table" style="font-size:11px; width:100%;">
+                                <thead style="position:sticky; top:0; background:var(--bg-secondary); z-index:1;">
+                                    <tr>
+                                        <th style="width:140px;">Time</th>
+                                        <th style="width:50px;">Proto</th>
+                                        <th>Source</th>
+                                        <th>Destination</th>
+                                        <th>Info</th>
+                                        <th style="width:60px;">Len</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="wr-pcap-tbody">
+                                    <tr><td colspan="6" style="text-align:center; color:var(--text-muted); padding:24px;">No capture yet. Pick a node and interface above, then click ▶ Capture.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
                     </div>
 
                     <div id="wr-tab-logs" class="wr-tab-panel" style="padding:16px; display:none;">

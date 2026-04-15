@@ -948,7 +948,7 @@ fn list_lease_files() -> Vec<serde_json::Value> {
 ///     not RCE. Filter is also length-capped at 200 chars.
 ///   • Hard timeout via tokio::time::timeout so a runaway capture
 ///     can't consume resources indefinitely.
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone, Serialize)]
 pub struct CaptureRequest {
     pub iface: String,
     #[serde(default)]
@@ -958,6 +958,11 @@ pub struct CaptureRequest {
     /// Optional capture timeout in seconds (default 30, max 120).
     #[serde(default = "default_capture_timeout")]
     pub timeout_seconds: u64,
+    /// Target cluster node id. If unset or matches self_node_id,
+    /// runs locally. Otherwise the request is proxied to that node
+    /// via the cluster secret so users can capture from any rack.
+    #[serde(default)]
+    pub node_id: Option<String>,
 }
 fn default_capture_count() -> u32 { 100 }
 fn default_capture_timeout() -> u64 { 30 }
@@ -969,6 +974,60 @@ pub async fn packet_capture(
 ) -> HttpResponse {
     auth_or_return!(req, state);
     let r = body.into_inner();
+
+    // Cluster proxy: if the user picked a remote node, forward the
+    // capture request to that node's WolfStack via the cluster secret.
+    let self_id = crate::agent::self_node_id();
+    if let Some(target) = r.node_id.as_ref() {
+        if !target.is_empty() && target != &self_id {
+            let nodes = state.cluster.get_all_nodes();
+            let target_node = match nodes.into_iter().find(|n| &n.id == target) {
+                Some(n) => n,
+                None => return HttpResponse::NotFound().body(format!("node '{}' not found in cluster", target)),
+            };
+            let secret = state.cluster_secret.clone();
+            // Strip node_id from the proxied body so the remote node
+            // doesn't recursively proxy back to us if a misconfigured
+            // self_id mismatch happens.
+            let mut proxy_body = r.clone();
+            proxy_body.node_id = None;
+            // Try HTTPS first then HTTP, mirroring the topology fan-out.
+            let urls = [
+                format!("https://{}:{}/api/router/capture", target_node.address, target_node.port),
+                format!("http://{}:{}/api/router/capture",  target_node.address, target_node.port),
+            ];
+            let client = match reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .timeout(std::time::Duration::from_secs(r.timeout_seconds + 10))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => return HttpResponse::InternalServerError().body(format!("client build: {}", e)),
+            };
+            for url in &urls {
+                match client.post(url)
+                    .header("X-WolfStack-Secret", &secret)
+                    .json(&proxy_body)
+                    .send().await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        let val: serde_json::Value = resp.json().await.unwrap_or(serde_json::json!({}));
+                        return HttpResponse::Ok().json(val);
+                    }
+                    Ok(resp) => {
+                        let txt = resp.text().await.unwrap_or_default();
+                        return HttpResponse::Ok().json(serde_json::json!({
+                            "lines": [], "error": format!("remote node returned {}: {}", target_node.id, txt)
+                        }));
+                    }
+                    Err(_) => continue,  // try next URL
+                }
+            }
+            return HttpResponse::Ok().json(serde_json::json!({
+                "lines": [], "error": format!("couldn't reach node '{}' (tried HTTPS then HTTP)", target_node.id)
+            }));
+        }
+    }
 
     // Interface allowlist: alnum + . _ -. Any other character means a
     // shell metachar attempt or an unsupported iface name; reject.
@@ -1037,6 +1096,101 @@ pub async fn packet_capture(
     }))
 }
 
+/// Best-effort install of a network tool when WolfRouter detects it's
+/// missing (currently used for tcpdump and conntrack). Detects the
+/// host's package manager and runs the appropriate install command.
+/// Requires WolfStack to be running as root or via sudo without
+/// password — typical for managed appliances.
+///
+/// Allowlist of tool names — keeps the package name parameter from
+/// becoming a shell-injection foothold.
+#[derive(Deserialize)]
+pub struct InstallToolRequest { pub tool: String }
+
+pub async fn install_tool(
+    req: HttpRequest,
+    state: S,
+    body: web::Json<InstallToolRequest>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let r = body.into_inner();
+
+    // Allowlist: only tools WolfRouter actually uses. Maps tool name
+    // → package name (often identical, but e.g. some distros split).
+    let pkg = match r.tool.as_str() {
+        "tcpdump"   => "tcpdump",
+        "conntrack" => "conntrack",
+        "iptables"  => "iptables",
+        "dnsmasq"   => "dnsmasq",
+        _ => return HttpResponse::BadRequest().body(
+            "tool must be one of: tcpdump, conntrack, iptables, dnsmasq"
+        ),
+    };
+
+    // Already installed? Short-circuit with a friendly message.
+    if std::process::Command::new("which").arg(pkg).status()
+        .map(|s| s.success()).unwrap_or(false)
+    {
+        return HttpResponse::Ok().json(serde_json::json!({
+            "success": true, "message": format!("'{}' is already installed", pkg)
+        }));
+    }
+
+    // Detect package manager. Order matters — apt-get exists on
+    // Debian-derived (most common), then dnf, yum, pacman, zypper.
+    let install: Option<(&str, Vec<&str>)> = if which("apt-get") {
+        Some(("apt-get", vec!["install", "-y", pkg]))
+    } else if which("dnf") {
+        Some(("dnf", vec!["install", "-y", pkg]))
+    } else if which("yum") {
+        Some(("yum", vec!["install", "-y", pkg]))
+    } else if which("pacman") {
+        // pacman wants --noconfirm to skip prompts and -Sy to refresh
+        Some(("pacman", vec!["-Sy", "--noconfirm", pkg]))
+    } else if which("zypper") {
+        Some(("zypper", vec!["install", "-y", pkg]))
+    } else {
+        None
+    };
+    let (cmd, args) = match install {
+        Some(p) => p,
+        None => return HttpResponse::Ok().json(serde_json::json!({
+            "success": false,
+            "error": format!("no supported package manager found — install '{}' manually", pkg)
+        })),
+    };
+
+    let out = match tokio::process::Command::new(cmd)
+        .args(&args)
+        .env("DEBIAN_FRONTEND", "noninteractive")
+        .output().await
+    {
+        Ok(o) => o,
+        Err(e) => return HttpResponse::Ok().json(serde_json::json!({
+            "success": false,
+            "error": format!("couldn't run {}: {}", cmd, e),
+        })),
+    };
+
+    if out.status.success() {
+        HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "message": format!("installed '{}' via {}", pkg, cmd),
+        }))
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        HttpResponse::Ok().json(serde_json::json!({
+            "success": false,
+            "error": format!("{} install failed: {}", cmd, stderr),
+        }))
+    }
+}
+
+fn which(cmd: &str) -> bool {
+    std::process::Command::new("which").arg(cmd).status()
+        .map(|s| s.success()).unwrap_or(false)
+}
+
 // ─── Mount ───
 
 pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
@@ -1063,5 +1217,6 @@ pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
         .route("/api/router/logs", web::get().to(list_firewall_logs))
         .route("/api/router/managed-overview", web::get().to(get_managed_overview))
         .route("/api/router/host-snapshot", web::get().to(get_host_snapshot))
-        .route("/api/router/capture", web::post().to(packet_capture));
+        .route("/api/router/capture", web::post().to(packet_capture))
+        .route("/api/router/install-tool", web::post().to(install_tool));
 }

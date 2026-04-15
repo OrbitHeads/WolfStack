@@ -866,53 +866,177 @@
     // ─── Packets (tcpdump) tab ───────────────────────────────
 
     function wrRenderPackets() {
-        // Populate the interface dropdown from the current node's
-        // topology — only interfaces that are actually present.
-        const sel = document.getElementById('wr-pcap-iface');
-        if (!sel) return;
-        const ifaces = new Set();
-        for (const n of (wrState.topology?.nodes || [])) {
-            for (const i of (n.interfaces || [])) ifaces.add(i.name);
-            for (const b of (n.bridges || [])) ifaces.add(b.name);
+        // Populate node + interface dropdowns from the live topology.
+        // Only show interfaces that are link-up — capturing on a down
+        // interface is just dead time waiting for the timeout.
+        const nodeSel = document.getElementById('wr-pcap-node');
+        const ifSel = document.getElementById('wr-pcap-iface');
+        if (!nodeSel || !ifSel) return;
+
+        const nodes = (wrState.topology?.nodes || []).filter(n => n.status !== 'unreachable');
+        const currentNode = nodeSel.value;
+        nodeSel.innerHTML = nodes.map(n =>
+            `<option value="${escHtml(n.node_id)}">${escHtml(n.node_name)}</option>`
+        ).join('') || '<option value="">(no nodes)</option>';
+        if (currentNode && nodes.some(n => n.node_id === currentNode)) {
+            nodeSel.value = currentNode;
         }
-        // Plus pseudo-iface "any" for tcpdump-on-all-interfaces
+
+        const selectedNode = nodes.find(n => n.node_id === nodeSel.value) || nodes[0];
+        const ifaces = new Set();
+        if (selectedNode) {
+            for (const i of (selectedNode.interfaces || [])) {
+                if (i.link_up) ifaces.add(i.name);
+            }
+            for (const b of (selectedNode.bridges || [])) {
+                ifaces.add(b.name);  // bridges always shown — they
+                                     // don't have an operstate concept
+            }
+        }
         const list = ['any', ...Array.from(ifaces).sort()];
-        const current = sel.value;
-        sel.innerHTML = list.map(i => `<option value="${escHtml(i)}">${escHtml(i)}</option>`).join('');
-        if (current && list.includes(current)) sel.value = current;
+        const currentIf = ifSel.value;
+        ifSel.innerHTML = list.map(i => `<option value="${escHtml(i)}">${escHtml(i)}</option>`).join('');
+        if (currentIf && list.includes(currentIf)) ifSel.value = currentIf;
+    }
+
+    /// Parse a single tcpdump line (with -tttt timestamp) into a row:
+    ///   "2026-04-15 11:37:34.107236 IP 100.96.0.2.45413 > 100.95.0.254.53: 32916+ A? discord.com. (29)"
+    /// Returns { time, proto, src, dst, info, length } — best-effort;
+    /// non-matching lines are passed through verbatim in the info col.
+    function wrParsePacketLine(line) {
+        const out = { time: '', proto: '', src: '', dst: '', info: line, length: '' };
+        // Timestamp: "YYYY-MM-DD HH:MM:SS.frac"
+        const tsMatch = line.match(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}\.\d+)\s+(.*)$/);
+        if (!tsMatch) return out;
+        out.time = tsMatch[2].slice(0, 12);  // HH:MM:SS.frac3
+        const rest = tsMatch[3];
+        // L3 family + src > dst:
+        const headerMatch = rest.match(/^(IP6?|ARP|STP|PPP|RARP)\s+(\S+)\s+>\s+(\S+):\s*(.*)$/);
+        if (!headerMatch) {
+            out.info = rest;
+            return out;
+        }
+        const family = headerMatch[1];
+        const srcRaw = headerMatch[2];
+        const dstRaw = headerMatch[3].replace(/[:,]+$/, '');
+        out.info = headerMatch[4] || '';
+        // src/dst may have a port appended via dot for IPv4 or .NNN for IPv6
+        const splitHostPort = (s) => {
+            // IPv4: a.b.c.d.PORT — last segment is port if all-digits
+            const lastDot = s.lastIndexOf('.');
+            if (lastDot > -1) {
+                const tail = s.slice(lastDot + 1);
+                if (/^\d+$/.test(tail) && s.slice(0, lastDot).split('.').length === 4) {
+                    return s.slice(0, lastDot) + ':' + tail;
+                }
+            }
+            return s;
+        };
+        out.src = splitHostPort(srcRaw);
+        out.dst = splitHostPort(dstRaw);
+        // Protocol: sniff from info or family.
+        if (/^ICMP\b/i.test(out.info)) out.proto = 'ICMP';
+        else if (/^Flags\s+\[/.test(out.info)) out.proto = 'TCP';
+        else if (/^UDP[, ]/.test(out.info)) out.proto = 'UDP';
+        else if (/^\d+\+\s+/.test(out.info)) out.proto = 'DNS';
+        else if (family === 'ARP') out.proto = 'ARP';
+        else if (family === 'IP6') out.proto = 'IPv6';
+        else out.proto = family;
+        // Length: "length N" anywhere
+        const lenMatch = out.info.match(/length\s+(\d+)/);
+        if (lenMatch) out.length = lenMatch[1];
+        return out;
     }
 
     async function wrStartCapture() {
+        const node_id = document.getElementById('wr-pcap-node').value.trim();
         const iface = document.getElementById('wr-pcap-iface').value.trim();
         const filter = document.getElementById('wr-pcap-filter').value.trim();
         const count = parseInt(document.getElementById('wr-pcap-count').value, 10) || 100;
         const timeoutSeconds = parseInt(document.getElementById('wr-pcap-timeout').value, 10) || 30;
-        const out = document.getElementById('wr-pcap-output');
+        const tbody = document.getElementById('wr-pcap-tbody');
+        const status = document.getElementById('wr-pcap-status');
         const btn = document.getElementById('wr-pcap-go');
         if (!iface) { alert('Pick an interface first'); return; }
 
-        out.textContent = `▶ Capturing on ${iface}${filter ? ' [filter: ' + filter + ']' : ''}…\n   max ${count} packets / ${timeoutSeconds}s timeout — please wait.`;
-        btn.disabled = true; btn.textContent = '⏳ Capturing…';
+        const setBtn = (disabled, label) => { btn.disabled = disabled; btn.textContent = label; };
+        const showStatus = (msg) => { status.innerHTML = msg; };
+        const showPlaceholder = (msg) => {
+            tbody.innerHTML = `<tr><td colspan="6" style="text-align:center; color:var(--text-muted); padding:24px;">${msg}</td></tr>`;
+        };
 
-        try {
+        showStatus(`⏳ Capturing on <code>${escHtml(iface)}</code>${filter ? ' [filter: <code>' + escHtml(filter) + '</code>]' : ''}… max ${count} packets / ${timeoutSeconds}s timeout`);
+        showPlaceholder('Waiting for packets…');
+        setBtn(true, '⏳ Capturing…');
+
+        const runCapture = async () => {
             const r = await fetch(wrUrl('/api/router/capture'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ iface, filter, count, timeout_seconds: timeoutSeconds }),
+                body: JSON.stringify({ iface, filter, count, timeout_seconds: timeoutSeconds, node_id }),
             });
             const data = await r.json();
-            if (!r.ok) {
-                out.textContent = `✗ HTTP ${r.status}: ${data.error || JSON.stringify(data)}`;
+            return { ok: r.ok, status: r.status, data };
+        };
+
+        try {
+            let result = await runCapture();
+            // Auto-install tcpdump if missing and retry once.
+            if (result.data?.error && /tcpdump/i.test(result.data.error)
+                && /no such file|not found|couldn't run/i.test(result.data.error))
+            {
+                showStatus('📦 Installing tcpdump on this host (one-time)…');
+                setBtn(true, '📦 Installing tcpdump…');
+                const inst = await fetch(wrUrl('/api/router/install-tool'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ tool: 'tcpdump' }),
+                });
+                const instData = await inst.json();
+                if (!instData.success) {
+                    showStatus(`✗ Couldn't install tcpdump automatically: ${escHtml(instData.error || 'unknown error')}`);
+                    showPlaceholder('Install tcpdump manually with your package manager and try again.');
+                    return;
+                }
+                showStatus(`✓ tcpdump installed. Now capturing…`);
+                setBtn(true, '⏳ Capturing…');
+                result = await runCapture();
+            }
+
+            if (!result.ok) {
+                showStatus(`✗ HTTP ${result.status}: ${escHtml(result.data.error || JSON.stringify(result.data))}`);
+                showPlaceholder('Capture failed.');
                 return;
             }
-            const lines = data.lines || [];
-            const errLine = data.error ? `\n\n✗ ${data.error}` : '';
-            const header = `🛜 ${lines.length} packet${lines.length === 1 ? '' : 's'} on ${escHtml(data.iface)}${data.filter ? ' [filter: ' + escHtml(data.filter) + ']' : ''}\n${'─'.repeat(60)}\n`;
-            out.textContent = header + lines.join('\n') + errLine;
+            const lines = result.data.lines || [];
+            const rows = lines.map(wrParsePacketLine);
+            showStatus(`✓ ${lines.length} packet${lines.length === 1 ? '' : 's'} on <code>${escHtml(result.data.iface || iface)}</code>${result.data.filter ? ' [filter: <code>' + escHtml(result.data.filter) + '</code>]' : ''}${result.data.error ? ' — ' + escHtml(result.data.error) : ''}`);
+
+            if (!rows.length) {
+                showPlaceholder('No packets captured (the timeout fired before any matched).');
+                return;
+            }
+
+            const protoColor = {
+                TCP: '#60a5fa', UDP: '#22c55e', ICMP: '#fbbf24',
+                DNS: '#a855f7', ARP: '#fb923c', IPv6: '#f472b6',
+            };
+            tbody.innerHTML = rows.map(p => {
+                const c = protoColor[p.proto] || '#94a3b8';
+                return `<tr>
+                    <td style="font-family:var(--font-mono); color:var(--text-muted);">${escHtml(p.time)}</td>
+                    <td><span class="badge" style="background:${c}22; color:${c}; font-size:10px; padding:1px 6px;">${escHtml(p.proto || '?')}</span></td>
+                    <td><code>${escHtml(p.src)}</code></td>
+                    <td><code>${escHtml(p.dst)}</code></td>
+                    <td style="color:var(--text-muted); font-family:var(--font-mono); font-size:10px;">${escHtml(p.info.slice(0, 200))}</td>
+                    <td style="text-align:right; color:var(--text-muted); font-family:var(--font-mono);">${escHtml(p.length)}</td>
+                </tr>`;
+            }).join('');
         } catch (e) {
-            out.textContent = '✗ ' + (e.message || e);
+            showStatus('✗ ' + escHtml(e.message || e));
+            showPlaceholder('Network error.');
         } finally {
-            btn.disabled = false; btn.textContent = '▶ Capture';
+            setBtn(false, '▶ Capture');
         }
     }
     window.wrStartCapture = wrStartCapture;
@@ -1216,20 +1340,21 @@
                         <!-- Iface name below (bigger, readable) -->
                         <text x="${px+jackW/2}" y="${py+jackH+12}" text-anchor="middle"
                               style="fill:#f1f5f9; font-size:11px; font-weight:600; font-family:monospace;">${escHtml(port.name.slice(0,10))}</text>
-                        <!-- IP address rotated -90° down the right side
-                             of the jack so it doesn't fight the iface
-                             name or neighbouring ports for horizontal
-                             space. Reads top-to-bottom from the jack
-                             top edge. -->
-                        ${ipDisplay ? `<text x="${px+jackW+4}" y="${py-2}"
-                              transform="rotate(90 ${px+jackW+4} ${py-2})"
-                              text-anchor="start"
-                              style="fill:#94a3b8; font-size:10px; font-family:monospace;">${escHtml(ipDisplay)}</text>` : ''}
+                        <!-- IP address shown only on hover via the
+                             custom tooltip — keeps the chassis clean
+                             and the labels readable. -->
                         <!-- Live BPS above LEDs (only if actively flowing) -->
                         ${(port.rx_bps + port.tx_bps) > 0
                             ? `<text x="${px+jackW/2}" y="${py-9}" text-anchor="middle" style="fill:#fde68a; font-size:8px; font-family:monospace;">${fmtBpsShort(port.rx_bps + port.tx_bps)}</text>`
                             : ''}
-                        <title>${escHtml(port.name)} — ${port.link_up ? 'UP' : 'DOWN'} — role: ${port.role}${(port.addresses||[]).length ? ' — ' + (port.addresses||[]).join(', ') : ''}</title>
+                        <!-- Multi-line tooltip — browsers honour
+                             newlines inside SVG <title>. -->
+                        <title>${escHtml([
+                            `Interface: ${port.name}`,
+                            `State: ${port.link_up ? 'UP' : 'DOWN'}`,
+                            `Role: ${port.role}`,
+                            ...(port.addresses && port.addresses.length ? port.addresses.map(a => `IP: ${a}`) : []),
+                        ].join('\n'))}</title>
                     </g>
                 `);
                 portsByNode[node.node_id].push({
