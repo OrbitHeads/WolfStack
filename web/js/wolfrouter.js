@@ -913,18 +913,35 @@
         const cloudGap = 30;
         const railW = 22;          // vertical rail width on each side
         const rackInnerPad = 8;    // gap between rail and appliance
-        const unitH = 96;          // 2U appliance height
-        const unitGap = 24;        // wider so devices fit between nodes
+        const baseUnitH = 96;      // 2U baseline appliance height
+        const oneUH = 22;          // each "rack unit" of growth = one device row
+        const unitGap = 24;
+        const deviceRowH = 22;     // pixel pitch for each device badge
 
         const nodeCount = topo.nodes.length;
-        const maxDevicesPerNode = Math.max(
-            1,
-            ...topo.nodes.map(n => Math.min(6, (n.vms?.length || 0) + (n.containers?.length || 0)))
-        );
+
+        // Variable per-node height: each node grows as more devices
+        // attach. Base = 2U, then +1U for every 2 devices over 6 (so 7-8
+        // devices = 3U, 9-10 = 4U, etc). Devices stay visible without
+        // overflow indicators.
+        const nodeHeights = topo.nodes.map(n => {
+            const devCount = (n.vms?.length || 0) + (n.containers?.length || 0);
+            if (devCount <= 6) return baseUnitH;
+            const extraRows = Math.ceil((devCount - 6) / 2);
+            return baseUnitH + extraRows * oneUH;
+        });
+        // Cumulative Y offset per node, computed once and reused below.
+        const nodeYs = [];
+        let yAcc = rackInnerPad;
+        for (const h of nodeHeights) {
+            nodeYs.push(yAcc);
+            yAcc += h + unitGap;
+        }
+        // Strip the trailing gap so the rack hugs the last appliance.
+        const innerContent = yAcc - unitGap + rackInnerPad;
 
         const rackY = cloudH + cloudGap;
-        const rackInnerH = nodeCount * unitH + (nodeCount - 1) * unitGap + rackInnerPad * 2;
-        // Leave room on the right for per-node device columns
+        const rackInnerH = innerContent;
         const H = rackY + rackInnerH + 60;
 
         const rackX = padX;
@@ -1027,9 +1044,11 @@
 
         // Rack appliances + ports ─────────────────────────────────
         const portsByNode = {};
-        let yCursor = rackY + rackInnerPad;
-        for (const node of topo.nodes) {
-            const ux = apX, uy = yCursor, uw = apW, uh = unitH;
+        for (let nodeIdx = 0; nodeIdx < topo.nodes.length; nodeIdx++) {
+            const node = topo.nodes[nodeIdx];
+            // Per-node height grows with device count (3U/4U/5U as needed).
+            const uh = nodeHeights[nodeIdx];
+            const ux = apX, uy = rackY + nodeYs[nodeIdx], uw = apW;
             const brandW = 120;
             const portsZoneX = ux + brandW + 14;
             const portsZoneW = uw - brandW - 28 - 100;  // leave room for stats panel
@@ -1064,6 +1083,8 @@
                 <text x="${statsX+8}" y="${uy+38}" style="fill:#60a5fa; font-size:9px; font-family:monospace;">VMS   ${node.vms.length}</text>
                 <text x="${statsX+8}" y="${uy+52}" style="fill:#a855f7; font-size:9px; font-family:monospace;">CTRS  ${node.containers.length}</text>
                 <text x="${statsX+8}" y="${uy+72}" style="fill:#94a3b8; font-size:8px;">${escHtml(node.lan_segments?.length ? node.lan_segments.length + ' LAN' : 'no LAN')}</text>
+                <!-- Rack-unit size badge so taller nodes are explained -->
+                <text x="${statsX+80}" y="${uy+24}" text-anchor="end" style="fill:#fde68a; font-size:11px; font-weight:700; font-family:monospace;">${Math.max(2, Math.round(uh / 44))}U</text>
             `);
 
             // Ports — laid out in a single row across the middle of the chassis
@@ -1121,7 +1142,6 @@
                 });
             });
 
-            yCursor += uh + unitGap;
         }
 
         // Patch cables ────────────────────────────────────────────
@@ -1131,8 +1151,8 @@
         // together. The "spine" runs vertically; each node taps off it.
         const wolfnetSpineX = rackX + rackW - railW + 6;
         if (topo.nodes.length > 1) {
-            const firstY = rackY + rackInnerPad + unitH/2;
-            const lastY = rackY + rackInnerPad + (topo.nodes.length-1)*(unitH+unitGap) + unitH/2;
+            const firstY = rackY + nodeYs[0] + nodeHeights[0]/2;
+            const lastY = rackY + nodeYs[topo.nodes.length-1] + nodeHeights[topo.nodes.length-1]/2;
             // Spine
             svg.insertAdjacentHTML('beforeend', `
                 <line x1="${wolfnetSpineX}" y1="${firstY}" x2="${wolfnetSpineX}" y2="${lastY}"
@@ -1143,7 +1163,7 @@
             `);
             // Per-node tap from the spine into the back of each appliance
             for (let n = 0; n < topo.nodes.length; n++) {
-                const ny = rackY + rackInnerPad + n*(unitH+unitGap) + unitH/2;
+                const ny = rackY + nodeYs[n] + nodeHeights[n]/2;
                 const nx = apX + apW - 100;  // right edge of the stats panel
                 svg.insertAdjacentHTML('beforeend', `
                     <path d="M ${nx},${ny} C ${nx+30},${ny} ${wolfnetSpineX-20},${ny} ${wolfnetSpineX},${ny}"
@@ -1204,28 +1224,30 @@
         // Per-node device clusters — instead of a flat shelf, hang each
         // node's VMs/containers directly under that node so the wiring
         // is unambiguous: device → server → port → cable → cloud.
-        const deviceColW = Math.max(180, Math.floor(rackW / Math.max(topo.nodes.length, 1)) - 20);
-        const deviceColGap = 12;
+        // Each device gets its own row; the node's appliance height was
+        // grown above to accommodate them, so devices line up vertically
+        // within their owning node's vertical band.
         for (let nIdx = 0; nIdx < topo.nodes.length; nIdx++) {
             const node = topo.nodes[nIdx];
-            const nodeY = rackY + rackInnerPad + nIdx * (unitH + unitGap);
+            const nodeY = rackY + nodeYs[nIdx];
+            const nodeHeightPx = nodeHeights[nIdx];
             const devicesForNode = (node.vms || []).concat(node.containers || []);
             if (!devicesForNode.length) continue;
 
-            // Pick an anchor point on the node's right side to wire from
+            // Anchor on the node's right side, wired to all devices.
             const anchorX = apX + apW;
-            const anchorY = nodeY + unitH / 2;
-            // Each device gets a small badge to the right of the rack.
-            // Layout: stack vertically beside the node, wrap to a second
-            // column if too many.
+            const anchorY = nodeY + nodeHeightPx / 2;
             const colX = anchorX + 40 + nIdx * 4;  // staggered to avoid overlap
-            devicesForNode.slice(0, 6).forEach((dev, i) => {
+            // Centre the device column on the node so taller appliances
+            // host their devices symmetrically rather than top-aligned.
+            const totalDeviceH = devicesForNode.length * deviceRowH;
+            const startY = nodeY + (nodeHeightPx - totalDeviceH) / 2;
+            devicesForNode.forEach((dev, i) => {
                 const isVm = dev.kind === 'vm';
                 const accent = isVm ? '#60a5fa' : '#a855f7';
                 const icon = isVm ? '🖥' : '📦';
-                const dy = anchorY - 60 + i * 22;
-                // Curved cable from node anchor to device badge
-                const cableColor = isVm ? '#60a5fa' : '#a855f7';
+                const dy = startY + i * deviceRowH;
+                const cableColor = accent;
                 svg.insertAdjacentHTML('beforeend', `
                     <path d="M ${anchorX},${anchorY} C ${anchorX+20},${anchorY} ${colX-15},${dy+10} ${colX},${dy+10}"
                           fill="none" stroke="${cableColor}" stroke-width="2" stroke-linecap="round" opacity="0.55"
@@ -1238,13 +1260,6 @@
                     </g>
                 `);
             });
-            // Overflow indicator if there are more devices
-            if (devicesForNode.length > 6) {
-                svg.insertAdjacentHTML('beforeend', `
-                    <text x="${colX + 85}" y="${anchorY + 76}" text-anchor="middle"
-                          style="fill:var(--text-muted, #94a3b8); font-size:10px;">+ ${devicesForNode.length - 6} more</text>
-                `);
-            }
         }
 
         // Inter-node WolfNet mesh — each pair of nodes connected by a
