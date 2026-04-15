@@ -1284,8 +1284,8 @@
         if (topo.nodes.length > 1) {
             for (let i = 0; i < topo.nodes.length; i++) {
                 for (let j = i + 1; j < topo.nodes.length; j++) {
-                    const yi = rackY + rackInnerPad + i * (unitH + unitGap) + unitH/2;
-                    const yj = rackY + rackInnerPad + j * (unitH + unitGap) + unitH/2;
+                    const yi = rackY + nodeYs[i] + nodeHeights[i]/2;
+                    const yj = rackY + nodeYs[j] + nodeHeights[j]/2;
                     const xLeft = apX + 8;
                     // Curve to the left of the rack so it's visible
                     const ctrlX = xLeft - 80;
