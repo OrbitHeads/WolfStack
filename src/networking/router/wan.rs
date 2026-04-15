@@ -29,6 +29,9 @@ use tracing::{info, warn};
 const PEERS_DIR: &str = "/etc/ppp/peers";
 const CHAP_SECRETS: &str = "/etc/ppp/chap-secrets";
 const PAP_SECRETS: &str = "/etc/ppp/pap-secrets";
+const IP_PRE_UP_DIR: &str = "/etc/ppp/ip-pre-up.d";
+const IP_DOWN_DIR: &str = "/etc/ppp/ip-down.d";
+const STATE_DIR: &str = "/var/run/wolfrouter";
 
 /// One WAN uplink configuration. Keyed by `id` (auto-generated) and
 /// owned by `node_id`.
@@ -168,6 +171,90 @@ pub fn validate(conn: &WanConnection) -> Result<(), String> {
 
 // ─── PPPoE service lifecycle ───
 
+/// Install the ip-pre-up and ip-down hook scripts that snapshot the
+/// system's current default route + /etc/resolv.conf before PPPoE
+/// messes with them, and restore them when the link goes down.
+///
+/// This is the belt-and-braces we need because pppd's own
+/// `replacedefaultroute` only works reliably when pppd exits cleanly
+/// via poff — and even then, some distros' pppd versions don't
+/// restore on unexpected link drops. Running our own save/restore
+/// in the pppd hook directories guarantees the system comes back to
+/// its pre-PPPoE state regardless of how pppd died.
+fn install_ppp_hooks(peer_name: &str) -> Result<(), String> {
+    fs::create_dir_all(IP_PRE_UP_DIR)
+        .map_err(|e| format!("mkdir {}: {}", IP_PRE_UP_DIR, e))?;
+    fs::create_dir_all(IP_DOWN_DIR)
+        .map_err(|e| format!("mkdir {}: {}", IP_DOWN_DIR, e))?;
+    fs::create_dir_all(STATE_DIR)
+        .map_err(|e| format!("mkdir {}: {}", STATE_DIR, e))?;
+
+    let state_prefix = format!("{}/{}-", STATE_DIR, peer_name);
+
+    // ip-pre-up: runs before pppd touches routing. Save default route
+    // and resolv.conf so ip-down can restore them.
+    let pre_up = format!(
+        "#!/bin/sh\n\
+         # WolfRouter pre-up hook for {peer} — saves pre-PPPoE state.\n\
+         # $6 is the pppd peer name; only act on ours.\n\
+         [ \"$6\" = \"{peer}\" ] || exit 0\n\
+         ip route show default > \"{prefix}default-route\" 2>/dev/null || true\n\
+         cp /etc/resolv.conf \"{prefix}resolv.conf\" 2>/dev/null || true\n\
+         exit 0\n",
+        peer = peer_name, prefix = state_prefix,
+    );
+    let pre_up_path = format!("{}/wolfrouter-{}", IP_PRE_UP_DIR, peer_name);
+    fs::write(&pre_up_path, pre_up)
+        .map_err(|e| format!("write {}: {}", pre_up_path, e))?;
+    make_executable(&pre_up_path);
+
+    // ip-down: runs when link drops (expected or not). Restore state.
+    // Add the saved default route back — harmless if it's already
+    // there. Restore /etc/resolv.conf from our snapshot.
+    let down = format!(
+        "#!/bin/sh\n\
+         # WolfRouter ip-down hook for {peer} — restores pre-PPPoE state.\n\
+         [ \"$6\" = \"{peer}\" ] || exit 0\n\
+         SAVED_ROUTE=$(cat \"{prefix}default-route\" 2>/dev/null)\n\
+         if [ -n \"$SAVED_ROUTE\" ]; then\n\
+             # Strip any trailing ppp0 cruft and re-add. ip route add\n\
+             # will fail if the route already exists; that's fine.\n\
+             echo \"$SAVED_ROUTE\" | while read -r route; do\n\
+                 [ -z \"$route\" ] && continue\n\
+                 ip route replace $route 2>/dev/null || true\n\
+             done\n\
+         fi\n\
+         if [ -f \"{prefix}resolv.conf\" ]; then\n\
+             cp \"{prefix}resolv.conf\" /etc/resolv.conf 2>/dev/null || true\n\
+         fi\n\
+         exit 0\n",
+        peer = peer_name, prefix = state_prefix,
+    );
+    let down_path = format!("{}/wolfrouter-{}", IP_DOWN_DIR, peer_name);
+    fs::write(&down_path, down)
+        .map_err(|e| format!("write {}: {}", down_path, e))?;
+    make_executable(&down_path);
+
+    Ok(())
+}
+
+fn make_executable(path: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = fs::metadata(path) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o755);
+        let _ = fs::set_permissions(path, perms);
+    }
+}
+
+fn remove_ppp_hooks(peer_name: &str) {
+    let _ = fs::remove_file(format!("{}/wolfrouter-{}", IP_PRE_UP_DIR, peer_name));
+    let _ = fs::remove_file(format!("{}/wolfrouter-{}", IP_DOWN_DIR, peer_name));
+    let state_prefix = format!("{}/{}-", STATE_DIR, peer_name);
+    let _ = fs::remove_file(format!("{}default-route", state_prefix));
+    let _ = fs::remove_file(format!("{}resolv.conf", state_prefix));
+}
+
 /// Write the pppd peers file + chap/pap secrets for a PPPoE connection
 /// and start the link. Idempotent: stops the link first if it's
 /// already running so config updates take effect cleanly.
@@ -177,6 +264,11 @@ pub fn pppoe_apply(conn: &WanConnection, cfg: &PppoeConfig) -> Result<(), String
 
     let peer_name = peer_name_for(&conn.id);
     let peer_path = format!("{}/{}", PEERS_DIR, peer_name);
+
+    // Install the pre-up/down hooks that save and restore the pre-
+    // PPPoE default route + resolv.conf. Belt-and-braces on top of
+    // pppd's own replacedefaultroute behaviour.
+    install_ppp_hooks(&peer_name)?;
 
     // Peer file — references the PPPoE plugin and the underlying iface.
     let mut peer = String::new();
@@ -245,35 +337,98 @@ pub fn pppoe_apply(conn: &WanConnection, cfg: &PppoeConfig) -> Result<(), String
 }
 
 /// Tear down the PPP link for this connection. Safe to call when no
-/// link exists. Belt-and-braces: poff first, then pkill any lingering
-/// pppd for this peer name, then wait for the pid file to disappear
-/// so we don't race with a subsequent start and end up with ppp0,
-/// ppp1, ppp2... stacking up.
+/// link exists.
+///
+/// Stop sequence is deliberately GENTLE — pppd needs to run its own
+/// ip-down.d hooks (including ours, which restore the pre-PPPoE
+/// default route + resolv.conf) before it exits. Jumping straight to
+/// pkill -9 skips those hooks and is exactly how v17.2.1 users ended
+/// up with a broken default route requiring a reboot.
+///
+///   1. `poff <peer>` — the clean way, lets pppd run all hooks.
+///   2. Wait up to 8s for the pid file to disappear.
+///   3. Only if still alive, SIGTERM (pppd still runs hooks on TERM).
+///   4. Wait another 4s.
+///   5. Last resort: SIGKILL. If we had to come this far, the hooks
+///      didn't run, and the caller (apply) should fall back to a
+///      manual route restore.
 pub fn pppoe_stop(conn: &WanConnection) -> Result<(), String> {
     let peer_name = peer_name_for(&conn.id);
-    // poff drops the named peer's link cleanly when it works.
-    let _ = Command::new("poff").arg(&peer_name).status();
-    // Fallback: some distros ship poff that doesn't match our peer
-    // naming, or pppd might be a zombie. Kill anything still running
-    // `pppd call <peer>`.
-    let _ = Command::new("pkill").args(["-f", &format!("pppd call {}", peer_name)]).status();
-    // Wait briefly for the pid file to clear. Without this, a quick
-    // disable-then-enable sequence stacks ppp0/ppp1/ppp2 because the
-    // new pppd starts before the old one finishes dying.
     let pid_path = format!("/var/run/{}.pid", peer_name);
-    for _ in 0..20 {
-        if !std::path::Path::new(&pid_path).exists() { break; }
+    let pid_file_exists = || std::path::Path::new(&pid_path).exists();
+
+    // 1. Clean shutdown via poff.
+    let _ = Command::new("poff").arg(&peer_name).status();
+
+    // 2. Wait up to 8s for pppd to exit and clean up the pid file.
+    for _ in 0..32 {
+        if !pid_file_exists() { break; }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    // Remove any stale pid file so pppd won't refuse to start later.
+
+    // 3. Still alive? SIGTERM — pppd still runs ip-down hooks on TERM.
+    if pid_file_exists() {
+        let _ = Command::new("pkill")
+            .args(["-TERM", "-f", &format!("pppd call {}", peer_name)])
+            .status();
+        for _ in 0..16 {
+            if !pid_file_exists() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+
+    // 4. Truly stuck? SIGKILL — we lose hook execution, so the
+    // caller falls back to manual state restore.
+    let hooks_skipped = if pid_file_exists() {
+        let _ = Command::new("pkill")
+            .args(["-KILL", "-f", &format!("pppd call {}", peer_name)])
+            .status();
+        for _ in 0..8 {
+            if !pid_file_exists() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        true
+    } else { false };
+
+    // Remove any stale pid file.
     let _ = fs::remove_file(&pid_path);
+
+    // If we had to SIGKILL, the ip-down hook didn't run — manually
+    // replay the "restore pre-PPPoE state" the hook would have done.
+    if hooks_skipped {
+        manual_state_restore(&peer_name);
+    }
     Ok(())
 }
 
+/// Last-resort restore when the pppd ip-down hook didn't run (we had
+/// to SIGKILL). Reads the saved state files the ip-pre-up hook wrote
+/// and restores the default route + /etc/resolv.conf directly.
+fn manual_state_restore(peer_name: &str) {
+    let prefix = format!("{}/{}-", STATE_DIR, peer_name);
+    if let Ok(route) = fs::read_to_string(format!("{}default-route", prefix)) {
+        for line in route.lines() {
+            let line = line.trim();
+            if line.is_empty() { continue; }
+            let args: Vec<&str> = line.split_whitespace().collect();
+            let mut cmd = Command::new("ip");
+            cmd.arg("route").arg("replace");
+            cmd.args(&args);
+            let _ = cmd.status();
+        }
+    }
+    let snap = format!("{}resolv.conf", prefix);
+    if std::path::Path::new(&snap).exists() {
+        let _ = Command::new("cp").args([&snap, "/etc/resolv.conf"]).status();
+    }
+}
+
 pub fn pppoe_purge(conn: &WanConnection) -> Result<(), String> {
+    let peer_name = peer_name_for(&conn.id);
     let _ = pppoe_stop(conn);
-    let peer_path = format!("{}/{}", PEERS_DIR, peer_name_for(&conn.id));
+    let peer_path = format!("{}/{}", PEERS_DIR, peer_name);
     let _ = fs::remove_file(&peer_path);
+    remove_ppp_hooks(&peer_name);
     Ok(())
 }
 
