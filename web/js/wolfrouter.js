@@ -1649,6 +1649,96 @@
         return null;  // no override — use the rule's action colour
     }
 
+    /// Walk every node in the graph and flag it with a warning level
+    /// when something's wrong:
+    ///   danger  — down links, crash-looping containers, orphan VMs
+    ///   warn    — unassigned ports, ports with no zone, link saturated
+    /// Returns Map<nodeId, { level, reasons }>. The render loop uses
+    /// this to paint a red/amber glow + tooltip so problems jump out.
+    function wrComputeNodeWarnings(fullGraph) {
+        const out = new Map();
+        const add = (id, level, reason) => {
+            const cur = out.get(id) || { level: 'warn', reasons: [] };
+            // Promote to danger if any reason is danger-level.
+            if (level === 'danger') cur.level = 'danger';
+            cur.reasons.push(reason);
+            out.set(id, cur);
+        };
+        // Port-level checks from topology.
+        for (const n of (wrState.topology?.nodes || [])) {
+            for (const p of (n.interfaces || [])) {
+                const pid = `port:${n.node_id}:${p.name}`;
+                if (!fullGraph.nodes.some(x => x.id === pid)) continue;
+                if (p.link_up === false) {
+                    // WAN down is catastrophic; any other port down is
+                    // merely a warning (could be a spare).
+                    const isWan = p.role === 'wan';
+                    add(pid, isWan ? 'danger' : 'warn',
+                        isWan ? 'WAN link is down' : 'link down');
+                }
+                const hasAddr = (p.addresses && p.addresses.length) ||
+                                (p.master); // slave port inherits from bridge
+                if (p.role && p.role !== 'unused' && !hasAddr) {
+                    add(pid, 'warn', `role=${p.role} but no IP configured`);
+                }
+            }
+            for (const vm of (n.vms || [])) {
+                const vid = `vm:${vm.name}`;
+                if (!fullGraph.nodes.some(x => x.id === vid)) continue;
+                if (!vm.ip && !vm.attached_to) {
+                    add(vid, 'warn', 'VM has no network attachment');
+                }
+            }
+            for (const ct of (n.containers || [])) {
+                const cid = `ct:${ct.name}`;
+                if (!fullGraph.nodes.some(x => x.id === cid)) continue;
+                if (!ct.ip && !ct.attached_to) {
+                    add(cid, 'warn', 'container has no network attachment');
+                }
+                // Restart-loop / stopped-but-should-be-running signals
+                // come from the `state` field on the topology-supplied
+                // container record (present for docker).
+                if (ct.state === 'restarting') {
+                    add(cid, 'danger', 'container is restart-looping');
+                } else if (ct.state === 'exited' || ct.state === 'dead') {
+                    add(cid, 'warn', `container is ${ct.state}`);
+                }
+            }
+        }
+        // LAN segments without a DHCP range — boots-from-zero install
+        // would give zero leases. Easy mistake, easy to flag.
+        for (const lan of (wrState.lans || [])) {
+            if (lan.dhcp && lan.dhcp.enabled) {
+                if (!lan.dhcp.range_start || !lan.dhcp.range_end) {
+                    add(`lan:${lan.id}`, 'warn', 'DHCP enabled but range is empty');
+                }
+            }
+        }
+        // Zones referenced by rules but with no interface assignment
+        // in this cluster — rules can't fire if nothing's in the zone.
+        const assignedZones = new Set();
+        const asgAll = wrState.zones?.assignments || {};
+        for (const nodeId of Object.keys(asgAll)) {
+            for (const iface of Object.keys(asgAll[nodeId] || {})) {
+                const z = asgAll[nodeId][iface];
+                if (!z) continue;
+                assignedZones.add(z.kind === 'lan' ? `zone:lan${z.id ?? 0}` : `zone:${z.kind}`);
+            }
+        }
+        for (const zn of fullGraph.nodes.filter(n => n.kind === 'zone')) {
+            if (zn.id === 'zone:wan' || zn.id === 'zone:management' || zn.id === 'zone:trusted') {
+                // WAN/Mgmt/Trusted: no assignment is fine if no rules
+                // reference them — only warn if the zone's in a rule.
+                const referenced = (wrState.rules || []).some(r =>
+                    wrEndpointNodeId(r.from) === zn.id || wrEndpointNodeId(r.to) === zn.id);
+                if (referenced && !assignedZones.has(zn.id)) {
+                    add(zn.id, 'warn', 'rules reference this zone but no interface is assigned to it');
+                }
+            }
+        }
+        return out;
+    }
+
     /// Render the canvas from scratch. Safe to call on every poll —
     /// cheap because graphs stay small (dozens of nodes, not
     /// thousands).
@@ -1740,12 +1830,20 @@
         }
 
         const wrap = document.getElementById('wr-policy-canvas-wrap');
-        const baseW = wrap?.clientWidth || 1000;
-        // Grow vertical space with node count so big cluster maps
-        // don't squash — but zoom-out is the real escape hatch.
-        const tierCount = new Set(graph.nodes.map(n => n.tier)).size || 1;
-        const baseH = Math.max(600, tierCount * 130);
-        const layout = wrLayoutPolicyGraph(graph, baseW - 40, baseH);
+        const wrapW = wrap?.clientWidth || 1000;
+        // Canvas grows to fit the widest row (210px per node) so ports
+        // on a big cluster don't end up a crammed ribbon across the
+        // middle; wrap has overflow:auto so users pan horizontally.
+        // Vertical space is a generous 190px per tier.
+        const tierCounts = {};
+        for (const n of graph.nodes) {
+            tierCounts[n.tier] = (tierCounts[n.tier] || 0) + 1;
+        }
+        const maxRow = Math.max(1, ...Object.values(tierCounts));
+        const tierCount = Object.keys(tierCounts).length || 1;
+        const baseW = Math.max(wrapW, maxRow * 210);
+        const baseH = Math.max(680, tierCount * 190);
+        const layout = wrLayoutPolicyGraph(graph, baseW - 60, baseH);
 
         const zoom = Math.max(0.3, Math.min(2.5, wrPolicyUi.zoom || 1));
         const W = baseW * zoom, H = baseH * zoom;
@@ -1765,6 +1863,18 @@
                 <filter id="wr-policy-glow" x="-50%" y="-50%" width="200%" height="200%">
                     <feGaussianBlur stdDeviation="3" result="b"/>
                     <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+                </filter>
+                <filter id="wr-policy-warn-glow" x="-80%" y="-80%" width="260%" height="260%">
+                    <feGaussianBlur stdDeviation="5" result="b"/>
+                    <feFlood flood-color="#ef4444" flood-opacity="0.9" result="c"/>
+                    <feComposite in="c" in2="b" operator="in" result="cb"/>
+                    <feMerge><feMergeNode in="cb"/><feMergeNode in="SourceGraphic"/></feMerge>
+                </filter>
+                <filter id="wr-policy-amber-glow" x="-80%" y="-80%" width="260%" height="260%">
+                    <feGaussianBlur stdDeviation="4" result="b"/>
+                    <feFlood flood-color="#fbbf24" flood-opacity="0.85" result="c"/>
+                    <feComposite in="c" in2="b" operator="in" result="cb"/>
+                    <feMerge><feMergeNode in="cb"/><feMergeNode in="SourceGraphic"/></feMerge>
                 </filter>
                 <radialGradient id="wr-sim-packet">
                     <stop offset="0" stop-color="#fde68a"/>
@@ -1869,14 +1979,18 @@
 
         // Nodes on top. Dim when trace mode is active and we're not
         // on the traced graph. Nodes with a meta.ip get a taller rect
-        // so we can show the IP/subnet on a second line.
-        const nodeW = 140, nodeH = 36, nodeHip = 52;
+        // so we can show the IP/subnet on a second line. Nodes that
+        // fail a health check get a red or amber glow + tooltip so
+        // problems are spottable at a glance.
+        const warnings = wrComputeNodeWarnings(fullGraph);
+        const nodeW = 160, nodeH = 38, nodeHip = 56;
         for (const n of graph.nodes) {
             const p = layout.get(n.id);
             if (!p) continue;
             const ipText = (n.meta && n.meta.ip) ? String(n.meta.ip) : '';
             const h = ipText ? nodeHip : nodeH;
             const x = p.x - nodeW/2, y = p.y - h/2;
+            const warn = warnings.get(n.id);
             const fill = {
                 internet: 'rgba(96,165,250,0.18)', zone: 'rgba(168,85,247,0.18)',
                 lan: 'rgba(34,197,94,0.15)', vm: 'rgba(59,130,246,0.12)',
@@ -1911,15 +2025,30 @@
                 ? `<text x="${p.x}" y="${p.y+12}" text-anchor="middle"
                         style="fill:var(--text-muted); font-size:10px; font-family:var(--font-mono,monospace); pointer-events:none;">${escHtml(ipText.slice(0,22))}</text>`
                 : '';
+            // Warning glow: down-ports/unconfigured things glow red,
+            // things that are merely "needs attention" glow amber.
+            // Trace highlight wins over warning so the traced path is
+            // never obscured.
+            const warnFilter = isTraced ? 'url(#wr-policy-glow)'
+                             : warn?.level === 'danger' ? 'url(#wr-policy-warn-glow)'
+                             : warn?.level === 'warn'   ? 'url(#wr-policy-amber-glow)'
+                             : '';
+            const warnStroke = warn?.level === 'danger' ? '#ef4444'
+                             : warn?.level === 'warn'   ? '#fbbf24'
+                             : stroke;
+            const warnStrokeW = warn ? 2.5 : (isTraced ? 2.5 : 1.5);
+            const tooltip = warn ? `<title>${escHtml(n.label)}\n⚠ ${escHtml(warn.reasons.join('\n⚠ '))}</title>` : '';
             svg.insertAdjacentHTML('beforeend', `
                 <g class="wr-policy-node" data-node="${escHtml(n.id)}" style="cursor:crosshair; opacity:${opacity};">
+                    ${tooltip}
                     <rect x="${x}" y="${y}" width="${nodeW}" height="${h}" rx="8"
-                          fill="${fill}" stroke="${stroke}" stroke-width="${isTraced ? 2.5 : 1.5}"
-                          ${isTraced ? 'filter="url(#wr-policy-glow)"' : ''}/>
+                          fill="${fill}" stroke="${warnStroke}" stroke-width="${warnStrokeW}"
+                          ${warnFilter ? `filter="${warnFilter}"` : ''}/>
                     <text x="${p.x}" y="${labelY}" text-anchor="middle"
-                          style="fill:var(--text); font-size:12px; font-weight:600; pointer-events:none;">${escHtml(n.icon)} ${escHtml(n.label.slice(0,16))}</text>
+                          style="fill:var(--text); font-size:12px; font-weight:600; pointer-events:none;">${escHtml(n.icon)} ${escHtml(n.label.slice(0,18))}</text>
                     ${ipLine}
                     ${bpsTag}
+                    ${warn ? `<text x="${x + nodeW - 8}" y="${y + 14}" text-anchor="end" style="fill:${warn.level === 'danger' ? '#ef4444' : '#fbbf24'}; font-size:14px; pointer-events:none;">⚠</text>` : ''}
                 </g>
             `);
         }
