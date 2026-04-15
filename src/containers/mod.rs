@@ -9,6 +9,7 @@
 //! WolfNet: Optional overlay network integration for container networking
 
 pub mod image_watcher;
+pub mod lxc_storage;
 
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;

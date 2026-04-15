@@ -195,9 +195,20 @@ pub async fn get_topology(
     // Find self's cluster name. If a filter is set and self isn't in
     // that cluster, omit self from the result and only fan out to peers
     // in the requested cluster.
+    // Cluster name normaliser — a node with no explicit cluster_name
+    // is grouped as "WolfStack" in the sidebar tree (see app.js
+    // `n.cluster_name || "WolfStack"`). Backend filtering must use
+    // the same alias or nameless nodes leak into named-cluster views.
+    let normalize = |n: Option<&str>| -> String {
+        match n {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => "WolfStack".into(),
+        }
+    };
     let self_cluster = state.cluster.get_self_cluster_name();
+    let self_cluster_norm = normalize(if self_cluster.is_empty() { None } else { Some(&self_cluster) });
     let include_self = match &cluster_filter {
-        Some(want) => self_cluster == *want,
+        Some(want) => self_cluster_norm == *want,
         None => true,
     };
 
@@ -235,21 +246,18 @@ pub async fn get_topology(
                 }));
                 continue;
             }
-            // Cluster scoping — LENIENT. A peer with cluster_name = None
-            // is still included (newly-added node that hasn't synced its
-            // cluster name yet, or one that pre-dates the cluster_name
-            // field). Strict filter only excludes nodes that explicitly
-            // belong to a DIFFERENT named cluster.
+            // Cluster scoping — strict, but uses the same None→"WolfStack"
+            // alias the sidebar tree uses so nameless nodes show up where
+            // the user expects (the WolfStack group, not every cluster).
             if let Some(ref want) = cluster_filter {
-                if let Some(other) = node.cluster_name.as_deref() {
-                    if other != want.as_str() {
-                        peer_diagnostics.push(serde_json::json!({
-                            "node_id": node.id, "hostname": node.hostname,
-                            "result": "skipped",
-                            "reason": format!("cluster_name='{}' doesn't match filter '{}'", other, want)
-                        }));
-                        continue;
-                    }
+                let node_cluster = normalize(node.cluster_name.as_deref());
+                if &node_cluster != want {
+                    peer_diagnostics.push(serde_json::json!({
+                        "node_id": node.id, "hostname": node.hostname,
+                        "result": "skipped",
+                        "reason": format!("cluster_name='{}' doesn't match filter '{}'", node_cluster, want)
+                    }));
+                    continue;
                 }
             }
             // We deliberately do NOT skip "offline" peers: last_seen
@@ -1232,7 +1240,12 @@ pub async fn create_wan(req: HttpRequest, state: S, body: web::Json<wan::WanConn
         }
     }
     replicate_config_to_cluster(state);
-    HttpResponse::Ok().json(&conn)
+    // Mask password before returning — never echo plaintext back to UI.
+    let mut response = conn.clone();
+    if let wan::WanMode::Pppoe(ref mut p) = response.mode {
+        if !p.password.is_empty() { p.password = "***".into(); }
+    }
+    HttpResponse::Ok().json(&response)
 }
 
 pub async fn update_wan(
@@ -1274,7 +1287,12 @@ pub async fn update_wan(
         let _ = wan::apply(&updated);
     }
     replicate_config_to_cluster(state);
-    HttpResponse::Ok().json(&updated)
+    // Mask password before returning — never echo plaintext back to UI.
+    let mut response = updated.clone();
+    if let wan::WanMode::Pppoe(ref mut p) = response.mode {
+        if !p.password.is_empty() { p.password = "***".into(); }
+    }
+    HttpResponse::Ok().json(&response)
 }
 
 pub async fn delete_wan(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {

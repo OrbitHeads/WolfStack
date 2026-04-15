@@ -4788,6 +4788,147 @@ pub async fn docker_inspect(
     }
 }
 
+// ─── LXC disk: inspect / resize / migrate ───────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct LxcResizeRequest {
+    /// Target absolute size in GB. Backend converts to bytes / Proxmox
+    /// short form. Must be ≥ current usage (refused otherwise).
+    pub size_gb: u64,
+    /// Volume id for Proxmox containers. Defaults to "rootfs" when
+    /// unset. Native LXC always grows the rootfs.
+    #[serde(default)]
+    pub volume: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct LxcMigrateStorageRequest {
+    /// Target storage path (native) or Proxmox storage id (PVE).
+    pub target: String,
+    /// Whether to remove the source after a successful copy. Defaults
+    /// to false — we keep the source until the user confirms the new
+    /// copy boots OK.
+    #[serde(default)]
+    pub remove_source: bool,
+    /// Volume id for Proxmox containers. Defaults to "rootfs".
+    #[serde(default)]
+    pub volume: Option<String>,
+}
+
+/// GET /api/containers/lxc/{name}/disk — current backend, size, used.
+pub async fn lxc_disk_info(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let name = path.into_inner();
+    match containers::lxc_storage::inspect(&name) {
+        Ok(info) => HttpResponse::Ok().json(info),
+        Err(e) => HttpResponse::NotFound().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// POST /api/containers/lxc/{name}/disk/resize — grow the rootfs (or
+/// a specific Proxmox volume) to a new absolute size in GB.
+pub async fn lxc_disk_resize(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<LxcResizeRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let name = path.into_inner();
+    let r = body.into_inner();
+    let info = match containers::lxc_storage::inspect(&name) {
+        Ok(i) => i,
+        Err(e) => return HttpResponse::NotFound().json(serde_json::json!({ "error": e })),
+    };
+    let new_bytes = r.size_gb.saturating_mul(1024 * 1024 * 1024);
+    if info.proxmox {
+        // Route via PVE API. Look up the matching PveClient by node name.
+        let vol = r.volume.unwrap_or_else(|| "rootfs".into());
+        let pve = match find_pve_client(&state, &info.pve_node).await {
+            Some(c) => c,
+            None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "error": "no Proxmox node registered for this container"
+            })),
+        };
+        let size_str = format!("{}G", r.size_gb);
+        match pve.lxc_resize_disk(info.pve_vmid, &vol, &size_str).await {
+            Ok(upid) => HttpResponse::Ok().json(serde_json::json!({
+                "message": format!("PVE resize task started: {}", upid),
+                "upid": upid,
+            })),
+            Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+        }
+    } else {
+        match containers::lxc_storage::resize(&name, new_bytes) {
+            Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+            Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+        }
+    }
+}
+
+/// POST /api/containers/lxc/{name}/disk/migrate — move the rootfs to
+/// a different storage path / pool.
+pub async fn lxc_disk_migrate(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<LxcMigrateStorageRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let name = path.into_inner();
+    let r = body.into_inner();
+    let info = match containers::lxc_storage::inspect(&name) {
+        Ok(i) => i,
+        Err(e) => return HttpResponse::NotFound().json(serde_json::json!({ "error": e })),
+    };
+    if info.proxmox {
+        let vol = r.volume.unwrap_or_else(|| "rootfs".into());
+        let pve = match find_pve_client(&state, &info.pve_node).await {
+            Some(c) => c,
+            None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "error": "no Proxmox node registered for this container"
+            })),
+        };
+        match pve.lxc_move_volume(info.pve_vmid, &vol, &r.target, r.remove_source).await {
+            Ok(upid) => HttpResponse::Ok().json(serde_json::json!({
+                "message": format!("PVE move-volume task started: {}", upid),
+                "upid": upid,
+            })),
+            Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+        }
+    } else {
+        match containers::lxc_storage::migrate(&name, &r.target, r.remove_source) {
+            Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+            Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+        }
+    }
+}
+
+/// Look up a connected PveClient by node id. Returns None if no
+/// Proxmox node by that id is registered (or if pve_node is empty,
+/// which means the container is on the local host running pct).
+async fn find_pve_client(
+    state: &web::Data<AppState>,
+    pve_node: &str,
+) -> Option<crate::proxmox::PveClient> {
+    if pve_node.is_empty() { return None; }
+    let nodes = state.cluster.get_all_nodes();
+    let target = nodes.iter().find(|n| n.node_type == "proxmox" && n.id == pve_node)?;
+    let token = target.pve_token.as_deref()?;
+    let node_name = target.pve_node_name.as_deref().unwrap_or(&target.hostname);
+    Some(crate::proxmox::PveClient::new(
+        &target.address,
+        target.port,
+        token,
+        target.pve_fingerprint.as_deref(),
+        node_name,
+    ))
+}
+
 /// GET /api/containers/lxc/{name}/mounts — list LXC container bind mounts
 pub async fn lxc_mounts(
     req: HttpRequest,
@@ -16915,6 +17056,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/containers/lxc/{name}/settings", web::post().to(lxc_update_settings))
         .route("/api/containers/lxc/{name}/export", web::post().to(lxc_export_endpoint))
         .route("/api/containers/lxc/{name}/migrate", web::post().to(lxc_migrate))
+        .route("/api/containers/lxc/{name}/disk", web::get().to(lxc_disk_info))
+        .route("/api/containers/lxc/{name}/disk/resize", web::post().to(lxc_disk_resize))
+        .route("/api/containers/lxc/{name}/disk/migrate", web::post().to(lxc_disk_migrate))
         .route("/api/containers/lxc/{name}/migrate-external", web::post().to(lxc_migrate_external))
         .route("/api/migration/{id}/status", web::get().to(migration_status))
         // Network Conflicts

@@ -100,24 +100,46 @@ impl PveClient {
 
     /// POST request to PVE API
     async fn post(&self, path: &str) -> Result<serde_json::Value, String> {
+        self.post_form(path, &[]).await
+    }
+
+    /// POST with a form-encoded body. PVE's resize/move endpoints take
+    /// parameters as form fields, not JSON, so this is the right call
+    /// for those.
+    async fn post_form(&self, path: &str, form: &[(&str, &str)]) -> Result<serde_json::Value, String> {
         let url = format!("{}/api2/json{}", self.base_url, path);
-
-
-        let resp = self.client.post(&url)
-            .header("Authorization", self.auth_header())
-            .send()
-            .await
+        let mut req = self.client.post(&url)
+            .header("Authorization", self.auth_header());
+        if !form.is_empty() {
+            req = req.form(form);
+        }
+        let resp = req.send().await
             .map_err(|e| format!("PVE request failed: {}", e))?;
-
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             return Err(format!("PVE API {} {}: {}", status.as_u16(), path, body));
         }
-
         let json: serde_json::Value = resp.json().await
             .map_err(|e| format!("PVE JSON parse: {}", e))?;
+        Ok(json.get("data").cloned().unwrap_or(json))
+    }
 
+    /// PUT with a form-encoded body — used by /lxc/{id}/resize.
+    async fn put_form(&self, path: &str, form: &[(&str, &str)]) -> Result<serde_json::Value, String> {
+        let url = format!("{}/api2/json{}", self.base_url, path);
+        let resp = self.client.put(&url)
+            .header("Authorization", self.auth_header())
+            .form(form)
+            .send().await
+            .map_err(|e| format!("PVE request failed: {}", e))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("PVE API {} {}: {}", status.as_u16(), path, body));
+        }
+        let json: serde_json::Value = resp.json().await
+            .map_err(|e| format!("PVE JSON parse: {}", e))?;
         Ok(json.get("data").cloned().unwrap_or(json))
     }
 
@@ -301,6 +323,54 @@ impl PveClient {
         let upid = data.as_str().unwrap_or("ok").to_string();
 
         Ok(upid)
+    }
+
+    /// Resize an LXC container's disk. `disk` is the volume id from
+    /// the config (typically "rootfs", or "mp0", "mp1" ... for extra
+    /// mountpoints). `size` is a Proxmox-format string — either a
+    /// concrete size like "16G" or a relative grow like "+4G". PVE
+    /// refuses shrinks via this endpoint.
+    pub async fn lxc_resize_disk(&self, vmid: u64, disk: &str, size: &str) -> Result<String, String> {
+        let path = format!("/nodes/{}/lxc/{}/resize", self.node_name, vmid);
+        let data = self.put_form(&path, &[("disk", disk), ("size", size)]).await?;
+        let upid = data.as_str().unwrap_or("ok").to_string();
+        Ok(upid)
+    }
+
+    /// Move an LXC container's volume to a different storage pool.
+    /// `volume` is the disk id ("rootfs", "mp0", ...). `target_storage`
+    /// is the storage id (e.g. "local-zfs", "ceph-pool"). `delete` =
+    /// true removes the source after a successful copy. PVE handles
+    /// the underlying copy method (zfs send/recv, qcow2 dd, etc).
+    pub async fn lxc_move_volume(
+        &self, vmid: u64, volume: &str, target_storage: &str, delete: bool,
+    ) -> Result<String, String> {
+        let path = format!("/nodes/{}/lxc/{}/move_volume", self.node_name, vmid);
+        let delete_str = if delete { "1" } else { "0" };
+        let data = self.post_form(&path, &[
+            ("volume", volume),
+            ("storage", target_storage),
+            ("delete", delete_str),
+        ]).await?;
+        let upid = data.as_str().unwrap_or("ok").to_string();
+        Ok(upid)
+    }
+
+    /// List storage pools available on this PVE node — used for the
+    /// "Move to..." dropdown in the WolfStack frontend.
+    pub async fn list_storages(&self) -> Result<Vec<serde_json::Value>, String> {
+        let path = format!("/nodes/{}/storage", self.node_name);
+        let data = self.get(&path).await?;
+        let arr = data.as_array().cloned().unwrap_or_default();
+        Ok(arr)
+    }
+
+    /// Read an LXC container's full config — same data `pct config`
+    /// would print, parsed by PVE into a JSON object with keys like
+    /// `rootfs`, `cores`, `memory`, etc.
+    pub async fn lxc_config(&self, vmid: u64) -> Result<serde_json::Value, String> {
+        let path = format!("/nodes/{}/lxc/{}/config", self.node_name, vmid);
+        self.get(&path).await
     }
 
     /// Get a termproxy ticket for interactive terminal access to a guest

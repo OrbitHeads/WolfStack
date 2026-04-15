@@ -11888,6 +11888,7 @@ function renderLxcCards(containers, stats) {
                 <button class="btn btn-sm" style="${bs}" onclick="openContainerCron('lxc','${c.name}')" title="Cron">⏰</button>
                 <button class="btn btn-sm" style="${bs}" onclick="cloneLxcContainer('${c.name}')" title="Clone">📋</button>
                 <button class="btn btn-sm" style="${bs}" onclick="migrateLxcContainer('${c.name}')" title="Migrate">🚀</button>
+                <button class="btn btn-sm" style="${bs}" onclick="openLxcStorage('${escapeHtml(c.name)}')" title="Storage (resize / move)">💾</button>
                 <button class="btn btn-sm" style="${bs}" onclick="exportLxcContainer('${c.name}')" title="Export">🗃️</button>
             </div>
             ${pies.length > 0 ? `<div style="display:flex;justify-content:space-evenly;padding:12px 8px;border-bottom:1px solid var(--border);">${pies.join('')}</div>` : ''}
@@ -14543,6 +14544,156 @@ async function doMigrateVm(name) {
         document.getElementById('vm-op-close').style.display = '';
         updateTaskLogEntry(taskId, { status: 'failed', description: `Migrate VM '${name}': ${e.message}` });
     }
+}
+
+// Open the LXC storage panel: shows current backend + size + used,
+// lets the user grow the volume or migrate it to another storage.
+// Same UI works for native LXC (rsync-based migrate, ZFS/LVM/btrfs
+// resize) and Proxmox-managed LXC (PVE move-volume / resize API).
+async function openLxcStorage(name) {
+    const apiBase = apiUrl(`/api/containers/lxc/${encodeURIComponent(name)}/disk`);
+    let info;
+    try {
+        const r = await fetch(apiBase);
+        if (!r.ok) {
+            const err = await r.json().catch(() => ({}));
+            showToast(`Couldn't read storage info: ${err.error || r.status}`, 'error');
+            return;
+        }
+        info = await r.json();
+    } catch (e) {
+        showToast('Network error: ' + e.message, 'error');
+        return;
+    }
+    const fmtBytes = (b) => {
+        if (b == null) return '—';
+        if (b > 1024**4) return (b / 1024**4).toFixed(2) + ' TB';
+        if (b > 1024**3) return (b / 1024**3).toFixed(2) + ' GB';
+        if (b > 1024**2) return (b / 1024**2).toFixed(1) + ' MB';
+        return b + ' B';
+    };
+    const currentGb = info.size_bytes != null ? Math.ceil(info.size_bytes / 1024 / 1024 / 1024) : 8;
+    const usedPct = (info.size_bytes && info.used_bytes)
+        ? Math.round(100 * info.used_bytes / info.size_bytes) : 0;
+    // Storage targets: registered LXC paths (for native) or PVE
+    // storages (for Proxmox). We try both — UI just shows one row per.
+    let targetOptions = '';
+    try {
+        if (info.proxmox) {
+            // PVE storage list isn't exposed yet via WolfStack — let
+            // the user type the storage id manually.
+            targetOptions = '<input id="lxc-storage-target" class="form-control" placeholder="e.g. local-zfs, ceph-pool"/>';
+        } else {
+            const r = await fetch(apiUrl('/api/storage/list'));
+            const list = r.ok ? await r.json() : [];
+            const paths = (list?.lxc_storage_paths || []).filter(p => p !== info.storage);
+            const opts = paths.length
+                ? paths.map(p => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`).join('')
+                : '<option value="">(no other LXC storage paths registered)</option>';
+            targetOptions = `<select id="lxc-storage-target" class="form-control">${opts}</select>`;
+        }
+    } catch (e) {
+        targetOptions = '<input id="lxc-storage-target" class="form-control" placeholder="storage path or PVE storage id"/>';
+    }
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay active';
+    overlay.style.zIndex = '10000';
+    overlay.innerHTML = `
+        <div class="modal" style="max-width:560px;">
+            <div class="modal-header">
+                <h3>💾 Storage — ${escapeHtml(name)}</h3>
+                <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">×</button>
+            </div>
+            <div class="modal-body" style="font-size:13px;">
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:14px; padding:10px; background:var(--bg-card); border-radius:6px;">
+                    <div><div style="color:var(--text-muted); font-size:11px;">Backend</div><strong>${escapeHtml(info.backend || '?')}</strong>${info.proxmox ? ' <span class="badge" style="background:rgba(168,85,247,0.15); color:#a855f7; font-size:10px; padding:1px 6px;">PVE</span>' : ''}</div>
+                    <div><div style="color:var(--text-muted); font-size:11px;">Filesystem</div><strong>${escapeHtml(info.fs_type || '?')}</strong></div>
+                    <div><div style="color:var(--text-muted); font-size:11px;">Storage</div><code style="font-size:11px;">${escapeHtml(info.storage || '—')}</code></div>
+                    <div><div style="color:var(--text-muted); font-size:11px;">Rootfs</div><code style="font-size:11px;">${escapeHtml(info.rootfs || '—')}</code></div>
+                    <div style="grid-column:1/-1;"><div style="color:var(--text-muted); font-size:11px;">Used / Size</div>
+                        <strong>${fmtBytes(info.used_bytes)} of ${fmtBytes(info.size_bytes)}</strong>
+                        <div style="background:var(--bg-secondary); height:6px; border-radius:3px; margin-top:4px;">
+                            <div style="background:${usedPct > 80 ? '#ef4444' : usedPct > 60 ? '#fbbf24' : '#22c55e'}; height:6px; width:${usedPct}%; border-radius:3px;"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <h4 style="font-size:13px; margin:12px 0 6px;">Grow disk</h4>
+                <div style="display:flex; gap:8px; align-items:end;">
+                    <label style="flex:1;">New size (GB)
+                        <input id="lxc-storage-size" type="number" class="form-control" value="${currentGb + 4}" min="${currentGb}"/>
+                    </label>
+                    <button class="btn btn-primary" onclick="lxcStorageResize('${escapeHtml(name)}')" style="height:34px;">Resize</button>
+                </div>
+                <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">
+                    ${info.backend === 'directory' ? '⚠️ Directory backend has no per-container quota — grow the host filesystem instead.' :
+                      info.proxmox ? 'Proxmox routes via the PVE resize API; absolute size only (no shrink).' :
+                      info.backend === 'zfs' ? 'ZFS quota change is online and instant.' :
+                      info.backend === 'lvm' ? 'LVM grow is online for ext4/xfs/btrfs.' :
+                      'Resize behaviour depends on the backend.'}
+                </div>
+
+                <h4 style="font-size:13px; margin:18px 0 6px;">Move to different storage</h4>
+                <div style="display:flex; gap:8px; align-items:end;">
+                    <div style="flex:1;">
+                        <div style="font-size:11px; color:var(--text-muted); margin-bottom:2px;">Target ${info.proxmox ? 'PVE storage id' : 'LXC storage path'}</div>
+                        ${targetOptions}
+                    </div>
+                    <label style="display:flex; align-items:center; gap:4px; font-size:12px;">
+                        <input type="checkbox" id="lxc-storage-remove"/> remove source
+                    </label>
+                    <button class="btn" onclick="lxcStorageMigrate('${escapeHtml(name)}')" style="height:34px;">Migrate</button>
+                </div>
+                <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">
+                    ${info.proxmox ? 'PVE move-volume copies the volume between storage pools (zfs send/recv, dd, etc).' : 'rsync -aHAX preserves perms/xattrs. Container should be stopped for a clean move.'}
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="this.closest('.modal-overlay').remove()">Close</button>
+            </div>
+        </div>`;
+    document.body.appendChild(overlay);
+}
+
+async function lxcStorageResize(name) {
+    const sizeGb = parseInt(document.getElementById('lxc-storage-size').value, 10);
+    if (!sizeGb || sizeGb < 1) { alert('Enter a size in GB'); return; }
+    if (!(await showConfirm(`Resize ${name}'s disk to ${sizeGb} GB?`))) return;
+    try {
+        const r = await fetch(apiUrl(`/api/containers/lxc/${encodeURIComponent(name)}/disk/resize`), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ size_gb: sizeGb }),
+        });
+        const data = await r.json();
+        if (!r.ok) {
+            showToast('Resize failed: ' + (data.error || r.status), 'error');
+            return;
+        }
+        showToast(data.message || 'Resized', 'success');
+        document.querySelector('.modal-overlay')?.remove();
+    } catch (e) { showToast('Error: ' + e.message, 'error'); }
+}
+
+async function lxcStorageMigrate(name) {
+    const target = document.getElementById('lxc-storage-target').value.trim();
+    const removeSource = document.getElementById('lxc-storage-remove').checked;
+    if (!target) { alert('Pick or enter a target storage'); return; }
+    if (!(await showConfirm(`Migrate ${name} to ${target}? ${removeSource ? '(source will be removed after copy)' : '(source will be kept)'}`))) return;
+    try {
+        const r = await fetch(apiUrl(`/api/containers/lxc/${encodeURIComponent(name)}/disk/migrate`), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ target, remove_source: removeSource }),
+        });
+        const data = await r.json();
+        if (!r.ok) {
+            showToast('Migrate failed: ' + (data.error || r.status), 'error');
+            return;
+        }
+        showToast(data.message || 'Migrate started', 'success', 8000);
+        document.querySelector('.modal-overlay')?.remove();
+    } catch (e) { showToast('Error: ' + e.message, 'error'); }
 }
 
 async function exportLxcContainer(name) {

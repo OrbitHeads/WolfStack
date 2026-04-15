@@ -235,9 +235,13 @@
     --bg-tertiary: rgba(6, 14, 48, 0.72);
     --border: rgba(55, 110, 220, 0.20);
     --border-light: rgba(70, 150, 255, 0.30);
-    --text-primary: #c8e0ff;
-    --text-secondary: #5a88c0;
-    --text-muted: #2e4d78;
+    /* Text was too dim against the frosted-blue backgrounds — pushed
+       primary near-white, secondary to a clearly-readable pale blue,
+       and muted up from 2e4d78 (basically invisible) to a8c4e8. */
+    --text: #f0f6ff;
+    --text-primary: #f0f6ff;
+    --text-secondary: #b8d0ee;
+    --text-muted: #a8c4e8;
     --accent: #3b9eff;
     --accent-light: #74c0ff;
     --accent-glow: rgba(59, 158, 255, 0.20);
