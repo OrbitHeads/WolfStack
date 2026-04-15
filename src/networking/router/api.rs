@@ -215,49 +215,103 @@ pub async fn get_topology(
         .timeout(std::time::Duration::from_secs(5))
         .build();
 
+    // Per-peer diagnostic trail so when a node is missing from the
+    // rack view, the response tells you *why* (filtered out / offline /
+    // HTTP error / etc) instead of leaving you guessing.
+    let mut peer_diagnostics: Vec<serde_json::Value> = Vec::new();
+
     if let Ok(client) = client {
         let mut futures = Vec::new();
         for node in cluster_nodes {
-            if node.is_self || node.id == self_id { continue; }
-            if !node.online { continue; }
-            if node.node_type != "wolfstack" { continue; }
-            // Cluster scoping: only include nodes whose cluster_name
-            // matches the requested filter (when one was supplied).
-            if let Some(ref want) = cluster_filter {
-                if node.cluster_name.as_deref() != Some(want.as_str()) { continue; }
+            if node.is_self || node.id == self_id {
+                peer_diagnostics.push(serde_json::json!({
+                    "node_id": node.id, "hostname": node.hostname,
+                    "result": "skipped", "reason": "is_self"
+                }));
+                continue;
             }
-            let url = format!("https://{}:{}/api/router/topology-local", node.address, node.port);
-            let secret_h = secret.clone();
-            let client_c = client.clone();
-            let node_id_for_log = node.id.clone();
-            futures.push(async move {
-                match client_c.get(&url)
-                    .header("X-WolfStack-Secret", &secret_h)
-                    .send().await
-                {
-                    Ok(r) if r.status().is_success() => {
-                        match r.json::<topology::NodeTopology>().await {
-                            Ok(t) => Some(t),
-                            Err(e) => {
-                                tracing::warn!("router topology decode {}: {}", node_id_for_log, e);
-                                None
-                            }
-                        }
-                    }
-                    Ok(r) => {
-                        tracing::warn!("router topology fetch {} returned {}", node_id_for_log, r.status());
-                        None
-                    }
-                    Err(e) => {
-                        tracing::warn!("router topology fetch {}: {}", node_id_for_log, e);
-                        None
+            if node.node_type != "wolfstack" {
+                peer_diagnostics.push(serde_json::json!({
+                    "node_id": node.id, "hostname": node.hostname,
+                    "result": "skipped", "reason": format!("node_type={} (not wolfstack)", node.node_type)
+                }));
+                continue;
+            }
+            // Cluster scoping — LENIENT. A peer with cluster_name = None
+            // is still included (newly-added node that hasn't synced its
+            // cluster name yet, or one that pre-dates the cluster_name
+            // field). Strict filter only excludes nodes that explicitly
+            // belong to a DIFFERENT named cluster.
+            if let Some(ref want) = cluster_filter {
+                if let Some(other) = node.cluster_name.as_deref() {
+                    if other != want.as_str() {
+                        peer_diagnostics.push(serde_json::json!({
+                            "node_id": node.id, "hostname": node.hostname,
+                            "result": "skipped",
+                            "reason": format!("cluster_name='{}' doesn't match filter '{}'", other, want)
+                        }));
+                        continue;
                     }
                 }
+            }
+            if !node.online {
+                peer_diagnostics.push(serde_json::json!({
+                    "node_id": node.id, "hostname": node.hostname,
+                    "result": "skipped",
+                    "reason": format!("offline (last_seen={})", node.last_seen)
+                }));
+                continue;
+            }
+
+            let host = node.address.clone();
+            let port = node.port;
+            let id = node.id.clone();
+            let hostname = node.hostname.clone();
+            let secret_h = secret.clone();
+            let client_c = client.clone();
+            futures.push(async move {
+                // Try HTTPS first (WolfStack default), fall back to HTTP
+                // for nodes that don't have TLS enabled.
+                let urls = [
+                    format!("https://{}:{}/api/router/topology-local", host, port),
+                    format!("http://{}:{}/api/router/topology-local",  host, port),
+                ];
+                let mut last_err = String::new();
+                for url in &urls {
+                    match client_c.get(url)
+                        .header("X-WolfStack-Secret", &secret_h)
+                        .send().await
+                    {
+                        Ok(r) if r.status().is_success() => {
+                            return match r.json::<topology::NodeTopology>().await {
+                                Ok(t) => Ok(t),
+                                Err(e) => Err((id.clone(), hostname.clone(), format!("decode error: {}", e))),
+                            };
+                        }
+                        Ok(r) => { last_err = format!("HTTP {} from {}", r.status(), url); }
+                        Err(e) => { last_err = format!("{} ({})", e, url); }
+                    }
+                }
+                Err((id, hostname, last_err))
             });
         }
         let results = futures::future::join_all(futures).await;
-        for r in results.into_iter().flatten() {
-            nodes.push(r);
+        for r in results {
+            match r {
+                Ok(t) => {
+                    peer_diagnostics.push(serde_json::json!({
+                        "node_id": t.node_id, "hostname": t.node_name,
+                        "result": "ok"
+                    }));
+                    nodes.push(t);
+                }
+                Err((id, hostname, reason)) => {
+                    peer_diagnostics.push(serde_json::json!({
+                        "node_id": id, "hostname": hostname,
+                        "result": "failed", "reason": reason
+                    }));
+                }
+            }
         }
     }
 
@@ -277,7 +331,16 @@ pub async fn get_topology(
     let generated_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
 
-    HttpResponse::Ok().json(topology::RouterTopology { nodes, links, generated_at })
+    // Wrap the standard topology with the per-peer diagnostics so the
+    // frontend can show "tried 3 peers, got 2 responses, 1 skipped
+    // because cluster_name didn't match" on the rack header.
+    HttpResponse::Ok().json(serde_json::json!({
+        "nodes": nodes,
+        "links": links,
+        "generated_at": generated_at,
+        "peer_diagnostics": peer_diagnostics,
+        "cluster_filter": cluster_filter,
+    }))
 }
 
 /// Local-only topology endpoint called by other cluster nodes during

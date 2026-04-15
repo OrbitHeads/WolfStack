@@ -897,9 +897,25 @@
         const totalUp = topo.nodes.reduce((s, n) => s + (n.interfaces || []).filter(i => i.link_up).length, 0);
         const totalVms = topo.nodes.reduce((s, n) => s + (n.vms?.length || 0), 0);
         const totalCt = topo.nodes.reduce((s, n) => s + (n.containers?.length || 0), 0);
+        // Per-peer diagnostics surface "why is this node missing?" right
+        // on the cluster header — no need to dig into server logs to
+        // debug fan-out failures.
+        const diag = topo.peer_diagnostics || [];
+        const diagFailed = diag.filter(d => d.result === 'failed' || d.result === 'skipped');
+        const diagBanner = diagFailed.length
+            ? `<details style="margin-top:6px; font-size:11px;">
+                <summary style="cursor:pointer; color:#fbbf24;">⚠ ${diagFailed.length} peer${diagFailed.length===1?'':'s'} not in this view — click to see why</summary>
+                <div style="margin-top:6px; padding:6px 10px; background:rgba(0,0,0,0.3); border-radius:4px;">
+                    ${diagFailed.map(d => `<div style="color:var(--text-muted);"><strong>${escHtml(d.hostname || d.node_id)}</strong>: ${escHtml(d.reason || d.result)}</div>`).join('')}
+                </div>
+            </details>` : '';
+
         header.innerHTML = `
-            <div><strong>📡 Cluster: ${escHtml(wrState.cluster || 'unnamed')}</strong>
-                <span style="color:var(--text-muted); margin-left:8px;">${topo.nodes.length} node${topo.nodes.length===1?'':'s'} · ${totalUp}/${totalPorts} ports up · ${totalVms} VMs · ${totalCt} containers</span>
+            <div style="flex:1; min-width:240px;">
+                <div><strong>📡 Cluster: ${escHtml(wrState.cluster || 'unnamed')}</strong>
+                    <span style="color:var(--text-muted); margin-left:8px;">${topo.nodes.length} node${topo.nodes.length===1?'':'s'} · ${totalUp}/${totalPorts} ports up · ${totalVms} VMs · ${totalCt} containers</span>
+                </div>
+                ${diagBanner}
             </div>
             <div style="color:var(--text-muted); font-size:11px;">⛓ live topology refreshes every 3s</div>
         `;
