@@ -631,6 +631,35 @@ pub async fn list_firewall_logs(req: HttpRequest, state: S) -> HttpResponse {
     HttpResponse::Ok().json(lines)
 }
 
+// ─── Integration: surface things WolfStack already manages ───
+
+/// Read-only view of WolfStack-managed networking primitives that
+/// WolfRouter doesn't own but the user needs to see in one place:
+///   • IP mappings (DNAT) — configured in the per-server Networking page
+///   • WolfNet status + peers — managed by the wolfnet daemon
+///
+/// The intent is integration, not duplication. Users keep editing IP
+/// mappings on the existing page; WolfRouter just shows them here so
+/// the firewall view doesn't lie about what traffic actually flows.
+pub async fn get_managed_overview(req: HttpRequest, state: S) -> HttpResponse {
+    auth_or_return!(req, state);
+
+    // IP mappings (DNAT entries owned by networking::mod.rs).
+    let ip_mappings = crate::networking::list_ip_mappings();
+
+    // WolfNet peers — best-effort. If the file doesn't exist (wolfnet
+    // not installed) we simply return null and the UI hides the panel.
+    let wolfnet_status: serde_json::Value = std::fs::read_to_string("/var/run/wolfnet/status.json")
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Null);
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "ip_mappings": ip_mappings,
+        "wolfnet_status": wolfnet_status,
+    }))
+}
+
 // ─── Mount ───
 
 pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
@@ -654,5 +683,6 @@ pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
         .route("/api/router/rules/apply", web::post().to(apply_rules_now))
         .route("/api/router/rules/confirm", web::post().to(confirm_rules))
         .route("/api/router/connections", web::get().to(list_connections))
-        .route("/api/router/logs", web::get().to(list_firewall_logs));
+        .route("/api/router/logs", web::get().to(list_firewall_logs))
+        .route("/api/router/managed-overview", web::get().to(get_managed_overview));
 }

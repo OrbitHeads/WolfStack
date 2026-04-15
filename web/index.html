@@ -5794,6 +5794,19 @@
                             <thead><tr><th style="width:40px;">#</th><th>Action</th><th>Dir</th><th>From</th><th>To</th><th>Proto</th><th>Ports</th><th>Comment</th><th style="width:80px;"></th></tr></thead>
                             <tbody id="wr-rules-tbody"></tbody>
                         </table>
+
+                        <!-- IP mappings (DNAT) — owned by the existing
+                             Networking page but surfaced here so users
+                             see ALL traffic policy in one view. -->
+                        <div id="wr-managed-mappings" style="margin-top:24px; display:none;">
+                            <h4 style="font-size:13px; margin-bottom:8px; color:var(--text-muted);">
+                                🔗 Port forwards (DNAT) — managed via the per-server Networking page
+                            </h4>
+                            <table class="data-table" style="font-size:12px;">
+                                <thead><tr><th>Public IP</th><th>→ WolfNet IP</th><th>Ports</th><th>Proto</th><th>Label</th><th></th></tr></thead>
+                                <tbody id="wr-mappings-tbody"></tbody>
+                            </table>
+                        </div>
                     </div>
 
                     <div id="wr-tab-lans" class="wr-tab-panel" style="padding:16px; display:none;">

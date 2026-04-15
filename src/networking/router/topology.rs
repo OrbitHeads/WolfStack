@@ -170,6 +170,52 @@ fn delta_bps(map: &mut HashMap<String, BpsSample>, iface: &str, bytes: u64, now:
 
 // ── System walkers ──
 
+/// Auto-assign zones for WolfStack-managed infrastructure interfaces
+/// the user hasn't explicitly zoned yet. WolfNet → Wolfnet zone,
+/// WireGuard bridges → Wolfnet (the VPN's whole point is reaching
+/// WolfNet), default-route NIC → WAN. Persists once seeded so the
+/// user can override later. Returns true if anything changed.
+pub fn ensure_default_zones(node_id: &str) -> bool {
+    use std::process::Command;
+    let mut changed = false;
+    let mut cfg = match RouterConfig::load() {
+        c => c,
+    };
+    // Pull current interface names cheaply.
+    let text = Command::new("ip").args(["-j", "link"]).output().ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_else(|| "[]".into());
+    let links: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap_or_default();
+    let primary = crate::networking::detect_primary_interface();
+    for link in links {
+        let name = match link.get("ifname").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() && s != "lo" => s.to_string(),
+            _ => continue,
+        };
+        // Skip if the user has already chosen a zone for this iface.
+        if cfg.zones.get(node_id, &name).is_some() { continue; }
+        let auto_zone = if name.starts_with("wn") || name.starts_with("wolfnet") {
+            Some(Zone::Wolfnet)
+        } else if name.starts_with("wg-") {
+            // WireGuard bridge feeds WolfNet — same trust domain.
+            Some(Zone::Wolfnet)
+        } else if name == primary {
+            Some(Zone::Wan)
+        } else {
+            None
+        };
+        if let Some(z) = auto_zone {
+            cfg.zones.set(node_id, &name, z);
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = cfg.save();
+    }
+    changed
+}
+
 /// Compute the local node's topology. API handlers on the master node
 /// call this on each worker node via cluster RPC to assemble the
 /// cluster-wide view.
@@ -178,6 +224,10 @@ pub fn compute_local(
     node_name: &str,
     config: &RouterConfig,
 ) -> NodeTopology {
+    // Seed defaults for WolfStack-managed interfaces if the user
+    // hasn't zoned them yet. Cheap (one ip-link call) and idempotent.
+    let _ = ensure_default_zones(node_id);
+
     let bps = sample_bps();
     let interfaces = walk_interfaces(&bps, config, node_id);
     let bridges = walk_bridges(config, node_id);
@@ -233,13 +283,26 @@ fn walk_interfaces(
     for (slot, link) in links.iter().enumerate() {
         let name = link.get("ifname").and_then(|v| v.as_str()).unwrap_or("").to_string();
         if name.is_empty() { continue; }
-        // Skip loopback and obviously-virtual interfaces we don't want to
-        // show as rack ports. Bridges and TAPs render elsewhere.
-        if name == "lo" || name.starts_with("tap-") || name.starts_with("veth")
-            || name.starts_with("br-") || name == "docker0" || name == "lxcbr0"
-            || name.starts_with("wn") {
+        // Skip purely-internal interfaces that aren't useful in the rack
+        // view: loopback, per-VM TAPs (their owning VM is rendered
+        // separately as a device), per-container veth pairs, the
+        // Linux-bridge slave names. WolfNet (wn*/wolfnet*) and WireGuard
+        // bridges (wg-*) ARE included as first-class ports — WolfRouter
+        // needs to show what WolfStack already runs, not hide it.
+        if name == "lo"
+            || name.starts_with("tap-")
+            || name.starts_with("veth")
+        {
             continue;
         }
+        // docker0/lxcbr0/br-* render in walk_bridges, but we still want
+        // them visible somewhere — emit them as ports too so the user
+        // sees the whole cluster layout from one place.
+        let _is_overlay_or_bridge =
+            name.starts_with("wn") || name.starts_with("wolfnet")
+            || name.starts_with("wg-")
+            || name == "docker0" || name == "lxcbr0"
+            || name.starts_with("br-");
         let mac = link.get("address").and_then(|v| v.as_str()).unwrap_or("").to_string();
         // Port up/down detection — `operstate` from `ip link` is unreliable
         // for many interfaces (returns UNKNOWN on virtual/wireless NICs
@@ -410,6 +473,23 @@ fn infer_role(name: &str, zone: &Option<Zone>, _link_up: bool, slaved: bool) -> 
             Zone::Wolfnet => PortRole::Wolfnet,
             _ => PortRole::Lan,
         };
+    }
+    // Auto-detect WolfStack-managed infrastructure. WolfRouter doesn't
+    // own these interfaces but it should recognise and label them so
+    // the user sees their full stack in one view rather than wondering
+    // why wn0 isn't showing up.
+    if name.starts_with("wn") || name.starts_with("wolfnet") {
+        return PortRole::Wolfnet;
+    }
+    if name.starts_with("wg-") {
+        // WireGuard bridge — VPN access into the cluster. Treated as
+        // its own role; the firewall view colours it management.
+        return PortRole::Management;
+    }
+    if name == "docker0" || name == "lxcbr0" || name.starts_with("br-") {
+        // Container/Linux bridges = LAN by default (containers get an
+        // IP on these and need outbound).
+        return PortRole::Lan;
     }
     if slaved { return PortRole::Lan; }
     // Heuristic: default-route interface = WAN. Cache avoided per-call

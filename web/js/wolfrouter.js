@@ -151,11 +151,12 @@
             </div>`;
         };
         try {
-            const [topoR, rulesR, lansR, zonesR] = await Promise.all([
+            const [topoR, rulesR, lansR, zonesR, managedR] = await Promise.all([
                 fetch(wrUrl('/api/router/topology')),
                 fetch(wrUrl('/api/router/rules')),
                 fetch(wrUrl('/api/router/segments')),
                 fetch(wrUrl('/api/router/zones')),
+                fetch(wrUrl('/api/router/managed-overview')),
             ]);
             if (!topoR.ok) {
                 const body = await topoR.text().catch(() => '');
@@ -167,6 +168,7 @@
             if (rulesR.ok) wrState.rules = await rulesR.json();
             if (lansR.ok)  wrState.lans = await lansR.json();
             if (zonesR.ok) wrState.zones = await zonesR.json();
+            if (managedR.ok) wrState.managed = await managedR.json();
             wrRenderAll();
         } catch (e) {
             console.error('wolfrouter load:', e);
@@ -254,6 +256,29 @@
     // ─── Table: firewall rules ───
 
     function wrRenderRules() {
+        // Also render the "managed elsewhere" port-forwards panel — IP
+        // mappings owned by WolfStack's existing Networking page.
+        const mPanel = document.getElementById('wr-managed-mappings');
+        const mBody = document.getElementById('wr-mappings-tbody');
+        const mappings = (wrState.managed?.ip_mappings) || [];
+        if (mPanel && mBody) {
+            if (mappings.length) {
+                mPanel.style.display = 'block';
+                mBody.innerHTML = mappings.map(m => `
+                    <tr style="${m.enabled ? '' : 'opacity:0.5;'}">
+                        <td><code>${escHtml(m.public_ip)}</code></td>
+                        <td><code>${escHtml(m.wolfnet_ip)}</code></td>
+                        <td>${escHtml(m.ports || 'all')}${m.dest_ports ? ` → ${escHtml(m.dest_ports)}` : ''}</td>
+                        <td>${escHtml(m.protocol || 'all').toUpperCase()}</td>
+                        <td>${escHtml(m.label || '')}</td>
+                        <td style="text-align:right;"><span class="badge" style="background:rgba(59,130,246,0.15); color:#60a5fa; font-size:10px;">external</span></td>
+                    </tr>
+                `).join('');
+            } else {
+                mPanel.style.display = 'none';
+            }
+        }
+
         const tbody = document.getElementById('wr-rules-tbody');
         if (!tbody) return;
         if (!wrState.rules.length) {
@@ -1083,19 +1108,34 @@
         canvas.innerHTML = '';
         canvas.appendChild(svg);
 
-        // Legend
+        // Legend + integration badges
         const legend = document.getElementById('wr-rack-legend');
         if (legend) {
             const sw = (color, label) =>
                 `<div style="display:flex; align-items:center; gap:6px;"><span style="display:inline-block; width:18px; height:4px; background:${color}; border-radius:2px;"></span> ${label}</div>`;
+
+            // Surface live integration state — what WolfStack already
+            // runs that WolfRouter is now showing alongside its own.
+            const wn = wrState.managed?.wolfnet_status;
+            const peerCount = (wn?.peers || []).length;
+            const wnBadge = wn
+                ? `<div style="display:flex; align-items:center; gap:6px;"><span style="color:#22c55e;">⛓</span> WolfNet: ${peerCount} peer${peerCount===1?'':'s'}${wn.running===false ? ' <span style="color:#ef4444;">(daemon down)</span>' : ''}</div>`
+                : '';
+            const mappingCount = (wrState.managed?.ip_mappings || []).length;
+            const mapBadge = mappingCount
+                ? `<div style="display:flex; align-items:center; gap:6px;"><span style="color:#60a5fa;">🔗</span> ${mappingCount} port forward${mappingCount===1?'':'s'} (DNAT)</div>`
+                : '';
+
             legend.innerHTML = [
                 sw('#fbbf24', 'WAN cable'),
                 sw('#3b82f6', 'LAN cable'),
                 sw('#22c55e', 'WolfNet'),
                 sw('#a855f7', 'Management'),
                 sw('#94a3b8', 'Unassigned'),
+                wnBadge,
+                mapBadge,
                 `<div style="margin-left:auto; color:var(--text-muted);">Click a port to assign a zone · cables animate when traffic flows</div>`
-            ].join('');
+            ].filter(Boolean).join('');
         }
 
         // Click handler for ports → open zone assignment
