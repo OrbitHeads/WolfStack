@@ -109,6 +109,14 @@
     // ─── Data loading ───
 
     async function wrLoadAll() {
+        // Surface fetch failures directly in the rack canvas — silent
+        // "Loading topology…" forever is the worst possible UX.
+        const showErr = (msg) => {
+            const c = document.getElementById('wr-rack-canvas');
+            if (c) c.innerHTML = `<div style="color:#ef4444; text-align:center; padding:40px; font-size:13px;">
+                ${msg}<br><br><span style="color:var(--text-muted); font-size:11px;">Check the browser console + WolfStack server log for details.</span>
+            </div>`;
+        };
         try {
             const [topoR, rulesR, lansR, zonesR] = await Promise.all([
                 fetch('/api/router/topology'),
@@ -116,12 +124,21 @@
                 fetch('/api/router/segments'),
                 fetch('/api/router/zones'),
             ]);
-            if (topoR.ok) wrState.topology = await topoR.json();
+            if (!topoR.ok) {
+                const body = await topoR.text().catch(() => '');
+                console.error('wolfrouter: topology fetch failed', topoR.status, body);
+                showErr(`Topology fetch failed: HTTP ${topoR.status} ${topoR.statusText}<br><code>${escHtml(body.slice(0,200))}</code>`);
+                return;
+            }
+            wrState.topology = await topoR.json();
             if (rulesR.ok) wrState.rules = await rulesR.json();
             if (lansR.ok)  wrState.lans = await lansR.json();
             if (zonesR.ok) wrState.zones = await zonesR.json();
             wrRenderAll();
-        } catch (e) { console.error('wolfrouter load:', e); }
+        } catch (e) {
+            console.error('wolfrouter load:', e);
+            showErr(`Network error: ${e.message || e}`);
+        }
     }
 
     function wrStartPolling() {

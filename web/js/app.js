@@ -1106,7 +1106,7 @@ function selectView(page) {
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     document.querySelector(`.nav-item[data-page="${page}"]`)?.classList.add('active');
 
-    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', 'cluster-browser': 'Cluster Browser' };
+    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', 'cluster-browser': 'Cluster Browser', wolfrouter: 'WolfRouter' };
     document.getElementById('page-title').textContent = titles[page] || page;
 
     if (page === 'datacenter') {
@@ -1142,6 +1142,12 @@ function selectView(page) {
         loadWolfFlowList();
     } else if (page === 'cluster-browser') {
         loadClusterBrowser();
+    } else if (page === 'wolfrouter') {
+        // Cluster-wide view — exposed at the top level (not per-server)
+        // because it manages firewall/DHCP/DNS across every node.
+        if (typeof wrLoadAll === 'function') {
+            wrLoadAll().then(() => { if (typeof wrStartPolling === 'function') wrStartPolling(); });
+        }
     }
 
     // Restore task log toggle button when leaving topology
