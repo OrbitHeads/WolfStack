@@ -456,36 +456,67 @@ fn walk_vms(node_id: &str) -> Vec<DeviceAttachment> {
 }
 
 fn walk_containers(_node_id: &str) -> Vec<DeviceAttachment> {
-    // Best-effort: list docker + lxc containers. Keep it cheap — this is
-    // called on every topology poll.
+    // Best-effort: list docker + lxc containers WITH their IPs so the
+    // rack-view device badges show something useful.
     let mut out = Vec::new();
-    // Docker
+    // Docker — `docker ps --format` can include the network IP via
+    // {{.Networks}} but that gives the network NAME, not the IP. To get
+    // the IP we use Go template syntax to pull NetworkSettings.IPAddress
+    // (or any per-network IP). One docker call covers all running
+    // containers.
     if let Ok(o) = Command::new("docker")
-        .args(["ps", "--format", "{{.Names}}|{{.Networks}}"])
+        .args(["ps", "--format", "{{.Names}}\t{{.Networks}}"])
         .output()
     {
         if o.status.success() {
             for line in String::from_utf8_lossy(&o.stdout).lines() {
-                if let Some((name, net)) = line.split_once('|') {
-                    out.push(DeviceAttachment {
-                        name: name.to_string(),
-                        kind: "docker".into(),
-                        attached_to: net.to_string(),
-                        ip: None,
-                    });
-                }
+                let parts: Vec<&str> = line.splitn(2, '\t').collect();
+                if parts.is_empty() { continue; }
+                let name = parts[0].to_string();
+                let nets = parts.get(1).map(|s| s.to_string()).unwrap_or_default();
+                // Best-effort IP fetch per container (skip on error).
+                let ip = Command::new("docker")
+                    .args(["inspect", "--format",
+                           "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}",
+                           &name])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    // First non-empty IP token (a container can be on
+                    // multiple networks).
+                    .and_then(|s| s.split_whitespace().next()
+                        .filter(|t| !t.is_empty())
+                        .map(|t| t.to_string()));
+                out.push(DeviceAttachment {
+                    name,
+                    kind: "docker".into(),
+                    attached_to: nets,
+                    ip,
+                });
             }
         }
     }
-    // LXC
+    // LXC — `lxc-info -iH` returns IPs only.
     if let Ok(o) = Command::new("lxc-ls").args(["--running"]).output() {
         if o.status.success() {
             for name in String::from_utf8_lossy(&o.stdout).split_whitespace() {
+                let ip = Command::new("lxc-info")
+                    .args(["-n", name, "-iH"])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    // lxc-info can return multiple lines (one per iface);
+                    // first non-link-local IPv4 wins.
+                    .and_then(|s| s.lines().find(|l| !l.starts_with("fe80") && l.contains('.'))
+                        .map(|l| l.trim().to_string()));
                 out.push(DeviceAttachment {
                     name: name.to_string(),
                     kind: "lxc".into(),
                     attached_to: "lxcbr0".into(),
-                    ip: None,
+                    ip,
                 });
             }
         }

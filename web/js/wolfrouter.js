@@ -1099,7 +1099,7 @@
                 <text x="${statsX+8}" y="${uy+24}" style="fill:#22c55e; font-size:9px; font-family:monospace;">PORTS ${node.interfaces.length}</text>
                 <text x="${statsX+8}" y="${uy+38}" style="fill:#60a5fa; font-size:9px; font-family:monospace;">VMS   ${node.vms.length}</text>
                 <text x="${statsX+8}" y="${uy+52}" style="fill:#a855f7; font-size:9px; font-family:monospace;">CTRS  ${node.containers.length}</text>
-                <text x="${statsX+8}" y="${uy+72}" style="fill:#94a3b8; font-size:8px;">${escHtml(node.lan_segments?.length ? node.lan_segments.length + ' LAN' : 'no LAN')}</text>
+                ${node.lan_segments?.length ? `<text x="${statsX+8}" y="${uy+72}" style="fill:#94a3b8; font-size:8px;">${node.lan_segments.length} WR LAN</text>` : ''}
                 <!-- Rack-unit size badge so taller nodes are explained -->
                 <text x="${statsX+80}" y="${uy+24}" text-anchor="end" style="fill:#fde68a; font-size:11px; font-weight:700; font-family:monospace;">${Math.max(2, Math.round(uh / 44))}U</text>
             `);
@@ -1109,7 +1109,7 @@
             // port shows iface name AND its IP address(es) underneath
             // so the user can read what's what at a glance.
             portsByNode[node.node_id] = [];
-            const jackW = 44, jackH = 32, jackGap = 12;
+            const jackW = 44, jackH = 32, jackGap = 22;  // wider gap so iface labels don't collide
             const maxPorts = Math.min(node.interfaces.length, Math.floor((portsZoneW + jackGap) / (jackW + jackGap)));
             const startPx = portsZoneX;  // left-align (was centered)
             const portsCY = uy + uh/2 - 2;
@@ -1280,10 +1280,10 @@
                           fill="none" stroke="${cableColor}" stroke-width="2" stroke-linecap="square" opacity="0.55"
                           ${i % 2 === 0 ? 'stroke-dasharray="6 4" class="wr-wire-active"' : ''}/>
                     <g>
-                        <rect x="${colX}" y="${dy}" width="170" height="20" rx="5"
+                        <rect x="${colX}" y="${dy}" width="200" height="20" rx="5"
                               fill="rgba(15,23,42,0.95)" stroke="${accent}" stroke-width="1"/>
-                        <text x="${colX+8}" y="${dy+14}" style="fill:#f1f5f9; font-size:11px;">${icon} ${escHtml(dev.name.slice(0,14))}</text>
-                        <text x="${colX+165}" y="${dy+14}" text-anchor="end" style="fill:${accent}; font-size:9px; font-family:monospace;">${escHtml((dev.attached_to||'').slice(0,9))}</text>
+                        <text x="${colX+8}" y="${dy+14}" style="fill:#f1f5f9; font-size:11px;">${icon} ${escHtml(dev.name.slice(0,16))}</text>
+                        <text x="${colX+195}" y="${dy+14}" text-anchor="end" style="fill:${accent}; font-size:10px; font-family:monospace;">${escHtml(dev.ip || dev.attached_to || '')}</text>
                     </g>
                 `);
             });
