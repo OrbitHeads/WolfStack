@@ -5760,6 +5760,7 @@
                         <button class="wr-tab" data-tab="leases" onclick="wrSelectTab('leases')">📡 DHCP Leases</button>
                         <button class="wr-tab" data-tab="zones" onclick="wrSelectTab('zones')">🎯 Zones</button>
                         <button class="wr-tab" data-tab="connections" onclick="wrSelectTab('connections')">🔗 Connections</button>
+                        <button class="wr-tab" data-tab="packets" onclick="wrSelectTab('packets')">📡 Packets</button>
                         <button class="wr-tab" data-tab="logs" onclick="wrSelectTab('logs')">📜 Logs</button>
                     </div>
 
@@ -5829,7 +5830,32 @@
 
                     <div id="wr-tab-connections" class="wr-tab-panel" style="padding:16px; display:none;">
                         <div style="font-size:12px; color:var(--text-muted); margin-bottom:12px;">Live connection tracking via <code>conntrack</code>. Showing most recent 500.</div>
-                        <table class="data-table" style="font-size:12px;"><thead><tr><th>Proto</th><th>Src</th><th>Dst</th><th>SPort</th><th>DPort</th><th>State</th></tr></thead><tbody id="wr-conn-tbody"></tbody></table>
+                        <div id="wr-conn-error" style="display:none; padding:10px 12px; margin-bottom:12px; background:rgba(239,68,68,0.1); border:1px solid rgba(239,68,68,0.3); border-radius:6px; font-size:12px; color:#fca5a5;"></div>
+                        <table class="data-table" style="font-size:12px;"><thead><tr><th>Proto</th><th>Src</th><th>Dst</th><th>SPort</th><th>DPort</th><th>State</th><th>Timeout</th></tr></thead><tbody id="wr-conn-tbody"></tbody></table>
+                    </div>
+
+                    <div id="wr-tab-packets" class="wr-tab-panel" style="padding:16px; display:none;">
+                        <div style="font-size:12px; color:var(--text-muted); margin-bottom:12px;">
+                            Wireshark-style packet capture via <code>tcpdump</code>. Pick an interface, optionally add a BPF filter (e.g. <code>tcp port 80</code>, <code>icmp</code>, <code>host 8.8.8.8</code>), choose how many packets to grab.
+                        </div>
+                        <div style="display:grid; grid-template-columns: 1fr 2fr 100px 100px auto; gap:8px; margin-bottom:12px; align-items:end;">
+                            <label>Interface
+                                <select id="wr-pcap-iface" class="form-control" style="font-size:13px;"></select>
+                            </label>
+                            <label>BPF filter (optional)
+                                <input id="wr-pcap-filter" class="form-control" placeholder="e.g. tcp port 443 and not host 1.1.1.1" maxlength="200" style="font-size:13px; font-family:var(--font-mono);"/>
+                            </label>
+                            <label>Packets
+                                <select id="wr-pcap-count" class="form-control" style="font-size:13px;">
+                                    <option>10</option><option selected>100</option><option>500</option><option>1000</option><option>5000</option>
+                                </select>
+                            </label>
+                            <label>Timeout (s)
+                                <input id="wr-pcap-timeout" type="number" class="form-control" value="30" min="1" max="120" style="font-size:13px;"/>
+                            </label>
+                            <button id="wr-pcap-go" class="btn btn-primary" onclick="wrStartCapture()" style="height:34px;">▶ Capture</button>
+                        </div>
+                        <pre id="wr-pcap-output" style="font-family:var(--font-mono); font-size:11px; background:#0a0f18; color:#cbd5e1; padding:10px; border-radius:6px; max-height:480px; overflow:auto; min-height:120px; border:1px solid var(--border);"></pre>
                     </div>
 
                     <div id="wr-tab-logs" class="wr-tab-panel" style="padding:16px; display:none;">

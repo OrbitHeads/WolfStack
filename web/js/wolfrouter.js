@@ -242,6 +242,7 @@
         if (tab === 'leases')       wrRenderLeases();
         if (tab === 'zones')        wrRenderZones();
         if (tab === 'connections')  wrRenderConnections();
+        if (tab === 'packets')      wrRenderPackets();
         if (tab === 'logs')         wrRenderLogs();
     }
 
@@ -830,26 +831,91 @@
 
     async function wrRenderConnections() {
         const tbody = document.getElementById('wr-conn-tbody');
+        const errBox = document.getElementById('wr-conn-error');
         if (!tbody) return;
         try {
             const r = await fetch(wrUrl('/api/router/connections'));
-            const rows = r.ok ? await r.json() : [];
+            const data = r.ok ? await r.json() : { rows: [], error: `HTTP ${r.status}` };
+            const rows = data.rows || [];
+            if (errBox) {
+                if (data.error) {
+                    errBox.style.display = 'block';
+                    errBox.textContent = data.error;
+                } else {
+                    errBox.style.display = 'none';
+                }
+            }
             if (!rows.length) {
-                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:var(--text-muted); padding:16px;">No connections tracked — <code>conntrack</code> may not be installed.</td></tr>';
+                tbody.innerHTML = `<tr><td colspan="7" style="text-align:center; color:var(--text-muted); padding:16px;">${data.error ? 'No data — see error above.' : 'No tracked connections right now. Generate some traffic and refresh.'}</td></tr>`;
                 return;
             }
-            tbody.innerHTML = rows.slice(0, 200).map(c => {
-                return `<tr>
-                    <td>${escHtml(c.proto || '')}</td>
-                    <td><code>${escHtml(c.src || '')}</code></td>
-                    <td><code>${escHtml(c.dst || '')}</code></td>
-                    <td>${escHtml(c.sport || '')}</td>
-                    <td>${escHtml(c.dport || '')}</td>
-                    <td>${escHtml(c.state || c.CLOSE || '')}</td>
-                </tr>`;
-            }).join('');
-        } catch (e) {}
+            tbody.innerHTML = rows.slice(0, 200).map(c => `<tr>
+                <td>${escHtml(c.proto || '')}</td>
+                <td><code>${escHtml(c.src || '')}</code></td>
+                <td><code>${escHtml(c.dst || '')}</code></td>
+                <td>${escHtml(c.sport || '')}</td>
+                <td>${escHtml(c.dport || '')}</td>
+                <td>${escHtml(c.state || '')}</td>
+                <td style="color:var(--text-muted); font-family:var(--font-mono); font-size:11px;">${escHtml(c.timeout || '')}</td>
+            </tr>`).join('');
+        } catch (e) {
+            if (errBox) { errBox.style.display = 'block'; errBox.textContent = 'Network error: ' + (e.message || e); }
+        }
     }
+
+    // ─── Packets (tcpdump) tab ───────────────────────────────
+
+    function wrRenderPackets() {
+        // Populate the interface dropdown from the current node's
+        // topology — only interfaces that are actually present.
+        const sel = document.getElementById('wr-pcap-iface');
+        if (!sel) return;
+        const ifaces = new Set();
+        for (const n of (wrState.topology?.nodes || [])) {
+            for (const i of (n.interfaces || [])) ifaces.add(i.name);
+            for (const b of (n.bridges || [])) ifaces.add(b.name);
+        }
+        // Plus pseudo-iface "any" for tcpdump-on-all-interfaces
+        const list = ['any', ...Array.from(ifaces).sort()];
+        const current = sel.value;
+        sel.innerHTML = list.map(i => `<option value="${escHtml(i)}">${escHtml(i)}</option>`).join('');
+        if (current && list.includes(current)) sel.value = current;
+    }
+
+    async function wrStartCapture() {
+        const iface = document.getElementById('wr-pcap-iface').value.trim();
+        const filter = document.getElementById('wr-pcap-filter').value.trim();
+        const count = parseInt(document.getElementById('wr-pcap-count').value, 10) || 100;
+        const timeoutSeconds = parseInt(document.getElementById('wr-pcap-timeout').value, 10) || 30;
+        const out = document.getElementById('wr-pcap-output');
+        const btn = document.getElementById('wr-pcap-go');
+        if (!iface) { alert('Pick an interface first'); return; }
+
+        out.textContent = `▶ Capturing on ${iface}${filter ? ' [filter: ' + filter + ']' : ''}…\n   max ${count} packets / ${timeoutSeconds}s timeout — please wait.`;
+        btn.disabled = true; btn.textContent = '⏳ Capturing…';
+
+        try {
+            const r = await fetch(wrUrl('/api/router/capture'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ iface, filter, count, timeout_seconds: timeoutSeconds }),
+            });
+            const data = await r.json();
+            if (!r.ok) {
+                out.textContent = `✗ HTTP ${r.status}: ${data.error || JSON.stringify(data)}`;
+                return;
+            }
+            const lines = data.lines || [];
+            const errLine = data.error ? `\n\n✗ ${data.error}` : '';
+            const header = `🛜 ${lines.length} packet${lines.length === 1 ? '' : 's'} on ${escHtml(data.iface)}${data.filter ? ' [filter: ' + escHtml(data.filter) + ']' : ''}\n${'─'.repeat(60)}\n`;
+            out.textContent = header + lines.join('\n') + errLine;
+        } catch (e) {
+            out.textContent = '✗ ' + (e.message || e);
+        } finally {
+            btn.disabled = false; btn.textContent = '▶ Capture';
+        }
+    }
+    window.wrStartCapture = wrStartCapture;
 
     async function wrRenderLogs() {
         const pre = document.getElementById('wr-logs-pre');

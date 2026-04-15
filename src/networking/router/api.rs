@@ -669,26 +669,59 @@ pub async fn confirm_rules(req: HttpRequest, state: S) -> HttpResponse {
 
 pub async fn list_connections(req: HttpRequest, state: S) -> HttpResponse {
     auth_or_return!(req, state);
-    let out = match std::process::Command::new("conntrack").args(["-L", "-o", "extended"]).output() {
+    // Try `conntrack -L` (default format works fine — extended adds an
+    // L3 prefix that's harder to parse). Surface the actual error if
+    // it fails so the user knows whether conntrack isn't installed,
+    // requires root, or some other problem.
+    let result = std::process::Command::new("conntrack").args(["-L"]).output();
+    let out = match result {
         Ok(o) if o.status.success() => o,
-        _ => return HttpResponse::Ok().json(Vec::<serde_json::Value>::new()),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            return HttpResponse::Ok().json(serde_json::json!({
+                "rows": [],
+                "error": format!("conntrack failed (exit {}): {}",
+                    o.status.code().unwrap_or(-1),
+                    if stderr.is_empty() { "no output".into() } else { stderr })
+            }));
+        }
+        Err(e) => {
+            return HttpResponse::Ok().json(serde_json::json!({
+                "rows": [],
+                "error": format!("couldn't run 'conntrack' — {} (install the 'conntrack' package?)", e)
+            }));
+        }
     };
     let text = String::from_utf8_lossy(&out.stdout);
     let mut rows = Vec::new();
-    // Parse conntrack extended format. Each line: "tcp 6 431999 ESTABLISHED src=... dst=... ..."
+    // Default format (no -o extended): the line begins with the L4
+    // protocol name, then a numeric proto id, timeout, state, then the
+    // tuple key=value tokens. Example:
+    //   tcp      6 431999 ESTABLISHED src=10.0.0.1 dst=10.0.0.2 sport=44321 dport=80 ...
     for line in text.lines().take(500) {
         let mut r = serde_json::Map::new();
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 5 { continue; }
+        if parts.len() < 4 { continue; }
         r.insert("proto".into(), serde_json::Value::String(parts[0].into()));
-        for part in &parts[4..] {
+        // parts[1] = numeric proto id (skip), parts[2] = timeout
+        r.insert("timeout".into(), serde_json::Value::String(parts[2].into()));
+        // State only present for tcp; UDP lines start key=value at parts[3].
+        let mut start_kv = 3usize;
+        if !parts[3].contains('=') {
+            r.insert("state".into(), serde_json::Value::String(parts[3].into()));
+            start_kv = 4;
+        }
+        for part in &parts[start_kv..] {
             if let Some((k, v)) = part.split_once('=') {
-                r.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+                // Only insert the FIRST occurrence of each key so we
+                // capture the original tuple (src/dst/sport/dport),
+                // not the reply tuple that conntrack appends.
+                r.entry(k.to_string()).or_insert(serde_json::Value::String(v.to_string()));
             }
         }
         rows.push(serde_json::Value::Object(r));
     }
-    HttpResponse::Ok().json(rows)
+    HttpResponse::Ok().json(serde_json::json!({ "rows": rows }))
 }
 
 /// Firewall log viewer. Reads kernel messages matching our NFLOG prefix
@@ -901,6 +934,109 @@ fn list_lease_files() -> Vec<serde_json::Value> {
     out
 }
 
+/// Live packet capture (Wireshark-style). Spawns `tcpdump` on the
+/// requested interface with an optional BPF filter, captures up to N
+/// packets (or until the timeout fires), returns the parsed lines.
+///
+/// Security:
+///   • Auth required (cookie or cluster secret).
+///   • Interface name validated against [a-zA-Z0-9._-] — no shell
+///     metacharacters can leak into the spawned process.
+///   • BPF filter is passed as a single argv token to tcpdump (not
+///     through a shell), so tcpdump's own parser sees it. tcpdump
+///     parses BPF, not arbitrary commands; misuse = capture errors,
+///     not RCE. Filter is also length-capped at 200 chars.
+///   • Hard timeout via tokio::time::timeout so a runaway capture
+///     can't consume resources indefinitely.
+#[derive(Deserialize)]
+pub struct CaptureRequest {
+    pub iface: String,
+    #[serde(default)]
+    pub filter: String,
+    #[serde(default = "default_capture_count")]
+    pub count: u32,
+    /// Optional capture timeout in seconds (default 30, max 120).
+    #[serde(default = "default_capture_timeout")]
+    pub timeout_seconds: u64,
+}
+fn default_capture_count() -> u32 { 100 }
+fn default_capture_timeout() -> u64 { 30 }
+
+pub async fn packet_capture(
+    req: HttpRequest,
+    state: S,
+    body: web::Json<CaptureRequest>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let r = body.into_inner();
+
+    // Interface allowlist: alnum + . _ -. Any other character means a
+    // shell metachar attempt or an unsupported iface name; reject.
+    if r.iface.is_empty() || r.iface.len() > 32
+        || !r.iface.chars().all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c))
+    {
+        return HttpResponse::BadRequest().body("invalid interface name");
+    }
+    if r.filter.len() > 200 {
+        return HttpResponse::BadRequest().body("filter too long (max 200 chars)");
+    }
+    let count = r.count.clamp(1, 5000);
+    let timeout = std::time::Duration::from_secs(r.timeout_seconds.clamp(1, 120));
+
+    let mut args: Vec<String> = vec![
+        "-nn".into(), "-l".into(),
+        "-i".into(), r.iface.clone(),
+        "-c".into(), count.to_string(),
+        "-tttt".into(),  // human-readable timestamp
+    ];
+    if !r.filter.trim().is_empty() {
+        args.push(r.filter.trim().to_string());
+    }
+
+    // Run tcpdump with timeout. Output is captured wholesale — for a
+    // live-streaming variant we'd need SSE; this MVP is "give me N
+    // packets that match".
+    let cmd = tokio::process::Command::new("tcpdump")
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output();
+
+    let output = match tokio::time::timeout(timeout, cmd).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return HttpResponse::Ok().json(serde_json::json!({
+                "lines": [], "error": format!("couldn't run 'tcpdump' — {} (install the 'tcpdump' package, and the WolfStack binary needs CAP_NET_RAW or root to capture)", e),
+            }));
+        }
+        Err(_) => {
+            return HttpResponse::Ok().json(serde_json::json!({
+                "lines": [], "error": format!("capture timed out after {}s with fewer than {} packets matching", r.timeout_seconds, count),
+            }));
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let lines: Vec<String> = stdout.lines().map(|s| s.to_string()).collect();
+
+    if lines.is_empty() && !output.status.success() {
+        return HttpResponse::Ok().json(serde_json::json!({
+            "lines": [],
+            "error": format!("tcpdump exited {}: {}",
+                output.status.code().unwrap_or(-1),
+                stderr.trim()),
+        }));
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "lines": lines,
+        "count": lines.len(),
+        "iface": r.iface,
+        "filter": r.filter,
+    }))
+}
+
 // ─── Mount ───
 
 pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
@@ -926,5 +1062,6 @@ pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
         .route("/api/router/connections", web::get().to(list_connections))
         .route("/api/router/logs", web::get().to(list_firewall_logs))
         .route("/api/router/managed-overview", web::get().to(get_managed_overview))
-        .route("/api/router/host-snapshot", web::get().to(get_host_snapshot));
+        .route("/api/router/host-snapshot", web::get().to(get_host_snapshot))
+        .route("/api/router/capture", web::post().to(packet_capture));
 }
