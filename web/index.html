@@ -108,7 +108,11 @@
             <span class="version">v11.24.0</span>
         </div>
         <nav class="sidebar-nav">
-            <div class="nav-section" style="display:flex; gap:4px; padding:8px 12px; justify-content:center;">
+            <!-- Top quick-jump icons. Grid capped at 5 columns so a long
+                 nav doesn't sprawl across the sidebar; extras wrap to a
+                 new row. Every icon must be unique — duplicate emoji
+                 break the "glance and recognise" the layout depends on. -->
+            <div class="nav-section" style="display:grid; grid-template-columns:repeat(5, 40px); gap:4px; padding:8px 12px; justify-content:center;">
                 <a class="nav-item active" data-page="datacenter" onclick="selectView('datacenter')" title="Datacenter"
                     style="display:flex;align-items:center;justify-content:center;width:40px;height:40px;padding:0;border-radius:10px;">
                     <span class="icon" style="margin:0;font-size:20px;">🏠</span>
@@ -139,7 +143,7 @@
                 <a class="nav-item" data-page="cluster-browser" onclick="selectView('cluster-browser')"
                     title="Cluster Browser — open cluster web apps without a VPN"
                     style="display:flex;align-items:center;justify-content:center;width:40px;height:40px;padding:0;border-radius:10px;">
-                    <span class="icon" style="margin:0;font-size:20px;">🌐</span>
+                    <span class="icon" style="margin:0;font-size:20px;">🔗</span>
                 </a>
             </div>
             <div class="nav-section">
