@@ -151,12 +151,13 @@
             </div>`;
         };
         try {
-            const [topoR, rulesR, lansR, zonesR, managedR] = await Promise.all([
+            const [topoR, rulesR, lansR, zonesR, managedR, snapR] = await Promise.all([
                 fetch(wrUrl('/api/router/topology')),
                 fetch(wrUrl('/api/router/rules')),
                 fetch(wrUrl('/api/router/segments')),
                 fetch(wrUrl('/api/router/zones')),
                 fetch(wrUrl('/api/router/managed-overview')),
+                fetch(wrUrl('/api/router/host-snapshot')),
             ]);
             if (!topoR.ok) {
                 const body = await topoR.text().catch(() => '');
@@ -169,6 +170,7 @@
             if (lansR.ok)  wrState.lans = await lansR.json();
             if (zonesR.ok) wrState.zones = await zonesR.json();
             if (managedR.ok) wrState.managed = await managedR.json();
+            if (snapR.ok) wrState.snapshot = await snapR.json();
             wrRenderAll();
         } catch (e) {
             console.error('wolfrouter load:', e);
@@ -278,6 +280,11 @@
                 mPanel.style.display = 'none';
             }
         }
+
+        // Discovered iptables rules — what's already on the host. Always
+        // visible so the firewall tab is never empty even when no
+        // WolfRouter rules exist yet.
+        wrRenderHostFirewall();
 
         const tbody = document.getElementById('wr-rules-tbody');
         if (!tbody) return;
@@ -508,10 +515,27 @@
     function wrRenderLans() {
         const grid = document.getElementById('wr-lans-list');
         if (!grid) return;
+        const discovered = (wrState.snapshot?.dhcp?.dnsmasq_processes) || [];
+        const discoveredHtml = discovered.length
+            ? `<div style="margin-bottom:16px; padding:12px; border:1px solid var(--border); border-radius:8px; background:var(--bg-card);">
+                <h4 style="font-size:13px; margin:0 0 8px;">📡 dnsmasq instances discovered on this host (${discovered.length})</h4>
+                <div style="font-size:11px; color:var(--text-muted); margin-bottom:8px;">Other DHCP/DNS servers running independently of WolfRouter — listed so you don't accidentally double-bind a port.</div>
+                ${discovered.map(p => `
+                    <div style="display:grid; grid-template-columns: 60px 120px 1fr; gap:8px; padding:4px 0; font-size:12px; border-top:1px dashed var(--border);">
+                        <span style="color:var(--text-muted);">PID ${escHtml(p.pid)}</span>
+                        <span><code>${escHtml(p.interface || 'auto')}</code></span>
+                        <span style="color:var(--text-muted); font-family:var(--font-mono); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escHtml(p.config_file || p.command.slice(0,80))}</span>
+                    </div>
+                `).join('')}
+            </div>`
+            : '';
+
         if (!wrState.lans.length) {
-            grid.innerHTML = '<div style="text-align:center; color:var(--text-muted); padding:30px;">No LANs yet. Create one to serve DHCP+DNS from WolfRouter.</div>';
+            grid.innerHTML = discoveredHtml +
+                '<div style="text-align:center; color:var(--text-muted); padding:30px;">No WolfRouter LANs yet. Create one to serve DHCP+DNS for a subnet.</div>';
             return;
         }
+        grid.innerHTML = discoveredHtml + grid.innerHTML;
         grid.innerHTML = wrState.lans.map(l => `
             <div style="padding:14px; border:1px solid var(--border); border-radius:8px; background:var(--bg-card);">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
@@ -534,6 +558,68 @@
                 </div>
             </div>
         `).join('');
+    }
+
+    // Render every iptables rule currently active on the host into the
+    // firewall tab so it's never empty. Rules owned by WolfRouter are
+    // already shown in the editable table above; this section shows
+    // everything else (Docker, LXC, WolfStack DNAT, manual rules,
+    // system chain defaults).
+    function wrRenderHostFirewall() {
+        let panel = document.getElementById('wr-host-firewall');
+        if (!panel) {
+            // Inject the panel once into the firewall tab.
+            const fwTab = document.getElementById('wr-tab-firewall');
+            if (!fwTab) return;
+            panel = document.createElement('div');
+            panel.id = 'wr-host-firewall';
+            panel.style.marginTop = '24px';
+            fwTab.appendChild(panel);
+        }
+        const filter = wrState.snapshot?.firewall?.filter || [];
+        const nat = wrState.snapshot?.firewall?.nat || [];
+        const all = filter.concat(nat);
+        if (!all.length) {
+            panel.innerHTML = `<h4 style="font-size:13px; margin-bottom:8px; color:var(--text-muted);">🛡 Discovered host firewall rules</h4>
+                <div style="color:var(--text-muted); font-size:12px; padding:12px;">No iptables rules detected (or iptables not readable as this user — try running as root).</div>`;
+            return;
+        }
+        // Group by owner so users see what's WolfRouter vs what's already there.
+        const ownerLabel = {
+            wolfrouter: 'WolfRouter (managed here)',
+            wolfstack:  'WolfStack (port forwards / VM NAT)',
+            docker:     'Docker',
+            lxc:        'LXC',
+            system:     'System / kernel',
+            user:       'User-defined / other',
+        };
+        const ownerColor = {
+            wolfrouter: '#a855f7', wolfstack: '#22c55e',
+            docker: '#3b82f6', lxc: '#06b6d4',
+            system: '#94a3b8', user: '#fbbf24',
+        };
+        const groups = {};
+        for (const r of all) {
+            (groups[r.owner] = groups[r.owner] || []).push(r);
+        }
+        const orderedKeys = Object.keys(ownerLabel).filter(k => groups[k]);
+        panel.innerHTML = `
+            <div style="display:flex; align-items:baseline; justify-content:space-between; margin-bottom:8px;">
+                <h4 style="font-size:13px; margin:0; color:var(--text);">🛡 All firewall rules on this host (${all.length} total)</h4>
+                <span style="font-size:11px; color:var(--text-muted);">read-only — discovered from <code>iptables-save</code></span>
+            </div>
+            ${orderedKeys.map(k => `
+                <details ${k === 'wolfrouter' || k === 'wolfstack' ? 'open' : ''} style="margin-bottom:8px; border:1px solid var(--border); border-radius:6px; background:var(--bg-card);">
+                    <summary style="padding:8px 12px; cursor:pointer; font-size:12px; font-weight:600;">
+                        <span style="display:inline-block; width:10px; height:10px; background:${ownerColor[k]}; border-radius:50%; vertical-align:middle; margin-right:8px;"></span>
+                        ${escHtml(ownerLabel[k])} <span style="color:var(--text-muted); font-weight:normal; margin-left:6px;">(${groups[k].length})</span>
+                    </summary>
+                    <div style="padding:0 8px 8px;">
+                        <pre style="font-family:var(--font-mono); font-size:11px; background:var(--bg-secondary); padding:8px; border-radius:4px; max-height:200px; overflow:auto; margin:4px 0;">${groups[k].map(r => escHtml(`[${r.table}] ${r.raw}`)).join('\n')}</pre>
+                    </div>
+                </details>
+            `).join('')}
+        `;
     }
 
     async function wrDeleteLan(id) {
@@ -636,11 +722,36 @@
     async function wrRenderLeases() {
         const container = document.getElementById('wr-leases-container');
         if (!container) return;
+        const discoveredFiles = (wrState.snapshot?.dhcp?.lease_files) || [];
+        const discoveredHtml = discoveredFiles.length
+            ? `<div style="margin-bottom:16px;">
+                <h4 style="font-size:13px; margin:0 0 8px;">🔍 Lease files discovered on this host</h4>
+                <div style="font-size:11px; color:var(--text-muted); margin-bottom:8px;">Aggregated from /var/lib/wolfstack-router, /var/lib/dhcp, /var/lib/misc and /run.</div>
+                ${discoveredFiles.map(f => `
+                    <details ${f.leases.length ? 'open' : ''} style="margin-bottom:8px; border:1px solid var(--border); border-radius:6px; background:var(--bg-card);">
+                        <summary style="padding:8px 12px; cursor:pointer; font-size:12px; font-weight:600;">
+                            📄 <code style="font-family:var(--font-mono);">${escHtml(f.path)}</code>
+                            <span style="color:var(--text-muted); font-weight:normal; margin-left:6px;">(${f.leases.length} lease${f.leases.length===1?'':'s'})</span>
+                        </summary>
+                        <div style="padding:0 8px 8px;">
+                            ${f.leases.length
+                                ? `<table class="data-table" style="font-size:11px;">
+                                    <thead><tr><th>IP</th><th>MAC</th><th>Hostname</th><th>Expires</th></tr></thead>
+                                    <tbody>${f.leases.map(le => `<tr><td><code>${escHtml(le.ip)}</code></td><td><code>${escHtml(le.mac)}</code></td><td>${escHtml(le.hostname || '—')}</td><td style="color:var(--text-muted);">${escHtml(le.expires)}</td></tr>`).join('')}</tbody>
+                                </table>`
+                                : '<div style="color:var(--text-muted); font-size:11px; padding:8px;">Empty</div>'}
+                        </div>
+                    </details>
+                `).join('')}
+            </div>`
+            : '';
+
         if (!wrState.lans.length) {
-            container.innerHTML = '<div style="text-align:center; color:var(--text-muted); padding:24px;">No LANs — no leases. Create a LAN first.</div>';
+            container.innerHTML = discoveredHtml +
+                '<div style="text-align:center; color:var(--text-muted); padding:18px;">No WolfRouter-managed LANs. Add one to serve DHCP from WolfRouter directly.</div>';
             return;
         }
-        const parts = [];
+        const parts = [discoveredHtml];
         for (const lan of wrState.lans) {
             try {
                 const r = await fetch(wrUrl('/api/router/segments/' + lan.id + '/leases'));
@@ -771,9 +882,27 @@
         if (!canvas) return;
         const topo = wrState.topology;
         if (!topo || !topo.nodes || topo.nodes.length === 0) {
-            canvas.innerHTML = '<div style="color:var(--text-muted); text-align:center; padding:60px;">Loading topology…</div>';
+            canvas.innerHTML = `<div style="color:var(--text-muted); text-align:center; padding:60px;">
+                No nodes in topology. <br>
+                ${wrState.cluster ? `Cluster <code>${escHtml(wrState.cluster)}</code> may have no online WolfStack nodes.` : 'No cluster selected.'}
+            </div>`;
             return;
         }
+        // Render a header describing the cluster + node count so the
+        // rack view feels like a real cluster overview, not just a
+        // diagram floating in space.
+        const header = document.createElement('div');
+        header.style.cssText = 'margin-bottom:12px; padding:10px 14px; background:rgba(168,85,247,0.08); border:1px solid rgba(168,85,247,0.25); border-radius:6px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; font-size:13px;';
+        const totalPorts = topo.nodes.reduce((s, n) => s + (n.interfaces?.length || 0), 0);
+        const totalUp = topo.nodes.reduce((s, n) => s + (n.interfaces || []).filter(i => i.link_up).length, 0);
+        const totalVms = topo.nodes.reduce((s, n) => s + (n.vms?.length || 0), 0);
+        const totalCt = topo.nodes.reduce((s, n) => s + (n.containers?.length || 0), 0);
+        header.innerHTML = `
+            <div><strong>📡 Cluster: ${escHtml(wrState.cluster || 'unnamed')}</strong>
+                <span style="color:var(--text-muted); margin-left:8px;">${topo.nodes.length} node${topo.nodes.length===1?'':'s'} · ${totalUp}/${totalPorts} ports up · ${totalVms} VMs · ${totalCt} containers</span>
+            </div>
+            <div style="color:var(--text-muted); font-size:11px;">⛓ live topology refreshes every 3s</div>
+        `;
 
         const W = Math.max(canvas.clientWidth || 1000, 720);
         const ns = 'http://www.w3.org/2000/svg';
@@ -1106,6 +1235,7 @@
         }
 
         canvas.innerHTML = '';
+        canvas.appendChild(header);
         canvas.appendChild(svg);
 
         // Legend + integration badges

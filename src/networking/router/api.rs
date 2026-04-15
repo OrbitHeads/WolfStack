@@ -660,6 +660,171 @@ pub async fn get_managed_overview(req: HttpRequest, state: S) -> HttpResponse {
     }))
 }
 
+/// Snapshot of the host's current network reality — what's actually
+/// running, regardless of who configured it. WolfRouter renders this
+/// in the firewall / LANs / leases tabs so the user never sees a blank
+/// page; they see what's already on the host plus anything WolfRouter
+/// has added on top.
+pub async fn get_host_snapshot(req: HttpRequest, state: S) -> HttpResponse {
+    auth_or_return!(req, state);
+
+    let firewall_filter = run_capture(&["iptables-save", "-t", "filter"]);
+    let firewall_nat    = run_capture(&["iptables-save", "-t", "nat"]);
+    let parsed_filter   = parse_iptables(&firewall_filter, "filter");
+    let parsed_nat      = parse_iptables(&firewall_nat, "nat");
+
+    let dnsmasq_processes = list_dnsmasq_processes();
+    let lease_files = list_lease_files();
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "firewall": {
+            "filter": parsed_filter,
+            "nat": parsed_nat,
+            "raw_filter_lines": firewall_filter.lines().count(),
+            "raw_nat_lines": firewall_nat.lines().count(),
+        },
+        "dhcp": {
+            "dnsmasq_processes": dnsmasq_processes,
+            "lease_files": lease_files,
+        },
+    }))
+}
+
+fn run_capture(args: &[&str]) -> String {
+    std::process::Command::new(args[0])
+        .args(&args[1..])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default()
+}
+
+/// Parse `iptables-save` output into structured rule rows. Skips
+/// chain definitions (`:CHAIN ACCEPT [0:0]`) and table headers — only
+/// `-A CHAIN <args>` lines become rows. Tags each rule with its
+/// "owner" by sniffing the comment / chain name (Docker, LXC,
+/// WolfStack, WolfRouter, manual).
+fn parse_iptables(text: &str, table: &str) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with('#') || l.starts_with('*')
+            || l.starts_with(':') || l == "COMMIT" {
+            continue;
+        }
+        if !l.starts_with("-A ") { continue; }
+        // Extract chain name (first token after -A)
+        let rest = &l[3..];
+        let chain = rest.split_whitespace().next().unwrap_or("").to_string();
+        // Detect owner from chain name + comment
+        let owner = if chain.starts_with("DOCKER") || chain == "FORWARD" && l.contains("docker") {
+            "docker"
+        } else if chain.contains("LXC") || l.contains("lxc") {
+            "lxc"
+        } else if chain.starts_with("WOLFROUTER") {
+            "wolfrouter"
+        } else if l.contains("wolfstack-") {
+            "wolfstack"
+        } else if chain == "INPUT" || chain == "FORWARD" || chain == "OUTPUT"
+                  || chain == "PREROUTING" || chain == "POSTROUTING" {
+            "system"
+        } else {
+            "user"
+        };
+        out.push(serde_json::json!({
+            "table": table,
+            "chain": chain,
+            "owner": owner,
+            "raw": l,
+        }));
+    }
+    out
+}
+
+/// Find all dnsmasq processes running on the host. Each entry includes
+/// PID and the config file from the command line so the UI can group
+/// instances by purpose.
+fn list_dnsmasq_processes() -> Vec<serde_json::Value> {
+    let out = std::process::Command::new("ps")
+        .args(["-eo", "pid,args"])
+        .output()
+        .ok();
+    let text = match out {
+        Some(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return vec![],
+    };
+    let mut procs = Vec::new();
+    for line in text.lines().skip(1) {
+        let line = line.trim();
+        if !line.contains("dnsmasq") { continue; }
+        // Skip the grep itself if anyone added it
+        if line.contains("grep") { continue; }
+        let mut parts = line.splitn(2, char::is_whitespace);
+        let pid = parts.next().unwrap_or("").to_string();
+        let cmd = parts.next().unwrap_or("").to_string();
+        // Pull --conf-file=... or -C ... if present
+        let conf_file = cmd.split_whitespace().find_map(|tok| {
+            if let Some(rest) = tok.strip_prefix("--conf-file=") {
+                Some(rest.to_string())
+            } else { None }
+        }).unwrap_or_default();
+        let interface = cmd.split_whitespace().find_map(|tok| {
+            tok.strip_prefix("--interface=").map(|s| s.to_string())
+        }).unwrap_or_default();
+        procs.push(serde_json::json!({
+            "pid": pid,
+            "command": cmd,
+            "config_file": conf_file,
+            "interface": interface,
+        }));
+    }
+    procs
+}
+
+/// Lease files from common locations: WolfRouter's own dir, system
+/// dnsmasq, ISC DHCPD, dhcpcd. Each entry includes parsed leases
+/// where the format is recognisable.
+fn list_lease_files() -> Vec<serde_json::Value> {
+    let candidates = [
+        "/var/lib/wolfstack-router",
+        "/var/lib/misc",         // system dnsmasq default
+        "/var/lib/dnsmasq",
+        "/var/lib/dhcp",         // ISC DHCPD
+        "/run",                   // legacy WolfStack VM TAP DHCP
+    ];
+    let mut out = Vec::new();
+    for dir in &candidates {
+        let entries = match std::fs::read_dir(dir) { Ok(e) => e, Err(_) => continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.ends_with(".leases") && !name.contains("lease") { continue; }
+            let path_str = path.to_string_lossy().to_string();
+            // Parse common dnsmasq format: <expires> <mac> <ip> <host> <client-id>
+            let leases: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| {
+                    let parts: Vec<&str> = l.split_whitespace().collect();
+                    if parts.len() < 4 { return None; }
+                    Some(serde_json::json!({
+                        "expires": parts[0],
+                        "mac": parts[1],
+                        "ip": parts[2],
+                        "hostname": if parts[3] == "*" { "" } else { parts[3] },
+                    }))
+                })
+                .collect();
+            out.push(serde_json::json!({
+                "path": path_str,
+                "leases": leases,
+            }));
+        }
+    }
+    out
+}
+
 // ─── Mount ───
 
 pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
@@ -684,5 +849,6 @@ pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
         .route("/api/router/rules/confirm", web::post().to(confirm_rules))
         .route("/api/router/connections", web::get().to(list_connections))
         .route("/api/router/logs", web::get().to(list_firewall_logs))
-        .route("/api/router/managed-overview", web::get().to(get_managed_overview));
+        .route("/api/router/managed-overview", web::get().to(get_managed_overview))
+        .route("/api/router/host-snapshot", web::get().to(get_host_snapshot));
 }
