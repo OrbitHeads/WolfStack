@@ -914,25 +914,21 @@
         const railW = 22;          // vertical rail width on each side
         const rackInnerPad = 8;    // gap between rail and appliance
         const unitH = 96;          // 2U appliance height
-        const unitGap = 12;
-        const shelfTopGap = 30;
-        const shelfRowH = 36;
+        const unitGap = 24;        // wider so devices fit between nodes
 
         const nodeCount = topo.nodes.length;
-        const allDevices = topo.nodes.flatMap(n =>
-            (n.vms || []).map(d => ({ ...d, node: n.node_id }))
-            .concat((n.containers || []).map(d => ({ ...d, node: n.node_id })))
+        const maxDevicesPerNode = Math.max(
+            1,
+            ...topo.nodes.map(n => Math.min(6, (n.vms?.length || 0) + (n.containers?.length || 0)))
         );
-        const shelfCols = Math.max(1, Math.floor((W - padX*2 - 20) / 200));
-        const shelfRows = Math.max(1, Math.ceil(allDevices.length / shelfCols));
-        const shelfH = 28 + shelfRows * shelfRowH;
 
         const rackY = cloudH + cloudGap;
         const rackInnerH = nodeCount * unitH + (nodeCount - 1) * unitGap + rackInnerPad * 2;
-        const H = rackY + rackInnerH + 20 + shelfTopGap + shelfH + 20;
+        // Leave room on the right for per-node device columns
+        const H = rackY + rackInnerH + 60;
 
         const rackX = padX;
-        const rackW = W - padX*2;
+        const rackW = Math.max(W - padX*2 - 220, 600);  // reserve right-side strip for devices
         const apX = rackX + railW + rackInnerPad;
         const apW = rackW - railW*2 - rackInnerPad*2;
 
@@ -1174,17 +1170,16 @@
             }
         }
 
-        // LAN/Wolfnet/Mgmt ports → device shelf (route down).
-        const shelfY = rackY + rackInnerH + shelfTopGap;
+        // LAN / WolfNet / Mgmt ports — render a small downward "patch
+        // tail" stub from each port so the user sees these are wired,
+        // even though the actual device-side cable is drawn separately
+        // from the node anchor over to its devices.
         for (const node of topo.nodes) {
             for (const port of (portsByNode[node.node_id] || [])) {
                 if (!port.link_up) continue;
                 if (port.role === 'wan') continue;
                 const x1 = port.cx, y1 = port.portBottom;
-                const x2 = port.cx, y2 = shelfY - 8;
-                const cy1 = y1 + 22;
-                const cy2 = y2 - 22;
-                const path = `M ${x1},${y1} C ${x1},${cy1} ${x2},${cy2} ${x2},${y2}`;
+                const path = `M ${x1},${y1} l 0,12`;
                 cables.push({ path, color: port.color, bps: port.bps, kind: port.role });
             }
         }
@@ -1206,31 +1201,69 @@
             `);
         }
 
-        // Device shelf ────────────────────────────────────────────
-        svg.insertAdjacentHTML('beforeend', `
-            <rect x="${padX}" y="${shelfY-6}" width="${W - padX*2}" height="6"
-                  fill="#1f2937" stroke="#0a0f18"/>
-            <text x="${padX+8}" y="${shelfY+18}" style="fill:#cbd5e1; font-size:11px; font-weight:600;">🔌 Devices on this cluster</text>
-        `);
+        // Per-node device clusters — instead of a flat shelf, hang each
+        // node's VMs/containers directly under that node so the wiring
+        // is unambiguous: device → server → port → cable → cloud.
+        const deviceColW = Math.max(180, Math.floor(rackW / Math.max(topo.nodes.length, 1)) - 20);
+        const deviceColGap = 12;
+        for (let nIdx = 0; nIdx < topo.nodes.length; nIdx++) {
+            const node = topo.nodes[nIdx];
+            const nodeY = rackY + rackInnerPad + nIdx * (unitH + unitGap);
+            const devicesForNode = (node.vms || []).concat(node.containers || []);
+            if (!devicesForNode.length) continue;
 
-        let dIdx = 0;
-        for (const node of topo.nodes) {
-            for (const dev of (node.vms || []).concat(node.containers || [])) {
+            // Pick an anchor point on the node's right side to wire from
+            const anchorX = apX + apW;
+            const anchorY = nodeY + unitH / 2;
+            // Each device gets a small badge to the right of the rack.
+            // Layout: stack vertically beside the node, wrap to a second
+            // column if too many.
+            const colX = anchorX + 40 + nIdx * 4;  // staggered to avoid overlap
+            devicesForNode.slice(0, 6).forEach((dev, i) => {
                 const isVm = dev.kind === 'vm';
-                const col = dIdx % shelfCols, row = Math.floor(dIdx / shelfCols);
-                const dx = padX + 10 + col * 200;
-                const dy = shelfY + 28 + row * shelfRowH;
-                const icon = isVm ? '🖥' : '📦';
                 const accent = isVm ? '#60a5fa' : '#a855f7';
+                const icon = isVm ? '🖥' : '📦';
+                const dy = anchorY - 60 + i * 22;
+                // Curved cable from node anchor to device badge
+                const cableColor = isVm ? '#60a5fa' : '#a855f7';
                 svg.insertAdjacentHTML('beforeend', `
+                    <path d="M ${anchorX},${anchorY} C ${anchorX+20},${anchorY} ${colX-15},${dy+10} ${colX},${dy+10}"
+                          fill="none" stroke="${cableColor}" stroke-width="2" stroke-linecap="round" opacity="0.55"
+                          ${i % 2 === 0 ? 'stroke-dasharray="6 4" class="wr-wire-active"' : ''}/>
                     <g>
-                        <rect x="${dx}" y="${dy}" width="190" height="28" rx="6"
-                              fill="rgba(15,23,42,0.95)" stroke="${accent}" stroke-width="1" opacity="0.85"/>
-                        <text x="${dx+10}" y="${dy+18}" style="fill:#f1f5f9; font-size:12px;">${icon} ${escHtml(dev.name.slice(0,14))}</text>
-                        <text x="${dx+185}" y="${dy+18}" text-anchor="end" style="fill:#94a3b8; font-size:10px; font-family:monospace;">${escHtml((dev.attached_to||'').slice(0,10))}</text>
+                        <rect x="${colX}" y="${dy}" width="170" height="20" rx="5"
+                              fill="rgba(15,23,42,0.95)" stroke="${accent}" stroke-width="1"/>
+                        <text x="${colX+8}" y="${dy+14}" style="fill:#f1f5f9; font-size:11px;">${icon} ${escHtml(dev.name.slice(0,14))}</text>
+                        <text x="${colX+165}" y="${dy+14}" text-anchor="end" style="fill:${accent}; font-size:9px; font-family:monospace;">${escHtml((dev.attached_to||'').slice(0,9))}</text>
                     </g>
                 `);
-                dIdx++;
+            });
+            // Overflow indicator if there are more devices
+            if (devicesForNode.length > 6) {
+                svg.insertAdjacentHTML('beforeend', `
+                    <text x="${colX + 85}" y="${anchorY + 76}" text-anchor="middle"
+                          style="fill:var(--text-muted, #94a3b8); font-size:10px;">+ ${devicesForNode.length - 6} more</text>
+                `);
+            }
+        }
+
+        // Inter-node WolfNet mesh — each pair of nodes connected by a
+        // curved green cable to visualise the L3 overlay holding the
+        // cluster together. Drawn behind everything else for depth.
+        if (topo.nodes.length > 1) {
+            for (let i = 0; i < topo.nodes.length; i++) {
+                for (let j = i + 1; j < topo.nodes.length; j++) {
+                    const yi = rackY + rackInnerPad + i * (unitH + unitGap) + unitH/2;
+                    const yj = rackY + rackInnerPad + j * (unitH + unitGap) + unitH/2;
+                    const xLeft = apX + 8;
+                    // Curve to the left of the rack so it's visible
+                    const ctrlX = xLeft - 80;
+                    svg.insertAdjacentHTML('beforeend', `
+                        <path d="M ${xLeft},${yi} C ${ctrlX},${yi} ${ctrlX},${yj} ${xLeft},${yj}"
+                              fill="none" stroke="#22c55e" stroke-width="2.5" stroke-linecap="round"
+                              opacity="0.5" stroke-dasharray="8 5" class="wr-wire-active"/>
+                    `);
+                }
             }
         }
 
