@@ -377,7 +377,8 @@
         clearInterval(wrState.rollbackTimerInterval);
         wrState.rollbackTimerInterval = null;
         wrState.rollbackDeadline = null;
-        document.getElementById('wr-rules-safemode').style.display = 'none';
+        const sm = document.getElementById('wr-rules-safemode');
+        if (sm) sm.style.display = 'none';
     }
 
     // Rule editor modal
@@ -571,6 +572,7 @@
         const panel = document.getElementById('wr-f-warnings');
         if (!panel) return;
         const rule = wrCollectRuleFromEditor();
+        if (!rule) return;  // DOM not ready yet — skip analysis
         const warnings = wrAnalyzeRule(rule);
         if (!warnings.length) {
             panel.innerHTML = '<div style="color:var(--text-muted); font-size:11px; padding:6px 0;">✓ No obvious issues detected with this rule.</div>';
@@ -594,7 +596,12 @@
     /// used by wrRenderRuleWarnings and wrSaveRule to share logic.
     function wrCollectRuleFromEditor() {
         const byId = (id) => document.getElementById(id);
-        if (!byId('wr-f-action')) return null;
+        // Every element the function touches must exist before we
+        // start reading — otherwise we race the modal DOM being built.
+        const required = ['wr-f-action', 'wr-f-ports', 'wr-f-enabled',
+            'wr-f-dir', 'wr-f-from', 'wr-f-to', 'wr-f-proto',
+            'wr-f-log', 'wr-f-comment'];
+        for (const id of required) { if (!byId(id)) return null; }
         const ports = byId('wr-f-ports').value.split(',').map(s => s.trim()).filter(Boolean)
             .map(p => ({ port: p, side: 'dst' }));
         return {
@@ -1192,9 +1199,13 @@
     window.wrShowWanEditor = wrShowWanEditor;
 
     function wrToggleWanModeFields() {
-        const m = document.getElementById('wr-w-mode').value;
-        document.getElementById('wr-w-static').style.display = m === 'static' ? 'block' : 'none';
-        document.getElementById('wr-w-pppoe').style.display = m === 'pppoe' ? 'block' : 'none';
+        const modeEl = document.getElementById('wr-w-mode');
+        if (!modeEl) return;  // modal not open
+        const m = modeEl.value;
+        const staticEl = document.getElementById('wr-w-static');
+        const pppoeEl = document.getElementById('wr-w-pppoe');
+        if (staticEl) staticEl.style.display = m === 'static' ? 'block' : 'none';
+        if (pppoeEl)  pppoeEl.style.display  = m === 'pppoe'  ? 'block' : 'none';
     }
     window.wrToggleWanModeFields = wrToggleWanModeFields;
 
@@ -1430,21 +1441,172 @@
         return layout;
     }
 
+    /// Per-view UI state for the policy map. Survives across renders
+    /// so filters / traced-node / sim path don't reset on topology
+    /// refresh.
+    let wrPolicyUi = {
+        filters: { allow: true, deny: true, reject: true, log: true, dnat: true, disabled: false },
+        search: '',
+        tracedNode: null,   // node id currently in "trace mode" (null = off)
+        simPath: null,      // { edgeIds: [...], verdict: 'allow' | 'deny' | ... }
+    };
+
+    /// Traffic rates per node id (in bps rx + tx). Computed once per
+    /// render from topology.nodes[].interfaces[].{rx_bps,tx_bps}
+    /// joined with the per-node zone assignments so we can total up
+    /// "how much traffic is flowing across WAN right now" etc.
+    function wrComputeNodeTraffic(fullGraph) {
+        const bps = new Map();  // node-id → { rx, tx, speedMbps }
+        const topo = wrState.topology;
+        if (!topo) return bps;
+
+        // Iterate every cluster node's interfaces and bucket the
+        // traffic by which policy-map node each iface rolls up into.
+        for (const node of (topo.nodes || [])) {
+            const asg = wrState.zones?.assignments?.[node.node_id] || {};
+            for (const iface of (node.interfaces || [])) {
+                const rx = iface.rx_bps || 0, tx = iface.tx_bps || 0;
+                const sp = iface.speed_mbps || 0;
+                const addTo = (id) => {
+                    const cur = bps.get(id) || { rx: 0, tx: 0, speedMbps: 0 };
+                    cur.rx += rx; cur.tx += tx;
+                    cur.speedMbps = Math.max(cur.speedMbps, sp);
+                    bps.set(id, cur);
+                };
+                // Always add to the role-derived zone if assigned.
+                const assigned = asg[iface.name];
+                if (assigned) {
+                    const zid = assigned.kind === 'lan'
+                        ? `zone:lan${assigned.id ?? 0}`
+                        : `zone:${assigned.kind}`;
+                    addTo(zid);
+                } else if (iface.role) {
+                    const zid = iface.role === 'wan' ? 'zone:wan'
+                              : iface.role === 'management' ? 'zone:management'
+                              : iface.role === 'lan' ? 'zone:lan0'
+                              : iface.role === 'wolfnet' ? 'zone:wolfnet'
+                              : null;
+                    if (zid) addTo(zid);
+                }
+                // WAN role also counts toward Internet.
+                if (iface.role === 'wan') addTo('internet');
+            }
+        }
+        return bps;
+    }
+
+    /// Format bps into a short humanised string. Used on edge labels
+    /// and the summary bar so operators can read them at a glance.
+    function wrFmtBps(bps) {
+        if (!bps || bps < 1) return '—';
+        if (bps < 1024) return bps.toFixed(0) + ' bps';
+        if (bps < 1024*1024) return (bps/1024).toFixed(1) + ' Kbps';
+        if (bps < 1024*1024*1024) return (bps/1048576).toFixed(1) + ' Mbps';
+        return (bps/1073741824).toFixed(2) + ' Gbps';
+    }
+
+    /// Pick a heat colour for a link given its utilisation as a
+    /// fraction of link speed. Used to tint edges so a saturated
+    /// link goes red on the policy map.
+    function wrHeatColour(utilFrac) {
+        if (utilFrac >= 0.70) return '#ef4444';  // red
+        if (utilFrac >= 0.30) return '#fbbf24';  // amber
+        return null;  // no override — use the rule's action colour
+    }
+
     /// Render the canvas from scratch. Safe to call on every poll —
     /// cheap because graphs stay small (dozens of nodes, not
     /// thousands).
     function wrRenderPolicyMap() {
         const host = document.getElementById('wr-policy-canvas');
         if (!host) return;
-        const graph = wrBuildPolicyGraph();
-        if (!graph.nodes.length) {
+        const fullGraph = wrBuildPolicyGraph();
+        if (!fullGraph.nodes.length) {
             host.innerHTML = '<div style="color:var(--text-muted); text-align:center; padding:60px;">No data yet.</div>';
             return;
         }
+
+        // Apply filters: action-type toggles + node-name search.
+        // Edges are filtered by their action; nodes are filtered by
+        // text match, but we keep every node that's still referenced
+        // by a visible edge so the graph stays connected.
+        const f = wrPolicyUi.filters;
+        const searchText = (wrPolicyUi.search || '').toLowerCase().trim();
+        const edgeVisible = (e) => {
+            if (!e.enabled && !f.disabled) return false;
+            if (e.kind === 'dnat') return f.dnat;
+            return f[e.action] !== false;
+        };
+        const edges = fullGraph.edges.filter(edgeVisible);
+        let nodes = fullGraph.nodes;
+        if (searchText) {
+            const hit = new Set(nodes.filter(n => n.label.toLowerCase().includes(searchText)).map(n => n.id));
+            // Include the other end of any edge touching a matching node.
+            for (const e of edges) {
+                if (hit.has(e.from)) hit.add(e.to);
+                if (hit.has(e.to))   hit.add(e.from);
+            }
+            nodes = nodes.filter(n => hit.has(n.id));
+        }
+        const graph = { nodes, edges };
+
+        // Group edges by unordered-pair for fan-out rendering — many
+        // rules between the same pair used to stack on one path.
+        const bundleKey = (from, to) => [from, to].sort().join(' | ');
+        const bundles = new Map();
+        for (const e of edges) {
+            const k = bundleKey(e.from, e.to);
+            if (!bundles.has(k)) bundles.set(k, []);
+            bundles.get(k).push(e);
+        }
+
+        // Per-node throughput map — used by the edge renderer to
+        // show live BPS and colour saturated links red.
+        const nodeBps = wrComputeNodeTraffic(fullGraph);
+
+        // Render the per-cluster-node throughput strip. Each cluster
+        // node gets one badge: hostname + rx/tx summed across its
+        // interfaces. Drops immediately show up as tiny bars.
+        const nodeBwStrip = document.getElementById('wr-policy-node-bw');
+        if (nodeBwStrip) {
+            const cluster = wrState.topology?.nodes || [];
+            if (!cluster.length) {
+                nodeBwStrip.innerHTML = '';
+            } else {
+                // Find the max aggregate across cluster nodes so we
+                // can scale the little inline bar consistently.
+                const aggregates = cluster.map(n => {
+                    let rx = 0, tx = 0, speedMbps = 0;
+                    for (const i of (n.interfaces || [])) {
+                        rx += i.rx_bps || 0; tx += i.tx_bps || 0;
+                        speedMbps = Math.max(speedMbps, i.speed_mbps || 0);
+                    }
+                    return { name: n.node_name, rx, tx, speedMbps };
+                });
+                const maxRx = Math.max(1, ...aggregates.map(a => a.rx));
+                const maxTx = Math.max(1, ...aggregates.map(a => a.tx));
+                nodeBwStrip.innerHTML = `<span style="color:var(--text);">📊 Cluster throughput:</span> ` +
+                    aggregates.map(a => {
+                        const rxPct = (a.rx / maxRx) * 100;
+                        const txPct = (a.tx / maxTx) * 100;
+                        const linkBps = (a.speedMbps || 1000) * 1e6;
+                        const util = (a.rx + a.tx) / linkBps;
+                        const colour = util >= 0.7 ? '#ef4444' : util >= 0.3 ? '#fbbf24' : '#22c55e';
+                        return `<span style="display:inline-flex; align-items:center; gap:4px; padding:3px 8px; background:var(--bg-card); border:1px solid var(--border); border-radius:4px;">
+                            <span style="font-weight:600; color:var(--text);">${escHtml(a.name)}</span>
+                            <span style="color:${colour};">⬇${wrFmtBps(a.rx)}</span>
+                            <span style="color:${colour};">⬆${wrFmtBps(a.tx)}</span>
+                            <span style="display:inline-block; width:40px; height:4px; background:var(--bg-secondary); border-radius:2px; position:relative;">
+                                <span style="position:absolute; left:0; top:0; height:100%; width:${Math.min(100, rxPct)}%; background:${colour}; border-radius:2px;"></span>
+                            </span>
+                        </span>`;
+                    }).join('');
+            }
+        }
+
         const wrap = document.getElementById('wr-policy-canvas-wrap');
         const W = wrap?.clientWidth || 1000;
-        // Height scales with node count so dense graphs don't overlap.
-        const H = Math.max(600, 140 * 5);  // 5 tiers
+        const H = Math.max(600, 140 * 5);
         const layout = wrLayoutPolicyGraph(graph, W - 40, H);
 
         const ns = 'http://www.w3.org/2000/svg';
@@ -1455,77 +1617,187 @@
         svg.setAttribute('xmlns', ns);
         svg.style.display = 'block';
 
-        // Arrow marker for edge heads.
         svg.insertAdjacentHTML('afterbegin', `
             <defs>
                 <marker id="wr-policy-arrow" viewBox="0 -5 10 10" refX="10" refY="0" markerWidth="6" markerHeight="6" orient="auto">
                     <path d="M0,-5L10,0L0,5" fill="currentColor"/>
                 </marker>
                 <filter id="wr-policy-glow" x="-50%" y="-50%" width="200%" height="200%">
-                    <feGaussianBlur stdDeviation="2" result="b"/>
+                    <feGaussianBlur stdDeviation="3" result="b"/>
                     <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
                 </filter>
+                <radialGradient id="wr-sim-packet">
+                    <stop offset="0" stop-color="#fde68a"/>
+                    <stop offset="0.5" stop-color="#f59e0b"/>
+                    <stop offset="1" stop-color="#92400e" stop-opacity="0"/>
+                </radialGradient>
             </defs>
         `);
 
-        // Draw edges first (behind nodes). Curved bezier from source
-        // centre to dest centre; label at the midpoint.
-        for (const e of graph.edges) {
-            const a = layout.get(e.from), b = layout.get(e.to);
-            if (!a || !b) continue;
-            const cx = (a.x + b.x) / 2;
-            const cy = (a.y + b.y) / 2;
-            // Offset the control point perpendicular to the line so
-            // multiple edges between the same pair spread out.
-            const path = `M ${a.x},${a.y} Q ${cx},${cy} ${b.x},${b.y}`;
-            const active = e.enabled;
-            const strokeW = active ? 2.5 : 1.5;
-            svg.insertAdjacentHTML('beforeend', `
-                <g class="wr-policy-edge" data-edge="${escHtml(e.id)}" style="cursor:pointer; color:${e.colour};">
-                    <path d="${path}" fill="none" stroke="${e.colour}"
-                          stroke-width="${strokeW}"
-                          opacity="${active ? 0.85 : 0.35}"
-                          stroke-dasharray="${active ? 'none' : '4 3'}"
-                          marker-end="url(#wr-policy-arrow)"/>
-                    <path d="${path}" fill="none" stroke="transparent" stroke-width="14"/>
-                    <text x="${cx}" y="${cy - 6}" text-anchor="middle"
-                          style="fill:${e.colour}; font-size:10px; font-family:var(--font-mono,monospace); pointer-events:none;">${escHtml(e.label || '')}</text>
-                </g>
-            `);
+        // Compute which nodes + edges are "live" for the trace/sim
+        // highlight, so we can dim the rest.
+        const tracedEdgeIds = new Set();
+        const tracedNodeIds = new Set();
+        if (wrPolicyUi.tracedNode) {
+            tracedNodeIds.add(wrPolicyUi.tracedNode);
+            for (const e of edges) {
+                if (e.from === wrPolicyUi.tracedNode || e.to === wrPolicyUi.tracedNode) {
+                    tracedEdgeIds.add(e.id);
+                    tracedNodeIds.add(e.from);
+                    tracedNodeIds.add(e.to);
+                }
+            }
+        }
+        if (wrPolicyUi.simPath) {
+            for (const id of wrPolicyUi.simPath.edgeIds) tracedEdgeIds.add(id);
+        }
+        const dimMode = wrPolicyUi.tracedNode != null;
+
+        // Edges with fan-out offsets so parallel rules don't stack.
+        // Edges tinted by utilisation when both endpoints have a BPS
+        // reading — saturated links go red so bottlenecks jump out.
+        for (const [, bundle] of bundles) {
+            const n = bundle.length;
+            bundle.forEach((e, idx) => {
+                const a = layout.get(e.from), b = layout.get(e.to);
+                if (!a || !b) return;
+                const t = n === 1 ? 0 : (idx - (n - 1) / 2);
+                const spread = 28;
+                const dx = b.x - a.x, dy = b.y - a.y;
+                const len = Math.hypot(dx, dy) || 1;
+                const nx = -dy / len, ny = dx / len;
+                const cx = (a.x + b.x) / 2 + nx * t * spread;
+                const cy = (a.y + b.y) / 2 + ny * t * spread;
+                const path = `M ${a.x},${a.y} Q ${cx},${cy} ${b.x},${b.y}`;
+                const dim = dimMode && !tracedEdgeIds.has(e.id);
+                const opacity = (e.enabled ? 0.85 : 0.35) * (dim ? 0.18 : 1);
+
+                // Bottleneck analysis: the edge's effective throughput
+                // is the minimum of the traffic measured at the two
+                // endpoints that ACTUALLY have a measurement. An edge
+                // from "zone that's measured" to "VM that isn't" uses
+                // the measured side straight — don't silently zero it
+                // out with Math.min(measured, 0).
+                const fromBps = nodeBps.get(e.from);
+                const toBps   = nodeBps.get(e.to);
+                let edgeRx = 0, edgeTx = 0, edgeSpeedMbps = 0, util = 0;
+                if (fromBps && toBps) {
+                    edgeRx = Math.min(fromBps.rx, toBps.rx);
+                    edgeTx = Math.min(fromBps.tx, toBps.tx);
+                    const speeds = [fromBps.speedMbps, toBps.speedMbps].filter(Boolean);
+                    edgeSpeedMbps = speeds.length ? Math.min(...speeds) : 1000;
+                    const avgTotal = ((fromBps.rx + fromBps.tx) + (toBps.rx + toBps.tx)) / 2;
+                    util = avgTotal / Math.max(1, edgeSpeedMbps * 1e6);
+                } else if (fromBps) {
+                    edgeRx = fromBps.rx; edgeTx = fromBps.tx;
+                    edgeSpeedMbps = fromBps.speedMbps || 1000;
+                    util = (fromBps.rx + fromBps.tx) / Math.max(1, edgeSpeedMbps * 1e6);
+                } else if (toBps) {
+                    edgeRx = toBps.rx; edgeTx = toBps.tx;
+                    edgeSpeedMbps = toBps.speedMbps || 1000;
+                    util = (toBps.rx + toBps.tx) / Math.max(1, edgeSpeedMbps * 1e6);
+                }
+                const heat = wrHeatColour(util);
+                const strokeColour = heat || e.colour;
+                // Scale stroke width by traffic so a fat cable = busy.
+                const bpsTotal = edgeRx + edgeTx;
+                const trafficBoost = bpsTotal > 0
+                    ? Math.min(4, Math.log10(Math.max(1, bpsTotal / 1000)))
+                    : 0;
+                const baseW = e.enabled ? 2.5 : 1.5;
+                const isTraced = tracedEdgeIds.has(e.id);
+                const strokeW = baseW + trafficBoost + (isTraced ? 1.5 : 0);
+                const bpsLabel = bpsTotal > 0
+                    ? ` · ${wrFmtBps(bpsTotal)}${util >= 0.7 ? ' 🔥' : ''}`
+                    : '';
+                svg.insertAdjacentHTML('beforeend', `
+                    <g class="wr-policy-edge" data-edge="${escHtml(e.id)}" style="cursor:pointer; color:${strokeColour};">
+                        <path d="${path}" fill="none" stroke="${strokeColour}"
+                              stroke-width="${strokeW.toFixed(2)}"
+                              opacity="${opacity}"
+                              stroke-dasharray="${e.enabled ? (bpsTotal > 0 ? '10 6' : 'none') : '4 3'}"
+                              marker-end="url(#wr-policy-arrow)"
+                              ${bpsTotal > 0 ? 'class="wr-wire-active"' : ''}
+                              ${isTraced ? 'filter="url(#wr-policy-glow)"' : ''}/>
+                        <path d="${path}" fill="none" stroke="transparent" stroke-width="14"/>
+                        <text x="${cx}" y="${cy - 6}" text-anchor="middle"
+                              style="fill:${strokeColour}; font-size:10px; font-family:var(--font-mono,monospace); pointer-events:none; opacity:${opacity};">${escHtml(e.label || '')}${escHtml(bpsLabel)}</text>
+                    </g>
+                `);
+            });
         }
 
-        // Then nodes on top.
+        // Nodes on top. Dim when trace mode is active and we're not
+        // on the traced graph.
         const nodeW = 120, nodeH = 36;
         for (const n of graph.nodes) {
             const p = layout.get(n.id);
             if (!p) continue;
             const x = p.x - nodeW/2, y = p.y - nodeH/2;
             const fill = {
-                internet: 'rgba(96,165,250,0.18)',
-                zone:     'rgba(168,85,247,0.18)',
-                lan:      'rgba(34,197,94,0.15)',
-                vm:       'rgba(59,130,246,0.12)',
+                internet: 'rgba(96,165,250,0.18)', zone: 'rgba(168,85,247,0.18)',
+                lan: 'rgba(34,197,94,0.15)', vm: 'rgba(59,130,246,0.12)',
                 container:'rgba(168,85,247,0.12)',
             }[n.kind] || 'rgba(148,163,184,0.12)';
             const stroke = {
-                internet: '#60a5fa',
-                zone:     '#a855f7',
-                lan:      '#22c55e',
-                vm:       '#60a5fa',
-                container:'#a855f7',
+                internet: '#60a5fa', zone: '#a855f7', lan: '#22c55e',
+                vm: '#60a5fa', container:'#a855f7',
             }[n.kind] || '#94a3b8';
+            const dim = dimMode && !tracedNodeIds.has(n.id);
+            const opacity = dim ? 0.25 : 1;
+            const isTraced = tracedNodeIds.has(n.id);
+            // Per-node traffic readout — tiny BPS tag above the rect
+            // so users can see which hubs (WAN, WolfNet, a busy zone)
+            // are pushing the most bytes. Only shown when > 0.
+            const nbps = nodeBps.get(n.id);
+            const nodeTotalBps = nbps ? (nbps.rx + nbps.tx) : 0;
+            const nodeUtil = nbps && nbps.speedMbps
+                ? nodeTotalBps / (nbps.speedMbps * 1e6) : 0;
+            const bpsTagColour = nodeUtil >= 0.7 ? '#ef4444'
+                : nodeUtil >= 0.3 ? '#fbbf24'
+                : '#4ade80';
+            const bpsTag = nodeTotalBps > 0
+                ? `<text x="${p.x}" y="${y-6}" text-anchor="middle"
+                        style="fill:${bpsTagColour}; font-size:10px; font-family:var(--font-mono,monospace); pointer-events:none;">${escHtml(wrFmtBps(nodeTotalBps))}</text>`
+                : '';
             svg.insertAdjacentHTML('beforeend', `
-                <g class="wr-policy-node" data-node="${escHtml(n.id)}" style="cursor:crosshair;">
+                <g class="wr-policy-node" data-node="${escHtml(n.id)}" style="cursor:crosshair; opacity:${opacity};">
                     <rect x="${x}" y="${y}" width="${nodeW}" height="${nodeH}" rx="8"
-                          fill="${fill}" stroke="${stroke}" stroke-width="1.5"/>
+                          fill="${fill}" stroke="${stroke}" stroke-width="${isTraced ? 2.5 : 1.5}"
+                          ${isTraced ? 'filter="url(#wr-policy-glow)"' : ''}/>
                     <text x="${p.x}" y="${p.y+4}" text-anchor="middle"
                           style="fill:var(--text); font-size:12px; font-weight:600; pointer-events:none;">${escHtml(n.icon)} ${escHtml(n.label.slice(0,14))}</text>
+                    ${bpsTag}
                 </g>
             `);
         }
 
-        // Live-drag ghost path — hidden until mousedown on a node.
-        svg.insertAdjacentHTML('beforeend', `<path id="wr-policy-drag-ghost" d="" fill="none" stroke="#fbbf24" stroke-width="3" stroke-dasharray="6 4" opacity="0.8" style="display:none;" marker-end="url(#wr-policy-arrow)"/>`);
+        // Live drag + drop-target highlight rings. Hidden until
+        // mousedown picks a source node.
+        svg.insertAdjacentHTML('beforeend', `
+            <g id="wr-drag-layer" style="pointer-events:none;">
+                <path id="wr-policy-drag-ghost" d="" fill="none" stroke="#fbbf24" stroke-width="3" stroke-dasharray="6 4" opacity="0.8" style="display:none;" marker-end="url(#wr-policy-arrow)"/>
+                <circle id="wr-drag-source-ring" r="32" fill="none" stroke="#fbbf24" stroke-width="3" style="display:none;" filter="url(#wr-policy-glow)"/>
+                <circle id="wr-drag-target-ring" r="32" fill="none" stroke="#22c55e" stroke-width="3" style="display:none;" filter="url(#wr-policy-glow)"/>
+            </g>
+        `);
+
+        // Simulator: animated packet glow that travels along the
+        // highlighted path. Rendered only when a sim path is set.
+        if (wrPolicyUi.simPath?.edgeIds?.length) {
+            const firstEdge = edges.find(e => e.id === wrPolicyUi.simPath.edgeIds[0]);
+            if (firstEdge) {
+                const a = layout.get(firstEdge.from), b = layout.get(firstEdge.to);
+                if (a && b) {
+                    svg.insertAdjacentHTML('beforeend', `
+                        <circle r="12" fill="url(#wr-sim-packet)">
+                            <animateMotion dur="1.2s" repeatCount="indefinite"
+                                path="M ${a.x},${a.y} L ${b.x},${b.y}"/>
+                        </circle>
+                    `);
+                }
+            }
+        }
 
         host.innerHTML = '';
         host.appendChild(svg);
@@ -1535,26 +1807,29 @@
         if (legend) {
             const sw = (c, l) => `<div style="display:flex; align-items:center; gap:4px;"><span style="display:inline-block; width:14px; height:3px; background:${c}; border-radius:2px;"></span>${l}</div>`;
             legend.innerHTML = [
-                sw('#22c55e', 'allow'),
-                sw('#ef4444', 'deny'),
-                sw('#f97316', 'reject'),
-                sw('#60a5fa', 'log'),
-                sw('#a855f7', 'DNAT (port forward)'),
-                `<span style="color:var(--text-muted);">· drag between nodes to add a rule · click a line to edit</span>`,
+                sw('#22c55e', 'allow'), sw('#ef4444', 'deny'), sw('#f97316', 'reject'),
+                sw('#60a5fa', 'log'),   sw('#a855f7', 'DNAT'),
+                `<span style="color:var(--text-muted);">· drag between nodes to add a rule · click a node to trace · click a line to edit</span>`,
             ].join('');
         }
 
-        // Wire interactions.
-        wrWirePolicyInteractions(svg, graph, layout, nodeW, nodeH);
+        wrWirePolicyInteractions(svg, graph, layout, nodeW, nodeH, fullGraph);
+        wrWirePolicyFilters();
+        wrWirePolicySimulator(fullGraph);
     }
 
-    /// Drag-to-create + click-to-edit handlers. Lives on the <svg>
-    /// element directly — nodes have `data-node` and edges have
-    /// `data-edge` attributes so event.target.closest() works.
-    function wrWirePolicyInteractions(svg, graph, layout, nodeW, nodeH) {
-        let dragFrom = null;  // node id we're dragging from
-        let dragStart = null; // {x,y} in SVG coords
+    /// Drag-to-create + click-to-edit + click-to-trace handlers.
+    /// Drag distance threshold separates "click" (trace a node / edit
+    /// an edge) from "drag" (create a rule) so simple clicks don't
+    /// accidentally open the rule editor.
+    function wrWirePolicyInteractions(svg, graph, layout, nodeW, nodeH, fullGraph) {
+        let dragFrom = null;
+        let dragStart = null;
+        let dragMoved = false;
+        const CLICK_THRESHOLD = 6;  // px — anything less than this is a click
         const ghost = svg.querySelector('#wr-policy-drag-ghost');
+        const sourceRing = svg.querySelector('#wr-drag-source-ring');
+        const targetRing = svg.querySelector('#wr-drag-target-ring');
 
         const getMousePos = (evt) => {
             const rect = svg.getBoundingClientRect();
@@ -1571,7 +1846,12 @@
             const p = layout.get(dragFrom);
             if (!p) return;
             dragStart = { x: p.x, y: p.y };
-            ghost.style.display = 'block';
+            dragMoved = false;
+            // Source ring: always visible on mousedown. Becomes the
+            // "you're dragging FROM here" hint.
+            sourceRing.setAttribute('cx', p.x);
+            sourceRing.setAttribute('cy', p.y);
+            sourceRing.style.display = 'block';
             ghost.setAttribute('d', `M ${p.x},${p.y} L ${p.x},${p.y}`);
             evt.preventDefault();
         });
@@ -1579,48 +1859,75 @@
         svg.addEventListener('mousemove', (evt) => {
             if (!dragFrom) return;
             const m = getMousePos(evt);
+            const dx = m.x - dragStart.x, dy = m.y - dragStart.y;
+            if (Math.hypot(dx, dy) > CLICK_THRESHOLD) {
+                dragMoved = true;
+                ghost.style.display = 'block';
+            }
             ghost.setAttribute('d', `M ${dragStart.x},${dragStart.y} L ${m.x},${m.y}`);
+            // Drop-target ring: highlight any node we're hovering
+            // that isn't the source itself.
+            const overEl = evt.target.closest('[data-node]');
+            const overId = overEl?.dataset?.node;
+            if (overId && overId !== dragFrom) {
+                const q = layout.get(overId);
+                if (q) {
+                    targetRing.setAttribute('cx', q.x);
+                    targetRing.setAttribute('cy', q.y);
+                    targetRing.style.display = 'block';
+                    return;
+                }
+            }
+            targetRing.style.display = 'none';
         });
 
-        const endDrag = (evt) => {
-            if (!dragFrom) return;
-            const targetEl = evt.target.closest('[data-node]');
+        const clearDrag = () => {
             ghost.style.display = 'none';
             ghost.setAttribute('d', '');
+            sourceRing.style.display = 'none';
+            targetRing.style.display = 'none';
+            dragFrom = null; dragStart = null; dragMoved = false;
+        };
+
+        svg.addEventListener('mouseup', (evt) => {
+            if (!dragFrom) return;
             const fromId = dragFrom;
+            const wasClick = !dragMoved;
+            const targetEl = evt.target.closest('[data-node]');
             const toId = targetEl?.dataset?.node;
-            dragFrom = null; dragStart = null;
+            clearDrag();
+
+            if (wasClick) {
+                // Click — enter trace mode for this node.
+                wrPolicyUi.tracedNode = (wrPolicyUi.tracedNode === fromId) ? null : fromId;
+                wrPolicyUi.simPath = null;
+                const clearTraceBtn = document.getElementById('wr-policy-clear-trace');
+                if (clearTraceBtn) {
+                    clearTraceBtn.style.display = wrPolicyUi.tracedNode ? 'inline-block' : 'none';
+                }
+                wrRenderPolicyMap();
+                return;
+            }
+            // Drag complete.
             if (!toId || toId === fromId) return;
-            // Translate node ids back to Endpoint objects and open
-            // the rule editor pre-filled.
-            const fromEp = wrNodeIdToEndpoint(fromId, graph);
-            const toEp   = wrNodeIdToEndpoint(toId,   graph);
+            const fromEp = wrNodeIdToEndpoint(fromId, fullGraph);
+            const toEp   = wrNodeIdToEndpoint(toId,   fullGraph);
             if (!fromEp || !toEp) {
                 alert('One of those nodes isn\'t addressable as a firewall endpoint yet — try a zone or a named VM/container.');
                 return;
             }
             wrShowRuleEditorPrefilled({
-                action: 'allow',
-                direction: 'forward',
-                from: fromEp,
-                to:   toEp,
-                protocol: 'any',
-                ports: [],
-                state_track: true,
+                action: 'allow', direction: 'forward',
+                from: fromEp, to: toEp,
+                protocol: 'any', ports: [], state_track: true,
                 log_match: false,
                 comment: `drag-created: ${fromId} → ${toId}`,
                 enabled: true,
             });
-        };
-        svg.addEventListener('mouseup', endDrag);
-        svg.addEventListener('mouseleave', () => {
-            if (!dragFrom) return;
-            ghost.style.display = 'none';
-            ghost.setAttribute('d', '');
-            dragFrom = null; dragStart = null;
         });
+        svg.addEventListener('mouseleave', () => { if (dragFrom) clearDrag(); });
 
-        // Click on an edge opens the edit popover (not drag).
+        // Click on an edge opens the edit popover.
         svg.querySelectorAll('[data-edge]').forEach(el => {
             el.addEventListener('click', (evt) => {
                 const edgeId = el.dataset.edge;
@@ -1630,6 +1937,164 @@
                 evt.stopPropagation();
             });
         });
+
+        // Clear-trace button — visible only while a trace is active.
+        const clearBtn = document.getElementById('wr-policy-clear-trace');
+        if (clearBtn) {
+            clearBtn.onclick = () => {
+                wrPolicyUi.tracedNode = null;
+                wrPolicyUi.simPath = null;
+                clearBtn.style.display = 'none';
+                wrRenderPolicyMap();
+            };
+        }
+    }
+
+    /// Wire the filter toolbar checkboxes + search input once per
+    /// render. Re-renders the canvas on every change.
+    function wrWirePolicyFilters() {
+        document.querySelectorAll('[data-wr-filter]').forEach(cb => {
+            cb.onchange = () => {
+                wrPolicyUi.filters[cb.dataset.wrFilter] = cb.checked;
+                wrRenderPolicyMap();
+            };
+            // Re-sync DOM state with stored UI state (after a full re-render).
+            cb.checked = !!wrPolicyUi.filters[cb.dataset.wrFilter];
+        });
+        const searchEl = document.getElementById('wr-policy-search');
+        if (searchEl) {
+            searchEl.value = wrPolicyUi.search;
+            searchEl.oninput = () => {
+                wrPolicyUi.search = searchEl.value;
+                wrRenderPolicyMap();
+            };
+        }
+    }
+
+    /// Wire the traffic simulator toolbar. Populates the src/dst
+    /// dropdowns with every node on the graph, then evaluates the
+    /// proposed packet against the rule list in order and shows the
+    /// verdict + which rule matched. Animates a packet along the
+    /// matched edge.
+    function wrWirePolicySimulator(fullGraph) {
+        const fromSel = document.getElementById('wr-sim-from');
+        const toSel = document.getElementById('wr-sim-to');
+        const protoSel = document.getElementById('wr-sim-proto');
+        const portIn = document.getElementById('wr-sim-port');
+        const goBtn = document.getElementById('wr-sim-go');
+        const result = document.getElementById('wr-sim-result');
+        if (!fromSel || !toSel || !goBtn || !result) return;
+
+        const opts = fullGraph.nodes.map(n =>
+            `<option value="${escHtml(n.id)}">${escHtml(n.icon)} ${escHtml(n.label)}</option>`
+        ).join('');
+        const prevFrom = fromSel.value;
+        const prevTo = toSel.value;
+        fromSel.innerHTML = opts;
+        toSel.innerHTML = opts;
+        if (prevFrom && fullGraph.nodes.some(n => n.id === prevFrom)) fromSel.value = prevFrom;
+        if (prevTo && fullGraph.nodes.some(n => n.id === prevTo)) toSel.value = prevTo;
+
+        goBtn.onclick = () => {
+            const fromEp = wrNodeIdToEndpoint(fromSel.value, fullGraph);
+            const toEp   = wrNodeIdToEndpoint(toSel.value,   fullGraph);
+            if (!fromEp || !toEp) {
+                result.innerHTML = '<span style="color:#ef4444;">✗ src or dst can\'t be translated</span>';
+                return;
+            }
+            const proto = protoSel.value;
+            const port = portIn.value.trim();
+            const verdict = wrSimulateTraffic(fromEp, toEp, proto, port);
+            wrPolicyUi.simPath = verdict.matchedEdgeId
+                ? { edgeIds: [verdict.matchedEdgeId], verdict: verdict.action }
+                : null;
+            const colour = {
+                allow:  '#22c55e', deny:   '#ef4444',
+                reject: '#f97316', log:    '#60a5fa',
+                implicit_allow: '#94a3b8',
+            }[verdict.action] || '#94a3b8';
+            result.innerHTML = `
+                <span style="color:${colour}; font-weight:600;">${verdict.action.toUpperCase()}</span>
+                ${verdict.matchedRuleId ? ` via rule <code style="color:var(--text);">${escHtml(verdict.matchedRuleId.slice(0, 8))}</code>` : ''}
+                ${verdict.note ? `<span style="color:var(--text-muted); margin-left:6px;">${escHtml(verdict.note)}</span>` : ''}
+            `;
+            wrRenderPolicyMap();
+        };
+    }
+
+    /// Evaluate a proposed packet against the current rule list in
+    /// order. Returns { action, matchedRuleId, matchedEdgeId, note }.
+    /// Mirrors the backend's rule-matching for the common cases —
+    /// this is a client-side approximation, not an exact iptables
+    /// walk, but close enough to answer "will this go through?".
+    function wrSimulateTraffic(fromEp, toEp, protocol, port) {
+        // Endpoint match logic: an endpoint in the rule matches the
+        // proposed endpoint iff rule endpoint is Any OR same kind+id.
+        const matchEp = (ruleEp, proposed) => {
+            if (!ruleEp) return true;
+            if (ruleEp.kind === 'any') return true;
+            if (!proposed) return false;  // guard against null proposed endpoint
+            if (ruleEp.kind !== proposed.kind) return false;
+            if (ruleEp.kind === 'zone') {
+                return ruleEp.zone?.kind === proposed.zone?.kind
+                    && (ruleEp.zone?.id ?? 0) === (proposed.zone?.id ?? 0);
+            }
+            if (ruleEp.kind === 'lan')       return ruleEp.id === proposed.id;
+            if (ruleEp.kind === 'vm'
+             || ruleEp.kind === 'container'
+             || ruleEp.kind === 'interface') return ruleEp.name === proposed.name;
+            if (ruleEp.kind === 'ip')        return ruleEp.cidr === proposed.cidr;
+            return true;
+        };
+        const protoMatches = (rp) => {
+            // Rule with proto=any matches every proposed packet.
+            if (rp === 'any') return true;
+            // Proposed packet with proto=any means "any/unknown" — we
+            // interpret this as "match rules regardless of proto" so
+            // users can simulate without committing to a layer-4
+            // protocol (e.g. "can X talk to Y at all?").
+            if (protocol === 'any') return true;
+            if (rp === 'tcpudp') return protocol === 'tcp' || protocol === 'udp';
+            return rp === protocol;
+        };
+        const portMatches = (rulePorts) => {
+            if (!rulePorts?.length) return true;
+            if (!port) return false;
+            const n = parseInt(port, 10);
+            if (isNaN(n)) return false;
+            return rulePorts.some(p => {
+                const s = p.port;
+                if (s.includes('-')) {
+                    const [lo, hi] = s.split('-').map(x => parseInt(x, 10));
+                    return n >= lo && n <= hi;
+                }
+                return parseInt(s, 10) === n;
+            });
+        };
+        // .slice() before sort — otherwise the sort mutates the live
+        // wrState.rules order and other tabs that iterate it see the
+        // shuffled-by-order sequence (caught in review).
+        const rules = (wrState.rules || []).slice()
+            .filter(r => r.enabled !== false)
+            .sort((a, b) => (a.order || 0) - (b.order || 0));
+        for (const r of rules) {
+            if (!matchEp(r.from, fromEp)) continue;
+            if (!matchEp(r.to,   toEp))   continue;
+            if (!protoMatches(r.protocol)) continue;
+            if (!portMatches(r.ports))    continue;
+            return {
+                action: r.action,
+                matchedRuleId: r.id,
+                matchedEdgeId: 'rule:' + r.id,
+                note: `${r.action === 'allow' ? '✓ permitted' : '✗ blocked'} — ${r.comment || '(no comment)'}`,
+            };
+        }
+        return {
+            action: 'implicit_allow',
+            matchedRuleId: null,
+            matchedEdgeId: null,
+            note: 'no rule matched — kernel default (ACCEPT) applies',
+        };
     }
 
     /// Translate a policy-map node id back to a firewall Endpoint
