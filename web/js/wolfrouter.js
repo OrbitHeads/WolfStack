@@ -1348,18 +1348,147 @@
             }
         }
 
-        // Tier 3: LAN segments (served by WolfRouter with DHCP+DNS).
+        // Always show the full cluster topology — ports, bridges,
+        // VLANs, VMs, containers, all wired together — so the map is
+        // a single "at a glance" view of where traffic flows. The
+        // node selector becomes an optional filter; by default we
+        // draw everything across every cluster node.
+        //
+        // Ports/bridges/vlans are namespaced by node_id because
+        // iface names (eth0, vmbr0, docker0) collide across hosts.
+        const selNode = wrPolicyUi.selectedNode || '';
+        const lanTier    = 6;
+        const deviceTier = 7;
+
+        // LAN segments (served by WolfRouter with DHCP+DNS).
         for (const lan of (wrState.lans || [])) {
-            addNode(`lan:${lan.id}`, lan.name, '🏠', 3, 'lan', { lan });
+            addNode(`lan:${lan.id}`, lan.name, '🏠', lanTier, 'lan', { lan, ip: lan.subnet_cidr });
         }
 
-        // Tier 4: VMs and containers, drawn from topology.
+        // Per-cluster-node topology: ports, vlans, bridges, VMs, CTs.
         for (const n of (wrState.topology?.nodes || [])) {
+            if (selNode && n.node_id !== selNode) continue;
+            const nodeTag = n.node_name || n.node_id;
+            for (const p of (n.interfaces || [])) {
+                const ip = (p.addresses && p.addresses[0]) || '';
+                const icon = p.link_up ? '🔌' : '⛔';
+                addNode(`port:${n.node_id}:${p.name}`, `${nodeTag}·${p.name}`, icon, 3, 'port', {
+                    port: p, node: n.node_id, ip,
+                });
+            }
+            for (const v of (n.vlans || [])) {
+                const ip = (v.addresses && v.addresses[0]) || '';
+                addNode(`vlan:${n.node_id}:${v.name}`, `${nodeTag}·${v.name}`, '🏷', 4, 'vlan', {
+                    vlan: v, node: n.node_id, ip: ip || `VLAN ${v.vlan_id}`,
+                });
+            }
+            for (const b of (n.bridges || [])) {
+                const ip = (b.addresses && b.addresses[0]) || '';
+                addNode(`br:${n.node_id}:${b.name}`, `${nodeTag}·${b.name}`, '🌉', 5, 'bridge', {
+                    bridge: b, node: n.node_id, ip,
+                });
+            }
             for (const vm of (n.vms || [])) {
-                addNode(`vm:${vm.name}`, vm.name, '🖥', 4, 'vm', { vm, node: n.node_id });
+                addNode(`vm:${vm.name}`, vm.name, '🖥', deviceTier, 'vm', {
+                    vm, node: n.node_id, ip: vm.ip || '',
+                });
             }
             for (const ct of (n.containers || [])) {
-                addNode(`ct:${ct.name}`, ct.name, '📦', 4, 'container', { ct, node: n.node_id });
+                addNode(`ct:${ct.name}`, ct.name, '📦', deviceTier, 'container', {
+                    ct, node: n.node_id, ip: ct.ip || ct.attached_to || '',
+                });
+            }
+        }
+
+        // ── Implicit infrastructure edges ───────────────────────
+        // Without these the graph is a bunch of unconnected dots
+        // whenever the user has no explicit firewall rules yet. Show
+        // the TOPOLOGY as faint grey edges so the mental model is
+        // always legible: Internet ↔ WAN ↔ zones ↔ LAN segments ↔
+        // devices. These are visual only — no rule behind them,
+        // clicking does nothing special.
+        const implicitEdge = (from, to, label) => {
+            if (!nodes.has(from) || !nodes.has(to)) return;
+            edges.push({
+                id: `implicit:${from}|${to}`,
+                from, to,
+                kind: 'implicit',
+                action: 'implicit',
+                colour: '#64748b',
+                enabled: true,
+                label: label || '',
+            });
+        };
+        // Internet ↔ WAN (classic uplink).
+        implicitEdge('internet', 'zone:wan', 'uplink');
+        // Each LAN segment belongs to its zone.
+        for (const lan of (wrState.lans || [])) {
+            const zId = lan.zone?.kind === 'lan'
+                ? `zone:lan${lan.zone.id ?? 0}`
+                : `zone:${lan.zone?.kind}`;
+            implicitEdge(`lan:${lan.id}`, zId, '');
+        }
+        // VMs with a WolfNet IP attach to the WolfNet zone. VMs on a
+        // passthrough bridge attach to the LAN zone that bridge is in.
+        // Physical wiring, per cluster node:
+        //   port ─(slave)─→ bridge          (PortState.master)
+        //   vlan ─(child)──→ parent port     (VlanState.parent)
+        //   port ─────────→ zone             (role/zone, when unbridged)
+        //   bridge ──────→ zone              (BridgeState.zone)
+        //   vm/ct ───────→ attached bridge   (attached_to)
+        for (const n of (wrState.topology?.nodes || [])) {
+            if (selNode && n.node_id !== selNode) continue;
+            const portId = (name) => `port:${n.node_id}:${name}`;
+            const brId   = (name) => `br:${n.node_id}:${name}`;
+            const vlanId = (name) => `vlan:${n.node_id}:${name}`;
+
+            for (const p of (n.interfaces || [])) {
+                if (p.master && nodes.has(brId(p.master))) {
+                    implicitEdge(portId(p.name), brId(p.master), '');
+                } else if (p.zone) {
+                    const zid = p.zone.kind === 'lan'
+                        ? `zone:lan${p.zone.id ?? 0}`
+                        : `zone:${p.zone.kind}`;
+                    implicitEdge(portId(p.name), zid, p.role || '');
+                } else if (p.role && p.role !== 'unused') {
+                    const zid = p.role === 'wan' ? 'zone:wan'
+                              : p.role === 'management' ? 'zone:management'
+                              : p.role === 'wolfnet' ? 'zone:wolfnet'
+                              : p.role === 'lan' ? 'zone:lan0'
+                              : null;
+                    if (zid) implicitEdge(portId(p.name), zid, p.role);
+                }
+            }
+            for (const v of (n.vlans || [])) {
+                if (v.parent && nodes.has(portId(v.parent))) {
+                    implicitEdge(vlanId(v.name), portId(v.parent), `vlan ${v.vlan_id}`);
+                }
+            }
+            for (const b of (n.bridges || [])) {
+                if (b.zone) {
+                    const zid = b.zone.kind === 'lan'
+                        ? `zone:lan${b.zone.id ?? 0}`
+                        : `zone:${b.zone.kind}`;
+                    implicitEdge(brId(b.name), zid, '');
+                }
+            }
+            for (const vm of (n.vms || [])) {
+                const toBr = vm.attached_to && nodes.has(brId(vm.attached_to))
+                    ? brId(vm.attached_to) : null;
+                if (toBr) {
+                    implicitEdge(`vm:${vm.name}`, toBr, '');
+                } else if (vm.attached_to === 'wolfnet' || vm.ip) {
+                    implicitEdge(`vm:${vm.name}`, 'zone:wolfnet', '');
+                }
+            }
+            for (const ct of (n.containers || [])) {
+                const toBr = ct.attached_to && nodes.has(brId(ct.attached_to))
+                    ? brId(ct.attached_to) : null;
+                if (toBr) {
+                    implicitEdge(`ct:${ct.name}`, toBr, '');
+                } else {
+                    implicitEdge(`ct:${ct.name}`, 'zone:lan0', '');
+                }
             }
         }
 
@@ -1447,8 +1576,10 @@
     let wrPolicyUi = {
         filters: { allow: true, deny: true, reject: true, log: true, dnat: true, disabled: false },
         search: '',
+        selectedNode: '',   // cluster node_id to limit VMs/containers to (empty = all)
         tracedNode: null,   // node id currently in "trace mode" (null = off)
         simPath: null,      // { edgeIds: [...], verdict: 'allow' | 'deny' | ... }
+        zoom: 1,            // 1.0 = fit to window; <1 zooms out; >1 zooms in
     };
 
     /// Traffic rates per node id (in bps rx + tx). Computed once per
@@ -1473,6 +1604,10 @@
                     cur.speedMbps = Math.max(cur.speedMbps, sp);
                     bps.set(id, cur);
                 };
+                // Per-port bucket — makes the port node in the policy
+                // map show its own BPS tag and heats up the edges it
+                // sits on, so bottlenecks are obvious.
+                addTo(`port:${node.node_id}:${iface.name}`);
                 // Always add to the role-derived zone if assigned.
                 const assigned = asg[iface.name];
                 if (assigned) {
@@ -1605,15 +1740,20 @@
         }
 
         const wrap = document.getElementById('wr-policy-canvas-wrap');
-        const W = wrap?.clientWidth || 1000;
-        const H = Math.max(600, 140 * 5);
-        const layout = wrLayoutPolicyGraph(graph, W - 40, H);
+        const baseW = wrap?.clientWidth || 1000;
+        // Grow vertical space with node count so big cluster maps
+        // don't squash — but zoom-out is the real escape hatch.
+        const tierCount = new Set(graph.nodes.map(n => n.tier)).size || 1;
+        const baseH = Math.max(600, tierCount * 130);
+        const layout = wrLayoutPolicyGraph(graph, baseW - 40, baseH);
 
+        const zoom = Math.max(0.3, Math.min(2.5, wrPolicyUi.zoom || 1));
+        const W = baseW * zoom, H = baseH * zoom;
         const ns = 'http://www.w3.org/2000/svg';
         const svg = document.createElementNS(ns, 'svg');
         svg.setAttribute('width', W);
         svg.setAttribute('height', H);
-        svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+        svg.setAttribute('viewBox', `0 0 ${baseW} ${baseH}`);
         svg.setAttribute('xmlns', ns);
         svg.style.display = 'block';
 
@@ -1728,20 +1868,26 @@
         }
 
         // Nodes on top. Dim when trace mode is active and we're not
-        // on the traced graph.
-        const nodeW = 120, nodeH = 36;
+        // on the traced graph. Nodes with a meta.ip get a taller rect
+        // so we can show the IP/subnet on a second line.
+        const nodeW = 140, nodeH = 36, nodeHip = 52;
         for (const n of graph.nodes) {
             const p = layout.get(n.id);
             if (!p) continue;
-            const x = p.x - nodeW/2, y = p.y - nodeH/2;
+            const ipText = (n.meta && n.meta.ip) ? String(n.meta.ip) : '';
+            const h = ipText ? nodeHip : nodeH;
+            const x = p.x - nodeW/2, y = p.y - h/2;
             const fill = {
                 internet: 'rgba(96,165,250,0.18)', zone: 'rgba(168,85,247,0.18)',
                 lan: 'rgba(34,197,94,0.15)', vm: 'rgba(59,130,246,0.12)',
                 container:'rgba(168,85,247,0.12)',
+                port: 'rgba(250,204,21,0.14)', bridge: 'rgba(45,212,191,0.14)',
+                vlan: 'rgba(244,114,182,0.14)',
             }[n.kind] || 'rgba(148,163,184,0.12)';
             const stroke = {
                 internet: '#60a5fa', zone: '#a855f7', lan: '#22c55e',
                 vm: '#60a5fa', container:'#a855f7',
+                port: '#facc15', bridge: '#2dd4bf', vlan: '#f472b6',
             }[n.kind] || '#94a3b8';
             const dim = dimMode && !tracedNodeIds.has(n.id);
             const opacity = dim ? 0.25 : 1;
@@ -1760,13 +1906,19 @@
                 ? `<text x="${p.x}" y="${y-6}" text-anchor="middle"
                         style="fill:${bpsTagColour}; font-size:10px; font-family:var(--font-mono,monospace); pointer-events:none;">${escHtml(wrFmtBps(nodeTotalBps))}</text>`
                 : '';
+            const labelY = ipText ? (p.y - 4) : (p.y + 4);
+            const ipLine = ipText
+                ? `<text x="${p.x}" y="${p.y+12}" text-anchor="middle"
+                        style="fill:var(--text-muted); font-size:10px; font-family:var(--font-mono,monospace); pointer-events:none;">${escHtml(ipText.slice(0,22))}</text>`
+                : '';
             svg.insertAdjacentHTML('beforeend', `
                 <g class="wr-policy-node" data-node="${escHtml(n.id)}" style="cursor:crosshair; opacity:${opacity};">
-                    <rect x="${x}" y="${y}" width="${nodeW}" height="${nodeH}" rx="8"
+                    <rect x="${x}" y="${y}" width="${nodeW}" height="${h}" rx="8"
                           fill="${fill}" stroke="${stroke}" stroke-width="${isTraced ? 2.5 : 1.5}"
                           ${isTraced ? 'filter="url(#wr-policy-glow)"' : ''}/>
-                    <text x="${p.x}" y="${p.y+4}" text-anchor="middle"
-                          style="fill:var(--text); font-size:12px; font-weight:600; pointer-events:none;">${escHtml(n.icon)} ${escHtml(n.label.slice(0,14))}</text>
+                    <text x="${p.x}" y="${labelY}" text-anchor="middle"
+                          style="fill:var(--text); font-size:12px; font-weight:600; pointer-events:none;">${escHtml(n.icon)} ${escHtml(n.label.slice(0,16))}</text>
+                    ${ipLine}
                     ${bpsTag}
                 </g>
             `);
@@ -1966,6 +2118,51 @@
             searchEl.value = wrPolicyUi.search;
             searchEl.oninput = () => {
                 wrPolicyUi.search = searchEl.value;
+                wrRenderPolicyMap();
+            };
+        }
+        // Zoom controls — buttons + ctrl-scroll on the canvas.
+        const zIn  = document.getElementById('wr-policy-zoom-in');
+        const zOut = document.getElementById('wr-policy-zoom-out');
+        const zFit = document.getElementById('wr-policy-zoom-fit');
+        const zPct = document.getElementById('wr-policy-zoom-pct');
+        const setZoom = (z) => {
+            wrPolicyUi.zoom = Math.max(0.3, Math.min(2.5, z));
+            wrRenderPolicyMap();
+        };
+        if (zPct) zPct.textContent = Math.round((wrPolicyUi.zoom || 1) * 100) + '%';
+        if (zIn)  zIn.onclick  = () => setZoom((wrPolicyUi.zoom || 1) * 1.25);
+        if (zOut) zOut.onclick = () => setZoom((wrPolicyUi.zoom || 1) / 1.25);
+        if (zFit) zFit.onclick = () => setZoom(1);
+        const wrap = document.getElementById('wr-policy-canvas-wrap');
+        if (wrap && !wrap._wrZoomWired) {
+            wrap.addEventListener('wheel', (evt) => {
+                if (!evt.ctrlKey && !evt.metaKey) return;
+                evt.preventDefault();
+                const factor = evt.deltaY < 0 ? 1.1 : 1/1.1;
+                setZoom((wrPolicyUi.zoom || 1) * factor);
+            }, { passive: false });
+            wrap._wrZoomWired = true;
+        }
+
+        // Cluster-node selector — populates from topology on every
+        // render so newly-joined nodes show up without a page reload.
+        const nodeSel = document.getElementById('wr-policy-node-select');
+        if (nodeSel) {
+            const clusterNodes = wrState.topology?.nodes || [];
+            const prev = wrPolicyUi.selectedNode || '';
+            nodeSel.innerHTML = '<option value="">All cluster nodes</option>' +
+                clusterNodes.map(n =>
+                    `<option value="${escHtml(n.node_id)}">${escHtml(n.node_name || n.node_id)}</option>`
+                ).join('');
+            // Preserve selection across re-renders if the node still exists.
+            if (prev && clusterNodes.some(n => n.node_id === prev)) {
+                nodeSel.value = prev;
+            } else if (prev) {
+                wrPolicyUi.selectedNode = '';
+            }
+            nodeSel.onchange = () => {
+                wrPolicyUi.selectedNode = nodeSel.value;
                 wrRenderPolicyMap();
             };
         }

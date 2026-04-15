@@ -489,6 +489,17 @@ impl WolfRunState {
         self.save();
     }
 
+    /// Look up which WolfRun services reference a given container —
+    /// used by the UI to warn users before they delete a container
+    /// that will just be reconciled back into existence by this
+    /// service. Returns the list of (service_id, service_name) pairs.
+    pub fn services_managing(&self, container_name: &str) -> Vec<(String, String)> {
+        self.services.read().unwrap().iter()
+            .filter(|s| s.instances.iter().any(|i| i.container_name == container_name))
+            .map(|s| (s.id.clone(), s.name.clone()))
+            .collect()
+    }
+
 
     /// Merge services received from a cluster peer.
     /// Strategy: for each cluster represented in the incoming data, REPLACE all
