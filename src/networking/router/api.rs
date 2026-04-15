@@ -1376,6 +1376,107 @@ async fn which_install(pkg: &str) -> bool {
         .map(|o| o.status.success()).unwrap_or(false)
 }
 
+/// Bring an interface up (`ip link set <iface> up`). Deliberately
+/// one-way — there's no "Bring Down" companion. Bringing a link down
+/// from the WolfRouter UI is a good way for operators to accidentally
+/// take themselves offline over a remote session.
+///
+/// If `node_id` targets a remote cluster node, the request is proxied
+/// there via the cluster secret (same pattern as packet capture).
+///
+/// Security: iface name is allowlisted to alnum + `.-_` so it can
+/// never carry shell metachars, and tokio::process::Command is invoked
+/// with a fixed argv (no shell involvement at all).
+#[derive(Deserialize)]
+pub struct InterfaceUpRequest {
+    pub iface: String,
+    #[serde(default)]
+    pub node_id: Option<String>,
+}
+
+pub async fn interface_up(
+    req: HttpRequest,
+    state: S,
+    body: web::Json<InterfaceUpRequest>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let r = body.into_inner();
+
+    if r.iface.is_empty() || r.iface.len() > 32
+        || !r.iface.chars().all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c))
+    {
+        return HttpResponse::BadRequest().body("invalid interface name");
+    }
+
+    // Proxy to remote node when requested.
+    let self_id = crate::agent::self_node_id();
+    if let Some(target) = r.node_id.as_ref() {
+        if !target.is_empty() && target != &self_id {
+            let nodes = state.cluster.get_all_nodes();
+            let target_node = match nodes.into_iter().find(|n| &n.id == target) {
+                Some(n) => n,
+                None => return HttpResponse::NotFound().body(format!("node '{}' not found", target)),
+            };
+            let secret = state.cluster_secret.clone();
+            let body_json = serde_json::json!({ "iface": r.iface });
+            let client = match reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .timeout(std::time::Duration::from_secs(10)).build()
+            {
+                Ok(c) => c,
+                Err(e) => return HttpResponse::InternalServerError().body(format!("client build: {}", e)),
+            };
+            let urls = [
+                format!("https://{}:{}/api/router/interface-up", target_node.address, target_node.port),
+                format!("http://{}:{}/api/router/interface-up", target_node.address, target_node.port),
+            ];
+            for url in &urls {
+                if let Ok(resp) = client.post(url)
+                    .header("X-WolfStack-Secret", &secret)
+                    .json(&body_json).send().await
+                {
+                    if resp.status().is_success() {
+                        let val: serde_json::Value = resp.json().await.unwrap_or(serde_json::json!({}));
+                        return HttpResponse::Ok().json(val);
+                    }
+                    let txt = resp.text().await.unwrap_or_default();
+                    return HttpResponse::Ok().json(serde_json::json!({
+                        "success": false,
+                        "error": format!("remote node returned: {}", txt)
+                    }));
+                }
+            }
+            return HttpResponse::Ok().json(serde_json::json!({
+                "success": false,
+                "error": "couldn't reach target node (tried HTTPS then HTTP)"
+            }));
+        }
+    }
+
+    // Local: run `ip link set <iface> up`.
+    let out = tokio::process::Command::new("ip")
+        .args(["link", "set", &r.iface, "up"])
+        .output().await
+        .map_err(|e| format!("spawn ip: {}", e));
+    match out {
+        Ok(o) if o.status.success() => HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "message": format!("brought '{}' up", r.iface)
+        })),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            HttpResponse::Ok().json(serde_json::json!({
+                "success": false,
+                "error": format!("ip link set up failed: {}", stderr),
+            }))
+        }
+        Err(e) => HttpResponse::Ok().json(serde_json::json!({
+            "success": false,
+            "error": e,
+        })),
+    }
+}
+
 // ─── Mount ───
 
 pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
@@ -1408,5 +1509,6 @@ pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
         .route("/api/router/wan",          web::post().to(create_wan))
         .route("/api/router/wan/{id}",     web::put().to(update_wan))
         .route("/api/router/wan/{id}",     web::delete().to(delete_wan))
-        .route("/api/router/wan-status",   web::get().to(wan_status));
+        .route("/api/router/wan-status",   web::get().to(wan_status))
+        .route("/api/router/interface-up", web::post().to(interface_up));
 }

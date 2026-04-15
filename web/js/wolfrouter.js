@@ -1816,6 +1816,7 @@
                 </div>
                 <div class="modal-footer">
                     <button class="btn" onclick="this.closest('.modal-overlay').remove()">Close</button>
+                    ${!port.link_up ? `<button class="btn" style="background:rgba(34,197,94,0.15); color:#22c55e;" onclick="wrBringUpPort('${escHtml(nodeId)}', '${escHtml(ifaceName)}', this)">⬆ Bring Up</button>` : ''}
                     <button class="btn btn-primary" onclick="(async()=>{await wrAssignZone('${nodeId}','${ifaceName}',document.getElementById('wr-port-zone').value); this.closest('.modal-overlay').remove();})()">Apply zone</button>
                 </div>
             </div>`;
@@ -1823,6 +1824,39 @@
         const cur = port.zone?.kind === 'lan' ? `lan${port.zone.id}` : (port.zone?.kind || '');
         if (cur) document.getElementById('wr-port-zone').value = cur;
     }
+
+    /// Runs `ip link set <iface> up` on the owning node (via cluster
+    /// RPC if remote). Intentionally one-way — no "Bring Down"
+    /// companion, because clicking that over a remote session is a
+    /// good way to take yourself offline.
+    async function wrBringUpPort(nodeId, iface, btn) {
+        const orig = btn.textContent;
+        btn.disabled = true; btn.textContent = '⏳ Bringing up…';
+        try {
+            const r = await fetch(wrUrl('/api/router/interface-up'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ iface, node_id: nodeId }),
+            });
+            const data = await r.json();
+            if (!r.ok || data.success === false) {
+                btn.textContent = '✗ failed';
+                alert('Bring up failed: ' + (data.error || 'HTTP ' + r.status));
+                btn.disabled = false; btn.textContent = orig;
+                return;
+            }
+            btn.textContent = '✓ up';
+            // Refresh topology so the rack view redraws the port as UP.
+            setTimeout(async () => {
+                await wrLoadAll();
+                btn.closest('.modal-overlay')?.remove();
+            }, 500);
+        } catch (e) {
+            btn.disabled = false; btn.textContent = orig;
+            alert('Error: ' + e.message);
+        }
+    }
+    window.wrBringUpPort = wrBringUpPort;
 
     // ─── Helpers ───
 
