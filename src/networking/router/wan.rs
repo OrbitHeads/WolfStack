@@ -102,6 +102,20 @@ pub struct PppoeConfig {
     /// LCP echo failures before pppd considers the link dead. Default 4.
     #[serde(default = "default_lcp_echo_failure")]
     pub lcp_echo_failure: u32,
+    /// If true, pppd installs this link as the system's default route
+    /// and kicks any existing default. **Default OFF** — turning it on
+    /// accidentally on a server that already has working internet via
+    /// a different interface will wipe that connectivity the moment
+    /// PPPoE succeeds. Only enable when this PPP link is genuinely
+    /// meant to be the server's WAN.
+    #[serde(default)]
+    pub use_default_route: bool,
+    /// If true, pppd overwrites /etc/resolv.conf with the DNS servers
+    /// the ISP hands out. **Default OFF** for the same reason — on a
+    /// server with a working DNS config, this clobbers it the moment
+    /// PPPoE succeeds.
+    #[serde(default)]
+    pub use_peer_dns: bool,
 }
 
 fn default_pppoe_mtu() -> u32 { 1492 }
@@ -176,8 +190,24 @@ pub fn pppoe_apply(conn: &WanConnection, cfg: &PppoeConfig) -> Result<(), String
     peer.push_str("noauth\n");
     peer.push_str("hide-password\n");
     peer.push_str("noipdefault\n");
-    peer.push_str("defaultroute\n");
-    peer.push_str("usepeerdns\n");
+    // defaultroute and usepeerdns are DESTRUCTIVE on a server with
+    // existing internet via a different NIC — pppd wipes the live
+    // default route / resolv.conf the moment the link comes up. Both
+    // are opt-in now. Users who want PPPoE as their actual WAN must
+    // explicitly tick the boxes in the WAN editor.
+    if cfg.use_default_route {
+        peer.push_str("defaultroute\n");
+        // replacedefaultroute makes pppd REPLACE any pre-existing
+        // default (instead of refusing to add one). We only want this
+        // if the user explicitly asked — otherwise pppd will warn but
+        // leave the existing default alone.
+        peer.push_str("replacedefaultroute\n");
+    } else {
+        peer.push_str("nodefaultroute\n");
+    }
+    if cfg.use_peer_dns {
+        peer.push_str("usepeerdns\n");
+    }
     peer.push_str("noaccomp\n");
     peer.push_str("default-asyncmap\n");
     peer.push_str(&format!("mtu {}\n", cfg.mtu));
@@ -215,11 +245,28 @@ pub fn pppoe_apply(conn: &WanConnection, cfg: &PppoeConfig) -> Result<(), String
 }
 
 /// Tear down the PPP link for this connection. Safe to call when no
-/// link exists. Removes the peers file too if `purge` is true.
+/// link exists. Belt-and-braces: poff first, then pkill any lingering
+/// pppd for this peer name, then wait for the pid file to disappear
+/// so we don't race with a subsequent start and end up with ppp0,
+/// ppp1, ppp2... stacking up.
 pub fn pppoe_stop(conn: &WanConnection) -> Result<(), String> {
     let peer_name = peer_name_for(&conn.id);
-    // poff drops the named peer's link.
+    // poff drops the named peer's link cleanly when it works.
     let _ = Command::new("poff").arg(&peer_name).status();
+    // Fallback: some distros ship poff that doesn't match our peer
+    // naming, or pppd might be a zombie. Kill anything still running
+    // `pppd call <peer>`.
+    let _ = Command::new("pkill").args(["-f", &format!("pppd call {}", peer_name)]).status();
+    // Wait briefly for the pid file to clear. Without this, a quick
+    // disable-then-enable sequence stacks ppp0/ppp1/ppp2 because the
+    // new pppd starts before the old one finishes dying.
+    let pid_path = format!("/var/run/{}.pid", peer_name);
+    for _ in 0..20 {
+        if !std::path::Path::new(&pid_path).exists() { break; }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    // Remove any stale pid file so pppd won't refuse to start later.
+    let _ = fs::remove_file(&pid_path);
     Ok(())
 }
 

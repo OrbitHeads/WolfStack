@@ -969,6 +969,24 @@
                             <label style="display:flex; align-items:center; gap:6px;">
                                 <input type="checkbox" id="wr-w-persist" checked/> Auto-reconnect on link drops
                             </label>
+                            <label style="grid-column:1/-1; display:flex; align-items:start; gap:6px; padding:8px 10px; background:rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.3); border-radius:4px;">
+                                <input type="checkbox" id="wr-w-pppoe-default-route" style="margin-top:2px;"/>
+                                <div>
+                                    <strong style="color:#fca5a5;">⚠ Make this PPP link the default route</strong>
+                                    <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">
+                                        When enabled, pppd <em>replaces</em> the system's existing default gateway the moment the link comes up. ONLY tick this when PPPoE is genuinely your server's primary internet. If the server already reaches the internet via a different NIC, turning this on will break that connectivity immediately.
+                                    </div>
+                                </div>
+                            </label>
+                            <label style="grid-column:1/-1; display:flex; align-items:start; gap:6px; padding:8px 10px; background:rgba(251,191,36,0.08); border:1px solid rgba(251,191,36,0.3); border-radius:4px;">
+                                <input type="checkbox" id="wr-w-pppoe-peer-dns" style="margin-top:2px;"/>
+                                <div>
+                                    <strong style="color:#fbbf24;">⚠ Use ISP's DNS (overwrites /etc/resolv.conf)</strong>
+                                    <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">
+                                        pppd will overwrite /etc/resolv.conf with the DNS servers the ISP hands out. Clobbers any existing resolver config.
+                                    </div>
+                                </div>
+                            </label>
                         </div>
                         <div style="margin-top:10px; padding:10px; background:rgba(168,85,247,0.08); border:1px solid rgba(168,85,247,0.3); border-radius:6px; font-size:12px; color:var(--text-muted);">
                             On save, WolfRouter writes <code>/etc/ppp/peers/wolfrouter-{id}</code> + secrets (mode 0600), auto-installs the <code>ppp</code> + <code>pppoe</code> packages if missing, then calls <code>pppd</code> to bring the link up. The resulting <code>ppp0</code> appears in the rack view as the WAN port.
@@ -1011,6 +1029,8 @@
                     document.getElementById('wr-w-mtu').value = c.mode.config?.mtu || 1492;
                     document.getElementById('wr-w-lcp').value = c.mode.config?.lcp_echo_interval ?? 30;
                     document.getElementById('wr-w-persist').checked = c.mode.config?.persist !== false;
+                    document.getElementById('wr-w-pppoe-default-route').checked = !!c.mode.config?.use_default_route;
+                    document.getElementById('wr-w-pppoe-peer-dns').checked = !!c.mode.config?.use_peer_dns;
                 }
                 wrToggleWanModeFields();
             });
@@ -1055,6 +1075,8 @@
                     persist: document.getElementById('wr-w-persist').checked,
                     lcp_echo_interval: parseInt(document.getElementById('wr-w-lcp').value, 10) || 0,
                     lcp_echo_failure: 4,
+                    use_default_route: document.getElementById('wr-w-pppoe-default-route').checked,
+                    use_peer_dns: document.getElementById('wr-w-pppoe-peer-dns').checked,
                 },
             };
         }
