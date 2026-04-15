@@ -172,24 +172,105 @@ fn self_node_name() -> String {
 
 // ─── Topology ───
 
-pub async fn get_topology(req: HttpRequest, state: S) -> HttpResponse {
+/// Optional `?cluster=<name>` query filter — when set, the topology
+/// only includes nodes belonging to that cluster. WolfRouter is
+/// per-cluster so the UI passes this on every fetch.
+#[derive(Deserialize)]
+pub struct TopologyQuery {
+    #[serde(default)]
+    pub cluster: Option<String>,
+}
+
+pub async fn get_topology(
+    req: HttpRequest,
+    state: S,
+    query: web::Query<TopologyQuery>,
+) -> HttpResponse {
     auth_or_return!(req, state);
     let cfg = state.router.config.read().unwrap().clone();
     let self_id = crate::agent::self_node_id();
     let self_name = self_node_name();
-    let me = topology::compute_local(&self_id, &self_name, &cfg);
+    let cluster_filter = query.cluster.clone();
 
-    // Remote nodes: walk ClusterState. Each node exposes its own
-    // /api/router/topology-local which returns just its NodeTopology.
-    // For now we build from local state only; the background sync
-    // populates remote_topologies. MVP ships single-node aggregation;
-    // multi-node is transparent once each node is running v17.1.0.
-    let mut nodes = vec![me];
-    // Pull cached remote topologies out of ClusterState. The agent tick
-    // populates these via /api/router/topology-local on each poll.
-    let remotes = state.router.remote_topologies.read().unwrap().clone();
-    for t in remotes.into_values() {
-        nodes.push(t);
+    // Find self's cluster name. If a filter is set and self isn't in
+    // that cluster, omit self from the result and only fan out to peers
+    // in the requested cluster.
+    let self_cluster = state.cluster.get_self_cluster_name();
+    let include_self = match &cluster_filter {
+        Some(want) => self_cluster == *want,
+        None => true,
+    };
+
+    let mut nodes = Vec::new();
+    if include_self {
+        nodes.push(topology::compute_local(&self_id, &self_name, &cfg));
+    }
+
+    // Fan out to every other online cluster node's topology-local
+    // endpoint, filtered by cluster name when one was requested.
+    let cluster_nodes = state.cluster.get_all_nodes();
+    let secret = state.cluster_secret.clone();
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(5))
+        .build();
+
+    if let Ok(client) = client {
+        let mut futures = Vec::new();
+        for node in cluster_nodes {
+            if node.is_self || node.id == self_id { continue; }
+            if !node.online { continue; }
+            if node.node_type != "wolfstack" { continue; }
+            // Cluster scoping: only include nodes whose cluster_name
+            // matches the requested filter (when one was supplied).
+            if let Some(ref want) = cluster_filter {
+                if node.cluster_name.as_deref() != Some(want.as_str()) { continue; }
+            }
+            let url = format!("https://{}:{}/api/router/topology-local", node.address, node.port);
+            let secret_h = secret.clone();
+            let client_c = client.clone();
+            let node_id_for_log = node.id.clone();
+            futures.push(async move {
+                match client_c.get(&url)
+                    .header("X-WolfStack-Secret", &secret_h)
+                    .send().await
+                {
+                    Ok(r) if r.status().is_success() => {
+                        match r.json::<topology::NodeTopology>().await {
+                            Ok(t) => Some(t),
+                            Err(e) => {
+                                tracing::warn!("router topology decode {}: {}", node_id_for_log, e);
+                                None
+                            }
+                        }
+                    }
+                    Ok(r) => {
+                        tracing::warn!("router topology fetch {} returned {}", node_id_for_log, r.status());
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!("router topology fetch {}: {}", node_id_for_log, e);
+                        None
+                    }
+                }
+            });
+        }
+        let results = futures::future::join_all(futures).await;
+        for r in results.into_iter().flatten() {
+            nodes.push(r);
+        }
+    }
+
+    // Cache the remotes so the next request can fall back if a node
+    // goes offline mid-request. Skip self (it's regenerated each call).
+    {
+        let mut cache = state.router.remote_topologies.write().unwrap();
+        cache.clear();
+        for n in &nodes {
+            if n.node_id != self_id {
+                cache.insert(n.node_id.clone(), n.clone());
+            }
+        }
     }
 
     let links = topology::derive_links(&nodes);

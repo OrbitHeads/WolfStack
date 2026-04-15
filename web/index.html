@@ -145,11 +145,6 @@
                     style="display:flex;align-items:center;justify-content:center;width:40px;height:40px;padding:0;border-radius:10px;">
                     <span class="icon" style="margin:0;font-size:20px;">🔗</span>
                 </a>
-                <a class="nav-item" data-page="wolfrouter" onclick="selectView('wolfrouter')"
-                    title="WolfRouter — cluster firewall, DHCP, DNS, rack view"
-                    style="display:flex;align-items:center;justify-content:center;width:40px;height:40px;padding:0;border-radius:10px;">
-                    <span class="icon" style="margin:0;font-size:20px;">🧩</span>
-                </a>
             </div>
             <div class="nav-section">
                 <div class="nav-section-title">Servers</div>
@@ -5761,8 +5756,8 @@
                     <!-- Tab bar for table view -->
                     <div id="wr-tabs" style="display:none; gap:2px; padding:8px 12px 0; border-bottom:1px solid var(--border); flex-wrap:wrap;">
                         <button class="wr-tab active" data-tab="firewall" onclick="wrSelectTab('firewall')">🔥 Firewall</button>
-                        <button class="wr-tab" data-tab="lans" onclick="wrSelectTab('lans')">🌐 LANs</button>
-                        <button class="wr-tab" data-tab="leases" onclick="wrSelectTab('leases')">📡 Leases</button>
+                        <button class="wr-tab" data-tab="lans" onclick="wrSelectTab('lans')">🌐 DHCP / LANs</button>
+                        <button class="wr-tab" data-tab="leases" onclick="wrSelectTab('leases')">📡 DHCP Leases</button>
                         <button class="wr-tab" data-tab="zones" onclick="wrSelectTab('zones')">🎯 Zones</button>
                         <button class="wr-tab" data-tab="connections" onclick="wrSelectTab('connections')">🔗 Connections</button>
                         <button class="wr-tab" data-tab="logs" onclick="wrSelectTab('logs')">📜 Logs</button>
@@ -5770,7 +5765,16 @@
 
                     <!-- Rack view canvas (default visible) -->
                     <div id="wr-rack-container" style="display:block; padding:16px; min-height:620px; background:radial-gradient(ellipse at top, rgba(30,41,59,0.9), rgba(7,11,20,1) 80%); border-radius:0 0 8px 8px;">
-                        <div id="wr-rack-canvas" style="width:100%; min-height:600px;"></div>
+                        <!-- Quick-action toolbar so primary tasks (firewall rules,
+                             DHCP/LAN setup, zone assignment) are reachable from
+                             the rack view without first switching to table mode. -->
+                        <div style="display:flex; gap:8px; margin-bottom:12px; flex-wrap:wrap; justify-content:flex-end;">
+                            <button class="btn btn-sm" onclick="wrSwitchView('table'); wrSelectTab('lans'); wrShowLanEditor();" title="Add a LAN with DHCP + DNS">🌐 + DHCP / LAN</button>
+                            <button class="btn btn-sm" onclick="wrSwitchView('table'); wrSelectTab('firewall'); wrShowRuleEditor();" title="Add a firewall rule">🔥 + Firewall rule</button>
+                            <button class="btn btn-sm" onclick="wrSwitchView('table'); wrSelectTab('zones');" title="Assign interfaces to zones">🎯 Zones</button>
+                            <button class="btn btn-sm" onclick="wrSwitchView('table'); wrSelectTab('leases');" title="View live DHCP leases">📡 Leases</button>
+                        </div>
+                        <div id="wr-rack-canvas" style="width:100%; min-height:560px;"></div>
                         <div id="wr-rack-legend" style="margin-top:12px; display:flex; gap:16px; flex-wrap:wrap; font-size:11px; color:var(--text-muted);"></div>
                     </div>
 

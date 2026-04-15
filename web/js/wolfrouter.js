@@ -70,6 +70,7 @@
     let wrState = {
         view: 'rack',          // 'rack' | 'table'
         activeTab: 'firewall', // firewall | lans | leases | zones | connections | logs
+        cluster: null,         // active cluster name — scopes every fetch
         topology: null,
         rules: [],
         lans: [],
@@ -79,9 +80,18 @@
         pollInterval: null,
     };
 
+    // Builds an /api/router/* URL with the active cluster as a query
+    // parameter. Backend uses it to filter nodes by cluster_name.
+    function wrUrl(path) {
+        if (!wrState.cluster) return path;
+        const sep = path.includes('?') ? '&' : '?';
+        return path + sep + 'cluster=' + encodeURIComponent(wrState.cluster);
+    }
+
     // Expose hooks the HTML and app.js call directly.
     window.wrLoadAll = wrLoadAll;
     window.wrStartPolling = wrStartPolling;
+    window.showWolfRouterForCluster = showWolfRouterForCluster;
     window.wrSwitchView = wrSwitchView;
     window.wrSelectTab = wrSelectTab;
     window.wrShowRuleEditor = wrShowRuleEditor;
@@ -108,6 +118,29 @@
 
     // ─── Data loading ───
 
+    // Entry point used by the cluster-scoped sidebar item. Sets the
+    // active cluster, switches the page, then loads.
+    async function showWolfRouterForCluster(clusterName) {
+        if (typeof closeSidebarMobile === 'function') closeSidebarMobile();
+        wrState.cluster = clusterName;
+        if (typeof currentPage !== 'undefined') window.currentPage = 'wolfrouter-cluster';
+        if (typeof currentNodeId !== 'undefined') window.currentNodeId = null;
+
+        document.querySelectorAll('.page-view').forEach(p => p.style.display = 'none');
+        const el = document.getElementById('page-wolfrouter');
+        if (el) el.style.display = 'block';
+
+        document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+        const item = document.querySelector(`.wolfrouter-cluster-item[data-cluster="${clusterName}"]`);
+        if (item) item.classList.add('active');
+
+        const titleEl = document.getElementById('page-title');
+        if (titleEl) titleEl.textContent = `WolfRouter — ${clusterName}`;
+
+        await wrLoadAll();
+        wrStartPolling();
+    }
+
     async function wrLoadAll() {
         // Surface fetch failures directly in the rack canvas — silent
         // "Loading topology…" forever is the worst possible UX.
@@ -119,10 +152,10 @@
         };
         try {
             const [topoR, rulesR, lansR, zonesR] = await Promise.all([
-                fetch('/api/router/topology'),
-                fetch('/api/router/rules'),
-                fetch('/api/router/segments'),
-                fetch('/api/router/zones'),
+                fetch(wrUrl('/api/router/topology')),
+                fetch(wrUrl('/api/router/rules')),
+                fetch(wrUrl('/api/router/segments')),
+                fetch(wrUrl('/api/router/zones')),
             ]);
             if (!topoR.ok) {
                 const body = await topoR.text().catch(() => '');
@@ -152,7 +185,7 @@
                             (net && net.style.display !== 'none');
             if (!visible) return;
             try {
-                const r = await fetch('/api/router/topology');
+                const r = await fetch(wrUrl('/api/router/topology'));
                 if (r.ok) {
                     wrState.topology = await r.json();
                     if (wrState.view === 'rack') wrRenderRack();
@@ -282,18 +315,18 @@
         const r = wrState.rules.find(x => x.id === id);
         if (!r) return;
         r.enabled = !r.enabled;
-        await fetch('/api/router/rules/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(r) });
+        await fetch(wrUrl('/api/router/rules/' + id), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(r) });
         await wrLoadAll();
     }
 
     async function wrDeleteRule(id) {
         if (!confirm('Delete this rule?')) return;
-        await fetch('/api/router/rules/' + id, { method: 'DELETE' });
+        await fetch(wrUrl('/api/router/rules/' + id), { method: 'DELETE' });
         await wrLoadAll();
     }
 
     async function wrTestRules() {
-        const r = await fetch('/api/router/rules/test', { method: 'POST' });
+        const r = await fetch(wrUrl('/api/router/rules/test'), { method: 'POST' });
         const result = await r.json();
         if (result.ok) {
             if (typeof showToast === 'function') showToast('Ruleset passes iptables-restore --test', 'success');
@@ -305,7 +338,7 @@
     }
 
     async function wrConfirmRules() {
-        await fetch('/api/router/rules/confirm', { method: 'POST' });
+        await fetch(wrUrl('/api/router/rules/confirm'), { method: 'POST' });
         clearInterval(wrState.rollbackTimerInterval);
         wrState.rollbackTimerInterval = null;
         wrState.rollbackDeadline = null;
@@ -435,7 +468,7 @@
         const rule = existing ? { ...existing } : { id: '', enabled: true, order: 0, state_track: true };
         Object.assign(rule, { enabled, action, direction, from, to, protocol, ports, comment, log_match });
         const method = id ? 'PUT' : 'POST';
-        const url = id ? '/api/router/rules/' + id : '/api/router/rules';
+        const url = wrUrl(id ? '/api/router/rules/' + id : '/api/router/rules');
         const r = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(rule) });
         if (!r.ok) {
             alert('Save failed: ' + await r.text());
@@ -480,7 +513,7 @@
 
     async function wrDeleteLan(id) {
         if (!confirm('Delete this LAN? dnsmasq for this segment will be stopped.')) return;
-        await fetch('/api/router/segments/' + id, { method: 'DELETE' });
+        await fetch(wrUrl('/api/router/segments/' + id), { method: 'DELETE' });
         await wrLoadAll();
     }
 
@@ -567,7 +600,7 @@
             cache_enabled: true,
             block_ads: document.getElementById('wr-l-ads').checked,
         });
-        const url = id ? '/api/router/segments/' + id : '/api/router/segments';
+        const url = wrUrl(id ? '/api/router/segments/' + id : '/api/router/segments');
         const method = id ? 'PUT' : 'POST';
         const r = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(lan) });
         if (!r.ok) { alert('Save failed: ' + await r.text()); return; }
@@ -585,7 +618,7 @@
         const parts = [];
         for (const lan of wrState.lans) {
             try {
-                const r = await fetch('/api/router/segments/' + lan.id + '/leases');
+                const r = await fetch(wrUrl('/api/router/segments/' + lan.id + '/leases'));
                 const leases = r.ok ? await r.json() : [];
                 parts.push(`
                     <div style="margin-bottom:18px;">
@@ -649,7 +682,7 @@
             if (m) zone = { kind: 'lan', id: parseInt(m[1], 10) };
             else zone = { kind: zoneStr };
         }
-        await fetch('/api/router/zones', {
+        await fetch(wrUrl('/api/router/zones'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ node_id, interface: iface, zone }),
@@ -663,7 +696,7 @@
         const tbody = document.getElementById('wr-conn-tbody');
         if (!tbody) return;
         try {
-            const r = await fetch('/api/router/connections');
+            const r = await fetch(wrUrl('/api/router/connections'));
             const rows = r.ok ? await r.json() : [];
             if (!rows.length) {
                 tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:var(--text-muted); padding:16px;">No connections tracked — <code>conntrack</code> may not be installed.</td></tr>';
@@ -686,7 +719,7 @@
         const pre = document.getElementById('wr-logs-pre');
         if (!pre) return;
         try {
-            const r = await fetch('/api/router/logs');
+            const r = await fetch(wrUrl('/api/router/logs'));
             const lines = r.ok ? await r.json() : [];
             pre.textContent = lines.length ? lines.join('\n') : '(no firewall log lines — enable "Log this match" on a rule to populate)';
         } catch (e) {}
@@ -942,6 +975,34 @@
         }
 
         // Patch cables ────────────────────────────────────────────
+        // WolfNet mesh: when there are multiple nodes, draw a thick
+        // green cable along the right side of the rack connecting every
+        // appliance — visualises the L3 overlay that ties the cluster
+        // together. The "spine" runs vertically; each node taps off it.
+        const wolfnetSpineX = rackX + rackW - railW + 6;
+        if (topo.nodes.length > 1) {
+            const firstY = rackY + rackInnerPad + unitH/2;
+            const lastY = rackY + rackInnerPad + (topo.nodes.length-1)*(unitH+unitGap) + unitH/2;
+            // Spine
+            svg.insertAdjacentHTML('beforeend', `
+                <line x1="${wolfnetSpineX}" y1="${firstY}" x2="${wolfnetSpineX}" y2="${lastY}"
+                      stroke="#22c55e" stroke-width="4" stroke-linecap="round" opacity="0.6"
+                      stroke-dasharray="6 4" class="wr-wire-active"/>
+                <text x="${wolfnetSpineX + 8}" y="${(firstY+lastY)/2}" transform="rotate(90 ${wolfnetSpineX+8} ${(firstY+lastY)/2})"
+                      text-anchor="middle" style="fill:#22c55e; font-size:10px; font-weight:600;">⛓ WolfNet mesh</text>
+            `);
+            // Per-node tap from the spine into the back of each appliance
+            for (let n = 0; n < topo.nodes.length; n++) {
+                const ny = rackY + rackInnerPad + n*(unitH+unitGap) + unitH/2;
+                const nx = apX + apW - 100;  // right edge of the stats panel
+                svg.insertAdjacentHTML('beforeend', `
+                    <path d="M ${nx},${ny} C ${nx+30},${ny} ${wolfnetSpineX-20},${ny} ${wolfnetSpineX},${ny}"
+                          fill="none" stroke="#22c55e" stroke-width="3" stroke-linecap="round" opacity="0.7"/>
+                    <circle cx="${wolfnetSpineX}" cy="${ny}" r="4" fill="#22c55e" opacity="0.9"/>
+                `);
+            }
+        }
+
         // WAN ports → cloud (route up).
         const cables = [];
         for (const node of topo.nodes) {

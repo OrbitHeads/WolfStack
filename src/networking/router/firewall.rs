@@ -25,6 +25,7 @@
 use super::*;
 use std::collections::HashSet;
 use std::process::Command;
+#[allow(unused_imports)]
 use tracing::{info, warn};
 
 const FILTER_CHAINS: &[&str] = &["WOLFROUTER_FWD", "WOLFROUTER_IN", "WOLFROUTER_OUT"];
@@ -74,7 +75,7 @@ pub fn build_ruleset(config: &RouterConfig, self_node_id: &str) -> String {
     rules.sort_by_key(|r| r.order);
 
     for r in rules {
-        if let Some(line) = compile_rule(r, &config.zones, self_node_id) {
+        for line in compile_rule(r, config, self_node_id) {
             out.push_str(&line);
             out.push('\n');
         }
@@ -84,79 +85,89 @@ pub fn build_ruleset(config: &RouterConfig, self_node_id: &str) -> String {
     out
 }
 
-/// Compile one FirewallRule to an `-A CHAIN ...` iptables-restore line.
-/// Returns None if the rule can't be compiled (e.g. references an
-/// unassigned zone, or a VM that doesn't exist) — the caller keeps
-/// going; misconfigured rules don't break the ruleset.
-fn compile_rule(rule: &FirewallRule, zones: &ZoneAssignments, self_node_id: &str) -> Option<String> {
+/// Compile one FirewallRule into one OR MORE iptables-restore lines.
+/// Returns multiple rules when:
+///   • Protocol is Tcpudp → emits one rule for tcp + one for udp
+///   • A zone endpoint has N>1 interfaces → emits N rules (one per iface)
+/// Returns empty Vec if the rule can't be compiled (zone with no
+/// members on this node, etc.) — misconfigured rules don't break the
+/// ruleset; they just no-op silently and a comment is included so
+/// debugging is possible.
+fn compile_rule(rule: &FirewallRule, config: &RouterConfig, self_node_id: &str) -> Vec<String> {
     let chain = match rule.direction {
         Direction::Forward => "WOLFROUTER_FWD",
         Direction::Input => "WOLFROUTER_IN",
         Direction::Output => "WOLFROUTER_OUT",
     };
 
-    let mut parts: Vec<String> = vec![format!("-A {}", chain)];
+    // Resolve "from" and "to" endpoints into one or more (arg-vec) match
+    // sets. The cartesian product of these expands a single rule into
+    // multiple iptables lines for multi-iface zones.
+    let from_opts = match expand_endpoint(&rule.from, "src", config, self_node_id) {
+        Ok(v) if v.is_empty() => return vec![format!(
+            "# wolfrouter rule {} skipped: 'from' endpoint resolved to nothing on this node",
+            rule.id
+        )],
+        Ok(v) => v,
+        Err(reason) => return vec![format!("# wolfrouter rule {} skipped: {}", rule.id, reason)],
+    };
+    let to_opts = match expand_endpoint(&rule.to, "dst", config, self_node_id) {
+        Ok(v) if v.is_empty() => return vec![format!(
+            "# wolfrouter rule {} skipped: 'to' endpoint resolved to nothing on this node",
+            rule.id
+        )],
+        Ok(v) => v,
+        Err(reason) => return vec![format!("# wolfrouter rule {} skipped: {}", rule.id, reason)],
+    };
 
-    // Protocol
-    match rule.protocol {
-        Protocol::Tcp => parts.push("-p tcp".into()),
-        Protocol::Udp => parts.push("-p udp".into()),
-        Protocol::Icmp => parts.push("-p icmp".into()),
-        Protocol::Tcpudp => {
-            // iptables can't do "either" in one rule. The caller should
-            // duplicate rules for tcp/udp. Treat as "any" here.
+    // Tcpudp expands into [Tcp, Udp]; everything else is a single proto.
+    let protos: Vec<Option<&str>> = match rule.protocol {
+        Protocol::Tcp => vec![Some("tcp")],
+        Protocol::Udp => vec![Some("udp")],
+        Protocol::Icmp => vec![Some("icmp")],
+        Protocol::Tcpudp => vec![Some("tcp"), Some("udp")],
+        Protocol::Any => vec![None],
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    for proto in &protos {
+        for from in &from_opts {
+            for to in &to_opts {
+                out.extend(emit_rule(rule, chain, *proto, from, to));
+            }
         }
-        Protocol::Any => {}
+    }
+    out
+}
+
+/// Build the actual iptables-restore line for a fully-resolved rule
+/// instance: one chain, one protocol, one from-match, one to-match.
+fn emit_rule(
+    rule: &FirewallRule,
+    chain: &str,
+    proto: Option<&str>,
+    from: &[String],
+    to: &[String],
+) -> Vec<String> {
+    let mut parts: Vec<String> = vec![format!("-A {}", chain)];
+    if let Some(p) = proto { parts.push(format!("-p {}", p)); }
+    for f in from { parts.push(f.clone()); }
+    for t in to { parts.push(t.clone()); }
+
+    // Ports — only meaningful for tcp/udp
+    if matches!(proto, Some("tcp") | Some("udp")) {
+        for ps in &rule.ports {
+            let flag = if ps.side == PortSide::Dst { "--dport" } else { "--sport" };
+            let port = ps.port.replace('-', ":");
+            parts.push(format!("{} {}", flag, port));
+        }
     }
 
-    // Source endpoint
-    for arg in endpoint_args(&rule.from, "src", zones, self_node_id)? {
-        parts.push(arg);
-    }
-    // Destination endpoint
-    for arg in endpoint_args(&rule.to, "dst", zones, self_node_id)? {
-        parts.push(arg);
-    }
-
-    // Ports (only meaningful if protocol is tcp/udp)
-    for ps in &rule.ports {
-        let flag = match (ps.side, rule.protocol) {
-            (PortSide::Dst, Protocol::Tcp | Protocol::Udp) => "--dport",
-            (PortSide::Src, Protocol::Tcp | Protocol::Udp) => "--sport",
-            _ => continue,
-        };
-        let port = ps.port.replace('-', ":");
-        parts.push(format!("{} {}", flag, port));
-    }
-
-    // State tracking for new connections. We already accept ESTABLISHED
-    // up top; limiting user rules to NEW prevents them firing once per
-    // packet on a long-lived stream and generating spurious log spam.
+    // State tracking — limit user rules to NEW connections; the global
+    // ESTABLISHED,RELATED accept rule at the top of each chain handles
+    // return traffic.
     if rule.state_track {
         parts.push("-m conntrack --ctstate NEW".into());
-    }
-
-    // Log copy (NFLOG) before the actual verdict so it's captured
-    // regardless of action.
-    if rule.log_match {
-        let prefix = format!("wolfrouter-{} ", &rule.id[..rule.id.len().min(8)]);
-        let mut log_parts = parts.clone();
-        log_parts.push("-j NFLOG".into());
-        log_parts.push("--nflog-group 1".into());
-        log_parts.push(format!("--nflog-prefix \"{}\"", prefix));
-        // Return a double-line: the log rule, then the action rule. The
-        // caller joins with \n later. We cheat by embedding it here.
-        let logline = log_parts.join(" ");
-        // Action jump
-        let action_flag = match rule.action {
-            Action::Allow => "-j ACCEPT",
-            Action::Deny  => "-j DROP",
-            Action::Reject => "-j REJECT",
-            Action::Log => "-j RETURN", // log-only rules just return
-        };
-        parts.push(action_flag.into());
-        let action_line = parts.join(" ");
-        return Some(format!("{}\n{}", logline, action_line));
     }
 
     let action_flag = match rule.action {
@@ -165,69 +176,88 @@ fn compile_rule(rule: &FirewallRule, zones: &ZoneAssignments, self_node_id: &str
         Action::Reject => "-j REJECT",
         Action::Log => "-j RETURN",
     };
-    parts.push(action_flag.into());
 
-    Some(parts.join(" "))
+    if rule.log_match {
+        // Emit the NFLOG copy first (doesn't terminate), then the action.
+        let prefix = format!("wolfrouter-{} ", &rule.id[..rule.id.len().min(8)]);
+        let mut log_parts = parts.clone();
+        log_parts.push("-j NFLOG".into());
+        log_parts.push("--nflog-group 1".into());
+        log_parts.push(format!("--nflog-prefix \"{}\"", prefix));
+        let log_line = log_parts.join(" ");
+        parts.push(action_flag.into());
+        let action_line = parts.join(" ");
+        vec![log_line, action_line]
+    } else {
+        parts.push(action_flag.into());
+        vec![parts.join(" ")]
+    }
 }
 
-/// Translate an endpoint to iptables args. `side` is "src" or "dst" and
-/// maps to -s/-d or -i/-o depending on endpoint kind.
-fn endpoint_args(
+/// Expand an Endpoint into one or more match-arg vectors. Each inner
+/// vector is the args for one rule instance. Multi-member zones return
+/// multiple instances; single-IP/iface returns one; Any returns one
+/// empty vector (no constraint). Returns Err with a human reason if
+/// the endpoint can't be resolved at all.
+fn expand_endpoint(
     ep: &Endpoint,
     side: &str,
-    zones: &ZoneAssignments,
+    config: &RouterConfig,
     self_node_id: &str,
-) -> Option<Vec<String>> {
+) -> Result<Vec<Vec<String>>, String> {
     match ep {
-        Endpoint::Any => Some(vec![]),
+        Endpoint::Any => Ok(vec![vec![]]),
+
         Endpoint::Ip { cidr } => {
             let flag = if side == "src" { "-s" } else { "-d" };
-            Some(vec![format!("{} {}", flag, cidr)])
+            Ok(vec![vec![format!("{} {}", flag, cidr)]])
         }
+
         Endpoint::Interface { name } => {
             let flag = if side == "src" { "-i" } else { "-o" };
-            Some(vec![format!("{} {}", flag, name)])
+            Ok(vec![vec![format!("{} {}", flag, name)]])
         }
+
         Endpoint::Zone { zone } => {
-            // Resolve to the list of interfaces on this node in that zone.
-            // Emit -i or -o with multi-interface via ipset for scalability.
-            let members = zones.members_for_zone_on_node(self_node_id, zone);
+            let members = config.zones.members_for_zone_on_node(self_node_id, zone);
             if members.is_empty() {
-                // Zone has no members on this node — rule doesn't apply here.
-                return None;
+                return Ok(vec![]);  // zone has no members on this node — rule no-ops here
             }
-            // For clarity + no ipset dependency at MVP, emit a single
-            // -i/-o per rule if there's one member, otherwise explode
-            // into multiple rules. compile_rule handles scalar output
-            // so we approximate by joining with commas (iptables supports
-            // multiple -i only via ipset, so single-member is the MVP
-            // constraint — multi-member interfaces degrade to "any").
-            if members.len() == 1 {
-                let flag = if side == "src" { "-i" } else { "-o" };
-                Some(vec![format!("{} {}", flag, members[0])])
-            } else {
-                // TODO: ipset. For now, match any — the zone rule still
-                // narrows via ctstate and other criteria.
-                warn!(
-                    "Zone {} has {} interfaces on node {} — multi-iface zones need ipset; matching any",
-                    zone.human(), members.len(), self_node_id
-                );
-                Some(vec![])
-            }
+            let flag = if side == "src" { "-i" } else { "-o" };
+            // Multi-iface: emit one rule instance per member interface
+            // (cartesian-expanded by compile_rule). Avoids the ipset
+            // dependency for now while still being correct.
+            Ok(members.into_iter().map(|m| vec![format!("{} {}", flag, m)]).collect())
         }
+
         Endpoint::Lan { id } => {
-            // Resolve LAN id → subnet CIDR. This requires access to
-            // the LANs list; plumb through RouterConfig. For now we
-            // can't reach it here, so this compiles to "any" (caller
-            // should resolve ahead of time). MVP: skip.
-            warn!("Endpoint::Lan compilation not yet wired (lan id: {})", id);
-            Some(vec![])
+            // Resolve LAN id → subnet CIDR. Source/dest match by IP.
+            let lan = config.lans.iter().find(|l| &l.id == id);
+            match lan {
+                Some(l) => {
+                    let flag = if side == "src" { "-s" } else { "-d" };
+                    Ok(vec![vec![format!("{} {}", flag, l.subnet_cidr)]])
+                }
+                None => Err(format!("LAN '{}' not found", id)),
+            }
         }
-        Endpoint::Vm { name: _ } | Endpoint::Container { name: _ } => {
-            // VM/container → IP lookup. Requires live state access;
-            // resolve ahead-of-time in the caller once we hook up
-            // compute. MVP: skip.
-            Some(vec![])
+
+        Endpoint::Vm { name } | Endpoint::Container { name } => {
+            // Resolve via WolfNet IP (the only VM IP we know without
+            // querying the guest). VMs without a WolfNet IP can't be
+            // matched — flag the rule as skipped so the user can fix it.
+            let vmm = crate::vms::manager::VmManager::new();
+            let vm = vmm.list_vms().into_iter().find(|v| &v.name == name);
+            match vm {
+                Some(v) => match v.wolfnet_ip {
+                    Some(ip) => {
+                        let flag = if side == "src" { "-s" } else { "-d" };
+                        Ok(vec![vec![format!("{} {}/32", flag, ip)]])
+                    }
+                    None => Err(format!("VM '{}' has no WolfNet IP — assign one before referencing it in a rule", name)),
+                },
+                None => Err(format!("VM/container '{}' not found", name)),
+            }
         }
     }
 }

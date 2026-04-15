@@ -1106,7 +1106,7 @@ function selectView(page) {
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     document.querySelector(`.nav-item[data-page="${page}"]`)?.classList.add('active');
 
-    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', 'cluster-browser': 'Cluster Browser', wolfrouter: 'WolfRouter' };
+    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', 'cluster-browser': 'Cluster Browser' };
     document.getElementById('page-title').textContent = titles[page] || page;
 
     if (page === 'datacenter') {
@@ -1142,12 +1142,6 @@ function selectView(page) {
         loadWolfFlowList();
     } else if (page === 'cluster-browser') {
         loadClusterBrowser();
-    } else if (page === 'wolfrouter') {
-        // Cluster-wide view — exposed at the top level (not per-server)
-        // because it manages firewall/DHCP/DNS across every node.
-        if (typeof wrLoadAll === 'function') {
-            wrLoadAll().then(() => { if (typeof wrStartPolling === 'function') wrStartPolling(); });
-        }
     }
 
     // Restore task log toggle button when leaving topology
@@ -1186,7 +1180,6 @@ function selectServerView(nodeId, view) {
         storage: 'Storage',
         files: 'File Manager',
         networking: 'Networking',
-        wolfrouter: 'WolfRouter',
         wolfnet: 'WolfNet',
         certificates: 'Certificates',
         cron: 'Cron Jobs',
@@ -1219,7 +1212,7 @@ function selectServerView(nodeId, view) {
 
     // Load data for the view
     // Show a modern loading overlay for views that fetch data asynchronously
-    const asyncViews = ['components', 'services', 'containers', 'compose', 'secrets', 'lxc', 'vms', 'storage', 'networking', 'wolfrouter', 'backups', 'wolfnet', 'certificates', 'cron', 'pve-resources', 'mysql-editor', 'security', 'ceph', 'wolfkube', 'wolfram'];
+    const asyncViews = ['components', 'services', 'containers', 'compose', 'secrets', 'lxc', 'vms', 'storage', 'networking', 'backups', 'wolfnet', 'certificates', 'cron', 'pve-resources', 'mysql-editor', 'security', 'ceph', 'wolfkube', 'wolfram'];
     if (asyncViews.includes(view) && el) {
         // Clear table bodies to prevent stale data showing
         el.querySelectorAll('tbody').forEach(tb => { tb.innerHTML = ''; });
@@ -1280,15 +1273,6 @@ function selectServerView(nodeId, view) {
     if (view === 'syslogs') { loadSystemLogs(); hidePageLoadingOverlay(el); }
     if (view === 'files') { if (!window._skipFileReset) { containerFileMode = null; currentFilePath = '/'; } window._skipFileReset = false; loadFiles().finally(() => hidePageLoadingOverlay(el)); }
     if (view === 'networking') loadNetworking().finally(() => hidePageLoadingOverlay(el));
-    if (view === 'wolfrouter') {
-        // WolfRouter is its own top-level page (cluster-wide). Networking
-        // page stays per-server (interfaces, DNS, IP mappings, WireGuard).
-        if (typeof wrLoadAll === 'function') {
-            wrLoadAll().finally(() => { wrStartPolling(); hidePageLoadingOverlay(el); });
-        } else {
-            hidePageLoadingOverlay(el);
-        }
-    }
     if (view === 'backups') loadBackups().finally(() => hidePageLoadingOverlay(el));
     if (view === 'wolfnet') loadWolfNet().finally(() => hidePageLoadingOverlay(el));
     if (view === 'certificates') loadCertificates().finally(() => hidePageLoadingOverlay(el));
@@ -1393,6 +1377,9 @@ function buildServerTree(nodes) {
                 </a>
                 <a class="nav-item server-child-item wolfdisk-cluster-item" data-cluster="${escapedName}" data-view="wolfdisk-cluster" onclick="showWolfDiskPage('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
                     <span class="icon" style="font-size:15px;">🐺</span> <span style="font-weight:600;">WolfDisk</span>
+                </a>
+                <a class="nav-item server-child-item wolfrouter-cluster-item" data-cluster="${escapedName}" data-view="wolfrouter-cluster" onclick="showWolfRouterForCluster('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
+                    <span class="icon" style="font-size:15px;">🧩</span> <span style="font-weight:600;">WolfRouter</span>
                 </a>`;
 
         // Each node within the cluster
