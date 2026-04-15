@@ -1180,6 +1180,7 @@ function selectServerView(nodeId, view) {
         storage: 'Storage',
         files: 'File Manager',
         networking: 'Networking',
+        wolfrouter: 'WolfRouter',
         wolfnet: 'WolfNet',
         certificates: 'Certificates',
         cron: 'Cron Jobs',
@@ -1212,7 +1213,7 @@ function selectServerView(nodeId, view) {
 
     // Load data for the view
     // Show a modern loading overlay for views that fetch data asynchronously
-    const asyncViews = ['components', 'services', 'containers', 'compose', 'secrets', 'lxc', 'vms', 'storage', 'networking', 'backups', 'wolfnet', 'certificates', 'cron', 'pve-resources', 'mysql-editor', 'security', 'ceph', 'wolfkube', 'wolfram'];
+    const asyncViews = ['components', 'services', 'containers', 'compose', 'secrets', 'lxc', 'vms', 'storage', 'networking', 'wolfrouter', 'backups', 'wolfnet', 'certificates', 'cron', 'pve-resources', 'mysql-editor', 'security', 'ceph', 'wolfkube', 'wolfram'];
     if (asyncViews.includes(view) && el) {
         // Clear table bodies to prevent stale data showing
         el.querySelectorAll('tbody').forEach(tb => { tb.innerHTML = ''; });
@@ -1273,6 +1274,15 @@ function selectServerView(nodeId, view) {
     if (view === 'syslogs') { loadSystemLogs(); hidePageLoadingOverlay(el); }
     if (view === 'files') { if (!window._skipFileReset) { containerFileMode = null; currentFilePath = '/'; } window._skipFileReset = false; loadFiles().finally(() => hidePageLoadingOverlay(el)); }
     if (view === 'networking') loadNetworking().finally(() => hidePageLoadingOverlay(el));
+    if (view === 'wolfrouter') {
+        // WolfRouter is its own top-level page (cluster-wide). Networking
+        // page stays per-server (interfaces, DNS, IP mappings, WireGuard).
+        if (typeof wrLoadAll === 'function') {
+            wrLoadAll().finally(() => { wrStartPolling(); hidePageLoadingOverlay(el); });
+        } else {
+            hidePageLoadingOverlay(el);
+        }
+    }
     if (view === 'backups') loadBackups().finally(() => hidePageLoadingOverlay(el));
     if (view === 'wolfnet') loadWolfNet().finally(() => hidePageLoadingOverlay(el));
     if (view === 'certificates') loadCertificates().finally(() => hidePageLoadingOverlay(el));

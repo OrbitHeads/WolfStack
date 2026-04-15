@@ -79,7 +79,9 @@
         pollInterval: null,
     };
 
-    // Expose hooks the HTML calls directly.
+    // Expose hooks the HTML and app.js call directly.
+    window.wrLoadAll = wrLoadAll;
+    window.wrStartPolling = wrStartPolling;
     window.wrSwitchView = wrSwitchView;
     window.wrSelectTab = wrSelectTab;
     window.wrShowRuleEditor = wrShowRuleEditor;
@@ -125,8 +127,13 @@
     function wrStartPolling() {
         if (wrState.pollInterval) clearInterval(wrState.pollInterval);
         wrState.pollInterval = setInterval(async () => {
-            const page = document.getElementById('page-networking');
-            if (!page || page.style.display === 'none') return;
+            // WolfRouter has its own page now, but stay tolerant of being
+            // embedded elsewhere. If neither page is visible, suspend.
+            const wr = document.getElementById('page-wolfrouter');
+            const net = document.getElementById('page-networking');
+            const visible = (wr && wr.style.display !== 'none') ||
+                            (net && net.style.display !== 'none');
+            if (!visible) return;
             try {
                 const r = await fetch('/api/router/topology');
                 if (r.ok) {
@@ -668,166 +675,330 @@
         } catch (e) {}
     }
 
-    // ─── Rack view SVG ───
+    // ─── Rack view SVG (the real-rack version) ───
+    //
+    // Renders a server-room scene: Internet cloud at top, vertical rack
+    // with mounting rails on either side, 2U appliances stacked inside,
+    // each with a brand strip + LCD label + a row of RJ45-style port
+    // jacks (with link/activity LEDs), and thick coloured patch cables
+    // routed from each WAN port up to the cloud and from each LAN/etc
+    // port down to a "device shelf" at the bottom.
+    //
+    // Cable colour code:
+    //   yellow  = WAN (internet uplink)
+    //   blue    = LAN (general user network)
+    //   green   = WolfNet overlay
+    //   purple  = Management
+    //   grey    = unassigned / trunk
 
     function wrRenderRack() {
         const canvas = document.getElementById('wr-rack-canvas');
         if (!canvas) return;
         const topo = wrState.topology;
-        if (!topo) {
-            canvas.innerHTML = '<div style="color:var(--text-muted); text-align:center; padding:40px;">Loading topology…</div>';
+        if (!topo || !topo.nodes || topo.nodes.length === 0) {
+            canvas.innerHTML = '<div style="color:var(--text-muted); text-align:center; padding:60px;">Loading topology…</div>';
             return;
         }
 
-        const W = canvas.clientWidth || 1000;
-        const nodeCount = Math.max(topo.nodes.length, 1);
-        const unitH = 110;               // height per node rack unit
-        const gap = 22;
-        const cloudH = 70;
-        const devicesH = Math.min(180, 40 + topo.nodes.reduce((s, n) => s + (n.vms.length + n.containers.length), 0) * 6);
-        const H = cloudH + 20 + nodeCount * (unitH + gap) + 20 + devicesH;
-
-        // Build SVG.
+        const W = Math.max(canvas.clientWidth || 1000, 720);
         const ns = 'http://www.w3.org/2000/svg';
+
+        // Layout dimensions ─────────────────────────────────────────
+        const padX = 20;
+        const cloudH = 90;
+        const cloudGap = 30;
+        const railW = 22;          // vertical rail width on each side
+        const rackInnerPad = 8;    // gap between rail and appliance
+        const unitH = 96;          // 2U appliance height
+        const unitGap = 12;
+        const shelfTopGap = 30;
+        const shelfRowH = 36;
+
+        const nodeCount = topo.nodes.length;
+        const allDevices = topo.nodes.flatMap(n =>
+            (n.vms || []).map(d => ({ ...d, node: n.node_id }))
+            .concat((n.containers || []).map(d => ({ ...d, node: n.node_id })))
+        );
+        const shelfCols = Math.max(1, Math.floor((W - padX*2 - 20) / 200));
+        const shelfRows = Math.max(1, Math.ceil(allDevices.length / shelfCols));
+        const shelfH = 28 + shelfRows * shelfRowH;
+
+        const rackY = cloudH + cloudGap;
+        const rackInnerH = nodeCount * unitH + (nodeCount - 1) * unitGap + rackInnerPad * 2;
+        const H = rackY + rackInnerH + 20 + shelfTopGap + shelfH + 20;
+
+        const rackX = padX;
+        const rackW = W - padX*2;
+        const apX = rackX + railW + rackInnerPad;
+        const apW = rackW - railW*2 - rackInnerPad*2;
+
+        // SVG root + defs ──────────────────────────────────────────
         const svg = document.createElementNS(ns, 'svg');
         svg.setAttribute('width', W); svg.setAttribute('height', H);
         svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
         svg.setAttribute('xmlns', ns);
+        svg.style.fontFamily = 'system-ui, sans-serif';
 
-        // Gradient defs for "cloud"
         svg.insertAdjacentHTML('afterbegin', `
             <defs>
-                <linearGradient id="wr-cloud-grad" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0" stop-color="rgba(59,130,246,0.25)"/>
-                    <stop offset="1" stop-color="rgba(59,130,246,0.08)"/>
+                <radialGradient id="wr-cloud" cx="50%" cy="40%" r="55%">
+                    <stop offset="0" stop-color="rgba(96,165,250,0.65)"/>
+                    <stop offset="0.7" stop-color="rgba(59,130,246,0.25)"/>
+                    <stop offset="1" stop-color="rgba(30,58,138,0.05)"/>
+                </radialGradient>
+                <linearGradient id="wr-rail" x1="0" y1="0" x2="1" y2="0">
+                    <stop offset="0" stop-color="#1f2937"/>
+                    <stop offset="0.5" stop-color="#374151"/>
+                    <stop offset="1" stop-color="#1f2937"/>
                 </linearGradient>
-                <linearGradient id="wr-unit-grad" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0" stop-color="rgba(51,65,85,1)"/>
-                    <stop offset="1" stop-color="rgba(30,41,59,1)"/>
+                <linearGradient id="wr-chassis" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0" stop-color="#2c3a4f"/>
+                    <stop offset="0.5" stop-color="#1f2a3d"/>
+                    <stop offset="1" stop-color="#141d2c"/>
                 </linearGradient>
+                <linearGradient id="wr-brand" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0" stop-color="#7c3aed"/>
+                    <stop offset="1" stop-color="#4c1d95"/>
+                </linearGradient>
+                <radialGradient id="wr-led-green" cx="50%" cy="50%" r="50%">
+                    <stop offset="0" stop-color="#bbf7d0"/>
+                    <stop offset="0.5" stop-color="#22c55e"/>
+                    <stop offset="1" stop-color="#15803d"/>
+                </radialGradient>
+                <radialGradient id="wr-led-amber" cx="50%" cy="50%" r="50%">
+                    <stop offset="0" stop-color="#fde68a"/>
+                    <stop offset="0.5" stop-color="#f59e0b"/>
+                    <stop offset="1" stop-color="#92400e"/>
+                </radialGradient>
+                <radialGradient id="wr-led-off" cx="50%" cy="50%" r="50%">
+                    <stop offset="0" stop-color="#1e293b"/>
+                    <stop offset="1" stop-color="#0f172a"/>
+                </radialGradient>
+                <linearGradient id="wr-jack" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0" stop-color="#0a0f18"/>
+                    <stop offset="1" stop-color="#1e293b"/>
+                </linearGradient>
+                <filter id="wr-glow" x="-50%" y="-50%" width="200%" height="200%">
+                    <feGaussianBlur stdDeviation="2" result="b"/>
+                    <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+                </filter>
             </defs>
         `);
 
-        // WAN "cloud" at the top
-        const cloudY = 10;
-        const cloudX = W / 2 - 130;
+        // Internet cloud ──────────────────────────────────────────
+        const cloudCX = W/2, cloudCY = cloudH/2 + 6;
         svg.insertAdjacentHTML('beforeend', `
             <g class="wr-cloud-group">
-                <ellipse cx="${W/2}" cy="${cloudY + cloudH/2}" rx="130" ry="${cloudH/2-5}" fill="url(#wr-cloud-grad)" stroke="rgba(59,130,246,0.4)" />
-                <text x="${W/2}" y="${cloudY + cloudH/2 + 5}" text-anchor="middle" class="wr-node-name" style="fill:#60a5fa;">🌐 Internet (WAN)</text>
+                <path d="M ${cloudCX-160},${cloudCY+12}
+                         C ${cloudCX-180},${cloudCY-20} ${cloudCX-110},${cloudCY-50} ${cloudCX-70},${cloudCY-30}
+                         C ${cloudCX-50},${cloudCY-55} ${cloudCX+10},${cloudCY-55} ${cloudCX+30},${cloudCY-30}
+                         C ${cloudCX+80},${cloudCY-55} ${cloudCX+150},${cloudCY-25} ${cloudCX+140},${cloudCY+5}
+                         C ${cloudCX+180},${cloudCY+15} ${cloudCX+170},${cloudCY+45} ${cloudCX+120},${cloudCY+40}
+                         L ${cloudCX-130},${cloudCY+40}
+                         C ${cloudCX-180},${cloudCY+45} ${cloudCX-185},${cloudCY+15} ${cloudCX-160},${cloudCY+12} Z"
+                      fill="url(#wr-cloud)" stroke="rgba(96,165,250,0.5)" stroke-width="1.5"/>
+                <text x="${cloudCX}" y="${cloudCY-2}" text-anchor="middle"
+                      style="fill:#bfdbfe; font-size:14px; font-weight:600;">🌍 Internet</text>
+                <text x="${cloudCX}" y="${cloudCY+18}" text-anchor="middle"
+                      style="fill:#93c5fd; font-size:10px;">WAN uplink</text>
             </g>
         `);
 
-        // Node rack units
-        const portsByNode = {};       // node_id → array of {name, cx, cy}
-        let y = cloudY + cloudH + 20;
-        for (const node of topo.nodes) {
-            const x = 10;
-            const w = W - 20;
-            const unit = document.createElementNS(ns, 'g');
-            unit.classList.add('wr-rack-unit-group');
-            svg.appendChild(unit);
-
-            // Rack chassis
-            unit.insertAdjacentHTML('beforeend', `
-                <rect x="${x}" y="${y}" width="${w}" height="${unitH}" rx="10" fill="url(#wr-unit-grad)" stroke="var(--border, #334155)" stroke-width="1.5"/>
-                <rect x="${x+8}" y="${y+8}" width="14" height="14" rx="2" fill="var(--primary,#a855f7)" opacity="0.6"/>
-                <rect x="${x+8}" y="${y+28}" width="14" height="14" rx="2" fill="#22c55e" opacity="${node.interfaces.some(i=>i.link_up) ? '1' : '0.3'}"/>
-                <text x="${x+30}" y="${y+22}" class="wr-node-name">🖥 ${escHtml(node.node_name)}</text>
-                <text x="${x+30}" y="${y+40}" class="wr-port-label" text-anchor="start">${node.interfaces.length} ports · ${node.vms.length} VMs · ${node.containers.length} containers</text>
+        // Rack frame ──────────────────────────────────────────────
+        // Outer rack background panel
+        svg.insertAdjacentHTML('beforeend', `
+            <rect x="${rackX}" y="${rackY}" width="${rackW}" height="${rackInnerH}" rx="6"
+                  fill="rgba(15,23,42,0.65)" stroke="#1e293b" stroke-width="2"/>
+        `);
+        // Left + right rails with mounting holes
+        for (const railX of [rackX, rackX + rackW - railW]) {
+            svg.insertAdjacentHTML('beforeend', `
+                <rect x="${railX}" y="${rackY}" width="${railW}" height="${rackInnerH}"
+                      fill="url(#wr-rail)" stroke="#0a0f18" stroke-width="0.5"/>
             `);
-
-            // Ports laid out left-to-right on the bottom half of the unit
-            portsByNode[node.node_id] = [];
-            const portBoxW = 48, portBoxH = 34;
-            const portsAreaX = x + 200;
-            const portsAreaW = w - 260;
-            const portGap = 8;
-            const maxCols = Math.max(1, Math.floor((portsAreaW + portGap) / (portBoxW + portGap)));
-            node.interfaces.slice(0, maxCols).forEach((port, i) => {
-                const px = portsAreaX + i * (portBoxW + portGap);
-                const py = y + 50;
-                const color = port.link_up
-                    ? (port.role === 'wan' ? '#ef4444' :
-                       port.role === 'lan' ? '#22c55e' :
-                       port.role === 'management' ? '#3b82f6' : '#64748b')
-                    : '#1e293b';
-                const roleLetter = {
-                    wan: 'W', lan: 'L', trunk: 'T', management: 'M', wolfnet: 'N', unused: '—'
-                }[port.role] || '·';
-                const bpsKb = Math.round((port.rx_bps + port.tx_bps) / 1024);
-                unit.insertAdjacentHTML('beforeend', `
-                    <g class="wr-port" data-node="${escHtml(node.node_id)}" data-iface="${escHtml(port.name)}">
-                        <rect x="${px}" y="${py}" width="${portBoxW}" height="${portBoxH}" rx="4" fill="${color}" opacity="${port.link_up ? 0.9 : 0.3}" stroke="rgba(0,0,0,0.3)"/>
-                        <circle cx="${px + portBoxW - 8}" cy="${py + 8}" r="3" fill="${port.link_up ? '#4ade80' : '#475569'}"/>
-                        <text x="${px + portBoxW/2}" y="${py + portBoxH/2 + 3}" text-anchor="middle" class="wr-port-label" style="font-size:11px; fill:white; font-weight:600;">${roleLetter}</text>
-                        <text x="${px + portBoxW/2}" y="${py + portBoxH + 11}" class="wr-port-label">${escHtml(port.name.slice(0,10))}</text>
-                        ${bpsKb > 0 ? `<text x="${px + portBoxW/2}" y="${py - 3}" class="wr-port-label" style="fill:#4ade80;">${fmtBps(port.rx_bps + port.tx_bps)}</text>` : ''}
-                        <title>${escHtml(port.name)} — ${port.link_up ? 'UP' : 'DOWN'} — ${escHtml((port.addresses||[]).join(', '))}</title>
-                    </g>
+            // Mounting holes — one every ~22px
+            for (let yy = rackY + 12; yy < rackY + rackInnerH - 6; yy += 22) {
+                svg.insertAdjacentHTML('beforeend', `
+                    <ellipse cx="${railX + railW/2}" cy="${yy}" rx="3" ry="4.5"
+                             fill="#0a0f18" stroke="#374151" stroke-width="0.4"/>
                 `);
-                portsByNode[node.node_id].push({ name: port.name, cx: px + portBoxW/2, cy: py + portBoxH/2, role: port.role, link_up: port.link_up, bps: port.rx_bps + port.tx_bps });
-            });
-
-            y += unitH + gap;
+            }
         }
 
-        // Wires: WAN ports → cloud
+        // Rack appliances + ports ─────────────────────────────────
+        const portsByNode = {};
+        let yCursor = rackY + rackInnerPad;
+        for (const node of topo.nodes) {
+            const ux = apX, uy = yCursor, uw = apW, uh = unitH;
+            const brandW = 120;
+            const portsZoneX = ux + brandW + 14;
+            const portsZoneW = uw - brandW - 28 - 100;  // leave room for stats panel
+            const statsX = ux + uw - 96;
+
+            // Chassis
+            const chassis = document.createElementNS(ns, 'g');
+            svg.appendChild(chassis);
+            chassis.insertAdjacentHTML('beforeend', `
+                <rect x="${ux}" y="${uy}" width="${uw}" height="${uh}" rx="6"
+                      fill="url(#wr-chassis)" stroke="#0a0f18" stroke-width="1.5"/>
+                <!-- Top venting strip -->
+                ${Array.from({length: 24}).map((_,i) =>
+                    `<line x1="${ux+10+i*8}" y1="${uy+5}" x2="${ux+14+i*8}" y2="${uy+5}" stroke="#0a0f18" stroke-width="1.2"/>`
+                ).join('')}
+                <!-- Brand panel (left) -->
+                <rect x="${ux+8}" y="${uy+10}" width="${brandW}" height="${uh-20}" rx="3"
+                      fill="url(#wr-brand)" opacity="0.85"/>
+                <text x="${ux+18}" y="${uy+34}" style="fill:#fff; font-size:14px; font-weight:700; letter-spacing:0.5px;">WOLF</text>
+                <text x="${ux+18}" y="${uy+50}" style="fill:rgba(255,255,255,0.7); font-size:10px; letter-spacing:1px;">STACK</text>
+                <text x="${ux+18}" y="${uy+72}" style="fill:#fde68a; font-size:11px; font-weight:600; font-family:monospace;">${escHtml(node.node_name.slice(0,14))}</text>
+                <!-- Power LED (always on if responsive) -->
+                <circle cx="${ux+brandW-8}" cy="${uy+18}" r="3.5" fill="url(#wr-led-green)" filter="url(#wr-glow)"/>
+                <!-- Activity LED (any port up) -->
+                <circle cx="${ux+brandW-8}" cy="${uy+34}" r="3.5"
+                        fill="${node.interfaces.some(i=>i.link_up) ? 'url(#wr-led-amber)' : 'url(#wr-led-off)'}"
+                        ${node.interfaces.some(i=>i.link_up) ? 'filter="url(#wr-glow)"' : ''}/>
+                <!-- Stats panel (right) -->
+                <rect x="${statsX}" y="${uy+10}" width="88" height="${uh-20}" rx="3"
+                      fill="rgba(0,0,0,0.4)" stroke="#0a0f18"/>
+                <text x="${statsX+8}" y="${uy+24}" style="fill:#22c55e; font-size:9px; font-family:monospace;">PORTS ${node.interfaces.length}</text>
+                <text x="${statsX+8}" y="${uy+38}" style="fill:#60a5fa; font-size:9px; font-family:monospace;">VMS   ${node.vms.length}</text>
+                <text x="${statsX+8}" y="${uy+52}" style="fill:#a855f7; font-size:9px; font-family:monospace;">CTRS  ${node.containers.length}</text>
+                <text x="${statsX+8}" y="${uy+72}" style="fill:#94a3b8; font-size:8px;">${escHtml(node.lan_segments?.length ? node.lan_segments.length + ' LAN' : 'no LAN')}</text>
+            `);
+
+            // Ports — laid out in a single row across the middle of the chassis
+            portsByNode[node.node_id] = [];
+            const jackW = 28, jackH = 22, jackGap = 6;
+            const maxPorts = Math.min(node.interfaces.length, Math.floor((portsZoneW + jackGap) / (jackW + jackGap)));
+            const startPx = portsZoneX + (portsZoneW - (maxPorts*(jackW+jackGap) - jackGap)) / 2;
+            const portsCY = uy + uh/2 + 2;
+
+            node.interfaces.slice(0, maxPorts).forEach((port, idx) => {
+                const px = startPx + idx * (jackW + jackGap);
+                const py = portsCY - jackH/2;
+                const cableColor = port.link_up
+                    ? (port.role === 'wan' ? '#fbbf24' :
+                       port.role === 'lan' ? '#3b82f6' :
+                       port.role === 'wolfnet' ? '#22c55e' :
+                       port.role === 'management' ? '#a855f7' : '#94a3b8')
+                    : '#475569';
+                const linkLed = port.link_up ? 'url(#wr-led-green)' : 'url(#wr-led-off)';
+                const actLed = (port.rx_bps + port.tx_bps) > 0 ? 'url(#wr-led-amber)' : 'url(#wr-led-off)';
+                // RJ45 jack: trapezoidal shape with 8 contact pins inside.
+                const jackPath = `M ${px+2},${py+jackH-2}
+                                  L ${px+2},${py+5}
+                                  L ${px+5},${py+2}
+                                  L ${px+jackW-5},${py+2}
+                                  L ${px+jackW-2},${py+5}
+                                  L ${px+jackW-2},${py+jackH-2} Z`;
+                chassis.insertAdjacentHTML('beforeend', `
+                    <g class="wr-port" data-node="${escHtml(node.node_id)}" data-iface="${escHtml(port.name)}">
+                        <!-- LEDs above the jack: link (left) + activity (right) -->
+                        <circle cx="${px+8}" cy="${py-3}" r="2" fill="${linkLed}"/>
+                        <circle cx="${px+jackW-8}" cy="${py-3}" r="2" fill="${actLed}"
+                                ${(port.rx_bps + port.tx_bps) > 0 ? 'filter="url(#wr-glow)"' : ''}/>
+                        <!-- The jack itself -->
+                        <path d="${jackPath}" fill="url(#wr-jack)" stroke="#000" stroke-width="0.6"/>
+                        <!-- 8 contact pins -->
+                        ${Array.from({length: 8}).map((_,j) =>
+                            `<line x1="${px+5+j*((jackW-10)/7)}" y1="${py+5}" x2="${px+5+j*((jackW-10)/7)}" y2="${py+jackH-4}" stroke="#fbbf24" stroke-width="0.6" opacity="${port.link_up ? 0.7 : 0.25}"/>`
+                        ).join('')}
+                        <!-- Iface name below -->
+                        <text x="${px+jackW/2}" y="${py+jackH+10}" text-anchor="middle"
+                              style="fill:#cbd5e1; font-size:8px; font-family:monospace;">${escHtml(port.name.slice(0,8))}</text>
+                        <!-- Live BPS above LEDs (only if actively flowing) -->
+                        ${(port.rx_bps + port.tx_bps) > 0
+                            ? `<text x="${px+jackW/2}" y="${py-9}" text-anchor="middle" style="fill:#fde68a; font-size:8px; font-family:monospace;">${fmtBpsShort(port.rx_bps + port.tx_bps)}</text>`
+                            : ''}
+                        <title>${escHtml(port.name)} — ${port.link_up ? 'UP' : 'DOWN'} — role: ${port.role}${(port.addresses||[]).length ? ' — ' + (port.addresses||[]).join(', ') : ''}</title>
+                    </g>
+                `);
+                portsByNode[node.node_id].push({
+                    name: port.name, cx: px + jackW/2, cy: py + jackH/2,
+                    portTop: py - 5, portBottom: py + jackH + 4,
+                    role: port.role, link_up: port.link_up,
+                    bps: port.rx_bps + port.tx_bps, color: cableColor,
+                });
+            });
+
+            yCursor += uh + unitGap;
+        }
+
+        // Patch cables ────────────────────────────────────────────
+        // WAN ports → cloud (route up).
+        const cables = [];
         for (const node of topo.nodes) {
             for (const port of (portsByNode[node.node_id] || [])) {
                 if (port.role === 'wan' && port.link_up) {
-                    const isActive = port.bps > 0;
-                    const path = `M ${port.cx},${port.cy} C ${port.cx},${(port.cy + cloudY + cloudH) / 2} ${W/2},${(port.cy + cloudY + cloudH) / 2} ${W/2},${cloudY + cloudH}`;
-                    svg.insertAdjacentHTML('beforeend', `
-                        <path d="${path}" class="wr-wire ${isActive ? 'wr-wire-active' : ''}" stroke="${isActive ? '#ef4444' : '#64748b'}" stroke-width="${isActive ? 2.5 : 1.5}" opacity="0.8"/>
-                    `);
+                    const x1 = port.cx, y1 = port.portTop;
+                    const x2 = cloudCX, y2 = cloudCY + 30;
+                    // Route around the rack to the side, up to cloud
+                    const cy1 = y1 - 20;
+                    const cy2 = (y1 + y2) / 2;
+                    const path = `M ${x1},${y1}
+                                  C ${x1},${cy1} ${x2},${cy2} ${x2},${y2}`;
+                    cables.push({ path, color: port.color, bps: port.bps, kind: 'wan' });
                 }
             }
         }
 
-        // WolfNet shaded region between nodes (only if multiple nodes)
-        if (topo.nodes.length > 1) {
-            const startY = cloudY + cloudH + 20;
-            const endY = startY + topo.nodes.length * (unitH + gap) - gap;
+        // LAN/Wolfnet/Mgmt ports → device shelf (route down).
+        const shelfY = rackY + rackInnerH + shelfTopGap;
+        for (const node of topo.nodes) {
+            for (const port of (portsByNode[node.node_id] || [])) {
+                if (!port.link_up) continue;
+                if (port.role === 'wan') continue;
+                const x1 = port.cx, y1 = port.portBottom;
+                const x2 = port.cx, y2 = shelfY - 8;
+                const cy1 = y1 + 22;
+                const cy2 = y2 - 22;
+                const path = `M ${x1},${y1} C ${x1},${cy1} ${x2},${cy2} ${x2},${y2}`;
+                cables.push({ path, color: port.color, bps: port.bps, kind: port.role });
+            }
+        }
+
+        // Render cables behind the chassis but above the rack panel —
+        // we already drew the rack/appliances first, so cables now go on
+        // top, which actually reads better in this metaphor (cables in
+        // front of equipment is what you see in a real rack from the
+        // patch-panel side).
+        for (const c of cables) {
+            const active = c.bps > 0;
             svg.insertAdjacentHTML('beforeend', `
-                <rect x="${W - 50}" y="${startY}" width="30" height="${endY - startY}" rx="8" fill="rgba(34,197,94,0.08)" stroke="rgba(34,197,94,0.3)" stroke-dasharray="4,3"/>
-                <text x="${W - 35}" y="${(startY + endY)/2}" transform="rotate(-90 ${W-35} ${(startY+endY)/2})" text-anchor="middle" class="wr-port-label" style="fill:#22c55e;">WolfNet</text>
+                <path d="${c.path}" fill="none" stroke-linecap="round"
+                      stroke="${c.color}" stroke-width="${active ? 5 : 4}"
+                      opacity="${active ? 0.95 : 0.7}"
+                      ${active ? 'class="wr-wire-active" stroke-dasharray="10 6"' : ''}/>
+                <path d="${c.path}" fill="none" stroke-linecap="round"
+                      stroke="rgba(255,255,255,0.18)" stroke-width="1"/>
             `);
         }
 
-        // Device strip at the bottom
-        const devY = y + 20;
+        // Device shelf ────────────────────────────────────────────
         svg.insertAdjacentHTML('beforeend', `
-            <text x="20" y="${devY + 10}" class="wr-node-name">🔌 Devices</text>
+            <rect x="${padX}" y="${shelfY-6}" width="${W - padX*2}" height="6"
+                  fill="#1f2937" stroke="#0a0f18"/>
+            <text x="${padX+8}" y="${shelfY+18}" style="fill:#cbd5e1; font-size:11px; font-weight:600;">🔌 Devices on this cluster</text>
         `);
-        let dx = 20, dy = devY + 26;
-        const badgeW = 160, badgeH = 22;
-        const cols = Math.max(1, Math.floor((W - 40) / (badgeW + 8)));
-        let i = 0;
+
+        let dIdx = 0;
         for (const node of topo.nodes) {
-            for (const vm of node.vms) {
-                const col = i % cols, row = Math.floor(i / cols);
-                const bx = 20 + col * (badgeW + 8);
-                const by = devY + 26 + row * (badgeH + 6);
+            for (const dev of (node.vms || []).concat(node.containers || [])) {
+                const isVm = dev.kind === 'vm';
+                const col = dIdx % shelfCols, row = Math.floor(dIdx / shelfCols);
+                const dx = padX + 10 + col * 200;
+                const dy = shelfY + 28 + row * shelfRowH;
+                const icon = isVm ? '🖥' : '📦';
+                const accent = isVm ? '#60a5fa' : '#a855f7';
                 svg.insertAdjacentHTML('beforeend', `
                     <g>
-                        <rect x="${bx}" y="${by}" width="${badgeW}" height="${badgeH}" rx="4" class="wr-device-badge"/>
-                        <text x="${bx + 8}" y="${by + 15}" class="wr-device-text">🖥 ${escHtml(vm.name.slice(0,18))} → ${escHtml(vm.attached_to.slice(0,10))}</text>
+                        <rect x="${dx}" y="${dy}" width="190" height="28" rx="6"
+                              fill="rgba(15,23,42,0.95)" stroke="${accent}" stroke-width="1" opacity="0.85"/>
+                        <text x="${dx+10}" y="${dy+18}" style="fill:#f1f5f9; font-size:12px;">${icon} ${escHtml(dev.name.slice(0,14))}</text>
+                        <text x="${dx+185}" y="${dy+18}" text-anchor="end" style="fill:#94a3b8; font-size:10px; font-family:monospace;">${escHtml((dev.attached_to||'').slice(0,10))}</text>
                     </g>
                 `);
-                i++;
-            }
-            for (const ct of node.containers) {
-                const col = i % cols, row = Math.floor(i / cols);
-                const bx = 20 + col * (badgeW + 8);
-                const by = devY + 26 + row * (badgeH + 6);
-                svg.insertAdjacentHTML('beforeend', `
-                    <g>
-                        <rect x="${bx}" y="${by}" width="${badgeW}" height="${badgeH}" rx="4" class="wr-device-badge" stroke="#3b82f6" stroke-opacity="0.4"/>
-                        <text x="${bx + 8}" y="${by + 15}" class="wr-device-text">📦 ${escHtml(ct.name.slice(0,18))}</text>
-                    </g>
-                `);
-                i++;
+                dIdx++;
             }
         }
 
@@ -837,13 +1008,16 @@
         // Legend
         const legend = document.getElementById('wr-rack-legend');
         if (legend) {
-            legend.innerHTML = `
-                <div><span style="display:inline-block; width:12px; height:12px; background:#ef4444; border-radius:2px; vertical-align:middle;"></span> WAN</div>
-                <div><span style="display:inline-block; width:12px; height:12px; background:#22c55e; border-radius:2px; vertical-align:middle;"></span> LAN</div>
-                <div><span style="display:inline-block; width:12px; height:12px; background:#3b82f6; border-radius:2px; vertical-align:middle;"></span> Management</div>
-                <div><span style="display:inline-block; width:12px; height:12px; background:#64748b; border-radius:2px; vertical-align:middle;"></span> Unassigned</div>
-                <div style="margin-left:auto; color:var(--text-muted);">Hover a port for details · click to assign a zone</div>
-            `;
+            const sw = (color, label) =>
+                `<div style="display:flex; align-items:center; gap:6px;"><span style="display:inline-block; width:18px; height:4px; background:${color}; border-radius:2px;"></span> ${label}</div>`;
+            legend.innerHTML = [
+                sw('#fbbf24', 'WAN cable'),
+                sw('#3b82f6', 'LAN cable'),
+                sw('#22c55e', 'WolfNet'),
+                sw('#a855f7', 'Management'),
+                sw('#94a3b8', 'Unassigned'),
+                `<div style="margin-left:auto; color:var(--text-muted);">Click a port to assign a zone · cables animate when traffic flows</div>`
+            ].join('');
         }
 
         // Click handler for ports → open zone assignment
@@ -854,6 +1028,14 @@
                 wrShowPortPanel(node, iface);
             });
         });
+    }
+
+    // Compact "5K" "120M" formatter for the LED-style port readouts.
+    function fmtBpsShort(bps) {
+        if (bps < 1024) return bps + 'b';
+        if (bps < 1024*1024) return Math.round(bps / 1024) + 'K';
+        if (bps < 1024*1024*1024) return Math.round(bps / 1048576) + 'M';
+        return (bps / 1073741824).toFixed(1) + 'G';
     }
 
     function wrShowPortPanel(nodeId, ifaceName) {

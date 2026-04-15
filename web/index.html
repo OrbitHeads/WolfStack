@@ -145,6 +145,11 @@
                     style="display:flex;align-items:center;justify-content:center;width:40px;height:40px;padding:0;border-radius:10px;">
                     <span class="icon" style="margin:0;font-size:20px;">🔗</span>
                 </a>
+                <a class="nav-item" data-page="wolfrouter" onclick="selectView('wolfrouter')"
+                    title="WolfRouter — cluster firewall, DHCP, DNS, rack view"
+                    style="display:flex;align-items:center;justify-content:center;width:40px;height:40px;padding:0;border-radius:10px;">
+                    <span class="icon" style="margin:0;font-size:20px;">🧩</span>
+                </a>
             </div>
             <div class="nav-section">
                 <div class="nav-section-title">Servers</div>
@@ -5739,13 +5744,13 @@
 
 
 
-        <!-- ═══ Networking ═══ -->
-        <div id="page-networking" class="page-view" style="display:none;">
-            <!-- WolfRouter (native firewall / DHCP / DNS / rack view) -->
+        <!-- ═══ WolfRouter (top-level page) ═══ -->
+        <div id="page-wolfrouter" class="page-view" style="display:none;">
             <div class="card" style="margin-bottom:16px;">
                 <div class="card-header" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
                     <h3 style="display:flex; align-items:center; gap:8px;">🧩 WolfRouter
                         <span class="badge" style="background:rgba(168,85,247,0.15); color:#a855f7; font-size:10px; padding:2px 8px; border-radius:10px;">beta</span>
+                        <span style="font-size:11px; color:var(--text-muted); font-weight:normal;">Cluster-wide firewall, DHCP, DNS</span>
                     </h3>
                     <div style="display:flex; gap:6px;">
                         <button id="wr-view-rack" class="btn btn-sm btn-primary" onclick="wrSwitchView('rack')">🗄️ Rack view</button>
@@ -5754,7 +5759,7 @@
                 </div>
                 <div class="card-body" style="padding:0;">
                     <!-- Tab bar for table view -->
-                    <div id="wr-tabs" style="display:flex; gap:2px; padding:8px 12px 0; border-bottom:1px solid var(--border); flex-wrap:wrap;">
+                    <div id="wr-tabs" style="display:none; gap:2px; padding:8px 12px 0; border-bottom:1px solid var(--border); flex-wrap:wrap;">
                         <button class="wr-tab active" data-tab="firewall" onclick="wrSelectTab('firewall')">🔥 Firewall</button>
                         <button class="wr-tab" data-tab="lans" onclick="wrSelectTab('lans')">🌐 LANs</button>
                         <button class="wr-tab" data-tab="leases" onclick="wrSelectTab('leases')">📡 Leases</button>
@@ -5763,14 +5768,14 @@
                         <button class="wr-tab" data-tab="logs" onclick="wrSelectTab('logs')">📜 Logs</button>
                     </div>
 
-                    <!-- Rack view canvas -->
-                    <div id="wr-rack-container" style="display:none; padding:16px; min-height:520px; background:linear-gradient(180deg, rgba(30,41,59,0.5), rgba(15,23,42,0.8)); border-radius:0 0 8px 8px;">
-                        <div id="wr-rack-canvas" style="width:100%; height:520px;"></div>
+                    <!-- Rack view canvas (default visible) -->
+                    <div id="wr-rack-container" style="display:block; padding:16px; min-height:620px; background:radial-gradient(ellipse at top, rgba(30,41,59,0.9), rgba(7,11,20,1) 80%); border-radius:0 0 8px 8px;">
+                        <div id="wr-rack-canvas" style="width:100%; min-height:600px;"></div>
                         <div id="wr-rack-legend" style="margin-top:12px; display:flex; gap:16px; flex-wrap:wrap; font-size:11px; color:var(--text-muted);"></div>
                     </div>
 
-                    <!-- Table view panels -->
-                    <div id="wr-tab-firewall" class="wr-tab-panel" style="padding:16px;">
+                    <!-- Table view panels (hidden by default) -->
+                    <div id="wr-tab-firewall" class="wr-tab-panel" style="padding:16px; display:none;">
                         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
                             <div style="font-size:12px; color:var(--text-muted);">Zone-to-zone allow/deny rules, applied cluster-wide. Rules are tested with <code>iptables-restore --test</code> before swap; safe-mode auto-reverts if you don't confirm in 30s.</div>
                             <div style="display:flex; gap:6px;">
@@ -5816,7 +5821,10 @@
                     </div>
                 </div>
             </div>
+        </div>
 
+        <!-- ═══ Networking ═══ -->
+        <div id="page-networking" class="page-view" style="display:none;">
             <!-- WolfNet Card -->
             <div class="card" style="margin-bottom:16px;">
                 <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">

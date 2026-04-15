@@ -27,6 +27,94 @@ macro_rules! auth_or_return {
     };
 }
 
+/// Push the current RouterConfig to every other cluster node so the
+/// firewall, LANs, and zone assignments stay in sync. Fired (in the
+/// background, doesn't block the originating user request) after every
+/// successful write. Each peer accepts via `/api/router/config-receive`
+/// authenticated with the X-WolfStack-Secret header.
+///
+/// "Settings should replicate across the cluster when they are changed
+/// so nothing breaks" — this is that.
+fn replicate_config_to_cluster(state: S) {
+    // The clone of the config and nodes happens INSIDE the spawned task,
+    // by which time the caller has returned and any write lock from the
+    // handler has been dropped. Calling this with the lock still held
+    // would deadlock — so the indirection is intentional.
+    tokio::spawn(async move {
+        let cfg = state.router.config.read().unwrap().clone();
+        let nodes = state.cluster.get_all_nodes();
+        let secret = state.cluster_secret.clone();
+        let self_id = crate::agent::self_node_id();
+        let body = match serde_json::to_string(&cfg) {
+            Ok(b) => b,
+            Err(e) => { tracing::warn!("router replicate: serialize failed: {}", e); return; }
+        };
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)  // cluster nodes may use self-signed
+            .timeout(std::time::Duration::from_secs(10))
+            .build();
+        let client = match client {
+            Ok(c) => c,
+            Err(e) => { tracing::warn!("router replicate: client build: {}", e); return; }
+        };
+        for node in nodes {
+            // Skip ourselves, offline nodes, and non-WolfStack nodes
+            // (Proxmox-only members can't host WolfRouter).
+            if node.is_self || node.id == self_id { continue; }
+            if !node.online { continue; }
+            if node.node_type != "wolfstack" { continue; }
+            let url = format!("https://{}:{}/api/router/config-receive", node.address, node.port);
+            let res = client.post(&url)
+                .header("X-WolfStack-Secret", &secret)
+                .header("Content-Type", "application/json")
+                .body(body.clone())
+                .send().await;
+            match res {
+                Ok(r) if r.status().is_success() => {
+                    tracing::debug!("router config replicated to {}", node.id);
+                }
+                Ok(r) => {
+                    tracing::warn!("router config replicate to {} returned {}", node.id, r.status());
+                }
+                Err(e) => {
+                    tracing::warn!("router config replicate to {} failed: {}", node.id, e);
+                }
+            }
+        }
+    });
+}
+
+/// Receive a RouterConfig from another cluster node. Persists it,
+/// re-applies firewall, restarts dnsmasq for any LANs hosted here.
+/// Called by the master/originator after a local edit.
+pub async fn config_receive(
+    req: HttpRequest,
+    state: S,
+    body: web::Json<RouterConfig>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let new_cfg = body.into_inner();
+    {
+        let mut cur = state.router.config.write().unwrap();
+        *cur = new_cfg.clone();
+        if let Err(e) = cur.save() {
+            return HttpResponse::InternalServerError().body(format!("save: {}", e));
+        }
+    }
+    // Apply firewall locally if auto_apply is on.
+    if new_cfg.auto_apply {
+        let ruleset = firewall::build_ruleset(&new_cfg, &crate::agent::self_node_id());
+        if let Err(e) = firewall::apply(&ruleset, false) {
+            tracing::warn!("router config-receive: firewall apply failed: {}", e);
+        }
+    }
+    // Re-render dnsmasq for LANs hosted on this node. Stops orphaned
+    // instances for LANs that were removed; starts/restarts current ones.
+    let self_id = crate::agent::self_node_id();
+    dhcp::start_all_for_node(&new_cfg, &self_id);
+    HttpResponse::Ok().body("synced")
+}
+
 /// Reject a LanSegment whose user-supplied fields contain newlines or
 /// other dnsmasq directive separators. dhcp::render_config writes these
 /// into a config file unescaped — without this guard a maliciously
@@ -141,20 +229,24 @@ pub struct ZoneAssignRequest {
 
 pub async fn assign_zone(req: HttpRequest, state: S, body: web::Json<ZoneAssignRequest>) -> HttpResponse {
     auth_or_return!(req, state);
-    let mut cfg = state.router.config.write().unwrap();
-    let req = body.into_inner();
-    match req.zone {
-        Some(z) => cfg.zones.set(&req.node_id, &req.interface, z),
-        None => cfg.zones.remove(&req.node_id, &req.interface),
-    }
-    if let Err(e) = cfg.save() {
-        return HttpResponse::InternalServerError().body(e);
-    }
-    if cfg.auto_apply {
-        let ruleset = firewall::build_ruleset(&cfg, &crate::agent::self_node_id());
-        let _ = firewall::apply(&ruleset, false);
-    }
-    HttpResponse::Ok().json(&cfg.zones)
+    let zones_snapshot = {
+        let mut cfg = state.router.config.write().unwrap();
+        let r = body.into_inner();
+        match r.zone {
+            Some(z) => cfg.zones.set(&r.node_id, &r.interface, z),
+            None => cfg.zones.remove(&r.node_id, &r.interface),
+        }
+        if let Err(e) = cfg.save() {
+            return HttpResponse::InternalServerError().body(e);
+        }
+        if cfg.auto_apply {
+            let ruleset = firewall::build_ruleset(&cfg, &crate::agent::self_node_id());
+            let _ = firewall::apply(&ruleset, false);
+        }
+        cfg.zones.clone()
+    }; // write lock dropped here — safe to replicate
+    replicate_config_to_cluster(state);
+    HttpResponse::Ok().json(&zones_snapshot)
 }
 
 pub async fn get_zones(req: HttpRequest, state: S) -> HttpResponse {
@@ -179,11 +271,13 @@ pub async fn create_segment(req: HttpRequest, state: S, body: web::Json<LanSegme
     let mut segment = body.into_inner();
     if segment.id.is_empty() { segment.id = gen_id("lan"); }
 
-    let mut cfg = state.router.config.write().unwrap();
-    cfg.lans.retain(|l| l.id != segment.id);
-    cfg.lans.push(segment.clone());
-    if let Err(e) = cfg.save() {
-        return HttpResponse::InternalServerError().body(e);
+    {
+        let mut cfg = state.router.config.write().unwrap();
+        cfg.lans.retain(|l| l.id != segment.id);
+        cfg.lans.push(segment.clone());
+        if let Err(e) = cfg.save() {
+            return HttpResponse::InternalServerError().body(e);
+        }
     }
     // Start dnsmasq if this LAN is ours.
     if segment.node_id == crate::agent::self_node_id() {
@@ -191,6 +285,7 @@ pub async fn create_segment(req: HttpRequest, state: S, body: web::Json<LanSegme
             return HttpResponse::InternalServerError().body(format!("dnsmasq start failed: {}", e));
         }
     }
+    replicate_config_to_cluster(state);
     HttpResponse::Ok().json(&segment)
 }
 
@@ -209,34 +304,41 @@ pub async fn update_segment(
     if updated.id != id {
         return HttpResponse::BadRequest().body("id mismatch");
     }
-    let mut cfg = state.router.config.write().unwrap();
-    let idx = match cfg.lans.iter().position(|l| l.id == id) {
-        Some(i) => i,
-        None => return HttpResponse::NotFound().body("not found"),
-    };
-    cfg.lans[idx] = updated.clone();
-    if let Err(e) = cfg.save() {
-        return HttpResponse::InternalServerError().body(e);
+    {
+        let mut cfg = state.router.config.write().unwrap();
+        let idx = match cfg.lans.iter().position(|l| l.id == id) {
+            Some(i) => i,
+            None => return HttpResponse::NotFound().body("not found"),
+        };
+        cfg.lans[idx] = updated.clone();
+        if let Err(e) = cfg.save() {
+            return HttpResponse::InternalServerError().body(e);
+        }
     }
     if updated.node_id == crate::agent::self_node_id() {
         let _ = dhcp::start(&updated);
     }
+    replicate_config_to_cluster(state);
     HttpResponse::Ok().json(&updated)
 }
 
 pub async fn delete_segment(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
-    let mut cfg = state.router.config.write().unwrap();
-    let removed = cfg.lans.iter().position(|l| l.id == id).map(|i| cfg.lans.remove(i));
-    if let Err(e) = cfg.save() {
-        return HttpResponse::InternalServerError().body(e);
-    }
+    let removed = {
+        let mut cfg = state.router.config.write().unwrap();
+        let r = cfg.lans.iter().position(|l| l.id == id).map(|i| cfg.lans.remove(i));
+        if let Err(e) = cfg.save() {
+            return HttpResponse::InternalServerError().body(e);
+        }
+        r
+    };
     if let Some(seg) = removed {
         if seg.node_id == crate::agent::self_node_id() {
             let _ = dhcp::purge(&seg);
         }
     }
+    replicate_config_to_cluster(state);
     HttpResponse::Ok().body("deleted")
 }
 
@@ -267,21 +369,23 @@ pub async fn create_rule(req: HttpRequest, state: S, body: web::Json<FirewallRul
     let mut rule = body.into_inner();
     if rule.id.is_empty() { rule.id = gen_id("rule"); }
 
-    let mut cfg = state.router.config.write().unwrap();
-    // Append at the end (max order + 1) so new rules don't shift others.
-    let next_order = cfg.rules.iter().map(|r| r.order).max().unwrap_or(-1) + 1;
-    if rule.order == 0 { rule.order = next_order; }
-    cfg.rules.retain(|r| r.id != rule.id);
-    cfg.rules.push(rule.clone());
-    if let Err(e) = cfg.save() {
-        return HttpResponse::InternalServerError().body(e);
-    }
-    if cfg.auto_apply {
-        let ruleset = firewall::build_ruleset(&cfg, &crate::agent::self_node_id());
-        if let Err(e) = firewall::apply(&ruleset, false) {
-            return HttpResponse::InternalServerError().body(format!("firewall apply failed: {}", e));
+    {
+        let mut cfg = state.router.config.write().unwrap();
+        let next_order = cfg.rules.iter().map(|r| r.order).max().unwrap_or(-1) + 1;
+        if rule.order == 0 { rule.order = next_order; }
+        cfg.rules.retain(|r| r.id != rule.id);
+        cfg.rules.push(rule.clone());
+        if let Err(e) = cfg.save() {
+            return HttpResponse::InternalServerError().body(e);
+        }
+        if cfg.auto_apply {
+            let ruleset = firewall::build_ruleset(&cfg, &crate::agent::self_node_id());
+            if let Err(e) = firewall::apply(&ruleset, false) {
+                return HttpResponse::InternalServerError().body(format!("firewall apply failed: {}", e));
+            }
         }
     }
+    replicate_config_to_cluster(state);
     HttpResponse::Ok().json(&rule)
 }
 
@@ -297,34 +401,40 @@ pub async fn update_rule(
     if updated.id != id {
         return HttpResponse::BadRequest().body("id mismatch");
     }
-    let mut cfg = state.router.config.write().unwrap();
-    let idx = match cfg.rules.iter().position(|r| r.id == id) {
-        Some(i) => i,
-        None => return HttpResponse::NotFound().body("not found"),
-    };
-    cfg.rules[idx] = updated.clone();
-    if let Err(e) = cfg.save() {
-        return HttpResponse::InternalServerError().body(e);
+    {
+        let mut cfg = state.router.config.write().unwrap();
+        let idx = match cfg.rules.iter().position(|r| r.id == id) {
+            Some(i) => i,
+            None => return HttpResponse::NotFound().body("not found"),
+        };
+        cfg.rules[idx] = updated.clone();
+        if let Err(e) = cfg.save() {
+            return HttpResponse::InternalServerError().body(e);
+        }
+        if cfg.auto_apply {
+            let ruleset = firewall::build_ruleset(&cfg, &crate::agent::self_node_id());
+            let _ = firewall::apply(&ruleset, false);
+        }
     }
-    if cfg.auto_apply {
-        let ruleset = firewall::build_ruleset(&cfg, &crate::agent::self_node_id());
-        let _ = firewall::apply(&ruleset, false);
-    }
+    replicate_config_to_cluster(state);
     HttpResponse::Ok().json(&updated)
 }
 
 pub async fn delete_rule(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
-    let mut cfg = state.router.config.write().unwrap();
-    cfg.rules.retain(|r| r.id != id);
-    if let Err(e) = cfg.save() {
-        return HttpResponse::InternalServerError().body(e);
+    {
+        let mut cfg = state.router.config.write().unwrap();
+        cfg.rules.retain(|r| r.id != id);
+        if let Err(e) = cfg.save() {
+            return HttpResponse::InternalServerError().body(e);
+        }
+        if cfg.auto_apply {
+            let ruleset = firewall::build_ruleset(&cfg, &crate::agent::self_node_id());
+            let _ = firewall::apply(&ruleset, false);
+        }
     }
-    if cfg.auto_apply {
-        let ruleset = firewall::build_ruleset(&cfg, &crate::agent::self_node_id());
-        let _ = firewall::apply(&ruleset, false);
-    }
+    replicate_config_to_cluster(state);
     HttpResponse::Ok().body("deleted")
 }
 
@@ -333,26 +443,27 @@ pub struct ReorderRequest { pub order: Vec<String> }
 
 pub async fn reorder_rules(req: HttpRequest, state: S, body: web::Json<ReorderRequest>) -> HttpResponse {
     auth_or_return!(req, state);
-    let req = body.into_inner();
-    let mut cfg = state.router.config.write().unwrap();
-    // Reassign `order` fields per the submitted id sequence; rules not
-    // in the list keep their current order offset by the list length.
-    let mut order_map: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
-    for (i, id) in req.order.iter().enumerate() {
-        order_map.insert(id.clone(), i as i32);
-    }
-    for r in &mut cfg.rules {
-        if let Some(o) = order_map.get(&r.id) {
-            r.order = *o;
+    let r = body.into_inner();
+    {
+        let mut cfg = state.router.config.write().unwrap();
+        let mut order_map: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+        for (i, id) in r.order.iter().enumerate() {
+            order_map.insert(id.clone(), i as i32);
+        }
+        for rule in &mut cfg.rules {
+            if let Some(o) = order_map.get(&rule.id) {
+                rule.order = *o;
+            }
+        }
+        if let Err(e) = cfg.save() {
+            return HttpResponse::InternalServerError().body(e);
+        }
+        if cfg.auto_apply {
+            let ruleset = firewall::build_ruleset(&cfg, &crate::agent::self_node_id());
+            let _ = firewall::apply(&ruleset, false);
         }
     }
-    if let Err(e) = cfg.save() {
-        return HttpResponse::InternalServerError().body(e);
-    }
-    if cfg.auto_apply {
-        let ruleset = firewall::build_ruleset(&cfg, &crate::agent::self_node_id());
-        let _ = firewall::apply(&ruleset, false);
-    }
+    replicate_config_to_cluster(state);
     HttpResponse::Ok().body("reordered")
 }
 
@@ -445,6 +556,7 @@ pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
     cfg
         .route("/api/router/topology", web::get().to(get_topology))
         .route("/api/router/topology-local", web::get().to(get_topology_local))
+        .route("/api/router/config-receive", web::post().to(config_receive))
         .route("/api/router/zones", web::get().to(get_zones))
         .route("/api/router/zones", web::post().to(assign_zone))
         .route("/api/router/segments", web::get().to(list_segments))

@@ -241,8 +241,14 @@ fn walk_interfaces(
             continue;
         }
         let mac = link.get("address").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        // Port up/down detection — `operstate` from `ip link` is unreliable
+        // for many interfaces (returns UNKNOWN on virtual/wireless NICs
+        // that are functionally up). The kernel exposes the authoritative
+        // physical link state at `/sys/class/net/<iface>/carrier` (1=up,
+        // 0=down). Read carrier first and fall back to operstate=="UP"
+        // only when carrier isn't readable.
         let operstate = link.get("operstate").and_then(|v| v.as_str()).unwrap_or("UNKNOWN");
-        let link_up = operstate == "UP";
+        let link_up = read_carrier(&name).unwrap_or(operstate == "UP" || operstate == "UNKNOWN");
         let master = link.get("master").and_then(|v| v.as_str()).map(|s| s.to_string());
         let speed_mbps = read_speed_mbps(&name);
         let (rx, tx) = bps.get(&name).cloned().unwrap_or((0, 0));
@@ -412,6 +418,18 @@ fn infer_role(name: &str, zone: &Option<Zone>, _link_up: bool, slaved: bool) -> 
         return PortRole::Wan;
     }
     PortRole::Unused
+}
+
+/// Read the kernel's authoritative link state from sysfs. Returns
+/// `Some(true)` if the carrier is up (cable plugged in / wireless
+/// associated), `Some(false)` if down, `None` if the file isn't
+/// readable (e.g. interface is administratively down so the kernel
+/// refuses to evaluate carrier) — caller should fall back.
+fn read_carrier(iface: &str) -> Option<bool> {
+    std::fs::read_to_string(format!("/sys/class/net/{}/carrier", iface))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .map(|n| n == 1)
 }
 
 fn read_speed_mbps(iface: &str) -> Option<u32> {
