@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use std::process::Command;
 use tracing::warn;
 
+pub mod router;
+
 /// Network interface info
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkInterface {

@@ -5737,6 +5737,82 @@
 
         <!-- ═══ Networking ═══ -->
         <div id="page-networking" class="page-view" style="display:none;">
+            <!-- WolfRouter (native firewall / DHCP / DNS / rack view) -->
+            <div class="card" style="margin-bottom:16px;">
+                <div class="card-header" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                    <h3 style="display:flex; align-items:center; gap:8px;">🧩 WolfRouter
+                        <span class="badge" style="background:rgba(168,85,247,0.15); color:#a855f7; font-size:10px; padding:2px 8px; border-radius:10px;">beta</span>
+                    </h3>
+                    <div style="display:flex; gap:6px;">
+                        <button id="wr-view-rack" class="btn btn-sm btn-primary" onclick="wrSwitchView('rack')">🗄️ Rack view</button>
+                        <button id="wr-view-table" class="btn btn-sm" onclick="wrSwitchView('table')">📋 Table view</button>
+                    </div>
+                </div>
+                <div class="card-body" style="padding:0;">
+                    <!-- Tab bar for table view -->
+                    <div id="wr-tabs" style="display:flex; gap:2px; padding:8px 12px 0; border-bottom:1px solid var(--border); flex-wrap:wrap;">
+                        <button class="wr-tab active" data-tab="firewall" onclick="wrSelectTab('firewall')">🔥 Firewall</button>
+                        <button class="wr-tab" data-tab="lans" onclick="wrSelectTab('lans')">🌐 LANs</button>
+                        <button class="wr-tab" data-tab="leases" onclick="wrSelectTab('leases')">📡 Leases</button>
+                        <button class="wr-tab" data-tab="zones" onclick="wrSelectTab('zones')">🎯 Zones</button>
+                        <button class="wr-tab" data-tab="connections" onclick="wrSelectTab('connections')">🔗 Connections</button>
+                        <button class="wr-tab" data-tab="logs" onclick="wrSelectTab('logs')">📜 Logs</button>
+                    </div>
+
+                    <!-- Rack view canvas -->
+                    <div id="wr-rack-container" style="display:none; padding:16px; min-height:520px; background:linear-gradient(180deg, rgba(30,41,59,0.5), rgba(15,23,42,0.8)); border-radius:0 0 8px 8px;">
+                        <div id="wr-rack-canvas" style="width:100%; height:520px;"></div>
+                        <div id="wr-rack-legend" style="margin-top:12px; display:flex; gap:16px; flex-wrap:wrap; font-size:11px; color:var(--text-muted);"></div>
+                    </div>
+
+                    <!-- Table view panels -->
+                    <div id="wr-tab-firewall" class="wr-tab-panel" style="padding:16px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                            <div style="font-size:12px; color:var(--text-muted);">Zone-to-zone allow/deny rules, applied cluster-wide. Rules are tested with <code>iptables-restore --test</code> before swap; safe-mode auto-reverts if you don't confirm in 30s.</div>
+                            <div style="display:flex; gap:6px;">
+                                <button class="btn btn-sm" onclick="wrTestRules()">Test</button>
+                                <button class="btn btn-sm btn-primary" onclick="wrShowRuleEditor()">+ Rule</button>
+                            </div>
+                        </div>
+                        <div id="wr-rules-safemode" style="display:none; margin-bottom:12px; padding:10px; background:rgba(234,179,8,0.1); border:1px solid rgba(234,179,8,0.4); border-radius:6px; font-size:13px;">
+                            <strong>Safe-mode:</strong> <span id="wr-rules-countdown">30</span>s until auto-revert. <button class="btn btn-sm btn-primary" onclick="wrConfirmRules()">Keep these rules</button>
+                        </div>
+                        <table class="data-table" style="font-size:13px;">
+                            <thead><tr><th style="width:40px;">#</th><th>Action</th><th>Dir</th><th>From</th><th>To</th><th>Proto</th><th>Ports</th><th>Comment</th><th style="width:80px;"></th></tr></thead>
+                            <tbody id="wr-rules-tbody"></tbody>
+                        </table>
+                    </div>
+
+                    <div id="wr-tab-lans" class="wr-tab-panel" style="padding:16px; display:none;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                            <div style="font-size:12px; color:var(--text-muted);">LAN segments served by WolfRouter — each runs its own dnsmasq for DHCP + DNS on a chosen interface.</div>
+                            <button class="btn btn-sm btn-primary" onclick="wrShowLanEditor()">+ LAN</button>
+                        </div>
+                        <div id="wr-lans-list" style="display:grid; gap:12px;"></div>
+                    </div>
+
+                    <div id="wr-tab-leases" class="wr-tab-panel" style="padding:16px; display:none;">
+                        <div style="font-size:12px; color:var(--text-muted); margin-bottom:12px;">Live DHCP leases across every LAN. Refreshed every 10s.</div>
+                        <div id="wr-leases-container"></div>
+                    </div>
+
+                    <div id="wr-tab-zones" class="wr-tab-panel" style="padding:16px; display:none;">
+                        <div style="font-size:12px; color:var(--text-muted); margin-bottom:12px;">Assign each interface to a zone. Rules use zone names, so you don't have to remember which NIC is WAN today.</div>
+                        <div id="wr-zones-grid"></div>
+                    </div>
+
+                    <div id="wr-tab-connections" class="wr-tab-panel" style="padding:16px; display:none;">
+                        <div style="font-size:12px; color:var(--text-muted); margin-bottom:12px;">Live connection tracking via <code>conntrack</code>. Showing most recent 500.</div>
+                        <table class="data-table" style="font-size:12px;"><thead><tr><th>Proto</th><th>Src</th><th>Dst</th><th>SPort</th><th>DPort</th><th>State</th></tr></thead><tbody id="wr-conn-tbody"></tbody></table>
+                    </div>
+
+                    <div id="wr-tab-logs" class="wr-tab-panel" style="padding:16px; display:none;">
+                        <div style="font-size:12px; color:var(--text-muted); margin-bottom:12px;">Firewall log stream (NFLOG → kernel log). Only rules with "Log this match" set appear here.</div>
+                        <pre id="wr-logs-pre" style="font-family:var(--font-mono); font-size:11px; background:var(--bg-secondary); padding:10px; border-radius:6px; max-height:400px; overflow:auto;"></pre>
+                    </div>
+                </div>
+            </div>
+
             <!-- WolfNet Card -->
             <div class="card" style="margin-bottom:16px;">
                 <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
@@ -7086,6 +7162,7 @@ region = us-east-1"></textarea>
         </div>
 
         <script>document.write('<script src="/js/app.js?v=' + Date.now() + '"><\/script>');</script>
+        <script>document.write('<script src="/js/wolfrouter.js?v=' + Date.now() + '"><\/script>');</script>
         <script>
             // Check auth on page load
             fetch('/api/auth/check')

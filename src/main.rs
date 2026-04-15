@@ -344,7 +344,12 @@ async fn main() -> std::io::Result<()> {
             oidc_pending_flows: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             image_watcher_cache: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             integrations: Arc::new(crate::integrations::IntegrationState::new(&cluster_secret)),
+            router: Arc::new(crate::networking::router::RouterState::new()),
         });
+
+        // Start the WolfRouter safe-mode watcher — auto-reverts firewall
+        // changes if the user doesn't confirm within the safe-mode window.
+        crate::networking::router::spawn_rollback_watcher(app_state.router.clone());
 
         // WolfUSB: init with cluster secret and restore assignments on startup
         wolfusb::init(&cluster_secret);

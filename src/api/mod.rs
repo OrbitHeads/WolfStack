@@ -131,6 +131,8 @@ pub struct AppState {
     pub image_watcher_cache: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::containers::image_watcher::ImageCheckResult>>>,
     /// Integration framework state
     pub integrations: Arc<crate::integrations::IntegrationState>,
+    /// WolfRouter (native firewall/DHCP/DNS) state
+    pub router: Arc<crate::networking::router::RouterState>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -16788,6 +16790,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg
         .configure(crate::vms::api::config)
         .configure(crate::tui::configure)
+        .configure(crate::networking::router::api::configure)
         // Auth (no auth required)
         .route("/api/auth/login", web::post().to(login))
         .route("/api/auth/logout", web::post().to(logout))
