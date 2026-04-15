@@ -1150,8 +1150,14 @@
                         <!-- Iface name below (bigger, readable) -->
                         <text x="${px+jackW/2}" y="${py+jackH+12}" text-anchor="middle"
                               style="fill:#f1f5f9; font-size:11px; font-weight:600; font-family:monospace;">${escHtml(port.name.slice(0,10))}</text>
-                        <!-- IP address (if assigned) -->
-                        ${ipDisplay ? `<text x="${px+jackW/2}" y="${py+jackH+24}" text-anchor="middle"
+                        <!-- IP address rotated -90° down the right side
+                             of the jack so it doesn't fight the iface
+                             name or neighbouring ports for horizontal
+                             space. Reads top-to-bottom from the jack
+                             top edge. -->
+                        ${ipDisplay ? `<text x="${px+jackW+4}" y="${py-2}"
+                              transform="rotate(90 ${px+jackW+4} ${py-2})"
+                              text-anchor="start"
                               style="fill:#94a3b8; font-size:10px; font-family:monospace;">${escHtml(ipDisplay)}</text>` : ''}
                         <!-- Live BPS above LEDs (only if actively flowing) -->
                         ${(port.rx_bps + port.tx_bps) > 0
