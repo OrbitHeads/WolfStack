@@ -241,6 +241,7 @@
         if (tab === 'lans')         wrRenderLans();
         if (tab === 'leases')       wrRenderLeases();
         if (tab === 'zones')        wrRenderZones();
+        if (tab === 'policy')       wrRenderPolicyMap();
         if (tab === 'wan')          wrRenderWan();
         if (tab === 'connections')  wrRenderConnections();
         if (tab === 'packets')      wrRenderPackets();
@@ -442,6 +443,10 @@
                             Enabled
                         </label>
                     </div>
+                    <!-- Live warnings — rule analyser flags lockout
+                         risks, duplicates, and no-op rules as the
+                         user fills in the fields. -->
+                    <div id="wr-f-warnings" style="margin-top:12px;"></div>
                 </div>
                 <div class="modal-footer">
                     <button class="btn" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
@@ -449,6 +454,18 @@
                 </div>
             </div>`;
         document.body.appendChild(overlay);
+        // Wire live-warning refresh on every field change. setTimeout
+        // defers the first run until after the existing-rule values
+        // have been populated below.
+        setTimeout(() => {
+            ['wr-f-action','wr-f-dir','wr-f-from','wr-f-to','wr-f-proto','wr-f-ports','wr-f-log','wr-f-enabled'].forEach(id => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                el.addEventListener('input', wrRenderRuleWarnings);
+                el.addEventListener('change', wrRenderRuleWarnings);
+            });
+            wrRenderRuleWarnings();
+        }, 50);
         // Populate existing values
         document.getElementById('wr-f-action').value = r.action;
         document.getElementById('wr-f-dir').value = r.direction;
@@ -459,6 +476,140 @@
         document.getElementById('wr-f-comment').value = r.comment || '';
         document.getElementById('wr-f-log').checked = !!r.log_match;
         document.getElementById('wr-f-enabled').checked = r.enabled !== false;
+    }
+
+    /// Analyse a proposed (or edited) rule against the current state
+    /// and return a list of {severity, message} warnings. Called from
+    /// the rule editor whenever a field changes so users see the
+    /// consequences BEFORE they click Save.
+    ///
+    /// Severities: "danger" (red — lockout risk or catastrophic),
+    /// "warning" (amber — probably-wrong), "info" (grey — observation).
+    function wrAnalyzeRule(rule) {
+        const out = [];
+        const fromText = (rule.from?.kind === 'any' ? 'any' :
+                          rule.from?.kind === 'zone' ? ('zone ' + (rule.from.zone?.kind || ''))
+                          : JSON.stringify(rule.from));
+        const toText   = (rule.to?.kind === 'any' ? 'any' :
+                          rule.to?.kind === 'zone' ? ('zone ' + (rule.to.zone?.kind || ''))
+                          : JSON.stringify(rule.to));
+
+        // 1. Any → Any deny = total lockout.
+        if (rule.action === 'deny' && rule.from?.kind === 'any' && rule.to?.kind === 'any') {
+            out.push({ severity: 'danger', message: 'Any → Any DENY blocks ALL traffic through the firewall. You will lose access to everything including this UI. Almost certainly not what you meant.' });
+        }
+
+        // 2. Any deny that includes the Trusted zone on the source side
+        //    — if the admin's machine is in Trusted, this locks them out.
+        if (rule.action === 'deny' && (rule.from?.kind === 'any' ||
+            (rule.from?.kind === 'zone' && rule.from.zone?.kind === 'trusted')))
+        {
+            if (rule.direction === 'input' || rule.direction === 'forward') {
+                out.push({ severity: 'danger', message: 'Deny rule with Trusted / Any as source can lock admins out of SSH and the WolfStack UI. Safe-mode will revert in 30s — be ready to click "Keep these rules" or let it roll back.' });
+            }
+        }
+
+        // 3. Intra-zone deny (LAN → same LAN) — rarely what you want.
+        if (rule.action === 'deny' && rule.from?.kind === 'zone' && rule.to?.kind === 'zone'
+            && rule.from.zone?.kind === rule.to.zone?.kind
+            && (rule.from.zone?.id === rule.to.zone?.id))
+        {
+            out.push({ severity: 'warning', message: `Denying ${fromText} → ${toText} isolates everything within that zone. If devices in this zone need to talk to each other, this breaks it.` });
+        }
+
+        // 4. Deny that targets WolfNet from a non-WolfNet zone —
+        //    breaks inter-node traffic.
+        if (rule.action === 'deny'
+            && (rule.to?.kind === 'zone' && rule.to.zone?.kind === 'wolfnet'))
+        {
+            out.push({ severity: 'warning', message: 'Blocking traffic INTO WolfNet breaks cluster communication — nodes stop seeing each other, WolfRouter replication stops, migrations fail. Only proceed if you know why you need this.' });
+        }
+
+        // 5. Allow/deny on OUTPUT for WAN → blocks this host's own
+        //    outgoing traffic (apt updates, DNS, etc).
+        if (rule.action === 'deny' && rule.direction === 'output'
+            && (rule.to?.kind === 'zone' && rule.to.zone?.kind === 'wan'))
+        {
+            out.push({ severity: 'danger', message: 'Output deny to WAN blocks this host\'s own outgoing traffic — package updates, DNS, NTP, Let\'s Encrypt renewals all fail.' });
+        }
+
+        // 6. Duplicate or contradicting rule detection.
+        for (const existing of (wrState.rules || [])) {
+            if (existing.id === rule.id) continue;  // editing self
+            if (!existing.enabled) continue;
+            const sameFrom = JSON.stringify(existing.from) === JSON.stringify(rule.from);
+            const sameTo   = JSON.stringify(existing.to)   === JSON.stringify(rule.to);
+            const sameProto = existing.protocol === rule.protocol;
+            if (sameFrom && sameTo && sameProto) {
+                if (existing.action === rule.action) {
+                    out.push({ severity: 'info', message: `A rule with the same source/dest/protocol and action already exists (#${existing.id.slice(0,8)}). This would be a duplicate.` });
+                } else {
+                    out.push({ severity: 'warning', message: `Another enabled rule (${existing.action.toUpperCase()}, #${existing.id.slice(0,8)}) matches the same source/dest/protocol. Order matters — the lower-numbered rule wins.` });
+                }
+            }
+        }
+
+        // 7. Port range with protocol=any — iptables ignores ports
+        //    unless proto is tcp/udp; this rule silently matches more
+        //    than the user thinks.
+        if ((rule.ports || []).length > 0 && rule.protocol === 'any') {
+            out.push({ severity: 'warning', message: 'Ports only take effect when protocol is TCP or UDP. With Any, the ports are ignored and this rule matches every protocol (ICMP, SCTP, etc).' });
+        }
+
+        // 8. Reject without state tracking — firing on every packet
+        //    of a long connection, flooding logs.
+        if (rule.action === 'reject' && !rule.state_track) {
+            out.push({ severity: 'info', message: 'Reject without state tracking fires once per packet, not once per connection. Log volume can be huge.' });
+        }
+
+        return out;
+    }
+
+    /// Render the warnings panel inline in the rule editor. Called
+    /// from the field change handlers (see wrShowRuleEditor).
+    function wrRenderRuleWarnings() {
+        const panel = document.getElementById('wr-f-warnings');
+        if (!panel) return;
+        const rule = wrCollectRuleFromEditor();
+        const warnings = wrAnalyzeRule(rule);
+        if (!warnings.length) {
+            panel.innerHTML = '<div style="color:var(--text-muted); font-size:11px; padding:6px 0;">✓ No obvious issues detected with this rule.</div>';
+            return;
+        }
+        const colours = {
+            danger:  { bg: 'rgba(239,68,68,0.12)', border: 'rgba(239,68,68,0.4)', icon: '🛑', label: '#ef4444' },
+            warning: { bg: 'rgba(251,191,36,0.10)', border: 'rgba(251,191,36,0.35)', icon: '⚠', label: '#fbbf24' },
+            info:    { bg: 'rgba(96,165,250,0.08)', border: 'rgba(96,165,250,0.3)',   icon: 'ℹ', label: '#60a5fa' },
+        };
+        panel.innerHTML = warnings.map(w => {
+            const c = colours[w.severity] || colours.info;
+            return `<div style="margin-bottom:6px; padding:8px 10px; background:${c.bg}; border:1px solid ${c.border}; border-radius:4px; font-size:12px;">
+                <span style="color:${c.label}; font-weight:600;">${c.icon} ${w.severity.toUpperCase()}</span>
+                <div style="color:var(--text); margin-top:2px;">${escHtml(w.message)}</div>
+            </div>`;
+        }).join('');
+    }
+
+    /// Pull the current editor field values into a rule object —
+    /// used by wrRenderRuleWarnings and wrSaveRule to share logic.
+    function wrCollectRuleFromEditor() {
+        const byId = (id) => document.getElementById(id);
+        if (!byId('wr-f-action')) return null;
+        const ports = byId('wr-f-ports').value.split(',').map(s => s.trim()).filter(Boolean)
+            .map(p => ({ port: p, side: 'dst' }));
+        return {
+            id: '',
+            enabled: byId('wr-f-enabled').checked,
+            action: byId('wr-f-action').value,
+            direction: byId('wr-f-dir').value,
+            from: textToEndpoint(byId('wr-f-from').value),
+            to: textToEndpoint(byId('wr-f-to').value),
+            protocol: byId('wr-f-proto').value,
+            ports,
+            state_track: true,
+            log_match: byId('wr-f-log').checked,
+            comment: byId('wr-f-comment').value,
+        };
     }
 
     function endpointToText(ep) {
@@ -1104,6 +1255,485 @@
     }
     window.wrDeleteWan = wrDeleteWan;
     window.wrRenderWan = wrRenderWan;
+
+    // ─── Policy map — drag-and-drop firewall editor ─────────
+    //
+    // Renders the current firewall + DNAT state as a directed graph.
+    // Nodes: Internet, each Zone, each LAN segment, each VM and
+    // container. Edges: one per enabled WolfRouter rule (coloured by
+    // action) plus one per IP mapping (DNAT). Drag from a source
+    // node to a destination opens the existing rule editor
+    // pre-filled. Click an edge to edit or delete it. The whole view
+    // auto-populates on load so the user sees "this is what my
+    // firewall is doing" before touching anything.
+
+    /// Translate an Endpoint (the serde-tagged enum from the backend)
+    /// into a node id on the policy map. Returns null when the
+    /// endpoint has no representation (e.g. Any — rendered as an
+    /// edge to the Internet node).
+    function wrEndpointNodeId(ep) {
+        if (!ep) return null;
+        switch (ep.kind) {
+            case 'any':       return 'internet';
+            case 'zone':
+                if (!ep.zone) return null;
+                if (ep.zone.kind === 'lan') return `zone:lan${ep.zone.id ?? 0}`;
+                if (ep.zone.kind === 'custom') return `zone:custom:${ep.zone.id || ''}`;
+                return `zone:${ep.zone.kind}`;
+            case 'interface': return `iface:${ep.name}`;
+            case 'ip':        return `ip:${ep.cidr}`;
+            case 'vm':        return `vm:${ep.name}`;
+            case 'container': return `ct:${ep.name}`;
+            case 'lan':       return `lan:${ep.id}`;
+        }
+        return null;
+    }
+
+    /// Build the full graph {nodes, edges} from the current wrState
+    /// snapshot. No fetches — purely derived from data we've already
+    /// loaded for the other tabs.
+    function wrBuildPolicyGraph() {
+        const nodes = new Map();   // id → {id, label, icon, tier, kind, meta}
+        const edges = [];
+        const addNode = (id, label, icon, tier, kind, meta) => {
+            if (!nodes.has(id)) nodes.set(id, { id, label, icon, tier, kind, meta: meta || {} });
+        };
+
+        // Tier 0: Internet.
+        addNode('internet', 'Internet', '🌐', 0, 'internet');
+
+        // Tier 1: WAN-ish zones (WAN, Management, Trusted).
+        addNode('zone:wan',        'WAN',        '📡', 1, 'zone', { zone: { kind: 'wan' } });
+        addNode('zone:management', 'Management', '🔧', 1, 'zone', { zone: { kind: 'management' } });
+        addNode('zone:trusted',    'Trusted',    '⭐', 1, 'zone', { zone: { kind: 'trusted' } });
+
+        // Tier 2: LAN-ish zones (LAN0, LAN1, DMZ, WolfNet) — only show
+        // zones that actually have interfaces assigned, OR the common
+        // defaults so users have somewhere to drag to.
+        const seenZones = new Set(['wan', 'management', 'trusted']);
+        // Scan zone assignments for custom/LAN zone numbers.
+        const assigns = wrState.zones?.assignments || {};
+        for (const nodeId of Object.keys(assigns)) {
+            for (const iface of Object.keys(assigns[nodeId] || {})) {
+                const z = assigns[nodeId][iface];
+                if (!z) continue;
+                if (z.kind === 'lan') seenZones.add(`lan${z.id ?? 0}`);
+                else seenZones.add(z.kind);
+            }
+        }
+        // Ensure core zones exist even if nothing's assigned yet.
+        for (const needed of ['lan0', 'dmz', 'wolfnet']) seenZones.add(needed);
+        for (const slug of seenZones) {
+            if (['wan', 'management', 'trusted'].includes(slug)) continue;  // already tier 1
+            if (slug.startsWith('lan')) {
+                const n = parseInt(slug.slice(3), 10) || 0;
+                addNode(`zone:${slug}`, `LAN ${n}`, '🌐', 2, 'zone', { zone: { kind: 'lan', id: n } });
+            } else if (slug === 'dmz') {
+                addNode('zone:dmz', 'DMZ', '🪖', 2, 'zone', { zone: { kind: 'dmz' } });
+            } else if (slug === 'wolfnet') {
+                addNode('zone:wolfnet', 'WolfNet', '⛓', 2, 'zone', { zone: { kind: 'wolfnet' } });
+            } else {
+                addNode(`zone:${slug}`, slug, '🎯', 2, 'zone', { zone: { kind: slug } });
+            }
+        }
+
+        // Tier 3: LAN segments (served by WolfRouter with DHCP+DNS).
+        for (const lan of (wrState.lans || [])) {
+            addNode(`lan:${lan.id}`, lan.name, '🏠', 3, 'lan', { lan });
+        }
+
+        // Tier 4: VMs and containers, drawn from topology.
+        for (const n of (wrState.topology?.nodes || [])) {
+            for (const vm of (n.vms || [])) {
+                addNode(`vm:${vm.name}`, vm.name, '🖥', 4, 'vm', { vm, node: n.node_id });
+            }
+            for (const ct of (n.containers || [])) {
+                addNode(`ct:${ct.name}`, ct.name, '📦', 4, 'container', { ct, node: n.node_id });
+            }
+        }
+
+        // Edges from firewall rules. An Any source/dest is rendered
+        // as an edge to/from Internet (visual shorthand — a rule
+        // with from=Any means "anywhere, including the internet").
+        const actionColour = {
+            allow:  '#22c55e',
+            deny:   '#ef4444',
+            reject: '#f97316',
+            log:    '#60a5fa',
+        };
+        for (const rule of (wrState.rules || [])) {
+            const fromId = wrEndpointNodeId(rule.from);
+            const toId   = wrEndpointNodeId(rule.to);
+            if (!fromId || !toId) continue;
+            // Ensure endpoint-derived nodes exist (e.g. rule references
+            // an IP/interface we don't have a node for yet).
+            if (!nodes.has(fromId)) {
+                addNode(fromId, fromId.split(':').slice(1).join(':') || fromId, '•', 2, 'dynamic');
+            }
+            if (!nodes.has(toId)) {
+                addNode(toId, toId.split(':').slice(1).join(':') || toId, '•', 2, 'dynamic');
+            }
+            edges.push({
+                id: 'rule:' + rule.id,
+                from: fromId, to: toId,
+                kind: 'rule',
+                action: rule.action,
+                colour: actionColour[rule.action] || '#94a3b8',
+                enabled: rule.enabled !== false,
+                label: `${rule.protocol || 'any'}${rule.ports?.length ? ':' + rule.ports.map(p=>p.port).join(',') : ''}`,
+                rule,
+            });
+        }
+
+        // Edges from IP mappings (DNAT): Internet → target WolfNet IP
+        // / VM. These are port forwards.
+        for (const m of (wrState.managed?.ip_mappings || [])) {
+            const toName = (wrState.topology?.nodes || []).flatMap(n => n.vms || [])
+                .find(v => v.ip === m.wolfnet_ip)?.name;
+            const toId = toName ? `vm:${toName}` : `ip:${m.wolfnet_ip}/32`;
+            if (!nodes.has(toId)) addNode(toId, m.wolfnet_ip, '🖥', 4, 'dynamic');
+            edges.push({
+                id: 'mapping:' + m.id,
+                from: 'internet', to: toId,
+                kind: 'dnat',
+                action: 'dnat',
+                colour: '#a855f7',
+                enabled: m.enabled !== false,
+                label: `${(m.protocol || 'all').toUpperCase()}${m.ports ? ' :' + m.ports : ''}`,
+                mapping: m,
+            });
+        }
+
+        return { nodes: Array.from(nodes.values()), edges };
+    }
+
+    /// Hierarchical layout: group nodes by tier, space them evenly
+    /// across the canvas width. Returns a map of node id → {x, y}.
+    function wrLayoutPolicyGraph(graph, width, height) {
+        const layout = new Map();
+        const tiers = {};
+        for (const n of graph.nodes) {
+            if (!tiers[n.tier]) tiers[n.tier] = [];
+            tiers[n.tier].push(n);
+        }
+        const tierKeys = Object.keys(tiers).map(n => parseInt(n, 10)).sort((a, b) => a - b);
+        const tierCount = tierKeys.length;
+        const rowH = Math.max(110, height / Math.max(tierCount, 1));
+        for (let i = 0; i < tierKeys.length; i++) {
+            const row = tiers[tierKeys[i]];
+            const y = rowH * (i + 0.5);
+            const spacing = width / (row.length + 1);
+            row.forEach((n, idx) => {
+                layout.set(n.id, { x: spacing * (idx + 1), y, node: n });
+            });
+        }
+        return layout;
+    }
+
+    /// Render the canvas from scratch. Safe to call on every poll —
+    /// cheap because graphs stay small (dozens of nodes, not
+    /// thousands).
+    function wrRenderPolicyMap() {
+        const host = document.getElementById('wr-policy-canvas');
+        if (!host) return;
+        const graph = wrBuildPolicyGraph();
+        if (!graph.nodes.length) {
+            host.innerHTML = '<div style="color:var(--text-muted); text-align:center; padding:60px;">No data yet.</div>';
+            return;
+        }
+        const wrap = document.getElementById('wr-policy-canvas-wrap');
+        const W = wrap?.clientWidth || 1000;
+        // Height scales with node count so dense graphs don't overlap.
+        const H = Math.max(600, 140 * 5);  // 5 tiers
+        const layout = wrLayoutPolicyGraph(graph, W - 40, H);
+
+        const ns = 'http://www.w3.org/2000/svg';
+        const svg = document.createElementNS(ns, 'svg');
+        svg.setAttribute('width', W);
+        svg.setAttribute('height', H);
+        svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+        svg.setAttribute('xmlns', ns);
+        svg.style.display = 'block';
+
+        // Arrow marker for edge heads.
+        svg.insertAdjacentHTML('afterbegin', `
+            <defs>
+                <marker id="wr-policy-arrow" viewBox="0 -5 10 10" refX="10" refY="0" markerWidth="6" markerHeight="6" orient="auto">
+                    <path d="M0,-5L10,0L0,5" fill="currentColor"/>
+                </marker>
+                <filter id="wr-policy-glow" x="-50%" y="-50%" width="200%" height="200%">
+                    <feGaussianBlur stdDeviation="2" result="b"/>
+                    <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+                </filter>
+            </defs>
+        `);
+
+        // Draw edges first (behind nodes). Curved bezier from source
+        // centre to dest centre; label at the midpoint.
+        for (const e of graph.edges) {
+            const a = layout.get(e.from), b = layout.get(e.to);
+            if (!a || !b) continue;
+            const cx = (a.x + b.x) / 2;
+            const cy = (a.y + b.y) / 2;
+            // Offset the control point perpendicular to the line so
+            // multiple edges between the same pair spread out.
+            const path = `M ${a.x},${a.y} Q ${cx},${cy} ${b.x},${b.y}`;
+            const active = e.enabled;
+            const strokeW = active ? 2.5 : 1.5;
+            svg.insertAdjacentHTML('beforeend', `
+                <g class="wr-policy-edge" data-edge="${escHtml(e.id)}" style="cursor:pointer; color:${e.colour};">
+                    <path d="${path}" fill="none" stroke="${e.colour}"
+                          stroke-width="${strokeW}"
+                          opacity="${active ? 0.85 : 0.35}"
+                          stroke-dasharray="${active ? 'none' : '4 3'}"
+                          marker-end="url(#wr-policy-arrow)"/>
+                    <path d="${path}" fill="none" stroke="transparent" stroke-width="14"/>
+                    <text x="${cx}" y="${cy - 6}" text-anchor="middle"
+                          style="fill:${e.colour}; font-size:10px; font-family:var(--font-mono,monospace); pointer-events:none;">${escHtml(e.label || '')}</text>
+                </g>
+            `);
+        }
+
+        // Then nodes on top.
+        const nodeW = 120, nodeH = 36;
+        for (const n of graph.nodes) {
+            const p = layout.get(n.id);
+            if (!p) continue;
+            const x = p.x - nodeW/2, y = p.y - nodeH/2;
+            const fill = {
+                internet: 'rgba(96,165,250,0.18)',
+                zone:     'rgba(168,85,247,0.18)',
+                lan:      'rgba(34,197,94,0.15)',
+                vm:       'rgba(59,130,246,0.12)',
+                container:'rgba(168,85,247,0.12)',
+            }[n.kind] || 'rgba(148,163,184,0.12)';
+            const stroke = {
+                internet: '#60a5fa',
+                zone:     '#a855f7',
+                lan:      '#22c55e',
+                vm:       '#60a5fa',
+                container:'#a855f7',
+            }[n.kind] || '#94a3b8';
+            svg.insertAdjacentHTML('beforeend', `
+                <g class="wr-policy-node" data-node="${escHtml(n.id)}" style="cursor:crosshair;">
+                    <rect x="${x}" y="${y}" width="${nodeW}" height="${nodeH}" rx="8"
+                          fill="${fill}" stroke="${stroke}" stroke-width="1.5"/>
+                    <text x="${p.x}" y="${p.y+4}" text-anchor="middle"
+                          style="fill:var(--text); font-size:12px; font-weight:600; pointer-events:none;">${escHtml(n.icon)} ${escHtml(n.label.slice(0,14))}</text>
+                </g>
+            `);
+        }
+
+        // Live-drag ghost path — hidden until mousedown on a node.
+        svg.insertAdjacentHTML('beforeend', `<path id="wr-policy-drag-ghost" d="" fill="none" stroke="#fbbf24" stroke-width="3" stroke-dasharray="6 4" opacity="0.8" style="display:none;" marker-end="url(#wr-policy-arrow)"/>`);
+
+        host.innerHTML = '';
+        host.appendChild(svg);
+
+        // Legend.
+        const legend = document.getElementById('wr-policy-legend');
+        if (legend) {
+            const sw = (c, l) => `<div style="display:flex; align-items:center; gap:4px;"><span style="display:inline-block; width:14px; height:3px; background:${c}; border-radius:2px;"></span>${l}</div>`;
+            legend.innerHTML = [
+                sw('#22c55e', 'allow'),
+                sw('#ef4444', 'deny'),
+                sw('#f97316', 'reject'),
+                sw('#60a5fa', 'log'),
+                sw('#a855f7', 'DNAT (port forward)'),
+                `<span style="color:var(--text-muted);">· drag between nodes to add a rule · click a line to edit</span>`,
+            ].join('');
+        }
+
+        // Wire interactions.
+        wrWirePolicyInteractions(svg, graph, layout, nodeW, nodeH);
+    }
+
+    /// Drag-to-create + click-to-edit handlers. Lives on the <svg>
+    /// element directly — nodes have `data-node` and edges have
+    /// `data-edge` attributes so event.target.closest() works.
+    function wrWirePolicyInteractions(svg, graph, layout, nodeW, nodeH) {
+        let dragFrom = null;  // node id we're dragging from
+        let dragStart = null; // {x,y} in SVG coords
+        const ghost = svg.querySelector('#wr-policy-drag-ghost');
+
+        const getMousePos = (evt) => {
+            const rect = svg.getBoundingClientRect();
+            return {
+                x: (evt.clientX - rect.left) * (svg.viewBox.baseVal.width / rect.width),
+                y: (evt.clientY - rect.top)  * (svg.viewBox.baseVal.height / rect.height),
+            };
+        };
+
+        svg.addEventListener('mousedown', (evt) => {
+            const nodeEl = evt.target.closest('[data-node]');
+            if (!nodeEl) return;
+            dragFrom = nodeEl.dataset.node;
+            const p = layout.get(dragFrom);
+            if (!p) return;
+            dragStart = { x: p.x, y: p.y };
+            ghost.style.display = 'block';
+            ghost.setAttribute('d', `M ${p.x},${p.y} L ${p.x},${p.y}`);
+            evt.preventDefault();
+        });
+
+        svg.addEventListener('mousemove', (evt) => {
+            if (!dragFrom) return;
+            const m = getMousePos(evt);
+            ghost.setAttribute('d', `M ${dragStart.x},${dragStart.y} L ${m.x},${m.y}`);
+        });
+
+        const endDrag = (evt) => {
+            if (!dragFrom) return;
+            const targetEl = evt.target.closest('[data-node]');
+            ghost.style.display = 'none';
+            ghost.setAttribute('d', '');
+            const fromId = dragFrom;
+            const toId = targetEl?.dataset?.node;
+            dragFrom = null; dragStart = null;
+            if (!toId || toId === fromId) return;
+            // Translate node ids back to Endpoint objects and open
+            // the rule editor pre-filled.
+            const fromEp = wrNodeIdToEndpoint(fromId, graph);
+            const toEp   = wrNodeIdToEndpoint(toId,   graph);
+            if (!fromEp || !toEp) {
+                alert('One of those nodes isn\'t addressable as a firewall endpoint yet — try a zone or a named VM/container.');
+                return;
+            }
+            wrShowRuleEditorPrefilled({
+                action: 'allow',
+                direction: 'forward',
+                from: fromEp,
+                to:   toEp,
+                protocol: 'any',
+                ports: [],
+                state_track: true,
+                log_match: false,
+                comment: `drag-created: ${fromId} → ${toId}`,
+                enabled: true,
+            });
+        };
+        svg.addEventListener('mouseup', endDrag);
+        svg.addEventListener('mouseleave', () => {
+            if (!dragFrom) return;
+            ghost.style.display = 'none';
+            ghost.setAttribute('d', '');
+            dragFrom = null; dragStart = null;
+        });
+
+        // Click on an edge opens the edit popover (not drag).
+        svg.querySelectorAll('[data-edge]').forEach(el => {
+            el.addEventListener('click', (evt) => {
+                const edgeId = el.dataset.edge;
+                const edge = graph.edges.find(e => e.id === edgeId);
+                if (!edge) return;
+                wrShowEdgePopover(edge, evt.clientX, evt.clientY);
+                evt.stopPropagation();
+            });
+        });
+    }
+
+    /// Translate a policy-map node id back to a firewall Endpoint
+    /// suitable for wrSaveRule. Mirrors wrEndpointNodeId() in reverse.
+    function wrNodeIdToEndpoint(id, graph) {
+        const node = graph?.nodes?.find(n => n.id === id);
+        if (id === 'internet') return { kind: 'any' };
+        if (id.startsWith('zone:')) {
+            // Prefer the node's stashed zone meta (exact round-trip)…
+            if (node?.meta?.zone) return { kind: 'zone', zone: node.meta.zone };
+            // …but fall back to reconstructing from the id so dynamic
+            // custom-zone nodes (added by the unknown-endpoint fallback)
+            // still translate to a usable endpoint instead of silently
+            // returning null and confusing the user.
+            const slug = id.slice(5);
+            const m = slug.match(/^lan(\d+)$/);
+            if (m) return { kind: 'zone', zone: { kind: 'lan', id: parseInt(m[1], 10) } };
+            if (slug.startsWith('custom:')) {
+                return { kind: 'zone', zone: { kind: 'custom', id: slug.slice(7) } };
+            }
+            return { kind: 'zone', zone: { kind: slug } };
+        }
+        if (id.startsWith('lan:')) return { kind: 'lan', id: id.slice(4) };
+        if (id.startsWith('vm:'))  return { kind: 'vm',  name: id.slice(3) };
+        if (id.startsWith('ct:'))  return { kind: 'container', name: id.slice(3) };
+        if (id.startsWith('ip:'))  return { kind: 'ip', cidr: id.slice(3) };
+        if (id.startsWith('iface:')) return { kind: 'interface', name: id.slice(6) };
+        return null;
+    }
+
+    /// Open the existing rule editor modal with fields pre-populated
+    /// from a drag-to-create action. Reuses wrShowRuleEditor's DOM.
+    function wrShowRuleEditorPrefilled(rule) {
+        wrShowRuleEditor(null);  // fresh modal
+        // Populate synchronously — the modal was just appended.
+        const byId = (id) => document.getElementById(id);
+        if (!byId('wr-f-action')) return;
+        byId('wr-f-action').value = rule.action;
+        byId('wr-f-dir').value = rule.direction;
+        byId('wr-f-from').value = endpointToPrefillText(rule.from);
+        byId('wr-f-to').value   = endpointToPrefillText(rule.to);
+        byId('wr-f-proto').value = rule.protocol;
+        byId('wr-f-ports').value = (rule.ports || []).map(p => p.port).join(', ');
+        byId('wr-f-comment').value = rule.comment || '';
+        byId('wr-f-log').checked = !!rule.log_match;
+        byId('wr-f-enabled').checked = rule.enabled !== false;
+        // Call the analyser explicitly once the pre-fill is written —
+        // don't race the 50ms timer that wrShowRuleEditor scheduled.
+        wrRenderRuleWarnings();
+    }
+    function endpointToPrefillText(ep) {
+        if (!ep || ep.kind === 'any') return 'any';
+        if (ep.kind === 'zone') {
+            if (ep.zone?.kind === 'lan') return 'zone:lan' + (ep.zone.id ?? 0);
+            return 'zone:' + ep.zone?.kind;
+        }
+        if (ep.kind === 'interface') return 'iface:' + ep.name;
+        if (ep.kind === 'ip')        return 'ip:' + ep.cidr;
+        if (ep.kind === 'lan')       return 'lan:' + ep.id;
+        if (ep.kind === 'vm')        return 'vm:' + ep.name;
+        if (ep.kind === 'container') return 'ct:' + ep.name;
+        return 'any';
+    }
+
+    /// Click-to-edit popover for an existing edge. Shows edit +
+    /// delete buttons + a compact rule summary.
+    function wrShowEdgePopover(edge, clientX, clientY) {
+        const pop = document.getElementById('wr-policy-edge-popover');
+        if (!pop) return;
+        const wrap = document.getElementById('wr-policy-canvas-wrap');
+        const rect = wrap.getBoundingClientRect();
+        pop.style.left = (clientX - rect.left + 8) + 'px';
+        pop.style.top  = (clientY - rect.top + 8) + 'px';
+        pop.style.display = 'block';
+        if (edge.kind === 'rule') {
+            const r = edge.rule;
+            pop.innerHTML = `
+                <div style="margin-bottom:6px;"><strong style="color:${edge.colour};">${escHtml(r.action.toUpperCase())}</strong> ${escHtml(r.protocol||'any')}${r.ports?.length ? ' ports ' + r.ports.map(p=>p.port).join(',') : ''}</div>
+                ${r.comment ? `<div style="color:var(--text-muted); font-size:11px; margin-bottom:6px;">${escHtml(r.comment)}</div>` : ''}
+                <div style="display:flex; gap:6px;">
+                    <button class="btn btn-sm" onclick="wrShowRuleEditor('${escHtml(r.id)}'); document.getElementById('wr-policy-edge-popover').style.display='none';">Edit</button>
+                    <button class="btn btn-sm" onclick="(async()=>{await wrDeleteRule('${escHtml(r.id)}'); wrRenderPolicyMap();})(); document.getElementById('wr-policy-edge-popover').style.display='none';">Delete</button>
+                    <button class="btn btn-sm" onclick="document.getElementById('wr-policy-edge-popover').style.display='none';">Close</button>
+                </div>`;
+        } else if (edge.kind === 'dnat') {
+            const m = edge.mapping;
+            pop.innerHTML = `
+                <div style="margin-bottom:6px;"><strong style="color:${edge.colour};">DNAT</strong> port forward</div>
+                <div style="font-size:11px;">${escHtml(m.public_ip)} → <code>${escHtml(m.wolfnet_ip)}</code>${m.ports ? ' :' + escHtml(m.ports) : ''}</div>
+                <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">Managed on the per-server Networking page.</div>
+                <div style="margin-top:6px;"><button class="btn btn-sm" onclick="document.getElementById('wr-policy-edge-popover').style.display='none';">Close</button></div>`;
+        }
+    }
+    // Expose for inline onclick handlers.
+    window.wrRenderPolicyMap = wrRenderPolicyMap;
+
+    // Dismiss popover on outside click.
+    document.addEventListener('click', (evt) => {
+        const pop = document.getElementById('wr-policy-edge-popover');
+        if (!pop || pop.style.display === 'none') return;
+        if (evt.target.closest('#wr-policy-edge-popover')) return;
+        if (evt.target.closest('[data-edge]')) return;
+        pop.style.display = 'none';
+    });
 
     // ─── Packets (tcpdump) tab ───────────────────────────────
 

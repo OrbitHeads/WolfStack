@@ -134,11 +134,12 @@ pub fn start(lan: &LanSegment) -> Result<(), String> {
         );
     }
 
-    // Spawn as daemon (dnsmasq's default is to daemonize). `--conf-file`
-    // points at our per-LAN file. We pass `--local-service` to refuse
-    // queries from outside the configured interface.
+    // Spawn as daemon (dnsmasq's default is to daemonize). `--conf-file=`
+    // (with the equals sign) is the only form dnsmasq accepts — separate
+    // arg causes "junk found in command line" because dnsmasq treats
+    // the path as a non-option positional. Same for --local-service.
     let out = Command::new("dnsmasq")
-        .args(["--conf-file", &cfg_path])
+        .arg(format!("--conf-file={}", cfg_path))
         .arg("--local-service")
         .output()
         .map_err(|e| format!("spawn dnsmasq: {}", e))?;

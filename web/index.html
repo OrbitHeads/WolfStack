@@ -5759,6 +5759,7 @@
                         <button class="wr-tab" data-tab="lans" onclick="wrSelectTab('lans')">🌐 DHCP / LANs</button>
                         <button class="wr-tab" data-tab="leases" onclick="wrSelectTab('leases')">📡 DHCP Leases</button>
                         <button class="wr-tab" data-tab="zones" onclick="wrSelectTab('zones')">🎯 Zones</button>
+                        <button class="wr-tab" data-tab="policy" onclick="wrSelectTab('policy')">🕸 Policy map</button>
                         <button class="wr-tab" data-tab="wan" onclick="wrSelectTab('wan')">🌍 WAN / PPPoE</button>
                         <button class="wr-tab" data-tab="connections" onclick="wrSelectTab('connections')">🔗 Connections</button>
                         <button class="wr-tab" data-tab="packets" onclick="wrSelectTab('packets')">📡 Packets</button>
@@ -5827,6 +5828,19 @@
                     <div id="wr-tab-zones" class="wr-tab-panel" style="padding:16px; display:none;">
                         <div style="font-size:12px; color:var(--text-muted); margin-bottom:12px;">Assign each interface to a zone. Rules use zone names, so you don't have to remember which NIC is WAN today.</div>
                         <div id="wr-zones-grid"></div>
+                    </div>
+
+                    <div id="wr-tab-policy" class="wr-tab-panel" style="padding:16px; display:none;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-wrap:wrap; gap:8px;">
+                            <div style="font-size:12px; color:var(--text-muted); max-width:720px;">
+                                Live view of what your firewall actually permits. Every node is a zone, LAN, VM, or container. Every line is a rule or port-forward. <strong>Drag from one node to another to create a rule between them.</strong> Click a line to edit or delete it.
+                            </div>
+                            <div id="wr-policy-legend" style="display:flex; gap:10px; font-size:10px; flex-wrap:wrap;"></div>
+                        </div>
+                        <div id="wr-policy-canvas-wrap" style="position:relative; min-height:600px; background:radial-gradient(ellipse at top, rgba(30,41,59,0.8), rgba(7,11,20,1) 80%); border-radius:8px; border:1px solid var(--border); overflow:hidden;">
+                            <div id="wr-policy-canvas" style="width:100%; min-height:600px;"></div>
+                            <div id="wr-policy-edge-popover" style="display:none; position:absolute; background:var(--bg-card); border:1px solid var(--border); border-radius:8px; padding:10px 12px; font-size:12px; box-shadow:0 8px 24px rgba(0,0,0,0.4); z-index:10;"></div>
+                        </div>
                     </div>
 
                     <div id="wr-tab-wan" class="wr-tab-panel" style="padding:16px; display:none;">

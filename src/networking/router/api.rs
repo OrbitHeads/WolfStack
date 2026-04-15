@@ -127,13 +127,36 @@ fn validate_segment(seg: &LanSegment) -> Result<(), String> {
         }
         Ok(())
     };
+    // Require a non-empty name and interface — otherwise the error
+    // surfaces deep inside dnsmasq with a cryptic "LAN ''" message.
+    if seg.name.trim().is_empty() {
+        return Err("LAN needs a name".into());
+    }
+    if seg.interface.trim().is_empty() {
+        return Err("LAN needs an interface (e.g. br-lan0, enp3s0, eth0.100)".into());
+    }
+    if seg.subnet_cidr.trim().is_empty() {
+        return Err("Subnet (CIDR) is required, e.g. 192.168.10.0/24".into());
+    }
+    if seg.router_ip.trim().is_empty() {
+        return Err("Router IP is required".into());
+    }
+    if seg.dhcp.enabled {
+        if seg.dhcp.pool_start.trim().is_empty() || seg.dhcp.pool_end.trim().is_empty() {
+            return Err("DHCP pool start and end are required when DHCP is enabled".into());
+        }
+    }
     check("name", &seg.name)?;
     check("interface", &seg.interface)?;
     check("subnet_cidr", &seg.subnet_cidr)?;
     check("router_ip", &seg.router_ip)?;
-    check("dhcp.pool_start", &seg.dhcp.pool_start)?;
-    check("dhcp.pool_end", &seg.dhcp.pool_end)?;
-    check("dhcp.lease_time", &seg.dhcp.lease_time)?;
+    // Newline checks on DHCP-specific fields only matter when DHCP is
+    // enabled — they'll otherwise be written into the dnsmasq config.
+    if seg.dhcp.enabled {
+        check("dhcp.pool_start", &seg.dhcp.pool_start)?;
+        check("dhcp.pool_end", &seg.dhcp.pool_end)?;
+        check("dhcp.lease_time", &seg.dhcp.lease_time)?;
+    }
     for (i, r) in seg.dhcp.reservations.iter().enumerate() {
         check(&format!("reservations[{}].mac", i), &r.mac)?;
         check(&format!("reservations[{}].ip", i), &r.ip)?;
