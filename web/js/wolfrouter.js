@@ -929,7 +929,8 @@
         const cloudGap = 30;
         const railW = 22;          // vertical rail width on each side
         const rackInnerPad = 8;    // gap between rail and appliance
-        const baseUnitH = 96;      // 2U baseline appliance height
+        const baseUnitH = 116;     // 2U baseline — taller now to fit
+                                   // the bigger port labels + IP line
         const oneUH = 22;          // each "rack unit" of growth = one device row
         const unitGap = 24;
         const deviceRowH = 22;     // pixel pitch for each device badge
@@ -1103,12 +1104,15 @@
                 <text x="${statsX+80}" y="${uy+24}" text-anchor="end" style="fill:#fde68a; font-size:11px; font-weight:700; font-family:monospace;">${Math.max(2, Math.round(uh / 44))}U</text>
             `);
 
-            // Ports — laid out in a single row across the middle of the chassis
+            // Ports — bigger jacks, left-aligned starting at the brand
+            // panel edge so layout is consistent across nodes. Each
+            // port shows iface name AND its IP address(es) underneath
+            // so the user can read what's what at a glance.
             portsByNode[node.node_id] = [];
-            const jackW = 28, jackH = 22, jackGap = 6;
+            const jackW = 44, jackH = 32, jackGap = 12;
             const maxPorts = Math.min(node.interfaces.length, Math.floor((portsZoneW + jackGap) / (jackW + jackGap)));
-            const startPx = portsZoneX + (portsZoneW - (maxPorts*(jackW+jackGap) - jackGap)) / 2;
-            const portsCY = uy + uh/2 + 2;
+            const startPx = portsZoneX;  // left-align (was centered)
+            const portsCY = uy + uh/2 - 2;
 
             node.interfaces.slice(0, maxPorts).forEach((port, idx) => {
                 const px = startPx + idx * (jackW + jackGap);
@@ -1121,28 +1125,34 @@
                     : '#475569';
                 const linkLed = port.link_up ? 'url(#wr-led-green)' : 'url(#wr-led-off)';
                 const actLed = (port.rx_bps + port.tx_bps) > 0 ? 'url(#wr-led-amber)' : 'url(#wr-led-off)';
+                // First IPv4 address for inline display under the port
+                const ipv4 = (port.addresses || []).find(a => a.includes('.') && !a.startsWith('fe80'));
+                const ipDisplay = ipv4 ? ipv4.split('/')[0] : '';
                 // RJ45 jack: trapezoidal shape with 8 contact pins inside.
-                const jackPath = `M ${px+2},${py+jackH-2}
-                                  L ${px+2},${py+5}
-                                  L ${px+5},${py+2}
-                                  L ${px+jackW-5},${py+2}
-                                  L ${px+jackW-2},${py+5}
-                                  L ${px+jackW-2},${py+jackH-2} Z`;
+                const jackPath = `M ${px+3},${py+jackH-3}
+                                  L ${px+3},${py+8}
+                                  L ${px+8},${py+3}
+                                  L ${px+jackW-8},${py+3}
+                                  L ${px+jackW-3},${py+8}
+                                  L ${px+jackW-3},${py+jackH-3} Z`;
                 chassis.insertAdjacentHTML('beforeend', `
                     <g class="wr-port" data-node="${escHtml(node.node_id)}" data-iface="${escHtml(port.name)}">
                         <!-- LEDs above the jack: link (left) + activity (right) -->
-                        <circle cx="${px+8}" cy="${py-3}" r="2" fill="${linkLed}"/>
-                        <circle cx="${px+jackW-8}" cy="${py-3}" r="2" fill="${actLed}"
+                        <circle cx="${px+10}" cy="${py-4}" r="2.5" fill="${linkLed}"/>
+                        <circle cx="${px+jackW-10}" cy="${py-4}" r="2.5" fill="${actLed}"
                                 ${(port.rx_bps + port.tx_bps) > 0 ? 'filter="url(#wr-glow)"' : ''}/>
                         <!-- The jack itself -->
-                        <path d="${jackPath}" fill="url(#wr-jack)" stroke="#000" stroke-width="0.6"/>
+                        <path d="${jackPath}" fill="url(#wr-jack)" stroke="#000" stroke-width="0.8"/>
                         <!-- 8 contact pins -->
                         ${Array.from({length: 8}).map((_,j) =>
-                            `<line x1="${px+5+j*((jackW-10)/7)}" y1="${py+5}" x2="${px+5+j*((jackW-10)/7)}" y2="${py+jackH-4}" stroke="#fbbf24" stroke-width="0.6" opacity="${port.link_up ? 0.7 : 0.25}"/>`
+                            `<line x1="${px+8+j*((jackW-16)/7)}" y1="${py+8}" x2="${px+8+j*((jackW-16)/7)}" y2="${py+jackH-5}" stroke="#fbbf24" stroke-width="0.8" opacity="${port.link_up ? 0.75 : 0.25}"/>`
                         ).join('')}
-                        <!-- Iface name below -->
-                        <text x="${px+jackW/2}" y="${py+jackH+10}" text-anchor="middle"
-                              style="fill:#cbd5e1; font-size:8px; font-family:monospace;">${escHtml(port.name.slice(0,8))}</text>
+                        <!-- Iface name below (bigger, readable) -->
+                        <text x="${px+jackW/2}" y="${py+jackH+12}" text-anchor="middle"
+                              style="fill:#f1f5f9; font-size:11px; font-weight:600; font-family:monospace;">${escHtml(port.name.slice(0,10))}</text>
+                        <!-- IP address (if assigned) -->
+                        ${ipDisplay ? `<text x="${px+jackW/2}" y="${py+jackH+24}" text-anchor="middle"
+                              style="fill:#94a3b8; font-size:10px; font-family:monospace;">${escHtml(ipDisplay)}</text>` : ''}
                         <!-- Live BPS above LEDs (only if actively flowing) -->
                         ${(port.rx_bps + port.tx_bps) > 0
                             ? `<text x="${px+jackW/2}" y="${py-9}" text-anchor="middle" style="fill:#fde68a; font-size:8px; font-family:monospace;">${fmtBpsShort(port.rx_bps + port.tx_bps)}</text>`
@@ -1152,7 +1162,8 @@
                 `);
                 portsByNode[node.node_id].push({
                     name: port.name, cx: px + jackW/2, cy: py + jackH/2,
-                    portTop: py - 5, portBottom: py + jackH + 4,
+                    portTop: py - 8, portBottom: py + jackH + 4,
+                    chassisTop: uy,
                     role: port.role, link_up: port.link_up,
                     bps: port.rx_bps + port.tx_bps, color: cableColor,
                 });
@@ -1182,43 +1193,40 @@
                 const ny = rackY + nodeYs[n] + nodeHeights[n]/2;
                 const nx = apX + apW - 100;  // right edge of the stats panel
                 svg.insertAdjacentHTML('beforeend', `
-                    <path d="M ${nx},${ny} C ${nx+30},${ny} ${wolfnetSpineX-20},${ny} ${wolfnetSpineX},${ny}"
-                          fill="none" stroke="#22c55e" stroke-width="3" stroke-linecap="round" opacity="0.7"/>
+                    <path d="M ${nx},${ny} H ${wolfnetSpineX}"
+                          fill="none" stroke="#22c55e" stroke-width="3" stroke-linecap="square" opacity="0.7"/>
                     <circle cx="${wolfnetSpineX}" cy="${ny}" r="4" fill="#22c55e" opacity="0.9"/>
                 `);
             }
         }
 
-        // WAN ports → cloud (route up).
+        // WAN ports → cloud, Manhattan routing.
+        // Each cable exits straight UP from the port, clears the top of
+        // its chassis, then runs horizontally to the cloud column, then
+        // straight up to the cloud bottom. Right-angle bends instead of
+        // bezier curves so cables never drift over neighbouring ports
+        // or labels.
         const cables = [];
+        // Stagger the horizontal "rail" each WAN cable rides so multiple
+        // WAN ports don't sit on top of each other on the way up.
+        let wanRailIdx = 0;
         for (const node of topo.nodes) {
             for (const port of (portsByNode[node.node_id] || [])) {
                 if (port.role === 'wan' && port.link_up) {
-                    const x1 = port.cx, y1 = port.portTop;
-                    const x2 = cloudCX, y2 = cloudCY + 30;
-                    // Route around the rack to the side, up to cloud
-                    const cy1 = y1 - 20;
-                    const cy2 = (y1 + y2) / 2;
-                    const path = `M ${x1},${y1}
-                                  C ${x1},${cy1} ${x2},${cy2} ${x2},${y2}`;
+                    const x1 = port.cx;
+                    const y1 = port.portTop;
+                    const chassisTop = port.chassisTop ?? (port.portTop - 30);
+                    const railY = chassisTop - 14 - (wanRailIdx * 6);
+                    const x2 = cloudCX;
+                    const y2 = cloudCY + 30;
+                    const path = `M ${x1},${y1} V ${railY} H ${x2} V ${y2}`;
                     cables.push({ path, color: port.color, bps: port.bps, kind: 'wan' });
+                    wanRailIdx++;
                 }
             }
         }
-
-        // LAN / WolfNet / Mgmt ports — render a small downward "patch
-        // tail" stub from each port so the user sees these are wired,
-        // even though the actual device-side cable is drawn separately
-        // from the node anchor over to its devices.
-        for (const node of topo.nodes) {
-            for (const port of (portsByNode[node.node_id] || [])) {
-                if (!port.link_up) continue;
-                if (port.role === 'wan') continue;
-                const x1 = port.cx, y1 = port.portBottom;
-                const path = `M ${x1},${y1} l 0,12`;
-                cables.push({ path, color: port.color, bps: port.bps, kind: port.role });
-            }
-        }
+        // (No more port "patch tails" — they overlapped the iface name
+        // and IP address text underneath the jacks.)
 
         // Render cables behind the chassis but above the rack panel —
         // we already drew the rack/appliances first, so cables now go on
@@ -1264,9 +1272,12 @@
                 const icon = isVm ? '🖥' : '📦';
                 const dy = startY + i * deviceRowH;
                 const cableColor = accent;
+                // Manhattan H-V-H: out the chassis right, down/up to
+                // the device row, into the device left edge.
+                const midX = anchorX + 18;
                 svg.insertAdjacentHTML('beforeend', `
-                    <path d="M ${anchorX},${anchorY} C ${anchorX+20},${anchorY} ${colX-15},${dy+10} ${colX},${dy+10}"
-                          fill="none" stroke="${cableColor}" stroke-width="2" stroke-linecap="round" opacity="0.55"
+                    <path d="M ${anchorX},${anchorY} H ${midX} V ${dy+10} H ${colX}"
+                          fill="none" stroke="${cableColor}" stroke-width="2" stroke-linecap="square" opacity="0.55"
                           ${i % 2 === 0 ? 'stroke-dasharray="6 4" class="wr-wire-active"' : ''}/>
                     <g>
                         <rect x="${colX}" y="${dy}" width="170" height="20" rx="5"
@@ -1287,11 +1298,12 @@
                     const yi = rackY + nodeYs[i] + nodeHeights[i]/2;
                     const yj = rackY + nodeYs[j] + nodeHeights[j]/2;
                     const xLeft = apX + 8;
-                    // Curve to the left of the rack so it's visible
-                    const ctrlX = xLeft - 80;
+                    // Manhattan C-shape to the left of the rack: out,
+                    // along, back. Right-angle bends, no curves.
+                    const railX = xLeft - 30 - ((i + j) % 3) * 8;
                     svg.insertAdjacentHTML('beforeend', `
-                        <path d="M ${xLeft},${yi} C ${ctrlX},${yi} ${ctrlX},${yj} ${xLeft},${yj}"
-                              fill="none" stroke="#22c55e" stroke-width="2.5" stroke-linecap="round"
+                        <path d="M ${xLeft},${yi} H ${railX} V ${yj} H ${xLeft}"
+                              fill="none" stroke="#22c55e" stroke-width="2.5" stroke-linecap="square"
                               opacity="0.5" stroke-dasharray="8 5" class="wr-wire-active"/>
                     `);
                 }

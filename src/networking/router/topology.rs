@@ -36,6 +36,32 @@ pub struct NodeTopology {
     pub containers: Vec<DeviceAttachment>,
     /// IDs of LAN segments hosted by this node.
     pub lan_segments: Vec<String>,
+    /// "live" = full topology fetched; "connecting" = retrying;
+    /// "unreachable" = retries exhausted. The frontend draws the
+    /// chassis immediately for every node in the cluster and fills
+    /// it in when the live data arrives.
+    #[serde(default = "default_topology_status")]
+    pub status: String,
+    /// Reason for non-live status (e.g. "connecting…", last error).
+    #[serde(default)]
+    pub status_note: String,
+}
+
+fn default_topology_status() -> String { "live".into() }
+
+impl NodeTopology {
+    /// Skeleton entry for a peer we haven't fetched (or couldn't
+    /// fetch). The rack view renders this as a chassis with a status
+    /// message until the real data arrives on a subsequent poll.
+    pub fn stub(node_id: String, node_name: String, status: &str, note: String) -> Self {
+        NodeTopology {
+            node_id, node_name,
+            interfaces: vec![], bridges: vec![], vlans: vec![],
+            vms: vec![], containers: vec![], lan_segments: vec![],
+            status: status.into(),
+            status_note: note,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,6 +274,8 @@ pub fn compute_local(
         vms,
         containers,
         lan_segments,
+        status: "live".into(),
+        status_note: String::new(),
     }
 }
 

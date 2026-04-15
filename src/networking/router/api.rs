@@ -223,13 +223,11 @@ pub async fn get_topology(
     if let Ok(client) = client {
         let mut futures = Vec::new();
         for node in cluster_nodes {
-            if node.is_self || node.id == self_id {
-                peer_diagnostics.push(serde_json::json!({
-                    "node_id": node.id, "hostname": node.hostname,
-                    "result": "skipped", "reason": "is_self"
-                }));
-                continue;
-            }
+            // Self isn't a "peer" — it's already in the result as the
+            // local node. Don't include it in diagnostics or the user
+            // sees confusing "wolf: is_self" lines in the missing-peers
+            // banner.
+            if node.is_self || node.id == self_id { continue; }
             if node.node_type != "wolfstack" {
                 peer_diagnostics.push(serde_json::json!({
                     "node_id": node.id, "hostname": node.hostname,
@@ -254,45 +252,54 @@ pub async fn get_topology(
                     }
                 }
             }
-            if !node.online {
-                peer_diagnostics.push(serde_json::json!({
-                    "node_id": node.id, "hostname": node.hostname,
-                    "result": "skipped",
-                    "reason": format!("offline (last_seen={})", node.last_seen)
-                }));
-                continue;
-            }
-
+            // We deliberately do NOT skip "offline" peers: last_seen
+            // can be stale (polling hiccup, recent restart) but the
+            // peer is reachable. WolfRouter retries up to 5 times with
+            // exponential backoff per peer; if every attempt fails the
+            // node still appears as a stub chassis so the user sees it
+            // exists. Subsequent 3s polls fill it in once the peer
+            // answers.
             let host = node.address.clone();
             let port = node.port;
             let id = node.id.clone();
             let hostname = node.hostname.clone();
+            let stub_name = if hostname.is_empty() { id.clone() } else { hostname.clone() };
             let secret_h = secret.clone();
             let client_c = client.clone();
             futures.push(async move {
-                // Try HTTPS first (WolfStack default), fall back to HTTP
-                // for nodes that don't have TLS enabled.
                 let urls = [
                     format!("https://{}:{}/api/router/topology-local", host, port),
                     format!("http://{}:{}/api/router/topology-local",  host, port),
                 ];
                 let mut last_err = String::new();
-                for url in &urls {
-                    match client_c.get(url)
-                        .header("X-WolfStack-Secret", &secret_h)
-                        .send().await
-                    {
-                        Ok(r) if r.status().is_success() => {
-                            return match r.json::<topology::NodeTopology>().await {
-                                Ok(t) => Ok(t),
-                                Err(e) => Err((id.clone(), hostname.clone(), format!("decode error: {}", e))),
-                            };
+                let mut backoff_ms = 100u64;
+                for attempt in 1..=5 {
+                    for url in &urls {
+                        match client_c.get(url)
+                            .header("X-WolfStack-Secret", &secret_h)
+                            .send().await
+                        {
+                            Ok(r) if r.status().is_success() => {
+                                return match r.json::<topology::NodeTopology>().await {
+                                    Ok(mut t) => {
+                                        t.status = "live".into();
+                                        t.status_note = String::new();
+                                        Ok(t)
+                                    }
+                                    Err(e) => Err((id.clone(), stub_name.clone(),
+                                        format!("decode error after {} attempt(s): {}", attempt, e))),
+                                };
+                            }
+                            Ok(r) => { last_err = format!("HTTP {} from {}", r.status(), url); }
+                            Err(e) => { last_err = format!("{} ({})", e, url); }
                         }
-                        Ok(r) => { last_err = format!("HTTP {} from {}", r.status(), url); }
-                        Err(e) => { last_err = format!("{} ({})", e, url); }
+                    }
+                    if attempt < 5 {
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(1500);
                     }
                 }
-                Err((id, hostname, last_err))
+                Err((id, stub_name, format!("5 attempts failed — last error: {}", last_err)))
             });
         }
         let results = futures::future::join_all(futures).await;
@@ -307,9 +314,15 @@ pub async fn get_topology(
                 }
                 Err((id, hostname, reason)) => {
                     peer_diagnostics.push(serde_json::json!({
-                        "node_id": id, "hostname": hostname,
-                        "result": "failed", "reason": reason
+                        "node_id": id.clone(), "hostname": hostname.clone(),
+                        "result": "failed", "reason": reason.clone()
                     }));
+                    // Emit a stub so the rack still draws a chassis for
+                    // this peer; the next poll will overwrite it with
+                    // live data once the peer responds.
+                    nodes.push(topology::NodeTopology::stub(
+                        id, hostname, "unreachable", reason,
+                    ));
                 }
             }
         }
