@@ -1462,6 +1462,93 @@ fn remap_volume(vol: &str, storage_base: &str) -> String {
     }
 }
 
+/// Prefix a Docker named volume with the container name so two
+/// independent installs of the same app (say, two Frigates) don't
+/// share the same volume at the daemon's global namespace. Bind
+/// mounts and anonymous volumes pass through untouched. Used only
+/// when the install has no custom storage path — with a storage path,
+/// remap_volume already isolates by putting the bind mount under
+/// `<base>/appstore/<container_name>/`.
+fn prefix_named_volume(vol: &str, container_name: &str) -> String {
+    if let Some(colon_pos) = vol.find(':') {
+        let host_part = &vol[..colon_pos];
+        let rest = &vol[colon_pos..];
+        if host_part.starts_with('/') || host_part.starts_with('.') {
+            vol.to_string()
+        } else {
+            format!("{}_{}{}", container_name, host_part, rest)
+        }
+    } else {
+        vol.to_string()
+    }
+}
+
+/// Shell helper injected once per generated install script. Picks the
+/// next free TCP/UDP host port starting at the requested base by
+/// checking kernel listeners via `ss` and existing Docker-bound ports
+/// via `docker ps`, plus an in-script allocation set so two ports in
+/// the same manifest don't get assigned the same remap.
+const PORT_HELPER_SH: &str = r#"# ─── WolfStack app-store port collision helper ───
+__WS_ALLOCATED_PORTS=""
+__ws_find_free_port() {
+    local port="$1"
+    local proto="${2:-tcp}"
+    local ss_flag="-tnlH"
+    [ "$proto" = "udp" ] && ss_flag="-unlH"
+    local limit=$((port + 200))
+    while [ "$port" -lt "$limit" ] && [ "$port" -lt 65535 ]; do
+        case " $__WS_ALLOCATED_PORTS " in *" $proto:$port "*) port=$((port+1)); continue ;; esac
+        if ss $ss_flag 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$port$"; then
+            port=$((port+1)); continue
+        fi
+        if docker ps --format '{{.Ports}}' 2>/dev/null | grep -qE ":$port->"; then
+            port=$((port+1)); continue
+        fi
+        __WS_ALLOCATED_PORTS="$__WS_ALLOCATED_PORTS $proto:$port"
+        echo "$port"; return
+    done
+    echo "$1"
+}
+"#;
+
+/// For one docker port spec, emit the shell that resolves a free host
+/// port into `$__PORT_<idx>` and return the `-p …` flag that uses it.
+/// Specs we don't know how to remap safely (IP-bound, ranges, no host
+/// side) come back untouched via shell_escape.
+fn emit_port_flag(script: &mut String, spec: &str, counter: &mut usize) -> String {
+    let (core, proto_suffix) = match spec.rsplit_once('/') {
+        Some((c, p)) if p == "tcp" || p == "udp" => (c, p),
+        _ => (spec, ""),
+    };
+    let parts: Vec<&str> = core.split(':').collect();
+    let (host_str, container_str) = match parts.as_slice() {
+        [h, c] => (*h, *c),
+        _ => return format!(" -p {}", shell_escape(spec)),
+    };
+    if host_str.is_empty() || container_str.is_empty()
+        || host_str.contains('-') || container_str.contains('-')
+        || host_str.parse::<u16>().is_err()
+        || container_str.parse::<u16>().is_err()
+    {
+        return format!(" -p {}", shell_escape(spec));
+    }
+    let proto = if proto_suffix.is_empty() { "tcp" } else { proto_suffix };
+    let idx = *counter;
+    *counter += 1;
+    script.push_str(&format!(
+        "__PORT_{idx}=$(__ws_find_free_port {host} {proto})\n",
+        idx = idx, host = host_str, proto = proto,
+    ));
+    script.push_str(&format!(
+        "[ \"$__PORT_{idx}\" != \"{host}\" ] && echo -e \"  \\033[0;33m⚠ {proto_up} port {host} busy — using $__PORT_{idx}\\033[0m\"\n",
+        idx = idx, host = host_str, proto_up = proto.to_ascii_uppercase(),
+    ));
+    let suffix = if proto_suffix.is_empty() { String::new() } else { format!("/{}", proto_suffix) };
+    // Intentionally NOT shell_escape'd — we built every character and
+    // need `${__PORT_N}` expanded by bash at run-time.
+    format!(" -p ${{__PORT_{}}}:{}{}", idx, container_str, suffix)
+}
+
 /// Prepare an install script for live terminal execution.
 /// Returns (session_id, script_path) on success.
 pub fn prepare_install(
@@ -1518,6 +1605,12 @@ pub fn prepare_install(
                 app.name
             ));
 
+            // Shell-side helper for port collision checking. Declared
+            // once up-front so every port flag that follows (main
+            // container + sidecars) shares an allocation set.
+            script.push_str(PORT_HELPER_SH);
+            script.push('\n');
+
             // Create storage directory if using custom storage
             if let Some(ref base) = vol_base {
                 script.push_str(&format!("mkdir -p {}\n", shell_escape(base)));
@@ -1526,6 +1619,8 @@ pub fn prepare_install(
                     base
                 ));
             }
+
+            let mut port_counter: usize = 0;
 
             // Sidecars first
             for sidecar in &docker.sidecars {
@@ -1543,15 +1638,28 @@ pub fn prepare_install(
                     sidecar_name
                 ));
 
+                // Resolve port flags BEFORE appending the docker create
+                // line so the `__PORT_N=…` assignments appear first.
+                let port_flags: Vec<String> = sidecar.ports.iter()
+                    .map(|p| emit_port_flag(&mut script, p, &mut port_counter))
+                    .collect();
+
                 let mut create_args = format!("docker create --name {} -it --restart unless-stopped", shell_escape(&sidecar_name));
-                for p in &sidecar.ports {
-                    create_args.push_str(&format!(" -p {}", shell_escape(p)));
+                for flag in &port_flags {
+                    create_args.push_str(flag);
                 }
                 for e in &env {
                     create_args.push_str(&format!(" -e {}", shell_escape(e)));
                 }
                 for v in &sidecar.volumes {
-                    let vol = if let Some(ref base) = vol_base { remap_volume(v, base) } else { v.clone() };
+                    // With vol_base: remap to a per-container bind
+                    // mount. Without: prefix the named volume with the
+                    // MAIN container name (not the sidecar suffix) so a
+                    // DB sidecar and its app share the same data vol.
+                    let vol = match vol_base.as_deref() {
+                        Some(base) => remap_volume(v, base),
+                        None => prefix_named_volume(v, container_name),
+                    };
                     create_args.push_str(&format!(" -v {}", shell_escape(&vol)));
                 }
                 create_args.push_str(&format!(" {}", shell_escape(&sidecar.image)));
@@ -1596,12 +1704,16 @@ pub fn prepare_install(
                     let rel = seed.container_path.strip_prefix(&format!("{}/", mount))
                         .unwrap_or("");
                     if rel.is_empty() { continue; }
-                    // Resolve named vol vs bind-mount path.
+                    // Resolve named vol vs bind-mount path. With a
+                    // custom storage path, the vol is a host directory
+                    // under <base>/<vol_name>. Without, it's a Docker
+                    // named volume — prefixed with container_name to
+                    // keep two installs of the same app isolated.
                     let resolved_vol = if let Some(ref base) = vol_base {
                         remap_volume(&format!("{}:{}", vol_name, mount), base)
                             .split(':').next().unwrap_or(vol_name).to_string()
                     } else {
-                        vol_name.to_string()
+                        format!("{}_{}", container_name, vol_name)
                     };
                     // Ensure the named volume exists up-front (a bind-
                     // mount dir gets auto-created by `docker run -v`).
@@ -1633,6 +1745,13 @@ pub fn prepare_install(
             ));
 
             let env = substitute_inputs(&docker.env, user_inputs);
+            // Resolve main-container port flags first so their
+            // `__PORT_N=…` assignments get written to the script
+            // ahead of the `docker create` line below.
+            let main_port_flags: Vec<String> = docker.ports.iter()
+                .map(|p| emit_port_flag(&mut script, p, &mut port_counter))
+                .collect();
+
             let mut create_args = format!("docker create --name {} -it --restart unless-stopped", shell_escape(container_name));
             // Resource limits (validated: memory must be digits+unit, cpu must be a number)
             if let Some(mem) = memory_limit {
@@ -1655,8 +1774,8 @@ pub fn prepare_install(
                     }
                 }
             }
-            for p in &docker.ports {
-                create_args.push_str(&format!(" -p {}", shell_escape(p)));
+            for flag in &main_port_flags {
+                create_args.push_str(flag);
             }
             for e in &env {
                 create_args.push_str(&format!(" -e {}", shell_escape(e)));
@@ -1675,7 +1794,10 @@ pub fn prepare_install(
                 }
             }
             for v in &docker.volumes {
-                let vol = if let Some(ref base) = vol_base { remap_volume(v, base) } else { v.clone() };
+                let vol = match vol_base.as_deref() {
+                    Some(base) => remap_volume(v, base),
+                    None => prefix_named_volume(v, container_name),
+                };
                 create_args.push_str(&format!(" -v {}", shell_escape(&vol)));
             }
             // Extra user-specified volumes (reject sensitive host paths)
