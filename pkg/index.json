@@ -31,7 +31,7 @@
     "author": "Wolf Software Systems Ltd",
     "icon": "🛡",
     "enterprise_only": false,
-    "download_url": "https://wolfstack.org/pkg/wolfsecure.tar.gz",
+    "download_url": "https://github.com/wolfsoftwaresystemsltd/WolfStack/releases/download/plugins/wolfsecure.tar.gz",
     "category": "security",
     "tags": ["security", "cve", "audit", "compliance", "scanner", "trivy"]
   }
