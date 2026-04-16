@@ -391,18 +391,32 @@ const MINER_PROCS: &[&str] = &[
 ];
 
 fn scan_crypto_miners(out: &mut Vec<DependencyCheck>) {
-    // pgrep -af <name> returns PID + full cmdline so operators can
-    // see WHERE it's running (container? systemd unit?) in the detail.
+    // Read /proc/*/comm directly instead of spawning pgrep per miner
+    // name. One walk of /proc, one read() per PID — no subprocess
+    // forks. On a busy host this is ~50× cheaper than the 17-pgrep
+    // loop the first cut used, which is the difference between the
+    // security scan being a background hum and being a noticeable
+    // blip in top.
     let mut hits: Vec<(String, String)> = Vec::new();
-    for proc in MINER_PROCS {
-        if let Ok(o) = Command::new("pgrep").args(["-af", proc]).output() {
-            if o.status.success() && !o.stdout.is_empty() {
-                let text = String::from_utf8_lossy(&o.stdout);
-                for line in text.lines() {
-                    hits.push(((*proc).into(), line.trim().to_string()));
-                }
-            }
-        }
+    let proc_entries = match std::fs::read_dir("/proc") { Ok(e) => e, Err(_) => return };
+    for entry in proc_entries.flatten() {
+        let name = entry.file_name();
+        let name_s = name.to_string_lossy();
+        // Only directories whose name is entirely digits are PIDs.
+        if !name_s.chars().all(|c| c.is_ascii_digit()) { continue; }
+        let comm_path = entry.path().join("comm");
+        let comm = match std::fs::read_to_string(&comm_path) {
+            Ok(s) => s.trim().to_string(), Err(_) => continue,
+        };
+        // comm is truncated to 15 chars in the kernel (TASK_COMM_LEN).
+        // Our miner list names are all <=15 chars so equality works.
+        if !MINER_PROCS.contains(&comm.as_str()) { continue; }
+        // Pull the full cmdline for context (argv0\0argv1\0...).
+        let cmdline = std::fs::read_to_string(entry.path().join("cmdline"))
+            .unwrap_or_default()
+            .replace('\0', " ").trim().to_string();
+        let pid = name_s.to_string();
+        hits.push((comm, format!("PID {}  {}", pid, if cmdline.is_empty() { "(no cmdline)".to_string() } else { cmdline })));
     }
     if hits.is_empty() { return; }
     let detail = hits.iter()

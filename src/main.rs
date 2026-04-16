@@ -354,11 +354,19 @@ async fn main() -> std::io::Result<()> {
         crate::networking::router::spawn_rollback_watcher(app_state.router.clone());
 
         // Security scanner background loop — runs posture + active-attack
-        // checks every 5 minutes and fires alerts via Discord/Slack/Telegram/
+        // checks on a timer and fires alerts via Discord/Slack/Telegram/
         // email when a critical-severity finding appears (SSH brute-force,
         // crypto miner, world-readable cluster_secret, etc). Cooldown keeps
-        // the same finding from spamming channels — one alert per unique
-        // finding id per hour is plenty.
+        // the same finding from spamming channels.
+        //
+        // Interval is 15 minutes — a compromise between detection latency
+        // (you want to find out about a crypto miner within the hour, not
+        // tomorrow) and cluster cost (each node runs its own scan, and
+        // some checks like journalctl can take 100ms–2s on a busy host).
+        // At 15 min the duty cycle is well under 1% per node; active
+        // attacks that started in the last 5 minutes still get caught on
+        // the next tick. If operators want tighter detection, the
+        // on-demand scan via /api/system-check runs the exact same code.
         tokio::spawn(async move {
             // Startup delay so the first scan happens after cluster discovery
             // settles — avoids noisy "scanner errored" at boot.
@@ -416,7 +424,7 @@ async fn main() -> std::io::Result<()> {
                 let now = std::time::Instant::now();
                 recent_alerts.retain(|_, t| now.duration_since(*t) < prune_cutoff);
 
-                tokio::time::sleep(std::time::Duration::from_secs(5 * 60)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(15 * 60)).await;
             }
         });
 
