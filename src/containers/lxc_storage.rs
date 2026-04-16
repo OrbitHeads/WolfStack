@@ -228,11 +228,31 @@ pub fn migrate(name: &str, target_storage: &str, remove_source: bool) -> Result<
             }
         }
     }
-    if !super::lxc_storage_paths().iter().any(|p| p == target_storage) {
-        return Err(format!("target '{}' is not a registered LXC storage path", target_storage));
-    }
     if target_storage == info.storage {
         return Err("source and target storage paths are the same".into());
+    }
+    // The target came from the user picking an option we built out of
+    // /api/storage/list (each mounted filesystem + "/lxc"), so it's a
+    // legitimate destination even if it isn't in the registered-paths
+    // registry yet. Refusing unregistered paths forced the user to
+    // visit Settings → LXC storage paths and add /wolfpool/lxc by
+    // hand before every migrate, which defeats the point of the
+    // dropdown. Auto-register once we've verified the parent mount
+    // exists — the post-migrate scanner then finds the container in
+    // its new home.
+    let parent = std::path::Path::new(target_storage)
+        .parent()
+        .map(|p| p.to_path_buf());
+    if let Some(p) = &parent {
+        if !p.exists() {
+            return Err(format!(
+                "target parent '{}' does not exist — mount the filesystem first",
+                p.display()
+            ));
+        }
+    }
+    if !super::lxc_storage_paths().iter().any(|p| p == target_storage) {
+        super::lxc_register_path(target_storage);
     }
 
     let src_dir = format!("{}/{}", info.storage, name);
