@@ -5848,10 +5848,30 @@
 
                     <div id="wr-tab-policy" class="wr-tab-panel" style="padding:16px; display:none;">
                         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-wrap:wrap; gap:8px;">
-                            <div style="font-size:12px; color:var(--text-muted); max-width:720px;">
-                                Live view of what your firewall actually permits. Every node is a zone, LAN, VM, or container. Every line is a rule or port-forward. <strong>Drag from one node to another to create a rule between them.</strong> Click a node to trace its connections. Click a line to edit or delete it.
-                            </div>
                             <div id="wr-policy-legend" style="display:flex; gap:10px; font-size:10px; flex-wrap:wrap;"></div>
+                            <div style="display:flex; gap:4px; margin-left:auto;">
+                                <button id="wr-policy-help-btn" onclick="document.getElementById('wr-policy-help-modal').style.display='flex';" title="Help" style="background:var(--bg-input); border:1px solid var(--border); color:var(--text); padding:4px 10px; border-radius:4px; cursor:pointer; font-size:12px;">? Help</button>
+                                <button id="wr-policy-fullscreen-btn" onclick="wrToggleFullscreen()" title="Fullscreen" style="background:var(--bg-input); border:1px solid var(--border); color:var(--text); padding:4px 10px; border-radius:4px; cursor:pointer; font-size:12px;">⛶ Fullscreen</button>
+                            </div>
+                        </div>
+                        <!-- Help modal — appears over the policy canvas -->
+                        <div id="wr-policy-help-modal" onclick="if(event.target===this)this.style.display='none'" style="display:none; position:fixed; inset:0; z-index:9999; background:rgba(0,0,0,0.6); justify-content:center; align-items:center;">
+                            <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:12px; padding:24px 28px; max-width:540px; width:90%; box-shadow:0 12px 40px rgba(0,0,0,0.5); color:var(--text); font-size:13px; line-height:1.7;">
+                                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                                    <h3 style="margin:0; font-size:16px; font-weight:700;">Policy Map — Help</h3>
+                                    <button onclick="document.getElementById('wr-policy-help-modal').style.display='none'" style="background:none; border:none; color:var(--text-muted); font-size:20px; cursor:pointer; padding:0 4px;">&times;</button>
+                                </div>
+                                <p>Live view of what your firewall actually permits. Every node is a zone, LAN, VM, or container. Every line is a rule or port-forward.</p>
+                                <ul style="padding-left:18px; margin:8px 0;">
+                                    <li><strong>Drag node → node</strong> — create a rule between them</li>
+                                    <li><strong>Click a node</strong> — trace its connections (everything else dims)</li>
+                                    <li><strong>Click a line</strong> — edit or delete the rule</li>
+                                    <li><strong>Drag empty space</strong> — pan the map</li>
+                                    <li><strong>Ctrl + scroll</strong> — zoom in/out</li>
+                                    <li><strong>Red/amber glow</strong> — something needs attention (hover for details)</li>
+                                </ul>
+                                <p style="color:var(--text-muted); font-size:11px; margin-bottom:0;">Close this with Escape, click outside, or the × button.</p>
+                            </div>
                         </div>
                         <!-- Filter toolbar — action-type toggles + text search. Lets users
                              declutter dense graphs fast. -->

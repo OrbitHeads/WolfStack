@@ -2089,8 +2089,7 @@
             const sw = (c, l) => `<div style="display:flex; align-items:center; gap:4px;"><span style="display:inline-block; width:14px; height:3px; background:${c}; border-radius:2px;"></span>${l}</div>`;
             legend.innerHTML = [
                 sw('#22c55e', 'allow'), sw('#ef4444', 'deny'), sw('#f97316', 'reject'),
-                sw('#60a5fa', 'log'),   sw('#a855f7', 'DNAT'),
-                `<span style="color:var(--text-muted);">· drag between nodes to add a rule · click a node to trace · click a line to edit</span>`,
+                sw('#60a5fa', 'log'),   sw('#a855f7', 'DNAT'), sw('#64748b', 'implicit'),
             ].join('');
         }
 
@@ -2120,24 +2119,45 @@
             };
         };
 
+        // Pan state — dragging on empty space scrolls the canvas wrap
+        // instead of creating a rule.
+        let panning = false;
+        let panStart = { x: 0, y: 0 };
+        let panScrollStart = { x: 0, y: 0 };
+        const wrap = document.getElementById('wr-policy-canvas-wrap');
+
         svg.addEventListener('mousedown', (evt) => {
             const nodeEl = evt.target.closest('[data-node]');
-            if (!nodeEl) return;
-            dragFrom = nodeEl.dataset.node;
-            const p = layout.get(dragFrom);
-            if (!p) return;
-            dragStart = { x: p.x, y: p.y };
-            dragMoved = false;
-            // Source ring: always visible on mousedown. Becomes the
-            // "you're dragging FROM here" hint.
-            sourceRing.setAttribute('cx', p.x);
-            sourceRing.setAttribute('cy', p.y);
-            sourceRing.style.display = 'block';
-            ghost.setAttribute('d', `M ${p.x},${p.y} L ${p.x},${p.y}`);
+            if (nodeEl) {
+                // Node drag — create rule.
+                dragFrom = nodeEl.dataset.node;
+                const p = layout.get(dragFrom);
+                if (!p) return;
+                dragStart = { x: p.x, y: p.y };
+                dragMoved = false;
+                sourceRing.setAttribute('cx', p.x);
+                sourceRing.setAttribute('cy', p.y);
+                sourceRing.style.display = 'block';
+                ghost.setAttribute('d', `M ${p.x},${p.y} L ${p.x},${p.y}`);
+                evt.preventDefault();
+                return;
+            }
+            // Edge click is handled on mouseup via .closest('[data-edge]')
+            // — for now start panning.
+            if (evt.target.closest('[data-edge]')) return;
+            panning = true;
+            panStart = { x: evt.clientX, y: evt.clientY };
+            panScrollStart = { x: wrap?.scrollLeft || 0, y: wrap?.scrollTop || 0 };
+            svg.style.cursor = 'grabbing';
             evt.preventDefault();
         });
 
         svg.addEventListener('mousemove', (evt) => {
+            if (panning && wrap) {
+                wrap.scrollLeft = panScrollStart.x - (evt.clientX - panStart.x);
+                wrap.scrollTop  = panScrollStart.y - (evt.clientY - panStart.y);
+                return;
+            }
             if (!dragFrom) return;
             const m = getMousePos(evt);
             const dx = m.x - dragStart.x, dy = m.y - dragStart.y;
@@ -2146,8 +2166,6 @@
                 ghost.style.display = 'block';
             }
             ghost.setAttribute('d', `M ${dragStart.x},${dragStart.y} L ${m.x},${m.y}`);
-            // Drop-target ring: highlight any node we're hovering
-            // that isn't the source itself.
             const overEl = evt.target.closest('[data-node]');
             const overId = overEl?.dataset?.node;
             if (overId && overId !== dragFrom) {
@@ -2171,6 +2189,11 @@
         };
 
         svg.addEventListener('mouseup', (evt) => {
+            if (panning) {
+                panning = false;
+                svg.style.cursor = '';
+                return;
+            }
             if (!dragFrom) return;
             const fromId = dragFrom;
             const wasClick = !dragMoved;
@@ -2516,6 +2539,39 @@
     }
     // Expose for inline onclick handlers.
     window.wrRenderPolicyMap = wrRenderPolicyMap;
+
+    // Fullscreen toggle — requests the Fullscreen API on the policy tab
+    // panel so the whole tab (canvas + toolbar + simulator) fills the
+    // screen. A second click (or Escape) exits fullscreen.
+    window.wrToggleFullscreen = function () {
+        const panel = document.getElementById('wr-tab-policy');
+        if (!panel) return;
+        if (document.fullscreenElement) {
+            document.exitFullscreen().catch(() => {});
+        } else {
+            panel.requestFullscreen().catch(() => {});
+            // Set a bg so the panel isn't transparent over the page.
+            panel.style.background = 'var(--bg-primary, #0a0e1a)';
+        }
+    };
+    // Re-render on fullscreen change so the canvas fills the new size.
+    document.addEventListener('fullscreenchange', () => {
+        const panel = document.getElementById('wr-tab-policy');
+        if (panel && !document.fullscreenElement) {
+            panel.style.background = '';
+        }
+        if (wrState.activeTab === 'policy') wrRenderPolicyMap();
+    });
+    // Escape dismisses the help modal.
+    document.addEventListener('keydown', (evt) => {
+        if (evt.key === 'Escape') {
+            const modal = document.getElementById('wr-policy-help-modal');
+            if (modal && modal.style.display !== 'none') {
+                modal.style.display = 'none';
+                evt.stopPropagation();
+            }
+        }
+    });
 
     // Dismiss popover on outside click.
     document.addEventListener('click', (evt) => {
