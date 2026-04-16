@@ -1060,14 +1060,21 @@ fn list_dnsmasq_processes() -> Vec<serde_json::Value> {
 }
 
 /// Lease files from common locations: WolfRouter's own dir, system
-/// dnsmasq, ISC DHCPD, dhcpcd. Each entry includes parsed leases
-/// where the format is recognisable.
+/// dnsmasq, ISC DHCPD (dhclient), dhcpcd. Each returned entry carries
+/// a `format` tag so the frontend knows whether to render the leases
+/// table ("dnsmasq"), the client-lease block list ("dhclient"), or
+/// just the file path ("unknown").
+///
+/// Tagging rather than a single parser matters because dnsmasq and
+/// dhclient use wildly different formats — feeding a dhclient file
+/// through the dnsmasq parser produces garbage columns (date-as-IP,
+/// weekday-number-as-MAC, etc) that's actively misleading.
 fn list_lease_files() -> Vec<serde_json::Value> {
     let candidates = [
         "/var/lib/wolfstack-router",
         "/var/lib/misc",         // system dnsmasq default
         "/var/lib/dnsmasq",
-        "/var/lib/dhcp",         // ISC DHCPD
+        "/var/lib/dhcp",         // ISC DHCPD client + server
         "/run",                   // legacy WolfStack VM TAP DHCP
     ];
     let mut out = Vec::new();
@@ -1078,28 +1085,103 @@ fn list_lease_files() -> Vec<serde_json::Value> {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if !name.ends_with(".leases") && !name.contains("lease") { continue; }
             let path_str = path.to_string_lossy().to_string();
-            // Parse common dnsmasq format: <expires> <mac> <ip> <host> <client-id>
-            let leases: Vec<serde_json::Value> = std::fs::read_to_string(&path)
-                .unwrap_or_default()
-                .lines()
-                .filter_map(|l| {
-                    let parts: Vec<&str> = l.split_whitespace().collect();
-                    if parts.len() < 4 { return None; }
-                    Some(serde_json::json!({
-                        "expires": parts[0],
-                        "mac": parts[1],
-                        "ip": parts[2],
-                        "hostname": if parts[3] == "*" { "" } else { parts[3] },
-                    }))
-                })
-                .collect();
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+
+            // Format detection — dhclient writes `lease {` blocks with
+            // `fixed-address ...;` lines; dnsmasq writes flat
+            // whitespace-separated records. Match on the cheapest
+            // signal first so a big dnsmasq file doesn't pay for a
+            // scan it doesn't need.
+            let looks_dhclient = content.contains("lease {") || content.contains("fixed-address");
+            let (format, leases) = if looks_dhclient {
+                ("dhclient", parse_dhclient_leases(&content))
+            } else {
+                let parsed = parse_dnsmasq_leases(&content);
+                if parsed.is_empty() && !content.trim().is_empty() {
+                    ("unknown", parsed)
+                } else {
+                    ("dnsmasq", parsed)
+                }
+            };
             out.push(serde_json::json!({
                 "path": path_str,
+                "format": format,
                 "leases": leases,
             }));
         }
     }
     out
+}
+
+/// Parse a dnsmasq lease file. Each line is `expires mac ip host client_id`;
+/// reject records whose "mac" field doesn't look like a MAC so a mis-classified
+/// file doesn't smuggle garbage rows past the format gate.
+fn parse_dnsmasq_leases(content: &str) -> Vec<serde_json::Value> {
+    content.lines().filter_map(|l| {
+        let parts: Vec<&str> = l.split_whitespace().collect();
+        if parts.len() < 4 { return None; }
+        // MAC plausibility check: two-hex-two-hex pattern, five colons.
+        if !looks_like_mac(parts[1]) { return None; }
+        Some(serde_json::json!({
+            "expires": parts[0],
+            "mac": parts[1],
+            "ip": parts[2],
+            "hostname": if parts[3] == "*" { "" } else { parts[3] },
+        }))
+    }).collect()
+}
+
+/// Parse an ISC dhclient `*.leases` file. Extracts one entry per
+/// `lease { ... }` block with the IP, server, interface, and expiry
+/// — enough for the "leases discovered on this host" panel to show
+/// meaningful content instead of a garbled table.
+fn parse_dhclient_leases(content: &str) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let mut in_block = false;
+    let mut cur: Option<(String, String, String, String)> = None;
+    // tuple: (iface, ip, server, expire)
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.starts_with("lease {") {
+            in_block = true;
+            cur = Some((String::new(), String::new(), String::new(), String::new()));
+            continue;
+        }
+        if !in_block { continue; }
+        if line.starts_with('}') {
+            if let Some((iface, ip, server, expire)) = cur.take() {
+                if !ip.is_empty() {
+                    out.push(serde_json::json!({
+                        "interface": iface, "ip": ip, "server": server, "expires": expire,
+                    }));
+                }
+            }
+            in_block = false;
+            continue;
+        }
+        let Some(rec) = cur.as_mut() else { continue };
+        // Strip trailing semicolon + the usual `key "value";` or `key value;` patterns.
+        let line = line.trim_end_matches(';');
+        if let Some(rest) = line.strip_prefix("interface ") {
+            rec.0 = rest.trim().trim_matches('"').to_string();
+        } else if let Some(rest) = line.strip_prefix("fixed-address ") {
+            rec.1 = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("option dhcp-server-identifier ") {
+            rec.2 = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("expire ") {
+            // "expire 4 2026/04/09 15:35:30" — keep just the date+time bit.
+            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+            rec.3 = parts.get(1).map(|s| s.trim().to_string()).unwrap_or_default();
+        }
+    }
+    out
+}
+
+fn looks_like_mac(s: &str) -> bool {
+    // Six hex pairs separated by colons. dnsmasq always emits this form.
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 6 { return false; }
+    parts.iter().all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// Live packet capture (Wireshark-style). Spawns `tcpdump` on the

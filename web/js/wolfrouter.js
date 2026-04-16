@@ -122,6 +122,7 @@
     // active cluster, switches the page, then loads.
     async function showWolfRouterForCluster(clusterName) {
         if (typeof closeSidebarMobile === 'function') closeSidebarMobile();
+        const previousCluster = wrState.cluster;
         wrState.cluster = clusterName;
         if (typeof currentPage !== 'undefined') window.currentPage = 'wolfrouter-cluster';
         if (typeof currentNodeId !== 'undefined') window.currentNodeId = null;
@@ -137,8 +138,60 @@
         const titleEl = document.getElementById('page-title');
         if (titleEl) titleEl.textContent = `WolfRouter — ${clusterName}`;
 
-        await wrLoadAll();
+        // When switching between clusters, the previous cluster's topology
+        // lingers on screen until the new fetch returns — confusing,
+        // because the rack view keeps showing the wrong nodes. Clear
+        // state and show a loading shim so it's unambiguous that a
+        // switch is in flight.
+        if (previousCluster && previousCluster !== clusterName) {
+            wrState.topology = null;
+            wrState.lans = [];
+            wrState.rules = [];
+            wrState.zones = { assignments: {} };
+            wrState.wan = [];
+            wrState.lastRackHash = '';  // force a full re-render once data arrives
+        }
+        wrShowClusterLoading(clusterName);
+
+        try {
+            await wrLoadAll();
+        } finally {
+            wrHideClusterLoading();
+        }
         wrStartPolling();
+    }
+
+    /// Full-card loading overlay shown while a cluster switch is in flight.
+    /// Replaces the rack canvas + table panels so the user sees a clear
+    /// "loading cluster X" instead of the previous cluster's data.
+    function wrShowClusterLoading(clusterName) {
+        const canvas = document.getElementById('wr-rack-canvas');
+        if (canvas) {
+            canvas.innerHTML = `
+                <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding:80px 20px; color:var(--text-muted); gap:14px;">
+                    <div class="wr-spinner" style="width:42px; height:42px; border:3px solid rgba(168,85,247,0.25); border-top-color:#a855f7; border-radius:50%; animation: wr-spin 0.8s linear infinite;"></div>
+                    <div style="font-size:14px;">Loading <strong style="color:var(--text);">${escHtml(clusterName)}</strong>…</div>
+                    <div style="font-size:11px; color:var(--text-muted); max-width:360px; text-align:center;">Fetching topology, firewall rules, LAN segments, and WAN connections from every node in this cluster.</div>
+                </div>
+                <style>@keyframes wr-spin { to { transform: rotate(360deg); } }</style>
+            `;
+        }
+        // Hide the table-view panels while loading — they'd show stale data otherwise.
+        document.querySelectorAll('.wr-tab-panel').forEach(p => {
+            p.dataset.wrWasDisplay = p.style.display || '';
+            p.style.display = 'none';
+        });
+    }
+
+    function wrHideClusterLoading() {
+        // Nothing special to undo for the canvas — wrRenderAll will repaint.
+        // Restore panel displays so the user's last-active table-view tab reappears.
+        document.querySelectorAll('.wr-tab-panel').forEach(p => {
+            if (p.dataset.wrWasDisplay !== undefined) {
+                p.style.display = p.dataset.wrWasDisplay;
+                delete p.dataset.wrWasDisplay;
+            }
+        });
     }
 
     async function wrLoadAll() {
@@ -1272,6 +1325,28 @@
         const container = document.getElementById('wr-leases-container');
         if (!container) return;
         const discoveredFiles = (wrState.snapshot?.dhcp?.lease_files) || [];
+        // Render each discovered file with columns matched to its format:
+        //   dnsmasq  → IP / MAC / Hostname / Expires (lease records)
+        //   dhclient → Interface / IP / Server / Expires (client leases)
+        //   unknown  → path only, no table (don't fabricate columns)
+        const renderFileTable = (f) => {
+            const fmt = f.format || 'dnsmasq';
+            if (!f.leases.length) {
+                return `<div style="color:var(--text-muted); font-size:11px; padding:8px;">${fmt === 'unknown' ? `Not a recognised lease file format &mdash; nothing to show from <code>${escHtml(f.path)}</code>.` : 'Empty'}</div>`;
+            }
+            if (fmt === 'dhclient') {
+                return `<div style="font-size:10px; color:var(--text-muted); padding:0 8px 4px;">ISC dhclient format &mdash; this host's own DHCP client, not a DHCP server.</div>
+                    <table class="data-table" style="font-size:11px;">
+                        <thead><tr><th>Interface</th><th>IP</th><th>DHCP server</th><th>Expires</th></tr></thead>
+                        <tbody>${f.leases.map(le => `<tr><td><code>${escHtml(le.interface || '—')}</code></td><td><code>${escHtml(le.ip || '')}</code></td><td><code>${escHtml(le.server || '—')}</code></td><td style="color:var(--text-muted);">${escHtml(le.expires || '')}</td></tr>`).join('')}</tbody>
+                    </table>`;
+            }
+            // dnsmasq (default)
+            return `<table class="data-table" style="font-size:11px;">
+                <thead><tr><th>IP</th><th>MAC</th><th>Hostname</th><th>Expires</th></tr></thead>
+                <tbody>${f.leases.map(le => `<tr><td><code>${escHtml(le.ip)}</code></td><td><code>${escHtml(le.mac)}</code></td><td>${escHtml(le.hostname || '—')}</td><td style="color:var(--text-muted);">${escHtml(le.expires)}</td></tr>`).join('')}</tbody>
+            </table>`;
+        };
         const discoveredHtml = discoveredFiles.length
             ? `<div style="margin-bottom:16px;">
                 <h4 style="font-size:13px; margin:0 0 8px;">🔍 Lease files discovered on this host</h4>
@@ -1280,15 +1355,11 @@
                     <details ${f.leases.length ? 'open' : ''} style="margin-bottom:8px; border:1px solid var(--border); border-radius:6px; background:var(--bg-card);">
                         <summary style="padding:8px 12px; cursor:pointer; font-size:12px; font-weight:600;">
                             📄 <code style="font-family:var(--font-mono);">${escHtml(f.path)}</code>
-                            <span style="color:var(--text-muted); font-weight:normal; margin-left:6px;">(${f.leases.length} lease${f.leases.length===1?'':'s'})</span>
+                            <span class="badge" style="background:rgba(148,163,184,0.15); color:var(--text-muted); font-size:10px; padding:1px 6px; margin-left:6px;">${escHtml(f.format || 'dnsmasq')}</span>
+                            <span style="color:var(--text-muted); font-weight:normal; margin-left:6px;">(${f.leases.length} ${f.format === 'dhclient' ? 'client-lease' : 'lease'}${f.leases.length===1?'':'s'})</span>
                         </summary>
                         <div style="padding:0 8px 8px;">
-                            ${f.leases.length
-                                ? `<table class="data-table" style="font-size:11px;">
-                                    <thead><tr><th>IP</th><th>MAC</th><th>Hostname</th><th>Expires</th></tr></thead>
-                                    <tbody>${f.leases.map(le => `<tr><td><code>${escHtml(le.ip)}</code></td><td><code>${escHtml(le.mac)}</code></td><td>${escHtml(le.hostname || '—')}</td><td style="color:var(--text-muted);">${escHtml(le.expires)}</td></tr>`).join('')}</tbody>
-                                </table>`
-                                : '<div style="color:var(--text-muted); font-size:11px; padding:8px;">Empty</div>'}
+                            ${renderFileTable(f)}
                         </div>
                     </details>
                 `).join('')}
@@ -1308,9 +1379,16 @@
                 // Build a quick MAC → reservation map so the "Pin" button
                 // shows "Pinned" instead when the lease is already static.
                 const reservedMacs = new Set((lan.dhcp?.reservations || []).map(r => (r.mac || '').toLowerCase()));
+                const reservedCount = (lan.dhcp?.reservations || []).length;
                 parts.push(`
                     <div style="margin-bottom:18px;">
-                        <div style="font-weight:600; margin-bottom:6px;">${escHtml(lan.name)} <span style="color:var(--text-muted); font-size:12px;">(${leases.length} active)</span></div>
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; flex-wrap:wrap; gap:8px;">
+                            <div style="font-weight:600;">${escHtml(lan.name)}
+                                <span style="color:var(--text-muted); font-size:12px; font-weight:normal;">(${leases.length} active · ${reservedCount} pinned)</span>
+                            </div>
+                            <button class="btn btn-sm" title="Create a static reservation without waiting for the device to connect — useful for pre-pinning servers or IoT devices by their MAC."
+                                    onclick="wrShowAddReservation('${escHtml(lan.id)}')">📌 + Add reservation</button>
+                        </div>
                         <table class="data-table" style="font-size:12px;">
                             <thead><tr><th>IP</th><th>MAC</th><th>Hostname</th><th>Expires (epoch)</th><th style="width:90px;">Action</th></tr></thead>
                             <tbody>
@@ -1417,6 +1495,129 @@
         }
     }
     window.wrPinLease = wrPinLease;
+
+    /// Manual static reservation — useful when the device hasn't
+    /// connected yet (common case: pre-pinning a server that 20 MQTT
+    /// clients address by IP, pre-configuring a printer, etc). Opens
+    /// a small modal that asks for MAC/IP/hostname, validates, and
+    /// appends to the segment's reservations. Same end state as pinning
+    /// an active lease but doesn't require the device on the network.
+    function wrShowAddReservation(lanId) {
+        const lan = (wrState.lans || []).find(l => l.id === lanId);
+        if (!lan) { alert('LAN not found'); return; }
+        // Suggest the next free IP inside the subnet to save the user
+        // from typing and accidentally colliding with the DHCP pool.
+        const suggested = wrSuggestReservationIp(lan);
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay active';
+        overlay.style.zIndex = '10000';
+        overlay.innerHTML = `
+            <div class="modal" style="max-width:520px;">
+                <div class="modal-header">
+                    <h3>📌 Add static reservation &mdash; ${escHtml(lan.name)}</h3>
+                    <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">×</button>
+                </div>
+                <div class="modal-body" style="font-size:13px;">
+                    <div style="font-size:11px; color:var(--text-muted); margin-bottom:10px;">
+                        Subnet: <code>${escHtml(lan.subnet_cidr)}</code> &bull; DHCP pool: <code>${escHtml(lan.dhcp?.pool_start || '—')} → ${escHtml(lan.dhcp?.pool_end || '—')}</code>. Reservations usually sit outside the pool so there's no chance of a collision.
+                    </div>
+                    <label style="display:block; margin-bottom:8px;">MAC address
+                        <input id="wr-addr-mac" class="form-control" placeholder="aa:bb:cc:dd:ee:ff" style="font-family:var(--font-mono); font-size:13px;" autofocus/>
+                    </label>
+                    <label style="display:block; margin-bottom:8px;">IP address
+                        <input id="wr-addr-ip" class="form-control" placeholder="${escHtml(suggested || '192.168.10.10')}" value="${escHtml(suggested)}" style="font-family:var(--font-mono); font-size:13px;"/>
+                    </label>
+                    <label style="display:block; margin-bottom:8px;">Hostname (optional)
+                        <input id="wr-addr-host" class="form-control" placeholder="mqtt-server"/>
+                    </label>
+                    <div id="wr-addr-status" style="font-size:12px; padding:4px 0;"></div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+                    <button id="wr-addr-btn" class="btn btn-primary" onclick="wrSaveAddReservation('${escHtml(lanId)}')">Add reservation</button>
+                </div>
+            </div>`;
+        document.body.appendChild(overlay);
+    }
+    window.wrShowAddReservation = wrShowAddReservation;
+
+    /// Suggest the first host IP outside the DHCP pool so users have a
+    /// sensible default that won't collide. Falls back to the tenth
+    /// host in the subnet if the pool can't be parsed.
+    function wrSuggestReservationIp(lan) {
+        // Try router_ip's /24 and pick a low address below the pool.
+        const cidrMatch = (lan.subnet_cidr || '').match(/^(\d+)\.(\d+)\.(\d+)\.\d+\/(\d+)$/);
+        if (!cidrMatch) return '';
+        const base = `${cidrMatch[1]}.${cidrMatch[2]}.${cidrMatch[3]}`;
+        const used = new Set();
+        for (const r of (lan.dhcp?.reservations || [])) used.add(r.ip);
+        if (lan.router_ip) used.add(lan.router_ip);
+        const poolStart = lan.dhcp?.pool_start || `${base}.100`;
+        const poolStartOct = parseInt((poolStart.split('.')[3] || '100'), 10);
+        // Prefer low IPs (.2 … poolStart-1) that aren't in use.
+        for (let i = 2; i < poolStartOct; i++) {
+            const cand = `${base}.${i}`;
+            if (!used.has(cand)) return cand;
+        }
+        // Fallback — .10 is almost always safe.
+        return `${base}.10`;
+    }
+
+    async function wrSaveAddReservation(lanId) {
+        const btn = document.getElementById('wr-addr-btn');
+        const statusEl = document.getElementById('wr-addr-status');
+        if (!btn || !statusEl) return;
+        const mac = (document.getElementById('wr-addr-mac').value || '').trim().toLowerCase();
+        const ip = (document.getElementById('wr-addr-ip').value || '').trim();
+        const hostname = (document.getElementById('wr-addr-host').value || '').trim();
+        const macRe = /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i;
+        const ipRe = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+        if (!macRe.test(mac)) {
+            statusEl.innerHTML = `<span style="color:#ef4444;">✗ MAC must look like <code>aa:bb:cc:dd:ee:ff</code>.</span>`;
+            return;
+        }
+        if (!ipRe.test(ip)) {
+            statusEl.innerHTML = `<span style="color:#ef4444;">✗ IP must be a dotted quad, e.g. <code>192.168.10.50</code>.</span>`;
+            return;
+        }
+        const lan = (wrState.lans || []).find(l => l.id === lanId);
+        if (!lan) { statusEl.innerHTML = `<span style="color:#ef4444;">✗ LAN not found.</span>`; return; }
+        if ((lan.dhcp?.reservations || []).some(r => (r.mac || '').toLowerCase() === mac)) {
+            statusEl.innerHTML = `<span style="color:#ef4444;">✗ A reservation for this MAC already exists. Edit it in the LAN editor (DHCP/LANs tab).</span>`;
+            return;
+        }
+        btn.disabled = true;
+        btn.textContent = '⏳ Saving…';
+        statusEl.innerHTML = '<span style="color:var(--text-muted);">⏳ Updating segment…</span>';
+
+        const updated = JSON.parse(JSON.stringify(lan));
+        updated.dhcp = updated.dhcp || {};
+        updated.dhcp.reservations = updated.dhcp.reservations || [];
+        updated.dhcp.reservations.push({ mac, ip, hostname: hostname || null });
+
+        try {
+            const r = await fetch(wrUrl('/api/router/segments/' + encodeURIComponent(lanId)), {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(updated),
+            });
+            if (r.ok) {
+                statusEl.innerHTML = `<span style="color:#22c55e;">✓ Reservation added &mdash; dnsmasq reloaded. Next time the MAC shows up on the LAN it'll be handed <code>${escHtml(ip)}</code>.</span>`;
+                setTimeout(() => {
+                    document.querySelector('.modal-overlay')?.remove();
+                    wrLoadAll();
+                }, 900);
+            } else {
+                const txt = await r.text();
+                statusEl.innerHTML = `<span style="color:#ef4444;">✗ Save failed: ${escHtml(txt)}</span>`;
+                btn.disabled = false; btn.textContent = 'Add reservation';
+            }
+        } catch (e) {
+            statusEl.innerHTML = `<span style="color:#ef4444;">✗ Request failed: ${escHtml(e.message || e)}</span>`;
+            btn.disabled = false; btn.textContent = 'Add reservation';
+        }
+    }
+    window.wrSaveAddReservation = wrSaveAddReservation;
 
     // ─── Zones ───
 
