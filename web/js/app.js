@@ -23432,6 +23432,143 @@ function switchSettingsTab(tabName) {
         loadPlugins();
     } else if (tabName === 'apikeys') {
         loadApiKeysTab();
+    } else if (tabName === 'systemcheck') {
+        // Auto-run on first open if results panel is empty
+        const out = document.getElementById('systemcheck-results');
+        if (out && !out.innerHTML.trim()) runSystemCheck();
+    }
+}
+
+// ─── System Check (Settings → 🩺 System Check) ───
+// Audits the host for every runtime dependency WolfStack expects and
+// renders a status list. If AI is configured, each Warning/Missing
+// row gets an "Ask AI" button that asks for tailored remediation.
+async function runSystemCheck() {
+    const out = document.getElementById('systemcheck-results');
+    const btn = document.getElementById('systemcheck-run-btn');
+    if (!out) return;
+    if (btn) { btn.disabled = true; btn.textContent = 'Scanning…'; }
+    out.innerHTML = '<div style="color:var(--text-muted); padding:24px; text-align:center;">Scanning host — running subprocess checks…</div>';
+    try {
+        const r = await fetch('/api/system-check');
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const data = await r.json();
+        renderSystemCheckResults(data);
+    } catch (e) {
+        out.innerHTML = `<div style="color:#ef4444; padding:24px;">System check failed: ${escapeHtml(e.message || String(e))}</div>`;
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '▶ Re-run Check'; }
+    }
+}
+
+function renderSystemCheckResults(data) {
+    const out = document.getElementById('systemcheck-results');
+    if (!out) return;
+    const checks = data.checks || [];
+    const aiEnabled = !!data.ai_enabled;
+
+    // Summary counters — at-a-glance tells the operator whether the
+    // server is healthy before they scroll the detailed list.
+    const counts = { ok: 0, warning: 0, missing: 0, unsupported: 0 };
+    for (const c of checks) counts[c.status] = (counts[c.status] || 0) + 1;
+    const statusMeta = {
+        ok:          { label: 'OK',          colour: '#22c55e', icon: '✅' },
+        warning:     { label: 'Warning',     colour: '#fbbf24', icon: '⚠️' },
+        missing:     { label: 'Missing',     colour: '#ef4444', icon: '❌' },
+        unsupported: { label: 'Unsupported', colour: '#94a3b8', icon: '➖' },
+    };
+
+    const pills = Object.entries(counts).filter(([_, n]) => n > 0).map(([k, n]) => {
+        const m = statusMeta[k];
+        return `<span style="display:inline-flex; align-items:center; gap:4px; padding:4px 10px; border-radius:999px; background:${m.colour}22; color:${m.colour}; font-weight:600; font-size:12px;">${m.icon} ${n} ${m.label}</span>`;
+    }).join(' ');
+
+    // Group by category so related checks cluster together.
+    const byCat = {};
+    for (const c of checks) {
+        (byCat[c.category] = byCat[c.category] || []).push(c);
+    }
+    const order = ['Core', 'Containers', 'Virtualisation', 'Networking', 'Storage', 'USB'];
+    const cats = [...order.filter(c => byCat[c]), ...Object.keys(byCat).filter(c => !order.includes(c))];
+
+    // Sort each category so problems bubble to the top.
+    const rank = { missing: 0, warning: 1, unsupported: 2, ok: 3 };
+    for (const cat of cats) byCat[cat].sort((a, b) => (rank[a.status] ?? 9) - (rank[b.status] ?? 9));
+
+    // Stash the raw check objects in a module-scoped map so the Ask-AI
+    // button doesn't have to stringify them into inline onclick handlers
+    // (that's a source of quoting bugs).
+    window._systemCheckCache = {};
+    const catHtml = cats.map(cat => {
+        const items = byCat[cat].map((c, idx) => {
+            const m = statusMeta[c.status] || statusMeta.ok;
+            const hint = c.install_hint
+                ? `<div style="font-family:var(--font-mono,monospace); font-size:12px; color:var(--text); background:var(--bg-input); padding:6px 8px; border-radius:4px; margin-top:6px; white-space:pre-wrap;">${escapeHtml(c.install_hint)}</div>`
+                : '';
+            const key = `${cat.replace(/\s+/g, '')}-${idx}`;
+            window._systemCheckCache[key] = c;
+            const aiTarget = `sc-ai-${key}`;
+            const aiBtn = (aiEnabled && (c.status === 'warning' || c.status === 'missing') && c.ai_helpful)
+                ? `<button class="btn btn-sm" style="font-size:11px; white-space:nowrap;" data-sc-key="${escapeHtml(key)}" onclick="askAiAboutCheck('${aiTarget}', window._systemCheckCache['${escapeHtml(key)}'])">🤖 Ask AI</button>`
+                : '';
+            return `<div style="display:flex; align-items:flex-start; gap:12px; padding:10px 12px; border-bottom:1px solid var(--border);">
+                <div style="flex-shrink:0; width:28px; text-align:center; font-size:16px;">${m.icon}</div>
+                <div style="flex:1; min-width:0;">
+                    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                        <span style="font-weight:600; color:var(--text);">${escapeHtml(c.name)}</span>
+                        ${c.version ? `<span style="font-family:var(--font-mono,monospace); font-size:11px; color:var(--text-muted);">${escapeHtml(c.version)}</span>` : ''}
+                        <span style="font-size:11px; color:${m.colour}; font-weight:600;">${m.label}</span>
+                    </div>
+                    <div style="font-size:12px; color:var(--text-muted); margin-top:2px;">${escapeHtml(c.detail)}</div>
+                    ${hint}
+                    <div id="${aiTarget}" style="display:none; margin-top:8px; background:rgba(168,85,247,0.08); border:1px solid rgba(168,85,247,0.3); border-radius:6px; padding:10px; font-size:12px; color:var(--text); white-space:pre-wrap;"></div>
+                </div>
+                <div style="flex-shrink:0;">${aiBtn}</div>
+            </div>`;
+        }).join('');
+        return `<div style="margin-bottom:16px; background:var(--bg-card); border:1px solid var(--border); border-radius:8px; overflow:hidden;">
+            <div style="padding:8px 12px; background:var(--bg-tertiary); font-weight:600; font-size:13px; color:var(--text-secondary);">${escapeHtml(cat)}</div>
+            ${items}
+        </div>`;
+    }).join('');
+
+    const aiBanner = aiEnabled
+        ? `<div style="padding:8px 12px; background:rgba(59,130,246,0.08); border:1px solid rgba(59,130,246,0.3); border-radius:6px; font-size:12px; color:var(--text-secondary); margin-bottom:12px;">🤖 AI is enabled — click <em>Ask AI</em> on any warning/missing row for tailored remediation.</div>`
+        : `<div style="padding:8px 12px; background:rgba(251,191,36,0.08); border:1px solid rgba(251,191,36,0.3); border-radius:6px; font-size:12px; color:var(--text-secondary); margin-bottom:12px;">💡 Tip: enable the AI agent in Settings → AI Agent to get context-aware remediation hints.</div>`;
+
+    out.innerHTML = `
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:12px;">
+            ${pills}
+            ${data.hostname ? `<span style="margin-left:auto; font-size:12px; color:var(--text-muted);">Host: <code>${escapeHtml(data.hostname)}</code></span>` : ''}
+        </div>
+        ${aiBanner}
+        ${catHtml}
+    `;
+}
+
+async function askAiAboutCheck(targetId, check) {
+    const target = document.getElementById(targetId);
+    if (!target) return;
+    target.style.display = 'block';
+    target.textContent = '🤖 Asking the AI agent…';
+    try {
+        const r = await fetch('/api/system-check/ask-ai', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                name: check.name,
+                detail: check.detail,
+                install_hint: check.install_hint || null,
+            }),
+        });
+        const data = await r.json();
+        if (!r.ok) {
+            target.textContent = '⚠️ ' + (data.error || `HTTP ${r.status}`);
+            return;
+        }
+        target.textContent = data.advice || '(AI returned no advice)';
+    } catch (e) {
+        target.textContent = '⚠️ ' + (e.message || String(e));
     }
 }
 

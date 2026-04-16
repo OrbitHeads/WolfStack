@@ -41,6 +41,7 @@ mod wolfnote;
 mod wolfusb;
 mod paths;
 mod ports;
+mod systemcheck;
 mod services_discovery;
 mod cluster_browser;
 mod compat;

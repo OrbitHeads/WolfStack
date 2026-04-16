@@ -1,0 +1,458 @@
+// Written by Paul Clevett
+// (C)Copyright Wolf Software Systems Ltd
+// https://wolf.uk.com
+
+//! Runtime dependency audit — iterates every tool / service / kernel
+//! feature WolfStack touches and reports whether it's installed, whether
+//! it's healthy, and what to do if it isn't.
+//!
+//! Drives the "System Check" button in Settings. The audit is intentionally
+//! server-local — each cluster node runs it on demand and the UI displays
+//! the result. Pairs with the AI agent to turn warnings into
+//! actionable remediation.
+
+use serde::{Deserialize, Serialize};
+use std::process::Command;
+use std::path::Path;
+
+use crate::installer::{detect_distro, DistroFamily};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DepStatus {
+    /// Green — installed, running, healthy.
+    Ok,
+    /// Amber — installed but something looks off (service stopped, wrong
+    /// permissions, etc.). AI is most useful on these.
+    Warning,
+    /// Red — not installed, WolfStack functionality will be degraded.
+    Missing,
+    /// Grey — the host OS/architecture doesn't ship this, nothing to fix.
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DependencyCheck {
+    pub name: String,
+    pub category: String,
+    pub status: DepStatus,
+    pub version: Option<String>,
+    /// Short human-readable explanation of what we found.
+    pub detail: String,
+    /// What the admin should do — populated on Warning/Missing.
+    pub install_hint: Option<String>,
+    /// Fires true when AI is genuinely useful here (i.e. it's not a
+    /// plain "apt install X" fix but something where context matters).
+    pub ai_helpful: bool,
+}
+
+/// Is a binary on PATH? Returns (found, version-string).
+fn bin_check(cmd: &str, version_arg: &[&str]) -> (bool, Option<String>) {
+    let which = Command::new("sh")
+        .args(["-c", &format!("command -v {}", cmd)])
+        .output();
+    let found = matches!(which, Ok(o) if o.status.success() && !o.stdout.is_empty());
+    if !found { return (false, None); }
+    let ver = Command::new(cmd).args(version_arg).output().ok()
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).to_string();
+            let t = String::from_utf8_lossy(&o.stderr).to_string();
+            let combined = if s.trim().is_empty() { t } else { s };
+            combined.lines().next().map(|l| l.trim().to_string())
+        });
+    (true, ver)
+}
+
+/// Is a systemd unit active?
+fn svc_active(unit: &str) -> bool {
+    Command::new("systemctl")
+        .args(["is-active", "--quiet", unit])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Distro-specific install hint string. Shown verbatim in the UI.
+fn hint(name_deb: &str, name_rhel: &str, name_arch: &str, name_suse: &str) -> String {
+    match detect_distro() {
+        DistroFamily::Debian => format!("apt install {}", name_deb),
+        DistroFamily::RedHat => format!("dnf install {}", name_rhel),
+        DistroFamily::Arch   => format!("pacman -S {}", name_arch),
+        DistroFamily::Suse   => format!("zypper install {}", name_suse),
+        DistroFamily::Unknown => format!("Install the '{}' package for your distro", name_deb),
+    }
+}
+
+/// Run every check and produce the report. Cheap enough to call on
+/// demand — nothing here is slow (all syscalls + local subprocess).
+pub fn run_checks() -> Vec<DependencyCheck> {
+    let mut out = Vec::new();
+    let distro = detect_distro();
+    let arch = std::env::consts::ARCH;
+    let is_alpine = Path::new("/etc/alpine-release").exists();
+
+    // ─── Core system ─────────────────────────────────────────────
+    out.push(check_kernel());
+    out.push(simple("systemctl", "Core", &["--version"],
+        "service manager — WolfStack registers units via it",
+        hint("systemd", "systemd", "systemd", "systemd"), false));
+    out.push(simple("curl", "Core", &["--version"],
+        "HTTP client — used for setup downloads + AI API",
+        hint("curl", "curl", "curl", "curl"), false));
+    out.push(simple("git", "Core", &["--version"],
+        "source checkout for WolfNet/WolfStack builds",
+        hint("git", "git", "git", "git"), false));
+    out.push(simple("modprobe", "Core", &["--version"],
+        "kernel module loader — needed for usbip/tun",
+        hint("kmod", "kmod", "kmod", "kmod"), false));
+    out.push(simple("pgrep", "Core", &["--version"],
+        "process lookup — used to check dnsmasq/pppd state",
+        hint("procps", "procps-ng", "procps-ng", "procps"), false));
+
+    // ─── Container runtime ───────────────────────────────────────
+    out.push(check_docker());
+    out.push(check_containerd());
+    out.push(simple("lxc-ls", "Containers", &["--version"],
+        "system container management",
+        hint("lxc", "lxc", "lxc", "lxc"), true));
+
+    // ─── Virtualisation ──────────────────────────────────────────
+    out.push(check_qemu());
+    // Proxmox isn't required — it's an integration — so report OK when
+    // absent rather than Missing, and Ok when present.
+    if Path::new("/usr/bin/pveversion").exists() {
+        let ver = Command::new("pveversion").output().ok()
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).lines().next().map(|s| s.to_string()));
+        out.push(DependencyCheck {
+            name: "Proxmox VE".into(), category: "Virtualisation".into(),
+            status: DepStatus::Ok, version: ver,
+            detail: "Proxmox hypervisor detected — PVE integration active".into(),
+            install_hint: None, ai_helpful: false,
+        });
+    }
+
+    // ─── Networking ──────────────────────────────────────────────
+    out.push(simple("iptables", "Networking", &["--version"],
+        "firewall rule compiler (WolfRouter, container NAT)",
+        hint("iptables", "iptables", "iptables", "iptables"), false));
+    out.push(simple("ip", "Networking", &["-V"],
+        "iproute2 — WolfStack configures bridges/VLANs via this",
+        hint("iproute2", "iproute", "iproute2", "iproute2"), false));
+    out.push(check_brctl());
+    out.push(simple("dnsmasq", "Networking", &["--version"],
+        "per-LAN DHCP/DNS; without it LAN segments can't serve leases",
+        hint("dnsmasq-base", "dnsmasq", "dnsmasq", "dnsmasq"), true));
+    out.push(simple("socat", "Networking", &["-V"],
+        "TCP/UNIX socket bridge — VM serial consoles",
+        hint("socat", "socat", "socat", "socat"), false));
+    out.push(simple("ethtool", "Networking", &["--version"],
+        "NIC offload tuning — required for VLAN passthrough",
+        hint("ethtool", "ethtool", "ethtool", "ethtool"), false));
+    out.push(simple("tcpdump", "Networking", &["--version"],
+        "packet capture — powers the Packets tab in WolfRouter",
+        hint("tcpdump", "tcpdump", "tcpdump", "tcpdump"), false));
+    out.push(simple("pppd", "Networking", &["--version"],
+        "PPPoE dial-up — used by WolfRouter WAN mode",
+        hint("ppp", "ppp", "ppp", "ppp"), true));
+    out.push(check_tun());
+
+    // ─── Storage ─────────────────────────────────────────────────
+    out.push(check_fuse3());
+    out.push(simple("s3fs", "Storage", &["--version"],
+        "S3 bucket mounts (optional). No S3 storage without this.",
+        hint("s3fs", "s3fs-fuse", "s3fs-fuse", "s3fs"),
+        // s3fs isn't in Alpine's repos — mark unsupported there.
+        !is_alpine));
+    out.push(simple("mount.nfs", "Storage", &[],
+        "NFS mounts — WolfStack storage pools use this",
+        hint("nfs-common", "nfs-utils", "nfs-utils", "nfs-client"), false));
+
+    // ─── USB passthrough ────────────────────────────────────────
+    out.push(check_kernel_module("vhci_hcd", "USB",
+        "USB virtualisation (client) — attach remote USB via WolfUSB"));
+    out.push(check_kernel_module("usbip_host", "USB",
+        "USB sharing (server) — export local USB to the cluster"));
+
+    // ─── Architecture-specific guards ───────────────────────────
+    if arch == "powerpc64" || arch == "powerpc64le" {
+        out.push(DependencyCheck {
+            name: "ppc64le QEMU".into(), category: "Virtualisation".into(),
+            status: DepStatus::Warning, version: None,
+            detail: "IBM Power architecture — some VM backends (amd64 ISOs) won't boot here".into(),
+            install_hint: Some("Use ppc64le ISOs for VM installs".into()),
+            ai_helpful: true,
+        });
+    }
+    if is_alpine {
+        // Silence the noise: things known to be unavailable on Alpine
+        // get flipped from Missing to Unsupported so the UI doesn't
+        // waste the user's attention.
+        for c in out.iter_mut() {
+            let unsupported = matches!(c.name.as_str(),
+                "docker" | "s3fs" | "dnsmasq" | "mount.nfs")
+                && matches!(c.status, DepStatus::Missing);
+            if unsupported {
+                c.status = DepStatus::Unsupported;
+                c.detail = format!("{} — not available on Alpine", c.detail);
+                c.install_hint = None;
+            }
+        }
+    }
+    let _ = distro;  // reserved for future distro-specific tweaks
+
+    out
+}
+
+/// Minimal check: `bin present?` with install hint. Used for the
+/// "just need it on PATH" checks.
+fn simple(
+    cmd: &str,
+    category: &str,
+    version_args: &[&str],
+    why: &str,
+    install: String,
+    ai_helpful: bool,
+) -> DependencyCheck {
+    let (found, ver) = bin_check(cmd, version_args);
+    DependencyCheck {
+        name: cmd.to_string(),
+        category: category.to_string(),
+        status: if found { DepStatus::Ok } else { DepStatus::Missing },
+        version: ver,
+        detail: if found { format!("Installed — {}", why) }
+                else     { format!("Not installed — {}", why) },
+        install_hint: if found { None } else { Some(install) },
+        ai_helpful,
+    }
+}
+
+fn check_docker() -> DependencyCheck {
+    let (found, ver) = bin_check("docker", &["--version"]);
+    if !found {
+        return DependencyCheck {
+            name: "docker".into(), category: "Containers".into(),
+            status: DepStatus::Missing, version: None,
+            detail: "Docker not installed — app store Docker installs will fail".into(),
+            install_hint: Some(hint("docker.io", "docker-ce", "docker", "docker")),
+            ai_helpful: true,
+        };
+    }
+    // Can we actually talk to the daemon? `docker info` exits non-zero
+    // if the socket is not reachable / the service is stopped / the
+    // user lacks permission. This catches the "installed but broken"
+    // case the user specifically mentioned.
+    let info = Command::new("docker").arg("info").output();
+    let daemon_ok = matches!(info.as_ref(), Ok(o) if o.status.success());
+    if daemon_ok {
+        return DependencyCheck {
+            name: "docker".into(), category: "Containers".into(),
+            status: DepStatus::Ok, version: ver,
+            detail: "Docker installed, daemon reachable".into(),
+            install_hint: None, ai_helpful: false,
+        };
+    }
+    // It's there but something's off. Build a detailed reason from the
+    // stderr of `docker info` so the AI has something useful to chew on.
+    let stderr = info.as_ref().ok()
+        .map(|o| String::from_utf8_lossy(&o.stderr).to_string())
+        .unwrap_or_default();
+    let svc_up = svc_active("docker");
+    let reason = if !svc_up {
+        "systemd `docker` service is not active".to_string()
+    } else if stderr.to_lowercase().contains("permission denied") {
+        "cannot access /var/run/docker.sock — user missing `docker` group?".into()
+    } else if stderr.trim().is_empty() {
+        "`docker info` failed without a clear error".into()
+    } else {
+        format!("`docker info` error: {}", stderr.lines().next().unwrap_or("").trim())
+    };
+    DependencyCheck {
+        name: "docker".into(), category: "Containers".into(),
+        status: DepStatus::Warning, version: ver,
+        detail: format!("Installed but not healthy — {}", reason),
+        install_hint: Some(if !svc_up {
+            "systemctl enable --now docker".into()
+        } else {
+            "usermod -aG docker $USER && newgrp docker".into()
+        }),
+        ai_helpful: true,
+    }
+}
+
+fn check_containerd() -> DependencyCheck {
+    let (found, ver) = bin_check("containerd", &["--version"]);
+    let running = svc_active("containerd");
+    if !found {
+        return DependencyCheck {
+            name: "containerd".into(), category: "Containers".into(),
+            status: DepStatus::Missing, version: None,
+            detail: "containerd not installed — Docker will not start without it".into(),
+            install_hint: Some(hint("containerd", "containerd.io", "containerd", "containerd")),
+            ai_helpful: false,
+        };
+    }
+    DependencyCheck {
+        name: "containerd".into(), category: "Containers".into(),
+        status: if running { DepStatus::Ok } else { DepStatus::Warning },
+        version: ver,
+        detail: if running { "containerd service active".into() }
+                else       { "containerd installed but service is not running".into() },
+        install_hint: if running { None } else { Some("systemctl enable --now containerd".into()) },
+        ai_helpful: !running,
+    }
+}
+
+fn check_qemu() -> DependencyCheck {
+    // Try the arch-specific binary first, then fall back to generic
+    // `qemu-system-x86_64` if we're on amd64.
+    let arch = std::env::consts::ARCH;
+    let cmd = match arch {
+        "aarch64" => "qemu-system-aarch64",
+        "powerpc64" | "powerpc64le" => "qemu-system-ppc64",
+        _ => "qemu-system-x86_64",
+    };
+    let (found, ver) = bin_check(cmd, &["--version"]);
+    DependencyCheck {
+        name: format!("QEMU ({})", cmd),
+        category: "Virtualisation".into(),
+        status: if found { DepStatus::Ok } else { DepStatus::Missing },
+        version: ver,
+        detail: if found { "KVM VM backend available".into() }
+                else     { "No QEMU binary for this architecture — VM installs will fail".into() },
+        install_hint: if found { None } else {
+            Some(hint(
+                "qemu-system-x86", "qemu-kvm", "qemu-full", "qemu-kvm",
+            ))
+        },
+        ai_helpful: !found,
+    }
+}
+
+fn check_brctl() -> DependencyCheck {
+    // `brctl` is deprecated in favour of `ip link`; consider present
+    // if EITHER exists so we don't chase a false positive on Arch.
+    let brctl_ok = bin_check("brctl", &["--version"]).0;
+    let ip_ok = bin_check("ip", &["-V"]).0;
+    if brctl_ok || ip_ok {
+        return DependencyCheck {
+            name: "bridge-utils".into(), category: "Networking".into(),
+            status: DepStatus::Ok, version: None,
+            detail: if brctl_ok { "brctl present".into() }
+                    else        { "ip link (iproute2) present — brctl not required".into() },
+            install_hint: None, ai_helpful: false,
+        };
+    }
+    DependencyCheck {
+        name: "bridge-utils".into(), category: "Networking".into(),
+        status: DepStatus::Missing, version: None,
+        detail: "Neither brctl nor iproute2 found — bridges can't be created".into(),
+        install_hint: Some(hint("bridge-utils", "bridge-utils", "bridge-utils", "bridge-utils")),
+        ai_helpful: false,
+    }
+}
+
+fn check_tun() -> DependencyCheck {
+    let exists = Path::new("/dev/net/tun").exists();
+    DependencyCheck {
+        name: "/dev/net/tun".into(), category: "Networking".into(),
+        status: if exists { DepStatus::Ok } else { DepStatus::Warning },
+        version: None,
+        detail: if exists { "TUN/TAP device available — WolfNet overlay works".into() }
+                else {
+                    "TUN device missing — unprivileged LXC containers need a cgroup device allowlist to create it".into()
+                },
+        install_hint: if exists { None } else {
+            Some("modprobe tun && mkdir -p /dev/net && mknod /dev/net/tun c 10 200".into())
+        },
+        ai_helpful: !exists,
+    }
+}
+
+fn check_fuse3() -> DependencyCheck {
+    // Look for libfuse3.so.* in the standard lib dirs. This is cheaper
+    // and more reliable than shelling out to pkg-config.
+    let found = ["/usr/lib", "/usr/lib64", "/lib", "/lib64", "/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu"]
+        .iter()
+        .any(|dir| std::fs::read_dir(dir).ok().map_or(false, |entries|
+            entries.flatten().any(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.starts_with("libfuse3.so")
+            })
+        ));
+    DependencyCheck {
+        name: "fuse3".into(), category: "Storage".into(),
+        status: if found { DepStatus::Ok } else { DepStatus::Missing },
+        version: None,
+        detail: if found { "libfuse3 available — s3fs/sshfs mounts work".into() }
+                else     { "libfuse3 not found — user-space mounts (S3, SSHFS, WolfDisk) will fail".into() },
+        install_hint: if found { None } else { Some(hint("libfuse3-3", "fuse3", "fuse3", "fuse3")) },
+        ai_helpful: !found,
+    }
+}
+
+fn check_kernel_module(modname: &str, category: &str, why: &str) -> DependencyCheck {
+    // Considered "Ok" if the module is loaded OR if the module file
+    // exists on disk (just not loaded yet). Otherwise, missing.
+    let loaded = Command::new("lsmod").output().ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout)
+            .lines().any(|l| l.split_whitespace().next() == Some(modname)))
+        .unwrap_or(false);
+    if loaded {
+        return DependencyCheck {
+            name: format!("{} (kernel module)", modname), category: category.into(),
+            status: DepStatus::Ok, version: None,
+            detail: format!("{} loaded", modname),
+            install_hint: None, ai_helpful: false,
+        };
+    }
+    // Does modprobe know about it without actually loading?
+    let known = Command::new("modprobe").args(["-n", modname])
+        .output().map(|o| o.status.success()).unwrap_or(false);
+    DependencyCheck {
+        name: format!("{} (kernel module)", modname), category: category.into(),
+        status: if known { DepStatus::Warning } else { DepStatus::Missing },
+        version: None,
+        detail: if known { format!("{} present but not loaded — {}", modname, why) }
+                else     { format!("{} not available — {}", modname, why) },
+        install_hint: if known {
+            Some(format!("modprobe {}", modname))
+        } else {
+            Some(hint(
+                &format!("linux-modules-extra-$(uname -r)"),
+                "kernel-modules-extra",
+                "linux",
+                "kernel-default-extra",
+            ))
+        },
+        ai_helpful: !known,
+    }
+}
+
+fn check_kernel() -> DependencyCheck {
+    let ver = Command::new("uname").arg("-r").output().ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().to_string().into());
+    let ver_str = ver.clone().unwrap_or_default();
+    let (major, minor) = parse_kernel_version(&ver_str);
+    let too_old = major < 5 || (major == 5 && minor < 4);
+    DependencyCheck {
+        name: "Linux kernel".into(), category: "Core".into(),
+        status: if too_old { DepStatus::Warning } else { DepStatus::Ok },
+        version: ver,
+        detail: if too_old {
+            format!("Kernel {} is older than 5.4 — some features (WolfNet, cgroup v2) may not work", ver_str)
+        } else {
+            format!("Kernel {} is fine", ver_str)
+        },
+        install_hint: if too_old {
+            Some("Upgrade your kernel package — WolfStack needs 5.4+ for WolfNet/cgroup2".into())
+        } else { None },
+        ai_helpful: too_old,
+    }
+}
+
+fn parse_kernel_version(s: &str) -> (u32, u32) {
+    let mut parts = s.split(|c: char| !c.is_ascii_digit());
+    let maj = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    let min = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    (maj, min)
+}

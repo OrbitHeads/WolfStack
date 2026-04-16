@@ -5784,6 +5784,79 @@ pub async fn ai_exec(
 }
 
 /// GET /api/ai/status — agent status and last health check
+/// GET /api/system-check — runs the dependency audit on this node
+/// and returns a structured report for the Settings UI.
+pub async fn system_check_run(
+    req: HttpRequest, state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let ai_enabled = state.ai_agent.config.lock().unwrap().is_configured();
+    // Run the check off the async executor — it shells out to lsmod,
+    // systemctl, docker info, etc. and we don't want to block actix.
+    let checks = match web::block(crate::systemcheck::run_checks).await {
+        Ok(v) => v,
+        Err(e) => return HttpResponse::InternalServerError()
+            .json(serde_json::json!({ "error": format!("System check failed: {}", e) })),
+    };
+    HttpResponse::Ok().json(serde_json::json!({
+        "checks": checks,
+        "ai_enabled": ai_enabled,
+        "hostname": hostname::get().ok().and_then(|h| h.into_string().ok()),
+    }))
+}
+
+/// POST /api/system-check/ask-ai — given a specific failing dependency,
+/// ask the AI agent for tailored remediation advice. Body: `{ name, detail, install_hint }`.
+#[derive(serde::Deserialize)]
+pub struct SystemCheckAskAi {
+    pub name: String,
+    pub detail: String,
+    pub install_hint: Option<String>,
+}
+pub async fn system_check_ask_ai(
+    req: HttpRequest, state: web::Data<AppState>,
+    body: web::Json<SystemCheckAskAi>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    if !state.ai_agent.config.lock().unwrap().is_configured() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "AI agent is not configured — enable it in Settings → AI Agent first"
+        }));
+    }
+    // Include a few lines of host context so the AI gives distro-
+    // specific advice. detect_distro() returns an enum with no Display
+    // impl so format with {:?}.
+    let distro = format!("{:?}", crate::installer::detect_distro());
+    let os_release = std::fs::read_to_string("/etc/os-release")
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.starts_with("PRETTY_NAME=") || l.starts_with("ID="))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let prompt = format!(
+        "WolfStack system check found a problem with `{}`.\n\
+         Detail: {}\n\
+         Suggested fix already shown to admin: {}\n\
+         Host: {} ({})\n\
+         Architecture: {}\n\n\
+         Give concrete remediation steps the admin can run *right now*. \
+         If the dependency simply isn't supported on this OS/arch, say so clearly \
+         and suggest the closest workaround. Keep it short and distro-aware.",
+        body.name,
+        body.detail,
+        body.install_hint.clone().unwrap_or_else(|| "(none)".into()),
+        os_release,
+        distro,
+        std::env::consts::ARCH,
+    );
+    match state.ai_agent.analyze_issue(&prompt).await {
+        Some(advice) => HttpResponse::Ok().json(serde_json::json!({ "advice": advice })),
+        None => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": "AI agent did not respond — check provider API key and model in Settings"
+        })),
+    }
+}
+
 pub async fn ai_status(
     req: HttpRequest, state: web::Data<AppState>,
 ) -> HttpResponse {
@@ -17079,6 +17152,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/ai/action/exec", web::post().to(ai_action_exec))
         .route("/api/ai/config/sync", web::post().to(ai_sync_config))
         .route("/api/ai/test-email", web::post().to(ai_test_email))
+        // System dependency audit
+        .route("/api/system-check", web::get().to(system_check_run))
+        .route("/api/system-check/ask-ai", web::post().to(system_check_ask_ai))
         // Ceph Cluster
         .route("/api/ceph/status", web::get().to(ceph_status))
         .route("/api/ceph/install-status", web::get().to(ceph_install_status))

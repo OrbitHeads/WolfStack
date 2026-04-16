@@ -3909,6 +3909,7 @@
                         <button class="settings-tab-btn" onclick="switchSettingsTab('backup')">📦 Config Backup</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('users')">👤 Users &amp; Auth</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('security')">🔐 Security</button>
+                        <button class="settings-tab-btn" onclick="switchSettingsTab('systemcheck')">🩺 System Check</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('paths')">📂 File Locations</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('wolfnote')">📝 WolfNote</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('plugins')">🔌 Plugins</button>
@@ -4932,6 +4933,21 @@
                                 <button class="btn" onclick="document.getElementById('plugin-install-modal').style.display='none'">Close</button>
                             </div>
                         </div>
+                    </div>
+
+                    <!-- ─── System Check Tab ─── -->
+                    <div id="settings-tab-systemcheck" class="settings-tab-panel">
+                        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; gap:12px; flex-wrap:wrap;">
+                            <div>
+                                <h4 style="margin:0 0 4px 0; font-size:16px; font-weight:600;">🩺 System Dependency Audit</h4>
+                                <p style="font-size:13px; color:var(--text-muted); margin:0;">
+                                    Scans this server for every runtime dependency WolfStack touches — Docker, QEMU, networking, storage, kernel modules —
+                                    and flags anything broken. Dependencies that aren't available on this OS/architecture are marked grey (nothing to fix).
+                                </p>
+                            </div>
+                            <button class="btn btn-primary" id="systemcheck-run-btn" onclick="runSystemCheck()" style="white-space:nowrap;">▶ Run Check</button>
+                        </div>
+                        <div id="systemcheck-results" style="margin-top:16px;"></div>
                     </div>
 
                     <div id="settings-tab-apikeys" class="settings-tab-panel">
