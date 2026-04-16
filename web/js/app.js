@@ -32411,6 +32411,174 @@ function buildServerRack(node, color) {
     return group;
 }
 
+// ─── WolfRouter Network Rack (3D) ───
+//
+// A dedicated rack per cluster that visualises the network topology:
+// physical ports, bridges, VLANs — one "switch unit" per cluster node.
+// Looks like a real network patch-panel rack rather than a server rack.
+// Data comes from the WolfRouter topology cache (`_topoNetworkCache`).
+
+let _topoNetworkCache = null;
+let _topoNetworkCacheAge = 0;
+
+async function topoFetchNetworkTopology() {
+    if (_topoNetworkCache && Date.now() - _topoNetworkCacheAge < 30000) return _topoNetworkCache;
+    try {
+        const r = await fetch('/api/router/topology');
+        if (r.ok) {
+            _topoNetworkCache = await r.json();
+            _topoNetworkCacheAge = Date.now();
+        }
+    } catch (e) {}
+    return _topoNetworkCache;
+}
+
+function buildNetworkRack(clusterName, clusterNodes, color, topoData) {
+    const group = new THREE.Group();
+    const rackH = 5.5, rackW = 1.2, rackD = 2.0;
+    const unitH = 0.35, unitGap = 0.05;
+    const frontZ = -rackD / 2;
+
+    // Rack frame (same geometry as server racks for visual consistency)
+    const frameMat = new THREE.MeshPhongMaterial({ color: 0x1a1a20, shininess: 40, specular: 0x333344 });
+    const postGeo = new THREE.BoxGeometry(0.08, rackH, 0.08);
+    [[-rackW/2, rackH/2, frontZ], [rackW/2, rackH/2, frontZ],
+     [-rackW/2, rackH/2, rackD/2], [rackW/2, rackH/2, rackD/2]].forEach(p => {
+        const post = new THREE.Mesh(postGeo, frameMat);
+        post.position.set(...p); post.castShadow = true; group.add(post);
+    });
+    const railH = new THREE.BoxGeometry(rackW + 0.08, 0.06, 0.08);
+    const railD = new THREE.BoxGeometry(0.08, 0.06, rackD + 0.08);
+    [0, rackH].forEach(y => {
+        [frontZ, rackD/2].forEach(z => { const r = new THREE.Mesh(railH, frameMat); r.position.set(0, y, z); group.add(r); });
+        [-rackW/2, rackW/2].forEach(x => { const r = new THREE.Mesh(railD, frameMat); r.position.set(x, y, 0); group.add(r); });
+    });
+
+    // Top unit: WolfRouter banner with cluster accent
+    const bannerGeo = new THREE.BoxGeometry(rackW - 0.16, unitH + 0.06, rackD - 0.2);
+    const bannerMat = new THREE.MeshPhongMaterial({ color: 0x1e293b, shininess: 60, specular: 0x445566 });
+    const banner = new THREE.Mesh(bannerGeo, bannerMat);
+    const bannerY = 0.3;
+    banner.position.set(0, bannerY + unitH / 2, 0);
+    banner.castShadow = true;
+    group.add(banner);
+    // Accent stripe
+    const accentGeo = new THREE.BoxGeometry(rackW - 0.22, 0.035, 0.025);
+    const accentMat = new THREE.MeshBasicMaterial({ color });
+    const accent = new THREE.Mesh(accentGeo, accentMat);
+    accent.position.set(0, bannerY + unitH + 0.02, frontZ + 0.12);
+    group.add(accent);
+    // WolfRouter label
+    const wrLabel = makeTextSprite('WOLFROUTER', { fontSize: 20, color: '#' + color.toString(16).padStart(6, '0'), scale: 0.2 });
+    wrLabel.position.set(0, bannerY + unitH / 2, frontZ + 0.16);
+    wrLabel.userData = { isLabel: true };
+    group.add(wrLabel);
+
+    // Resolve topology nodes for this cluster. The topology API returns
+    // nodes keyed by node_id/node_name; we match by the cluster nodes'
+    // id or hostname.
+    const topoNodes = (topoData?.nodes || []).filter(tn => {
+        return clusterNodes.some(cn =>
+            cn.id === tn.node_id || cn.hostname === tn.node_name ||
+            cn.id === tn.node_name || cn.hostname === tn.node_id
+        );
+    });
+
+    // One "switch unit" per cluster node, each showing RJ45-port LEDs.
+    let slotY = bannerY + unitH + unitGap + 0.12;
+    const maxSlots = Math.floor((rackH - slotY - 0.2) / (unitH * 2 + unitGap));
+    const nodesToShow = topoNodes.slice(0, Math.max(maxSlots, 2));
+
+    nodesToShow.forEach((tn) => {
+        const ifaces = tn.interfaces || [];
+        const bridges = tn.bridges || [];
+
+        // Switch unit body (taller than a server unit — two rows)
+        const swH = unitH * 2;
+        const swGeo = new THREE.BoxGeometry(rackW - 0.16, swH, rackD - 0.2);
+        const swMat = new THREE.MeshPhongMaterial({ color: 0x0f172a, shininess: 30, specular: 0x334455 });
+        const sw = new THREE.Mesh(swGeo, swMat);
+        sw.position.set(0, slotY + swH / 2, 0);
+        sw.castShadow = true;
+        group.add(sw);
+
+        // Front panel
+        const panelW = rackW - 0.2;
+        const panelGeo = new THREE.BoxGeometry(panelW, swH - 0.04, 0.015);
+        const panelMat = new THREE.MeshPhongMaterial({ color: 0x1e293b, shininess: 20 });
+        const panel = new THREE.Mesh(panelGeo, panelMat);
+        panel.position.set(0, slotY + swH / 2, frontZ + 0.12);
+        group.add(panel);
+
+        // Node name label (small, left-aligned)
+        const nodeName = tn.node_name || tn.node_id || '?';
+        const nnLabel = makeTextSprite(nodeName.slice(0, 12), { fontSize: 14, color: '#94a3b8', scale: 0.12 });
+        nnLabel.position.set(-panelW / 2 + 0.2, slotY + swH - 0.06, frontZ + 0.16);
+        nnLabel.userData = { isLabel: true };
+        group.add(nnLabel);
+
+        // RJ45 port LEDs — small coloured dots in a row on the front.
+        // Green = link up, red = link down, blue = bridge.
+        const portStartX = -panelW / 2 + 0.08;
+        const portSpacing = 0.065;
+        const portZ = frontZ + 0.14;
+        const ledR = 0.022;
+        const portLedGeo = new THREE.SphereGeometry(ledR, 8, 8);
+        const portRowY = slotY + swH / 2 - 0.08;
+
+        // Physical ports — top row
+        ifaces.forEach((iface, idx) => {
+            if (idx > 14) return; // max 15 per row
+            const px = portStartX + idx * portSpacing;
+            const portColor = iface.link_up ? 0x22c55e : 0xef4444;
+            const led = new THREE.Mesh(portLedGeo, new THREE.MeshBasicMaterial({ color: portColor }));
+            led.position.set(px, portRowY, portZ);
+            group.add(led);
+            // Tiny glow for up ports
+            if (iface.link_up) {
+                const glow = new THREE.PointLight(portColor, 0.08, 0.5);
+                glow.position.set(px, portRowY, portZ + 0.05);
+                group.add(glow);
+            }
+        });
+
+        // Bridges — bottom row (cyan)
+        const brRowY = portRowY - portSpacing * 1.5;
+        bridges.forEach((br, idx) => {
+            if (idx > 14) return;
+            const px = portStartX + idx * portSpacing;
+            const led = new THREE.Mesh(portLedGeo, new THREE.MeshBasicMaterial({ color: 0x06b6d4 }));
+            led.position.set(px, brRowY, portZ);
+            group.add(led);
+        });
+
+        slotY += swH + unitGap + 0.04;
+    });
+
+    // If we had more topo nodes than slots, overflow indicator
+    if (topoNodes.length > nodesToShow.length) {
+        const extra = topoNodes.length - nodesToShow.length;
+        const overLabel = makeTextSprite(`+${extra} more`, { fontSize: 14, color: '#64748b', scale: 0.14 });
+        overLabel.position.set(0, slotY + 0.1, frontZ + 0.15);
+        overLabel.userData = { isLabel: true };
+        group.add(overLabel);
+    }
+
+    // Side accent strips (same as server racks)
+    const stripGeo = new THREE.BoxGeometry(0.02, rackH - 0.5, 0.02);
+    const stripMat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.8 });
+    const stripL = new THREE.Mesh(stripGeo, stripMat); stripL.position.set(-rackW/2 - 0.02, rackH/2, frontZ); group.add(stripL);
+    const stripR = new THREE.Mesh(stripGeo, stripMat.clone()); stripR.position.set(rackW/2 + 0.02, rackH/2, frontZ); group.add(stripR);
+
+    // Subtle cyan glow — network equipment vibe
+    const glow = new THREE.PointLight(0x06b6d4, 0.25, 5);
+    glow.position.set(0, 2.5, frontZ - 0.5);
+    group.add(glow);
+
+    group.userData = { isRack: true, isNetworkRack: true, clusterName };
+    return group;
+}
+
 function buildTopologyScene() {
     if (!_topo) return;
     const { scene } = _topo;
@@ -32423,6 +32591,9 @@ function buildTopologyScene() {
     _topo.extraMeshes = [];
     _topo.connectionLines = [];
     _topo.labelSprites = [];
+    // Allow the network rack fetch to trigger one more rebuild if data
+    // arrived between clears.
+    if (_topoNetworkCache) _topo._networkBuilt = true;
 
     if (nodes.length === 0) return;
 
@@ -32437,9 +32608,10 @@ function buildTopologyScene() {
     const cNames = Object.keys(clusters);
     const cColors = [0xdc2626, 0x3b82f6, 0x10b981, 0xf59e0b, 0x8b5cf6, 0xec4899, 0x06b6d4, 0xf97316];
     const rackSpacing = 2.0;
-    const clusterGap = 4.0;
+    const clusterGap = 5.0;
 
-    // Lay out racks in rows per cluster
+    // Lay out racks in rows per cluster. Each cluster gets its server
+    // racks then one extra WolfRouter network rack at the end.
     let offsetX = 0;
     cNames.forEach((cName, ci) => {
         const color = cColors[ci % cColors.length];
@@ -32453,21 +32625,18 @@ function buildTopologyScene() {
             scene.add(rack);
             _topo.nodeMeshes.push(rack);
 
-            // Critical warning ! above rack if any metric is critical
             if (rack.userData._hasCritical) {
                 const warn = makeTextSprite('!', { fontSize: 48, color: '#ef4444', scale: 0.6 });
                 warn.position.set(x, 6.8, 0);
                 warn.userData = { isLabel: true, isWarning: true };
                 scene.add(warn);
                 _topo.labelSprites.push(warn);
-                // Red glow above rack
                 const warnLight = new THREE.PointLight(0xef4444, 0.5, 8);
                 warnLight.position.set(x, 6.5, -0.5);
                 scene.add(warnLight);
                 _topo.extraMeshes.push(warnLight);
             }
 
-            // Server name on the side of the rack — rotated 90 degrees, small white text
             const nameLabel = makeTextSprite(node.hostname || node.id, {
                 fontSize: 24,
                 color: '#ccccdd',
@@ -32480,8 +32649,26 @@ function buildTopologyScene() {
             _topo.labelSprites.push(nameLabel);
         });
 
-        // Cluster name label above racks
-        const midX = startX + (clusterNodes.length - 1) * rackSpacing / 2;
+        // WolfRouter network rack — placed after the last server rack
+        // in this cluster row, separated by one rack spacing.
+        const netX = offsetX + clusterNodes.length * rackSpacing;
+        if (_topoNetworkCache) {
+            const netRack = buildNetworkRack(cName, clusterNodes, color, _topoNetworkCache);
+            netRack.position.set(netX, 0, 0);
+            scene.add(netRack);
+            _topo.extraMeshes.push(netRack);
+            // Side label
+            const netLabel = makeTextSprite('Network', { fontSize: 20, color: '#06b6d4', scale: 0.4 });
+            netLabel.position.set(netX + 0.82, 2.8, 0);
+            netLabel.material.rotation = -Math.PI / 2;
+            netLabel.userData = { isLabel: true, isSideLabel: true };
+            scene.add(netLabel);
+            _topo.labelSprites.push(netLabel);
+        }
+        const totalRacksInCluster = clusterNodes.length + (_topoNetworkCache ? 1 : 0);
+
+        // Cluster name label above racks (centred over all racks incl network)
+        const midX = startX + (totalRacksInCluster - 1) * rackSpacing / 2;
         const clabel = makeTextSprite(cName, {
             fontSize: 32,
             color: '#' + color.toString(16).padStart(6, '0'),
@@ -32492,7 +32679,7 @@ function buildTopologyScene() {
         scene.add(clabel);
         _topo.labelSprites.push(clabel);
 
-        offsetX += clusterNodes.length * rackSpacing + clusterGap;
+        offsetX += totalRacksInCluster * rackSpacing + clusterGap;
     });
 
     // Centre the scene
@@ -32536,10 +32723,24 @@ function buildTopologyScene() {
             Promise.all(uncached.map(n => topoFetchContainers(n.id))).then(() => {
                 _topo._fetchingNames = false;
                 if (_topo && !_topo.disposed && currentPage === 'topology') {
-                    buildTopologyScene(); // rebuild with real names + stats for LEDs
+                    buildTopologyScene();
                 }
             }).catch(() => { _topo._fetchingNames = false; });
         }
+    }
+    // Lazy-fetch WolfRouter network topology for the per-cluster network racks.
+    // A single fetch covers all clusters (the API returns all nodes).
+    if (!_topo._fetchingNetwork) {
+        _topo._fetchingNetwork = true;
+        topoFetchNetworkTopology().then(data => {
+            _topo._fetchingNetwork = false;
+            if (data && !_topo._networkBuilt) {
+                _topo._networkBuilt = true;
+                if (_topo && !_topo.disposed && currentPage === 'topology') {
+                    buildTopologyScene();
+                }
+            }
+        }).catch(() => { _topo._fetchingNetwork = false; });
     }
 }
 
