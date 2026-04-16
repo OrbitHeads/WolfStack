@@ -14604,7 +14604,14 @@ async function openLxcStorage(name) {
         const list = r.ok ? await r.json() : {};
         const storages = Array.isArray(list.storages) ? list.storages : [];
         let opts = '';
-        if (info.proxmox || list.proxmox) {
+        // Branch on the container's nature, not the host's — the UI
+        // label and the backend migrate handler both switch on
+        // info.proxmox only. If we also keyed off list.proxmox a PVE
+        // host holding a native LXC CT (e.g. numeric name "106") would
+        // get PVE storage IDs in the dropdown but a native rsync in
+        // the backend, which then treats "wolfpool" as a filesystem
+        // path and fails.
+        if (info.proxmox) {
             // PVE: rootdir or images content types can host LXC rootfs.
             const usable = storages.filter(s =>
                 s.content && s.content.some(c => c === 'rootdir' || c === 'images')
@@ -14670,7 +14677,7 @@ async function openLxcStorage(name) {
                     <label style="flex:1;">New size (GB)
                         <input id="lxc-storage-size" type="number" class="form-control" value="${currentGb + 4}" min="${currentGb}"/>
                     </label>
-                    <button class="btn btn-primary" onclick="lxcStorageResize('${escapeHtml(name)}')" style="height:34px;">Resize</button>
+                    <button class="btn btn-primary" onclick="lxcStorageResize(this, '${escapeHtml(name)}')" style="height:34px;">Resize</button>
                 </div>
                 <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">
                     ${info.backend === 'directory' ? '⚠️ Directory backend has no per-container quota — grow the host filesystem instead.' :
@@ -14689,7 +14696,7 @@ async function openLxcStorage(name) {
                     <label style="display:flex; align-items:center; gap:4px; font-size:12px;">
                         <input type="checkbox" id="lxc-storage-remove"/> remove source
                     </label>
-                    <button class="btn" onclick="lxcStorageMigrate('${escapeHtml(name)}')" style="height:34px;">Migrate</button>
+                    <button class="btn" onclick="lxcStorageMigrate(this, '${escapeHtml(name)}')" style="height:34px;">Migrate</button>
                 </div>
                 <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">
                     ${info.proxmox ? 'PVE move-volume copies the volume between storage pools (zfs send/recv, dd, etc).' : 'rsync -aHAX preserves perms/xattrs. Container should be stopped for a clean move.'}
@@ -14702,8 +14709,14 @@ async function openLxcStorage(name) {
     document.body.appendChild(overlay);
 }
 
-async function lxcStorageResize(name) {
-    const sizeGb = parseInt(document.getElementById('lxc-storage-size').value, 10);
+async function lxcStorageResize(btn, name) {
+    // Scope field lookups to the modal this button lives in — the same
+    // ID may exist elsewhere in the DOM (e.g. a storage modal for a
+    // different container still open) and document.getElementById would
+    // pick the first one, not the one the user is actually looking at.
+    const overlay = btn?.closest?.('.modal-overlay') || document;
+    const sizeEl = overlay.querySelector('#lxc-storage-size');
+    const sizeGb = parseInt(sizeEl?.value, 10);
     if (!sizeGb || sizeGb < 1) { alert('Enter a size in GB'); return; }
     if (!(await showConfirm(`Resize ${name}'s disk to ${sizeGb} GB?`))) return;
     try {
@@ -14718,13 +14731,22 @@ async function lxcStorageResize(name) {
             return;
         }
         showToast(data.message || 'Resized', 'success');
-        document.querySelector('.modal-overlay')?.remove();
+        overlay.remove?.();
     } catch (e) { showToast('Error: ' + e.message, 'error'); }
 }
 
-async function lxcStorageMigrate(name) {
-    const target = document.getElementById('lxc-storage-target').value.trim();
-    const removeSource = document.getElementById('lxc-storage-remove').checked;
+async function lxcStorageMigrate(btn, name) {
+    // Scope field lookups to this modal — see lxcStorageResize for why.
+    // The previous code used document.getElementById which picks the
+    // first match anywhere on the page, so a lingering overlay could
+    // feed us the wrong storage target / checkbox state and produce
+    // confirms like "Migrate 106 to local? (source will be kept)"
+    // when the user had picked wolfpool with remove-source ticked.
+    const overlay = btn?.closest?.('.modal-overlay') || document;
+    const targetEl = overlay.querySelector('#lxc-storage-target');
+    const removeEl = overlay.querySelector('#lxc-storage-remove');
+    const target = (targetEl?.value || '').trim();
+    const removeSource = !!removeEl?.checked;
     if (!target) { alert('Pick or enter a target storage'); return; }
     if (!(await showConfirm(`Migrate ${name} to ${target}? ${removeSource ? '(source will be removed after copy)' : '(source will be kept)'}`))) return;
     try {
@@ -14739,7 +14761,7 @@ async function lxcStorageMigrate(name) {
             return;
         }
         showToast(data.message || 'Migrate started', 'success', 8000);
-        document.querySelector('.modal-overlay')?.remove();
+        overlay.remove?.();
     } catch (e) { showToast('Error: ' + e.message, 'error'); }
 }
 
@@ -23561,12 +23583,36 @@ function populateSystemCheckNodes() {
     if (prev && nodes.some(n => n.id === prev)) sel.value = prev;
 }
 
+// Probe for a popup blocker. Must run inside the user-gesture that
+// triggered runSystemCheck() — calling window.open() outside a gesture
+// is blocked by every browser and would give a false positive. The
+// test window is opened off-screen at 1×1 and closed immediately.
+function checkBrowserPopupBlocker() {
+    let popup = null;
+    try {
+        popup = window.open('about:blank', 'wolfstack_popup_test',
+            'width=1,height=1,left=-9999,top=-9999,menubar=no,toolbar=no,location=no,status=no');
+    } catch (e) {
+        return { blocked: true, reason: e.message || String(e) };
+    }
+    if (!popup || popup.closed || typeof popup.closed === 'undefined') {
+        return { blocked: true, reason: 'window.open returned null' };
+    }
+    try { popup.close(); } catch (_) {}
+    return { blocked: false };
+}
+
 async function runSystemCheck() {
     const out = document.getElementById('systemcheck-results');
     const btn = document.getElementById('systemcheck-run-btn');
     const sel = document.getElementById('systemcheck-node');
     if (!out) return;
     if (btn) { btn.disabled = true; btn.textContent = 'Scanning…'; }
+
+    // Run the popup-blocker probe now, while we're still inside the
+    // click handler's user-gesture. Anything after the await below is
+    // outside the gesture and window.open() would be blocked regardless.
+    const popupResult = checkBrowserPopupBlocker();
 
     // Local vs remote — a blank selection (or a self-node) hits the
     // local endpoint; anything else proxies through the cluster.
@@ -23585,6 +23631,7 @@ async function runSystemCheck() {
         const data = await r.json();
         data._targetLabel = targetLabel;
         data._targetNodeId = nodeId || '';
+        data._browserPopup = popupResult;
         renderSystemCheckResults(data);
     } catch (e) {
         out.innerHTML = `<div style="color:#ef4444; padding:24px;">System check failed on ${escapeHtml(targetLabel)}: ${escapeHtml(e.message || String(e))}</div>`;
@@ -23596,9 +23643,29 @@ async function runSystemCheck() {
 function renderSystemCheckResults(data) {
     const out = document.getElementById('systemcheck-results');
     if (!out) return;
-    const checks = data.checks || [];
+    const checks = (data.checks || []).slice();
     const aiEnabled = !!data.ai_enabled;
     const targetNodeId = data._targetNodeId || '';
+
+    // Browser-side popup-blocker check. WolfStack opens VNC/console/
+    // installer/download windows via window.open(), so a blocker here
+    // silently breaks those features — worth surfacing with the rest
+    // of the health checks.
+    if (data._browserPopup) {
+        const blocked = data._browserPopup.blocked;
+        checks.push({
+            category: 'Browser',
+            name: 'Popup blocker',
+            status: blocked ? 'warning' : 'ok',
+            detail: blocked
+                ? 'Your browser blocked a test popup. Consoles, VNC, file downloads and installer windows will fail to open.'
+                : 'Browser allows popups from this site — consoles, VNC and installer windows will open correctly.',
+            install_hint: blocked
+                ? 'Allow popups for this site in your browser settings, then re-run the check.'
+                : null,
+            ai_helpful: false,
+        });
+    }
 
     // Summary counters — at-a-glance tells the operator whether the
     // server is healthy before they scroll the detailed list.
@@ -23622,7 +23689,7 @@ function renderSystemCheckResults(data) {
     for (const c of checks) {
         (byCat[c.category] = byCat[c.category] || []).push(c);
     }
-    const order = ['Core', 'Containers', 'Virtualisation', 'Networking', 'Storage', 'USB'];
+    const order = ['Core', 'Containers', 'Virtualisation', 'Networking', 'Storage', 'USB', 'Browser'];
     const cats = [...order.filter(c => byCat[c]), ...Object.keys(byCat).filter(c => !order.includes(c))];
 
     // Sort each category so problems bubble to the top.
