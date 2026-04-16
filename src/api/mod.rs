@@ -16473,13 +16473,27 @@ pub async fn plugins_store(req: HttpRequest, state: web::Data<AppState>) -> Http
             "feature": "plugins"
         }));
     }
-    // Fetch the index from the remote store
+    // Fetch the index from the remote store. Cache-bust per-request with
+    // `?t=<epoch-ms>` and send `Cache-Control: no-cache` so neither the
+    // GitHub raw CDN (max-age=300) nor any upstream proxy hands back a
+    // stale index after someone publishes a new plugin. Without this,
+    // users could wait up to 5 minutes for a new plugin to appear in
+    // the store, and stale-cache debugging ate a chunk of v17.4.14
+    // support time.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .danger_accept_invalid_certs(true)
         .build()
         .unwrap_or_default();
-    match client.get(PLUGIN_INDEX_URL).send().await {
+    let bust = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis()).unwrap_or(0);
+    let url = format!("{}?t={}", PLUGIN_INDEX_URL, bust);
+    match client.get(&url)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send().await
+    {
         Ok(resp) if resp.status().is_success() => {
             let body = resp.text().await.unwrap_or_else(|_| "[]".to_string());
             // Parse to validate, then return. Tag each plugin with installed status.
@@ -16490,7 +16504,13 @@ pub async fn plugins_store(req: HttpRequest, state: web::Data<AppState>) -> Http
                 let is_installed = installed.iter().any(|i| i.manifest.id == id);
                 p["installed"] = serde_json::json!(is_installed);
             }
-            HttpResponse::Ok().json(plugins)
+            // Prevent browser from caching this response — otherwise the user
+            // has to hard-refresh to see a newly-published plugin, which is
+            // the "it's still not showing" support pattern.
+            HttpResponse::Ok()
+                .insert_header(("Cache-Control", "no-store, no-cache, must-revalidate"))
+                .insert_header(("Pragma", "no-cache"))
+                .json(plugins)
         }
         Ok(resp) => HttpResponse::BadGateway().json(serde_json::json!({
             "error": format!("Plugin store returned HTTP {}", resp.status())
