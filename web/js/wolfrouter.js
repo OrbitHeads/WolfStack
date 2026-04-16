@@ -969,6 +969,16 @@
                         <label>Pool start<input id="wr-l-pool-start" class="form-control"/></label>
                         <label>Pool end<input id="wr-l-pool-end" class="form-control"/></label>
                         <label>Lease time<input id="wr-l-lease" class="form-control" value="12h"/></label>
+                        <div style="grid-column:1/-1;">
+                            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                                <strong style="font-size:12px;">Static reservations</strong>
+                                <button class="btn btn-sm" onclick="wrLanAddReservationRow()">+ Add reservation</button>
+                            </div>
+                            <div style="font-size:11px; color:var(--text-muted); margin-bottom:6px;">
+                                MAC-pinned IPs. Handy for servers, printers, cameras, IoT that needs a stable address. You can also use the 📌 <strong>Pin</strong> button on the DHCP Leases tab to promote an active lease here with one click.
+                            </div>
+                            <div id="wr-l-reservations" style="display:flex; flex-direction:column; gap:4px;"></div>
+                        </div>
                         <label style="grid-column:1/-1;">DNS provider
                             <select id="wr-l-fwd-preset" class="form-control" onchange="wrLanApplyDnsPreset()">${wrDnsPresetOptionsHtml()}</select>
                             <input id="wr-l-fwd" class="form-control" value="1.1.1.1, 1.0.0.1" style="margin-top:4px;" placeholder="comma-separated IPs"/>
@@ -1019,7 +1029,37 @@
         const presetId = wrDnsPresetFromServers(l.dns.forwarders);
         document.getElementById('wr-l-fwd-preset').value = presetId;
         document.getElementById('wr-l-ads').checked = !!l.dns.block_ads;
+
+        // Populate the reservations editor from existing data. Each row
+        // is a live DOM block the user can edit; wrSaveLan reads them
+        // back when saving.
+        const resContainer = document.getElementById('wr-l-reservations');
+        if (resContainer) {
+            resContainer.innerHTML = '';
+            for (const r of (l.dhcp?.reservations || [])) {
+                wrLanAddReservationRow(r);
+            }
+        }
     }
+
+    /// Append one reservation row to the LAN editor. `seed` (optional)
+    /// pre-fills the row when opening for edit. MAC + IP validate on
+    /// save; hostname is free-form because dnsmasq accepts any label.
+    function wrLanAddReservationRow(seed) {
+        const container = document.getElementById('wr-l-reservations');
+        if (!container) return;
+        const row = document.createElement('div');
+        row.className = 'wr-l-res-row';
+        row.style.cssText = 'display:grid; grid-template-columns: 180px 150px 1fr 32px; gap:4px; align-items:center;';
+        row.innerHTML = `
+            <input class="form-control wr-l-res-mac" placeholder="aa:bb:cc:dd:ee:ff" style="font-family:var(--font-mono); font-size:12px;" value="${escHtml(seed?.mac || '')}"/>
+            <input class="form-control wr-l-res-ip" placeholder="192.168.10.50" style="font-family:var(--font-mono); font-size:12px;" value="${escHtml(seed?.ip || '')}"/>
+            <input class="form-control wr-l-res-host" placeholder="hostname (optional)" style="font-size:12px;" value="${escHtml(seed?.hostname || '')}"/>
+            <button class="btn btn-sm" title="Remove this reservation" onclick="this.closest('.wr-l-res-row').remove()">×</button>
+        `;
+        container.appendChild(row);
+    }
+    window.wrLanAddReservationRow = wrLanAddReservationRow;
 
     // Fill the forwarders text input from the selected preset. "custom"
     // leaves whatever the user has typed so they don't lose their work.
@@ -1106,12 +1146,42 @@
         lan.router_ip = document.getElementById('wr-l-router').value.trim();
         const zoneVal = document.getElementById('wr-l-zone').value;
         lan.zone = wrValueToZone(zoneVal) || { kind: 'lan', id: 0 };
+        // Collect + validate reservations. Malformed rows abort the save
+        // with a visible error so the user can fix them — skipping them
+        // silently would confuse people who think they saved a reservation
+        // that actually got dropped.
+        const resRows = Array.from(document.querySelectorAll('#wr-l-reservations .wr-l-res-row'));
+        const macRe = /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i;
+        const ipRe = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+        const reservations = [];
+        const seenMacs = new Set();
+        for (const row of resRows) {
+            const mac = row.querySelector('.wr-l-res-mac').value.trim().toLowerCase();
+            const ip = row.querySelector('.wr-l-res-ip').value.trim();
+            const hostname = row.querySelector('.wr-l-res-host').value.trim();
+            if (!mac && !ip && !hostname) continue;  // empty row — silently drop
+            if (!macRe.test(mac)) {
+                say('❌', `Reservation has an invalid MAC: <code>${escHtml(mac || '(empty)')}</code>. Expected <code>aa:bb:cc:dd:ee:ff</code>. Save aborted.`, '#ef4444');
+                unlock(); return;
+            }
+            if (!ipRe.test(ip)) {
+                say('❌', `Reservation for <code>${escHtml(mac)}</code> has an invalid IP: <code>${escHtml(ip || '(empty)')}</code>. Save aborted.`, '#ef4444');
+                unlock(); return;
+            }
+            if (seenMacs.has(mac)) {
+                say('❌', `Duplicate MAC in reservations: <code>${escHtml(mac)}</code>. Each MAC can only be pinned to one IP. Save aborted.`, '#ef4444');
+                unlock(); return;
+            }
+            seenMacs.add(mac);
+            reservations.push({ mac, ip, hostname: hostname || null });
+        }
+
         lan.dhcp = Object.assign(lan.dhcp || {}, {
             enabled: document.getElementById('wr-l-dhcp-enabled').checked,
             pool_start: document.getElementById('wr-l-pool-start').value.trim(),
             pool_end: document.getElementById('wr-l-pool-end').value.trim(),
             lease_time: document.getElementById('wr-l-lease').value.trim(),
-            reservations: lan.dhcp?.reservations || [],
+            reservations,
             extra_options: lan.dhcp?.extra_options || [],
         });
         lan.dns = Object.assign(lan.dns || {}, {
@@ -1235,14 +1305,33 @@
             try {
                 const r = await fetch(wrUrl('/api/router/segments/' + lan.id + '/leases'));
                 const leases = r.ok ? await r.json() : [];
+                // Build a quick MAC → reservation map so the "Pin" button
+                // shows "Pinned" instead when the lease is already static.
+                const reservedMacs = new Set((lan.dhcp?.reservations || []).map(r => (r.mac || '').toLowerCase()));
                 parts.push(`
                     <div style="margin-bottom:18px;">
                         <div style="font-weight:600; margin-bottom:6px;">${escHtml(lan.name)} <span style="color:var(--text-muted); font-size:12px;">(${leases.length} active)</span></div>
                         <table class="data-table" style="font-size:12px;">
-                            <thead><tr><th>IP</th><th>MAC</th><th>Hostname</th><th>Expires (epoch)</th></tr></thead>
+                            <thead><tr><th>IP</th><th>MAC</th><th>Hostname</th><th>Expires (epoch)</th><th style="width:90px;">Action</th></tr></thead>
                             <tbody>
-                                ${leases.length ? leases.map(le => `<tr><td><code>${escHtml(le.ip)}</code></td><td><code>${escHtml(le.mac)}</code></td><td>${escHtml(le.hostname || '—')}</td><td style="color:var(--text-muted);">${le.expires}</td></tr>`).join('')
-                                : '<tr><td colspan="4" style="text-align:center; color:var(--text-muted); padding:12px;">No active leases</td></tr>'}
+                                ${leases.length ? leases.map(le => {
+                                    const macLc = (le.mac || '').toLowerCase();
+                                    const alreadyPinned = reservedMacs.has(macLc);
+                                    // Button passes identifiers via data-* attributes and
+                                    // has wrPinLease read them back via `this.dataset` — keeps
+                                    // user-supplied hostnames out of the inline onclick string
+                                    // where a stray quote could break the JS (or worse).
+                                    const btn = alreadyPinned
+                                        ? `<span class="badge" style="background:rgba(34,197,94,0.15); color:#22c55e; font-size:10px;">📌 pinned</span>`
+                                        : `<button class="btn btn-sm wr-lease-pin" title="Pin this MAC → IP so it always gets this address"
+                                                data-lan="${escHtml(lan.id)}"
+                                                data-mac="${escHtml(le.mac)}"
+                                                data-ip="${escHtml(le.ip)}"
+                                                data-host="${escHtml(le.hostname || '')}"
+                                                onclick="wrPinLease(this)">📌 Pin</button>`;
+                                    return `<tr><td><code>${escHtml(le.ip)}</code></td><td><code>${escHtml(le.mac)}</code></td><td>${escHtml(le.hostname || '—')}</td><td style="color:var(--text-muted);">${le.expires}</td><td>${btn}</td></tr>`;
+                                }).join('')
+                                : '<tr><td colspan="5" style="text-align:center; color:var(--text-muted); padding:12px;">No active leases</td></tr>'}
                             </tbody>
                         </table>
                     </div>
@@ -1251,6 +1340,83 @@
         }
         container.innerHTML = parts.join('');
     }
+
+    /// Promote an active DHCP lease to a static reservation. Pre-fills
+    /// mac/ip/hostname from whatever dnsmasq is currently serving for
+    /// this client — 99% of the time exactly what the user wants when
+    /// they see the button next to a lease.
+    ///
+    /// Reads its inputs from the button's data-* attributes so nothing
+    /// user-supplied ever lives in the inline onclick string.
+    ///
+    /// Serialised via wrState.pinning so two quick clicks don't race the
+    /// reload window: without the guard, a second click while wrLoadAll
+    /// is still fetching would read the pre-first-click wrState.lans,
+    /// issue a PUT that clobbers the first reservation we just wrote.
+    async function wrPinLease(btn) {
+        if (!btn) return;
+        if (wrState.pinning) {
+            btn.textContent = '⏳ busy…';
+            setTimeout(() => { btn.textContent = '📌 Pin'; }, 700);
+            return;
+        }
+        wrState.pinning = true;
+        const lanId = btn.dataset.lan || '';
+        const mac = btn.dataset.mac || '';
+        const ip = btn.dataset.ip || '';
+        const hostname = btn.dataset.host || '';
+        const origLabel = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = '⏳ Pinning…';
+        try {
+            const lan = (wrState.lans || []).find(l => l.id === lanId);
+            if (!lan) { btn.textContent = '✗ LAN not found'; return; }
+            // Defensive clone — don't mutate wrState in place; the next
+            // poll will refresh anyway.
+            const updated = JSON.parse(JSON.stringify(lan));
+            updated.dhcp = updated.dhcp || {};
+            updated.dhcp.reservations = updated.dhcp.reservations || [];
+            // Skip if already present (shouldn't happen — button says "pinned"
+            // in that case — but belt and braces).
+            const macLc = (mac || '').toLowerCase();
+            if (updated.dhcp.reservations.some(r => (r.mac || '').toLowerCase() === macLc)) {
+                btn.textContent = '📌 already pinned';
+                return;
+            }
+            updated.dhcp.reservations.push({
+                mac: macLc,
+                ip,
+                hostname: hostname || null,
+            });
+            const r = await fetch(wrUrl('/api/router/segments/' + encodeURIComponent(lanId)), {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(updated),
+            });
+            if (r.ok) {
+                btn.textContent = '✓ pinned';
+                btn.style.background = 'rgba(34,197,94,0.15)';
+                btn.style.color = '#22c55e';
+                // Refresh wrState + re-render so the column flips to the
+                // "pinned" badge on next render (plus any neighbouring
+                // state stays fresh).
+                await wrLoadAll();
+            } else {
+                const txt = await r.text();
+                btn.textContent = '✗ failed';
+                alert('Could not pin lease: ' + txt);
+                btn.disabled = false;
+                btn.textContent = origLabel;
+            }
+        } catch (e) {
+            btn.disabled = false;
+            btn.textContent = origLabel;
+            alert('Pin failed: ' + (e.message || e));
+        } finally {
+            wrState.pinning = false;
+        }
+    }
+    window.wrPinLease = wrPinLease;
 
     // ─── Zones ───
 

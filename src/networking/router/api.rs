@@ -161,6 +161,18 @@ fn validate_segment(seg: &LanSegment) -> Result<(), String> {
         check(&format!("reservations[{}].mac", i), &r.mac)?;
         check(&format!("reservations[{}].ip", i), &r.ip)?;
         if let Some(h) = &r.hostname { check(&format!("reservations[{}].hostname", i), h)?; }
+        // dnsmasq renders reservations as `dhcp-host=<mac>,<ip>[,<hostname>]`
+        // — a literal comma in any field would inject an extra dnsmasq
+        // option (e.g. `tag:foo`, `set:group`, `interface=eth0`). The
+        // LAN editor's regex already blocks this, but wrPinLease takes
+        // MAC/IP straight from the lease file without re-validating;
+        // defence-in-depth here keeps the backend safe regardless of
+        // how the field arrived.
+        if r.mac.contains(',') { return Err(format!("reservations[{}].mac contains comma", i)); }
+        if r.ip.contains(',')  { return Err(format!("reservations[{}].ip contains comma", i)); }
+        if let Some(h) = &r.hostname {
+            if h.contains(',') { return Err(format!("reservations[{}].hostname contains comma", i)); }
+        }
     }
     for (i, opt) in seg.dhcp.extra_options.iter().enumerate() {
         check(&format!("extra_options[{}]", i), opt)?;
