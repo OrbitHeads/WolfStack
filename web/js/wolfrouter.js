@@ -245,6 +245,7 @@
         if (tab === 'wan')          wrRenderWan();
         if (tab === 'connections')  wrRenderConnections();
         if (tab === 'packets')      wrRenderPackets();
+        if (tab === 'tools')        wrRenderDnsTools();
         if (tab === 'logs')         wrRenderLogs();
     }
 
@@ -966,9 +967,12 @@
                         <label>Pool start<input id="wr-l-pool-start" class="form-control"/></label>
                         <label>Pool end<input id="wr-l-pool-end" class="form-control"/></label>
                         <label>Lease time<input id="wr-l-lease" class="form-control" value="12h"/></label>
-                        <label>DNS forwarders (comma-separated)<input id="wr-l-fwd" class="form-control" value="1.1.1.1, 9.9.9.9"/></label>
-                        <label style="display:flex; gap:8px; align-items:center;">
-                            <input type="checkbox" id="wr-l-ads"/>Block ads/trackers via DNS
+                        <label style="grid-column:1/-1;">DNS provider
+                            <select id="wr-l-fwd-preset" class="form-control" onchange="wrLanApplyDnsPreset()">${wrDnsPresetOptionsHtml()}</select>
+                            <input id="wr-l-fwd" class="form-control" value="1.1.1.1, 1.0.0.1" style="margin-top:4px;" placeholder="comma-separated IPs"/>
+                        </label>
+                        <label style="grid-column:1/-1; display:flex; gap:8px; align-items:center;">
+                            <input type="checkbox" id="wr-l-ads"/>Block ads/trackers via DNS (hosts-file block list)
                         </label>
                     </div>
                 </div>
@@ -1007,8 +1011,23 @@
         document.getElementById('wr-l-pool-end').value = l.dhcp.pool_end;
         document.getElementById('wr-l-lease').value = l.dhcp.lease_time || '12h';
         document.getElementById('wr-l-fwd').value = (l.dns.forwarders || []).join(', ');
+        // Match the current forwarders against the preset list so the
+        // dropdown shows the right label when opened for editing.
+        const presetId = wrDnsPresetFromServers(l.dns.forwarders);
+        document.getElementById('wr-l-fwd-preset').value = presetId;
         document.getElementById('wr-l-ads').checked = !!l.dns.block_ads;
     }
+
+    // Fill the forwarders text input from the selected preset. "custom"
+    // leaves whatever the user has typed so they don't lose their work.
+    function wrLanApplyDnsPreset() {
+        const sel = document.getElementById('wr-l-fwd-preset');
+        const input = document.getElementById('wr-l-fwd');
+        if (!sel || !input) return;
+        const preset = WR_DNS_PRESETS.find(p => p.id === sel.value);
+        if (preset?.servers) input.value = preset.servers.join(', ');
+    }
+    window.wrLanApplyDnsPreset = wrLanApplyDnsPreset;
 
     // Populate the Interface dropdown from the selected node's interfaces + bridges.
     function wrLanPopulateIfaces() {
@@ -3780,6 +3799,33 @@
         return (p >= 0 && p <= 32) ? p : null;
     }
 
+    // DNS forwarder presets. Keyed so the LAN editor + Quick Setup wizard
+    // can switch forwarders with a single select change. "custom" keeps
+    // whatever the user typed.
+    const WR_DNS_PRESETS = [
+        { id: 'cloudflare', label: 'Cloudflare (1.1.1.1)',         servers: ['1.1.1.1', '1.0.0.1'] },
+        { id: 'google',     label: 'Google (8.8.8.8)',             servers: ['8.8.8.8', '8.8.4.4'] },
+        { id: 'quad9',      label: 'Quad9 (9.9.9.9, filters malware)', servers: ['9.9.9.9', '149.112.112.112'] },
+        { id: 'opendns',    label: 'OpenDNS (Cisco)',              servers: ['208.67.222.222', '208.67.220.220'] },
+        { id: 'adguard',    label: 'AdGuard (blocks ads/trackers)', servers: ['94.140.14.14', '94.140.15.15'] },
+        { id: 'custom',     label: 'Custom — enter below',          servers: null },
+    ];
+
+    function wrDnsPresetOptionsHtml() {
+        return WR_DNS_PRESETS.map(p =>
+            `<option value="${p.id}">${p.label}</option>`).join('');
+    }
+
+    // Look up which preset a list of forwarders matches (if any).
+    function wrDnsPresetFromServers(servers) {
+        const s = (servers || []).slice().sort().join(',');
+        for (const p of WR_DNS_PRESETS) {
+            if (!p.servers) continue;
+            if (p.servers.slice().sort().join(',') === s) return p.id;
+        }
+        return 'custom';
+    }
+
     // ─── Quick Setup wizard ───
     //
     // One click on the Zones tab → WAN + LAN records auto-created with
@@ -3854,7 +3900,15 @@
                     <div style="padding:16px; background:rgba(251,191,36,0.1); border:1px solid rgba(251,191,36,0.35); border-radius:6px;">
                         <strong>Assign zones first.</strong> Give at least one interface the <code>WAN</code> zone (your internet-facing NIC) and one or more the <code>LAN</code> zone (your home network side). Then come back here.
                     </div>` : `
-                    <p style="color:var(--text-muted); margin:0 0 12px;">Based on your zone assignments, WolfRouter will create the missing WAN + LAN records, assign the router IP to each LAN interface, and apply the firewall. Review below and edit any defaults, then click <strong>Run setup</strong>.</p>
+                    <div style="padding:10px 12px; margin-bottom:12px; background:rgba(239,68,68,0.1); border:1px solid rgba(239,68,68,0.35); border-radius:6px; font-size:12px;">
+                        <strong style="color:#fca5a5;">⚠ Shut down any other DHCP server on this LAN first.</strong>
+                        <div style="margin-top:3px; color:var(--text-muted);">If OPNsense, pfSense, your ISP router, a pi-hole, or another WolfRouter instance is still handing out leases on the same physical network, clients will get random leases from whichever server answered first — you'll see half the devices online and half unable to reach anything. One DHCP per broadcast domain.</div>
+                    </div>
+                    <p style="color:var(--text-muted); margin:0 0 12px;">Based on your zone assignments, WolfRouter will create the missing WAN + LAN records, assign the router IP to each LAN interface, apply the firewall, and verify DNS resolution end-to-end. Review below and edit any defaults, then click <strong>Run setup</strong>.</p>
+
+                    <label style="display:block; margin-bottom:10px;">DNS provider for every new LAN
+                        <select id="wr-qs-dns-preset" class="form-control" style="max-width:360px;">${wrDnsPresetOptionsHtml()}</select>
+                    </label>
 
                     ${wanPlan.length ? `
                     <h4 style="font-size:13px; margin:14px 0 6px;">🌍 WAN (internet uplink)</h4>
@@ -3947,8 +4001,14 @@
             }
         }
 
+        // Resolve the DNS provider once — applied to every LAN we create.
+        const dnsPresetId = document.getElementById('wr-qs-dns-preset')?.value || 'cloudflare';
+        const dnsPreset = WR_DNS_PRESETS.find(p => p.id === dnsPresetId);
+        const forwarders = (dnsPreset?.servers) || ['1.1.1.1', '1.0.0.1'];
+
         // 2. For each LAN-zoned iface: assign router IP to interface, bring up, create LanSegment.
         const lanHiddens = Array.from(document.querySelectorAll('#wr-qs-lan input[type="hidden"]'));
+        const createdLans = [];  // for the post-setup DNS validation pass
         for (const h of lanHiddens) {
             const node = h.dataset.node, iface = h.dataset.iface, zoneVal = h.dataset.zone;
             const card = h.closest('div');
@@ -3986,6 +4046,8 @@
             // 2c. Create the LAN segment (skip if already exists).
             if (h.dataset.skip === '1') {
                 log('ℹ', `LAN segment on <code>${escHtml(iface)}</code> already exists — IP re-confirmed only.`, 'var(--text-muted)');
+                // Still include in the DNS-validation pass so an existing-but-broken LAN gets flagged.
+                createdLans.push({ iface, routerIp });
                 continue;
             }
             const zoneObj = wrValueToZone(zoneVal);
@@ -3995,7 +4057,7 @@
                 subnet_cidr: cidr, router_ip: routerIp,
                 dhcp: { enabled: true, pool_start: poolStart, pool_end: poolEnd,
                         lease_time: '12h', reservations: [], extra_options: [] },
-                dns: { forwarders: ['1.1.1.1', '9.9.9.9'], local_records: [],
+                dns: { forwarders, local_records: [],
                        cache_enabled: true, block_ads: false },
                 description: 'Created by Quick Setup',
             };
@@ -4004,8 +4066,10 @@
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(body),
                 });
-                if (r.ok) log('✅', `LAN segment on <code>${escHtml(iface)}</code> created — dnsmasq serving DHCP+DNS on <code>${escHtml(cidr)}</code>.`, '#22c55e');
-                else log('❌', `LAN segment on <code>${escHtml(iface)}</code> failed: ${escHtml(await r.text())}`, '#ef4444');
+                if (r.ok) {
+                    log('✅', `LAN segment on <code>${escHtml(iface)}</code> created — dnsmasq serving DHCP+DNS on <code>${escHtml(cidr)}</code> (forwarders: ${escHtml(forwarders.join(', '))}).`, '#22c55e');
+                    createdLans.push({ iface, routerIp });
+                } else log('❌', `LAN segment on <code>${escHtml(iface)}</code> failed: ${escHtml(await r.text())}`, '#ef4444');
             } catch (e) {
                 log('❌', `LAN segment on <code>${escHtml(iface)}</code> errored: ${escHtml(e.message || e)}`, '#ef4444');
             }
@@ -4020,9 +4084,465 @@
             log('❌', `Firewall apply errored: ${escHtml(e.message || e)}`, '#ef4444');
         }
 
+        // 4. Host-side DNS bind check for each created LAN. This only
+        // confirms dnsmasq is bound on the router IP (the query routes
+        // via lo from the host) — it does NOT prove LAN clients can
+        // reach it. For that, point the user at the DNS Tools tab's
+        // LAN-side health section.
+        if (createdLans.length) {
+            log('⏳', 'Running host-side dnsmasq bind check on each LAN…', 'var(--text-muted)');
+            // Give dnsmasq a moment to finish binding after segment create.
+            await new Promise(r => setTimeout(r, 800));
+            let anyFailed = false;
+            for (const cl of createdLans) {
+                try {
+                    const r = await fetch(wrUrl('/api/router/test-dns'), {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ router_ip: cl.routerIp, hostname: 'cloudflare.com' }),
+                    });
+                    const j = await r.json();
+                    if (j.success) {
+                        log('✅', `dnsmasq on <code>${escHtml(cl.iface)}</code> (<code>${escHtml(cl.routerIp)}</code>) is bound and answering host-side — resolved cloudflare.com → <code>${escHtml((j.answer || '').split('\n')[0])}</code> in ${j.duration_ms}ms. (Host-side only — doesn't prove LAN clients can reach it.)`, '#22c55e');
+                    } else {
+                        anyFailed = true;
+                        log('❌', `dnsmasq bind check on <code>${escHtml(cl.iface)}</code> (<code>${escHtml(cl.routerIp)}</code>): ${escHtml(j.error || 'failed')}`, '#ef4444');
+                    }
+                } catch (e) {
+                    anyFailed = true;
+                    log('⚠', `DNS bind check on <code>${escHtml(cl.iface)}</code> errored (dig not installed?): ${escHtml(e.message || e)}`, '#fbbf24');
+                }
+            }
+            if (anyFailed) {
+                log('ℹ', 'Open the <strong>🛠 DNS Tools</strong> tab → "LAN-side DNS health" section to see if LAN clients are actually reaching dnsmasq.', '#60a5fa');
+            } else {
+                log('ℹ', 'Next step: verify from a LAN client. If a client can\'t resolve, open the <strong>🛠 DNS Tools</strong> tab → "LAN-side DNS health" section — it tails dnsmasq\'s query log so you can see in real time whether client queries are arriving.', '#60a5fa');
+            }
+        }
+
         log('🎉', '<strong>Setup complete.</strong> Plug a client into the LAN interface — it should get a DHCP lease and reach the internet.', '#a855f7');
         runBtn.textContent = 'Done';
         await wrLoadAll();
     }
     window.wrRunQuickSetup = wrRunQuickSetup;
+
+    // ─── DNS Tools tab — ping / traceroute / nslookup / whois ─────────
+    //
+    // Every interaction pushes status/feedback into the visible panel —
+    // spinners for in-flight, coloured results, explanatory messages on
+    // failure. Nothing goes only to the console.
+
+    async function wrRenderDnsTools() {
+        const root = document.getElementById('wr-tools-root');
+        if (!root) return;
+
+        // Lane-side LAN picker options — only LANs with DHCP/DNS matter
+        // for the "is a client reaching our dnsmasq?" question.
+        const lanOpts = (wrState.lans || []).map(l =>
+            `<option value="${escHtml(l.id)}">${escHtml(l.name)} — ${escHtml(l.interface)} (${escHtml(l.subnet_cidr)})</option>`).join('');
+
+        root.innerHTML = `
+            <!-- LAN-SIDE DIAGNOSTICS — the section that actually answers
+                 "why can't my client resolve?" by watching real client
+                 traffic, not by running dig from the host. -->
+            <div style="padding:14px; border:1px solid rgba(168,85,247,0.35); border-radius:8px; background:rgba(168,85,247,0.06); margin-bottom:16px;">
+                <div style="display:flex; align-items:baseline; gap:8px; margin-bottom:6px;">
+                    <strong style="font-size:14px; color:#a855f7;">🔬 LAN-side DNS health</strong>
+                    <span style="font-size:11px; color:var(--text-muted);">— shows whether LAN clients can actually reach dnsmasq</span>
+                </div>
+                <div style="font-size:11px; color:var(--text-muted); margin-bottom:10px;">
+                    Host-side tests (dig, nslookup) reach dnsmasq via <code>lo</code> and mislead if the issue is LAN routing or firewall. These two tools watch the LAN interface and dnsmasq's own query log to show what clients are (or aren't) doing.
+                </div>
+
+                ${lanOpts ? `
+                <label style="display:block; margin-bottom:10px;">LAN to diagnose
+                    <select id="wr-lside-lan" class="form-control" style="max-width:480px;" onchange="wrLSideRefreshLog()">${lanOpts}</select>
+                </label>
+
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+                    <!-- dnsmasq query log — definitive evidence of whether clients arrive. -->
+                    <div style="padding:12px; border:1px solid var(--border); border-radius:6px; background:var(--bg-card); display:flex; flex-direction:column; gap:8px;">
+                        <div style="display:flex; align-items:center; justify-content:space-between;">
+                            <strong style="font-size:13px;">📜 dnsmasq query log</strong>
+                            <span id="wr-lside-log-badge" class="badge" style="font-size:10px; padding:2px 6px;">checking…</span>
+                        </div>
+                        <div style="font-size:11px; color:var(--text-muted);">Tail the per-LAN dnsmasq log. Enable to capture every query from LAN clients — no query in here after a client tries to resolve = packet never reached dnsmasq.</div>
+                        <div style="display:flex; gap:6px;">
+                            <button id="wr-lside-log-on" class="btn btn-sm btn-primary" onclick="wrLSideSetQueryLog(true)">Enable logging</button>
+                            <button id="wr-lside-log-off" class="btn btn-sm" onclick="wrLSideSetQueryLog(false)">Disable</button>
+                            <button class="btn btn-sm" onclick="wrLSideRefreshLog()">🔄 Refresh</button>
+                            <label style="font-size:11px; display:flex; align-items:center; gap:4px; margin-left:auto;">
+                                <input type="checkbox" id="wr-lside-log-auto" checked/> auto-refresh
+                            </label>
+                        </div>
+                        <div id="wr-lside-log-meta" style="font-size:11px; color:var(--text-muted);"></div>
+                        <pre id="wr-lside-log-tail" style="font-family:var(--font-mono); font-size:11px; background:var(--bg-secondary); padding:8px; border-radius:4px; max-height:280px; overflow:auto; white-space:pre-wrap; margin:0; min-height:80px;">(Enable logging then try DNS from a LAN client — queries will appear here as they arrive.)</pre>
+                    </div>
+
+                    <!-- Packet capture on the LAN interface. Independent check
+                         that sees arriving packets even if dnsmasq rejected them. -->
+                    <div style="padding:12px; border:1px solid var(--border); border-radius:6px; background:var(--bg-card); display:flex; flex-direction:column; gap:8px;">
+                        <div style="display:flex; align-items:center; justify-content:space-between;">
+                            <strong style="font-size:13px;">📡 Capture UDP 53 on LAN interface</strong>
+                            <span id="wr-lside-cap-badge" class="badge" style="font-size:10px; padding:2px 6px; background:rgba(148,163,184,0.15); color:var(--text-muted);">idle</span>
+                        </div>
+                        <div style="font-size:11px; color:var(--text-muted);">Runs <code>tcpdump -i &lt;iface&gt; udp port 53</code> for 10 seconds. Shows packets reaching the NIC even if dnsmasq isn't answering them.</div>
+                        <div style="display:flex; gap:6px;">
+                            <button id="wr-lside-cap-btn" class="btn btn-sm btn-primary" onclick="wrLSideCapture()">▶ Capture 10s</button>
+                        </div>
+                        <div id="wr-lside-cap-meta" style="font-size:11px; color:var(--text-muted);"></div>
+                        <pre id="wr-lside-cap-out" style="font-family:var(--font-mono); font-size:11px; background:var(--bg-secondary); padding:8px; border-radius:4px; max-height:280px; overflow:auto; white-space:pre-wrap; margin:0; min-height:80px;">(Click Capture 10s, then generate DNS traffic from a LAN client.)</pre>
+                    </div>
+                </div>` : `
+                <div style="padding:10px; color:var(--text-muted); font-size:12px;">
+                    No LAN segments defined yet — create one in the DHCP/LANs tab first, then come back.
+                </div>`}
+            </div>
+
+            <!-- HOST-SIDE TOOLS — useful for upstream checks (is 1.1.1.1
+                 reachable from this host? is a public domain resolving?),
+                 but NOT for "can my LAN client resolve" — the section
+                 above is the right place for that. -->
+            <div style="font-size:12px; color:var(--text-muted); margin-bottom:12px;">
+                <strong>Host-side tools</strong> below run from the WolfStack host, not from a client machine. Use them for upstream reachability checks. For LAN-client diagnostics, use the section above.
+            </div>
+            <div id="wr-tools-status" style="margin-bottom:12px;"></div>
+
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+                ${wrToolCardHtml('ping', '📡 Ping', 'Four ICMP echo packets with 1s timeout. Shows round-trip latency and packet loss.', 'cloudflare.com', false)}
+                ${wrToolCardHtml('traceroute', '🛣 Traceroute', 'Map each router hop to the target. Capped at 20 hops, 2s per probe.', 'cloudflare.com', false)}
+                ${wrToolCardHtml('nslookup', '🔍 nslookup', 'Resolve a name against the system (or an explicit) DNS server. Runs from the host — for LAN-client issues use the section above.', 'cloudflare.com', true)}
+                ${wrToolCardHtml('whois', '🪪 whois', 'WHOIS registry lookup for a domain or IP. Takes up to 30 seconds.', 'cloudflare.com', false)}
+            </div>
+        `;
+
+        // Surface per-tool availability so users know if "Run" will work
+        // BEFORE they click it (no silent confusion on missing dig).
+        await wrRenderToolsStatus();
+
+        // Kick off the LAN-side log tail + auto-refresh loop (if any LAN exists).
+        if (lanOpts) {
+            wrLSideRefreshLog();
+            wrLSideStartAutoRefresh();
+        }
+    }
+
+    // ─── LAN-side diagnostics helpers ─────────────────────────────
+
+    function wrLSideLanId() {
+        return document.getElementById('wr-lside-lan')?.value || '';
+    }
+
+    function wrLSideLan() {
+        const id = wrLSideLanId();
+        return (wrState.lans || []).find(l => l.id === id);
+    }
+
+    async function wrLSideSetQueryLog(enable) {
+        const id = wrLSideLanId();
+        if (!id) return;
+        const btnOn = document.getElementById('wr-lside-log-on');
+        const btnOff = document.getElementById('wr-lside-log-off');
+        const meta = document.getElementById('wr-lside-log-meta');
+        if (btnOn) btnOn.disabled = true;
+        if (btnOff) btnOff.disabled = true;
+        if (meta) meta.innerHTML = `<span style="color:var(--text-muted);">⏳ ${enable ? 'Enabling' : 'Disabling'} query logging — dnsmasq will restart (~1s)…</span>`;
+        try {
+            const r = await fetch(wrUrl(`/api/router/segments/${encodeURIComponent(id)}/query-log`), {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enable }),
+            });
+            const j = await r.json();
+            if (j.success) {
+                if (meta) meta.innerHTML = `<span style="color:#22c55e;">✓ ${escHtml(j.message || '')}</span>`;
+            } else {
+                if (meta) meta.innerHTML = `<span style="color:#ef4444;">✗ ${escHtml(j.error || 'Failed')}</span>`;
+            }
+        } catch (e) {
+            if (meta) meta.innerHTML = `<span style="color:#ef4444;">✗ Request failed: ${escHtml(e.message || e)}</span>`;
+        } finally {
+            if (btnOn) btnOn.disabled = false;
+            if (btnOff) btnOff.disabled = false;
+            wrLSideRefreshLog();
+        }
+    }
+    window.wrLSideSetQueryLog = wrLSideSetQueryLog;
+
+    async function wrLSideRefreshLog() {
+        const id = wrLSideLanId();
+        const tail = document.getElementById('wr-lside-log-tail');
+        const meta = document.getElementById('wr-lside-log-meta');
+        const badge = document.getElementById('wr-lside-log-badge');
+        if (!id || !tail) return;
+        try {
+            const r = await fetch(wrUrl(`/api/router/segments/${encodeURIComponent(id)}/query-log?lines=200`));
+            if (!r.ok) {
+                tail.textContent = '✗ Fetch failed: HTTP ' + r.status;
+                if (badge) { badge.textContent = 'error'; badge.style.color = '#ef4444'; badge.style.background = 'rgba(239,68,68,0.15)'; }
+                return;
+            }
+            const j = await r.json();
+            if (badge) {
+                if (j.enabled) {
+                    badge.textContent = 'logging ON';
+                    badge.style.color = '#22c55e';
+                    badge.style.background = 'rgba(34,197,94,0.15)';
+                } else {
+                    badge.textContent = 'logging OFF';
+                    badge.style.color = 'var(--text-muted)';
+                    badge.style.background = 'rgba(148,163,184,0.15)';
+                }
+            }
+            const lines = j.lines || [];
+            const clients = j.unique_clients || [];
+            if (!j.enabled && !lines.length) {
+                tail.textContent = '(Query logging is OFF. Click "Enable logging" — dnsmasq will restart. Then try DNS from a LAN client; entries will appear here.)';
+            } else if (!lines.length) {
+                tail.textContent = '(Logging is ON but no entries yet. Try `nslookup cloudflare.com ' + (wrLSideLan()?.router_ip || '<router-ip>') + '` from a LAN client.)';
+            } else {
+                tail.textContent = lines.join('\n');
+                tail.scrollTop = tail.scrollHeight;
+            }
+            if (meta) {
+                const parts = [`${j.total_entries || 0} total entries`];
+                if (clients.length) parts.push(`clients seen: ${clients.join(', ')}`);
+                else if (j.enabled) parts.push('<span style="color:#fbbf24;">no LAN clients have queried yet</span>');
+                meta.innerHTML = parts.join(' · ');
+            }
+        } catch (e) {
+            tail.textContent = '✗ Fetch errored: ' + (e.message || e);
+        }
+    }
+    window.wrLSideRefreshLog = wrLSideRefreshLog;
+
+    // Auto-refresh loop — only fires while the DNS Tools tab is visible
+    // and auto-refresh is ticked. Reuses the existing wrState timer slot
+    // pattern so switching tabs / pages doesn't leave stale intervals.
+    function wrLSideStartAutoRefresh() {
+        if (wrState.lsideTimer) { clearInterval(wrState.lsideTimer); wrState.lsideTimer = null; }
+        wrState.lsideTimer = setInterval(() => {
+            const auto = document.getElementById('wr-lside-log-auto');
+            const panel = document.getElementById('wr-tab-tools');
+            if (!auto || !auto.checked) return;
+            if (!panel || panel.style.display === 'none') {
+                clearInterval(wrState.lsideTimer); wrState.lsideTimer = null;
+                return;
+            }
+            wrLSideRefreshLog();
+        }, 2000);
+    }
+
+    async function wrLSideCapture() {
+        const lan = wrLSideLan();
+        const btn = document.getElementById('wr-lside-cap-btn');
+        const badge = document.getElementById('wr-lside-cap-badge');
+        const meta = document.getElementById('wr-lside-cap-meta');
+        const out = document.getElementById('wr-lside-cap-out');
+        if (!lan || !btn || !out) return;
+        btn.disabled = true;
+        btn.textContent = '⏳ Capturing 10s…';
+        if (badge) { badge.textContent = 'capturing…'; badge.style.background = 'rgba(251,191,36,0.15)'; badge.style.color = '#fbbf24'; }
+        if (meta) meta.innerHTML = `<span style="color:var(--text-muted);">Watching <code>${escHtml(lan.interface)}</code> for UDP/53 traffic. Try DNS from a LAN client NOW — you have 10 seconds.</span>`;
+        out.textContent = '(waiting for packets…)';
+        try {
+            const r = await fetch(wrUrl('/api/router/capture'), {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    iface: lan.interface,
+                    filter: 'udp port 53',
+                    count: 500,
+                    timeout_seconds: 10,
+                    node_id: lan.node_id,
+                }),
+            });
+            const j = await r.json();
+            const lines = j.lines || [];
+            if (lines.length) {
+                out.textContent = lines.join('\n');
+                if (badge) { badge.textContent = `${lines.length} packets`; badge.style.background = 'rgba(34,197,94,0.15)'; badge.style.color = '#22c55e'; }
+                if (meta) meta.innerHTML = `<span style="color:#22c55e;">✓ ${lines.length} packet(s) captured on <code>${escHtml(lan.interface)}</code>. DNS traffic IS reaching the interface.</span>`;
+            } else if (j.error) {
+                out.textContent = '✗ ' + j.error;
+                if (badge) { badge.textContent = 'error'; badge.style.background = 'rgba(239,68,68,0.15)'; badge.style.color = '#ef4444'; }
+                if (meta) meta.innerHTML = `<span style="color:#ef4444;">${escHtml(j.error)}</span>`;
+            } else {
+                out.textContent = '(nothing captured in 10 seconds)';
+                if (badge) { badge.textContent = 'nothing seen'; badge.style.background = 'rgba(251,191,36,0.15)'; badge.style.color = '#fbbf24'; }
+                if (meta) meta.innerHTML = `<span style="color:#fbbf24;">⚠ No DNS packets reached <code>${escHtml(lan.interface)}</code>. If you tried to resolve from a client during the capture, the packet never made it here — check client's default gateway, ARP (<code>ip neigh</code>), and upstream switches.</span>`;
+            }
+        } catch (e) {
+            out.textContent = '✗ Capture failed: ' + (e.message || e);
+            if (badge) { badge.textContent = 'failed'; badge.style.background = 'rgba(239,68,68,0.15)'; badge.style.color = '#ef4444'; }
+        } finally {
+            btn.disabled = false;
+            btn.textContent = '▶ Capture 10s';
+        }
+    }
+    window.wrLSideCapture = wrLSideCapture;
+
+    function wrToolCardHtml(tool, heading, desc, placeholder, hasServer) {
+        const sfx = tool;
+        return `
+            <div style="padding:14px; border:1px solid var(--border); border-radius:8px; background:var(--bg-card); display:flex; flex-direction:column; gap:8px;">
+                <div style="display:flex; align-items:baseline; gap:8px;">
+                    <strong style="font-size:14px;">${heading}</strong>
+                    <span id="wr-tool-badge-${sfx}" class="badge" style="font-size:10px; padding:2px 6px; background:rgba(148,163,184,0.15); color:var(--text-muted);">checking…</span>
+                </div>
+                <div style="font-size:11px; color:var(--text-muted);">${desc}</div>
+                <div style="display:flex; gap:6px;">
+                    <input id="wr-tool-target-${sfx}" class="form-control" placeholder="${escHtml(placeholder)}" style="flex:1; font-size:12px;"/>
+                    ${hasServer ? `<input id="wr-tool-server-${sfx}" class="form-control" placeholder="DNS server (optional)" style="flex:1; font-size:12px;"/>` : ''}
+                    <button id="wr-tool-btn-${sfx}" class="btn btn-sm btn-primary" onclick="wrRunTool('${sfx}')">Run</button>
+                </div>
+                <pre id="wr-tool-out-${sfx}" style="display:none; font-family:var(--font-mono); font-size:11px; background:var(--bg-secondary); padding:8px; border-radius:4px; max-height:260px; overflow:auto; white-space:pre-wrap; margin:0;"></pre>
+            </div>
+        `;
+    }
+
+    // Fetch the tool-installed status from the backend and annotate each
+    // card. If anything is missing, surface a prominent "Install diag tools"
+    // button so the user isn't left wondering why "Run" is silently broken.
+    async function wrRenderToolsStatus() {
+        const statusBox = document.getElementById('wr-tools-status');
+        if (!statusBox) return;
+        statusBox.innerHTML = '<span style="color:var(--text-muted); font-size:12px;">⏳ Checking which diagnostic tools are installed on this host…</span>';
+        let status;
+        try {
+            const r = await fetch(wrUrl('/api/router/tools/status'));
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            status = await r.json();
+        } catch (e) {
+            statusBox.innerHTML = `<div style="padding:10px; background:rgba(239,68,68,0.1); border:1px solid rgba(239,68,68,0.35); border-radius:6px; font-size:12px; color:#fca5a5;">Could not check tool status: ${escHtml(e.message || e)}</div>`;
+            return;
+        }
+        const tools = [
+            { key: 'ping',       card: 'ping' },
+            { key: 'traceroute', card: 'traceroute' },
+            { key: 'nslookup',   card: 'nslookup' },
+            { key: 'whois',      card: 'whois' },
+        ];
+        for (const t of tools) {
+            const badge = document.getElementById('wr-tool-badge-' + t.card);
+            if (!badge) continue;
+            if (status[t.key]) {
+                badge.textContent = 'installed';
+                badge.style.background = 'rgba(34,197,94,0.15)';
+                badge.style.color = '#22c55e';
+            } else {
+                badge.textContent = 'NOT installed';
+                badge.style.background = 'rgba(239,68,68,0.15)';
+                badge.style.color = '#ef4444';
+            }
+        }
+        const missing = tools.filter(t => !status[t.key]).map(t => t.key);
+        const digMissing = !status.dig;
+        if (missing.length || digMissing) {
+            const parts = [...missing];
+            if (digMissing && !parts.includes('nslookup')) parts.push('dig');
+            statusBox.innerHTML = `
+                <div style="padding:12px 14px; background:rgba(251,191,36,0.1); border:1px solid rgba(251,191,36,0.35); border-radius:6px; font-size:13px;">
+                    <strong style="color:#fbbf24;">⚠ Missing tools:</strong> <code>${parts.join(', ')}</code>
+                    <div style="color:var(--text-muted); font-size:11px; margin-top:3px;">
+                        Click the button to install them automatically — WolfStack detects your distro's package manager (apt, dnf, yum, pacman, zypper) and uses the right package name for each.
+                    </div>
+                    <button id="wr-tools-install-btn" class="btn btn-primary btn-sm" style="margin-top:8px;" onclick="wrInstallDiagTools()">📥 Install missing tools</button>
+                    <div id="wr-tools-install-status" style="margin-top:6px; font-size:11px; color:var(--text-muted);"></div>
+                </div>
+            `;
+        } else {
+            statusBox.innerHTML = `<div style="padding:10px 12px; background:rgba(34,197,94,0.08); border:1px solid rgba(34,197,94,0.3); border-radius:6px; font-size:12px; color:#4ade80;">✓ All diagnostic tools are installed on this host.</div>`;
+        }
+    }
+
+    async function wrInstallDiagTools() {
+        const btn = document.getElementById('wr-tools-install-btn');
+        const statusEl = document.getElementById('wr-tools-install-status');
+        if (!btn || !statusEl) return;
+        btn.disabled = true;
+        btn.textContent = '⏳ Installing…';
+        statusEl.textContent = 'Running the package manager. On a first-time install this can take 10–60 seconds depending on your distro.';
+        try {
+            const r = await fetch(wrUrl('/api/router/tools/install'), {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+            });
+            const j = await r.json();
+            if (j.success) {
+                statusEl.innerHTML = `<span style="color:#22c55e;">✓ ${escHtml(j.message || 'Installed.')}</span>`;
+                btn.textContent = '✓ Installed';
+                // Refresh status so the per-card badges flip to "installed".
+                setTimeout(() => wrRenderToolsStatus(), 400);
+            } else {
+                statusEl.innerHTML = `<span style="color:#ef4444;">✗ ${escHtml(j.error || 'Install failed.')}</span>`;
+                btn.disabled = false;
+                btn.textContent = '📥 Retry install';
+            }
+        } catch (e) {
+            statusEl.innerHTML = `<span style="color:#ef4444;">✗ Install request failed: ${escHtml(e.message || e)}</span>`;
+            btn.disabled = false;
+            btn.textContent = '📥 Retry install';
+        }
+    }
+    window.wrInstallDiagTools = wrInstallDiagTools;
+
+    async function wrRunTool(tool) {
+        const targetEl = document.getElementById('wr-tool-target-' + tool);
+        const serverEl = document.getElementById('wr-tool-server-' + tool);
+        const btn = document.getElementById('wr-tool-btn-' + tool);
+        const out = document.getElementById('wr-tool-out-' + tool);
+        if (!targetEl || !btn || !out) return;
+        const target = targetEl.value.trim();
+        if (!target) {
+            out.style.display = 'block';
+            out.style.color = '#ef4444';
+            out.textContent = '✗ Enter a target hostname or IP first.';
+            return;
+        }
+        btn.disabled = true;
+        const origLabel = btn.textContent;
+        btn.textContent = '⏳ Running…';
+        out.style.display = 'block';
+        out.style.color = 'var(--text-muted)';
+        // Per-tool "this may take a while" hint so the user doesn't wonder
+        // if the page is stuck. Traceroute in particular can take 30–60s.
+        const waits = {
+            ping: 'Sending 4 ICMP echo packets (up to ~15 seconds)…',
+            traceroute: 'Tracing each hop up to 20 routers — this can take up to 60 seconds…',
+            nslookup: 'Querying DNS server (up to 10 seconds)…',
+            whois: 'Looking up WHOIS registry (up to 30 seconds)…',
+        };
+        out.textContent = waits[tool] || 'Running…';
+
+        const body = { target };
+        if (tool === 'nslookup' && serverEl?.value.trim()) body.server = serverEl.value.trim();
+
+        try {
+            const r = await fetch(wrUrl('/api/router/tools/' + tool), {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            const j = await r.json();
+            if (r.status === 400) {
+                out.style.color = '#ef4444';
+                out.textContent = '✗ ' + (j.error || 'Invalid input');
+            } else if (j.success) {
+                out.style.color = 'var(--text)';
+                const tail = `\n\n──\n✓ Completed in ${j.duration_ms}ms.`;
+                out.textContent = (j.output || '(no output)') + tail;
+            } else {
+                out.style.color = '#f87171';
+                const parts = [];
+                if (j.output) parts.push(j.output);
+                if (j.error) parts.push('✗ ' + j.error);
+                parts.push(`Completed in ${j.duration_ms}ms.`);
+                out.textContent = parts.join('\n');
+            }
+        } catch (e) {
+            out.style.color = '#ef4444';
+            out.textContent = '✗ Request failed: ' + (e.message || e);
+        } finally {
+            btn.disabled = false;
+            btn.textContent = origLabel;
+        }
+    }
+    window.wrRunTool = wrRunTool;
+    window.wrRenderDnsTools = wrRenderDnsTools;
 })();

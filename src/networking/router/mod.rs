@@ -135,6 +135,13 @@ pub struct DnsServerConfig {
     /// Block ad/tracker domains. Pulls from a pluggable hosts list.
     #[serde(default)]
     pub block_ads: bool,
+    /// If true, dnsmasq logs every query to a per-LAN file at
+    /// /var/lib/wolfstack-router/lan-<id>.log. Debug-only — leaves a
+    /// growing log file on disk while enabled. The DNS Tools tab
+    /// toggles this so admins can watch LAN clients' queries land (or
+    /// not) in real time.
+    #[serde(default)]
+    pub query_log: bool,
 }
 
 impl Default for DnsServerConfig {
@@ -144,6 +151,7 @@ impl Default for DnsServerConfig {
             local_records: vec![],
             cache_enabled: true,
             block_ads: false,
+            query_log: false,
         }
     }
 }

@@ -111,6 +111,16 @@ pub fn render_config(lan: &LanSegment) -> Result<String, String> {
         cfg.push_str(&format!("addn-hosts={}\n", ADBLOCK_HOSTS));
     }
 
+    // Query logging — drives the "LAN-side DNS health" diagnostic in
+    // the DNS Tools tab. When on, dnsmasq writes one line per query to
+    // a dedicated per-LAN file (NOT syslog — we don't want to pollute
+    // journald, and reading back is much simpler from a known path).
+    if lan.dns.query_log {
+        let log_path = format!("{}/lan-{}.log", LEASE_DIR, lan.id);
+        cfg.push_str("log-queries\n");
+        cfg.push_str(&format!("log-facility={}\n", log_path));
+    }
+
     fs::write(&path, cfg)
         .map_err(|e| format!("Write dnsmasq config {}: {}", path, e))?;
     Ok(path)

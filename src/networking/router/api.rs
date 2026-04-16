@@ -545,6 +545,131 @@ pub async fn get_leases(req: HttpRequest, state: S, path: web::Path<String>) -> 
     HttpResponse::Ok().json(dhcp::read_leases(&id))
 }
 
+#[derive(Deserialize)]
+pub struct QueryLogToggle {
+    pub enable: bool,
+}
+
+/// POST /api/router/segments/{id}/query-log
+/// Toggle per-LAN dnsmasq query logging. On restart, dnsmasq re-spawns
+/// with `log-queries` + a dedicated log file — every subsequent client
+/// query is appended so the DNS Tools tab can show whether LAN clients
+/// are actually reaching the resolver.
+///
+/// Debug-only — leaves a growing log file on disk while enabled. The
+/// frontend is responsible for turning it off when the user is done.
+pub async fn set_query_log(
+    req: HttpRequest, state: S,
+    path: web::Path<String>, body: web::Json<QueryLogToggle>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let id = path.into_inner();
+    let enable = body.enable;
+
+    // Flip the flag in RouterConfig + save + restart dnsmasq. Lock is
+    // acquired + released before the restart so a slow dnsmasq spawn
+    // doesn't block concurrent read paths (topology, list_segments).
+    let lan = {
+        let mut cfg = state.router.config.write().unwrap();
+        let updated = {
+            let seg = match cfg.lans.iter_mut().find(|l| l.id == id) {
+                Some(s) => s,
+                None => return HttpResponse::NotFound().body("LAN not found"),
+            };
+            seg.dns.query_log = enable;
+            seg.clone()
+        };
+        if let Err(e) = cfg.save() {
+            return HttpResponse::InternalServerError().body(format!("save: {}", e));
+        }
+        updated
+    };
+
+    // Local node only: reapply the dnsmasq config. Remote nodes will
+    // pick up the change from the next config replicate + restart via
+    // their own dhcp::start path.
+    if lan.node_id == crate::agent::self_node_id() {
+        if enable {
+            // Truncate any previous log so users don't mistake stale entries
+            // for new activity when they re-enable.
+            let log_path = format!("/var/lib/wolfstack-router/lan-{}.log", lan.id);
+            let _ = std::fs::write(&log_path, "");
+        }
+        if let Err(e) = dhcp::start(&lan) {
+            return HttpResponse::InternalServerError()
+                .body(format!("restart dnsmasq: {}", e));
+        }
+    }
+
+    replicate_config_to_cluster(state.clone());
+    HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "enabled": enable,
+        "message": if enable {
+            "Query logging enabled — dnsmasq restarted. Try DNS from a LAN client and refresh the log panel."
+        } else {
+            "Query logging disabled — dnsmasq restarted without log-queries."
+        },
+    }))
+}
+
+/// GET /api/router/segments/{id}/query-log?lines=200
+/// Return the tail of the per-LAN dnsmasq query log. Polled by the DNS
+/// Tools tab so admins see queries arrive (or not) as they test from a
+/// client machine.
+pub async fn get_query_log(
+    req: HttpRequest, state: S,
+    path: web::Path<String>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let id = path.into_inner();
+    let cfg = state.router.config.read().unwrap();
+    let lan = match cfg.lans.iter().find(|l| l.id == id) {
+        Some(s) => s.clone(),
+        None => return HttpResponse::NotFound().body("LAN not found"),
+    };
+    drop(cfg);
+
+    if lan.node_id != crate::agent::self_node_id() {
+        // Remote node — MVP reports not-available. Could proxy in future.
+        return HttpResponse::Ok().json(serde_json::json!({
+            "enabled": lan.dns.query_log,
+            "lines": [],
+            "error": "Log viewing for remote-node LANs is not yet implemented. Log in to that node directly.",
+        }));
+    }
+
+    let want_lines: usize = query.get("lines").and_then(|s| s.parse().ok()).unwrap_or(200).min(2000);
+    let log_path = format!("/var/lib/wolfstack-router/lan-{}.log", id);
+    let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+    // Only keep the last N lines — dnsmasq appends indefinitely.
+    let all: Vec<&str> = text.lines().collect();
+    let start = all.len().saturating_sub(want_lines);
+    let tail: Vec<String> = all[start..].iter().map(|s| s.to_string()).collect();
+
+    // Count unique client IPs seen in this tail — a quick "did anyone
+    // actually query us?" signal the frontend can highlight.
+    let mut unique_clients = std::collections::BTreeSet::new();
+    for line in &tail {
+        // dnsmasq query lines look like:
+        //   "... dnsmasq[1234]: query[A] example.com from 192.168.10.42"
+        if let Some(idx) = line.rfind(" from ") {
+            let rest = &line[idx + 6..];
+            let client = rest.split_whitespace().next().unwrap_or("").trim();
+            if !client.is_empty() { unique_clients.insert(client.to_string()); }
+        }
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "enabled": lan.dns.query_log,
+        "lines": tail,
+        "total_entries": all.len(),
+        "unique_clients": unique_clients.into_iter().collect::<Vec<_>>(),
+        "log_path": log_path,
+    }))
+}
+
 // ─── Firewall rules ───
 
 pub async fn list_rules(req: HttpRequest, state: S) -> HttpResponse {
@@ -1500,6 +1625,376 @@ pub async fn interface_up(
     }
 }
 
+#[derive(Deserialize)]
+pub struct TestDnsRequest {
+    /// IP the LAN segment's dnsmasq is expected to answer on.
+    pub router_ip: String,
+    /// Hostname to resolve. Defaults to cloudflare.com — a name that will
+    /// exist regardless of the user's upstream forwarder choice.
+    #[serde(default = "default_test_hostname")]
+    pub hostname: String,
+}
+
+fn default_test_hostname() -> String { "cloudflare.com".into() }
+
+/// POST /api/router/test-dns — fire a single DNS query at a LAN's
+/// router IP and report whether dnsmasq is actually answering. The
+/// Quick Setup wizard calls this after creating a segment so users see
+/// "DHCP works but DNS is broken" as a clear failure instead of
+/// discovering it only when their client can't load a web page.
+///
+/// The shape matches the rest of WolfRouter's endpoints:
+///   { success: bool, answer?: string, error?: string, duration_ms: u128 }
+///
+/// The host runs `dig @<router_ip> <hostname> +short` — note: this does
+/// NOT validate from a LAN client's perspective. If a firewall rule
+/// blocks LAN→host:53 but the host itself can reach :53, the test
+/// still passes. That's a known limitation — the "real" test needs a
+/// probe from the LAN side which we can't do from wolfstack itself.
+pub async fn test_dns(
+    req: HttpRequest, state: S,
+    body: web::Json<TestDnsRequest>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let r = body.into_inner();
+
+    // Reject anything that isn't a plain IPv4 — router_ip is passed to
+    // dig as a literal arg, and we don't want shell metacharacters or
+    // names slipping through.
+    if r.router_ip.parse::<std::net::Ipv4Addr>().is_err() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "success": false, "error": "router_ip must be a valid IPv4 address"
+        }));
+    }
+    let hostname = r.hostname.trim();
+    if hostname.is_empty() ||
+       !hostname.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') ||
+       hostname.len() > 253
+    {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "success": false, "error": "hostname must be alphanumeric with . and -"
+        }));
+    }
+
+    let start = std::time::Instant::now();
+    let out = std::process::Command::new("dig")
+        .args([
+            &format!("@{}", r.router_ip),
+            hostname,
+            "+short", "+time=3", "+tries=1",
+        ])
+        .output();
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    match out {
+        Ok(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            // `dig +short` emits one line per answer record (IP or CNAME).
+            // We treat an answer containing at least one IPv4 as success;
+            // anything else (empty, NXDOMAIN, SERVFAIL, timeout) is a fail.
+            let ip_answered = stdout.lines().any(|l| l.parse::<std::net::Ipv4Addr>().is_ok());
+            if ip_answered {
+                HttpResponse::Ok().json(serde_json::json!({
+                    "success": true,
+                    "answer": stdout,
+                    "duration_ms": duration_ms,
+                }))
+            } else {
+                // No usable answer. Craft a message that points at the
+                // likely cause: dnsmasq not bound (:53 already taken by
+                // systemd-resolved or another resolver), or upstream
+                // forwarder unreachable from the host.
+                let err = if stderr.contains("connection refused") || stdout.contains("connection refused") {
+                    format!("Connection refused on {}:53 — dnsmasq isn't listening. Likely cause: another resolver holds :53 (run `ss -tulnp | grep :53` on the host).", r.router_ip)
+                } else if stderr.contains("timed out") || stdout.contains("timed out") || stdout.is_empty() {
+                    format!("No answer from {}:53 within 3s — dnsmasq may not be bound on the LAN interface, or a firewall rule is blocking port 53. Check `systemctl status` / `iptables -L WOLFROUTER_IN -nv`.", r.router_ip)
+                } else {
+                    format!("DNS server responded but did not return an A record. dig output: {}", stdout)
+                };
+                HttpResponse::Ok().json(serde_json::json!({
+                    "success": false,
+                    "error": err,
+                    "answer": stdout,
+                    "duration_ms": duration_ms,
+                }))
+            }
+        }
+        Err(e) => {
+            HttpResponse::Ok().json(serde_json::json!({
+                "success": false,
+                "error": format!("Couldn't run `dig`: {}. Install 'dnsutils' (Debian/Ubuntu), 'bind-utils' (Fedora/RHEL), or 'bind' (Arch) and try again.", e),
+                "duration_ms": duration_ms,
+            }))
+        }
+    }
+}
+
+// ─── Network diagnostic tools (ping, traceroute, nslookup, whois) ───
+//
+// These power the "DNS Tools" tab — quick-diagnostic utilities the
+// admin can run from the browser without SSH'ing in. All tools run
+// on the wolfstack host (not from a LAN client) so they diagnose
+// upstream reachability, not the LAN-side experience.
+//
+// Security posture:
+//   • Target strings are strictly validated: alphanumerics + `. - : _`.
+//     No shell invocation — Command::new() with args is argv-style.
+//   • Every tool has an outer timeout so a user can't DoS the host by
+//     submitting unreachable targets.
+//   • Auth-gated like every other router endpoint.
+
+#[derive(Deserialize)]
+pub struct NetToolRequest {
+    pub target: String,
+    /// nslookup-specific: resolve against this server instead of the
+    /// system default. Ignored for ping/traceroute/whois.
+    #[serde(default)]
+    pub server: String,
+}
+
+/// Shared target validator. Rejects shell metacharacters and overly
+/// long strings. Returns the trimmed target or an error message.
+fn validate_target(target: &str) -> Result<String, String> {
+    let t = target.trim();
+    if t.is_empty() { return Err("target is empty".into()); }
+    if t.len() > 253 { return Err("target is too long (>253 chars)".into()); }
+    if !t.chars().all(|c| c.is_ascii_alphanumeric() || ".-:_".contains(c)) {
+        return Err("target must be a plain hostname or IP (a-z, 0-9, .-:_ only)".into());
+    }
+    Ok(t.to_string())
+}
+
+/// Run an external diag tool with a timeout. Returns the stdout/stderr
+/// and the elapsed time. Tokio's wait-with-timeout kills the child
+/// cleanly on expiry so we don't orphan processes on slow targets.
+async fn run_with_timeout(
+    cmd: &str, args: &[&str], timeout_secs: u64,
+) -> (bool, String, String, u64) {
+    let start = std::time::Instant::now();
+    let fut = tokio::process::Command::new(cmd)
+        .args(args)
+        .output();
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs), fut
+    ).await;
+    let duration_ms = start.elapsed().as_millis() as u64;
+    match out {
+        Ok(Ok(o)) => {
+            let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+            (o.status.success(), stdout, stderr, duration_ms)
+        }
+        Ok(Err(e)) => (false, String::new(),
+            format!("Couldn't run `{}`: {} (is it installed?)", cmd, e),
+            duration_ms),
+        Err(_) => (false, String::new(),
+            format!("`{}` timed out after {}s", cmd, timeout_secs),
+            duration_ms),
+    }
+}
+
+/// POST /api/router/tools/ping
+pub async fn tool_ping(
+    req: HttpRequest, state: S, body: web::Json<NetToolRequest>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let target = match validate_target(&body.target) {
+        Ok(t) => t, Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({"error": e})),
+    };
+    // -c 4: send four packets. -W 1: wait at most 1s per reply.
+    let (ok, stdout, stderr, ms) = run_with_timeout(
+        "ping", &["-c", "4", "-W", "1", &target], 15,
+    ).await;
+    HttpResponse::Ok().json(serde_json::json!({
+        "success": ok, "output": stdout, "error": if ok { String::new() } else { stderr },
+        "duration_ms": ms,
+    }))
+}
+
+/// POST /api/router/tools/traceroute
+pub async fn tool_traceroute(
+    req: HttpRequest, state: S, body: web::Json<NetToolRequest>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let target = match validate_target(&body.target) {
+        Ok(t) => t, Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({"error": e})),
+    };
+    // -m 20: cap at 20 hops (most routes are <15). -w 2: 2s wait per
+    // probe. -q 1: one probe per hop (faster, good enough for a browser UI).
+    let (ok, stdout, stderr, ms) = run_with_timeout(
+        "traceroute", &["-m", "20", "-w", "2", "-q", "1", &target], 60,
+    ).await;
+    HttpResponse::Ok().json(serde_json::json!({
+        "success": ok, "output": stdout, "error": if ok { String::new() } else { stderr },
+        "duration_ms": ms,
+    }))
+}
+
+/// POST /api/router/tools/nslookup
+pub async fn tool_nslookup(
+    req: HttpRequest, state: S, body: web::Json<NetToolRequest>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let target = match validate_target(&body.target) {
+        Ok(t) => t, Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({"error": e})),
+    };
+    let mut args: Vec<String> = vec![target];
+    if !body.server.is_empty() {
+        // server is a hostname or IP too — same validation.
+        match validate_target(&body.server) {
+            Ok(s) => args.push(s),
+            Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({"error": format!("server: {}", e)})),
+        };
+    }
+    let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let (ok, stdout, stderr, ms) = run_with_timeout(
+        "nslookup", &args_ref, 10,
+    ).await;
+    HttpResponse::Ok().json(serde_json::json!({
+        "success": ok, "output": stdout, "error": if ok { String::new() } else { stderr },
+        "duration_ms": ms,
+    }))
+}
+
+/// POST /api/router/tools/whois
+pub async fn tool_whois(
+    req: HttpRequest, state: S, body: web::Json<NetToolRequest>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let target = match validate_target(&body.target) {
+        Ok(t) => t, Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({"error": e})),
+    };
+    let (ok, stdout, stderr, ms) = run_with_timeout(
+        "whois", &[&target], 30,
+    ).await;
+    HttpResponse::Ok().json(serde_json::json!({
+        "success": ok, "output": stdout, "error": if ok { String::new() } else { stderr },
+        "duration_ms": ms,
+    }))
+}
+
+/// GET /api/router/tools/status — returns which diag tools are installed.
+/// Drives the "install missing tools" prompt in the DNS Tools tab.
+pub async fn tool_status(
+    req: HttpRequest, state: S,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let check = |name: &str| -> bool {
+        std::process::Command::new("which").arg(name).output()
+            .map(|o| o.status.success()).unwrap_or(false)
+    };
+    HttpResponse::Ok().json(serde_json::json!({
+        "ping": check("ping"),
+        "traceroute": check("traceroute"),
+        "nslookup": check("nslookup"),
+        "dig": check("dig"),
+        "whois": check("whois"),
+    }))
+}
+
+/// POST /api/router/tools/install — install any of the diag tools that
+/// are missing. Detects the package manager (apt/dnf/yum/pacman/zypper)
+/// and uses the appropriate package name for that distro since
+/// dig/nslookup in particular ship under different names everywhere.
+/// Returns per-tool success so the UI can reflect partial installs.
+pub async fn tool_install(
+    req: HttpRequest, state: S,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let pm = if which("apt-get") { "apt" }
+        else if which("dnf")    { "dnf" }
+        else if which("yum")    { "yum" }
+        else if which("pacman") { "pacman" }
+        else if which("zypper") { "zypper" }
+        else { return HttpResponse::Ok().json(serde_json::json!({
+            "success": false,
+            "error": "No supported package manager found. Install ping, traceroute, nslookup, dig, and whois manually."
+        })); };
+
+    // Map a tool name → package name for the current package manager.
+    // "dig" and "nslookup" both come from the same package (dnsutils/
+    // bind-utils/bind/bind-tools), so we dedupe before installing.
+    let pkg_for = |tool: &str| -> String {
+        match (tool, pm) {
+            ("ping", "apt") => "iputils-ping".into(),
+            ("ping", _)     => "iputils".into(),
+            ("traceroute", _) => "traceroute".into(),
+            ("nslookup", "apt") | ("dig", "apt") => "dnsutils".into(),
+            ("nslookup", "dnf") | ("dig", "dnf") |
+            ("nslookup", "yum") | ("dig", "yum") |
+            ("nslookup", "zypper") | ("dig", "zypper") => "bind-utils".into(),
+            ("nslookup", "pacman") | ("dig", "pacman") => "bind".into(),
+            ("whois", _) => "whois".into(),
+            _ => tool.to_string(),  // fallback: assume pkg == tool
+        }
+    };
+
+    let tools = ["ping", "traceroute", "nslookup", "dig", "whois"];
+    let check_installed = |name: &str| -> bool {
+        std::process::Command::new("which").arg(name).output()
+            .map(|o| o.status.success()).unwrap_or(false)
+    };
+
+    // Build the unique package list for whatever's missing.
+    let mut packages: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for t in &tools {
+        if !check_installed(t) {
+            packages.insert(pkg_for(t));
+        }
+    }
+
+    if packages.is_empty() {
+        return HttpResponse::Ok().json(serde_json::json!({
+            "success": true, "message": "All diagnostic tools already installed."
+        }));
+    }
+
+    let pkg_vec: Vec<String> = packages.into_iter().collect();
+    let pkg_ref: Vec<&str> = pkg_vec.iter().map(|s| s.as_str()).collect();
+
+    let (cmd, args) = match pm {
+        "apt"    => ("apt-get", {
+            let mut a = vec!["install", "-y"];
+            a.extend(pkg_ref.iter());
+            a
+        }),
+        "dnf"    => ("dnf", { let mut a = vec!["install", "-y"]; a.extend(pkg_ref.iter()); a }),
+        "yum"    => ("yum", { let mut a = vec!["install", "-y"]; a.extend(pkg_ref.iter()); a }),
+        "pacman" => ("pacman", { let mut a = vec!["-Sy", "--noconfirm"]; a.extend(pkg_ref.iter()); a }),
+        "zypper" => ("zypper", { let mut a = vec!["install", "-y"]; a.extend(pkg_ref.iter()); a }),
+        _ => unreachable!(),
+    };
+
+    let out = tokio::process::Command::new(cmd)
+        .args(&args)
+        .env("DEBIAN_FRONTEND", "noninteractive")
+        .output().await;
+
+    match out {
+        Ok(o) if o.status.success() => {
+            // Re-check after install so the client sees the current state
+            // rather than assuming success applied uniformly.
+            let status: std::collections::BTreeMap<&str, bool> = tools.iter()
+                .map(|t| (*t, check_installed(t))).collect();
+            HttpResponse::Ok().json(serde_json::json!({
+                "success": true,
+                "message": format!("Installed via {}: {}", cmd, pkg_vec.join(", ")),
+                "tools": status,
+            }))
+        }
+        Ok(o) => HttpResponse::Ok().json(serde_json::json!({
+            "success": false,
+            "error": format!("{} exited {}: {}", cmd,
+                o.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&o.stderr).trim()),
+        })),
+        Err(e) => HttpResponse::Ok().json(serde_json::json!({
+            "success": false, "error": format!("couldn't run {}: {}", cmd, e),
+        })),
+    }
+}
+
 // ─── Mount ───
 
 pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
@@ -1514,6 +2009,8 @@ pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
         .route("/api/router/segments/{id}", web::put().to(update_segment))
         .route("/api/router/segments/{id}", web::delete().to(delete_segment))
         .route("/api/router/segments/{id}/leases", web::get().to(get_leases))
+        .route("/api/router/segments/{id}/query-log", web::get().to(get_query_log))
+        .route("/api/router/segments/{id}/query-log", web::post().to(set_query_log))
         .route("/api/router/rules", web::get().to(list_rules))
         .route("/api/router/rules", web::post().to(create_rule))
         .route("/api/router/rules/{id}", web::put().to(update_rule))
@@ -1528,6 +2025,13 @@ pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
         .route("/api/router/host-snapshot", web::get().to(get_host_snapshot))
         .route("/api/router/capture", web::post().to(packet_capture))
         .route("/api/router/install-tool", web::post().to(install_tool))
+        .route("/api/router/test-dns",     web::post().to(test_dns))
+        .route("/api/router/tools/status",    web::get().to(tool_status))
+        .route("/api/router/tools/install",   web::post().to(tool_install))
+        .route("/api/router/tools/ping",      web::post().to(tool_ping))
+        .route("/api/router/tools/traceroute",web::post().to(tool_traceroute))
+        .route("/api/router/tools/nslookup",  web::post().to(tool_nslookup))
+        .route("/api/router/tools/whois",     web::post().to(tool_whois))
         .route("/api/router/wan",          web::get().to(list_wan))
         .route("/api/router/wan",          web::post().to(create_wan))
         .route("/api/router/wan/{id}",     web::put().to(update_wan))

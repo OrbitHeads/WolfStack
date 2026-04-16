@@ -5785,6 +5785,7 @@
                         <button class="wr-tab" data-tab="wan" onclick="wrSelectTab('wan')">🌍 WAN / PPPoE</button>
                         <button class="wr-tab" data-tab="connections" onclick="wrSelectTab('connections')">🔗 Connections</button>
                         <button class="wr-tab" data-tab="packets" onclick="wrSelectTab('packets')">📡 Packets</button>
+                        <button class="wr-tab" data-tab="tools" onclick="wrSelectTab('tools')">🛠 DNS Tools</button>
                         <button class="wr-tab" data-tab="logs" onclick="wrSelectTab('logs')">📜 Logs</button>
                     </div>
 
@@ -5992,6 +5993,10 @@
                                 </tbody>
                             </table>
                         </div>
+                    </div>
+
+                    <div id="wr-tab-tools" class="wr-tab-panel" style="padding:16px; display:none;">
+                        <div id="wr-tools-root"></div>
                     </div>
 
                     <div id="wr-tab-logs" class="wr-tab-panel" style="padding:16px; display:none;">
