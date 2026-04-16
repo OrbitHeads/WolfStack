@@ -23433,29 +23433,74 @@ function switchSettingsTab(tabName) {
     } else if (tabName === 'apikeys') {
         loadApiKeysTab();
     } else if (tabName === 'systemcheck') {
-        // Auto-run on first open if results panel is empty
+        populateSystemCheckNodes();
         const out = document.getElementById('systemcheck-results');
         if (out && !out.innerHTML.trim()) runSystemCheck();
     }
 }
 
 // ─── System Check (Settings → 🩺 System Check) ───
-// Audits the host for every runtime dependency WolfStack expects and
-// renders a status list. If AI is configured, each Warning/Missing
-// row gets an "Ask AI" button that asks for tailored remediation.
+// Audits any server in the datacenter for every runtime dependency
+// WolfStack expects. Remote nodes are reached via the standard
+// /api/nodes/{id}/proxy/... cluster proxy so auth + TLS are handled
+// the same way as other cluster APIs.
+
+// Populate the target-node dropdown with every known node, grouped by
+// cluster. Called on every open so newly-joined nodes appear without
+// a page reload. The previous selection is preserved when possible.
+function populateSystemCheckNodes() {
+    const sel = document.getElementById('systemcheck-node');
+    if (!sel) return;
+    const prev = sel.value;
+    const nodes = (typeof allNodes !== 'undefined' && allNodes) ? allNodes : [];
+    // Group by cluster_name so the dropdown matches the sidebar mental
+    // model. Un-clustered nodes fall under "Default".
+    const byCluster = {};
+    for (const n of nodes) {
+        const c = n.cluster_name || n.pve_cluster_name || 'Default';
+        (byCluster[c] = byCluster[c] || []).push(n);
+    }
+    const groups = Object.keys(byCluster).sort();
+    let html = '<option value="">This server (local)</option>';
+    for (const c of groups) {
+        html += `<optgroup label="${escapeHtml(c)}">`;
+        for (const n of byCluster[c].sort((a, b) => (a.hostname || a.id).localeCompare(b.hostname || b.id))) {
+            const label = (n.hostname || n.id) + (n.is_self ? ' (this server)' : '');
+            html += `<option value="${escapeHtml(n.id)}" data-is-self="${n.is_self ? '1' : '0'}">${escapeHtml(label)}</option>`;
+        }
+        html += '</optgroup>';
+    }
+    sel.innerHTML = html;
+    if (prev && nodes.some(n => n.id === prev)) sel.value = prev;
+}
+
 async function runSystemCheck() {
     const out = document.getElementById('systemcheck-results');
     const btn = document.getElementById('systemcheck-run-btn');
+    const sel = document.getElementById('systemcheck-node');
     if (!out) return;
     if (btn) { btn.disabled = true; btn.textContent = 'Scanning…'; }
-    out.innerHTML = '<div style="color:var(--text-muted); padding:24px; text-align:center;">Scanning host — running subprocess checks…</div>';
+
+    // Local vs remote — a blank selection (or a self-node) hits the
+    // local endpoint; anything else proxies through the cluster.
+    const nodeId = sel?.value || '';
+    const selectedOpt = sel?.selectedOptions?.[0];
+    const isSelf = selectedOpt?.dataset?.isSelf === '1';
+    const url = (!nodeId || isSelf)
+        ? '/api/system-check'
+        : `/api/nodes/${encodeURIComponent(nodeId)}/proxy/system-check`;
+    const targetLabel = !nodeId ? 'this server' : (selectedOpt?.textContent || nodeId);
+
+    out.innerHTML = `<div style="color:var(--text-muted); padding:24px; text-align:center;">Scanning <strong>${escapeHtml(targetLabel)}</strong> — running subprocess checks…</div>`;
     try {
-        const r = await fetch('/api/system-check');
+        const r = await fetch(url);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const data = await r.json();
+        data._targetLabel = targetLabel;
+        data._targetNodeId = nodeId || '';
         renderSystemCheckResults(data);
     } catch (e) {
-        out.innerHTML = `<div style="color:#ef4444; padding:24px;">System check failed: ${escapeHtml(e.message || String(e))}</div>`;
+        out.innerHTML = `<div style="color:#ef4444; padding:24px;">System check failed on ${escapeHtml(targetLabel)}: ${escapeHtml(e.message || String(e))}</div>`;
     } finally {
         if (btn) { btn.disabled = false; btn.textContent = '▶ Re-run Check'; }
     }
@@ -23466,16 +23511,18 @@ function renderSystemCheckResults(data) {
     if (!out) return;
     const checks = data.checks || [];
     const aiEnabled = !!data.ai_enabled;
+    const targetNodeId = data._targetNodeId || '';
 
     // Summary counters — at-a-glance tells the operator whether the
     // server is healthy before they scroll the detailed list.
-    const counts = { ok: 0, warning: 0, missing: 0, unsupported: 0 };
+    const counts = { ok: 0, warning: 0, missing: 0, unsupported: 0, auto_install: 0 };
     for (const c of checks) counts[c.status] = (counts[c.status] || 0) + 1;
     const statusMeta = {
-        ok:          { label: 'OK',          colour: '#22c55e', icon: '✅' },
-        warning:     { label: 'Warning',     colour: '#fbbf24', icon: '⚠️' },
-        missing:     { label: 'Missing',     colour: '#ef4444', icon: '❌' },
-        unsupported: { label: 'Unsupported', colour: '#94a3b8', icon: '➖' },
+        ok:           { label: 'OK',           colour: '#22c55e', icon: '✅' },
+        warning:      { label: 'Warning',      colour: '#fbbf24', icon: '⚠️' },
+        missing:      { label: 'Missing',      colour: '#ef4444', icon: '❌' },
+        unsupported:  { label: 'Unsupported',  colour: '#94a3b8', icon: '➖' },
+        auto_install: { label: 'On demand',    colour: '#60a5fa', icon: '⚙️' },
     };
 
     const pills = Object.entries(counts).filter(([_, n]) => n > 0).map(([k, n]) => {
@@ -23492,7 +23539,9 @@ function renderSystemCheckResults(data) {
     const cats = [...order.filter(c => byCat[c]), ...Object.keys(byCat).filter(c => !order.includes(c))];
 
     // Sort each category so problems bubble to the top.
-    const rank = { missing: 0, warning: 1, unsupported: 2, ok: 3 };
+    // AutoInstall sits with OK (informational, not a problem) so it
+    // doesn't clutter the top of the list.
+    const rank = { missing: 0, warning: 1, unsupported: 2, auto_install: 3, ok: 3 };
     for (const cat of cats) byCat[cat].sort((a, b) => (rank[a.status] ?? 9) - (rank[b.status] ?? 9));
 
     // Stash the raw check objects in a module-scoped map so the Ask-AI
@@ -23509,7 +23558,7 @@ function renderSystemCheckResults(data) {
             window._systemCheckCache[key] = c;
             const aiTarget = `sc-ai-${key}`;
             const aiBtn = (aiEnabled && (c.status === 'warning' || c.status === 'missing') && c.ai_helpful)
-                ? `<button class="btn btn-sm" style="font-size:11px; white-space:nowrap;" data-sc-key="${escapeHtml(key)}" onclick="askAiAboutCheck('${aiTarget}', window._systemCheckCache['${escapeHtml(key)}'])">🤖 Ask AI</button>`
+                ? `<button class="btn btn-sm" style="font-size:11px; white-space:nowrap;" data-sc-key="${escapeHtml(key)}" onclick="askAiAboutCheck('${aiTarget}', window._systemCheckCache['${escapeHtml(key)}'], '${escapeHtml(targetNodeId)}')">🤖 Ask AI</button>`
                 : '';
             return `<div style="display:flex; align-items:flex-start; gap:12px; padding:10px 12px; border-bottom:1px solid var(--border);">
                 <div style="flex-shrink:0; width:28px; text-align:center; font-size:16px;">${m.icon}</div>
@@ -23536,23 +23585,32 @@ function renderSystemCheckResults(data) {
         ? `<div style="padding:8px 12px; background:rgba(59,130,246,0.08); border:1px solid rgba(59,130,246,0.3); border-radius:6px; font-size:12px; color:var(--text-secondary); margin-bottom:12px;">🤖 AI is enabled — click <em>Ask AI</em> on any warning/missing row for tailored remediation.</div>`
         : `<div style="padding:8px 12px; background:rgba(251,191,36,0.08); border:1px solid rgba(251,191,36,0.3); border-radius:6px; font-size:12px; color:var(--text-secondary); margin-bottom:12px;">💡 Tip: enable the AI agent in Settings → AI Agent to get context-aware remediation hints.</div>`;
 
+    const hostPill = data._targetLabel
+        ? `<span style="margin-left:auto; font-size:12px; color:var(--text-muted);">Scanned: <code>${escapeHtml(data._targetLabel)}</code>${data.hostname ? ` (${escapeHtml(data.hostname)})` : ''}</span>`
+        : (data.hostname ? `<span style="margin-left:auto; font-size:12px; color:var(--text-muted);">Host: <code>${escapeHtml(data.hostname)}</code></span>` : '');
     out.innerHTML = `
         <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:12px;">
             ${pills}
-            ${data.hostname ? `<span style="margin-left:auto; font-size:12px; color:var(--text-muted);">Host: <code>${escapeHtml(data.hostname)}</code></span>` : ''}
+            ${hostPill}
         </div>
         ${aiBanner}
         ${catHtml}
     `;
 }
 
-async function askAiAboutCheck(targetId, check) {
+async function askAiAboutCheck(targetId, check, nodeId) {
     const target = document.getElementById(targetId);
     if (!target) return;
     target.style.display = 'block';
     target.textContent = '🤖 Asking the AI agent…';
+    // Route through the node proxy so the AI gets the remote node's
+    // distro/arch context — otherwise it'd answer as if the local
+    // node is the one with the problem.
+    const url = nodeId
+        ? `/api/nodes/${encodeURIComponent(nodeId)}/proxy/system-check/ask-ai`
+        : '/api/system-check/ask-ai';
     try {
-        const r = await fetch('/api/system-check/ask-ai', {
+        const r = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({

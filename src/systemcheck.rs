@@ -29,6 +29,11 @@ pub enum DepStatus {
     Missing,
     /// Grey — the host OS/architecture doesn't ship this, nothing to fix.
     Unsupported,
+    /// Blue — not installed, but WolfStack installs this automatically the
+    /// first time the feature that needs it is used (e.g. pppd gets pulled
+    /// in when PPPoE WAN is configured, tcpdump when packet capture runs).
+    /// Not a problem — just an informational note.
+    AutoInstall,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,27 +150,28 @@ pub fn run_checks() -> Vec<DependencyCheck> {
     out.push(simple("socat", "Networking", &["-V"],
         "TCP/UNIX socket bridge — VM serial consoles",
         hint("socat", "socat", "socat", "socat"), false));
-    out.push(simple("ethtool", "Networking", &["--version"],
-        "NIC offload tuning — required for VLAN passthrough",
-        hint("ethtool", "ethtool", "ethtool", "ethtool"), false));
-    out.push(simple("tcpdump", "Networking", &["--version"],
-        "packet capture — powers the Packets tab in WolfRouter",
-        hint("tcpdump", "tcpdump", "tcpdump", "tcpdump"), false));
-    out.push(simple("pppd", "Networking", &["--version"],
-        "PPPoE dial-up — used by WolfRouter WAN mode",
-        hint("ppp", "ppp", "ppp", "ppp"), true));
+    out.push(simple_auto("ethtool", "Networking", &["--version"],
+        "VLAN passthrough NIC offload tuning",
+        hint("ethtool", "ethtool", "ethtool", "ethtool")));
+    out.push(simple_auto("tcpdump", "Networking", &["--version"],
+        "packet capture (Packets tab in WolfRouter)",
+        hint("tcpdump", "tcpdump", "tcpdump", "tcpdump")));
+    out.push(simple_auto("pppd", "Networking", &["--version"],
+        "PPPoE dial-up (WolfRouter WAN)",
+        hint("ppp", "ppp", "ppp", "ppp")));
+    out.push(simple_auto("pppoe", "Networking", &["-V"],
+        "PPPoE plugin (WolfRouter WAN)",
+        hint("pppoe", "rp-pppoe", "rp-pppoe", "rp-pppoe")));
     out.push(check_tun());
 
     // ─── Storage ─────────────────────────────────────────────────
     out.push(check_fuse3());
-    out.push(simple("s3fs", "Storage", &["--version"],
-        "S3 bucket mounts (optional). No S3 storage without this.",
-        hint("s3fs", "s3fs-fuse", "s3fs-fuse", "s3fs"),
-        // s3fs isn't in Alpine's repos — mark unsupported there.
-        !is_alpine));
-    out.push(simple("mount.nfs", "Storage", &[],
-        "NFS mounts — WolfStack storage pools use this",
-        hint("nfs-common", "nfs-utils", "nfs-utils", "nfs-client"), false));
+    out.push(simple_auto("s3fs", "Storage", &["--version"],
+        "S3 bucket mounts (Storage → S3)",
+        hint("s3fs", "s3fs-fuse", "s3fs-fuse", "s3fs")));
+    out.push(simple_auto("mount.nfs", "Storage", &[],
+        "NFS mounts (Storage → NFS)",
+        hint("nfs-common", "nfs-utils", "nfs-utils", "nfs-client")));
 
     // ─── USB passthrough ────────────────────────────────────────
     out.push(check_kernel_module("vhci_hcd", "USB",
@@ -213,14 +219,48 @@ fn simple(
     install: String,
     ai_helpful: bool,
 ) -> DependencyCheck {
+    simple_inner(cmd, category, version_args, why, install, ai_helpful, false)
+}
+
+/// Same as `simple`, but flags the binary as one WolfStack auto-installs
+/// the first time the feature that needs it is used. When missing we
+/// report AutoInstall (blue, informational) instead of Missing (red).
+fn simple_auto(
+    cmd: &str,
+    category: &str,
+    version_args: &[&str],
+    why: &str,
+    install: String,
+) -> DependencyCheck {
+    simple_inner(cmd, category, version_args, why, install, false, true)
+}
+
+fn simple_inner(
+    cmd: &str,
+    category: &str,
+    version_args: &[&str],
+    why: &str,
+    install: String,
+    ai_helpful: bool,
+    auto_install: bool,
+) -> DependencyCheck {
     let (found, ver) = bin_check(cmd, version_args);
+    let status = if found { DepStatus::Ok }
+                 else if auto_install { DepStatus::AutoInstall }
+                 else { DepStatus::Missing };
+    let detail = if found {
+        format!("Installed — {}", why)
+    } else if auto_install {
+        format!("Not installed — WolfStack installs this automatically when {} is used", why)
+    } else {
+        format!("Not installed — {}", why)
+    };
     DependencyCheck {
         name: cmd.to_string(),
         category: category.to_string(),
-        status: if found { DepStatus::Ok } else { DepStatus::Missing },
+        status,
         version: ver,
-        detail: if found { format!("Installed — {}", why) }
-                else     { format!("Not installed — {}", why) },
+        detail,
         install_hint: if found { None } else { Some(install) },
         ai_helpful,
     }

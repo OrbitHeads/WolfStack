@@ -4937,17 +4937,23 @@
 
                     <!-- ─── System Check Tab ─── -->
                     <div id="settings-tab-systemcheck" class="settings-tab-panel">
-                        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; gap:12px; flex-wrap:wrap;">
-                            <div>
-                                <h4 style="margin:0 0 4px 0; font-size:16px; font-weight:600;">🩺 System Dependency Audit</h4>
-                                <p style="font-size:13px; color:var(--text-muted); margin:0;">
-                                    Scans this server for every runtime dependency WolfStack touches — Docker, QEMU, networking, storage, kernel modules —
-                                    and flags anything broken. Dependencies that aren't available on this OS/architecture are marked grey (nothing to fix).
-                                </p>
-                            </div>
+                        <div style="margin-bottom:12px;">
+                            <h4 style="margin:0 0 4px 0; font-size:16px; font-weight:600;">🩺 System Dependency Audit</h4>
+                            <p style="font-size:13px; color:var(--text-muted); margin:0;">
+                                Scans any server in any cluster for every runtime dependency WolfStack touches — Docker, QEMU, networking, storage, kernel modules —
+                                and flags anything broken. Dependencies WolfStack installs automatically on demand show up blue.
+                            </p>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:12px; margin-bottom:16px; flex-wrap:wrap;">
+                            <label style="display:flex; gap:6px; align-items:center; font-size:13px;">
+                                <span style="color:var(--text-muted);">Target node:</span>
+                                <select id="systemcheck-node" style="background:var(--bg-input); border:1px solid var(--border); color:var(--text); padding:6px 10px; border-radius:4px; font-size:13px; min-width:240px;">
+                                    <option value="">This server (local)</option>
+                                </select>
+                            </label>
                             <button class="btn btn-primary" id="systemcheck-run-btn" onclick="runSystemCheck()" style="white-space:nowrap;">▶ Run Check</button>
                         </div>
-                        <div id="systemcheck-results" style="margin-top:16px;"></div>
+                        <div id="systemcheck-results"></div>
                     </div>
 
                     <div id="settings-tab-apikeys" class="settings-tab-panel">
