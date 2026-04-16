@@ -1,0 +1,521 @@
+// Written by Paul Clevett
+// (C)Copyright Wolf Software Systems Ltd
+// https://wolf.uk.com
+
+//! Security posture scanner + active-attack detection.
+//!
+//! Runs alongside the System Check audit and emits findings in the
+//! same `DependencyCheck` shape so the existing Settings → System
+//! Check UI auto-renders them under a dedicated "Security" category.
+//! No new endpoint, no new frontend — just more rows.
+//!
+//! Two flavours of checks:
+//!
+//! **Posture** — static things that should be true on a healthy host:
+//!   • No risky services listening on 0.0.0.0 (Docker 2375, Redis, Mongo…)
+//!   • /etc/wolfstack/ config files aren't world-readable
+//!   • sshd hardened: no root login, no password auth
+//!   • fail2ban / sshguard running when SSH is exposed
+//!   • Cluster secret is long + high-entropy
+//!
+//! **Active attack** — things happening right now that warrant alerting:
+//!   • SSH brute-force in progress (≥ N failed auths from one IP in 5 min)
+//!   • Known-bad crypto miner processes running (xmrig, minerd, cpuminer…)
+//!   • Recent executable files in /tmp or /dev/shm (malware staging)
+//!   • Outbound connections to unusual ports (IRC C2, Tor nodes, etc.)
+//!
+//! Every check catches its own errors — a broken log file in one
+//! place never blocks the others. Missing tools are reported as
+//! `Unsupported` so they don't look like failures.
+//!
+//! Designed to run both on demand (from `/api/system-check`) and on
+//! a timer from the main loop for active-attack detection with alerts.
+
+use crate::systemcheck::{DependencyCheck, DepStatus};
+use chrono::Datelike;
+use std::os::unix::fs::{PermissionsExt, MetadataExt};
+use std::path::Path;
+use std::process::Command;
+
+const CATEGORY: &str = "Security";
+
+/// Run every security check and return the findings. Cheap enough to
+/// fold into `/api/system-check` — no check does more than a few
+/// subprocess calls or a small log file read.
+pub fn run_security_checks() -> Vec<DependencyCheck> {
+    let mut out = Vec::new();
+    scan_listening_services(&mut out);
+    scan_config_permissions(&mut out);
+    scan_cluster_secret(&mut out);
+    scan_sshd_config(&mut out);
+    scan_fail2ban(&mut out);
+    scan_ssh_bruteforce(&mut out);
+    scan_crypto_miners(&mut out);
+    scan_tmp_binaries(&mut out);
+    scan_outbound_suspicious(&mut out);
+    if out.is_empty() {
+        out.push(ok("No active threats", "Every posture check passed and no active-attack signatures were detected in recent logs.", None));
+    }
+    out
+}
+
+// ─── Helpers for finding construction ───────────────────────────
+
+fn ok(name: &str, detail: &str, version: Option<String>) -> DependencyCheck {
+    DependencyCheck {
+        name: name.into(),
+        category: CATEGORY.into(),
+        status: DepStatus::Ok,
+        version,
+        detail: detail.into(),
+        install_hint: None,
+        ai_helpful: false,
+    }
+}
+
+fn warn(name: &str, detail: &str, fix: Option<String>) -> DependencyCheck {
+    DependencyCheck {
+        name: name.into(),
+        category: CATEGORY.into(),
+        status: DepStatus::Warning,
+        version: None,
+        detail: detail.into(),
+        install_hint: fix,
+        ai_helpful: true,
+    }
+}
+
+/// Critical severity → use Missing so the red badge shows (the
+/// existing UI only has 5 statuses; red is the hottest colour).
+fn critical(name: &str, detail: &str, fix: Option<String>) -> DependencyCheck {
+    DependencyCheck {
+        name: name.into(),
+        category: CATEGORY.into(),
+        status: DepStatus::Missing,
+        version: None,
+        detail: detail.into(),
+        install_hint: fix,
+        ai_helpful: true,
+    }
+}
+
+// ─── Listening services ─────────────────────────────────────────
+
+/// Well-known services that are typically a mistake to expose off
+/// loopback. Ordered roughly by blast radius (worst first).
+const RISKY_PORTS: &[(u16, &str, &str, bool)] = &[
+    // (port, service-name, reason, critical?)
+    (2375, "docker-api-plain",   "Docker Engine HTTP API has no auth — anyone reaching this port has root via container escape. Should ONLY ever bind 127.0.0.1.", true),
+    (2376, "docker-api-tls",     "Docker Engine HTTPS API. Cert-authed but still hands out container root to anyone with the client cert.", false),
+    (6379, "redis",              "Redis by default has no auth and supports CONFIG REWRITE — classic RCE when exposed.", false),
+    (27017,"mongodb",            "MongoDB historically shipped with auth disabled; exposed instances get mass-compromised.", false),
+    (9200, "elasticsearch",      "Elasticsearch HTTP API — full cluster control if unauthenticated.", false),
+    (3306, "mysql",              "MySQL on a non-loopback interface. Credential leak or wildcard-host user = attacker access.", false),
+    (5432, "postgres",           "PostgreSQL exposed. Verify pg_hba.conf doesn't trust the network.", false),
+    (11211,"memcached",          "memcached has no auth; UDP listener is a classic amplification vector.", false),
+    (5601, "kibana",              "Kibana UI. If its Elasticsearch is open, attackers get a search interface too.", false),
+];
+
+fn scan_listening_services(out: &mut Vec<DependencyCheck>) {
+    let output = match Command::new("ss").args(["-tulnp"]).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => {
+            out.push(DependencyCheck {
+                name: "Listening services scan".into(),
+                category: CATEGORY.into(),
+                status: DepStatus::Unsupported,
+                version: None,
+                detail: "ss not available — install iproute2 to scan listening sockets.".into(),
+                install_hint: None,
+                ai_helpful: false,
+            });
+            return;
+        }
+    };
+
+    for line in output.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 5 { continue; }
+        let netid = fields[0];
+        let local = fields[4];
+        if local.starts_with("127.") || local.starts_with("[::1]:") { continue; }
+        let port: u16 = match local.rsplit(':').next().and_then(|p| p.parse().ok()) {
+            Some(p) => p, None => continue,
+        };
+        let proto = if netid.starts_with("tcp") { "tcp" } else { "udp" };
+
+        for (rp, service, reason, is_critical) in RISKY_PORTS {
+            if *rp != port { continue; }
+            let name = format!("{}/{} exposed — {}", proto, port, service);
+            let detail = format!("{} Listening on {}.", reason, local);
+            let fix = Some(format!(
+                "Bind the service to 127.0.0.1 in its config, OR block externally:\n  iptables -A INPUT -p {} --dport {} ! -s 127.0.0.1 -j DROP",
+                proto, port));
+            out.push(if *is_critical { critical(&name, &detail, fix) } else { warn(&name, &detail, fix) });
+            break;
+        }
+    }
+}
+
+// ─── Config permissions ─────────────────────────────────────────
+
+fn scan_config_permissions(out: &mut Vec<DependencyCheck>) {
+    let cfg_dir = "/etc/wolfstack";
+    if !Path::new(cfg_dir).exists() { return; }
+    let entries = match std::fs::read_dir(cfg_dir) { Ok(e) => e, Err(_) => return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() { continue; }
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        let looks_sensitive = name.contains("secret")
+            || name.contains("credentials")
+            || name.contains("chap")
+            || name.contains("pap")
+            || name == "ai.json"
+            || name == "alerting.json"
+            || name == "wolfhost.json";
+        if !looks_sensitive { continue; }
+        let perm_bits = match std::fs::metadata(&path) {
+            Ok(m) => m.permissions().mode() & 0o777, Err(_) => continue,
+        };
+        let world_readable = perm_bits & 0o004 != 0;
+        let group_readable = perm_bits & 0o040 != 0;
+        if world_readable {
+            out.push(critical(
+                &format!("{} is world-readable", name),
+                &format!("Mode {:o} on {} — any local user can read its contents (API keys, cluster secrets).", perm_bits, path.display()),
+                Some(format!("chmod 600 {}", path.display())),
+            ));
+        } else if group_readable {
+            out.push(warn(
+                &format!("{} is group-readable", name),
+                &format!("Mode {:o} on {} — non-admin group members can read credentials.", perm_bits, path.display()),
+                Some(format!("chmod 600 {}", path.display())),
+            ));
+        }
+    }
+}
+
+// ─── Cluster secret ─────────────────────────────────────────────
+
+fn scan_cluster_secret(out: &mut Vec<DependencyCheck>) {
+    let path = "/etc/wolfstack/cluster_secret.txt";
+    let s = match std::fs::read_to_string(path) {
+        Ok(t) => t.trim().to_string(), Err(_) => return,
+    };
+    if s.is_empty() { return; }
+    let unique = s.chars().collect::<std::collections::HashSet<_>>().len();
+    if s.len() < 24 {
+        out.push(warn(
+            "Cluster secret is too short",
+            &format!("cluster_secret.txt is {} chars; inter-node messages are trivially spoofable at that length. Aim for ≥32 random bytes.", s.len()),
+            Some(format!("head -c 32 /dev/urandom | base64 > {} && chmod 600 {}  (then propagate to every cluster node)", path, path)),
+        ));
+    } else if s.len() >= 8 && unique < 4 {
+        out.push(warn(
+            "Cluster secret has low entropy",
+            &format!("Only {} unique characters across {} — looks like a placeholder or keyboard-walked value.", unique, s.len()),
+            Some(format!("head -c 32 /dev/urandom | base64 > {} && chmod 600 {}", path, path)),
+        ));
+    }
+}
+
+// ─── sshd hardening ─────────────────────────────────────────────
+
+fn scan_sshd_config(out: &mut Vec<DependencyCheck>) {
+    let path = "/etc/ssh/sshd_config";
+    let text = match std::fs::read_to_string(path) { Ok(t) => t, Err(_) => return };
+    // Only flag an explicit "yes" — most distros default to "prohibit-password" (fine) or rely on the OpenSSH default. Users who typed "yes" meant it.
+    let mut root_login_yes = false;
+    let mut password_auth_yes = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() { continue; }
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("permitrootlogin ") && lower.contains(" yes") {
+            root_login_yes = true;
+        }
+        if lower.starts_with("passwordauthentication ") && lower.contains(" yes") {
+            password_auth_yes = true;
+        }
+    }
+    if root_login_yes {
+        out.push(critical(
+            "sshd allows root login",
+            "/etc/ssh/sshd_config has PermitRootLogin yes — direct root-over-SSH is widely scanned for and trivially brute-forced. Disable it.",
+            Some("Edit /etc/ssh/sshd_config: `PermitRootLogin no` then `systemctl restart sshd`. Create a regular user with sudo first if you don't have one.".into()),
+        ));
+    }
+    if password_auth_yes {
+        out.push(warn(
+            "sshd accepts password authentication",
+            "/etc/ssh/sshd_config has PasswordAuthentication yes. Key-only auth + fail2ban is dramatically safer against the constant scan traffic every public SSH endpoint sees.",
+            Some("Set PasswordAuthentication no and PubkeyAuthentication yes in /etc/ssh/sshd_config (make sure your key works first!), then `systemctl restart sshd`.".into()),
+        ));
+    }
+}
+
+// ─── fail2ban presence ─────────────────────────────────────────
+
+fn ssh_is_exposed() -> bool {
+    // Use -tulnp (same shape as scan_listening_services) — with -t alone
+    // ss drops the Netid column and field indices shift, which silently
+    // broke this check in the first cut.
+    let out = match Command::new("ss").args(["-tulnp"]).output() {
+        Ok(o) if o.status.success() => o.stdout, _ => return false,
+    };
+    for line in String::from_utf8_lossy(&out).lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 5 { continue; }
+        if !fields[0].starts_with("tcp") { continue; }  // SSH is TCP only
+        let local = fields[4];
+        if local.starts_with("127.") || local.starts_with("[::1]:") { continue; }
+        if local.ends_with(":22") { return true; }
+    }
+    false
+}
+
+fn process_running(name: &str) -> bool {
+    Command::new("pgrep").args(["-x", name]).output()
+        .map(|o| o.status.success()).unwrap_or(false)
+}
+
+fn scan_fail2ban(out: &mut Vec<DependencyCheck>) {
+    if !ssh_is_exposed() { return; }
+    if process_running("fail2ban-server") || process_running("sshguard") { return; }
+    out.push(warn(
+        "SSH exposed without brute-force protection",
+        "sshd is listening on a non-loopback address but neither fail2ban nor sshguard is running. Public SSH endpoints see constant dictionary attacks — even key-only auth benefits from fail2ban because it blocks scanners early and shrinks log noise.",
+        Some("Install fail2ban:\n  Debian/Ubuntu:  sudo apt install fail2ban && sudo systemctl enable --now fail2ban\n  Fedora/RHEL:    sudo dnf install fail2ban && sudo systemctl enable --now fail2ban\n  Arch:           sudo pacman -S fail2ban && sudo systemctl enable --now fail2ban\nVerify:  sudo fail2ban-client status sshd".into()),
+    ));
+}
+
+// ─── Active attack: SSH brute force ─────────────────────────────
+
+/// Count recent "Failed password" / "Invalid user" entries grouped by
+/// source IP. Threshold = 10 in the last 5 minutes from one IP. Uses
+/// journalctl if available (works on any systemd box regardless of
+/// where auth actually logs) with a fallback to /var/log/auth.log.
+fn scan_ssh_bruteforce(out: &mut Vec<DependencyCheck>) {
+    // `journalctl --since "5 minutes ago"` is the right way. If it's
+    // not available (non-systemd boxes), fall back to tailing the last
+    // N lines of /var/log/auth.log via `tail -n 2000`. NEVER read the
+    // full auth.log — on a server running for months it can be tens of
+    // thousands of historical lines, which would make the "last 5
+    // minutes" count meaningless and fire alerts for attackers that
+    // stopped days ago.
+    let text = Command::new("journalctl")
+        .args(["--since", "5 minutes ago", "-u", "ssh", "-u", "sshd",
+               "-u", "openssh-server", "--no-pager", "--output=cat"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .or_else(|| {
+            // Tail the last 2000 lines — plenty for a real brute-force
+            // window, bounded enough that noisy historical hosts don't
+            // trigger false positives. Caller filters further by the
+            // per-line timestamp below.
+            Command::new("tail")
+                .args(["-n", "2000", "/var/log/auth.log"])
+                .output().ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        })
+        .unwrap_or_default();
+    if text.is_empty() { return; }
+
+    // Count failures per IP. If the line has a classic syslog timestamp
+    // ("Apr 16 21:30:45 host sshd..."), filter to the last 5 minutes —
+    // journalctl already does this for us, but the auth.log fallback
+    // returns the last 2000 lines which may cover days on a quiet box.
+    let now = chrono::Utc::now();
+    let window = chrono::Duration::minutes(5);
+    let year = now.year();
+    let mut counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for line in text.lines() {
+        if !line.contains("Failed password") && !line.contains("Invalid user") { continue; }
+        // Parse the leading syslog timestamp if present. Format is
+        // "Mmm DD HH:MM:SS" (fixed-width-ish; DD can be "%e" with a
+        // space or "%d"). Skip the filter silently if it doesn't parse
+        // — journalctl lines have no leading timestamp with --output=cat
+        // and we want to count those.
+        let first_15 = line.chars().take(15).collect::<String>();
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(
+            &format!("{} {}", year, first_15), "%Y %b %e %H:%M:%S")
+            .or_else(|_| chrono::NaiveDateTime::parse_from_str(
+                &format!("{} {}", year, first_15), "%Y %b %d %H:%M:%S"))
+        {
+            let t = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc);
+            if now.signed_duration_since(t) > window { continue; }
+        }
+        // Extract "from X.X.X.X" IP. Dumb scan — no regex engine for a dep.
+        if let Some(idx) = line.rfind(" from ") {
+            let rest = &line[idx + 6..];
+            let ip = rest.split_whitespace().next().unwrap_or("");
+            if ip.is_empty() { continue; }
+            let ip = ip.trim_start_matches('[').split(']').next().unwrap_or(ip);
+            *counts.entry(ip.to_string()).or_insert(0) += 1;
+        }
+    }
+    let mut attackers: Vec<(String, u32)> = counts.into_iter()
+        .filter(|(_, n)| *n >= 10)
+        .collect();
+    attackers.sort_by(|a, b| b.1.cmp(&a.1));
+    if attackers.is_empty() { return; }
+    let top = attackers.iter().take(5)
+        .map(|(ip, n)| format!("  {} — {} failed attempts", ip, n))
+        .collect::<Vec<_>>().join("\n");
+    let total: u32 = attackers.iter().map(|(_, n)| n).sum();
+    out.push(critical(
+        &format!("SSH brute-force in progress ({} IP{}, {} attempts/5min)",
+            attackers.len(), if attackers.len() == 1 { "" } else { "s" }, total),
+        &format!(
+            "Multiple failed SSH authentication attempts in the last 5 minutes:\n\n{}\n\nThis is either active scanning, a targeted brute-force, or a misconfigured client hammering with wrong credentials.",
+            top),
+        Some("Install fail2ban to auto-block (see the related finding for install commands). For immediate manual block: `iptables -A INPUT -s <IP> -j DROP`. Consider moving sshd to a non-default port to shed scan traffic.".into()),
+    ));
+}
+
+// ─── Active attack: crypto miners ───────────────────────────────
+
+/// Known crypto-miner process names. If one of these shows up on a
+/// host the operator didn't put there, it's almost certainly a
+/// compromise — miners are the most common payload for exposed-Redis,
+/// exposed-Docker-API, and weak-SSH attacks.
+const MINER_PROCS: &[&str] = &[
+    "xmrig", "xmr-stak", "minerd", "cpuminer", "ccminer",
+    "ethminer", "nsfminer", "phoenixminer", "teamredminer",
+    "nbminer", "lolminer", "bzminer", "t-rex", "gminer",
+    "cgminer", "bfgminer", "minergate",
+];
+
+fn scan_crypto_miners(out: &mut Vec<DependencyCheck>) {
+    // pgrep -af <name> returns PID + full cmdline so operators can
+    // see WHERE it's running (container? systemd unit?) in the detail.
+    let mut hits: Vec<(String, String)> = Vec::new();
+    for proc in MINER_PROCS {
+        if let Ok(o) = Command::new("pgrep").args(["-af", proc]).output() {
+            if o.status.success() && !o.stdout.is_empty() {
+                let text = String::from_utf8_lossy(&o.stdout);
+                for line in text.lines() {
+                    hits.push(((*proc).into(), line.trim().to_string()));
+                }
+            }
+        }
+    }
+    if hits.is_empty() { return; }
+    let detail = hits.iter()
+        .map(|(proc, line)| format!("  [{}]  {}", proc, line))
+        .collect::<Vec<_>>().join("\n");
+    out.push(critical(
+        &format!("Crypto-miner process detected ({} match{})",
+            hits.len(), if hits.len() == 1 { "" } else { "es" }),
+        &format!(
+            "Known crypto-miner binaries are running on this host. If you didn't install them, the box is compromised — miners are the #1 payload for exposed-Redis, exposed-Docker-API, and weak-SSH hacks.\n\n{}",
+            detail),
+        Some("1. Identify the parent: `ps -ef | grep <pid>` and check if it's a container (`docker ps -q | xargs docker inspect`). 2. Kill it: `kill -9 <pid>`. 3. Find the persistence mechanism (cron, systemd unit, ~/.bashrc, /etc/rc.local) and remove it. 4. Rotate every credential on this host. 5. Consider reimaging — miners rarely come alone.".into()),
+    ));
+}
+
+// ─── Active attack: recent tmp binaries ────────────────────────
+
+/// Malware drops its stage-2 in /tmp or /dev/shm because those are
+/// world-writable. Flag any executable file in those dirs newer than
+/// 24 hours old (excluding known-benign patterns like pip unpack dirs).
+fn scan_tmp_binaries(out: &mut Vec<DependencyCheck>) {
+    let mut suspicious = Vec::new();
+    for dir in &["/tmp", "/dev/shm"] {
+        let entries = match std::fs::read_dir(dir) { Ok(e) => e, Err(_) => continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let meta = match entry.metadata() { Ok(m) => m, Err(_) => continue };
+            if !meta.is_file() { continue; }
+            let mode = meta.permissions().mode();
+            let executable = mode & 0o111 != 0;
+            if !executable { continue; }
+            // Age check — files older than 24h aren't worth flagging.
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+            let age = now - meta.mtime();
+            if age > 86400 || age < 0 { continue; }
+            // Skip common benign patterns.
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with("systemd-") || name.starts_with("tmp.")
+                || name.starts_with(".systemd-") || name.starts_with("tmux-")
+                || name.starts_with("pip-") || name.ends_with(".tmp") {
+                continue;
+            }
+            suspicious.push(format!("  {} ({:o}, {} mins old)", path.display(), mode & 0o777, age / 60));
+        }
+    }
+    if suspicious.is_empty() { return; }
+    out.push(warn(
+        &format!("Recent executable file(s) in /tmp or /dev/shm ({} found)", suspicious.len()),
+        &format!(
+            "Files that are world-writable AND executable AND freshly-dropped are classic malware-staging indicators. If you didn't put these there, investigate.\n\n{}",
+            suspicious.join("\n")),
+        Some("Check each file: `file <path>` (what is it?), `lsof <path>` (is a process using it?), `ps -ef | grep <name>`. If malicious: kill the process, remove the file, find the entry point. If benign (package install, CI artefact): delete or move it so it stops triggering.".into()),
+    ));
+}
+
+// ─── Active attack: outbound suspicious ─────────────────────────
+
+/// Outbound connections to ports commonly used by RATs, C2, and
+/// crypto-miner pools. Not definitive — IRC (6667) and Tor entry
+/// (9001) are the obvious bad-news ports, but xmr pools use 3333,
+/// 4444, 14444, 5555, 7777, 9999 all the time.
+const SUSPICIOUS_REMOTE_PORTS: &[(u16, &str)] = &[
+    (1337, "leet — hacker/RAT meme port"),
+    (3333, "crypto-mining pool (monero stratum)"),
+    (4444, "Metasploit default, common RAT port, and some mining pools"),
+    (5555, "RAT / mining pool"),
+    (6666, "IRC (legacy), some RAT families"),
+    (6667, "IRC — classic C2 channel"),
+    (7777, "common mining pool"),
+    (8443, "HTTPS-alt — legit but worth noting if no HTTPS service on your side"),
+    (9001, "Tor relay port (suspicious for a server)"),
+    (9999, "mining pool / RAT"),
+    (14444,"xmrig monero pool"),
+];
+
+fn scan_outbound_suspicious(out: &mut Vec<DependencyCheck>) {
+    let text = match Command::new("ss").args(["-tn", "state", "established"]).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return,
+    };
+    // `ss -tn state established` output format (state column is
+    // suppressed when a state filter is used):
+    //   Recv-Q Send-Q Local-Address:Port Peer-Address:Port
+    //   0      0      192.168.1.10:42842  1.2.3.4:443
+    // So we have 4 fields, peer is fields[3].
+    let mut hits: Vec<(String, u16, String)> = Vec::new();
+    for line in text.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 4 { continue; }
+        let peer = fields[3];           // Peer Address:Port
+        // Skip private + loopback peer ranges — we only care about outbound to the internet.
+        if peer.starts_with("127.") || peer.starts_with("192.168.") ||
+           peer.starts_with("10.") || peer.starts_with("172.")  ||  // very rough but covers RFC1918
+           peer.starts_with("[::1]:") || peer.starts_with("[fe80")
+        { continue; }
+        let port_str = peer.rsplit(':').next().unwrap_or("");
+        let port: u16 = match port_str.parse() { Ok(p) => p, Err(_) => continue };
+        for (sp, reason) in SUSPICIOUS_REMOTE_PORTS {
+            if *sp == port {
+                hits.push((peer.to_string(), port, (*reason).into()));
+                break;
+            }
+        }
+    }
+    if hits.is_empty() { return; }
+    let detail = hits.iter().take(10)
+        .map(|(peer, _, reason)| format!("  {} — {}", peer, reason))
+        .collect::<Vec<_>>().join("\n");
+    out.push(warn(
+        &format!("Outbound connection(s) to suspicious ports ({} found)", hits.len()),
+        &format!(
+            "Established TCP sessions to ports commonly used by RATs, C2, or crypto-miner pools:\n\n{}\n\nFalse positives happen — devs running IRC clients or mining their own hardware will show up here too. Confirm each one against what you actually run.",
+            detail),
+        Some("For each connection: `lsof -i :<port>` identifies the local process. If legitimate (IRC client, personal mining), leave it. If not: kill the process, remove persistence, rotate creds.".into()),
+    ));
+}

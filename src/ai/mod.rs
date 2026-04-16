@@ -621,6 +621,28 @@ impl AiAgent {
         let config = self.config.lock().unwrap().clone();
         if !config.is_configured() { return None; }
 
+        // Pull in live security findings so the AI sees active attacks
+        // (SSH brute-force, crypto miners, exposed services) alongside
+        // the usual CPU/RAM/disk metrics. Run off-executor because the
+        // scan shells out to ss/pgrep/journalctl. Fail soft — health
+        // check continues with plain metrics if the security scan errors.
+        let security_summary = tokio::task::spawn_blocking(|| {
+            let findings = crate::security::run_security_checks();
+            if findings.is_empty() { return String::new(); }
+            let mut lines = Vec::new();
+            for f in &findings {
+                let sev = match f.status {
+                    crate::systemcheck::DepStatus::Missing => "CRITICAL",
+                    crate::systemcheck::DepStatus::Warning => "WARNING",
+                    _ => continue,
+                };
+                lines.push(format!("  [{}] {} — {}", sev, f.name, f.detail.replace('\n', " ")));
+            }
+            if lines.is_empty() { String::new() } else {
+                format!("\n\nSecurity scan findings:\n{}", lines.join("\n"))
+            }
+        }).await.unwrap_or_default();
+
         let prompt = format!(
             "You are a server monitoring AI for WolfStack. Analyze these metrics and report ONLY if there are concerns. \
              If everything looks healthy, respond with exactly 'ALL_OK'. \
@@ -630,12 +652,15 @@ impl AiAgent {
              When CPU or memory is high, the top processes are included — identify WHICH process is causing the issue \
              by name (e.g. 'mysqld using 85% CPU', 'java consuming 4.2GB RAM'). Don't just say 'CPU is high' — say what's using it.\n\
              For Kubernetes clusters: flag unhealthy/NotReady nodes, failed or pending pods, pods with high restart counts \
-             (10+), and any cluster that reports as UNHEALTHY. Include the cluster name and affected pod/node names.\n\n\
+             (10+), and any cluster that reports as UNHEALTHY. Include the cluster name and affected pod/node names.\n\
+             For security findings, treat CRITICAL entries as the top priority — active SSH brute-force, crypto miners, \
+             and world-readable secrets mean the host is either under attack or already compromised. Recommend immediate \
+             containment (block the IP, kill the process, rotate the secret) before anything else.\n\n\
              IMPORTANT: If you identify a fixable issue, propose the fix using ACTION tags:\n\
              [ACTION id=\"unique-id\" title=\"Short Title\" risk=\"low|medium|high\" explain=\"Why this fixes it\" target=\"local\"]command[/ACTION]\n\
              The admin will see these actions in the WolfStack dashboard AND in the alert email, and can approve them with one click.\n\n\
-             Current server metrics:\n{}",
-            metrics_summary
+             Current server metrics:\n{}{}",
+            metrics_summary, security_summary
         );
 
         let system = "You are a WolfStack server health monitoring agent. Be concise and technical. Only flag genuine issues. Propose fixes with [ACTION] tags when possible.";

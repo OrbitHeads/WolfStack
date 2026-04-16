@@ -5862,13 +5862,37 @@ pub async fn system_check_run(
 ) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let ai_enabled = state.ai_agent.config.lock().unwrap().is_configured();
-    // Run the check off the async executor — it shells out to lsmod,
-    // systemctl, docker info, etc. and we don't want to block actix.
-    let checks = match web::block(crate::systemcheck::run_checks).await {
+    // Run both audits off the async executor — they shell out to lsmod,
+    // systemctl, docker info, ss, journalctl, pgrep etc. and we don't
+    // want actix's async runtime parked on them. Run them in parallel
+    // so the user-visible latency matches the slower of the two, not
+    // the sum.
+    let deps_fut = web::block(crate::systemcheck::run_checks);
+    let sec_fut  = web::block(crate::security::run_security_checks);
+    let (deps_res, sec_res) = tokio::join!(deps_fut, sec_fut);
+    let mut checks = match deps_res {
         Ok(v) => v,
         Err(e) => return HttpResponse::InternalServerError()
             .json(serde_json::json!({ "error": format!("System check failed: {}", e) })),
     };
+    match sec_res {
+        Ok(mut v) => checks.append(&mut v),
+        Err(e) => {
+            // Security scan error doesn't fail the whole endpoint —
+            // surface it as a single Warning entry so the user sees
+            // why the Security category looks thin. Any other outcome
+            // would hide a real issue.
+            checks.push(crate::systemcheck::DependencyCheck {
+                name: "Security scan errored".into(),
+                category: "Security".into(),
+                status: crate::systemcheck::DepStatus::Warning,
+                version: None,
+                detail: format!("Security scan task failed: {}. Non-fatal — dependency checks above are still accurate.", e),
+                install_hint: None,
+                ai_helpful: false,
+            });
+        }
+    }
     HttpResponse::Ok().json(serde_json::json!({
         "checks": checks,
         "ai_enabled": ai_enabled,

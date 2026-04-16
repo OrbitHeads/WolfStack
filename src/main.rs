@@ -42,6 +42,7 @@ mod wolfusb;
 mod paths;
 mod ports;
 mod systemcheck;
+mod security;
 mod services_discovery;
 mod cluster_browser;
 mod compat;
@@ -351,6 +352,73 @@ async fn main() -> std::io::Result<()> {
         // Start the WolfRouter safe-mode watcher — auto-reverts firewall
         // changes if the user doesn't confirm within the safe-mode window.
         crate::networking::router::spawn_rollback_watcher(app_state.router.clone());
+
+        // Security scanner background loop — runs posture + active-attack
+        // checks every 5 minutes and fires alerts via Discord/Slack/Telegram/
+        // email when a critical-severity finding appears (SSH brute-force,
+        // crypto miner, world-readable cluster_secret, etc). Cooldown keeps
+        // the same finding from spamming channels — one alert per unique
+        // finding id per hour is plenty.
+        tokio::spawn(async move {
+            // Startup delay so the first scan happens after cluster discovery
+            // settles — avoids noisy "scanner errored" at boot.
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            let mut recent_alerts: std::collections::HashMap<String, std::time::Instant> =
+                std::collections::HashMap::new();
+            let cooldown = std::time::Duration::from_secs(60 * 60);
+            loop {
+                // Run the synchronous scan off the async executor.
+                let findings = tokio::task::spawn_blocking(
+                    crate::security::run_security_checks
+                ).await.unwrap_or_default();
+
+                // Load alert config fresh each iteration so toggle changes
+                // take effect without a restart.
+                let cfg = crate::alerting::AlertConfig::load();
+                if cfg.enabled {
+                    for f in &findings {
+                        // Only `Missing` (which we use as "critical" severity)
+                        // goes to alerts — warnings live in the System Check
+                        // UI, don't page operators at 3am.
+                        if !matches!(f.status, crate::systemcheck::DepStatus::Missing) {
+                            continue;
+                        }
+                        // Dedup key: strip everything after an opening
+                        // parenthesis so dynamic counts ("3 IPs, 47
+                        // attempts") don't create a new key every
+                        // iteration and defeat the cooldown. Stable
+                        // prefix == same-attack dedup, while a NEW kind
+                        // of finding gets its own bucket.
+                        let key = f.name
+                            .split('(')
+                            .next().unwrap_or(&f.name)
+                            .trim()
+                            .to_string();
+                        let now = std::time::Instant::now();
+                        if let Some(prev) = recent_alerts.get(&key) {
+                            if now.duration_since(*prev) < cooldown { continue; }
+                        }
+                        recent_alerts.insert(key, now);
+
+                        let title = format!("🚨 WolfStack Security — {}", f.name);
+                        let mut msg = f.detail.clone();
+                        if let Some(fix) = &f.install_hint {
+                            msg.push_str("\n\nSuggested fix:\n");
+                            msg.push_str(fix);
+                        }
+                        crate::alerting::send_alert(&cfg, &title, &msg).await;
+                    }
+                }
+
+                // Prune cooldown map entries older than 2× cooldown — stops
+                // it growing unbounded over weeks of uptime.
+                let prune_cutoff = std::time::Duration::from_secs(60 * 60 * 2);
+                let now = std::time::Instant::now();
+                recent_alerts.retain(|_, t| now.duration_since(*t) < prune_cutoff);
+
+                tokio::time::sleep(std::time::Duration::from_secs(5 * 60)).await;
+            }
+        });
 
         // Re-apply the persisted router config (WAN, LAN DHCP/DNS,
         // firewall) on startup. Before this existed, every reboot of a
