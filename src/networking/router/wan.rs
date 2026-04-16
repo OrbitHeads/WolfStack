@@ -45,21 +45,27 @@ fn nat_ensure(iface: &str) -> Result<(), String> {
     let check = Command::new("iptables")
         .args(["-t", "nat", "-C", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"])
         .status();
-    if matches!(check, Ok(s) if s.success()) {
-        return Ok(());
+    let masq_needs_add = !matches!(check, Ok(s) if s.success());
+    if masq_needs_add {
+        let out = Command::new("iptables")
+            .args(["-t", "nat", "-A", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"])
+            .output()
+            .map_err(|e| format!("iptables -A POSTROUTING: {}", e))?;
+        if !out.status.success() {
+            return Err(format!(
+                "WAN MASQUERADE add on {} failed: {}",
+                iface, String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        info!("WolfRouter: MASQUERADE installed on WAN interface {}", iface);
     }
-    let out = Command::new("iptables")
-        .args(["-t", "nat", "-A", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"])
-        .output()
-        .map_err(|e| format!("iptables -A POSTROUTING: {}", e))?;
-    if !out.status.success() {
-        return Err(format!(
-            "WAN MASQUERADE add on {} failed: {}",
-            iface, String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    info!("WolfRouter: MASQUERADE installed on WAN interface {}", iface);
-    Ok(())
+    // MSS clamp is non-optional — without it, PPPoE and any tunnelled
+    // WAN stalls on large TCP flows (apt, docker pulls, Windows Update,
+    // TLS payloads) because LAN clients negotiate 1460-byte segments
+    // that won't fit in a 1492-byte pipe, and PMTU ICMPs frequently
+    // get eaten somewhere between us and the target. Install it right
+    // next to MASQUERADE so the two always travel together.
+    mss_clamp_ensure(iface)
 }
 
 /// Drop every MASQUERADE rule whose output interface matches. Loop on
@@ -75,6 +81,69 @@ fn nat_remove(iface: &str) {
             _ => break,
         }
     }
+    // Companion — strip the MSS clamp too. Same idempotent loop so
+    // duplicates from earlier bugs don't accumulate.
+    for _ in 0..16 {
+        let out = Command::new("iptables")
+            .args(["-t", "mangle", "-D", "FORWARD",
+                   "-o", iface, "-p", "tcp",
+                   "--tcp-flags", "SYN,RST", "SYN",
+                   "-j", "TCPMSS", "--clamp-mss-to-pmtu"])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => continue,
+            _ => break,
+        }
+    }
+}
+
+/// Install an MSS clamp on TCP SYN packets leaving through `iface`.
+/// Rewrites the MSS option in every outgoing SYN to the path MTU so
+/// LAN clients never negotiate a segment size bigger than the WAN can
+/// actually carry — the classic fix for "small things work, big
+/// downloads stall" on PPPoE links (MTU 1492 instead of 1500) and on
+/// any link where Path MTU Discovery ICMPs get eaten upstream.
+///
+/// `--clamp-mss-to-pmtu` auto-picks from the interface MTU, so the
+/// same rule works for PPPoE (1492 → MSS 1452), DHCP (1500 → 1460),
+/// and anything tunnelled (WireGuard, GRE, etc).
+///
+/// Idempotent: `-C` pre-check means apply() is safe to call
+/// repeatedly. Without this, every WAN-enable would stack another
+/// duplicate rule.
+fn mss_clamp_ensure(iface: &str) -> Result<(), String> {
+    if iface.is_empty() { return Ok(()); }
+    // Two explicit arg arrays (check vs add) — cheaper readability win
+    // over mutating a shared array by index. Only the op flag differs
+    // between them; everything else must stay identical for the `-C`
+    // lookup to find the rule a later `-A` installed.
+    let check_args = [
+        "-t", "mangle", "-C", "FORWARD",
+        "-o", iface, "-p", "tcp",
+        "--tcp-flags", "SYN,RST", "SYN",
+        "-j", "TCPMSS", "--clamp-mss-to-pmtu",
+    ];
+    let add_args = [
+        "-t", "mangle", "-A", "FORWARD",
+        "-o", iface, "-p", "tcp",
+        "--tcp-flags", "SYN,RST", "SYN",
+        "-j", "TCPMSS", "--clamp-mss-to-pmtu",
+    ];
+    if matches!(Command::new("iptables").args(check_args).status(), Ok(s) if s.success()) {
+        return Ok(());
+    }
+    let out = Command::new("iptables")
+        .args(add_args)
+        .output()
+        .map_err(|e| format!("iptables -A mangle FORWARD: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "WAN MSS clamp add on {} failed: {}",
+            iface, String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    info!("WolfRouter: MSS clamp-to-pmtu installed on WAN interface {}", iface);
+    Ok(())
 }
 
 /// One WAN uplink configuration. Keyed by `id` (auto-generated) and
@@ -256,18 +325,24 @@ fn install_ppp_hooks(peer_name: &str) -> Result<(), String> {
 
     // ip-up: runs after pppd has negotiated the link and the ppp*
     // interface is ready. Install MASQUERADE on $1 (the ppp iface) so
-    // LAN clients routed over this WAN actually reach the internet.
+    // LAN clients routed over this WAN actually reach the internet,
+    // AND the TCPMSS clamp so LAN TCP sessions don't negotiate a
+    // segment size bigger than the 1492-byte PPPoE pipe — without it,
+    // apt/docker/TLS bulk transfers stall intermittently while tiny
+    // flows (ping, DNS, TLS handshakes) look fine.
     // Record the iface name in state so ip-down can clean up even if
     // the dynamic number differs between runs.
     let up = format!(
         "#!/bin/sh\n\
-         # WolfRouter ip-up hook for {peer} — installs WAN MASQUERADE.\n\
+         # WolfRouter ip-up hook for {peer} — installs WAN MASQUERADE + MSS clamp.\n\
          [ \"$6\" = \"{peer}\" ] || exit 0\n\
          IFACE=\"$1\"\n\
          [ -n \"$IFACE\" ] || exit 0\n\
          echo \"$IFACE\" > \"{prefix}iface\" 2>/dev/null || true\n\
          iptables -t nat -C POSTROUTING -o \"$IFACE\" -j MASQUERADE 2>/dev/null \\\n\
              || iptables -t nat -A POSTROUTING -o \"$IFACE\" -j MASQUERADE 2>/dev/null || true\n\
+         iptables -t mangle -C FORWARD -o \"$IFACE\" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \\\n\
+             || iptables -t mangle -A FORWARD -o \"$IFACE\" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true\n\
          exit 0\n",
         peer = peer_name, prefix = state_prefix,
     );
@@ -283,12 +358,13 @@ fn install_ppp_hooks(peer_name: &str) -> Result<(), String> {
         "#!/bin/sh\n\
          # WolfRouter ip-down hook for {peer} — restores pre-PPPoE state.\n\
          [ \"$6\" = \"{peer}\" ] || exit 0\n\
-         # Remove any MASQUERADE rule(s) we installed for this link.\n\
-         # Try both $1 (pppd passes the iface) and the iface we recorded\n\
-         # in state during ip-up, in case they differ on a rebind.\n\
+         # Remove any MASQUERADE + MSS-clamp rule(s) we installed for\n\
+         # this link. Try both $1 (pppd passes the iface) and the iface\n\
+         # we recorded in state during ip-up, in case they differ on a rebind.\n\
          for IF in \"$1\" \"$(cat \"{prefix}iface\" 2>/dev/null)\"; do\n\
              [ -z \"$IF\" ] && continue\n\
              while iptables -t nat -D POSTROUTING -o \"$IF\" -j MASQUERADE 2>/dev/null; do :; done\n\
+             while iptables -t mangle -D FORWARD -o \"$IF\" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; do :; done\n\
          done\n\
          rm -f \"{prefix}iface\" 2>/dev/null || true\n\
          SAVED_ROUTE=$(cat \"{prefix}default-route\" 2>/dev/null)\n\

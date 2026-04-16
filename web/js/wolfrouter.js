@@ -151,13 +151,14 @@
             </div>`;
         };
         try {
-            const [topoR, rulesR, lansR, zonesR, managedR, snapR] = await Promise.all([
+            const [topoR, rulesR, lansR, zonesR, managedR, snapR, wanR] = await Promise.all([
                 fetch(wrUrl('/api/router/topology')),
                 fetch(wrUrl('/api/router/rules')),
                 fetch(wrUrl('/api/router/segments')),
                 fetch(wrUrl('/api/router/zones')),
                 fetch(wrUrl('/api/router/managed-overview')),
                 fetch(wrUrl('/api/router/host-snapshot')),
+                fetch(wrUrl('/api/router/wan')),
             ]);
             if (!topoR.ok) {
                 const body = await topoR.text().catch(() => '');
@@ -171,6 +172,7 @@
             if (zonesR.ok) wrState.zones = await zonesR.json();
             if (managedR.ok) wrState.managed = await managedR.json();
             if (snapR.ok) wrState.snapshot = await snapR.json();
+            if (wanR.ok)  wrState.wan = await wanR.json();
             wrRenderAll();
         } catch (e) {
             console.error('wolfrouter load:', e);
@@ -976,9 +978,10 @@
                         </label>
                     </div>
                 </div>
+                <div id="wr-l-status" style="padding:0 20px; font-size:12px;"></div>
                 <div class="modal-footer">
                     <button class="btn" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
-                    <button class="btn btn-primary" onclick="wrSaveLan('${l.id}')">${existing ? 'Save' : 'Create'}</button>
+                    <button id="wr-l-save-btn" class="btn btn-primary" onclick="wrSaveLan('${l.id}')">${existing ? 'Save' : 'Create'}</button>
                 </div>
             </div>`;
         document.body.appendChild(overlay);
@@ -1075,6 +1078,23 @@
     window.wrLanOnIfaceChange = wrLanOnIfaceChange;
 
     async function wrSaveLan(id) {
+        // Pull elements for inline status + button management. Every state
+        // change below pipes through `say()` so the user sees exactly which
+        // stage we're in — important because the preflight install can
+        // take 30-60s on a first-time setup.
+        const statusEl = document.getElementById('wr-l-status');
+        const saveBtn = document.getElementById('wr-l-save-btn');
+        const origLabel = saveBtn ? saveBtn.textContent : '';
+        const say = (emoji, msg, colour = 'var(--text)') => {
+            if (statusEl) statusEl.innerHTML =
+                `<div style="padding:4px 0; color:${colour};">${emoji} ${msg}</div>` + statusEl.innerHTML;
+        };
+        const unlock = () => {
+            if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = origLabel; }
+        };
+        if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = '⏳ Working…'; }
+        if (statusEl) statusEl.innerHTML = '';
+
         const existing = id ? wrState.lans.find(l => l.id === id) : null;
         const nodeSel = document.getElementById('wr-l-node');
         const node_id = nodeSel ? nodeSel.value : '';
@@ -1101,6 +1121,23 @@
             block_ads: document.getElementById('wr-l-ads').checked,
         });
 
+        // Preflight — ensure dnsmasq exists BEFORE trying to create a segment
+        // that spawns it. Without this the backend's dhcp::start fails with
+        // a hard-to-read error after the user has already filled the form.
+        if (lan.dhcp.enabled) {
+            say('⏳', 'Checking that dnsmasq is installed (apt/dnf can take up to a minute the first time)…', 'var(--text-muted)');
+            const res = await wrEnsureTool('dnsmasq');
+            if (res.alreadyInstalled) {
+                say('✅', 'dnsmasq already installed.', '#22c55e');
+            } else if (res.success) {
+                say('✅', 'dnsmasq installed via the host package manager.', '#22c55e');
+            } else {
+                say('❌', `dnsmasq not available: ${escHtml(res.message)}. Install it manually (e.g. <code>apt install dnsmasq</code>) and try again.`, '#ef4444');
+                unlock();
+                return;
+            }
+        }
+
         // Optional: assign the router IP to the interface first. Done before
         // saving the segment so dnsmasq can bind to a live, addressed iface.
         // Failures here are surfaced but don't block segment creation — users
@@ -1115,11 +1152,15 @@
                         method: 'POST', headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ address: lan.router_ip, prefix }),
                     });
-                    if (!r.ok) {
+                    if (r.ok) {
+                        say('✅', `Router IP <code>${escHtml(lan.router_ip)}/${prefix}</code> assigned to <code>${escHtml(lan.interface)}</code>.`, '#22c55e');
+                    } else {
                         const txt = await r.text();
                         // "File exists" is the idempotent-retry case — silently OK.
-                        if (!/file exists|already assigned|RTNETLINK.*File exists/i.test(txt)) {
-                            console.warn('IP assign on', lan.interface, 'returned:', txt);
+                        if (/file exists|already assigned|RTNETLINK.*File exists/i.test(txt)) {
+                            say('ℹ', `Router IP already on <code>${escHtml(lan.interface)}</code>.`, 'var(--text-muted)');
+                        } else {
+                            say('⚠', `IP assign warning (segment will still be saved): ${escHtml(txt)}`, '#fbbf24');
                         }
                     }
                     // Bring the interface up (best-effort; a bridge is typically already up).
@@ -1129,17 +1170,32 @@
                         body: JSON.stringify({ up: true }),
                     }).catch(() => {});
                 } catch (e) {
-                    console.warn('Could not assign IP to', lan.interface, e);
+                    say('⚠', `Could not assign IP: ${escHtml(e.message || e)}. Continuing with segment save.`, '#fbbf24');
                 }
             }
         }
 
+        say('⏳', 'Saving segment — dnsmasq will start…', 'var(--text-muted)');
         const url = wrUrl(id ? '/api/router/segments/' + id : '/api/router/segments');
         const method = id ? 'PUT' : 'POST';
-        const r = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(lan) });
-        if (!r.ok) { alert('Save failed: ' + await r.text()); return; }
-        document.querySelector('.modal-overlay')?.remove();
-        await wrLoadAll();
+        try {
+            const r = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(lan) });
+            if (!r.ok) {
+                say('❌', `Save failed: ${escHtml(await r.text())}`, '#ef4444');
+                unlock();
+                return;
+            }
+        } catch (e) {
+            say('❌', `Save errored: ${escHtml(e.message || e)}`, '#ef4444');
+            unlock();
+            return;
+        }
+        say('✅', 'Segment saved — dnsmasq running.', '#22c55e');
+        // Tiny pause so the user actually sees the green tick before the modal closes.
+        setTimeout(() => {
+            document.querySelector('.modal-overlay')?.remove();
+            wrLoadAll();
+        }, 400);
     }
 
     async function wrRenderLeases() {
@@ -1206,21 +1262,72 @@
             grid.innerHTML = '<div style="color:var(--text-muted);">Loading topology...</div>';
             return;
         }
+
+        // Drift detection — zone labels are just firewall tags, but users
+        // naturally expect changing a zone to rewire the router. Surface
+        // any mismatch between "what the zone says" and "what the actual
+        // WanConnection / LanSegment is doing" so the user knows a
+        // manual fix (edit LAN/WAN, or re-run Quick Setup) is needed
+        // for the change to be more than cosmetic.
+        const drifts = [];
+        const wans = wrState.wan || [];
+        const lans = wrState.lans || [];
+        for (const node of topo.nodes) {
+            for (const ifc of (node.interfaces || [])) {
+                const z = ifc.zone;
+                const hasEnabledWan = wans.some(w => w.enabled && w.node_id === node.node_id && w.interface === ifc.name);
+                const hasLan        = lans.some(l => l.node_id === node.node_id && l.interface === ifc.name);
+                const label = `<code>${escHtml(ifc.name)}</code> on <code>${escHtml(node.node_name)}</code>`;
+                if (z?.kind === 'wan' && !hasEnabledWan) {
+                    drifts.push({ sev: 'warn', iface: ifc.name, node: node.node_id, msg: `${label} is zoned <strong>WAN</strong> but no enabled WAN connection uses it. Either create a WAN connection for this interface, change the zone, or re-run ⚡ Quick Setup.` });
+                }
+                if (z?.kind === 'lan' && !hasLan) {
+                    drifts.push({ sev: 'warn', iface: ifc.name, node: node.node_id, msg: `${label} is zoned <strong>LAN ${z.id ?? 0}</strong> but no LAN segment serves DHCP on it. Either create a LAN segment for this interface, change the zone, or re-run ⚡ Quick Setup.` });
+                }
+                if (hasEnabledWan && z && z.kind !== 'wan') {
+                    drifts.push({ sev: 'warn', iface: ifc.name, node: node.node_id, msg: `${label} has an active WAN connection, but its zone is <strong>${escHtml(zoneHuman(z))}</strong>. Firewall rules will treat it as ${escHtml(zoneHuman(z))}; change the zone to WAN so rules match reality.` });
+                }
+                if (hasLan && z && z.kind !== 'lan') {
+                    drifts.push({ sev: 'warn', iface: ifc.name, node: node.node_id, msg: `${label} is actively serving a LAN segment, but its zone is <strong>${escHtml(zoneHuman(z))}</strong>. Firewall rules will treat it as ${escHtml(zoneHuman(z))}; change the zone to LAN so rules match reality.` });
+                }
+            }
+        }
+        const driftBanner = drifts.length
+            ? `<div style="margin-bottom:14px; padding:12px 14px; background:rgba(251,191,36,0.1); border:1px solid rgba(251,191,36,0.4); border-radius:6px; font-size:12px;">
+                <strong style="color:#fbbf24;">⚠ Zone labels and running config have drifted apart (${drifts.length} issue${drifts.length===1?'':'s'}).</strong>
+                <div style="color:var(--text-muted); margin-top:3px;">
+                    Zones are labels that firewall rules use &mdash; changing a zone here doesn't automatically move the router IP, dnsmasq, or MASQUERADE to a different interface. Those live on LAN segments and WAN connections (their own interface fields). Drift means the rack view and rules may not match what's actually happening.
+                </div>
+                <ul style="margin:8px 0 0; padding-left:18px;">
+                    ${drifts.map(d => `<li style="margin-bottom:4px;">${d.msg}</li>`).join('')}
+                </ul>
+            </div>`
+            : '';
+
         const zones = ['wan', 'lan0', 'lan1', 'dmz', 'wolfnet', 'trusted'];
-        const parts = [];
+        const parts = [driftBanner];
         for (const node of topo.nodes) {
             parts.push(`<div style="margin-bottom:16px;">
                 <h4 style="margin:0 0 8px; font-size:13px;">${escHtml(node.node_name)} <span style="color:var(--text-muted); font-size:11px; font-weight:normal;">(${node.node_id})</span></h4>
-                <table class="data-table" style="font-size:12px;"><thead><tr><th>Interface</th><th>Current zone</th><th>Assign</th></tr></thead><tbody>
+                <table class="data-table" style="font-size:12px;"><thead><tr><th>Interface</th><th>Current zone</th><th>Actually doing</th><th>Assign</th></tr></thead><tbody>
                 ${node.interfaces.map(ifc => {
                     const current = ifc.zone ? zoneHuman(ifc.zone) : '<span style="color:var(--text-muted);">unassigned</span>';
                     const opts = ['<option value="">(unassigned)</option>'].concat(
                         zones.map(z => `<option value="${z}">${z.toUpperCase()}</option>`)
                     ).join('');
                     const cur = ifc.zone?.kind === 'lan' ? `lan${ifc.zone.id}` : (ifc.zone?.kind || '');
+                    // "Actually doing" surfaces which LAN/WAN is bound
+                    // to this iface — the ground truth behind the zone.
+                    const lan = lans.find(l => l.node_id === node.node_id && l.interface === ifc.name);
+                    const wan = wans.find(w => w.enabled && w.node_id === node.node_id && w.interface === ifc.name);
+                    const actualBits = [];
+                    if (wan) actualBits.push(`<span class="badge" style="background:rgba(251,191,36,0.15); color:#fbbf24; font-size:10px;">WAN: ${escHtml(wan.name)}</span>`);
+                    if (lan) actualBits.push(`<span class="badge" style="background:rgba(59,130,246,0.15); color:#60a5fa; font-size:10px;">LAN: ${escHtml(lan.name)} (${escHtml(lan.subnet_cidr)})</span>`);
+                    const actualCell = actualBits.length ? actualBits.join(' ') : '<span style="color:var(--text-muted); font-size:11px;">&mdash;</span>';
                     return `<tr>
                         <td><code>${escHtml(ifc.name)}</code> ${ifc.link_up ? '<span style="color:var(--success);">●</span>' : '<span style="color:var(--text-muted);">○</span>'}</td>
                         <td>${current}</td>
+                        <td>${actualCell}</td>
                         <td>
                             <select class="form-control" style="font-size:12px; padding:3px 6px;" onchange="wrAssignZone('${node.node_id}', '${ifc.name}', this.value)">
                                 ${opts.replace(`value="${cur}"`, `value="${cur}" selected`)}
@@ -3049,6 +3156,107 @@
     //   purple  = Management
     //   grey    = unassigned / trunk
 
+    /// Hash the topology's structural fingerprint — the stuff that
+    /// affects what the rack LOOKS like. Deliberately excludes anything
+    /// that changes every poll (rx_bps, tx_bps) so the common case
+    /// ("3-second tick, nothing structural changed, just traffic
+    /// counters updated") skips the expensive full re-render.
+    function wrRackStructureHash(topo) {
+        if (!topo || !topo.nodes) return '';
+        const bits = [];
+        for (const n of topo.nodes) {
+            bits.push('N:' + n.node_id + '|' + n.node_name + '|' + (n.status || 'live'));
+            for (const i of (n.interfaces || [])) {
+                bits.push('I:' + i.name + '|' + (i.zone ? (i.zone.kind + (i.zone.id != null ? ':' + i.zone.id : '')) : '') + '|' + (i.role || '') + '|' + (i.link_up ? 1 : 0) + '|' + (i.addresses || []).join(','));
+            }
+            for (const b of (n.bridges || [])) bits.push('B:' + b.name + '|' + (b.members || []).join(','));
+            for (const v of (n.vms || [])) bits.push('V:' + v.name + '|' + (v.attached_to || '') + '|' + (v.ip || ''));
+            for (const c of (n.containers || [])) bits.push('C:' + c.name + '|' + (c.kind || '') + '|' + (c.attached_to || '') + '|' + (c.ip || ''));
+        }
+        for (const d of (topo.peer_diagnostics || [])) {
+            bits.push('P:' + d.node_id + '|' + d.result + '|' + (d.reason || ''));
+        }
+        return bits.join(';');
+    }
+
+    /// Soft-update the rack view: patch BPS labels, LED colours, pin
+    /// opacity on every port in place. Assumes the structural skeleton
+    /// is unchanged (caller has already verified via wrRackStructureHash).
+    /// Runs in <1ms for typical clusters. No SVG rebuild, no flash.
+    function wrSoftUpdateRack(topo) {
+        const canvas = document.getElementById('wr-rack-canvas');
+        if (!canvas) return false;
+        // Build a quick lookup of the current port state.
+        const byKey = new Map();
+        for (const n of topo.nodes || []) {
+            for (const i of n.interfaces || []) {
+                byKey.set(n.node_id + '::' + i.name, i);
+            }
+        }
+        const ports = canvas.querySelectorAll('.wr-port[data-node][data-iface]');
+        if (!ports.length) return false;  // nothing to patch — force full render
+        for (const g of ports) {
+            const key = g.dataset.node + '::' + g.dataset.iface;
+            const port = byKey.get(key);
+            if (!port) continue;
+            const bps = (port.rx_bps || 0) + (port.tx_bps || 0);
+
+            // Activity LED + glow.
+            const actLed = g.querySelector('[data-wr-role="led-act"]');
+            if (actLed) {
+                actLed.setAttribute('fill', bps > 0 ? 'url(#wr-led-amber)' : 'url(#wr-led-off)');
+                if (bps > 0) actLed.setAttribute('filter', 'url(#wr-glow)');
+                else actLed.removeAttribute('filter');
+            }
+
+            // Link LED (changes rarely but cheap to patch when it does).
+            const linkLed = g.querySelector('[data-wr-role="led-link"]');
+            if (linkLed) {
+                linkLed.setAttribute('fill', port.link_up ? 'url(#wr-led-green)' : 'url(#wr-led-off)');
+            }
+
+            // Pin opacity tracks link_up.
+            const pinOpacity = port.link_up ? '0.75' : '0.25';
+            g.querySelectorAll('[data-wr-role="pin"]').forEach(p => {
+                if (p.getAttribute('opacity') !== pinOpacity) p.setAttribute('opacity', pinOpacity);
+            });
+
+            // BPS label — patch text + visibility without adding/removing nodes.
+            const bpsLabel = g.querySelector('[data-wr-role="bps"]');
+            if (bpsLabel) {
+                if (bps > 0) {
+                    const newText = fmtBpsShort(bps);
+                    if (bpsLabel.textContent !== newText) bpsLabel.textContent = newText;
+                    bpsLabel.setAttribute('visibility', 'visible');
+                } else {
+                    bpsLabel.setAttribute('visibility', 'hidden');
+                }
+            }
+        }
+        // Cable active/idle styling — WAN cables change look when their
+        // source port goes from idle to flowing. Patch in place so the
+        // user sees the wire light up without a whole-rack repaint.
+        const cables = canvas.querySelectorAll('[data-wr-cable]');
+        for (const cable of cables) {
+            const key = cable.dataset.wrCable;
+            if (!key) continue;
+            const port = byKey.get(key);
+            if (!port) continue;
+            const bps = (port.rx_bps || 0) + (port.tx_bps || 0);
+            const active = bps > 0;
+            cable.setAttribute('stroke-width', active ? '5' : '4');
+            cable.setAttribute('opacity', active ? '0.95' : '0.7');
+            if (active) {
+                cable.classList.add('wr-wire-active');
+                cable.setAttribute('stroke-dasharray', '10 6');
+            } else {
+                cable.classList.remove('wr-wire-active');
+                cable.removeAttribute('stroke-dasharray');
+            }
+        }
+        return true;
+    }
+
     function wrRenderRack() {
         const canvas = document.getElementById('wr-rack-canvas');
         if (!canvas) return;
@@ -3058,8 +3266,22 @@
                 No nodes in topology. <br>
                 ${wrState.cluster ? `Cluster <code>${escHtml(wrState.cluster)}</code> may have no online WolfStack nodes.` : 'No cluster selected.'}
             </div>`;
+            wrState.lastRackHash = '';
             return;
         }
+
+        // Structural-change gate: if the rack's skeleton is identical
+        // to the last render, skip the full SVG rebuild and just patch
+        // the live values. This is what kills the 3-second flash the
+        // user was seeing — 95% of polls only see BPS deltas, nothing
+        // structural, so most ticks are now no-op paints.
+        const structureHash = wrRackStructureHash(topo);
+        if (wrState.lastRackHash === structureHash) {
+            if (wrSoftUpdateRack(topo)) return;
+            // Fall through to full render if soft-update can't find the
+            // tagged elements (first paint after a navigation, DOM reset).
+        }
+        wrState.lastRackHash = structureHash;
         // Render a header describing the cluster + node count so the
         // rack view feels like a real cluster overview, not just a
         // diagram floating in space.
@@ -3072,15 +3294,32 @@
         // Per-peer diagnostics surface "why is this node missing?" right
         // on the cluster header — no need to dig into server logs to
         // debug fan-out failures.
+        // WolfRouter is cluster-scoped — peers from OTHER clusters are
+        // supposed to be absent from this view. Only surface "failed"
+        // peers (couldn't reach a cluster-mate) as warnings.
+        //   • failed  → real problem: a same-cluster peer isn't answering
+        //   • skipped → intentional: peer belongs to a different cluster
+        //     or isn't a wolfstack node at all
+        // Skipped entries stay available behind a quieter "hidden peers"
+        // disclosure for debugging, but don't amber-flag them.
         const diag = topo.peer_diagnostics || [];
-        const diagFailed = diag.filter(d => d.result === 'failed' || d.result === 'skipped');
-        const diagBanner = diagFailed.length
+        const diagFailed  = diag.filter(d => d.result === 'failed');
+        const diagSkipped = diag.filter(d => d.result === 'skipped');
+        const failedBanner = diagFailed.length
             ? `<details style="margin-top:6px; font-size:11px;">
-                <summary style="cursor:pointer; color:#fbbf24;">⚠ ${diagFailed.length} peer${diagFailed.length===1?'':'s'} not in this view — click to see why</summary>
+                <summary style="cursor:pointer; color:#fbbf24;">⚠ ${diagFailed.length} cluster peer${diagFailed.length===1?'':'s'} unreachable — click to see why</summary>
                 <div style="margin-top:6px; padding:6px 10px; background:rgba(0,0,0,0.3); border-radius:4px;">
                     ${diagFailed.map(d => `<div style="color:var(--text-muted);"><strong>${escHtml(d.hostname || d.node_id)}</strong>: ${escHtml(d.reason || d.result)}</div>`).join('')}
                 </div>
             </details>` : '';
+        const skippedInfo = diagSkipped.length
+            ? `<details style="margin-top:4px; font-size:10px; color:var(--text-muted);">
+                <summary style="cursor:pointer; opacity:0.7;">${diagSkipped.length} node${diagSkipped.length===1?'':'s'} hidden (different cluster / not WolfStack)</summary>
+                <div style="margin-top:4px; padding:6px 10px; background:rgba(0,0,0,0.15); border-radius:4px;">
+                    ${diagSkipped.map(d => `<div><strong>${escHtml(d.hostname || d.node_id)}</strong>: ${escHtml(d.reason || '')}</div>`).join('')}
+                </div>
+            </details>` : '';
+        const diagBanner = failedBanner + skippedInfo;
 
         header.innerHTML = `
             <div style="flex:1; min-width:240px;">
@@ -3307,31 +3546,37 @@
                                   L ${px+jackW-8},${py+3}
                                   L ${px+jackW-3},${py+8}
                                   L ${px+jackW-3},${py+jackH-3} Z`;
+                // Tag every dynamic element (LEDs, pin lines, BPS text,
+                // tooltip) with data-wr-role="…" so the soft-update pass
+                // can patch them in place without re-rendering the whole
+                // rack. The BPS text is always emitted — hidden when
+                // zero — so we never have to add/remove nodes on update.
+                const actBps = port.rx_bps + port.tx_bps;
                 chassis.insertAdjacentHTML('beforeend', `
                     <g class="wr-port" data-node="${escHtml(node.node_id)}" data-iface="${escHtml(port.name)}">
                         <!-- LEDs above the jack: link (left) + activity (right) -->
-                        <circle cx="${px+10}" cy="${py-4}" r="2.5" fill="${linkLed}"/>
-                        <circle cx="${px+jackW-10}" cy="${py-4}" r="2.5" fill="${actLed}"
-                                ${(port.rx_bps + port.tx_bps) > 0 ? 'filter="url(#wr-glow)"' : ''}/>
+                        <circle cx="${px+10}" cy="${py-4}" r="2.5" fill="${linkLed}" data-wr-role="led-link"/>
+                        <circle cx="${px+jackW-10}" cy="${py-4}" r="2.5" fill="${actLed}" data-wr-role="led-act"
+                                ${actBps > 0 ? 'filter="url(#wr-glow)"' : ''}/>
                         <!-- The jack itself -->
                         <path d="${jackPath}" fill="url(#wr-jack)" stroke="#000" stroke-width="0.8"/>
                         <!-- 8 contact pins -->
                         ${Array.from({length: 8}).map((_,j) =>
-                            `<line x1="${px+8+j*((jackW-16)/7)}" y1="${py+8}" x2="${px+8+j*((jackW-16)/7)}" y2="${py+jackH-5}" stroke="#fbbf24" stroke-width="0.8" opacity="${port.link_up ? 0.75 : 0.25}"/>`
+                            `<line data-wr-role="pin" x1="${px+8+j*((jackW-16)/7)}" y1="${py+8}" x2="${px+8+j*((jackW-16)/7)}" y2="${py+jackH-5}" stroke="#fbbf24" stroke-width="0.8" opacity="${port.link_up ? 0.75 : 0.25}"/>`
                         ).join('')}
                         <!-- Iface name below (bigger, readable) -->
                         <text x="${px+jackW/2}" y="${py+jackH+12}" text-anchor="middle"
                               style="fill:#f1f5f9; font-size:11px; font-weight:600; font-family:monospace;">${escHtml(port.name.slice(0,10))}</text>
-                        <!-- IP address shown only on hover via the
-                             custom tooltip — keeps the chassis clean
-                             and the labels readable. -->
-                        <!-- Live BPS above LEDs (only if actively flowing) -->
-                        ${(port.rx_bps + port.tx_bps) > 0
-                            ? `<text x="${px+jackW/2}" y="${py-9}" text-anchor="middle" style="fill:#fde68a; font-size:8px; font-family:monospace;">${fmtBpsShort(port.rx_bps + port.tx_bps)}</text>`
-                            : ''}
+                        <!-- Live BPS above LEDs. Always rendered so soft
+                             update can patch text + visibility without
+                             adding/removing DOM nodes (which triggers
+                             the flash the user hated). -->
+                        <text data-wr-role="bps" x="${px+jackW/2}" y="${py-9}" text-anchor="middle"
+                              style="fill:#fde68a; font-size:8px; font-family:monospace;"
+                              visibility="${actBps > 0 ? 'visible' : 'hidden'}">${actBps > 0 ? fmtBpsShort(actBps) : ''}</text>
                         <!-- Multi-line tooltip — browsers honour
                              newlines inside SVG <title>. -->
-                        <title>${escHtml([
+                        <title data-wr-role="tooltip">${escHtml([
                             `Interface: ${port.name}`,
                             `State: ${port.link_up ? 'UP' : 'DOWN'}`,
                             `Role: ${port.role}`,
@@ -3399,7 +3644,11 @@
                     const x2 = cloudCX;
                     const y2 = cloudCY + 30;
                     const path = `M ${x1},${y1} V ${railY} H ${x2} V ${y2}`;
-                    cables.push({ path, color: port.color, bps: port.bps, kind: 'wan' });
+                    // cableKey ties the rendered path back to the owning
+                    // port so the soft-update pass can flip active/idle
+                    // styling when bps crosses zero without a full rebuild.
+                    const cableKey = node.node_id + '::' + port.name;
+                    cables.push({ path, color: port.color, bps: port.bps, kind: 'wan', cableKey });
                     wanRailIdx++;
                 }
             }
@@ -3414,8 +3663,11 @@
         // patch-panel side).
         for (const c of cables) {
             const active = c.bps > 0;
+            // The outer path carries the activity styling; the inner
+            // path is a static highlight. Only the outer needs a data
+            // attribute for soft updates.
             svg.insertAdjacentHTML('beforeend', `
-                <path d="${c.path}" fill="none" stroke-linecap="round"
+                <path data-wr-cable="${escHtml(c.cableKey || '')}" d="${c.path}" fill="none" stroke-linecap="round"
                       stroke="${c.color}" stroke-width="${active ? 5 : 4}"
                       opacity="${active ? 0.95 : 0.7}"
                       ${active ? 'class="wr-wire-active" stroke-dasharray="10 6"' : ''}/>
@@ -3799,6 +4051,32 @@
         return (p >= 0 && p <= 32) ? p : null;
     }
 
+    // Ensure a backend tool (dnsmasq, iptables, tcpdump, conntrack) is
+    // installed on the local node — hit /api/router/install-tool which
+    // short-circuits when already installed or spawns apt/dnf/pacman
+    // otherwise. Returns { success, message, alreadyInstalled }.
+    //
+    // We call this as a preflight so users never hit the "dnsmasq is
+    // not installed" error buried inside dhcp::start. The wait (30-60s
+    // on a first-time install) is shown explicitly in the UI.
+    async function wrEnsureTool(tool) {
+        try {
+            const r = await fetch(wrUrl('/api/router/install-tool'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ tool }),
+            });
+            const j = await r.json();
+            return {
+                success: !!j.success,
+                message: j.message || j.error || '',
+                alreadyInstalled: (j.message || '').includes('already installed'),
+            };
+        } catch (e) {
+            return { success: false, message: 'request failed: ' + (e.message || e), alreadyInstalled: false };
+        }
+    }
+
     // DNS forwarder presets. Keyed so the LAN editor + Quick Setup wizard
     // can switch forwarders with a single select change. "custom" keeps
     // whatever the user typed.
@@ -3977,6 +4255,26 @@
             statusBox.innerHTML += `<div style="padding:4px 0; font-size:12px; color:${colour};">${emoji} ${msg}</div>`;
             statusBox.scrollTop = statusBox.scrollHeight;
         };
+
+        // 0. Preflight — make sure dnsmasq and iptables are installed BEFORE
+        // trying to use them. Without this, users hit a cryptic "dnsmasq is
+        // not installed" error inside dhcp::start after all the setup ran.
+        // install-tool no-ops (returns "already installed") when present, so
+        // calling blind is safe.
+        log('⏳', 'Preflight: checking dnsmasq + iptables are installed on the host…', 'var(--text-muted)');
+        for (const tool of ['iptables', 'dnsmasq']) {
+            const res = await wrEnsureTool(tool);
+            if (res.alreadyInstalled) {
+                log('✅', `<code>${escHtml(tool)}</code> already installed.`, '#22c55e');
+            } else if (res.success) {
+                log('✅', `<code>${escHtml(tool)}</code> installed: ${escHtml(res.message)}`, '#22c55e');
+            } else {
+                log('❌', `<code>${escHtml(tool)}</code> install failed: ${escHtml(res.message)}. Fix that first (try <code>apt install ${escHtml(tool)}</code>) then re-run Quick Setup.`, '#ef4444');
+                // Abort — every subsequent step depends on these tools.
+                runBtn.textContent = 'Aborted';
+                return;
+            }
+        }
 
         // 1. Create WAN connections for any WAN-zoned iface without one.
         const wanHiddens = Array.from(document.querySelectorAll('#wr-qs-wan input[type="hidden"]'));
@@ -4545,4 +4843,152 @@
     }
     window.wrRunTool = wrRunTool;
     window.wrRenderDnsTools = wrRenderDnsTools;
+
+    // ─── Config export / import ───
+    //
+    // Back up the entire WolfRouter state (zones, LANs, WAN, rules,
+    // global toggles) to a JSON file the user can re-upload later.
+    // Useful before experimenting, for rebuild-after-reinstall, and
+    // for cloning a known-good config between clusters.
+
+    async function wrExportConfig() {
+        // Toast feedback is subtle — the browser's download indicator is
+        // the primary signal. We also show a short-lived banner so the
+        // user sees "yes, it's done" without having to notice the file.
+        try {
+            const r = await fetch(wrUrl('/api/router/export'));
+            if (!r.ok) {
+                alert('Export failed: HTTP ' + r.status + ' ' + await r.text());
+                return;
+            }
+            // Pull the filename out of Content-Disposition so the file
+            // lands with the server-supplied timestamp.
+            const disp = r.headers.get('Content-Disposition') || '';
+            const m = disp.match(/filename="([^"]+)"/);
+            const filename = m ? m[1] : 'wolfrouter-config.json';
+            const blob = await r.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(url);
+            if (typeof showToast === 'function') {
+                showToast(`Exported ${filename}. PPPoE passwords masked.`, 'success');
+            } else {
+                alert(`Exported ${filename}.\n\nNote: PPPoE passwords are masked as "***" in the export — safe to share, but you'll keep passwords if you re-import back onto this node.`);
+            }
+        } catch (e) {
+            alert('Export errored: ' + (e.message || e));
+        }
+    }
+    window.wrExportConfig = wrExportConfig;
+
+    function wrShowImportConfig() {
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay active';
+        overlay.style.zIndex = '10000';
+        overlay.innerHTML = `
+            <div class="modal" style="max-width:560px;">
+                <div class="modal-header">
+                    <h3>📤 Import WolfRouter config</h3>
+                    <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">×</button>
+                </div>
+                <div class="modal-body" style="font-size:13px;">
+                    <div style="padding:10px 12px; background:rgba(239,68,68,0.1); border:1px solid rgba(239,68,68,0.35); border-radius:6px; margin-bottom:12px;">
+                        <strong style="color:#fca5a5;">⚠ Replaces your entire config.</strong>
+                        <div style="color:var(--text-muted); font-size:12px; margin-top:3px;">
+                            All zones, LANs, WAN connections, and firewall rules will be overwritten by the uploaded file. Export your current config first (💾 Export) if you want a rollback.
+                        </div>
+                    </div>
+                    <label style="display:block; margin-bottom:10px;">Config file (JSON from Export)
+                        <input id="wr-imp-file" type="file" accept=".json,application/json" class="form-control"/>
+                    </label>
+                    <label style="display:flex; gap:8px; align-items:center; padding:8px 10px; background:rgba(34,197,94,0.08); border:1px solid rgba(34,197,94,0.3); border-radius:6px;">
+                        <input type="checkbox" id="wr-imp-apply" checked/>
+                        <div>
+                            <strong style="color:#4ade80;">Apply immediately after import</strong>
+                            <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">
+                                Restarts dnsmasq for every LAN, re-dials PPPoE, re-applies the firewall. Uncheck to stage the config and apply manually.
+                            </div>
+                        </div>
+                    </label>
+                    <div id="wr-imp-status" style="margin-top:12px; font-size:12px;"></div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+                    <button id="wr-imp-btn" class="btn btn-primary" onclick="wrRunImportConfig()">Import</button>
+                </div>
+            </div>`;
+        document.body.appendChild(overlay);
+    }
+    window.wrShowImportConfig = wrShowImportConfig;
+
+    async function wrRunImportConfig() {
+        const fileEl = document.getElementById('wr-imp-file');
+        const applyEl = document.getElementById('wr-imp-apply');
+        const btn = document.getElementById('wr-imp-btn');
+        const statusEl = document.getElementById('wr-imp-status');
+        if (!fileEl || !btn || !statusEl) return;
+        const file = fileEl.files && fileEl.files[0];
+        if (!file) {
+            statusEl.innerHTML = '<span style="color:#ef4444;">✗ Pick a JSON file first.</span>';
+            return;
+        }
+        btn.disabled = true;
+        btn.textContent = '⏳ Importing…';
+        statusEl.innerHTML = '<span style="color:var(--text-muted);">⏳ Reading file…</span>';
+
+        let parsed;
+        try {
+            const text = await file.text();
+            parsed = JSON.parse(text);
+        } catch (e) {
+            statusEl.innerHTML = `<span style="color:#ef4444;">✗ Could not parse JSON: ${escHtml(e.message || e)}</span>`;
+            btn.disabled = false;
+            btn.textContent = 'Import';
+            return;
+        }
+
+        statusEl.innerHTML = '<span style="color:var(--text-muted);">⏳ Uploading + applying…</span>';
+        try {
+            const r = await fetch(wrUrl('/api/router/import'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ config: parsed, apply: !!applyEl.checked }),
+            });
+            const j = await r.json();
+            if (j.success) {
+                const s = j.summary || {};
+                const a = j.applied || {};
+                const parts = [`✓ ${escHtml(j.message || 'Imported.')}`];
+                parts.push(`<div style="margin-top:6px; font-size:11px; color:var(--text-muted);">Summary: ${s.lans || 0} LAN(s), ${s.wan_connections || 0} WAN, ${s.rules || 0} rules, ${s.zones || 0} zone assignments.</div>`);
+                if (applyEl.checked) {
+                    const applyBits = [];
+                    if (a.wan_applied != null)        applyBits.push(`${a.wan_applied} WAN dialers started`);
+                    if (a.dnsmasq_restarted != null)  applyBits.push(`${a.dnsmasq_restarted} dnsmasq instance(s) restarted`);
+                    if (a.firewall)                   applyBits.push(`firewall: ${escHtml(a.firewall)}`);
+                    if ((a.wan_errors || []).length)  applyBits.push(`<span style="color:#ef4444;">WAN errors: ${(a.wan_errors).map(escHtml).join('; ')}</span>`);
+                    if (applyBits.length) parts.push(`<div style="margin-top:4px; font-size:11px;">Applied: ${applyBits.join(' · ')}</div>`);
+                }
+                statusEl.innerHTML = `<div style="padding:8px 10px; background:rgba(34,197,94,0.1); border:1px solid rgba(34,197,94,0.35); border-radius:4px; color:#4ade80;">${parts.join('')}</div>`;
+                btn.textContent = '✓ Imported';
+                // Delay close so user reads the summary.
+                setTimeout(() => {
+                    document.querySelector('.modal-overlay')?.remove();
+                    wrLoadAll();
+                }, 2000);
+            } else {
+                statusEl.innerHTML = `<div style="padding:8px 10px; background:rgba(239,68,68,0.1); border:1px solid rgba(239,68,68,0.35); border-radius:4px; color:#fca5a5;">✗ ${escHtml(j.error || 'Import failed.')}</div>`;
+                btn.disabled = false;
+                btn.textContent = 'Import';
+            }
+        } catch (e) {
+            statusEl.innerHTML = `<span style="color:#ef4444;">✗ Request failed: ${escHtml(e.message || e)}</span>`;
+            btn.disabled = false;
+            btn.textContent = 'Import';
+        }
+    }
+    window.wrRunImportConfig = wrRunImportConfig;
 })();

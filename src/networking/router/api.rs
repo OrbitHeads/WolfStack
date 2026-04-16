@@ -1995,6 +1995,199 @@ pub async fn tool_install(
     }
 }
 
+// ─── Import / export — round-trip the entire RouterConfig ───
+//
+// One-file backup + restore so admins can snapshot their setup before
+// experimenting, share a known-good config between clusters, or rebuild
+// a lost node quickly. The JSON shape matches RouterConfig exactly, so
+// it's also the same file the daemon writes to /etc/wolfstack/router/config.json
+// on save — useful for out-of-band edits.
+
+/// GET /api/router/export — download the full RouterConfig as JSON.
+/// PPPoE passwords are masked to "***" so exported files are safe to
+/// share. On import, "***" is treated as "keep existing" — no password
+/// loss if you're restoring onto the same node.
+pub async fn export_config(
+    req: HttpRequest, state: S,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let mut cfg = state.router.config.read().unwrap().clone();
+    // Mask PPPoE passwords in-place.
+    for w in cfg.wan_connections.iter_mut() {
+        if let wan::WanMode::Pppoe(ref mut p) = w.mode {
+            if !p.password.is_empty() { p.password = "***".into(); }
+        }
+    }
+    let body = match serde_json::to_string_pretty(&cfg) {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::InternalServerError().body(format!("serialize: {}", e)),
+    };
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let filename = format!("wolfrouter-config-{}.json", ts);
+    HttpResponse::Ok()
+        .insert_header(("Content-Type", "application/json"))
+        .insert_header(("Content-Disposition", format!("attachment; filename=\"{}\"", filename)))
+        .body(body)
+}
+
+#[derive(Deserialize)]
+pub struct ImportConfigRequest {
+    /// Full RouterConfig as JSON. Passwords set to "***" are preserved
+    /// from the current on-disk config.
+    pub config: serde_json::Value,
+    /// Apply (restart dnsmasq, re-dial PPPoE, re-apply firewall) after
+    /// importing. Default true — the most common use is "restore then
+    /// make it live".
+    #[serde(default = "default_true_import")]
+    pub apply: bool,
+}
+
+fn default_true_import() -> bool { true }
+
+/// POST /api/router/import — replace the RouterConfig with a caller-
+/// supplied JSON. Validates by deserialising into RouterConfig; returns
+/// 400 with a readable parse error if the shape is wrong. Preserves
+/// PPPoE passwords from the current config where the incoming value is
+/// "***".
+///
+/// This is intentionally all-or-nothing: partial imports would leave
+/// the node in a weird half-state. Callers should snapshot
+/// via /api/router/export first if they want rollback.
+pub async fn import_config(
+    req: HttpRequest, state: S,
+    body: web::Json<ImportConfigRequest>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let incoming = body.into_inner();
+
+    // Parse into the strongly-typed RouterConfig so we reject malformed
+    // JSON before touching state.
+    let mut new_cfg: RouterConfig = match serde_json::from_value(incoming.config) {
+        Ok(c) => c,
+        Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({
+            "success": false,
+            "error": format!("Config JSON is invalid: {}. Expected a wolfrouter config export.", e),
+        })),
+    };
+
+    // Validate every LAN segment and WAN connection against the same
+    // rules the per-item create/update endpoints enforce. Without this,
+    // a crafted import JSON could slip newlines into fields like
+    // extra_options / local_records / pppoe username and forge
+    // arbitrary dnsmasq or pppd directives (addn-hosts=/etc/shadow
+    // and similar). Reject the whole import on the first invalid
+    // entry — partial validation would leave the admin with a
+    // half-persisted config that's worse than just refusing.
+    for seg in &new_cfg.lans {
+        if let Err(e) = validate_segment(seg) {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "success": false,
+                "error": format!("LAN '{}' failed validation: {}", seg.name, e),
+            }));
+        }
+    }
+    for conn in &new_cfg.wan_connections {
+        if let Err(e) = wan::validate(conn) {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "success": false,
+                "error": format!("WAN '{}' failed validation: {}", conn.name, e),
+            }));
+        }
+    }
+
+    // Preserve PPPoE passwords where the import carries the masked "***".
+    // This lets users round-trip their own exports without losing creds.
+    {
+        let cur = state.router.config.read().unwrap();
+        for new_w in new_cfg.wan_connections.iter_mut() {
+            if let wan::WanMode::Pppoe(ref mut np) = new_w.mode {
+                if np.password == "***" {
+                    // Find the same connection id in the current config.
+                    if let Some(old) = cur.wan_connections.iter().find(|c| c.id == new_w.id) {
+                        if let wan::WanMode::Pppoe(op) = &old.mode {
+                            np.password = op.password.clone();
+                        }
+                    } else {
+                        // Imported with "***" but no existing record to pull from —
+                        // blank the password so pppd doesn't try to auth with literal "***".
+                        np.password = String::new();
+                    }
+                }
+            }
+        }
+    }
+
+    // Snapshot counts for the response summary.
+    let summary = serde_json::json!({
+        "lans": new_cfg.lans.len(),
+        "wan_connections": new_cfg.wan_connections.len(),
+        "rules": new_cfg.rules.len(),
+        "zones": new_cfg.zones.assignments.values().map(|m| m.len() as u64).sum::<u64>(),
+    });
+
+    // Persist.
+    {
+        let mut cfg = state.router.config.write().unwrap();
+        *cfg = new_cfg;
+        if let Err(e) = cfg.save() {
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "success": false, "error": format!("save: {}", e),
+            }));
+        }
+    }
+
+    // Optionally apply. Each subsystem reports per-item; we aggregate a
+    // count for the response so the UI can show exactly what happened.
+    let mut applied = serde_json::json!({});
+    if incoming.apply {
+        let cfg = state.router.config.read().unwrap().clone();
+        let self_id = crate::agent::self_node_id();
+
+        // WAN — dial + MASQUERADE install.
+        let mut wan_ok = 0u32;
+        let mut wan_err: Vec<String> = Vec::new();
+        for conn in &cfg.wan_connections {
+            if conn.node_id != self_id { continue; }
+            if !conn.enabled { continue; }
+            match wan::apply(conn) {
+                Ok(()) => wan_ok += 1,
+                Err(e) => wan_err.push(format!("{}: {}", conn.name, e)),
+            }
+        }
+        applied["wan_applied"] = serde_json::Value::from(wan_ok);
+        applied["wan_errors"] = serde_json::Value::from(wan_err);
+
+        // DHCP — restart each LAN's dnsmasq with the fresh config.
+        dhcp::start_all_for_node(&cfg, &self_id);
+        applied["dnsmasq_restarted"] = serde_json::Value::from(
+            cfg.lans.iter().filter(|l| l.node_id == self_id).count() as u64
+        );
+
+        // Firewall — rebuild + swap.
+        let ruleset = firewall::build_ruleset(&cfg, &self_id);
+        match firewall::apply(&ruleset, false) {
+            Ok(prev) => {
+                *state.router.last_applied_rules.write().unwrap() = Some(prev);
+                applied["firewall"] = serde_json::Value::from("applied");
+            }
+            Err(e) => applied["firewall"] = serde_json::Value::from(format!("error: {}", e)),
+        }
+    }
+
+    replicate_config_to_cluster(state.clone());
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "message": if incoming.apply {
+            "Config imported and applied. Firewall, DHCP/DNS, and WAN are live."
+        } else {
+            "Config imported (not applied). Hit Apply or toggle Auto-apply to make it live."
+        },
+        "summary": summary,
+        "applied": applied,
+    }))
+}
+
 // ─── Mount ───
 
 pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
@@ -2032,6 +2225,8 @@ pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
         .route("/api/router/tools/traceroute",web::post().to(tool_traceroute))
         .route("/api/router/tools/nslookup",  web::post().to(tool_nslookup))
         .route("/api/router/tools/whois",     web::post().to(tool_whois))
+        .route("/api/router/export", web::get().to(export_config))
+        .route("/api/router/import", web::post().to(import_config))
         .route("/api/router/wan",          web::get().to(list_wan))
         .route("/api/router/wan",          web::post().to(create_wan))
         .route("/api/router/wan/{id}",     web::put().to(update_wan))

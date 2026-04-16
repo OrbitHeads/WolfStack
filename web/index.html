@@ -5800,6 +5800,8 @@
                             <button class="btn btn-sm" onclick="wrSwitchView('table'); wrSelectTab('firewall'); wrShowRuleEditor();" title="Add a firewall rule">🔥 + Firewall rule</button>
                             <button class="btn btn-sm" onclick="wrSwitchView('table'); wrSelectTab('zones');" title="Assign interfaces to zones">🎯 Zones</button>
                             <button class="btn btn-sm" onclick="wrSwitchView('table'); wrSelectTab('leases');" title="View live DHCP leases">📡 Leases</button>
+                            <button class="btn btn-sm" onclick="wrExportConfig()" title="Download the entire WolfRouter config as a JSON backup">💾 Export</button>
+                            <button class="btn btn-sm" onclick="wrShowImportConfig()" title="Restore a WolfRouter config from a JSON backup">📤 Import</button>
                         </div>
                         <div id="wr-rack-canvas" style="width:100%; min-height:560px;"></div>
                         <div id="wr-rack-legend" style="margin-top:12px; display:flex; gap:16px; flex-wrap:wrap; font-size:11px; color:var(--text-muted);"></div>

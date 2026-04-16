@@ -345,7 +345,7 @@ fn walk_interfaces(
         let (rx, tx) = bps.get(&name).cloned().unwrap_or((0, 0));
         let addresses = addr_map.get(&name).cloned().unwrap_or_default();
         let zone = config.zones.get(node_id, &name).cloned();
-        let role = infer_role(&name, &zone, link_up, master.is_some());
+        let role = infer_role(&name, &zone, link_up, master.is_some(), config, node_id);
 
         out.push(PortState {
             name,
@@ -524,7 +524,29 @@ fn walk_containers(_node_id: &str) -> Vec<DeviceAttachment> {
     out
 }
 
-fn infer_role(name: &str, zone: &Option<Zone>, _link_up: bool, slaved: bool) -> PortRole {
+fn infer_role(
+    name: &str,
+    zone: &Option<Zone>,
+    _link_up: bool,
+    slaved: bool,
+    config: &RouterConfig,
+    node_id: &str,
+) -> PortRole {
+    // Reality beats label. If a WanConnection or LanSegment actually
+    // points at this interface, that's what it IS, regardless of what
+    // the user has clicked in the Zones tab. This stops the rack view
+    // from lying after a zone-drift (zones say WAN but the LAN segment
+    // is still serving DHCP here — showing a cable to Internet would
+    // be wrong and is exactly the "weird rack" bug users hit).
+    if config.wan_connections.iter().any(|w| w.enabled && w.node_id == node_id && w.interface == name) {
+        return PortRole::Wan;
+    }
+    if config.lans.iter().any(|l| l.node_id == node_id && l.interface == name) {
+        return PortRole::Lan;
+    }
+
+    // No actual config binds this iface. Fall back to the zone label
+    // as the admin's intent, then name heuristics.
     if let Some(z) = zone {
         return match z {
             Zone::Wan => PortRole::Wan,
