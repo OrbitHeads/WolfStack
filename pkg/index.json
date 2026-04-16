@@ -22,17 +22,5 @@
     "download_url": "https://github.com/wolfsoftwaresystemsltd/WolfStack/releases/download/plugins/wolfcustom.tar.gz",
     "category": "branding",
     "tags": ["branding", "white-label", "customisation"]
-  },
-  {
-    "id": "wolfsecure",
-    "name": "WolfSecure",
-    "version": "0.1.4",
-    "description": "Audits containers, config, network surface, and host hygiene for known-bad patterns. Uses Trivy for CVE scanning when available. Findings appear under Settings → WolfSecure.",
-    "author": "Wolf Software Systems Ltd",
-    "icon": "🛡",
-    "enterprise_only": false,
-    "download_url": "https://github.com/wolfsoftwaresystemsltd/WolfStack/releases/download/plugins/wolfsecure.tar.gz",
-    "category": "security",
-    "tags": ["security", "cve", "audit", "compliance", "scanner", "trivy"]
   }
 ]
