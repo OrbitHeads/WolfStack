@@ -13730,36 +13730,177 @@ async function saveLxcSettings(name) {
     }
 }
 
-async function addMountPoint(name) {
-    var src = prompt('Host path (e.g. /mnt/data):');
-    if (!src) return;
-    var dest = prompt('Container path (e.g. /mnt/data):', src);
-    if (!dest) return;
+// LXC bind-mount add. Opens a proper modal (replacing the old
+// blocking prompt() chain) and includes the PVE-only options — shared,
+// backup, quota, size — in a collapsed advanced section when the
+// container is Proxmox-managed. The backend silently ignores those
+// flags on native containers, so turning them on for a non-PVE CT is
+// harmless but we hide them to keep the form uncluttered.
+function openLxcMountModal(name, opts) {
+    opts = opts || {};
+    const isProxmox = !!(opts.proxmox ?? (window._lxcParsedCfg && window._lxcParsedCfg.proxmox));
+    const defaults = opts.defaults || {};
+
+    // Remove any lingering modal before appending a fresh one.
+    document.getElementById('lxc-mount-modal')?.remove();
+
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay active';
+    overlay.id = 'lxc-mount-modal';
+    overlay.style.zIndex = '10001';
+    overlay.innerHTML = `
+        <div class="modal" style="max-width:560px;">
+            <div class="modal-header">
+                <h3>📁 Add Bind Mount — ${escapeHtml(name)}</h3>
+                <button class="modal-close" onclick="document.getElementById('lxc-mount-modal')?.remove()">×</button>
+            </div>
+            <div class="modal-body" style="font-size:13px;">
+                <div style="display:flex; flex-direction:column; gap:10px;">
+                    <label style="display:flex; flex-direction:column; gap:4px;">
+                        <span style="font-weight:600;">Source <span style="font-weight:400;color:var(--text-muted);font-size:11px;">${isProxmox ? '— host path or PVE storage id' : '— host directory'}</span></span>
+                        <input id="lxc-mount-host" class="form-control" type="text"
+                            placeholder="${isProxmox ? '/mnt/pve/cephfs/cs  or  local:4' : '/mnt/data'}"
+                            value="${escapeHtml(defaults.host_path || '')}">
+                    </label>
+                    <label style="display:flex; flex-direction:column; gap:4px;">
+                        <span style="font-weight:600;">Container path</span>
+                        <input id="lxc-mount-container" class="form-control" type="text"
+                            placeholder="/mnt/shared"
+                            value="${escapeHtml(defaults.container_path || '')}">
+                    </label>
+                    <label style="display:flex; align-items:center; gap:6px;">
+                        <input id="lxc-mount-ro" type="checkbox" ${defaults.read_only ? 'checked' : ''}>
+                        <span>Read-only</span>
+                    </label>
+                    ${isProxmox ? `
+                    <details style="background:var(--bg-tertiary); border:1px solid var(--border); border-radius:6px; padding:8px 10px;">
+                        <summary style="cursor:pointer; font-weight:600; font-size:12px;">Proxmox options</summary>
+                        <div style="display:flex; flex-direction:column; gap:8px; margin-top:10px;">
+                            <label style="display:flex; align-items:center; gap:6px;">
+                                <input id="lxc-mount-shared" type="checkbox" ${defaults.shared ? 'checked' : ''}>
+                                <span>Shared <span style="color:var(--text-muted); font-size:11px;">— same content across cluster nodes (CephFS, NFS, etc). Lets pct migrate run without copying the volume.</span></span>
+                            </label>
+                            <label style="display:flex; align-items:center; gap:6px;">
+                                <input id="lxc-mount-backup" type="checkbox" ${defaults.backup ? 'checked' : ''}>
+                                <span>Include in vzdump backups</span>
+                            </label>
+                            <label style="display:flex; align-items:center; gap:6px;">
+                                <input id="lxc-mount-quota" type="checkbox" ${defaults.quota ? 'checked' : ''}>
+                                <span>Enable filesystem quotas <span style="color:var(--text-muted); font-size:11px;">(privileged CTs only)</span></span>
+                            </label>
+                            <label style="display:flex; flex-direction:column; gap:4px;">
+                                <span>Size (GB) <span style="font-weight:400;color:var(--text-muted);font-size:11px;">— PVE storage sources only; leave blank for host-path binds</span></span>
+                                <input id="lxc-mount-size" class="form-control" type="number" min="1" step="1"
+                                    placeholder="e.g. 50" value="${defaults.size_gb != null ? defaults.size_gb : ''}">
+                            </label>
+                        </div>
+                    </details>` : ''}
+                    <details style="background:var(--bg-tertiary); border:1px solid var(--border); border-radius:6px; padding:8px 10px;">
+                        <summary style="cursor:pointer; font-weight:600; font-size:12px;">Paste a Proxmox mp string</summary>
+                        <div style="margin-top:8px; display:flex; flex-direction:column; gap:6px;">
+                            <input id="lxc-mount-raw" class="form-control" type="text"
+                                placeholder="/mnt/pve/cephfs/cs,mp=/mnt/shared,shared=1">
+                            <button class="btn btn-sm" style="align-self:flex-start;" onclick="lxcMountParseRaw()">Parse into fields</button>
+                            <div style="font-size:11px; color:var(--text-muted);">Accepts either the options part (<code>/src,mp=/dst,shared=1</code>) or a full config line (<code>mp0: /src,mp=/dst,…</code>).</div>
+                        </div>
+                    </details>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="document.getElementById('lxc-mount-modal')?.remove()">Cancel</button>
+                <button class="btn btn-primary" onclick="lxcMountSubmit('${escapeHtml(name)}')">Add Mount</button>
+            </div>
+        </div>`;
+    document.body.appendChild(overlay);
+    document.getElementById('lxc-mount-host').focus();
+}
+
+// Parse a PVE-style "src,mp=/dst,flag=1" string (optionally prefixed
+// with "mpN: ") into the modal fields so a user can paste the line
+// straight out of a pct config.
+function lxcMountParseRaw() {
+    const raw = document.getElementById('lxc-mount-raw')?.value?.trim();
+    if (!raw) return;
+    // Strip a leading "mp0: " / "mp12: " prefix if present.
+    const cleaned = raw.replace(/^mp\d+\s*:\s*/, '');
+    const parts = cleaned.split(',');
+    const host = (parts.shift() || '').trim();
+    if (host) document.getElementById('lxc-mount-host').value = host;
+    let container = '';
+    let sizeGb = '';
+    const flags = { ro: false, shared: false, backup: false, quota: false };
+    for (const p of parts) {
+        const [k, v] = p.split('=').map(s => (s || '').trim());
+        if (k === 'mp') container = v;
+        else if (k === 'ro' && v === '1') flags.ro = true;
+        else if (k === 'shared' && v === '1') flags.shared = true;
+        else if (k === 'backup' && v === '1') flags.backup = true;
+        else if (k === 'quota' && v === '1') flags.quota = true;
+        else if (k === 'size') {
+            const m = v.match(/^(\d+)\s*([TGMKtgmk])?/);
+            if (m) {
+                const n = parseInt(m[1], 10);
+                const u = (m[2] || 'G').toUpperCase();
+                sizeGb = u === 'T' ? n * 1024 : u === 'G' ? n : u === 'M' ? Math.max(1, Math.round(n / 1024)) : n;
+            }
+        }
+    }
+    if (container) document.getElementById('lxc-mount-container').value = container;
+    const set = (id, v) => { const el = document.getElementById(id); if (el) el.checked = v; };
+    set('lxc-mount-ro', flags.ro);
+    set('lxc-mount-shared', flags.shared);
+    set('lxc-mount-backup', flags.backup);
+    set('lxc-mount-quota', flags.quota);
+    const sz = document.getElementById('lxc-mount-size');
+    if (sz && sizeGb !== '') sz.value = sizeGb;
+}
+
+async function lxcMountSubmit(name) {
+    const host = document.getElementById('lxc-mount-host')?.value?.trim();
+    const container = document.getElementById('lxc-mount-container')?.value?.trim();
+    if (!host || !container) { showToast('Source and container path are required', 'error'); return; }
+    const body = {
+        host_path: host,
+        container_path: container,
+        read_only: document.getElementById('lxc-mount-ro')?.checked || false,
+    };
+    const sharedEl = document.getElementById('lxc-mount-shared');
+    const backupEl = document.getElementById('lxc-mount-backup');
+    const quotaEl = document.getElementById('lxc-mount-quota');
+    const sizeEl = document.getElementById('lxc-mount-size');
+    if (sharedEl) body.shared = sharedEl.checked;
+    if (backupEl) body.backup = backupEl.checked;
+    if (quotaEl) body.quota = quotaEl.checked;
+    if (sizeEl && sizeEl.value) {
+        const n = parseInt(sizeEl.value, 10);
+        if (n > 0) body.size_gb = n;
+    }
     try {
-        var resp = await fetch(apiUrl(`/api/containers/lxc/${encodeURIComponent(name)}/mounts`), {
+        const resp = await fetch(apiUrl(`/api/containers/lxc/${encodeURIComponent(name)}/mounts`), {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ host_path: src, container_path: dest, read_only: false }),
+            body: JSON.stringify(body),
         });
-        var data = await resp.json();
-        if (resp.ok) { showToast(data.message || 'Mount added', 'success'); openLxcSettings(name); }
-        else { showToast(data.error || 'Failed', 'error'); }
+        const data = await resp.json();
+        if (resp.ok) {
+            showToast(data.message || 'Mount added', 'success');
+            document.getElementById('lxc-mount-modal')?.remove();
+            openLxcSettings(name);
+        } else {
+            showToast(data.error || 'Failed', 'error');
+        }
     } catch (e) { showToast('Failed: ' + e.message, 'error'); }
 }
 
-async function addWolfDiskMount(name) {
-    var src = prompt('WolfDisk mount path on host:', '/mnt/wolfdisk');
-    if (!src) return;
-    var dest = prompt('Mount path inside container:', '/mnt/shared');
-    if (!dest) return;
-    try {
-        var resp = await fetch(apiUrl(`/api/containers/lxc/${encodeURIComponent(name)}/mounts`), {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ host_path: src, container_path: dest, read_only: false }),
-        });
-        var data = await resp.json();
-        if (resp.ok) { showToast(data.message || 'WolfDisk mount added', 'success'); openLxcSettings(name); }
-        else { showToast(data.error || 'Failed', 'error'); }
-    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+function addMountPoint(name) {
+    openLxcMountModal(name, {});
+}
+
+function addWolfDiskMount(name) {
+    // WolfDisk is just a host path on the local node — pre-fill the
+    // common defaults and let the user tweak in the modal.
+    openLxcMountModal(name, {
+        defaults: { host_path: '/mnt/wolfdisk', container_path: '/mnt/shared' },
+    });
 }
 
 async function removeLxcMount(name, hostPath) {
@@ -14600,19 +14741,18 @@ async function openLxcStorage(name) {
     // so a user can't accidentally "migrate" into the same place.
     let targetOptions = '';
     try {
-        const r = await fetch(apiUrl('/api/storage/list'));
-        const list = r.ok ? await r.json() : {};
-        const storages = Array.isArray(list.storages) ? list.storages : [];
+        // PVE containers use move-volume and need a PVE storage id —
+        // fetch those from /api/storage/list. Native LXC uses rsync to
+        // a filesystem path, which means we need *real mount points*
+        // on the host, not PVE storage definitions that may have no
+        // directly-cd-able path (rbd, zfs pools referenced by id, …).
+        // /api/storage/filesystems walks the node's live metrics disk
+        // list and returns only writable on-disk filesystems.
         let opts = '';
-        // Branch on the container's nature, not the host's — the UI
-        // label and the backend migrate handler both switch on
-        // info.proxmox only. If we also keyed off list.proxmox a PVE
-        // host holding a native LXC CT (e.g. numeric name "106") would
-        // get PVE storage IDs in the dropdown but a native rsync in
-        // the backend, which then treats "wolfpool" as a filesystem
-        // path and fails.
         if (info.proxmox) {
-            // PVE: rootdir or images content types can host LXC rootfs.
+            const r = await fetch(apiUrl('/api/storage/list'));
+            const list = r.ok ? await r.json() : {};
+            const storages = Array.isArray(list.storages) ? list.storages : [];
             const usable = storages.filter(s =>
                 s.content && s.content.some(c => c === 'rootdir' || c === 'images')
                 && s.id !== info.storage
@@ -14624,19 +14764,31 @@ async function openLxcStorage(name) {
                 }).join('');
             }
         } else {
-            // Native: every filesystem the host has mounted is a
-            // candidate. We append /lxc so containers land in a
-            // predictable subdir — matches the create-modal default.
+            const r = await fetch(apiUrl('/api/storage/filesystems'));
+            const list = r.ok ? await r.json() : {};
+            const mounts = Array.isArray(list.filesystems) ? list.filesystems : [];
+            // Always offer the default /var/lib/lxc unless the container
+            // is already there — matches the create-modal default.
             const defaultPath = '/var/lib/lxc';
             if (info.storage !== defaultPath) {
                 opts += `<option value="${defaultPath}">${defaultPath} (default)</option>`;
             }
-            for (const s of storages) {
-                if (s.id === '/') continue;
-                const candidate = s.id + '/lxc';
+            // For every real mount, offer <mount>/lxc as the target so
+            // containers land in a predictable subdir. Skip the mount
+            // the container is already on and /var/lib/lxc's parent
+            // mount (already covered by the default option above).
+            for (const m of mounts) {
+                if (!m.mount_point) continue;
+                const candidate = m.mount_point === '/'
+                    ? defaultPath
+                    : `${m.mount_point.replace(/\/+$/, '')}/lxc`;
                 if (candidate === info.storage) continue;
-                const free = formatBytes(s.available_bytes);
-                opts += `<option value="${escapeHtml(candidate)}">${escapeHtml(candidate)} (${free} free)</option>`;
+                if (candidate === defaultPath && info.storage === defaultPath) continue;
+                // Dedupe — /var/lib/lxc as default plus a filesystem
+                // mounted at / would both produce /var/lib/lxc.
+                if (opts.includes(`value="${escapeHtml(candidate)}"`)) continue;
+                const free = formatBytes(m.available_bytes);
+                opts += `<option value="${escapeHtml(candidate)}">${escapeHtml(candidate)} (${escapeHtml(m.fs_type)}, ${free} free)</option>`;
             }
         }
         if (opts) {

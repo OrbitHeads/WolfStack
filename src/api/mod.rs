@@ -3377,6 +3377,50 @@ pub async fn remote_storage_list(
     HttpResponse::BadGateway().json(serde_json::json!({"error": format!("Could not reach remote cluster: {}", last_err)}))
 }
 
+/// GET /api/storage/filesystems — list real host mountpoints. Unlike
+/// /api/storage/list this never returns PVE storage IDs; it walks the
+/// live metrics disk list so callers that need a filesystem *path*
+/// (LXC rsync migrate, anything writing via bind mount) don't get
+/// handed something like `wolfpool` or `local-zfs` they can't cd into.
+pub async fn storage_filesystems(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    // Writable on-disk filesystems that actually host container data.
+    // NFS / CIFS etc are intentionally excluded — rsync across them
+    // works but loses perms/xattrs that -aHAX promises.
+    const WRITABLE_FS_TYPES: &[&str] = &[
+        "ext4", "ext3", "ext2", "xfs", "btrfs", "zfs", "f2fs", "reiserfs", "jfs",
+    ];
+
+    let node = state.cluster.get_node(&state.cluster.self_id);
+    let disks = node.as_ref().and_then(|n| n.metrics.as_ref())
+        .map(|m| m.disks.clone())
+        .unwrap_or_default();
+
+    let items: Vec<serde_json::Value> = disks.iter()
+        .filter(|d| {
+            let fs = d.fs_type.to_ascii_lowercase();
+            WRITABLE_FS_TYPES.iter().any(|t| fs == *t || fs.starts_with(&format!("{}.", t)))
+                && d.available_bytes > 1024 * 1024 * 1024  // > 1 GiB free
+                && !d.mount_point.starts_with("/snap")
+                && !d.mount_point.starts_with("/boot")
+                && !d.mount_point.starts_with("/var/lib/docker/")
+                && !d.mount_point.starts_with("/var/lib/containers/")
+        })
+        .map(|d| serde_json::json!({
+            "mount_point": d.mount_point,
+            "fs_type": d.fs_type,
+            "total_bytes": d.total_bytes,
+            "used_bytes": d.used_bytes,
+            "available_bytes": d.available_bytes,
+        }))
+        .collect();
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "filesystems": items,
+    }))
+}
+
 /// GET /api/storage/list — list available storage locations (Proxmox-aware)
 pub async fn storage_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
@@ -4955,6 +4999,16 @@ pub struct AddMountRequest {
     pub container_path: String,
     #[serde(default)]
     pub read_only: bool,
+    // PVE-only flags; ignored on native LXC where `lxc.mount.entry`
+    // has no equivalent.
+    #[serde(default)]
+    pub shared: bool,
+    #[serde(default)]
+    pub backup: bool,
+    #[serde(default)]
+    pub quota: bool,
+    #[serde(default)]
+    pub size_gb: Option<u64>,
 }
 
 /// POST /api/containers/lxc/{name}/mounts — add bind mount to LXC container
@@ -4966,7 +5020,16 @@ pub async fn lxc_add_mount(
 ) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let name = path.into_inner();
-    match containers::lxc_add_mount(&name, &body.host_path, &body.container_path, body.read_only) {
+    let opts = containers::LxcMountOptions {
+        host_path: body.host_path.clone(),
+        container_path: body.container_path.clone(),
+        read_only: body.read_only,
+        shared: body.shared,
+        backup: body.backup,
+        quota: body.quota,
+        size_gb: body.size_gb,
+    };
+    match containers::lxc_add_mount(&name, &opts) {
         Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
     }
@@ -17121,6 +17184,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/containers/lxc/import-external", web::post().to(lxc_import_external))
         .route("/api/containers/transfer-token", web::post().to(generate_transfer_token))
         .route("/api/storage/list", web::get().to(storage_list))
+        .route("/api/storage/filesystems", web::get().to(storage_filesystems))
         .route("/api/storage/remote-list", web::get().to(remote_storage_list))
         .route("/api/containers/lxc/stats", web::get().to(lxc_stats))
         .route("/api/containers/lxc/{name}/logs", web::get().to(lxc_logs))

@@ -1483,6 +1483,20 @@ fn prefix_named_volume(vol: &str, container_name: &str) -> String {
     }
 }
 
+/// Extract the container-side target path from a Docker volume spec
+/// (`SRC:TARGET[:MODE]`). Used to dedupe volumes: if a user extra
+/// mounts to the same TARGET as a manifest default, the user's choice
+/// wins. Returned target is trimmed of trailing slashes so `/foo` and
+/// `/foo/` compare equal. Returns None for anonymous volumes or specs
+/// we can't parse — those get skipped by the dedupe step.
+fn volume_target(vol: &str) -> Option<String> {
+    let mut parts = vol.splitn(3, ':');
+    parts.next()?;
+    let target = parts.next()?;
+    if target.is_empty() { return None; }
+    Some(target.trim_end_matches('/').to_string())
+}
+
 /// Shell helper injected once per generated install script. Picks the
 /// next free TCP/UDP host port starting at the requested base by
 /// checking kernel listeners via `ss` and existing Docker-bound ports
@@ -1675,62 +1689,87 @@ pub fn prepare_install(
             ));
             script.push_str(&format!("docker pull {}\n\n", shell_escape(&docker.image)));
 
-            // Seed dummy config files into named volumes BEFORE the
+            // Build the effective volume set for the main container,
+            // keyed by the container-side target path. This is where
+            // user extras override manifest defaults: picking a bind
+            // mount at `/media/frigate` on the install dialog must
+            // REPLACE the manifest's `frigate_media:/media/frigate`,
+            // not stack alongside it — Docker happily accepts two -v
+            // flags for the same target but then silently picks one,
+            // which is what produced the "original assignment wins"
+            // bug users kept hitting on the Frigate install.
+            //
+            // BTreeMap keeps emission order deterministic (alphabetic
+            // by target) which makes install scripts reproducible.
+            use std::collections::BTreeMap;
+            let mut vol_map: BTreeMap<String, String> = BTreeMap::new();
+            for v in &docker.volumes {
+                let remapped = match vol_base.as_deref() {
+                    Some(base) => remap_volume(v, base),
+                    None => prefix_named_volume(v, container_name),
+                };
+                if let Some(target) = volume_target(&remapped) {
+                    vol_map.insert(target, remapped);
+                }
+            }
+            if let Some(extras) = extra_volumes {
+                const BLOCKED_PREFIXES: &[&str] = &["/etc/shadow", "/etc/passwd", "/proc", "/sys"];
+                for v in extras {
+                    let trimmed = v.trim();
+                    if trimmed.is_empty() || !trimmed.contains(':') { continue; }
+                    let host_path = trimmed.split(':').next().unwrap_or("");
+                    if BLOCKED_PREFIXES.iter().any(|b| host_path.starts_with(b)) { continue; }
+                    if let Some(target) = volume_target(trimmed) {
+                        vol_map.insert(target, trimmed.to_string());
+                    }
+                }
+            }
+
+            // Seed dummy config files into volumes BEFORE the
             // container is created, so apps like Frigate that crash-
             // loop on missing config come up cleanly the first time.
-            // We match each seed file's container_path against the
-            // volume mount prefixes so we know which named volume to
-            // populate; the write is skipped if the file already
-            // exists (user edits survive reinstalls).
+            // Matched against vol_map (the RESOLVED post-override
+            // set) — a user extra that replaces /config with a host
+            // bind mount means the seed lands in the user's directory
+            // and the old named volume is correctly left alone.
             if !docker.seed_files.is_empty() {
                 script.push_str("echo -e '\\033[1;33m▸ Seeding default config files\\033[0m'\n");
                 for seed in &docker.seed_files {
                     // Find the volume whose container-side mount point
                     // is a prefix of this seed file's path.
-                    let mut match_vol: Option<(&str, &str)> = None;
-                    for v in &docker.volumes {
-                        let parts: Vec<&str> = v.splitn(2, ':').collect();
-                        if parts.len() != 2 { continue; }
-                        let mount = parts[1].trim_end_matches('/');
-                        if seed.container_path == mount
-                            || seed.container_path.starts_with(&format!("{}/", mount))
+                    let mut match_entry: Option<(String, String)> = None;
+                    for (target, spec) in &vol_map {
+                        if seed.container_path == *target
+                            || seed.container_path.starts_with(&format!("{}/", target))
                         {
-                            match_vol = Some((parts[0], mount));
+                            // Source is everything before the first ':' —
+                            // a host path (starts with /) or a named volume.
+                            let source = spec.splitn(2, ':').next().unwrap_or("").to_string();
+                            match_entry = Some((source, target.clone()));
                             break;
                         }
                     }
-                    let Some((vol_name, mount)) = match_vol else { continue };
-                    // Path inside the volume (strip the mount prefix).
+                    let Some((source, mount)) = match_entry else { continue };
                     let rel = seed.container_path.strip_prefix(&format!("{}/", mount))
                         .unwrap_or("");
-                    if rel.is_empty() { continue; }
-                    // Resolve named vol vs bind-mount path. With a
-                    // custom storage path, the vol is a host directory
-                    // under <base>/<vol_name>. Without, it's a Docker
-                    // named volume — prefixed with container_name to
-                    // keep two installs of the same app isolated.
-                    let resolved_vol = if let Some(ref base) = vol_base {
-                        remap_volume(&format!("{}:{}", vol_name, mount), base)
-                            .split(':').next().unwrap_or(vol_name).to_string()
-                    } else {
-                        format!("{}_{}", container_name, vol_name)
-                    };
+                    if rel.is_empty() || source.is_empty() { continue; }
                     // Ensure the named volume exists up-front (a bind-
-                    // mount dir gets auto-created by `docker run -v`).
-                    if !resolved_vol.starts_with('/') {
+                    // mount dir is auto-created by `docker run -v`).
+                    if !source.starts_with('/') {
                         script.push_str(&format!(
                             "docker volume create {} >/dev/null\n",
-                            shell_escape(&resolved_vol),
+                            shell_escape(&source),
                         ));
                     }
                     // Write the file via a throwaway alpine container
-                    // that mounts the volume. `-f target` test skips
-                    // the write when the file already exists.
+                    // that mounts the volume. The `[ -f … ]` test skips
+                    // the write when the file already exists so user
+                    // edits survive a reinstall.
                     script.push_str(&format!(
                         "docker run --rm -v {}:/seed -e SEED_CONTENT={} alpine sh -c '\
                          mkdir -p \"$(dirname /seed/{})\" && \
                          [ -f /seed/{} ] || printf %s \"$SEED_CONTENT\" > /seed/{}'\n",
-                        shell_escape(&resolved_vol),
+                        shell_escape(&source),
                         shell_escape(&seed.content),
                         rel, rel, rel,
                     ));
@@ -1793,25 +1832,14 @@ pub fn prepare_install(
                     }
                 }
             }
-            for v in &docker.volumes {
-                let vol = match vol_base.as_deref() {
-                    Some(base) => remap_volume(v, base),
-                    None => prefix_named_volume(v, container_name),
-                };
-                create_args.push_str(&format!(" -v {}", shell_escape(&vol)));
-            }
-            // Extra user-specified volumes (reject sensitive host paths)
-            if let Some(extras) = extra_volumes {
-                const BLOCKED_PREFIXES: &[&str] = &["/etc/shadow", "/etc/passwd", "/proc", "/sys"];
-                for v in extras {
-                    let trimmed = v.trim();
-                    if !trimmed.is_empty() && trimmed.contains(':') {
-                        let host_path = trimmed.split(':').next().unwrap_or("");
-                        if !BLOCKED_PREFIXES.iter().any(|b| host_path.starts_with(b)) {
-                            create_args.push_str(&format!(" -v {}", shell_escape(trimmed)));
-                        }
-                    }
-                }
+            // Emit the resolved volume set built above (manifest
+            // defaults with user extras overriding by container-side
+            // target). Earlier versions emitted manifest volumes and
+            // user extras as separate -v flag groups; Docker accepts
+            // both but the two pointing at the same target silently
+            // collided. The dedupe happens in vol_map construction.
+            for vol in vol_map.values() {
+                create_args.push_str(&format!(" -v {}", shell_escape(vol)));
             }
             if let Some(ref ip) = wolfnet_ip {
                 create_args.push_str(&format!(" --label wolfnet.ip={}", ip));

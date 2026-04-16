@@ -4093,6 +4093,13 @@ pub struct LxcParsedConfig {
     // Storage
     #[serde(default)]
     pub storage_path: String,
+
+    // True when the container's config lives in /etc/pve/lxc/… and
+    // must be managed via `pct set`. The frontend uses this to decide
+    // whether to show the PVE-specific mount options (shared, backup,
+    // size, quota) in the Add Mount modal.
+    #[serde(default)]
+    pub proxmox: bool,
 }
 /// Parse a Proxmox-format config (/etc/pve/lxc/<vmid>.conf)
 /// Format: `key: value` with network as `net0: name=eth0,bridge=vmbr0,hwaddr=...,ip=...,gw=...`
@@ -4267,6 +4274,7 @@ pub fn lxc_parse_config(container: &str) -> Option<LxcParsedConfig> {
     let mut cfg = LxcParsedConfig {
         raw_config: content.clone(),
         storage_path: if std::path::Path::new(&rootfs).exists() { rootfs } else { base.clone() },
+        proxmox: is_proxmox_fmt,
         ..Default::default()
     };
 
@@ -7410,20 +7418,179 @@ pub struct ContainerMount {
     pub read_only: bool,
 }
 
-/// Add a bind mount to an LXC container's config (container must be stopped)
-pub fn lxc_add_mount(container: &str, host_path: &str, container_path: &str, read_only: bool) -> Result<String, String> {
+/// Mount options supported across native LXC and Proxmox CTs. The
+/// PVE-only flags (shared, backup, size_gb, quota) are silently
+/// ignored on native containers — they have no equivalent in the
+/// `lxc.mount.entry` syntax.
+#[derive(Debug, Default, Clone)]
+pub struct LxcMountOptions {
+    pub host_path: String,
+    pub container_path: String,
+    pub read_only: bool,
+    pub shared: bool,
+    pub backup: bool,
+    pub quota: bool,
+    pub size_gb: Option<u64>,
+}
+
+/// Return Some(vmid) when this container name is registered with PVE
+/// via `pct list`, None otherwise. The Name column is the last token
+/// on the row; we match it strict-equal so "web" doesn't hit "webdb".
+fn pct_vmid_for_name(container: &str) -> Option<u64> {
+    if !is_proxmox() { return None; }
+    // Numeric names (PVE uses VMIDs) can be passed straight through.
+    if let Ok(vmid) = container.parse::<u64>() {
+        let out = Command::new("pct").args(["config", &vmid.to_string()]).output().ok()?;
+        if out.status.success() { return Some(vmid); }
+    }
+    let out = Command::new("pct").args(["list"]).output().ok()?;
+    if !out.status.success() { return None; }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines().skip(1) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 { continue; }
+        if *parts.last()? == container {
+            return parts[0].parse().ok();
+        }
+    }
+    None
+}
+
+fn pct_add_mount(vmid: u64, opts: &LxcMountOptions) -> Result<String, String> {
+    // Find the next free mpN slot by scanning existing config.
+    let out = Command::new("pct").args(["config", &vmid.to_string()])
+        .output().map_err(|e| format!("pct config: {}", e))?;
+    if !out.status.success() {
+        return Err(format!("pct config failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    let cfg = String::from_utf8_lossy(&out.stdout);
+    let used: std::collections::HashSet<u32> = cfg.lines()
+        .filter_map(|l| {
+            let rest = l.trim().strip_prefix("mp")?;
+            let colon = rest.find(':')?;
+            rest[..colon].parse::<u32>().ok()
+        })
+        .collect();
+    let mp_idx = (0..256u32).find(|i| !used.contains(i))
+        .ok_or_else(|| "no free mpN slot (0-255 all used)".to_string())?;
+
+    // Build the option string. Only bind-mount sources (host paths
+    // starting with /) should skip `size=` — for those PVE doesn't
+    // allocate a volume, so a size= key is invalid.
+    let mut parts: Vec<String> = vec![opts.host_path.clone()];
+    parts.push(format!("mp={}", opts.container_path));
+    if opts.read_only { parts.push("ro=1".to_string()); }
+    if opts.shared { parts.push("shared=1".to_string()); }
+    if opts.backup { parts.push("backup=1".to_string()); }
+    if opts.quota { parts.push("quota=1".to_string()); }
+    if let Some(sz) = opts.size_gb {
+        if !opts.host_path.starts_with('/') { parts.push(format!("size={}G", sz)); }
+    }
+    let mp_value = parts.join(",");
+
+    let out = Command::new("pct")
+        .args(["set", &vmid.to_string(), &format!("--mp{}", mp_idx), &mp_value])
+        .output()
+        .map_err(|e| format!("pct set: {}", e))?;
+    if !out.status.success() {
+        return Err(format!("pct set failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    Ok(format!("Mount mp{} added: {} → {}", mp_idx, opts.host_path, opts.container_path))
+}
+
+fn pct_list_mounts(vmid: u64) -> Vec<ContainerMount> {
+    let out = match Command::new("pct").args(["config", &vmid.to_string()]).output() {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let cfg = String::from_utf8_lossy(&out.stdout);
+    let mut mounts = Vec::new();
+    for line in cfg.lines() {
+        let rest = match line.trim().strip_prefix("mp") {
+            Some(r) => r,
+            None => continue,
+        };
+        let colon = match rest.find(':') { Some(c) => c, None => continue };
+        let idx_str = &rest[..colon];
+        if idx_str.parse::<u32>().is_err() { continue; }
+        let value = rest[colon + 1..].trim();
+        // First comma splits source from options; no comma means just
+        // a source with no options (unusual but valid).
+        let (host_path, opts_str) = match value.find(',') {
+            Some(pos) => (value[..pos].to_string(), &value[pos + 1..]),
+            None => (value.to_string(), ""),
+        };
+        let mut container_path = String::new();
+        let mut read_only = false;
+        for opt in opts_str.split(',') {
+            let opt = opt.trim();
+            if let Some(v) = opt.strip_prefix("mp=") { container_path = v.to_string(); }
+            if opt == "ro=1" { read_only = true; }
+        }
+        if container_path.is_empty() { continue; }
+        mounts.push(ContainerMount {
+            host_path,
+            container_path,
+            mount_type: format!("mp{}", idx_str),
+            read_only,
+        });
+    }
+    mounts
+}
+
+fn pct_remove_mount(vmid: u64, host_path: &str) -> Result<String, String> {
+    let out = Command::new("pct").args(["config", &vmid.to_string()])
+        .output().map_err(|e| format!("pct config: {}", e))?;
+    if !out.status.success() {
+        return Err(format!("pct config failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    let cfg = String::from_utf8_lossy(&out.stdout);
+    let mut target: Option<u32> = None;
+    for line in cfg.lines() {
+        let rest = match line.trim().strip_prefix("mp") { Some(r) => r, None => continue };
+        let colon = match rest.find(':') { Some(c) => c, None => continue };
+        let idx_str = &rest[..colon];
+        let idx = match idx_str.parse::<u32>() { Ok(i) => i, Err(_) => continue };
+        let value = rest[colon + 1..].trim();
+        let source = value.split(',').next().unwrap_or("").trim();
+        if source == host_path { target = Some(idx); break; }
+    }
+    let idx = target.ok_or_else(|| format!("no mpN entry matching '{}'", host_path))?;
+    let out = Command::new("pct")
+        .args(["set", &vmid.to_string(), "--delete", &format!("mp{}", idx)])
+        .output()
+        .map_err(|e| format!("pct set --delete: {}", e))?;
+    if !out.status.success() {
+        return Err(format!("pct set failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    Ok(format!("Mount mp{} removed", idx))
+}
+
+/// Add a bind mount to an LXC container's config (container must be
+/// stopped). Routes through `pct set` on Proxmox CTs so the mp entry
+/// lives in `/etc/pve/lxc/<vmid>.conf` with full PVE metadata; falls
+/// back to writing an `lxc.mount.entry` line on native LXC.
+pub fn lxc_add_mount(container: &str, opts: &LxcMountOptions) -> Result<String, String> {
+    if let Some(vmid) = pct_vmid_for_name(container) {
+        return pct_add_mount(vmid, opts);
+    }
+
+    let host_path = &opts.host_path;
+    let container_path = &opts.container_path;
     let config_path = format!("{}/{}/config", lxc_base_dir(container), container);
     let mut config = std::fs::read_to_string(&config_path)
         .map_err(|e| format!("Container '{}' config not found: {}", container, e))?;
 
-    // Ensure host path exists (create it if it doesn't)
-    if !std::path::Path::new(host_path).exists() {
+    // Ensure host path exists (create it if it doesn't). Only makes
+    // sense for a literal filesystem path — skip if the user passed a
+    // PVE storage id on a non-PVE host (would fail and confuse).
+    if host_path.starts_with('/') && !std::path::Path::new(host_path).exists() {
         std::fs::create_dir_all(host_path)
             .map_err(|e| format!("Failed to create host path '{}': {}", host_path, e))?;
     }
 
     // Build the mount entry
-    let ro_flag = if read_only { ",ro" } else { "" };
+    let ro_flag = if opts.read_only { ",ro" } else { "" };
     // Container path must not have a leading / for lxc.mount.entry
     let clean_container_path = container_path.trim_start_matches('/');
     let entry = format!("\nlxc.mount.entry = {} {} none bind,create=dir{} 0 0\n",
@@ -7438,12 +7605,15 @@ pub fn lxc_add_mount(container: &str, host_path: &str, container_path: &str, rea
     std::fs::write(&config_path, config)
         .map_err(|e| format!("Failed to write config: {}", e))?;
 
-
     Ok(format!("Mount added: {} → {}", host_path, container_path))
 }
 
 /// Remove a bind mount from an LXC container's config
 pub fn lxc_remove_mount(container: &str, host_path: &str) -> Result<String, String> {
+    if let Some(vmid) = pct_vmid_for_name(container) {
+        return pct_remove_mount(vmid, host_path);
+    }
+
     let config_path = format!("{}/{}/config", lxc_base_dir(container), container);
     let config = std::fs::read_to_string(&config_path)
         .map_err(|e| format!("Container '{}' config not found: {}", container, e))?;
@@ -7468,6 +7638,10 @@ pub fn lxc_remove_mount(container: &str, host_path: &str) -> Result<String, Stri
 
 /// List current bind mounts for an LXC container
 pub fn lxc_list_mounts(container: &str) -> Vec<ContainerMount> {
+    if let Some(vmid) = pct_vmid_for_name(container) {
+        return pct_list_mounts(vmid);
+    }
+
     let config_path = format!("{}/{}/config", lxc_base_dir(container), container);
     let config = match std::fs::read_to_string(&config_path) {
         Ok(c) => c,
