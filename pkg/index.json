@@ -26,7 +26,7 @@
   {
     "id": "wolfsecure",
     "name": "WolfSecure",
-    "version": "0.1.1",
+    "version": "0.1.2",
     "description": "Audits containers, config, network surface, and host hygiene for known-bad patterns. Uses Trivy for CVE scanning when available. Findings appear under Settings → WolfSecure.",
     "author": "Wolf Software Systems Ltd",
     "icon": "🛡",
