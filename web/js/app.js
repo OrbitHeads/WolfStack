@@ -3439,7 +3439,7 @@ function renderVms(vms) {
                 <td>${wolfnetIp !== '—' ? `<span class="badge" style="background:var(--accent-bg); color:var(--accent);">${wolfnetIp}</span>` : '—'}</td>
                 <td>${vncText}</td>
                 <td><input type="checkbox" ${autostart} onchange="toggleVmAutostart('${vm.name}', this.checked)"></td>
-                <td style="white-space:nowrap;">
+                <td><div style="display:flex; flex-wrap:wrap; gap:2px; min-width:0;">
                     <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="showVmLogs('${vm.name}')" title="Logs">📋</button>
                     ${vm.running ?
                 `${vm.vmid
@@ -3453,7 +3453,7 @@ function renderVms(vms) {
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#22c55e;" onclick="vmAction('${vm.name}', 'start', this)" title="Start">▶️</button>
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#ef4444;" onclick="deleteVm('${vm.name}')" title="Delete">🗑️</button>`
             }
-                </td>
+                </div></td>
             </tr>${storageSubRow}
         `;
     }).join('');
@@ -12024,7 +12024,7 @@ function renderDockerContainers(containers) {
             <td style="font-size:12px; font-family:monospace;">${c.ip_address || '-'}${c.gateway ? '<div style="font-size:10px;color:var(--text-muted);">GW: ' + escapeHtml(c.gateway) + '</div>' : ''}${c.mac_address ? '<div style="font-size:10px;color:var(--text-muted);">MAC: ' + escapeHtml(c.mac_address) + '</div>' : ''}</td>
             <td style="font-size:11px;">${ports}</td>
             <td><input type="checkbox" ${c.autostart ? 'checked' : ''} onchange="toggleDockerAutostart('${c.id}', this.checked)"></td>
-            <td style="white-space:nowrap;">
+            <td><div style="display:flex; flex-wrap:wrap; gap:2px; min-width:0;">
                 ${isRunning ? `
                     <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;opacity:0.4;cursor:not-allowed;pointer-events:none;" disabled title="Start">▶️</button>
                     <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="dockerAction('${c.name}', 'stop', this)" title="Stop">⏹️</button>
@@ -12051,7 +12051,7 @@ function renderDockerContainers(containers) {
                 <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="openContainerCron('docker', '${c.name}')" title="Cron Jobs">⏰</button>
                 <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="cloneDockerContainer('${c.name}')" title="Clone">📋</button>
                 <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="migrateDockerContainer('${c.name}')" title="Migrate">🚀</button>
-            </td>
+            </div></td>
         </tr>${statsSubRow}`;
     }).join('');
 }
@@ -12705,7 +12705,7 @@ function renderLxcContainers(containers, stats) {
             <td><span style="color:${stateColor}">●</span> ${c.state}</td>
             <td style="font-size:12px; font-family:monospace;">${c.ip_address || '-'}${c.gateway ? '<div style="font-size:10px;color:var(--text-muted);">GW: ' + escapeHtml(c.gateway) + '</div>' : ''}${c.mac_address ? '<div style="font-size:10px;color:var(--text-muted);">MAC: ' + escapeHtml(c.mac_address) + '</div>' : ''}</td>
             <td><input type="checkbox" ${c.autostart ? 'checked' : ''} onchange="toggleLxcAutostart('${c.name}', this.checked)"></td>
-            <td style="white-space:nowrap;">
+            <td><div style="display:flex; flex-wrap:wrap; gap:2px; min-width:0;">
                 <button class="btn btn-sm" style="${isRunning ? disStyle : btnStyle}" ${isRunning ? 'disabled' : ''} ${!isRunning ? `onclick="lxcAction('${c.name}', 'start', this)"` : ''} title="Start">▶️</button>
                 <button class="btn btn-sm" style="${!isRunning ? disStyle : btnStyle}" ${!isRunning ? 'disabled' : ''} ${isRunning ? `onclick="lxcAction('${c.name}', 'stop', this)"` : ''} title="Stop">⏹️</button>
                 <button class="btn btn-sm" style="${!isRunning ? disStyle : btnStyle}" ${!isRunning ? 'disabled' : ''} ${isRunning ? `onclick="lxcAction('${c.name}', 'restart', this)"` : ''} title="Restart">🔄</button>
@@ -12720,8 +12720,9 @@ function renderLxcContainers(containers, stats) {
                 <button class="btn btn-sm" style="${btnStyle}" onclick="openContainerCron('lxc', '${c.name}')" title="Cron Jobs">⏰</button>
                 <button class="btn btn-sm" style="${btnStyle}" onclick="cloneLxcContainer('${c.name}')" title="Clone">📋</button>
                 <button class="btn btn-sm" style="${btnStyle}" onclick="migrateLxcContainer('${c.name}')" title="Migrate">🚀</button>
+                <button class="btn btn-sm" style="${btnStyle}" onclick="openLxcStorage('${escapeHtml(c.name)}')" title="Storage (resize / move)">💾</button>
                 <button class="btn btn-sm" style="${btnStyle}" onclick="exportLxcContainer('${c.name}')" title="Export">🗃️</button>
-            </td>
+            </div></td>
         </tr>${statsSubRow}`;
     }).join('');
 }
@@ -14591,22 +14592,52 @@ async function openLxcStorage(name) {
     const currentGb = info.size_bytes != null ? Math.ceil(info.size_bytes / 1024 / 1024 / 1024) : 8;
     const usedPct = (info.size_bytes && info.used_bytes)
         ? Math.round(100 * info.used_bytes / info.size_bytes) : 0;
-    // Storage targets: registered LXC paths (for native) or PVE
-    // storages (for Proxmox). We try both — UI just shows one row per.
+    // Storage targets — use the same /api/storage/list that the LXC
+    // create flow uses, filtered to sensible LXC-rootfs targets. That
+    // call goes through apiUrl() so when the user is viewing a remote
+    // node's containers, the storage list also comes from that node
+    // (not the browser's local host). Filter out the current storage
+    // so a user can't accidentally "migrate" into the same place.
     let targetOptions = '';
     try {
-        if (info.proxmox) {
-            // PVE storage list isn't exposed yet via WolfStack — let
-            // the user type the storage id manually.
-            targetOptions = '<input id="lxc-storage-target" class="form-control" placeholder="e.g. local-zfs, ceph-pool"/>';
+        const r = await fetch(apiUrl('/api/storage/list'));
+        const list = r.ok ? await r.json() : {};
+        const storages = Array.isArray(list.storages) ? list.storages : [];
+        let opts = '';
+        if (info.proxmox || list.proxmox) {
+            // PVE: rootdir or images content types can host LXC rootfs.
+            const usable = storages.filter(s =>
+                s.content && s.content.some(c => c === 'rootdir' || c === 'images')
+                && s.id !== info.storage
+            );
+            if (usable.length) {
+                opts = usable.map(s => {
+                    const free = formatBytes(s.available_bytes);
+                    return `<option value="${escapeHtml(s.id)}">${escapeHtml(s.id)} (${escapeHtml(s.type)}, ${free} free)</option>`;
+                }).join('');
+            }
         } else {
-            const r = await fetch(apiUrl('/api/storage/list'));
-            const list = r.ok ? await r.json() : [];
-            const paths = (list?.lxc_storage_paths || []).filter(p => p !== info.storage);
-            const opts = paths.length
-                ? paths.map(p => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`).join('')
-                : '<option value="">(no other LXC storage paths registered)</option>';
+            // Native: every filesystem the host has mounted is a
+            // candidate. We append /lxc so containers land in a
+            // predictable subdir — matches the create-modal default.
+            const defaultPath = '/var/lib/lxc';
+            if (info.storage !== defaultPath) {
+                opts += `<option value="${defaultPath}">${defaultPath} (default)</option>`;
+            }
+            for (const s of storages) {
+                if (s.id === '/') continue;
+                const candidate = s.id + '/lxc';
+                if (candidate === info.storage) continue;
+                const free = formatBytes(s.available_bytes);
+                opts += `<option value="${escapeHtml(candidate)}">${escapeHtml(candidate)} (${free} free)</option>`;
+            }
+        }
+        if (opts) {
             targetOptions = `<select id="lxc-storage-target" class="form-control">${opts}</select>`;
+        } else {
+            // Nothing else to migrate to — fall back to a text input so
+            // the user can still type a path/storage id if they have one.
+            targetOptions = `<input id="lxc-storage-target" class="form-control" placeholder="${info.proxmox ? 'e.g. local-zfs, ceph-pool' : 'filesystem path'}"/>`;
         }
     } catch (e) {
         targetOptions = '<input id="lxc-storage-target" class="form-control" placeholder="storage path or PVE storage id"/>';
