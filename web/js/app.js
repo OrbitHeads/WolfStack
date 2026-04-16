@@ -13821,10 +13821,15 @@ async function migrateDockerContainer(name) {
         const data = await resp.json();
         const nodes = Array.isArray(data) ? data : (data.nodes || []);
 
-        // Filter to same cluster, exclude self node
-        const currentNode = nodes.find(n => n.is_self) || allNodes.find(n => n.id === currentNodeId);
-        const myCluster = currentNode?.cluster_name || 'WolfStack';
-        const clusterNodes = nodes.filter(n => !n.is_self && n.online && (n.cluster_name || 'WolfStack') === myCluster);
+        // Filter to the container's OWN cluster, excluding its current
+        // host. `currentNodeId` is the node the user is browsing — i.e.
+        // the host of this container — regardless of which cluster the
+        // browser is connected to.
+        const containerHost = nodes.find(n => n.id === currentNodeId)
+                           || allNodes.find(n => n.id === currentNodeId)
+                           || nodes.find(n => n.is_self);
+        const containerCluster = containerHost?.cluster_name || 'WolfStack';
+        const clusterNodes = nodes.filter(n => n.id !== currentNodeId && n.online && (n.cluster_name || 'WolfStack') === containerCluster);
 
         let nodeOpts = '';
         if (clusterNodes.length > 0) {
@@ -14075,10 +14080,17 @@ async function migrateLxcContainer(name) {
             nodes = Array.isArray(data) ? data : (data.nodes || []);
         }
     } catch (e) { }
-    // Filter to same cluster, exclude self node
-    const currentNode = nodes.find(n => n.is_self) || allNodes.find(n => n.id === currentNodeId);
-    const myCluster = currentNode?.cluster_name || 'WolfStack';
-    const remoteNodes = nodes.filter(n => !n.is_self && n.online && (n.cluster_name || 'WolfStack') === myCluster)
+    // Filter to the container's OWN cluster (not the cluster the
+    // browser is connected to). When the user is browsing a container
+    // on a remote node via the cluster browser, `is_self` points at
+    // the local WolfStack host, which is often a different cluster.
+    // The container's host is `currentNodeId`.
+    const containerHost = nodes.find(n => n.id === currentNodeId)
+                       || allNodes.find(n => n.id === currentNodeId)
+                       || nodes.find(n => n.is_self);
+    const containerCluster = containerHost?.cluster_name || 'WolfStack';
+    const remoteNodes = nodes
+        .filter(n => n.id !== currentNodeId && n.online && (n.cluster_name || 'WolfStack') === containerCluster)
         .sort((a, b) => (a.hostname || a.address).localeCompare(b.hostname || b.address));
 
     const modal = document.createElement('div');
@@ -14273,10 +14285,14 @@ async function migrateVm(name) {
             nodes = Array.isArray(data) ? data : (data.nodes || []);
         }
     } catch (e) { }
-    // Filter to same cluster, exclude self node
-    const currentNode = nodes.find(n => n.is_self) || allNodes.find(n => n.id === currentNodeId);
-    const myCluster = currentNode?.cluster_name || 'WolfStack';
-    const remoteNodes = nodes.filter(n => !n.is_self && n.online && (n.cluster_name || 'WolfStack') === myCluster)
+    // Filter to the VM's OWN cluster (excluding its current host).
+    // Uses `currentNodeId` — the node being browsed — not the self-node,
+    // so cross-cluster browsing lists the right destinations.
+    const vmHost = nodes.find(n => n.id === currentNodeId)
+                || allNodes.find(n => n.id === currentNodeId)
+                || nodes.find(n => n.is_self);
+    const vmCluster = vmHost?.cluster_name || 'WolfStack';
+    const remoteNodes = nodes.filter(n => n.id !== currentNodeId && n.online && (n.cluster_name || 'WolfStack') === vmCluster)
         .sort((a, b) => (a.hostname || a.address).localeCompare(b.hostname || b.address));
 
     const modal = document.createElement('div');
@@ -15310,17 +15326,25 @@ function selectLxcTemplate(distro, release, arch, variant) {
                         style="width:100%; padding:8px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary);">
                 </div>
             </div>
-            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:12px;">
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:6px;">
                 <div>
-                    <label style="display:block; margin-bottom:4px; font-weight:600; font-size:13px;">💾 Storage Location</label>
+                    <label style="display:block; margin-bottom:4px; font-weight:600; font-size:13px;">📥 Template Storage <span style="font-weight:400; color:var(--text-muted); font-size:11px;">(where the distro tarball is cached)</span></label>
+                    <select id="lxc-create-template-storage"
+                        style="width:100%; padding:8px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary); font-size:13px;">
+                        <option value="">Local (default)</option>
+                    </select>
+                </div>
+                <div>
+                    <label style="display:block; margin-bottom:4px; font-weight:600; font-size:13px;">💾 Build Storage <span style="font-weight:400; color:var(--text-muted); font-size:11px;">(where the rootfs lives)</span></label>
                     <select id="lxc-create-storage"
                         style="width:100%; padding:8px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary); font-size:13px;">
                         <option value="/var/lib/lxc">/var/lib/lxc (default)</option>
                     </select>
                 </div>
-                <div style="display:flex; align-items:end;">
-                    <span id="lxc-storage-info" style="font-size:12px; color:var(--text-muted); padding-bottom:10px;"></span>
-                </div>
+            </div>
+            <div style="margin-bottom:12px; font-size:11px; color:var(--text-muted); line-height:1.5;">
+                <span id="lxc-storage-info"></span>
+                <span style="display:block;">💡 Change the storage of an existing container from <strong>LXC Containers</strong> → container detail → <strong>💾 Storage</strong> → <strong>Move to different storage</strong>.</span>
             </div>
             <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:12px;">
                 <div>
@@ -15384,12 +15408,43 @@ function selectLxcTemplate(distro, release, arch, variant) {
 
     document.getElementById('lxc-create-name').focus();
 
-    // Populate storage dropdown from /api/storage/list (Proxmox-aware)
+    // Populate storage dropdowns from /api/storage/list (Proxmox-aware).
+    // Two pickers: template cache (where the tarball lands) and rootfs
+    // build storage (where the container lives).
     const storageSelect = document.getElementById('lxc-create-storage');
+    const tmplSelect = document.getElementById('lxc-create-template-storage');
     const storageInfo = document.getElementById('lxc-storage-info');
     fetch(apiUrl('/api/storage/list'))
         .then(r => r.json())
         .then(data => {
+            // Populate template-storage picker. Proxmox surfaces vztmpl
+            // content; on standalone LXC the same filesystem list works
+            // (template cache can live anywhere with free space).
+            if (tmplSelect) {
+                tmplSelect.innerHTML = '';
+                if (data.proxmox) {
+                    const tmplStorages = data.storages.filter(s =>
+                        s.content && s.content.some(c => c === 'vztmpl')
+                    );
+                    if (tmplStorages.length === 0) {
+                        tmplSelect.innerHTML = '<option value="">Local (default)</option>';
+                    } else {
+                        tmplStorages.forEach(s => {
+                            const free = formatBytes(s.available_bytes);
+                            const def = s.id === 'local' ? ' (default)' : '';
+                            tmplSelect.innerHTML += `<option value="${s.id}"${def ? ' selected' : ''}>${s.id} (${s.type}, ${free} free)${def}</option>`;
+                        });
+                    }
+                } else {
+                    tmplSelect.innerHTML = '<option value="">/var/cache/lxc (default)</option>';
+                    data.storages.forEach(s => {
+                        if (s.id !== '/') {
+                            const free = formatBytes(s.available_bytes);
+                            tmplSelect.innerHTML += `<option value="${s.id}">${s.id} (${free} free)</option>`;
+                        }
+                    });
+                }
+            }
             storageSelect.innerHTML = '';
             if (data.proxmox) {
                 // Proxmox: show PVE storage IDs
@@ -15475,6 +15530,7 @@ async function createLxcContainer() {
     const architecture = document.getElementById('lxc-create-arch').value.trim();
     const wolfnet_ip = document.getElementById('lxc-wolfnet-ip')?.value?.trim() || '';
     const storage_path = document.getElementById('lxc-create-storage')?.value || '';
+    const template_storage = document.getElementById('lxc-create-template-storage')?.value || '';
     const root_password = document.getElementById('lxc-create-password')?.value?.trim() || '';
     const memory_limit = document.getElementById('lxc-create-memory')?.value || '';
     const cpu_cores = document.getElementById('lxc-create-cpus')?.value || '';
@@ -15569,7 +15625,7 @@ async function createLxcContainer() {
         const resp = await fetch(apiUrl('/api/containers/lxc/create'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name, distribution, release, architecture, wolfnet_ip, storage_path, root_password, memory_limit, cpu_cores }),
+            body: JSON.stringify({ name, distribution, release, architecture, wolfnet_ip, storage_path, template_storage, root_password, memory_limit, cpu_cores }),
         });
 
         let data;

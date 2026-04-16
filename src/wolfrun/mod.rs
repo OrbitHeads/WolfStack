@@ -1488,7 +1488,7 @@ async fn deploy_lxc(
 
     if node.is_self {
         match crate::containers::lxc_create(
-            container_name, &lxc.distribution, &lxc.release, &lxc.architecture, None,
+            container_name, &lxc.distribution, &lxc.release, &lxc.architecture, None, None,
         ) {
             Ok(_) => {
                 let _ = crate::containers::lxc_start(container_name);

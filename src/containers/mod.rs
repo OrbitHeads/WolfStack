@@ -5814,18 +5814,24 @@ fn pct_fix_nm_networking(vmid: &str, distribution: &str) {
 
 /// Create an LXC container via Proxmox's pct command (public API entry point)
 pub fn pct_create_api(name: &str, distribution: &str, release: &str, architecture: &str,
-              storage_id: Option<&str>, root_password: Option<&str>,
+              storage_id: Option<&str>, template_storage_id: Option<&str>,
+              root_password: Option<&str>,
               memory_mb: Option<u32>, cpu_cores: Option<u32>,
               wolfnet_ip: Option<&str>) -> Result<String, String> {
     let vmid = pct_next_vmid()?;
     let storage = storage_id.unwrap_or("local-lvm");
 
-    // Determine which storage holds templates (use "local" for vztmpl by default)
-    let template_storage = if storage == "local-lvm" || storage == "local-zfs" {
-        "local"  // LVM/ZFS can't hold templates, use "local" (directory)
+    // Prefer the caller-supplied template storage if they picked one in the
+    // UI; otherwise fall back to the "'local' unless the rootfs storage can
+    // hold templates" heuristic. LVM and ZFS pools can't hold vztmpl content.
+    let template_storage_default = if storage == "local-lvm" || storage == "local-zfs" {
+        "local"
     } else {
         storage
     };
+    let template_storage = template_storage_id
+        .filter(|s| !s.is_empty())
+        .unwrap_or(template_storage_default);
 
     // Ensure the template is downloaded
     let template_volid = pct_ensure_template(template_storage, distribution, release, architecture)?;
@@ -6278,12 +6284,15 @@ pub fn lxc_export_cleanup(archive_path: &str) {
 
 /// Create an LXC container from a download template
 /// On Proxmox nodes, automatically uses `pct create` instead of `lxc-create`
-pub fn lxc_create(name: &str, distribution: &str, release: &str, architecture: &str, storage_path: Option<&str>) -> Result<String, String> {
+pub fn lxc_create(name: &str, distribution: &str, release: &str, architecture: &str,
+                  storage_path: Option<&str>, template_cache_path: Option<&str>) -> Result<String, String> {
 
 
-    // On Proxmox, delegate to pct create
+    // On Proxmox, delegate to pct create. Template-storage hint passes
+    // through so the user's choice of vztmpl storage is honoured.
     if is_proxmox() {
-        let result = pct_create_api(name, distribution, release, architecture, storage_path, None, None, None, None);
+        let result = pct_create_api(name, distribution, release, architecture,
+            storage_path, template_cache_path, None, None, None, None);
         if result.is_ok() { invalidate_count_caches(); }
         return result;
     }
@@ -6306,7 +6315,18 @@ pub fn lxc_create(name: &str, distribution: &str, release: &str, architecture: &
 
     args.extend_from_slice(&["--", "-d", distribution, "-r", release, "-a", architecture]);
 
-    let output = Command::new("lxc-create")
+    // LXC_CACHE_PATH tells the lxc-download template script where to
+    // stash the downloaded tarball. Defaults to /var/cache/lxc when
+    // unset; the UI's template-storage picker funnels into this.
+    let mut cmd = Command::new("lxc-create");
+    if let Some(cache) = template_cache_path {
+        if !cache.is_empty() {
+            // Let the template land on the chosen storage (it'll live
+            // in <cache>/lxc/cache/download/...).
+            cmd.env("LXC_CACHE_PATH", format!("{}/lxc/cache", cache.trim_end_matches('/')));
+        }
+    }
+    let output = cmd
         .args(&args)
         .output()
         .map_err(|e| format!("Failed to create LXC container: {}", e))?;

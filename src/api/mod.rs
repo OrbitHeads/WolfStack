@@ -3239,6 +3239,12 @@ pub struct LxcCreateRequest {
     pub architecture: String,
     pub wolfnet_ip: Option<String>,
     pub storage_path: Option<String>,
+    /// Where the distro template tarball should live. On Proxmox this is
+    /// the PVE storage id that holds `vztmpl` content (defaults to "local").
+    /// On native LXC it's used as LXC_CACHE_PATH for lxc-create so the
+    /// downloaded tarball goes there instead of /var/cache/lxc.
+    #[serde(default)]
+    pub template_storage: Option<String>,
     pub root_password: Option<String>,
     pub memory_limit: Option<String>,
     pub cpu_cores: Option<String>,
@@ -3261,6 +3267,7 @@ pub async fn lxc_create(
     // On Proxmox, pct_create handles password, memory, and CPU natively
     if containers::is_proxmox() {
         let storage = body.storage_path.as_deref();
+        let template_storage = body.template_storage.as_deref();
         let password = body.root_password.as_deref();
         // Parse memory limit (e.g. "512m" -> 512, "2g" -> 2048)
         let memory_mb = body.memory_limit.as_deref().and_then(|m| {
@@ -3273,7 +3280,7 @@ pub async fn lxc_create(
 
         return match containers::pct_create_api(
             &body.name, &body.distribution, &body.release, &body.architecture,
-            storage, password, memory_mb, cpu_cores,
+            storage, template_storage, password, memory_mb, cpu_cores,
             wolfnet_ip.as_deref(),
         ) {
             Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
@@ -3283,7 +3290,8 @@ pub async fn lxc_create(
 
     // Standalone LXC path
     let storage = body.storage_path.as_deref();
-    match containers::lxc_create(&body.name, &body.distribution, &body.release, &body.architecture, storage) {
+    let template_storage = body.template_storage.as_deref();
+    match containers::lxc_create(&body.name, &body.distribution, &body.release, &body.architecture, storage, template_storage) {
         Ok(msg) => {
             let mut messages = vec![msg];
 

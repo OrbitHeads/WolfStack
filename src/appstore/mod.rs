@@ -385,6 +385,7 @@ fn install_lxc(
         &lxc.release,
         &lxc.architecture,
         None, // default storage
+        None, // default template cache
     )?;
 
     // Write WolfNet IP file so it's pre-assigned
