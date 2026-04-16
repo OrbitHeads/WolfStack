@@ -30,8 +30,52 @@ const PEERS_DIR: &str = "/etc/ppp/peers";
 const CHAP_SECRETS: &str = "/etc/ppp/chap-secrets";
 const PAP_SECRETS: &str = "/etc/ppp/pap-secrets";
 const IP_PRE_UP_DIR: &str = "/etc/ppp/ip-pre-up.d";
+const IP_UP_DIR: &str = "/etc/ppp/ip-up.d";
 const IP_DOWN_DIR: &str = "/etc/ppp/ip-down.d";
 const STATE_DIR: &str = "/var/run/wolfrouter";
+
+/// Idempotent add of `POSTROUTING -o <iface> -j MASQUERADE` in the nat
+/// table. Without this, LAN clients routed through a WolfRouter WAN
+/// leave with private source IPs and the ISP drops them — which is
+/// exactly the "clients can't go online" symptom users hit when
+/// WolfRouter looked otherwise healthy. The `-C` pre-check keeps
+/// apply() safe to call repeatedly.
+fn nat_ensure(iface: &str) -> Result<(), String> {
+    if iface.is_empty() { return Ok(()); }
+    let check = Command::new("iptables")
+        .args(["-t", "nat", "-C", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"])
+        .status();
+    if matches!(check, Ok(s) if s.success()) {
+        return Ok(());
+    }
+    let out = Command::new("iptables")
+        .args(["-t", "nat", "-A", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"])
+        .output()
+        .map_err(|e| format!("iptables -A POSTROUTING: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "WAN MASQUERADE add on {} failed: {}",
+            iface, String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    info!("WolfRouter: MASQUERADE installed on WAN interface {}", iface);
+    Ok(())
+}
+
+/// Drop every MASQUERADE rule whose output interface matches. Loop on
+/// `-D` so duplicate rules (from earlier bugs or manual edits) all go.
+fn nat_remove(iface: &str) {
+    if iface.is_empty() { return; }
+    for _ in 0..16 {
+        let out = Command::new("iptables")
+            .args(["-t", "nat", "-D", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => continue,
+            _ => break,
+        }
+    }
+}
 
 /// One WAN uplink configuration. Keyed by `id` (auto-generated) and
 /// owned by `node_id`.
@@ -184,6 +228,8 @@ pub fn validate(conn: &WanConnection) -> Result<(), String> {
 fn install_ppp_hooks(peer_name: &str) -> Result<(), String> {
     fs::create_dir_all(IP_PRE_UP_DIR)
         .map_err(|e| format!("mkdir {}: {}", IP_PRE_UP_DIR, e))?;
+    fs::create_dir_all(IP_UP_DIR)
+        .map_err(|e| format!("mkdir {}: {}", IP_UP_DIR, e))?;
     fs::create_dir_all(IP_DOWN_DIR)
         .map_err(|e| format!("mkdir {}: {}", IP_DOWN_DIR, e))?;
     fs::create_dir_all(STATE_DIR)
@@ -208,6 +254,28 @@ fn install_ppp_hooks(peer_name: &str) -> Result<(), String> {
         .map_err(|e| format!("write {}: {}", pre_up_path, e))?;
     make_executable(&pre_up_path);
 
+    // ip-up: runs after pppd has negotiated the link and the ppp*
+    // interface is ready. Install MASQUERADE on $1 (the ppp iface) so
+    // LAN clients routed over this WAN actually reach the internet.
+    // Record the iface name in state so ip-down can clean up even if
+    // the dynamic number differs between runs.
+    let up = format!(
+        "#!/bin/sh\n\
+         # WolfRouter ip-up hook for {peer} — installs WAN MASQUERADE.\n\
+         [ \"$6\" = \"{peer}\" ] || exit 0\n\
+         IFACE=\"$1\"\n\
+         [ -n \"$IFACE\" ] || exit 0\n\
+         echo \"$IFACE\" > \"{prefix}iface\" 2>/dev/null || true\n\
+         iptables -t nat -C POSTROUTING -o \"$IFACE\" -j MASQUERADE 2>/dev/null \\\n\
+             || iptables -t nat -A POSTROUTING -o \"$IFACE\" -j MASQUERADE 2>/dev/null || true\n\
+         exit 0\n",
+        peer = peer_name, prefix = state_prefix,
+    );
+    let up_path = format!("{}/wolfrouter-{}", IP_UP_DIR, peer_name);
+    fs::write(&up_path, up)
+        .map_err(|e| format!("write {}: {}", up_path, e))?;
+    make_executable(&up_path);
+
     // ip-down: runs when link drops (expected or not). Restore state.
     // Add the saved default route back — harmless if it's already
     // there. Restore /etc/resolv.conf from our snapshot.
@@ -215,6 +283,14 @@ fn install_ppp_hooks(peer_name: &str) -> Result<(), String> {
         "#!/bin/sh\n\
          # WolfRouter ip-down hook for {peer} — restores pre-PPPoE state.\n\
          [ \"$6\" = \"{peer}\" ] || exit 0\n\
+         # Remove any MASQUERADE rule(s) we installed for this link.\n\
+         # Try both $1 (pppd passes the iface) and the iface we recorded\n\
+         # in state during ip-up, in case they differ on a rebind.\n\
+         for IF in \"$1\" \"$(cat \"{prefix}iface\" 2>/dev/null)\"; do\n\
+             [ -z \"$IF\" ] && continue\n\
+             while iptables -t nat -D POSTROUTING -o \"$IF\" -j MASQUERADE 2>/dev/null; do :; done\n\
+         done\n\
+         rm -f \"{prefix}iface\" 2>/dev/null || true\n\
          SAVED_ROUTE=$(cat \"{prefix}default-route\" 2>/dev/null)\n\
          if [ -n \"$SAVED_ROUTE\" ]; then\n\
              # Strip any trailing ppp0 cruft and re-add. ip route add\n\
@@ -249,10 +325,12 @@ fn make_executable(path: &str) {
 
 fn remove_ppp_hooks(peer_name: &str) {
     let _ = fs::remove_file(format!("{}/wolfrouter-{}", IP_PRE_UP_DIR, peer_name));
+    let _ = fs::remove_file(format!("{}/wolfrouter-{}", IP_UP_DIR, peer_name));
     let _ = fs::remove_file(format!("{}/wolfrouter-{}", IP_DOWN_DIR, peer_name));
     let state_prefix = format!("{}/{}-", STATE_DIR, peer_name);
     let _ = fs::remove_file(format!("{}default-route", state_prefix));
     let _ = fs::remove_file(format!("{}resolv.conf", state_prefix));
+    let _ = fs::remove_file(format!("{}iface", state_prefix));
 }
 
 /// Write the pppd peers file + chap/pap secrets for a PPPoE connection
@@ -403,9 +481,17 @@ pub fn pppoe_stop(conn: &WanConnection) -> Result<(), String> {
 
 /// Last-resort restore when the pppd ip-down hook didn't run (we had
 /// to SIGKILL). Reads the saved state files the ip-pre-up hook wrote
-/// and restores the default route + /etc/resolv.conf directly.
+/// and restores the default route + /etc/resolv.conf directly. Also
+/// strips the WAN MASQUERADE the ip-up hook installed — otherwise a
+/// killed pppd leaves a stale rule bound to a ppp iface that no
+/// longer exists, which piles up over restarts.
 fn manual_state_restore(peer_name: &str) {
     let prefix = format!("{}/{}-", STATE_DIR, peer_name);
+    if let Ok(iface) = fs::read_to_string(format!("{}iface", prefix)) {
+        let iface = iface.trim();
+        nat_remove(iface);
+    }
+    let _ = fs::remove_file(format!("{}iface", prefix));
     if let Ok(route) = fs::read_to_string(format!("{}default-route", prefix)) {
         for line in route.lines() {
             let line = line.trim();
@@ -502,6 +588,10 @@ pub fn pppoe_status(conn: &WanConnection) -> Option<(String, String)> {
 /// Apply or stop a single connection based on its enabled flag.
 pub fn apply(conn: &WanConnection) -> Result<(), String> {
     if !conn.enabled {
+        // On disable, strip MASQUERADE for the physical iface too
+        // (PPPoE also covers the dynamic ppp iface via its ip-down
+        // hook / manual_state_restore; this catches DHCP/Static).
+        nat_remove(&conn.interface);
         if let WanMode::Pppoe(_) = &conn.mode {
             return pppoe_stop(conn);
         }
@@ -514,10 +604,18 @@ pub fn apply(conn: &WanConnection) -> Result<(), String> {
             // existing DHCP client already handles it. Future: write a
             // dispatcher hook.
             warn!("WAN DHCP for {} is a passthrough — managed by the host's DHCP client", conn.name);
+            // NAT must be installed by WolfRouter even for passthrough
+            // modes — without MASQUERADE on this interface, LAN clients
+            // routed through it leave with private source IPs and the
+            // upstream drops them. ip_forward is enabled globally
+            // elsewhere (networking::mod.rs); this is the companion
+            // piece that actually makes routing reach the internet.
+            nat_ensure(&conn.interface)?;
             Ok(())
         }
         WanMode::Static(_s) => {
             warn!("WAN static IP for {} is a passthrough — manage via host network config", conn.name);
+            nat_ensure(&conn.interface)?;
             Ok(())
         }
     }

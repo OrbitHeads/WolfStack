@@ -1553,9 +1553,19 @@ fn emit_port_flag(script: &mut String, spec: &str, counter: &mut usize) -> Strin
         "__PORT_{idx}=$(__ws_find_free_port {host} {proto})\n",
         idx = idx, host = host_str, proto = proto,
     ));
+    // Well-known service-port hint: when AdGuard-style apps land on a
+    // router node, port 53 is already owned by dnsmasq on the LAN iface
+    // and a remap to 5454 is technically fine but users don't always
+    // realise LAN clients can still reach the app via the container IP
+    // on port 53 internally. Same story for HTTP(S).
+    let hint = match host_str {
+        "53" => " (point your DNS forwarder at the container IP on port 53, not the host port)",
+        "80" | "443" => " (reverse-proxy or update the URL to the new host port)",
+        _ => "",
+    };
     script.push_str(&format!(
-        "[ \"$__PORT_{idx}\" != \"{host}\" ] && echo -e \"  \\033[0;33m⚠ {proto_up} port {host} busy — using $__PORT_{idx}\\033[0m\"\n",
-        idx = idx, host = host_str, proto_up = proto.to_ascii_uppercase(),
+        "[ \"$__PORT_{idx}\" != \"{host}\" ] && echo -e \"  \\033[0;33m⚠ {proto_up} port {host} busy — using $__PORT_{idx}{hint}\\033[0m\"\n",
+        idx = idx, host = host_str, proto_up = proto.to_ascii_uppercase(), hint = hint,
     ));
     let suffix = if proto_suffix.is_empty() { String::new() } else { format!("/{}", proto_suffix) };
     // Intentionally NOT shell_escape'd — we built every character and
