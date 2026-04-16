@@ -415,11 +415,33 @@
                                 <option value="output">Output (from WolfStack host)</option>
                             </select>
                         </label>
-                        <label>From (source)
-                            <input id="wr-f-from" class="form-control" placeholder="any  |  zone:lan0  |  ip:192.168.1.0/24"/>
+                        <label style="grid-column:1/-1;">From (source)
+                            <div style="display:flex; gap:4px;">
+                                <select id="wr-f-from-kind" class="form-control" style="flex:0 0 140px;" onchange="wrRenderEndpointValue('from')">
+                                    <option value="any">Any</option>
+                                    <option value="zone">Zone</option>
+                                    <option value="lan">LAN segment</option>
+                                    <option value="interface">Interface</option>
+                                    <option value="ip">IP / CIDR</option>
+                                    <option value="vm">VM</option>
+                                    <option value="container">Container</option>
+                                </select>
+                                <div id="wr-f-from-value-wrap" style="flex:1;"></div>
+                            </div>
                         </label>
-                        <label>To (destination)
-                            <input id="wr-f-to" class="form-control" placeholder="any  |  zone:wan  |  ip:8.8.8.8"/>
+                        <label style="grid-column:1/-1;">To (destination)
+                            <div style="display:flex; gap:4px;">
+                                <select id="wr-f-to-kind" class="form-control" style="flex:0 0 140px;" onchange="wrRenderEndpointValue('to')">
+                                    <option value="any">Any</option>
+                                    <option value="zone">Zone</option>
+                                    <option value="lan">LAN segment</option>
+                                    <option value="interface">Interface</option>
+                                    <option value="ip">IP / CIDR</option>
+                                    <option value="vm">VM</option>
+                                    <option value="container">Container</option>
+                                </select>
+                                <div id="wr-f-to-value-wrap" style="flex:1;"></div>
+                            </div>
                         </label>
                         <label>Protocol
                             <select id="wr-f-proto" class="form-control">
@@ -455,28 +477,127 @@
                 </div>
             </div>`;
         document.body.appendChild(overlay);
-        // Wire live-warning refresh on every field change. setTimeout
-        // defers the first run until after the existing-rule values
-        // have been populated below.
-        setTimeout(() => {
-            ['wr-f-action','wr-f-dir','wr-f-from','wr-f-to','wr-f-proto','wr-f-ports','wr-f-log','wr-f-enabled'].forEach(id => {
-                const el = document.getElementById(id);
-                if (!el) return;
-                el.addEventListener('input', wrRenderRuleWarnings);
-                el.addEventListener('change', wrRenderRuleWarnings);
-            });
-            wrRenderRuleWarnings();
-        }, 50);
-        // Populate existing values
+
+        // Initial population: set kinds + value widgets from the rule being edited.
         document.getElementById('wr-f-action').value = r.action;
         document.getElementById('wr-f-dir').value = r.direction;
-        document.getElementById('wr-f-from').value = endpointToText(r.from);
-        document.getElementById('wr-f-to').value = endpointToText(r.to);
+        document.getElementById('wr-f-from-kind').value = r.from?.kind || 'any';
+        document.getElementById('wr-f-to-kind').value = r.to?.kind || 'any';
+        wrRenderEndpointValue('from', r.from);
+        wrRenderEndpointValue('to', r.to);
         document.getElementById('wr-f-proto').value = r.protocol;
         document.getElementById('wr-f-ports').value = (r.ports || []).map(p => p.port).join(', ');
         document.getElementById('wr-f-comment').value = r.comment || '';
         document.getElementById('wr-f-log').checked = !!r.log_match;
         document.getElementById('wr-f-enabled').checked = r.enabled !== false;
+
+        // Wire live-warning refresh on every field change. setTimeout
+        // defers the first run until after the initial render settles.
+        setTimeout(() => {
+            ['wr-f-action','wr-f-dir','wr-f-from-kind','wr-f-to-kind',
+             'wr-f-proto','wr-f-ports','wr-f-log','wr-f-enabled'].forEach(id => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                el.addEventListener('input', wrRenderRuleWarnings);
+                el.addEventListener('change', wrRenderRuleWarnings);
+            });
+            // The value widgets are rebuilt on kind-change; use a delegated
+            // listener so handlers apply to whichever input is current.
+            ['wr-f-from-value-wrap', 'wr-f-to-value-wrap'].forEach(id => {
+                const wrap = document.getElementById(id);
+                if (!wrap) return;
+                wrap.addEventListener('input', wrRenderRuleWarnings);
+                wrap.addEventListener('change', wrRenderRuleWarnings);
+            });
+            wrRenderRuleWarnings();
+        }, 50);
+    }
+
+    /// Render the "value" side of an endpoint picker based on the kind.
+    /// side = 'from' | 'to'. seed (optional) = Endpoint to pre-select.
+    function wrRenderEndpointValue(side, seed) {
+        const kindSel = document.getElementById(`wr-f-${side}-kind`);
+        const wrap = document.getElementById(`wr-f-${side}-value-wrap`);
+        if (!kindSel || !wrap) return;
+        const kind = kindSel.value;
+        // If a seed was passed (populating on first open), sync the kind select to it too.
+        if (seed && seed.kind) kindSel.value = seed.kind;
+        const effectiveKind = seed?.kind || kind;
+
+        switch (effectiveKind) {
+            case 'any': {
+                wrap.innerHTML = `<input class="form-control" value="(matches any source / destination)" disabled/>`;
+                break;
+            }
+            case 'zone': {
+                const opts = wrZoneOptions().map(z =>
+                    `<option value="${escHtml(z.value)}">${escHtml(z.label)}</option>`).join('');
+                wrap.innerHTML = `<select id="wr-f-${side}-value" class="form-control">${opts}</select>`;
+                if (seed?.zone) document.getElementById(`wr-f-${side}-value`).value = wrZoneToValue(seed.zone);
+                break;
+            }
+            case 'lan': {
+                const lans = wrState.lans || [];
+                const opts = lans.length
+                    ? lans.map(l => `<option value="${escHtml(l.id)}">${escHtml(l.name)} — ${escHtml(l.subnet_cidr)}</option>`).join('')
+                    : '<option value="">(no LAN segments defined — create one first)</option>';
+                wrap.innerHTML = `<select id="wr-f-${side}-value" class="form-control">${opts}</select>`;
+                if (seed?.id) document.getElementById(`wr-f-${side}-value`).value = seed.id;
+                break;
+            }
+            case 'interface': {
+                const ifaces = wrInterfaceOptions();
+                const opts = ifaces.length
+                    ? ifaces.map(i => `<option value="${escHtml(i.name)}">${escHtml(i.name)}${i.zone ? ' — ' + zoneHuman(i.zone) : ''} (${escHtml(i.node_name)})</option>`).join('')
+                    : '<option value="">(no interfaces available)</option>';
+                wrap.innerHTML = `<select id="wr-f-${side}-value" class="form-control">${opts}</select>`;
+                if (seed?.name) document.getElementById(`wr-f-${side}-value`).value = seed.name;
+                break;
+            }
+            case 'ip': {
+                wrap.innerHTML = `<input id="wr-f-${side}-value" class="form-control" placeholder="192.168.1.0/24 or 8.8.8.8/32"/>`;
+                if (seed?.cidr) document.getElementById(`wr-f-${side}-value`).value = seed.cidr;
+                break;
+            }
+            case 'vm': {
+                const vms = wrVmOptions();
+                const opts = vms.length
+                    ? vms.map(v => `<option value="${escHtml(v.name)}">${escHtml(v.name)}${v.ip ? ' — ' + escHtml(v.ip) : ''} (${escHtml(v.node_name)})</option>`).join('')
+                    : '<option value="">(no VMs found)</option>';
+                wrap.innerHTML = `<select id="wr-f-${side}-value" class="form-control">${opts}</select>`;
+                if (seed?.name) document.getElementById(`wr-f-${side}-value`).value = seed.name;
+                break;
+            }
+            case 'container': {
+                const cs = wrContainerOptions();
+                const opts = cs.length
+                    ? cs.map(c => `<option value="${escHtml(c.name)}">${escHtml(c.name)}${c.ip ? ' — ' + escHtml(c.ip) : ''} (${escHtml(c.node_name)})</option>`).join('')
+                    : '<option value="">(no containers found)</option>';
+                wrap.innerHTML = `<select id="wr-f-${side}-value" class="form-control">${opts}</select>`;
+                if (seed?.name) document.getElementById(`wr-f-${side}-value`).value = seed.name;
+                break;
+            }
+        }
+    }
+    window.wrRenderEndpointValue = wrRenderEndpointValue;
+
+    /// Read the endpoint value widget back into a structured Endpoint.
+    function wrReadEndpoint(side) {
+        const kindSel = document.getElementById(`wr-f-${side}-kind`);
+        if (!kindSel) return { kind: 'any' };
+        const kind = kindSel.value;
+        const valEl = document.getElementById(`wr-f-${side}-value`);
+        const val = valEl ? valEl.value : '';
+        switch (kind) {
+            case 'any':       return { kind: 'any' };
+            case 'zone':      return { kind: 'zone', zone: wrValueToZone(val) || { kind: 'wan' } };
+            case 'lan':       return { kind: 'lan', id: val };
+            case 'interface': return { kind: 'interface', name: val };
+            case 'ip':        return { kind: 'ip', cidr: val };
+            case 'vm':        return { kind: 'vm', name: val };
+            case 'container': return { kind: 'container', name: val };
+        }
+        return { kind: 'any' };
     }
 
     /// Analyse a proposed (or edited) rule against the current state
@@ -599,7 +720,7 @@
         // Every element the function touches must exist before we
         // start reading — otherwise we race the modal DOM being built.
         const required = ['wr-f-action', 'wr-f-ports', 'wr-f-enabled',
-            'wr-f-dir', 'wr-f-from', 'wr-f-to', 'wr-f-proto',
+            'wr-f-dir', 'wr-f-from-kind', 'wr-f-to-kind', 'wr-f-proto',
             'wr-f-log', 'wr-f-comment'];
         for (const id of required) { if (!byId(id)) return null; }
         const ports = byId('wr-f-ports').value.split(',').map(s => s.trim()).filter(Boolean)
@@ -609,8 +730,8 @@
             enabled: byId('wr-f-enabled').checked,
             action: byId('wr-f-action').value,
             direction: byId('wr-f-dir').value,
-            from: textToEndpoint(byId('wr-f-from').value),
-            to: textToEndpoint(byId('wr-f-to').value),
+            from: wrReadEndpoint('from'),
+            to: wrReadEndpoint('to'),
             protocol: byId('wr-f-proto').value,
             ports,
             state_track: true,
@@ -648,8 +769,8 @@
     async function wrSaveRule(id) {
         const action = document.getElementById('wr-f-action').value;
         const direction = document.getElementById('wr-f-dir').value;
-        const from = textToEndpoint(document.getElementById('wr-f-from').value);
-        const to = textToEndpoint(document.getElementById('wr-f-to').value);
+        const from = wrReadEndpoint('from');
+        const to = wrReadEndpoint('to');
         const protocol = document.getElementById('wr-f-proto').value;
         const portsRaw = document.getElementById('wr-f-ports').value;
         const ports = portsRaw.split(',').map(s => s.trim()).filter(Boolean).map(p => ({ port: p, side: 'dst' }));
@@ -790,14 +911,26 @@
 
     function wrShowLanEditor(id) {
         const existing = id ? wrState.lans.find(l => l.id === id) : null;
+        // Seed a subnet that isn't already in use when creating new.
+        const seeded = existing ? null : wrSuggestSubnet(0);
         const l = existing || {
             id: '', name: '', node_id: '',
-            interface: 'br-lan0', zone: { kind: 'lan', id: 0 },
-            subnet_cidr: '192.168.10.0/24', router_ip: '192.168.10.1',
-            dhcp: { enabled: true, pool_start: '192.168.10.100', pool_end: '192.168.10.250', lease_time: '12h', reservations: [], extra_options: [] },
+            interface: '', zone: { kind: 'lan', id: 0 },
+            subnet_cidr: seeded.cidr, router_ip: seeded.router_ip,
+            dhcp: { enabled: true, pool_start: seeded.pool_start, pool_end: seeded.pool_end, lease_time: '12h', reservations: [], extra_options: [] },
             dns: { forwarders: ['1.1.1.1', '9.9.9.9'], local_records: [], cache_enabled: true, block_ads: false },
             description: '',
         };
+
+        const nodes = wrState.topology?.nodes || [];
+        const zoneOpts = wrZoneOptions().filter(z => z.value.startsWith('lan') || z.value === 'dmz' || z.value.startsWith('custom:'));
+        const nodeOptionsHtml = nodes.map(n =>
+            `<option value="${escHtml(n.node_id)}">${escHtml(n.node_name)}</option>`
+        ).join('') || '<option value="">(no nodes)</option>';
+        const zoneOptionsHtml = zoneOpts.map(z =>
+            `<option value="${escHtml(z.value)}">${escHtml(z.label)}</option>`
+        ).join('');
+
         const overlay = document.createElement('div');
         overlay.className = 'modal-overlay active';
         overlay.style.zIndex = '10000';
@@ -810,11 +943,23 @@
                 <div class="modal-body" style="font-size:13px;">
                     <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
                         <label>Name<input id="wr-l-name" class="form-control" placeholder="HomeLAN"/></label>
-                        <label>Node (leave blank for this node)<input id="wr-l-node" class="form-control"/></label>
-                        <label>Interface (bridge or NIC)<input id="wr-l-iface" class="form-control" placeholder="br-lan0"/></label>
+                        <label>Node<select id="wr-l-node" class="form-control" onchange="wrLanPopulateIfaces()">${nodeOptionsHtml}</select></label>
+                        <label>Interface (bridge or NIC)<select id="wr-l-iface" class="form-control" onchange="wrLanOnIfaceChange()"></select></label>
+                        <label>Zone<select id="wr-l-zone" class="form-control">${zoneOptionsHtml}</select></label>
                         <label>Subnet CIDR<input id="wr-l-cidr" class="form-control" placeholder="192.168.10.0/24"/></label>
                         <label>Router IP<input id="wr-l-router" class="form-control" placeholder="192.168.10.1"/></label>
-                        <label>Zone number<input type="number" id="wr-l-zone" class="form-control" value="0" min="0"/></label>
+                        <label style="grid-column:1/-1;">
+                            <div id="wr-l-iface-info" style="padding:6px 8px; border-radius:4px; font-size:11px; background:var(--bg-secondary); color:var(--text-muted);">Pick an interface to see its current addresses.</div>
+                        </label>
+                        <label style="grid-column:1/-1; display:flex; gap:8px; align-items:start; padding:10px 12px; background:rgba(34,197,94,0.08); border:1px solid rgba(34,197,94,0.3); border-radius:6px;">
+                            <input type="checkbox" id="wr-l-assign-ip" checked style="margin-top:3px;"/>
+                            <div>
+                                <strong style="color:#4ade80;">Assign router IP to interface on save</strong>
+                                <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">
+                                    dnsmasq only binds — it doesn't address the interface. With this on, WolfRouter runs <code>ip addr add</code> for you so the interface is actually reachable at the router IP. If the address already exists it's left alone.
+                                </div>
+                            </div>
+                        </label>
                         <label style="grid-column:1/-1; display:flex; gap:8px; align-items:center;">
                             <input type="checkbox" id="wr-l-dhcp-enabled"/>Enable DHCP
                         </label>
@@ -833,12 +978,30 @@
                 </div>
             </div>`;
         document.body.appendChild(overlay);
+
+        // Populate node → iface cascade. Pick the LAN's own node if editing,
+        // else the first node.
+        const nodeSel = document.getElementById('wr-l-node');
+        nodeSel.value = l.node_id || (nodes[0]?.node_id || '');
+        wrLanPopulateIfaces();
+        // Prefer the LAN's current iface, else a LAN-zoned iface on this node, else the first option.
+        const ifaceSel = document.getElementById('wr-l-iface');
+        if (l.interface) {
+            ifaceSel.value = l.interface;
+            if (ifaceSel.value !== l.interface) {
+                // Wasn't in the current node's iface list — add it so editing doesn't silently drop it.
+                const opt = document.createElement('option');
+                opt.value = l.interface; opt.textContent = l.interface + ' (not found on selected node)';
+                ifaceSel.appendChild(opt);
+                ifaceSel.value = l.interface;
+            }
+        }
+        wrLanOnIfaceChange();
+
         document.getElementById('wr-l-name').value = l.name;
-        document.getElementById('wr-l-node').value = l.node_id;
-        document.getElementById('wr-l-iface').value = l.interface;
+        document.getElementById('wr-l-zone').value = wrZoneToValue(l.zone) || 'lan0';
         document.getElementById('wr-l-cidr').value = l.subnet_cidr;
         document.getElementById('wr-l-router').value = l.router_ip;
-        document.getElementById('wr-l-zone').value = l.zone?.id ?? 0;
         document.getElementById('wr-l-dhcp-enabled').checked = !!l.dhcp.enabled;
         document.getElementById('wr-l-pool-start').value = l.dhcp.pool_start;
         document.getElementById('wr-l-pool-end').value = l.dhcp.pool_end;
@@ -847,16 +1010,63 @@
         document.getElementById('wr-l-ads').checked = !!l.dns.block_ads;
     }
 
+    // Populate the Interface dropdown from the selected node's interfaces + bridges.
+    function wrLanPopulateIfaces() {
+        const nodeSel = document.getElementById('wr-l-node');
+        const ifaceSel = document.getElementById('wr-l-iface');
+        if (!nodeSel || !ifaceSel) return;
+        const nodeId = nodeSel.value;
+        const n = (wrState.topology?.nodes || []).find(x => x.node_id === nodeId);
+        const opts = [];
+        if (n) {
+            const bridges = (n.bridges || []).map(b => ({ name: b.name, kind: 'bridge', zone: b.zone }));
+            const ifaces = (n.interfaces || []).map(i => ({ name: i.name, kind: 'iface', zone: i.zone, up: i.link_up }));
+            // Bridges first — they're the canonical LAN attach point in a typical setup.
+            for (const b of bridges) {
+                opts.push(`<option value="${escHtml(b.name)}">${escHtml(b.name)} (bridge${b.zone ? ', ' + zoneHuman(b.zone) : ''})</option>`);
+            }
+            for (const ifc of ifaces) {
+                const up = ifc.up ? '●' : '○';
+                opts.push(`<option value="${escHtml(ifc.name)}">${up} ${escHtml(ifc.name)}${ifc.zone ? ' (' + zoneHuman(ifc.zone) + ')' : ''}</option>`);
+            }
+        }
+        ifaceSel.innerHTML = opts.join('') || '<option value="">(no interfaces on this node)</option>';
+        wrLanOnIfaceChange();
+    }
+    window.wrLanPopulateIfaces = wrLanPopulateIfaces;
+
+    // When the interface selection changes, surface its current addresses so
+    // the user sees up-front whether the router IP will conflict or coexist.
+    function wrLanOnIfaceChange() {
+        const nodeSel = document.getElementById('wr-l-node');
+        const ifaceSel = document.getElementById('wr-l-iface');
+        const info = document.getElementById('wr-l-iface-info');
+        if (!nodeSel || !ifaceSel || !info) return;
+        const nodeId = nodeSel.value, ifaceName = ifaceSel.value;
+        const n = (wrState.topology?.nodes || []).find(x => x.node_id === nodeId);
+        if (!n || !ifaceName) { info.textContent = 'Pick an interface to see its current addresses.'; return; }
+        const ifc = (n.interfaces || []).find(i => i.name === ifaceName) || (n.bridges || []).find(b => b.name === ifaceName);
+        const addrs = ifc?.addresses || [];
+        if (!addrs.length) {
+            info.innerHTML = `<span style="color:#fbbf24;">⚠ <code>${escHtml(ifaceName)}</code> has no IP address. Leave "Assign router IP to interface" ticked and WolfRouter will set it up on save.</span>`;
+        } else {
+            info.innerHTML = `Current addresses on <code>${escHtml(ifaceName)}</code>: ${addrs.map(a => `<code>${escHtml(a)}</code>`).join(', ')}. Router IP will be added alongside.`;
+        }
+    }
+    window.wrLanOnIfaceChange = wrLanOnIfaceChange;
+
     async function wrSaveLan(id) {
         const existing = id ? wrState.lans.find(l => l.id === id) : null;
-        const node_id = document.getElementById('wr-l-node').value.trim();
+        const nodeSel = document.getElementById('wr-l-node');
+        const node_id = nodeSel ? nodeSel.value : '';
         const lan = existing ? JSON.parse(JSON.stringify(existing)) : { id: '', zone: { kind: 'lan', id: 0 }, dhcp: {}, dns: {}, description: '' };
         lan.name = document.getElementById('wr-l-name').value.trim();
         lan.node_id = node_id || (wrState.topology?.nodes?.[0]?.node_id ?? '');
         lan.interface = document.getElementById('wr-l-iface').value.trim();
         lan.subnet_cidr = document.getElementById('wr-l-cidr').value.trim();
         lan.router_ip = document.getElementById('wr-l-router').value.trim();
-        lan.zone = { kind: 'lan', id: parseInt(document.getElementById('wr-l-zone').value, 10) || 0 };
+        const zoneVal = document.getElementById('wr-l-zone').value;
+        lan.zone = wrValueToZone(zoneVal) || { kind: 'lan', id: 0 };
         lan.dhcp = Object.assign(lan.dhcp || {}, {
             enabled: document.getElementById('wr-l-dhcp-enabled').checked,
             pool_start: document.getElementById('wr-l-pool-start').value.trim(),
@@ -871,6 +1081,40 @@
             cache_enabled: true,
             block_ads: document.getElementById('wr-l-ads').checked,
         });
+
+        // Optional: assign the router IP to the interface first. Done before
+        // saving the segment so dnsmasq can bind to a live, addressed iface.
+        // Failures here are surfaced but don't block segment creation — users
+        // can set the IP manually via the Network tab if needed.
+        const assignIp = document.getElementById('wr-l-assign-ip')?.checked;
+        if (assignIp && lan.interface && lan.router_ip) {
+            const prefix = wrPrefixFromCidr(lan.subnet_cidr);
+            if (prefix != null) {
+                try {
+                    const url = await wrNodeUrl(lan.node_id, '/api/networking/interfaces/' + encodeURIComponent(lan.interface) + '/ip');
+                    const r = await fetch(url, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ address: lan.router_ip, prefix }),
+                    });
+                    if (!r.ok) {
+                        const txt = await r.text();
+                        // "File exists" is the idempotent-retry case — silently OK.
+                        if (!/file exists|already assigned|RTNETLINK.*File exists/i.test(txt)) {
+                            console.warn('IP assign on', lan.interface, 'returned:', txt);
+                        }
+                    }
+                    // Bring the interface up (best-effort; a bridge is typically already up).
+                    const stateUrl = await wrNodeUrl(lan.node_id, '/api/networking/interfaces/' + encodeURIComponent(lan.interface) + '/state');
+                    fetch(stateUrl, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ up: true }),
+                    }).catch(() => {});
+                } catch (e) {
+                    console.warn('Could not assign IP to', lan.interface, e);
+                }
+            }
+        }
+
         const url = wrUrl(id ? '/api/router/segments/' + id : '/api/router/segments');
         const method = id ? 'PUT' : 'POST';
         const r = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(lan) });
@@ -3371,4 +3615,414 @@
         if (bps < 1024 * 1024 * 1024) return (bps / 1048576).toFixed(1) + ' Mbps';
         return (bps / 1073741824).toFixed(2) + ' Gbps';
     }
+
+    // ─── Picker helpers (Zones / Interfaces / LANs / VMs / Containers) ───
+    //
+    // Replace the old "type it yourself" UX with dropdowns sourced from
+    // the live topology. Frees users from remembering interface names
+    // like enp3s0 and from typing zone slugs like "zone:lan0" correctly.
+
+    async function wrLocalNodeId() {
+        // Cached hit only when lookup previously succeeded. Use `undefined`
+        // as the "never looked up" sentinel so lookups can retry after a
+        // transient failure (the cluster-info endpoint can be briefly
+        // unavailable during startup).
+        if (typeof wrState.localNodeId === 'string') return wrState.localNodeId;
+        try {
+            const r = await fetch('/api/nodes');
+            if (r.ok) {
+                const j = await r.json();
+                const self = (j.nodes || []).find(n => n.is_self);
+                if (self?.id) {
+                    wrState.localNodeId = self.id;
+                    return self.id;
+                }
+            }
+        } catch {}
+        // Leave cache unset so a subsequent call retries — this matters
+        // because without a known local id every IP-assignment attempt
+        // would go through node_proxy and fail with "Use local API for
+        // self node" against the local node.
+        return '';
+    }
+
+    // Build a URL for a non-wolfrouter endpoint (e.g. /api/networking/…)
+    // that may need to execute on a remote cluster node. Returns the
+    // local path when nodeId is blank or matches self; otherwise the
+    // node_proxy wrapper.
+    //
+    // If we can't resolve the local node id (startup race, auth edge
+    // case), default to the direct path rather than the proxy: the
+    // browser is already talking to a specific node, and the proxy
+    // refuses self-targets with HTTP 400. Wrong-proxying is the worse
+    // failure mode because it's silent until someone investigates the
+    // 400 response.
+    async function wrNodeUrl(nodeId, path) {
+        if (!nodeId) return path;
+        const local = await wrLocalNodeId();
+        if (!local) return path;                      // unknown self → default to direct
+        if (nodeId === local) return path;
+        const stripped = path.replace(/^\/api\//, '');
+        return `/api/nodes/${encodeURIComponent(nodeId)}/proxy/${stripped}`;
+    }
+
+    // Zone options used in every picker. Standard zones + any custom
+    // zones already in play on the cluster so the set stays coherent.
+    function wrZoneOptions() {
+        const base = [
+            { value: 'wan',      label: 'WAN — outside world',       zone: { kind: 'wan' } },
+            { value: 'lan0',     label: 'LAN 0 — primary LAN',       zone: { kind: 'lan', id: 0 } },
+            { value: 'lan1',     label: 'LAN 1',                      zone: { kind: 'lan', id: 1 } },
+            { value: 'lan2',     label: 'LAN 2',                      zone: { kind: 'lan', id: 2 } },
+            { value: 'lan3',     label: 'LAN 3',                      zone: { kind: 'lan', id: 3 } },
+            { value: 'dmz',      label: 'DMZ — public-facing hosts', zone: { kind: 'dmz' } },
+            { value: 'wolfnet',  label: 'WolfNet — cluster mesh',    zone: { kind: 'wolfnet' } },
+            { value: 'trusted',  label: 'Trusted — admins only',     zone: { kind: 'trusted' } },
+        ];
+        const custom = new Set();
+        for (const n of (wrState.topology?.nodes || [])) {
+            for (const ifc of (n.interfaces || [])) {
+                if (ifc.zone?.kind === 'custom' && ifc.zone.id) custom.add(ifc.zone.id);
+            }
+            for (const b of (n.bridges || [])) {
+                if (b.zone?.kind === 'custom' && b.zone.id) custom.add(b.zone.id);
+            }
+        }
+        for (const c of custom) {
+            base.push({ value: 'custom:' + c, label: 'Custom — ' + c, zone: { kind: 'custom', id: c } });
+        }
+        return base;
+    }
+
+    // Flat list of every interface + bridge on every node.
+    function wrInterfaceOptions() {
+        const out = [];
+        for (const n of (wrState.topology?.nodes || [])) {
+            for (const ifc of (n.interfaces || [])) {
+                out.push({
+                    node_id: n.node_id, node_name: n.node_name,
+                    name: ifc.name, kind: 'iface',
+                    zone: ifc.zone, addresses: ifc.addresses || [], up: !!ifc.link_up,
+                });
+            }
+            for (const b of (n.bridges || [])) {
+                out.push({
+                    node_id: n.node_id, node_name: n.node_name,
+                    name: b.name, kind: 'bridge',
+                    zone: b.zone, addresses: b.addresses || [], up: true,
+                });
+            }
+        }
+        return out;
+    }
+
+    function wrVmOptions() {
+        const out = [];
+        for (const n of (wrState.topology?.nodes || [])) {
+            for (const v of (n.vms || [])) {
+                out.push({ node_id: n.node_id, node_name: n.node_name, name: v.name, ip: v.ip || null });
+            }
+        }
+        return out;
+    }
+
+    function wrContainerOptions() {
+        const out = [];
+        for (const n of (wrState.topology?.nodes || [])) {
+            for (const c of (n.containers || [])) {
+                out.push({ node_id: n.node_id, node_name: n.node_name, name: c.name, kind: c.kind, ip: c.ip || null });
+            }
+        }
+        return out;
+    }
+
+    function wrZoneToValue(z) {
+        if (!z) return '';
+        if (z.kind === 'lan') return 'lan' + (z.id ?? 0);
+        if (z.kind === 'custom') return 'custom:' + (z.id || '');
+        return z.kind;
+    }
+
+    function wrValueToZone(v) {
+        if (!v) return null;
+        if (v.startsWith('custom:')) return { kind: 'custom', id: v.slice(7) };
+        const m = v.match(/^lan(\d+)$/);
+        if (m) return { kind: 'lan', id: parseInt(m[1], 10) };
+        return { kind: v };
+    }
+
+    // Suggest a /24 subnet that doesn't collide with existing LAN
+    // segments. Uses 192.168.<10+preferredLanIdx*10>.0/24 as the seed.
+    function wrSuggestSubnet(preferredLanIdx) {
+        const used = new Set((wrState.lans || []).map(l => l.subnet_cidr));
+        const seed = ((preferredLanIdx || 0) + 1) * 10;
+        for (let offset = 0; offset < 244; offset++) {
+            const thirdOct = seed + offset;
+            if (thirdOct >= 255) break;
+            const cidr = `192.168.${thirdOct}.0/24`;
+            if (!used.has(cidr)) {
+                return {
+                    cidr, router_ip: `192.168.${thirdOct}.1`,
+                    pool_start: `192.168.${thirdOct}.100`,
+                    pool_end: `192.168.${thirdOct}.250`,
+                };
+            }
+        }
+        return { cidr: '192.168.99.0/24', router_ip: '192.168.99.1',
+                 pool_start: '192.168.99.100', pool_end: '192.168.99.250' };
+    }
+
+    // Parse prefix length out of a CIDR string. Returns null on malformed input.
+    function wrPrefixFromCidr(cidr) {
+        const m = (cidr || '').match(/\/(\d+)\s*$/);
+        if (!m) return null;
+        const p = parseInt(m[1], 10);
+        return (p >= 0 && p <= 32) ? p : null;
+    }
+
+    // ─── Quick Setup wizard ───
+    //
+    // One click on the Zones tab → WAN + LAN records auto-created with
+    // sensible defaults, derived from the zones the user already
+    // assigned. Transparent: the user sees exactly what will happen
+    // before they click the go button, and each step reports success
+    // or failure inline so they never wonder why internet isn't
+    // working.
+
+    async function wrShowQuickSetup() {
+        if (!wrState.topology?.nodes?.length) {
+            alert('Topology is still loading — try again in a moment.');
+            return;
+        }
+        const ifaces = wrInterfaceOptions();
+        const wanIfaces = ifaces.filter(i => i.zone?.kind === 'wan');
+        const lanIfaces = ifaces.filter(i => i.zone?.kind === 'lan');
+
+        let existingWans = [];
+        try {
+            const r = await fetch(wrUrl('/api/router/wan'));
+            if (r.ok) existingWans = await r.json();
+        } catch {}
+        const existingLans = wrState.lans || [];
+
+        const wanPlan = wanIfaces.map(i => {
+            const already = existingWans.find(w => w.node_id === i.node_id && w.interface === i.name);
+            return { iface: i, already };
+        });
+        // Two interfaces sharing the same LAN zone id would otherwise collide
+        // on the default subnet. Track what we've handed out in this pass so
+        // each iface gets a unique /24.
+        const consumed = new Set((wrState.lans || []).map(l => l.subnet_cidr));
+        const lanPlan = lanIfaces.map((i, idx) => {
+            const already = existingLans.find(l => l.node_id === i.node_id && l.interface === i.name);
+            const zoneId = i.zone?.id ?? 0;
+            let subnet;
+            if (already) {
+                subnet = {
+                    cidr: already.subnet_cidr, router_ip: already.router_ip,
+                    pool_start: already.dhcp?.pool_start || '',
+                    pool_end: already.dhcp?.pool_end || '',
+                };
+            } else {
+                // Offset by both the zone id AND the iface iteration index
+                // so two ifaces in the same zone still get distinct /24s.
+                let offset = zoneId + idx;
+                do {
+                    subnet = wrSuggestSubnet(offset);
+                    offset++;
+                } while (consumed.has(subnet.cidr) && offset < zoneId + idx + 24);
+                consumed.add(subnet.cidr);
+            }
+            const ipAlready = (i.addresses || []).some(a => a.startsWith(subnet.router_ip + '/'));
+            const otherIps = (i.addresses || []).filter(a => !a.startsWith(subnet.router_ip + '/'));
+            return { iface: i, already, subnet, ipAlready, otherIps };
+        });
+
+        const hasAnything = wanPlan.length + lanPlan.length > 0;
+
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay active';
+        overlay.style.zIndex = '10000';
+        overlay.innerHTML = `
+            <div class="modal" style="max-width:720px;">
+                <div class="modal-header">
+                    <h3>⚡ Quick Setup — turn this host into a router</h3>
+                    <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">×</button>
+                </div>
+                <div class="modal-body" style="font-size:13px;">
+                    ${!hasAnything ? `
+                    <div style="padding:16px; background:rgba(251,191,36,0.1); border:1px solid rgba(251,191,36,0.35); border-radius:6px;">
+                        <strong>Assign zones first.</strong> Give at least one interface the <code>WAN</code> zone (your internet-facing NIC) and one or more the <code>LAN</code> zone (your home network side). Then come back here.
+                    </div>` : `
+                    <p style="color:var(--text-muted); margin:0 0 12px;">Based on your zone assignments, WolfRouter will create the missing WAN + LAN records, assign the router IP to each LAN interface, and apply the firewall. Review below and edit any defaults, then click <strong>Run setup</strong>.</p>
+
+                    ${wanPlan.length ? `
+                    <h4 style="font-size:13px; margin:14px 0 6px;">🌍 WAN (internet uplink)</h4>
+                    <div id="wr-qs-wan" style="display:grid; gap:8px;">
+                        ${wanPlan.map((p, i) => `
+                        <div style="padding:10px; border:1px solid var(--border); border-radius:6px; background:var(--bg-card);">
+                            <div style="display:flex; justify-content:space-between; align-items:center;">
+                                <div><code>${escHtml(p.iface.name)}</code> on <code>${escHtml(p.iface.node_name)}</code>
+                                ${p.iface.up ? '<span style="color:#22c55e;">● up</span>' : '<span style="color:var(--text-muted);">○ down</span>'}</div>
+                                <span class="badge" style="background:${p.already ? 'rgba(96,165,250,0.15)' : 'rgba(34,197,94,0.15)'}; color:${p.already ? '#60a5fa' : '#22c55e'}; font-size:10px;">${p.already ? 'exists — will skip' : 'will create DHCP uplink'}</span>
+                            </div>
+                            ${p.already ? '' : `
+                            <div style="margin-top:6px; font-size:11px; color:var(--text-muted);">
+                                Mode: DHCP (the interface's existing DHCP client keeps running; WolfRouter just installs MASQUERADE on <code>${escHtml(p.iface.name)}</code>).
+                            </div>`}
+                            <input type="hidden" data-wan-idx="${i}" data-node="${escHtml(p.iface.node_id)}" data-iface="${escHtml(p.iface.name)}" data-skip="${p.already ? '1' : '0'}"/>
+                        </div>`).join('')}
+                    </div>` : '<div style="color:#f87171; font-size:12px;">⚠ No interface has the WAN zone. Without WAN, LAN clients have no internet uplink.</div>'}
+
+                    ${lanPlan.length ? `
+                    <h4 style="font-size:13px; margin:14px 0 6px;">🌐 LAN (your home network)</h4>
+                    <div id="wr-qs-lan" style="display:grid; gap:8px;">
+                        ${lanPlan.map((p, i) => `
+                        <div style="padding:10px; border:1px solid var(--border); border-radius:6px; background:var(--bg-card);">
+                            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                                <div><code>${escHtml(p.iface.name)}</code> on <code>${escHtml(p.iface.node_name)}</code>
+                                <span class="badge" style="background:rgba(168,85,247,0.15); color:#a855f7; font-size:10px; margin-left:4px;">${zoneHuman(p.iface.zone)}</span></div>
+                                <span class="badge" style="background:${p.already ? 'rgba(96,165,250,0.15)' : 'rgba(34,197,94,0.15)'}; color:${p.already ? '#60a5fa' : '#22c55e'}; font-size:10px;">${p.already ? 'exists — will reconfigure IP only' : 'will create segment'}</span>
+                            </div>
+                            <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; font-size:12px;">
+                                <label>Subnet <input class="form-control wr-qs-cidr" value="${escHtml(p.subnet.cidr)}" ${p.already ? 'disabled' : ''}/></label>
+                                <label>Router IP <input class="form-control wr-qs-router" value="${escHtml(p.subnet.router_ip)}" ${p.already ? 'disabled' : ''}/></label>
+                                <label>DHCP pool start <input class="form-control wr-qs-pool-start" value="${escHtml(p.subnet.pool_start)}" ${p.already ? 'disabled' : ''}/></label>
+                                <label>DHCP pool end <input class="form-control wr-qs-pool-end" value="${escHtml(p.subnet.pool_end)}" ${p.already ? 'disabled' : ''}/></label>
+                            </div>
+                            ${p.otherIps.length ? `
+                            <div style="margin-top:6px; padding:6px 8px; background:rgba(251,191,36,0.1); border:1px solid rgba(251,191,36,0.35); border-radius:4px; font-size:11px;">
+                                ⚠ Interface already has address(es): ${p.otherIps.map(a => `<code>${escHtml(a)}</code>`).join(', ')}. WolfRouter will add the router IP alongside — the existing IPs stay.
+                            </div>` : ''}
+                            ${p.ipAlready ? `<div style="margin-top:6px; font-size:11px; color:var(--text-muted);">✓ <code>${escHtml(p.subnet.router_ip)}</code> already assigned to this interface.</div>` : ''}
+                            <input type="hidden" data-lan-idx="${i}" data-node="${escHtml(p.iface.node_id)}" data-iface="${escHtml(p.iface.name)}" data-zone="${escHtml(wrZoneToValue(p.iface.zone))}" data-skip="${p.already ? '1' : '0'}"/>
+                        </div>`).join('')}
+                    </div>` : '<div style="color:var(--text-muted); font-size:12px;">No interface has a LAN zone — nothing to serve DHCP on.</div>'}
+
+                    <div id="wr-qs-status" style="margin-top:14px; display:none;"></div>
+                    `}
+                </div>
+                <div class="modal-footer">
+                    <button class="btn" onclick="this.closest('.modal-overlay').remove()">Close</button>
+                    ${hasAnything ? `<button id="wr-qs-run" class="btn btn-primary" onclick="wrRunQuickSetup()">Run setup</button>` : ''}
+                </div>
+            </div>`;
+        document.body.appendChild(overlay);
+    }
+    window.wrShowQuickSetup = wrShowQuickSetup;
+
+    async function wrRunQuickSetup() {
+        const runBtn = document.getElementById('wr-qs-run');
+        const statusBox = document.getElementById('wr-qs-status');
+        if (!runBtn || !statusBox) return;
+        runBtn.disabled = true;
+        runBtn.textContent = 'Running…';
+        statusBox.style.display = 'block';
+        statusBox.innerHTML = '';
+        const log = (emoji, msg, colour = 'var(--text)') => {
+            statusBox.innerHTML += `<div style="padding:4px 0; font-size:12px; color:${colour};">${emoji} ${msg}</div>`;
+            statusBox.scrollTop = statusBox.scrollHeight;
+        };
+
+        // 1. Create WAN connections for any WAN-zoned iface without one.
+        const wanHiddens = Array.from(document.querySelectorAll('#wr-qs-wan input[type="hidden"]'));
+        for (const h of wanHiddens) {
+            if (h.dataset.skip === '1') continue;
+            const node = h.dataset.node, iface = h.dataset.iface;
+            const body = {
+                id: '', name: `WAN on ${iface}`,
+                node_id: node, interface: iface,
+                mode: { mode: 'dhcp' },
+                enabled: true, description: 'Created by Quick Setup',
+            };
+            try {
+                const r = await fetch(wrUrl('/api/router/wan'), {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                if (r.ok) log('✅', `WAN connection on <code>${escHtml(iface)}</code> created. MASQUERADE installed.`, '#22c55e');
+                else log('❌', `WAN create on <code>${escHtml(iface)}</code> failed: ${escHtml(await r.text())}`, '#ef4444');
+            } catch (e) {
+                log('❌', `WAN create on <code>${escHtml(iface)}</code> errored: ${escHtml(e.message || e)}`, '#ef4444');
+            }
+        }
+
+        // 2. For each LAN-zoned iface: assign router IP to interface, bring up, create LanSegment.
+        const lanHiddens = Array.from(document.querySelectorAll('#wr-qs-lan input[type="hidden"]'));
+        for (const h of lanHiddens) {
+            const node = h.dataset.node, iface = h.dataset.iface, zoneVal = h.dataset.zone;
+            const card = h.closest('div');
+            const cidr = card.querySelector('.wr-qs-cidr').value.trim();
+            const routerIp = card.querySelector('.wr-qs-router').value.trim();
+            const poolStart = card.querySelector('.wr-qs-pool-start').value.trim();
+            const poolEnd = card.querySelector('.wr-qs-pool-end').value.trim();
+            const prefix = wrPrefixFromCidr(cidr);
+            if (prefix == null) { log('❌', `LAN <code>${escHtml(iface)}</code>: bad CIDR <code>${escHtml(cidr)}</code>`, '#ef4444'); continue; }
+
+            // 2a. Assign router IP to the interface (idempotent — ignore "File exists").
+            try {
+                const url = await wrNodeUrl(node, '/api/networking/interfaces/' + encodeURIComponent(iface) + '/ip');
+                const r = await fetch(url, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ address: routerIp, prefix }),
+                });
+                const txt = await r.text();
+                if (r.ok) log('✅', `<code>${escHtml(routerIp)}/${prefix}</code> assigned to <code>${escHtml(iface)}</code>.`, '#22c55e');
+                else if (/file exists|already assigned|RTNETLINK.*File exists/i.test(txt)) log('ℹ', `<code>${escHtml(routerIp)}/${prefix}</code> already on <code>${escHtml(iface)}</code>.`, 'var(--text-muted)');
+                else log('❌', `IP assign on <code>${escHtml(iface)}</code> failed: ${escHtml(txt)}`, '#ef4444');
+            } catch (e) {
+                log('❌', `IP assign on <code>${escHtml(iface)}</code> errored: ${escHtml(e.message || e)}`, '#ef4444');
+            }
+
+            // 2b. Bring interface up.
+            try {
+                const url = await wrNodeUrl(node, '/api/networking/interfaces/' + encodeURIComponent(iface) + '/state');
+                await fetch(url, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ up: true }),
+                });
+            } catch {}
+
+            // 2c. Create the LAN segment (skip if already exists).
+            if (h.dataset.skip === '1') {
+                log('ℹ', `LAN segment on <code>${escHtml(iface)}</code> already exists — IP re-confirmed only.`, 'var(--text-muted)');
+                continue;
+            }
+            const zoneObj = wrValueToZone(zoneVal);
+            const body = {
+                id: '', name: `LAN on ${iface}`,
+                node_id: node, interface: iface, zone: zoneObj,
+                subnet_cidr: cidr, router_ip: routerIp,
+                dhcp: { enabled: true, pool_start: poolStart, pool_end: poolEnd,
+                        lease_time: '12h', reservations: [], extra_options: [] },
+                dns: { forwarders: ['1.1.1.1', '9.9.9.9'], local_records: [],
+                       cache_enabled: true, block_ads: false },
+                description: 'Created by Quick Setup',
+            };
+            try {
+                const r = await fetch(wrUrl('/api/router/segments'), {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                if (r.ok) log('✅', `LAN segment on <code>${escHtml(iface)}</code> created — dnsmasq serving DHCP+DNS on <code>${escHtml(cidr)}</code>.`, '#22c55e');
+                else log('❌', `LAN segment on <code>${escHtml(iface)}</code> failed: ${escHtml(await r.text())}`, '#ef4444');
+            } catch (e) {
+                log('❌', `LAN segment on <code>${escHtml(iface)}</code> errored: ${escHtml(e.message || e)}`, '#ef4444');
+            }
+        }
+
+        // 3. Apply firewall so the new rules/MASQUERADE go live.
+        try {
+            const r = await fetch(wrUrl('/api/router/rules/apply'), { method: 'POST' });
+            if (r.ok) log('✅', 'Firewall ruleset applied.', '#22c55e');
+            else log('❌', `Firewall apply failed: ${escHtml(await r.text())}`, '#ef4444');
+        } catch (e) {
+            log('❌', `Firewall apply errored: ${escHtml(e.message || e)}`, '#ef4444');
+        }
+
+        log('🎉', '<strong>Setup complete.</strong> Plug a client into the LAN interface — it should get a DHCP lease and reach the internet.', '#a855f7');
+        runBtn.textContent = 'Done';
+        await wrLoadAll();
+    }
+    window.wrRunQuickSetup = wrRunQuickSetup;
 })();

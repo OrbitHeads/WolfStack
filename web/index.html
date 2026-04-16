@@ -5794,6 +5794,7 @@
                              DHCP/LAN setup, zone assignment) are reachable from
                              the rack view without first switching to table mode. -->
                         <div style="display:flex; gap:8px; margin-bottom:12px; flex-wrap:wrap; justify-content:flex-end;">
+                            <button class="btn btn-sm btn-primary" onclick="wrShowQuickSetup()" title="One-click WAN + LAN + router IP based on your zone assignments">⚡ Quick Setup</button>
                             <button class="btn btn-sm" onclick="wrSwitchView('table'); wrSelectTab('lans'); wrShowLanEditor();" title="Add a LAN with DHCP + DNS">🌐 + DHCP / LAN</button>
                             <button class="btn btn-sm" onclick="wrSwitchView('table'); wrSelectTab('firewall'); wrShowRuleEditor();" title="Add a firewall rule">🔥 + Firewall rule</button>
                             <button class="btn btn-sm" onclick="wrSwitchView('table'); wrSelectTab('zones');" title="Assign interfaces to zones">🎯 Zones</button>
@@ -5848,7 +5849,13 @@
                     </div>
 
                     <div id="wr-tab-zones" class="wr-tab-panel" style="padding:16px; display:none;">
-                        <div style="font-size:12px; color:var(--text-muted); margin-bottom:12px;">Assign each interface to a zone. Rules use zone names, so you don't have to remember which NIC is WAN today.</div>
+                        <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px; margin-bottom:12px; flex-wrap:wrap;">
+                            <div style="font-size:12px; color:var(--text-muted); max-width:640px;">
+                                Assign each interface to a zone. Rules use zone names, so you don't have to remember which NIC is WAN today.
+                                Once at least one interface is <strong>WAN</strong> and one is <strong>LAN</strong>, click <strong>Quick Setup</strong> to auto-create the WAN uplink, LAN segment, and router IP in one go.
+                            </div>
+                            <button class="btn btn-primary btn-sm" onclick="wrShowQuickSetup()" title="Create WAN + LAN records from the current zone assignments">⚡ Quick Setup</button>
+                        </div>
                         <div id="wr-zones-grid"></div>
                     </div>
 
