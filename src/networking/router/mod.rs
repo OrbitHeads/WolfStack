@@ -376,6 +376,92 @@ impl Default for RouterState {
     fn default() -> Self { Self::new() }
 }
 
+/// Apply the persisted router config on startup. Before this existed,
+/// a host booting with WolfStack-as-router lost its WAN link, LAN
+/// DHCP, and firewall rules every reboot — Docker and Proxmox both
+/// autostart their payloads, but WolfStack only *loaded* the router
+/// config on startup and required a human to click Apply in the UI
+/// before anything came back up. Clients got leases but no internet.
+///
+/// Runs each subsystem best-effort: a WAN that fails to dial still
+/// lets the LAN come up; a broken firewall rule still lets WAN and
+/// LAN stand. Order matters:
+///   1. WAN first — PPPoE ip-up hooks install MASQUERADE on the
+///      dynamic ppp iface, and LAN/firewall may reference WAN zones.
+///   2. LAN dnsmasq next — can only bind once its interface exists.
+///   3. Firewall last — rules reference interfaces from 1+2.
+/// Safe-mode is explicitly OFF: unattended boot has no human to
+/// confirm rules within the 30s window, and auto-reverting on every
+/// reboot would be worse than "rules applied with no rollback".
+pub fn apply_on_startup(state: std::sync::Arc<RouterState>, self_node_id: &str) {
+    let cfg = state.config.read().unwrap().clone();
+
+    // Skip entirely when the user hasn't configured WolfRouter on this
+    // node. firewall::build_ruleset + apply would still produce a valid
+    // "empty" ruleset, but applying it flushes the built-in INPUT /
+    // FORWARD / OUTPUT chains and with them any jumps that Docker / VM
+    // managers / other subsystems installed for their own forwarding.
+    // Those subsystems re-install their rules on their own events, but
+    // doing that pointless churn on every reboot isn't free. If this
+    // node has nothing to say about routing, stay out of the way.
+    let applies_here = cfg.wan_connections.iter()
+        .any(|c| c.enabled && c.node_id == self_node_id)
+        || cfg.lans.iter().any(|l| l.node_id == self_node_id)
+        || cfg.rules.iter().any(|r| r.enabled
+            && r.node_id.as_deref().map(|n| n == self_node_id).unwrap_or(true));
+    if !applies_here {
+        tracing::debug!(
+            "WolfRouter startup: no router config bound to this node — skipping apply"
+        );
+        return;
+    }
+
+    let mut wan_ok = 0usize;
+    let mut wan_err = 0usize;
+    for conn in &cfg.wan_connections {
+        if conn.node_id != self_node_id { continue; }
+        if !conn.enabled { continue; }
+        match wan::apply(conn) {
+            Ok(()) => { wan_ok += 1; }
+            Err(e) => {
+                wan_err += 1;
+                tracing::error!(
+                    "WolfRouter startup: WAN '{}' apply failed: {}",
+                    conn.name, e
+                );
+            }
+        }
+    }
+    if wan_ok + wan_err > 0 {
+        tracing::info!(
+            "WolfRouter startup: {} WAN connection(s) applied, {} failed",
+            wan_ok, wan_err
+        );
+    }
+
+    // dhcp::start_all_for_node already skips LANs bound to other
+    // nodes and logs per-LAN failures. No return value to aggregate.
+    dhcp::start_all_for_node(&cfg, self_node_id);
+
+    // Firewall — only if the user actually has rules. On a fresh
+    // install with empty rules the build produces an empty chain
+    // dump that's technically valid but emitting an info line just
+    // so sysadmins see activity at boot.
+    let ruleset = firewall::build_ruleset(&cfg, self_node_id);
+    match firewall::apply(&ruleset, false) {
+        Ok(prev) => {
+            *state.last_applied_rules.write().unwrap() = Some(prev);
+            tracing::info!(
+                "WolfRouter startup: firewall rules applied ({} user rule(s))",
+                cfg.rules.len()
+            );
+        }
+        Err(e) => {
+            tracing::error!("WolfRouter startup: firewall apply failed: {}", e);
+        }
+    }
+}
+
 /// Background safe-mode tick — checks whether the rollback deadline has
 /// elapsed without the user confirming, and reverts the firewall if so.
 /// Spawn this once per process from main; it sleeps 1s between checks.

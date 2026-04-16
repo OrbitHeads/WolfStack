@@ -352,6 +352,26 @@ async fn main() -> std::io::Result<()> {
         // changes if the user doesn't confirm within the safe-mode window.
         crate::networking::router::spawn_rollback_watcher(app_state.router.clone());
 
+        // Re-apply the persisted router config (WAN, LAN DHCP/DNS,
+        // firewall) on startup. Before this existed, every reboot of a
+        // WolfStack-as-router host dropped its WAN link, LAN DHCP, and
+        // firewall rules until a human clicked Apply in the UI — while
+        // Docker and Proxmox happily auto-started their containers/VMs
+        // into a network with no path to the internet. Spawn-blocking
+        // so iptables/dnsmasq/pppd subprocess work doesn't hold up the
+        // async runtime, with a small delay so sysinfo metrics and
+        // cluster discovery initialize first.
+        {
+            let router_state = app_state.router.clone();
+            let nid = node_id.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                tokio::task::spawn_blocking(move || {
+                    crate::networking::router::apply_on_startup(router_state, &nid);
+                }).await.ok();
+            });
+        }
+
         // WolfUSB: init with cluster secret and restore assignments on startup
         wolfusb::init(&cluster_secret);
         {
