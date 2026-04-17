@@ -15732,42 +15732,90 @@ function selectLxcTemplate(distro, release, arch, variant) {
                     });
                 }
             }
+            // Helper: is this storage type shared across cluster nodes?
+            // Shared = Ceph, CephFS, NFS, GlusterFS, CIFS. Everything
+            // else is node-local (dir, lvm, zfs, etc).
+            const isSharedType = (t) => /ceph|rbd|nfs|gluster|cifs/i.test(t || '');
+            // Badge + contextual hint per storage type so the user
+            // understands the tradeoff BEFORE they pick.
+            const storageBadge = (t) => isSharedType(t) ? '🟢 shared' : '📁 local';
+            const storageHintForType = (t) => {
+                const tl = (t || '').toLowerCase();
+                if (/ceph|rbd/.test(tl))      return 'Shared across the cluster — migrate containers instantly, no data copy. Best for HA.';
+                if (/nfs/.test(tl))            return 'Network-shared — accessible from all nodes on this NFS mount.';
+                if (/gluster/.test(tl))        return 'Distributed shared storage — redundant and cluster-wide.';
+                if (/cifs|smb/.test(tl))       return 'Network share (CIFS/SMB) — accessible from nodes with this mount.';
+                if (/zfs/.test(tl))            return 'Local with snapshots — fast clones and rollback, but migration copies data.';
+                if (/lvm/.test(tl))            return 'Local thin-provisioned — efficient disk use, migration copies data.';
+                return 'Plain directory on this node — simplest, but migration requires full copy.';
+            };
+            // Track all storages so the onchange hint updater can find
+            // the type for any selected value.
+            const allStorageEntries = [];
+
             storageSelect.innerHTML = '';
             if (data.proxmox) {
-                // Proxmox: show PVE storage IDs
+                // Proxmox: show PVE storage IDs suitable for rootdirs
                 const rootdirStorages = data.storages.filter(s =>
                     s.content && s.content.some(c => c === 'rootdir' || c === 'images')
                 );
-                if (rootdirStorages.length === 0) {
-                    // Fallback: show all active storages
-                    data.storages.filter(s => s.status === 'active').forEach(s => {
-                        const free = formatBytes(s.available_bytes);
-                        storageSelect.innerHTML += `<option value="${s.id}">${s.id} (${s.type}, ${free} free)</option>`;
-                    });
-                } else {
-                    rootdirStorages.forEach(s => {
-                        const free = formatBytes(s.available_bytes);
-                        const def = s.id === 'local-lvm' ? ' (default)' : '';
-                        storageSelect.innerHTML += `<option value="${s.id}"${def ? ' selected' : ''}>${s.id} (${s.type}, ${free} free)${def}</option>`;
-                    });
+                const display = rootdirStorages.length ? rootdirStorages : data.storages.filter(s => s.status === 'active');
+                // Prefer shared storage as the default when available;
+                // fall back to local-lvm.
+                const preferred = display.find(s => isSharedType(s.type))
+                               || display.find(s => s.id === 'local-lvm')
+                               || display[0];
+                display.forEach(s => {
+                    const free = formatBytes(s.available_bytes);
+                    const badge = storageBadge(s.type);
+                    const sel = preferred && s.id === preferred.id ? ' selected' : '';
+                    storageSelect.innerHTML += `<option value="${s.id}"${sel}>${badge} ${s.id} (${s.type}, ${free} free)</option>`;
+                    allStorageEntries.push({ value: s.id, type: s.type, bytes: s.available_bytes });
+                });
+                if (preferred) {
+                    storageInfo.innerHTML = storageHintForType(preferred.type);
                 }
-                storageInfo.textContent = 'Proxmox storage';
             } else {
                 // Standalone: show filesystem mount points
-                const defaultOpt = `<option value="/var/lib/lxc">/var/lib/lxc (default)</option>`;
-                storageSelect.innerHTML = defaultOpt;
+                storageSelect.innerHTML = `<option value="/var/lib/lxc">📁 local /var/lib/lxc (default)</option>`;
+                allStorageEntries.push({ value: '/var/lib/lxc', type: 'dir', bytes: 0 });
                 data.storages.forEach(s => {
                     if (s.id !== '/') {
                         const free = formatBytes(s.available_bytes);
                         const path = s.id + '/lxc';
-                        storageSelect.innerHTML += `<option value="${path}">${path} (${free} free)</option>`;
+                        const badge = storageBadge(s.type);
+                        storageSelect.innerHTML += `<option value="${path}">${badge} ${path} (${s.type || 'dir'}, ${free} free)</option>`;
+                        allStorageEntries.push({ value: path, type: s.type || 'dir', bytes: s.available_bytes });
                     }
                 });
+                // Auto-select shared storage if available (standalone + Ceph / NFS).
+                const sharedOpt = allStorageEntries.find(e => isSharedType(e.type));
+                if (sharedOpt) {
+                    storageSelect.value = sharedOpt.value;
+                    storageInfo.innerHTML = storageHintForType(sharedOpt.type);
+                } else {
+                    storageInfo.innerHTML = storageHintForType('dir');
+                }
             }
+
+            // Update hint on selection change — contextual explanation
+            // of what the chosen storage means for HA and migration.
             storageSelect.onchange = () => {
                 const sel = storageSelect.value;
-                const match = data.storages.find(s => sel.startsWith(s.id));
-                storageInfo.textContent = match ? `${formatBytes(match.available_bytes)} free` : '';
+                const entry = allStorageEntries.find(e => sel.startsWith(e.value) || sel === e.value);
+                if (entry) {
+                    const free = entry.bytes ? ' · ' + formatBytes(entry.bytes) + ' free' : '';
+                    storageInfo.innerHTML = storageHintForType(entry.type) + free;
+                } else {
+                    storageInfo.textContent = '';
+                }
+                // Warn if user picks local when shared is available.
+                const hasShared = allStorageEntries.some(e => isSharedType(e.type));
+                const pickedShared = entry && isSharedType(entry.type);
+                if (hasShared && !pickedShared) {
+                    const sharedName = allStorageEntries.find(e => isSharedType(e.type))?.value || 'shared storage';
+                    storageInfo.innerHTML += `<br><span style="color:var(--warning,#fbbf24);">⚠ You have shared storage (<strong>${escapeHtml(sharedName)}</strong>) available — picking local means this container can't be live-migrated or used with WolfRun HA.</span>`;
+                }
             };
         })
         .catch(() => {
