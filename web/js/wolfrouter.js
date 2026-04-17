@@ -3719,35 +3719,78 @@
         const unitGap = 24;
         const deviceRowH = 22;     // pixel pitch for each device badge
 
-        // Discovered routers (default gateways) — drawn between the
-        // cloud and the server rack as small 1U appliances.
+        // ─── Gateway-grouped layout ───
+        //
+        // Group servers by their primary default gateway. Each group
+        // becomes a vertical stack in the rack: router chassis (1U)
+        // followed by its servers (2U+). Servers with no detected
+        // gateway go at the bottom with a direct cable to the cloud.
+        //
+        // This produces an accurate "trace the cable" view:
+        //   Server WAN port → router LAN port → router WAN port → cloud
         const discoveredRouters = topo.routers || [];
-        const routerRowH = discoveredRouters.length ? 48 : 0;
-        const routerGap = discoveredRouters.length ? 16 : 0;
-
+        const routerUnitH = 42;  // 1U router chassis
         const nodeCount = topo.nodes.length;
 
-        // Variable per-node height: each node grows as more devices
-        // attach. Base = 2U, then +1U for every 2 devices over 6 (so 7-8
-        // devices = 3U, 9-10 = 4U, etc). Devices stay visible without
-        // overflow indicators.
+        // Per-node heights (unchanged formula, just computed up front).
         const nodeHeights = topo.nodes.map(n => {
             const devCount = (n.vms?.length || 0) + (n.containers?.length || 0);
             if (devCount <= 6) return baseUnitH;
             const extraRows = Math.ceil((devCount - 6) / 2);
             return baseUnitH + extraRows * oneUH;
         });
-        // Cumulative Y offset per node, computed once and reused below.
-        const nodeYs = [];
-        let yAcc = rackInnerPad;
-        for (const h of nodeHeights) {
-            nodeYs.push(yAcc);
-            yAcc += h + unitGap;
+
+        // Group nodes by primary gateway IP. Dedup routers by IP so a
+        // gateway shared by 3 Hetzner boxes shows once, not three times.
+        const gwGroups = new Map();   // gateway_ip → { router, nodeIndices: [] }
+        const noGwNodes = [];         // indices of nodes with no gateway
+        topo.nodes.forEach((node, idx) => {
+            const gw = (node.routers || [])[0];
+            if (gw && gw.ip) {
+                if (!gwGroups.has(gw.ip)) {
+                    gwGroups.set(gw.ip, { router: gw, nodeIndices: [] });
+                }
+                gwGroups.get(gw.ip).nodeIndices.push(idx);
+            } else {
+                noGwNodes.push(idx);
+            }
+        });
+
+        // Build the rack item sequence: [router, server, server, …, router, server, …, ungrouped servers].
+        // Each item has a type ('router'|'server'), a height, and
+        // enough info to render + cable later.
+        const rackItems = [];
+        for (const [, grp] of gwGroups) {
+            rackItems.push({ type: 'router', router: grp.router, height: routerUnitH, serverIndices: grp.nodeIndices });
+            for (const idx of grp.nodeIndices) {
+                rackItems.push({ type: 'server', nodeIdx: idx, height: nodeHeights[idx], gatewayIp: grp.router.ip });
+            }
         }
-        // Strip the trailing gap so the rack hugs the last appliance.
+        for (const idx of noGwNodes) {
+            rackItems.push({ type: 'server', nodeIdx: idx, height: nodeHeights[idx], gatewayIp: null });
+        }
+
+        // Compute Y positions for every rack item (routers + servers
+        // interleaved). Also build nodeYs[] indexed by topo.nodes position
+        // so the existing per-node rendering code (which indexes by
+        // nodeIdx) still works without rewrite.
+        const nodeYs = new Array(nodeCount).fill(0);
+        const itemYs = [];
+        const routerItems = [];   // { rackItemIdx, y, router, serverIndices }
+        let yAcc = rackInnerPad;
+        for (let i = 0; i < rackItems.length; i++) {
+            itemYs.push(yAcc);
+            const item = rackItems[i];
+            if (item.type === 'router') {
+                routerItems.push({ idx: i, y: yAcc, router: item.router, serverIndices: item.serverIndices });
+            } else {
+                nodeYs[item.nodeIdx] = yAcc;
+            }
+            yAcc += item.height + unitGap;
+        }
         const innerContent = yAcc - unitGap + rackInnerPad;
 
-        const rackY = cloudH + cloudGap + routerRowH + routerGap;
+        const rackY = cloudH + cloudGap;
         const rackInnerH = innerContent;
         const H = rackY + rackInnerH + 60;
 
@@ -3828,51 +3871,11 @@
             </g>
         `);
 
-        // Discovered routers — drawn between cloud and rack ──────
-        // Each router is a small rounded-rect appliance with the vendor
-        // badge + name + IP. Clicking opens the router's admin UI.
         const vendorEmoji = {
             'mikrotik': '🔴', 'ubiquiti': '⬛', 'avm': '📡', 'openwrt': '🐧',
             'opnsense': '🛡', 'pfsense': '🛡', 'tp-link': '📶', 'netgear': '📶',
             'asus': '📶', 'linksys': '📶', 'cisco': '🔷', 'draytek': '📶',
         };
-        if (discoveredRouters.length) {
-            const routerAreaY = cloudH + cloudGap;
-            const routerW = Math.min(280, (rackW - 20) / discoveredRouters.length - 10);
-            const totalW = discoveredRouters.length * (routerW + 10) - 10;
-            const startX = rackX + (rackW - totalW) / 2;
-            discoveredRouters.forEach((r, i) => {
-                const rx = startX + i * (routerW + 10);
-                const ry = routerAreaY;
-                const emoji = vendorEmoji[(r.vendor || '').toLowerCase()] || '📡';
-                const label = r.name || r.ip;
-                const sublabel = r.vendor ? `${r.vendor}${r.model && r.model !== r.vendor ? ' · ' + r.model : ''}` : r.ip;
-                svg.insertAdjacentHTML('beforeend', `
-                    <g class="wr-port" style="cursor:pointer;" ${r.web_url ? `data-admin-url="${escHtml(r.web_url)}"` : ''} onclick="if(this.dataset.adminUrl)window.open(this.dataset.adminUrl,'_blank')">
-                        <rect x="${rx}" y="${ry}" width="${routerW}" height="${routerRowH}" rx="8"
-                              fill="rgba(30,41,59,0.85)" stroke="#475569" stroke-width="1.5"/>
-                        <text x="${rx + 10}" y="${ry + 20}" style="fill:#f1f5f9; font-size:12px; font-weight:600;">${emoji} ${escHtml(label.slice(0, 24))}</text>
-                        <text x="${rx + 10}" y="${ry + 34}" style="fill:#94a3b8; font-size:10px;">${escHtml(sublabel.slice(0, 30))}${r.reachable ? '' : ' · ⚫ offline'}</text>
-                        ${r.web_url ? `<text x="${rx + routerW - 8}" y="${ry + 20}" text-anchor="end" style="fill:#60a5fa; font-size:10px;">↗ admin</text>` : ''}
-                        <title>${escHtml([
-                            r.name || 'Router',
-                            `IP: ${r.ip}`,
-                            r.vendor ? `Vendor: ${r.vendor}` : '',
-                            r.model ? `Model: ${r.model}` : '',
-                            r.web_url ? `Admin UI: ${r.web_url}` : '',
-                            r.reachable ? 'Status: reachable' : 'Status: unreachable',
-                        ].filter(Boolean).join('\\n'))}</title>
-                    </g>
-                `);
-                // Wire from cloud bottom → router top (center).
-                const cx = rx + routerW / 2;
-                svg.insertAdjacentHTML('beforeend', `
-                    <path d="M ${cx},${cloudCY + 30} V ${ry}"
-                          fill="none" stroke="#fbbf24" stroke-width="3" stroke-linecap="round"
-                          opacity="0.7" class="wr-wire-active" stroke-dasharray="6 4"/>
-                `);
-            });
-        }
 
         // Rack frame ──────────────────────────────────────────────
         // Outer rack background panel
@@ -3893,6 +3896,55 @@
                              fill="#0a0f18" stroke="#374151" stroke-width="0.4"/>
                 `);
             }
+        }
+
+        // Router chassis (1U, inside the rack) ─────────────────────
+        // Each gateway gets a full-width amber chassis with a WAN port
+        // (top-left, cable goes to cloud) and LAN ports (bottom edge,
+        // one per server, cables come from server WAN ports below).
+        const routerPortPositions = {}; // gwIp → { wanPortCx, wanPortCy, lanPorts: [{cx,cy}] }
+        for (const ri of routerItems) {
+            const r = ri.router;
+            const uy = rackY + ri.y;
+            const emoji = vendorEmoji[(r.vendor || '').toLowerCase()] || '📡';
+            const label = r.name || r.ip;
+            const sublabel = r.vendor ? `${r.vendor}${r.model && r.model !== r.vendor ? ' · ' + r.model : ''}` : r.ip;
+
+            // 1U amber-tinted chassis — visually distinct from server dark-blue.
+            svg.insertAdjacentHTML('beforeend', `
+                <g style="cursor:pointer;" ${r.web_url ? `data-admin-url="${escHtml(r.web_url)}"` : ''} onclick="if(this.dataset.adminUrl)window.open(this.dataset.adminUrl,'_blank')">
+                    <rect x="${apX}" y="${uy}" width="${apW}" height="${routerUnitH}" rx="6"
+                          fill="rgba(251,191,36,0.08)" stroke="rgba(251,191,36,0.4)" stroke-width="1.5"/>
+                    <text x="${apX + 14}" y="${uy + 17}" style="fill:#fbbf24; font-size:13px; font-weight:700;">${emoji} ${escHtml(label.slice(0,30))}</text>
+                    <text x="${apX + 14}" y="${uy + 32}" style="fill:#94a3b8; font-size:10px;">${escHtml(sublabel.slice(0,40))} · ${escHtml(r.ip)}${r.reachable ? '' : ' · ⚫ offline'}</text>
+                    ${r.web_url ? `<text x="${apX + apW - 14}" y="${uy + 17}" text-anchor="end" style="fill:#60a5fa; font-size:10px; cursor:pointer;">↗ admin</text>` : ''}
+                    <title>${escHtml([r.name || 'Router', 'IP: ' + r.ip, r.vendor ? 'Vendor: ' + r.vendor : '', r.model ? 'Model: ' + r.model : '', r.web_url ? 'Admin: ' + r.web_url : ''].filter(Boolean).join('\\n'))}</title>
+                </g>
+            `);
+
+            // WAN port icon (top-left of router chassis) — cable target for cloud.
+            const wanPx = apX + 50, wanPy = uy;
+            svg.insertAdjacentHTML('beforeend', `
+                <rect x="${wanPx - 6}" y="${wanPy - 2}" width="12" height="6" rx="1.5"
+                      fill="#fbbf24" opacity="0.6"/>
+                <text x="${wanPx}" y="${wanPy - 5}" text-anchor="middle" style="fill:#fbbf24; font-size:8px; font-weight:600;">WAN</text>
+            `);
+
+            // LAN port positions along the bottom edge — one per server in this gateway group.
+            const lanPorts = [];
+            const serverCount = ri.serverIndices.length;
+            const lanStartX = apX + apW * 0.4;
+            const lanSpacing = Math.min(60, (apW * 0.55) / Math.max(serverCount, 1));
+            for (let si = 0; si < serverCount; si++) {
+                const lpx = lanStartX + si * lanSpacing;
+                const lpy = uy + routerUnitH;
+                lanPorts.push({ cx: lpx, cy: lpy, nodeIdx: ri.serverIndices[si] });
+                svg.insertAdjacentHTML('beforeend', `
+                    <rect x="${lpx - 6}" y="${lpy - 4}" width="12" height="6" rx="1.5"
+                          fill="#3b82f6" opacity="0.5"/>
+                `);
+            }
+            routerPortPositions[r.ip] = { wanCx: wanPx, wanCy: wanPy, lanPorts };
         }
 
         // Rack appliances + ports ─────────────────────────────────
@@ -4049,38 +4101,56 @@
             }
         }
 
-        // WAN ports → cloud, Manhattan routing.
-        // Each cable exits straight UP from the port, clears the top of
-        // its chassis, then runs horizontally to the cloud column, then
-        // straight up to the cloud bottom. Right-angle bends instead of
-        // bezier curves so cables never drift over neighbouring ports
-        // or labels.
+        // WAN cables — two kinds now:
+        //
+        // 1. Server WAN port → router LAN port (short internal cable
+        //    within the rack, for servers with a detected gateway)
+        // 2. Router WAN port → cloud (uplink cable, one per gateway)
+        // 3. Server WAN port → cloud (direct, for servers with NO
+        //    detected gateway — the legacy path)
+        //
+        // This traces the real traffic flow: server → router → internet.
         const cables = [];
-        // Stagger the horizontal "rail" each WAN cable rides so multiple
-        // WAN ports don't sit on top of each other on the way up.
         let wanRailIdx = 0;
+
+        // Router WAN port → cloud cables (one per gateway).
+        for (const ri of routerItems) {
+            const rp = routerPortPositions[ri.router.ip];
+            if (!rp) continue;
+            const x1 = rp.wanCx, y1 = rp.wanCy;
+            const railY = rackY - 10 - (wanRailIdx * 6);
+            const x2 = cloudCX, y2 = cloudCY + 30;
+            const path = `M ${x1},${y1} V ${railY} H ${x2} V ${y2}`;
+            cables.push({ path, color: '#fbbf24', bps: 1, kind: 'wan-uplink', cableKey: 'gw::' + ri.router.ip });
+            wanRailIdx++;
+        }
+
+        // Server WAN ports → either router LAN port or cloud.
         for (const node of topo.nodes) {
             for (const port of (portsByNode[node.node_id] || [])) {
-                if (port.role === 'wan' && port.link_up) {
-                    const x1 = port.cx;
-                    const y1 = port.portTop;
-                    const chassisTop = port.chassisTop ?? (port.portTop - 30);
-                    const railY = chassisTop - 14 - (wanRailIdx * 6);
-                    // If routers are present, WAN cables run to the
-                    // bottom of the router row (not the cloud). If no
-                    // routers, still go to the cloud as before.
-                    const x2 = cloudCX;
-                    const y2 = discoveredRouters.length
-                        ? (cloudH + cloudGap + routerRowH)
-                        : (cloudCY + 30);
-                    const path = `M ${x1},${y1} V ${railY} H ${x2} V ${y2}`;
-                    // cableKey ties the rendered path back to the owning
-                    // port so the soft-update pass can flip active/idle
-                    // styling when bps crosses zero without a full rebuild.
+                if (port.role !== 'wan' || !port.link_up) continue;
+                const x1 = port.cx, y1 = port.portTop;
+                const chassisTop = port.chassisTop ?? (port.portTop - 30);
+
+                // Find the server's gateway group.
+                const gwIp = rackItems.find(ri => ri.type === 'server' && topo.nodes[ri.nodeIdx]?.node_id === node.node_id)?.gatewayIp;
+                const rp = gwIp ? routerPortPositions[gwIp] : null;
+                const lanPort = rp?.lanPorts?.find(lp => lp.nodeIdx === topo.nodes.findIndex(n => n.node_id === node.node_id));
+
+                if (lanPort) {
+                    // Cable from server WAN port UP to the router's LAN port.
+                    const railY = chassisTop - 8 - (wanRailIdx * 4);
+                    const path = `M ${x1},${y1} V ${railY} H ${lanPort.cx} V ${lanPort.cy}`;
                     const cableKey = node.node_id + '::' + port.name;
                     cables.push({ path, color: port.color, bps: port.bps, kind: 'wan', cableKey });
-                    wanRailIdx++;
+                } else {
+                    // No gateway detected — direct cable to cloud.
+                    const railY = chassisTop - 14 - (wanRailIdx * 6);
+                    const path = `M ${x1},${y1} V ${railY} H ${cloudCX} V ${cloudCY + 30}`;
+                    const cableKey = node.node_id + '::' + port.name;
+                    cables.push({ path, color: port.color, bps: port.bps, kind: 'wan', cableKey });
                 }
+                wanRailIdx++;
             }
         }
         // (No more port "patch tails" — they overlapped the iface name
