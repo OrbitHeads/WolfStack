@@ -435,6 +435,7 @@
         wrState.rollbackDeadline = null;
         const sm = document.getElementById('wr-rules-safemode');
         if (sm) sm.style.display = 'none';
+        if (typeof showToast === 'function') showToast('Firewall rules confirmed — safe-mode timer cleared', 'success');
     }
 
     // Rule editor modal
@@ -843,6 +844,7 @@
             alert('Save failed: ' + await r.text());
             return;
         }
+        if (typeof showToast === 'function') showToast(`Firewall rule ${id ? 'updated' : 'created'}`, 'success');
         document.querySelector('.modal-overlay')?.remove();
         await wrLoadAll();
     }
@@ -1989,6 +1991,7 @@
         const method = id ? 'PUT' : 'POST';
         const r = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         if (!r.ok) { alert('Save failed: ' + await r.text()); return; }
+        if (typeof showToast === 'function') showToast(`WAN connection '${name}' ${id ? 'updated' : 'created'}`, 'success');
         document.querySelector('.modal-overlay')?.remove();
         await wrLoadAll();
         wrRenderWan();
@@ -3543,6 +3546,9 @@
         for (const d of (topo.peer_diagnostics || [])) {
             bits.push('P:' + d.node_id + '|' + d.result + '|' + (d.reason || ''));
         }
+        for (const r of (topo.routers || [])) {
+            bits.push('R:' + r.ip + '|' + (r.name || '') + '|' + (r.vendor || '') + '|' + (r.reachable ? '1' : '0'));
+        }
         return bits.join(';');
     }
 
@@ -3713,6 +3719,12 @@
         const unitGap = 24;
         const deviceRowH = 22;     // pixel pitch for each device badge
 
+        // Discovered routers (default gateways) — drawn between the
+        // cloud and the server rack as small 1U appliances.
+        const discoveredRouters = topo.routers || [];
+        const routerRowH = discoveredRouters.length ? 48 : 0;
+        const routerGap = discoveredRouters.length ? 16 : 0;
+
         const nodeCount = topo.nodes.length;
 
         // Variable per-node height: each node grows as more devices
@@ -3735,7 +3747,7 @@
         // Strip the trailing gap so the rack hugs the last appliance.
         const innerContent = yAcc - unitGap + rackInnerPad;
 
-        const rackY = cloudH + cloudGap;
+        const rackY = cloudH + cloudGap + routerRowH + routerGap;
         const rackInnerH = innerContent;
         const H = rackY + rackInnerH + 60;
 
@@ -3815,6 +3827,52 @@
                       style="fill:#93c5fd; font-size:10px;">WAN uplink</text>
             </g>
         `);
+
+        // Discovered routers — drawn between cloud and rack ──────
+        // Each router is a small rounded-rect appliance with the vendor
+        // badge + name + IP. Clicking opens the router's admin UI.
+        const vendorEmoji = {
+            'mikrotik': '🔴', 'ubiquiti': '⬛', 'avm': '📡', 'openwrt': '🐧',
+            'opnsense': '🛡', 'pfsense': '🛡', 'tp-link': '📶', 'netgear': '📶',
+            'asus': '📶', 'linksys': '📶', 'cisco': '🔷', 'draytek': '📶',
+        };
+        if (discoveredRouters.length) {
+            const routerAreaY = cloudH + cloudGap;
+            const routerW = Math.min(280, (rackW - 20) / discoveredRouters.length - 10);
+            const totalW = discoveredRouters.length * (routerW + 10) - 10;
+            const startX = rackX + (rackW - totalW) / 2;
+            discoveredRouters.forEach((r, i) => {
+                const rx = startX + i * (routerW + 10);
+                const ry = routerAreaY;
+                const emoji = vendorEmoji[(r.vendor || '').toLowerCase()] || '📡';
+                const label = r.name || r.ip;
+                const sublabel = r.vendor ? `${r.vendor}${r.model && r.model !== r.vendor ? ' · ' + r.model : ''}` : r.ip;
+                svg.insertAdjacentHTML('beforeend', `
+                    <g class="wr-port" style="cursor:pointer;" ${r.web_url ? `data-admin-url="${escHtml(r.web_url)}"` : ''} onclick="if(this.dataset.adminUrl)window.open(this.dataset.adminUrl,'_blank')">
+                        <rect x="${rx}" y="${ry}" width="${routerW}" height="${routerRowH}" rx="8"
+                              fill="rgba(30,41,59,0.85)" stroke="#475569" stroke-width="1.5"/>
+                        <text x="${rx + 10}" y="${ry + 20}" style="fill:#f1f5f9; font-size:12px; font-weight:600;">${emoji} ${escHtml(label.slice(0, 24))}</text>
+                        <text x="${rx + 10}" y="${ry + 34}" style="fill:#94a3b8; font-size:10px;">${escHtml(sublabel.slice(0, 30))}${r.reachable ? '' : ' · ⚫ offline'}</text>
+                        ${r.web_url ? `<text x="${rx + routerW - 8}" y="${ry + 20}" text-anchor="end" style="fill:#60a5fa; font-size:10px;">↗ admin</text>` : ''}
+                        <title>${escHtml([
+                            r.name || 'Router',
+                            `IP: ${r.ip}`,
+                            r.vendor ? `Vendor: ${r.vendor}` : '',
+                            r.model ? `Model: ${r.model}` : '',
+                            r.web_url ? `Admin UI: ${r.web_url}` : '',
+                            r.reachable ? 'Status: reachable' : 'Status: unreachable',
+                        ].filter(Boolean).join('\\n'))}</title>
+                    </g>
+                `);
+                // Wire from cloud bottom → router top (center).
+                const cx = rx + routerW / 2;
+                svg.insertAdjacentHTML('beforeend', `
+                    <path d="M ${cx},${cloudCY + 30} V ${ry}"
+                          fill="none" stroke="#fbbf24" stroke-width="3" stroke-linecap="round"
+                          opacity="0.7" class="wr-wire-active" stroke-dasharray="6 4"/>
+                `);
+            });
+        }
 
         // Rack frame ──────────────────────────────────────────────
         // Outer rack background panel
@@ -4008,8 +4066,13 @@
                     const y1 = port.portTop;
                     const chassisTop = port.chassisTop ?? (port.portTop - 30);
                     const railY = chassisTop - 14 - (wanRailIdx * 6);
+                    // If routers are present, WAN cables run to the
+                    // bottom of the router row (not the cloud). If no
+                    // routers, still go to the cloud as before.
                     const x2 = cloudCX;
-                    const y2 = cloudCY + 30;
+                    const y2 = discoveredRouters.length
+                        ? (cloudH + cloudGap + routerRowH)
+                        : (cloudCY + 30);
                     const path = `M ${x1},${y1} V ${railY} H ${x2} V ${y2}`;
                     // cableKey ties the rendered path back to the owning
                     // port so the soft-update pass can flip active/idle
@@ -4786,7 +4849,16 @@
 
         log('🎉', '<strong>Setup complete.</strong> Plug a client into the LAN interface — it should get a DHCP lease and reach the internet.', '#a855f7');
         runBtn.textContent = 'Done';
+        if (typeof showToast === 'function') showToast('Quick Setup complete — WAN + LAN + firewall applied', 'success');
         await wrLoadAll();
+        // Auto-close after a few seconds so user doesn't have to hunt
+        // for the Close button. Long enough to read the final "setup
+        // complete" line; short enough that they don't wonder if it's
+        // stuck. Close manually is still available via the × / Close
+        // button for users who want to copy the log.
+        setTimeout(() => {
+            runBtn.closest('.modal-overlay')?.remove();
+        }, 4000);
     }
     window.wrRunQuickSetup = wrRunQuickSetup;
 

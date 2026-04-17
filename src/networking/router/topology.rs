@@ -36,6 +36,11 @@ pub struct NodeTopology {
     pub containers: Vec<DeviceAttachment>,
     /// IDs of LAN segments hosted by this node.
     pub lan_segments: Vec<String>,
+    /// Upstream routers discovered on this node (default gateways).
+    /// Each node in a cluster may have different gateways; the master
+    /// deduplicates by IP when building the cluster-wide view.
+    #[serde(default)]
+    pub routers: Vec<DiscoveredRouter>,
     /// "live" = full topology fetched; "connecting" = retrying;
     /// "unreachable" = retries exhausted. The frontend draws the
     /// chassis immediately for every node in the cluster and fills
@@ -58,6 +63,7 @@ impl NodeTopology {
             node_id, node_name,
             interfaces: vec![], bridges: vec![], vlans: vec![],
             vms: vec![], containers: vec![], lan_segments: vec![],
+            routers: vec![],
             status: status.into(),
             status_note: note,
         }
@@ -242,6 +248,201 @@ pub fn ensure_default_zones(node_id: &str) -> bool {
     changed
 }
 
+/// A router/gateway device discovered on the network — typically the
+/// default route target. Shown in the rack view above the server
+/// chassis so users see the full path: Internet → router → WAN port.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredRouter {
+    pub ip: String,
+    /// Human name — best-effort from HTTP title, SNMP sysDescr, or
+    /// reverse DNS. Falls back to just the IP.
+    pub name: String,
+    /// Vendor name parsed from probe results (e.g. "MikroTik",
+    /// "AVM Fritz!Box", "Ubiquiti", "OpenWrt"). Empty if unidentified.
+    pub vendor: String,
+    /// Model string if found (e.g. "Fritz!Box 7590", "hAP ac3").
+    pub model: String,
+    /// URL to the router's admin web UI (if HTTP/HTTPS responded).
+    pub web_url: String,
+    /// True if the gateway responded to probes within the last poll.
+    pub reachable: bool,
+}
+
+/// Detect default gateways from the kernel routing table and probe
+/// each one to identify vendor/model. Cheap enough to call every poll
+/// cycle — `ip route` is a netlink read (<1ms), and the HTTP probes
+/// have a 2-second timeout so they don't block for ages when a gateway
+/// is down.
+pub fn discover_routers() -> Vec<DiscoveredRouter> {
+    let out = match std::process::Command::new("ip")
+        .args(["-j", "route", "show", "default"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return vec![],
+    };
+    let routes: Vec<serde_json::Value> = serde_json::from_slice(&out).unwrap_or_default();
+    // Deduplicate gateways (multiple default routes can point at the
+    // same IP via different interfaces).
+    let mut seen = std::collections::HashSet::new();
+    let mut routers = Vec::new();
+    for route in &routes {
+        let gw = match route.get("gateway").and_then(|v| v.as_str()) {
+            Some(g) if !g.is_empty() => g.to_string(),
+            _ => continue,
+        };
+        if !seen.insert(gw.clone()) { continue; }
+        routers.push(probe_router(&gw));
+    }
+    routers
+}
+
+/// Probe a single gateway IP to extract vendor/model/web-URL. Tries
+/// HTTPS first (most modern routers redirect HTTP→HTTPS), falls back
+/// to HTTP, then plain reachability via ping. The whole function is
+/// bounded to ~3 seconds worst-case.
+fn probe_router(ip: &str) -> DiscoveredRouter {
+    let mut router = DiscoveredRouter {
+        ip: ip.to_string(),
+        name: ip.to_string(),
+        vendor: String::new(),
+        model: String::new(),
+        web_url: String::new(),
+        reachable: false,
+    };
+
+    // Try HTTPS then HTTP with a short timeout. curl -D - writes
+    // response headers to stdout (NOT stderr) when combined with
+    // -o /dev/null. The -w write-out string is also appended to
+    // stdout. So everything we need to fingerprint is in stdout.
+    for scheme in &["https", "http"] {
+        let url = format!("{}://{}", scheme, ip);
+        let out = std::process::Command::new("curl")
+            .args(["-skL", "--max-time", "2",
+                   "-D", "-",           // dump headers to stdout
+                   "-o", "/dev/null",   // discard body
+                   &url])
+            .output();
+        if let Ok(o) = out {
+            let text = String::from_utf8_lossy(&o.stdout).to_string();
+            if !text.is_empty() {
+                router.reachable = true;
+                router.web_url = url.clone();
+                identify_vendor(&text, &mut router);
+                if !router.vendor.is_empty() { break; }
+            }
+        }
+    }
+
+    // If HTTP didn't work, try a quick ping for reachability.
+    if !router.reachable {
+        if let Ok(o) = std::process::Command::new("ping")
+            .args(["-c", "1", "-W", "1", ip])
+            .output()
+        {
+            router.reachable = o.status.success();
+        }
+    }
+
+    // Reverse DNS as a last-resort name.
+    if router.name == router.ip {
+        if let Ok(o) = std::process::Command::new("dig")
+            .args(["+short", "-x", ip, "+time=1", "+tries=1"])
+            .output()
+        {
+            let rdns = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !rdns.is_empty() && rdns != ip {
+                router.name = rdns.trim_end_matches('.').to_string();
+            }
+        }
+    }
+
+    router
+}
+
+/// Parse HTTP headers / body for known vendor fingerprints and fill
+/// in vendor + model + name on the router struct. Order matters —
+/// first match wins.
+fn identify_vendor(text: &str, router: &mut DiscoveredRouter) {
+    let lower = text.to_ascii_lowercase();
+
+    // Extract <title>...</title> if present (some curl modes capture it).
+    let title = text.find("<title>")
+        .and_then(|start| {
+            let rest = &text[start + 7..];
+            rest.find("</title>").map(|end| rest[..end].trim().to_string())
+        });
+    // Extract Server: header value.
+    let server = text.lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("server:"))
+        .map(|l| l[7..].trim().to_string());
+
+    // Vendor-specific fingerprints — most reliable to least.
+    let patterns: &[(&str, &str, fn(&Option<String>, &Option<String>) -> (String, String))] = &[
+        ("fritz", "AVM", |title, _| {
+            let model = title.as_deref().unwrap_or("Fritz!Box").to_string();
+            ("AVM Fritz!Box".into(), model)
+        }),
+        ("mikrotik", "MikroTik", |_, server| {
+            let model = server.as_deref().unwrap_or("RouterOS").to_string();
+            ("MikroTik".into(), model)
+        }),
+        ("routeros", "MikroTik", |_, server| {
+            ("MikroTik".into(), server.as_deref().unwrap_or("RouterOS").to_string())
+        }),
+        ("ubnt", "Ubiquiti", |title, _| {
+            ("Ubiquiti".into(), title.as_deref().unwrap_or("UniFi").to_string())
+        }),
+        ("unifi", "Ubiquiti", |title, _| {
+            ("Ubiquiti".into(), title.as_deref().unwrap_or("UniFi").to_string())
+        }),
+        ("airos", "Ubiquiti", |_, _| ("Ubiquiti".into(), "airOS".into())),
+        ("opnsense", "OPNsense", |_, _| ("OPNsense".into(), "OPNsense".into())),
+        ("pfsense", "pfSense", |_, _| ("pfSense".into(), "pfSense".into())),
+        ("openwrt", "OpenWrt", |_, _| ("OpenWrt".into(), "OpenWrt".into())),
+        ("luci", "OpenWrt", |_, _| ("OpenWrt".into(), "LuCI".into())),
+        ("tp-link", "TP-Link", |title, _| {
+            ("TP-Link".into(), title.as_deref().unwrap_or("TP-Link").to_string())
+        }),
+        ("netgear", "Netgear", |title, _| {
+            ("Netgear".into(), title.as_deref().unwrap_or("Netgear").to_string())
+        }),
+        ("asus", "ASUS", |title, _| {
+            ("ASUS".into(), title.as_deref().unwrap_or("ASUS Router").to_string())
+        }),
+        ("linksys", "Linksys", |title, _| {
+            ("Linksys".into(), title.as_deref().unwrap_or("Linksys").to_string())
+        }),
+        ("cisco", "Cisco", |title, _| {
+            ("Cisco".into(), title.as_deref().unwrap_or("Cisco").to_string())
+        }),
+        ("draytek", "DrayTek", |title, _| {
+            ("DrayTek".into(), title.as_deref().unwrap_or("DrayTek Vigor").to_string())
+        }),
+    ];
+
+    for (keyword, _vendor, extract) in patterns {
+        if lower.contains(keyword) {
+            let (vendor, model) = extract(&title, &server);
+            router.vendor = vendor;
+            router.model = model.clone();
+            router.name = if title.is_some() {
+                title.as_deref().unwrap_or(&model).to_string()
+            } else {
+                model
+            };
+            return;
+        }
+    }
+
+    // Fallback: use title or server as-is if we got anything.
+    if let Some(t) = &title {
+        if !t.is_empty() { router.name = t.clone(); }
+    } else if let Some(s) = &server {
+        if !s.is_empty() { router.name = s.clone(); }
+    }
+}
+
 /// Compute the local node's topology. API handlers on the master node
 /// call this on each worker node via cluster RPC to assemble the
 /// cluster-wide view.
@@ -265,6 +466,11 @@ pub fn compute_local(
         .map(|l| l.id.clone())
         .collect();
 
+    // Router discovery is expensive (~2s per gateway when probing HTTP).
+    // Cache the result and re-probe at most every 60 seconds so the 3s
+    // topology poll cycle doesn't stack up probe latency.
+    let routers = cached_discover_routers();
+
     NodeTopology {
         node_id: node_id.into(),
         node_name: node_name.into(),
@@ -274,9 +480,39 @@ pub fn compute_local(
         vms,
         containers,
         lan_segments,
+        routers,
         status: "live".into(),
         status_note: String::new(),
     }
+}
+
+/// Cached router discovery — re-probes at most every 60 seconds.
+/// Between probes, returns the previous result so the 3s topology
+/// poll doesn't pile up 2s HTTP probes on every tick.
+///
+/// The mutex is held ONLY for the cache read/write — the actual
+/// probe (which can take seconds) runs outside the lock so
+/// concurrent callers don't stall waiting for curl to finish.
+fn cached_discover_routers() -> Vec<DiscoveredRouter> {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<(std::time::Instant, Vec<DiscoveredRouter>)>> = Mutex::new(None);
+    let ttl = std::time::Duration::from_secs(60);
+
+    // Check cache under lock — return immediately if fresh.
+    {
+        let guard = CACHE.lock().unwrap();
+        if let Some((ts, ref data)) = *guard {
+            if ts.elapsed() < ttl { return data.clone(); }
+        }
+    } // lock dropped before the expensive probe
+
+    // Cache miss — probe outside the lock.
+    let fresh = discover_routers();
+
+    // Write back under lock.
+    let mut guard = CACHE.lock().unwrap();
+    *guard = Some((std::time::Instant::now(), fresh.clone()));
+    fresh
 }
 
 fn walk_interfaces(

@@ -37,6 +37,111 @@ use std::os::unix::fs::{PermissionsExt, MetadataExt};
 use std::path::Path;
 use std::process::Command;
 
+/// Cluster-wide security checks that need access to AppState (for
+/// topology / cluster info). Called from the /api/system-check
+/// endpoint alongside the stateless `run_security_checks()`.
+///
+/// Separated because the background security scanner in main.rs
+/// doesn't have AppState — it only runs the stateless checks. The
+/// cluster-scoped checks only run on-demand from the UI which is
+/// fine because cross-node IP conflicts don't change on a 15-min
+/// cadence (containers don't move by themselves).
+pub fn run_cluster_checks(state: &crate::api::AppState) -> Vec<DependencyCheck> {
+    let mut out = Vec::new();
+    scan_cluster_ip_conflicts(state, &mut out);
+    out
+}
+
+/// Detect duplicate WolfNet IPs across containers/VMs on DIFFERENT
+/// nodes within the same cluster. The local `scan_ip_conflicts`
+/// catches same-node duplicates from LXC config files; this catches
+/// cross-node duplicates that only show up when the full cluster
+/// topology is assembled.
+///
+/// Scoped to the current cluster: containers in cluster A and cluster
+/// B CAN have the same WolfNet IP — they're on separate overlay
+/// networks and never interfere.
+fn scan_cluster_ip_conflicts(
+    state: &crate::api::AppState,
+    out: &mut Vec<DependencyCheck>,
+) {
+    // Build (ip → [(container_name, node_name)]) map from ALL nodes in
+    // the cluster. Uses the cached topology snapshots from the last
+    // agent poll (including the local node's). Does NOT call
+    // compute_local() here — that shells out to ip/ss/curl and would
+    // stall the request thread for seconds. The topology poll (every
+    // 3s) already keeps these snapshots fresh.
+    let mut ip_owners: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
+
+    // Remote nodes' cached topologies (includes containers + VMs with
+    // their WolfNet IPs from the last successful poll).
+    {
+        let remotes = state.router.remote_topologies.read().unwrap();
+        for topo in remotes.values() {
+            collect_ips(topo, &mut ip_owners);
+        }
+    }
+
+    // Local node's containers — read from LXC storage paths directly
+    // (cheap filesystem read, no subprocess) so we don't miss the
+    // local node's containers when remote_topologies doesn't include
+    // self.
+    {
+        let self_name = hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "this node".into());
+        for base in crate::containers::lxc_storage_paths() {
+            let entries = match std::fs::read_dir(&base) { Ok(e) => e, Err(_) => continue };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let ip_path = entry.path().join(".wolfnet").join("ip");
+                if let Ok(ip) = std::fs::read_to_string(&ip_path) {
+                    let ip = ip.trim().to_string();
+                    if !ip.is_empty() {
+                        ip_owners.entry(ip).or_default().push((name, self_name.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Flag any IP with >1 owner.
+    for (ip, owners) in &ip_owners {
+        if owners.len() < 2 { continue; }
+        let detail = owners.iter()
+            .map(|(cname, nname)| format!("  {} on {}", cname, nname))
+            .collect::<Vec<_>>().join("\n");
+        out.push(DependencyCheck {
+            name: format!("Cluster-wide duplicate WolfNet IP: {}", ip),
+            category: CATEGORY.into(),
+            status: DepStatus::Missing,  // critical
+            version: None,
+            detail: format!(
+                "Multiple containers/VMs across the cluster share the same WolfNet IP. WolfNet routes by IP — only one will be reachable; the other is silently unreachable until the conflict is resolved.\n\n{}",
+                detail),
+            install_hint: Some(
+                "Open each container's Settings → Network → WolfNet and assign a unique IP. Use 🔍 Next Available to find a free one.".into()),
+            ai_helpful: true,
+        });
+    }
+}
+
+fn collect_ips(
+    topo: &crate::networking::router::topology::NodeTopology,
+    map: &mut std::collections::HashMap<String, Vec<(String, String)>>,
+) {
+    let node = &topo.node_name;
+    for c in topo.containers.iter().chain(topo.vms.iter()) {
+        if let Some(ref ip) = c.ip {
+            let ip = ip.trim().to_string();
+            if !ip.is_empty() {
+                map.entry(ip).or_default().push((c.name.clone(), node.clone()));
+            }
+        }
+    }
+}
+
 const CATEGORY: &str = "Security";
 
 /// Run every security check and return the findings. Cheap enough to
@@ -53,6 +158,7 @@ pub fn run_security_checks() -> Vec<DependencyCheck> {
     scan_crypto_miners(&mut out);
     scan_tmp_binaries(&mut out);
     scan_outbound_suspicious(&mut out);
+    scan_ip_conflicts(&mut out);
     if out.is_empty() {
         out.push(ok("No active threats", "Every posture check passed and no active-attack signatures were detected in recent logs.", None));
     }
@@ -532,4 +638,70 @@ fn scan_outbound_suspicious(out: &mut Vec<DependencyCheck>) {
             detail),
         Some("For each connection: `lsof -i :<port>` identifies the local process. If legitimate (IRC client, personal mining), leave it. If not: kill the process, remove persistence, rotate creds.".into()),
     ));
+}
+
+// ─── IP / MAC conflict detection ────────────────────────────────
+
+/// Detect containers sharing the same IP or MAC address. Uses the
+/// existing `detect_network_conflicts()` from the containers module
+/// which walks every LXC config file. Additionally scans WolfNet IP
+/// marker files (`.wolfnet/ip`) which the LXC config scan misses
+/// because WolfNet IPs are stored separately.
+fn scan_ip_conflicts(out: &mut Vec<DependencyCheck>) {
+    // Reuse the existing conflict detector for LXC net config.
+    let conflicts = crate::containers::detect_network_conflicts();
+
+    // Also scan WolfNet IPs for duplicates. The marker files live at
+    // <lxc-base>/<container>/.wolfnet/ip with just the IP as content.
+    let mut wolfnet_ips: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for base in crate::containers::lxc_storage_paths() {
+        let entries = match std::fs::read_dir(&base) { Ok(e) => e, Err(_) => continue };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let ip_path = entry.path().join(".wolfnet").join("ip");
+            if let Ok(ip) = std::fs::read_to_string(&ip_path) {
+                let ip = ip.trim().to_string();
+                if !ip.is_empty() {
+                    wolfnet_ips.entry(ip).or_default().push(name);
+                }
+            }
+        }
+    }
+
+    // Emit findings for LXC config conflicts (MAC + bridge IP).
+    for c in &conflicts {
+        if c.containers.len() < 2 { continue; }
+        let names = c.containers.join(", ");
+        if c.conflict_type == "mac" {
+            out.push(critical(
+                &format!("Duplicate MAC address: {}", c.value),
+                &format!(
+                    "Containers sharing the same MAC on the same bridge will cause ARP confusion — packets go to the wrong container, connections drop randomly, and both containers appear to flicker on/off.\n\nContainers: {}",
+                    names),
+                Some(format!("Open each container's Settings → Network tab and generate a unique MAC for one of them (🎲 button). Then restart both containers.")),
+            ));
+        } else {
+            out.push(critical(
+                &format!("Duplicate IP address: {}", c.value),
+                &format!(
+                    "Multiple containers configured with the same IP address. Only one will actually hold the address at a time — the other silently fails to communicate, causing mysterious connectivity issues.\n\nContainers: {}",
+                    names),
+                Some(format!("Open each container's Settings → Network tab and assign unique IPs. If using DHCP, remove the static IP from one of them.")),
+            ));
+        }
+    }
+
+    // Emit findings for WolfNet IP duplicates.
+    for (ip, containers) in &wolfnet_ips {
+        if containers.len() < 2 { continue; }
+        let names = containers.join(", ");
+        out.push(critical(
+            &format!("Duplicate WolfNet IP: {}", ip),
+            &format!(
+                "Multiple containers assigned the same WolfNet overlay IP. WolfNet routes packets by IP — two containers on the same address means traffic goes to whichever one ARP'd last, and the other is unreachable.\n\nContainers: {}",
+                names),
+            Some(format!("Open each container's Settings → Network → WolfNet and assign a unique IP. Use 🔍 Next Available to find a free one.")),
+        ));
+    }
 }

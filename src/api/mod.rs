@@ -5985,6 +5985,12 @@ pub async fn system_check_run(
         Err(e) => return HttpResponse::InternalServerError()
             .json(serde_json::json!({ "error": format!("System check failed: {}", e) })),
     };
+    // Cluster-scoped checks (cross-node WolfNet IP conflicts) need
+    // AppState for the cached remote topologies. Runs synchronously
+    // here — cheap because it just reads in-memory topology snapshots.
+    let mut cluster_checks = crate::security::run_cluster_checks(&state);
+    checks.append(&mut cluster_checks);
+
     match sec_res {
         Ok(mut v) => checks.append(&mut v),
         Err(e) => {

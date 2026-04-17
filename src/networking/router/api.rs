@@ -390,9 +390,24 @@ pub async fn get_topology(
     // Wrap the standard topology with the per-peer diagnostics so the
     // frontend can show "tried 3 peers, got 2 responses, 1 skipped
     // because cluster_name didn't match" on the rack header.
+    // Aggregate routers from every node and dedup by IP. Each node
+    // discovers its own default gateways (which may differ across
+    // subnets/sites), and the master collects them all so the rack
+    // view shows every upstream router the cluster talks through.
+    let mut router_ips = std::collections::HashSet::new();
+    let mut routers = Vec::new();
+    for node in &nodes {
+        for r in &node.routers {
+            if router_ips.insert(r.ip.clone()) {
+                routers.push(r.clone());
+            }
+        }
+    }
+
     HttpResponse::Ok().json(serde_json::json!({
         "nodes": nodes,
         "links": links,
+        "routers": routers,
         "generated_at": generated_at,
         "peer_diagnostics": peer_diagnostics,
         "cluster_filter": cluster_filter,
