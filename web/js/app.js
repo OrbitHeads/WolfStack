@@ -14252,9 +14252,15 @@ async function migrateLxcContainer(name) {
                 <div><label style="font-size:13px;color:var(--text-muted,#aaa);">Migrate to</label>
                     <select id="migrate-target" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;">
                         <option value="">— Select a cluster node —</option>
-                        ${remoteNodes.map(n => `<option value="${n.id}">${n.hostname} (${n.address})</option>`).join('')}
-                        <option value="__external__">External cluster...</option>
-                    </select></div>
+                        ${remoteNodes.map(n => {
+                            const memGb = n.total_memory ? (n.total_memory / 1073741824).toFixed(1) + ' GB RAM' : '';
+                            return `<option value="${n.id}">${n.hostname || n.id} — ${n.address}${memGb ? ' · ' + memGb : ''}</option>`;
+                        }).join('')}
+                        ${!remoteNodes.length ? '<option value="" disabled>(no other online nodes in this cluster)</option>' : ''}
+                        <option value="__external__">↗ External cluster...</option>
+                    </select>
+                    <div id="migrate-target-info" style="font-size:11px;color:var(--text-muted,#666);margin-top:4px;"></div>
+                </div>
                 <div id="migrate-external-fields" style="display:none;">
                     <div style="background:var(--info-bg);border:1px solid var(--info);border-radius:8px;padding:10px 12px;margin-bottom:12px;color:var(--info);font-size:0.82em;line-height:1.5;">
                         💡 <strong>Cross-cluster migration</strong> lets you move a container to a WolfStack instance on a different network.
@@ -14280,18 +14286,33 @@ async function migrateLxcContainer(name) {
     `;
     document.body.appendChild(modal);
 
-    // Helper: populate storage dropdown from a storage list response
+    // Helper: populate storage dropdown from a storage list response.
+    // Also detects shared storage (Ceph, NFS, CIFS) and surfaces a
+    // helpful badge so users know "this migration won't need a data
+    // copy if you pick a shared backend".
     function lxcPopulateStorages(data) {
         const sel = document.getElementById('migrate-storage');
         const hint = document.getElementById('migrate-storage-hint');
+        const info = document.getElementById('migrate-target-info');
         sel.innerHTML = '<option value="">Auto (default)</option>';
         const storages = data.storages || [];
         const suitable = storages.filter(s => s.content && s.content.some(c => c === 'rootdir' || c === 'images'));
-        (suitable.length ? suitable : storages.filter(s => s.status === 'active')).forEach(s => {
+        const display = suitable.length ? suitable : storages.filter(s => s.status === 'active');
+        const sharedTypes = ['cephfs', 'rbd', 'ceph', 'nfs', 'cifs', 'glusterfs', 'zfs-over-iscsi'];
+        let hasShared = false;
+        display.forEach(s => {
             const free = typeof formatBytes === 'function' ? formatBytes(s.available_bytes) : Math.round(s.available_bytes / 1073741824) + ' GB';
-            sel.insertAdjacentHTML('beforeend', `<option value="${s.id}">${s.id} (${s.type || ''}, ${free} free)</option>`);
+            const isShared = sharedTypes.some(t => (s.type || '').toLowerCase().includes(t));
+            if (isShared) hasShared = true;
+            const badge = isShared ? ' 🟢 shared' : '';
+            sel.insertAdjacentHTML('beforeend', `<option value="${s.id}">${s.id} (${s.type || ''}, ${free} free${badge})</option>`);
         });
-        hint.textContent = storages.length ? '' : 'No storages found';
+        if (hasShared && info) {
+            info.innerHTML = '<span style="color:#22c55e;">🟢 Shared storage (Ceph/NFS) detected on the target — if you pick it, migration is config-only and takes seconds instead of copying gigabytes.</span>';
+        } else if (info) {
+            info.innerHTML = display.length ? '<span style="color:var(--text-muted);">No shared storage with this node — container data will be copied over the network.</span>' : '';
+        }
+        hint.textContent = storages.length ? '' : 'No storages found on the target node';
     }
 
     // Show/hide external fields + fetch storages from selected target node
@@ -15519,7 +15540,9 @@ function selectLxcTemplate(distro, release, arch, variant) {
             <input type="hidden" id="lxc-create-distro" value="${distro}">
             <input type="hidden" id="lxc-create-release" value="${release}">
             <input type="hidden" id="lxc-create-arch" value="${arch}">
-            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:12px;">
+            <!-- ── Identity ───────────────────────────── -->
+            <div style="font-size:12px; font-weight:700; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px;">Identity</div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:16px;">
                 <div>
                     <label style="display:block; margin-bottom:4px; font-weight:600; font-size:13px;">Container Name</label>
                     <input id="lxc-create-name" type="text" value="${distro}-${release}" placeholder="my-container"
@@ -15531,27 +15554,10 @@ function selectLxcTemplate(distro, release, arch, variant) {
                         style="width:100%; padding:8px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary);">
                 </div>
             </div>
-            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:6px;">
-                <div>
-                    <label style="display:block; margin-bottom:4px; font-weight:600; font-size:13px;">📥 Template Storage <span style="font-weight:400; color:var(--text-muted); font-size:11px;">(where the distro tarball is cached)</span></label>
-                    <select id="lxc-create-template-storage"
-                        style="width:100%; padding:8px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary); font-size:13px;">
-                        <option value="">Local (default)</option>
-                    </select>
-                </div>
-                <div>
-                    <label style="display:block; margin-bottom:4px; font-weight:600; font-size:13px;">💾 Build Storage <span style="font-weight:400; color:var(--text-muted); font-size:11px;">(where the rootfs lives)</span></label>
-                    <select id="lxc-create-storage"
-                        style="width:100%; padding:8px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary); font-size:13px;">
-                        <option value="/var/lib/lxc">/var/lib/lxc (default)</option>
-                    </select>
-                </div>
-            </div>
-            <div style="margin-bottom:12px; font-size:11px; color:var(--text-muted); line-height:1.5;">
-                <span id="lxc-storage-info"></span>
-                <span style="display:block;">💡 Change the storage of an existing container from <strong>LXC Containers</strong> → container detail → <strong>💾 Storage</strong> → <strong>Move to different storage</strong>.</span>
-            </div>
-            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:12px;">
+
+            <!-- ── Resources ─────────────────────────── -->
+            <div style="font-size:12px; font-weight:700; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px;">Resources</div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:16px;">
                 <div>
                     <label style="display:block; margin-bottom:4px; font-weight:600; font-size:13px;">🧠 Memory Limit</label>
                     <select id="lxc-create-memory"
@@ -15579,6 +15585,31 @@ function selectLxcTemplate(distro, release, arch, variant) {
                     </select>
                 </div>
             </div>
+
+            <!-- ── Storage ───────────────────────────── -->
+            <details style="margin-bottom:16px;">
+                <summary style="font-size:12px; font-weight:700; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.5px; cursor:pointer; margin-bottom:8px;">Storage <span style="font-weight:400; font-size:11px; text-transform:none;">(defaults are fine for most containers)</span></summary>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:6px; margin-top:8px;">
+                    <div>
+                        <label style="display:block; margin-bottom:4px; font-weight:600; font-size:13px;">📥 Template Storage <span style="font-weight:400; color:var(--text-muted); font-size:11px;">(distro tarball cache)</span></label>
+                        <select id="lxc-create-template-storage"
+                            style="width:100%; padding:8px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary); font-size:13px;">
+                            <option value="">Local (default)</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label style="display:block; margin-bottom:4px; font-weight:600; font-size:13px;">💾 Rootfs Storage <span style="font-weight:400; color:var(--text-muted); font-size:11px;">(where the container lives)</span></label>
+                        <select id="lxc-create-storage"
+                            style="width:100%; padding:8px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary); font-size:13px;">
+                            <option value="/var/lib/lxc">/var/lib/lxc (default)</option>
+                        </select>
+                    </div>
+                </div>
+                <div style="font-size:11px; color:var(--text-muted); line-height:1.5;">
+                    <span id="lxc-storage-info"></span>
+                    <span style="display:block;">💡 You can move a running container's storage later from its detail page → Storage → Move.</span>
+                </div>
+            </details>
             <div style="margin-bottom:12px; padding:12px; background:var(--bg-tertiary); border-radius:8px; border:1px solid var(--border);">
                 <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
                     <div style="display:flex; align-items:center; gap:8px;">
@@ -15590,18 +15621,61 @@ function selectLxcTemplate(distro, release, arch, variant) {
                 <div id="lxc-mounts-list" style="display:flex; flex-direction:column; gap:6px;"></div>
                 <div style="font-size:11px; color:var(--text-muted); margin-top:6px;">Map host directories into the container (applied on start, requires restart)</div>
             </div>
-            <div id="lxc-wolfnet-section" style="margin-bottom:12px; padding:12px; background:var(--bg-tertiary); border-radius:8px; border:1px solid var(--border);">
-                <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
-                    <span>🐺</span>
-                    <strong style="font-size:13px;">WolfNet Networking</strong>
+            <div style="margin-bottom:12px; padding:12px; background:var(--bg-tertiary); border-radius:8px; border:1px solid var(--border);">
+                <div style="display:flex; align-items:center; gap:8px; margin-bottom:10px;">
+                    <span>🌐</span>
+                    <strong style="font-size:13px;">Network</strong>
                     <span id="lxc-wolfnet-status" style="font-size:12px; color:var(--text-muted);">Checking...</span>
                 </div>
-                <div id="lxc-wolfnet-ip-row" style="display:flex; align-items:center; gap:8px;">
-                    <label style="font-size:13px; white-space:nowrap;">Assign IP:</label>
-                    <input id="lxc-wolfnet-ip" type="text" placeholder="auto"
-                        style="flex:1; padding:6px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary); font-size:13px;">
-                    <span style="font-size:12px; color:var(--text-muted);">Leave empty for no WolfNet</span>
+                <div style="display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap;">
+                    <button type="button" class="btn btn-sm lxc-net-preset" data-net="wolfnet" onclick="lxcSelectNetPreset('wolfnet')" style="flex:1; min-width:140px; padding:10px 12px; text-align:left; border:2px solid var(--primary,#a855f7); background:rgba(168,85,247,0.1);">
+                        <strong style="display:block; font-size:12px;">🐺 WolfNet</strong>
+                        <span style="font-size:10px; color:var(--text-muted);">Recommended — reachable from every cluster node, auto-assigned IP, zero config.</span>
+                    </button>
+                    <button type="button" class="btn btn-sm lxc-net-preset" data-net="bridge" onclick="lxcSelectNetPreset('bridge')" style="flex:1; min-width:140px; padding:10px 12px; text-align:left; border:2px solid transparent;">
+                        <strong style="display:block; font-size:12px;">🔌 Bridged LAN</strong>
+                        <span style="font-size:10px; color:var(--text-muted);">Attach to a physical LAN bridge (lxcbr0, vmbr0). Gets a LAN IP via DHCP or static.</span>
+                    </button>
+                    <button type="button" class="btn btn-sm lxc-net-preset" data-net="host" onclick="lxcSelectNetPreset('host')" style="flex:1; min-width:140px; padding:10px 12px; text-align:left; border:2px solid transparent;">
+                        <strong style="display:block; font-size:12px;">🖥 Host Network</strong>
+                        <span style="font-size:10px; color:var(--text-muted);">Shares the host's network stack. For special cases (no isolation).</span>
+                    </button>
                 </div>
+                <input type="hidden" id="lxc-net-mode" value="wolfnet"/>
+                <div id="lxc-net-wolfnet" style="">
+                    <div style="display:flex; align-items:center; gap:8px;">
+                        <label style="font-size:13px; white-space:nowrap;">WolfNet IP:</label>
+                        <input id="lxc-wolfnet-ip" type="text" placeholder="auto (next free)"
+                            style="flex:1; padding:6px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary); font-size:13px;">
+                    </div>
+                    <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">Auto-assigned from the WolfNet subnet. Override with a specific IP or leave blank to skip WolfNet.</div>
+                </div>
+                <div id="lxc-net-bridge" style="display:none;">
+                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+                        <div>
+                            <label style="font-size:12px;">Bridge</label>
+                            <select id="lxc-bridge-name" style="width:100%; padding:6px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary); font-size:12px; margin-top:3px;">
+                                <option value="lxcbr0">lxcbr0 (default)</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="font-size:12px;">IP assignment</label>
+                            <select id="lxc-bridge-ip-mode" onchange="document.getElementById('lxc-bridge-static').style.display = this.value === 'static' ? 'grid' : 'none';" style="width:100%; padding:6px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary); font-size:12px; margin-top:3px;">
+                                <option value="dhcp">DHCP (from your router)</option>
+                                <option value="static">Static IP</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div id="lxc-bridge-static" style="display:none; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px;">
+                        <div><label style="font-size:12px;">IP + CIDR</label><input id="lxc-bridge-ip" placeholder="192.168.10.50/24" style="width:100%; padding:6px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary); font-size:12px; margin-top:3px;"/></div>
+                        <div><label style="font-size:12px;">Gateway</label><input id="lxc-bridge-gw" placeholder="192.168.10.1" style="width:100%; padding:6px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary); font-size:12px; margin-top:3px;"/></div>
+                    </div>
+                    <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">Container will be attached to the bridge and get a LAN IP. Use this when the container needs to be directly reachable from the physical network.</div>
+                </div>
+                <div id="lxc-net-host" style="display:none;">
+                    <div style="font-size:11px; color:var(--text-muted);">Container shares the host's interfaces, IPs, and routing. No network isolation. Only for special cases (e.g. services that need to bind the host's IP directly).</div>
+                </div>
+                <div id="lxc-net-preview" style="margin-top:8px; font-size:11px; padding:6px 8px; background:var(--bg-secondary); border-radius:4px; color:var(--text-muted);"></div>
             </div>
             <div style="display:flex; gap:8px;">
                 <button class="btn btn-primary" onclick="createLxcContainer()">📦 Create Container</button>
@@ -15725,6 +15799,53 @@ function selectLxcTemplate(distro, release, arch, variant) {
         });
 }
 
+/// Network preset picker — highlights the selected card, shows/hides
+/// the detail section for each mode, and updates the preview line so
+/// the user sees the outcome before clicking Create.
+function lxcSelectNetPreset(mode) {
+    document.getElementById('lxc-net-mode').value = mode;
+    // Highlight the selected card, dim others.
+    document.querySelectorAll('.lxc-net-preset').forEach(btn => {
+        const sel = btn.dataset.net === mode;
+        btn.style.borderColor = sel ? 'var(--primary,#a855f7)' : 'transparent';
+        btn.style.background = sel ? 'rgba(168,85,247,0.1)' : 'transparent';
+    });
+    // Show/hide per-mode detail panels.
+    document.getElementById('lxc-net-wolfnet').style.display = mode === 'wolfnet' ? '' : 'none';
+    document.getElementById('lxc-net-bridge').style.display  = mode === 'bridge'  ? '' : 'none';
+    document.getElementById('lxc-net-host').style.display    = mode === 'host'    ? '' : 'none';
+    // Preview line.
+    const preview = document.getElementById('lxc-net-preview');
+    if (preview) {
+        const ipField = document.getElementById('lxc-wolfnet-ip');
+        const ip = ipField ? ipField.value || ipField.placeholder : '(auto)';
+        const hints = {
+            wolfnet: `This container will be reachable at <code>${ip.replace('auto (next free)', '10.10.10.X')}</code> via WolfNet from every cluster node.`,
+            bridge:  'This container will get a LAN IP (DHCP or the static address you set) and be directly reachable on the physical network.',
+            host:    'This container will share the host\'s IP and ports — no isolation.',
+        };
+        preview.innerHTML = hints[mode] || '';
+    }
+    // Populate bridge dropdown from topology if switching to bridge mode.
+    if (mode === 'bridge') {
+        const sel = document.getElementById('lxc-bridge-name');
+        if (sel && sel.options.length <= 1) {
+            // Fetch available bridges from the local node.
+            fetch(apiUrl('/api/networking/interfaces'))
+                .then(r => r.ok ? r.json() : [])
+                .then(ifaces => {
+                    const bridges = (Array.isArray(ifaces) ? ifaces : [])
+                        .filter(i => i.type === 'bridge' || (i.name || '').startsWith('br') || (i.name || '') === 'lxcbr0' || (i.name || '').startsWith('vmbr'));
+                    if (bridges.length) {
+                        sel.innerHTML = bridges.map(b =>
+                            `<option value="${escapeHtml(b.name || b)}">${escapeHtml(b.name || b)}</option>`
+                        ).join('');
+                    }
+                }).catch(() => {});
+        }
+    }
+}
+
 async function createLxcContainer() {
     // Remove any stale progress modal from a previous attempt
     document.getElementById('lxc-create-modal')?.remove();
@@ -15830,7 +15951,17 @@ async function createLxcContainer() {
         const resp = await fetch(apiUrl('/api/containers/lxc/create'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name, distribution, release, architecture, wolfnet_ip, storage_path, template_storage, root_password, memory_limit, cpu_cores }),
+            body: JSON.stringify({
+                name, distribution, release, architecture, storage_path, template_storage, root_password, memory_limit, cpu_cores,
+                // Network mode from the three-preset picker. Backend uses
+                // this to write the correct LXC net config (veth/bridge
+                // for "bridge", none for "host", WolfNet for "wolfnet").
+                network_mode: document.getElementById('lxc-net-mode')?.value || 'wolfnet',
+                wolfnet_ip: (document.getElementById('lxc-net-mode')?.value || 'wolfnet') === 'wolfnet' ? wolfnet_ip : undefined,
+                bridge_name: document.getElementById('lxc-bridge-name')?.value || undefined,
+                bridge_ip: document.getElementById('lxc-bridge-ip')?.value || undefined,
+                bridge_gateway: document.getElementById('lxc-bridge-gw')?.value || undefined,
+            }),
         });
 
         let data;

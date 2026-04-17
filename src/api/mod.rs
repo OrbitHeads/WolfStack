@@ -3248,6 +3248,23 @@ pub struct LxcCreateRequest {
     pub root_password: Option<String>,
     pub memory_limit: Option<String>,
     pub cpu_cores: Option<String>,
+    /// Network mode: "wolfnet" (default), "bridge", or "host". When
+    /// "bridge" is set, bridge_name / bridge_ip / bridge_gateway control
+    /// the LXC veth network config. When "host" is set, the container
+    /// shares the host's network namespace.
+    #[serde(default)]
+    pub network_mode: Option<String>,
+    /// Bridge name for mode=bridge (e.g. "lxcbr0", "vmbr0"). Ignored for
+    /// other modes.
+    #[serde(default)]
+    pub bridge_name: Option<String>,
+    /// Static IP in CIDR form for mode=bridge+static (e.g. "192.168.10.50/24").
+    /// If absent or empty, the container uses DHCP from the bridge.
+    #[serde(default)]
+    pub bridge_ip: Option<String>,
+    /// Gateway for mode=bridge+static. Usually the router IP on that subnet.
+    #[serde(default)]
+    pub bridge_gateway: Option<String>,
 }
 
 /// POST /api/containers/lxc/create — create an LXC container from template
@@ -3314,18 +3331,101 @@ pub async fn lxc_create(
                 _ => {}
             }
 
-            // Attach WolfNet (auto-assigned or user-specified)
-            if let Some(ref ip) = wolfnet_ip {
-                match containers::lxc_attach_wolfnet(&body.name, ip) {
-                    Ok(wn_msg) => messages.push(wn_msg),
-                    Err(e) => messages.push(format!("WolfNet warning: {}", e)),
+            // Network — three modes:
+            //   "wolfnet" (default): attach to WolfNet overlay with auto or manual IP
+            //   "bridge":            configure LXC veth on the specified bridge (DHCP or static)
+            //   "host":              no network namespace isolation
+            let net_mode = body.network_mode.as_deref().unwrap_or("wolfnet");
+            match net_mode {
+                "wolfnet" | "" => {
+                    if let Some(ref ip) = wolfnet_ip {
+                        match containers::lxc_attach_wolfnet(&body.name, ip) {
+                            Ok(wn_msg) => messages.push(wn_msg),
+                            Err(e) => messages.push(format!("WolfNet warning: {}", e)),
+                        }
+                    }
                 }
+                "bridge" => {
+                    let bridge = body.bridge_name.as_deref().unwrap_or("lxcbr0");
+                    let config_path = format!("{}/{}/config",
+                        containers::lxc_base_dir(&body.name), body.name);
+                    // Replace the existing lxc.net.0.* block with our bridge config.
+                    // Read → filter out old net lines → append fresh ones. This is
+                    // safe because lxc-create already wrote a net block and we're
+                    // just changing the bridge and IP assignment.
+                    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+                    let mut lines: Vec<String> = existing.lines()
+                        .filter(|l| !l.trim().starts_with("lxc.net.0."))
+                        .map(|s| s.to_string())
+                        .collect();
+                    lines.push(format!("lxc.net.0.type = veth"));
+                    lines.push(format!("lxc.net.0.link = {}", bridge));
+                    lines.push(format!("lxc.net.0.flags = up"));
+                    // Generate a random MAC so each container has a unique one.
+                    let mac = format!("00:16:3e:{:02x}:{:02x}:{:02x}",
+                        rand_byte(), rand_byte(), rand_byte());
+                    lines.push(format!("lxc.net.0.hwaddr = {}", mac));
+                    if let Some(ref ip) = body.bridge_ip {
+                        let ip = ip.trim();
+                        if !ip.is_empty() {
+                            lines.push(format!("lxc.net.0.ipv4.address = {}", ip));
+                            if let Some(ref gw) = body.bridge_gateway {
+                                let gw = gw.trim();
+                                if !gw.is_empty() {
+                                    lines.push(format!("lxc.net.0.ipv4.gateway = {}", gw));
+                                }
+                            }
+                        }
+                    }
+                    lines.push(String::new()); // trailing newline
+                    if let Err(e) = std::fs::write(&config_path, lines.join("\n")) {
+                        messages.push(format!("Bridge config warning: {}", e));
+                    } else {
+                        messages.push(format!("Network: veth on {} ({})", bridge,
+                            if body.bridge_ip.as_deref().map(|s| s.trim()).unwrap_or("").is_empty() { "DHCP" } else { "static" }));
+                    }
+                }
+                "host" => {
+                    let config_path = format!("{}/{}/config",
+                        containers::lxc_base_dir(&body.name), body.name);
+                    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+                    let mut lines: Vec<String> = existing.lines()
+                        .filter(|l| !l.trim().starts_with("lxc.net.0."))
+                        .map(|s| s.to_string())
+                        .collect();
+                    lines.push("lxc.net.0.type = none".to_string());
+                    lines.push(String::new());
+                    if let Err(e) = std::fs::write(&config_path, lines.join("\n")) {
+                        messages.push(format!("Host network config warning: {}", e));
+                    } else {
+                        messages.push("Network: host (no isolation)".to_string());
+                    }
+                }
+                _ => {}
             }
 
             HttpResponse::Ok().json(serde_json::json!({ "message": messages.join(" — ") }))
         }
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
     }
+}
+
+/// Quick pseudo-random byte for MAC addresses. NOT crypto-grade — just
+/// needs to be unique-enough per container so bridges don't confuse them.
+/// Reads 1 byte from /dev/urandom which is always non-blocking on Linux.
+fn rand_byte() -> u8 {
+    use std::io::Read;
+    let mut buf = [0u8; 1];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut buf);
+    } else {
+        // Fallback: nanos-derived (non-repeatable across fast calls but better than nothing).
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos()).unwrap_or(0);
+        buf[0] = (nanos & 0xFF) as u8;
+    }
+    buf[0]
 }
 
 /// GET /api/storage/remote-list?url=<target> — proxy storage list from a remote WolfStack node
