@@ -3938,29 +3938,19 @@
             const sublabel = r.vendor ? `${r.vendor}${r.model && r.model !== r.vendor ? ' · ' + r.model : ''}` : r.ip;
 
             // ─── Router chassis: rack-mount network appliance ───
-            // Layout mirrors real rack-mount routers: brand panel on the
-            // left (~120px), then a row of 8 RJ45 ports to the right.
-            // Port 0 = WAN (gold pins), ports 1–N = LAN (blue, one per
-            // server), remaining ports = empty/unused (dark, no LEDs).
-            // This puts all ports right-aligned with the server ports
-            // below so cables run vertically without crossing.
-            const chassis = document.createElementNS(ns, 'g');
-            chassis.style.cursor = r.web_url ? 'pointer' : 'default';
-            if (r.web_url) {
-                chassis.dataset.adminUrl = r.web_url;
-                chassis.addEventListener('click', function() {
-                    if (this.dataset.adminUrl) window.open(this.dataset.adminUrl, '_blank');
-                });
-            }
+            // Layout: brand panel left, 8 RJ45 ports center-right,
+            // power button far right (click → opens admin web UI).
+            const brandW = 130;
+            const pwrBtnX = apX + apW - 36;
+            const pwrBtnCY = uy + routerUnitH / 2;
+            const adminUrl = escHtml(r.web_url || `http://${r.ip}`);
 
-            // Chassis body — amber tint
             const chassisHtml = `
                 <rect x="${apX}" y="${uy}" width="${apW}" height="${routerUnitH}" rx="4"
                       fill="rgba(251,191,36,0.06)" stroke="rgba(251,191,36,0.35)" stroke-width="1.5"/>
             `;
 
-            // Brand panel (left strip) — vendor emoji + name + IP
-            const brandW = 130;
+            // Brand panel (left strip) — vendor emoji + name + IP + model
             const brandHtml = `
                 <rect x="${apX}" y="${uy}" width="${brandW}" height="${routerUnitH}" rx="4"
                       fill="rgba(251,191,36,0.12)"/>
@@ -3970,6 +3960,45 @@
                 <text x="${apX + 10}" y="${uy + 44}" style="fill:#64748b; font-size:8px;">${escHtml((r.model || '').slice(0,16))}</text>
                 ${r.reachable ? '' : '<circle cx="' + (apX + brandW - 10) + '" cy="' + (uy + 12) + '" r="3" fill="#ef4444"/>'}
                 <title>${escHtml([r.name || 'Router', 'IP: ' + r.ip, r.vendor ? 'Vendor: ' + r.vendor : '', r.model ? 'Model: ' + r.model : '', r.web_url ? 'Admin: ' + r.web_url : ''].filter(Boolean).join('\n'))}</title>
+            `;
+
+            // Power switch — realistic rocker-style with a red glow.
+            // SVG <a> wraps the whole switch so clicking anywhere on
+            // it opens the router's admin UI in a new tab.
+            const swX = apX + apW - 42;
+            const swY = uy + 8;
+            const swH = routerUnitH - 16;
+            const swW = 28;
+            const glowOn = r.reachable;
+            const pwrBtnHtml = `
+                <a href="${adminUrl}" target="_blank" style="cursor:pointer;">
+                    <!-- Glow halo behind the switch when router is up -->
+                    ${glowOn ? `<ellipse cx="${swX + swW/2}" cy="${swY + swH/2}" rx="${swW/2 + 6}" ry="${swH/2 + 4}"
+                                  fill="rgba(239,68,68,0.15)"/>
+                               <ellipse cx="${swX + swW/2}" cy="${swY + swH/2}" rx="${swW/2 + 3}" ry="${swH/2 + 2}"
+                                  fill="rgba(239,68,68,0.08)"/>` : ''}
+                    <!-- Switch housing (recessed dark bezel) -->
+                    <rect x="${swX - 2}" y="${swY - 2}" width="${swW + 4}" height="${swH + 4}" rx="4"
+                          fill="#0a0f18" stroke="#1e293b" stroke-width="1"/>
+                    <!-- Rocker body — red when on, dark grey when off -->
+                    <rect x="${swX}" y="${swY}" width="${swW}" height="${swH}" rx="3"
+                          fill="${glowOn ? '#dc2626' : '#374151'}"
+                          stroke="${glowOn ? '#ef4444' : '#4b5563'}" stroke-width="0.8"/>
+                    <!-- Top highlight (3D bevel effect) -->
+                    <rect x="${swX + 2}" y="${swY + 1}" width="${swW - 4}" height="${swH/2 - 2}" rx="2"
+                          fill="${glowOn ? 'rgba(248,113,113,0.4)' : 'rgba(255,255,255,0.06)'}"/>
+                    <!-- Center line (rocker seam) -->
+                    <line x1="${swX + 4}" y1="${swY + swH/2}" x2="${swX + swW - 4}" y2="${swY + swH/2}"
+                          stroke="${glowOn ? 'rgba(0,0,0,0.3)' : 'rgba(0,0,0,0.2)'}" stroke-width="0.8"/>
+                    <!-- Power LED dot -->
+                    <circle cx="${swX + swW/2}" cy="${swY + swH/2 - 5}" r="2.5"
+                            fill="${glowOn ? '#fca5a5' : '#1f2937'}"
+                            ${glowOn ? 'filter="url(#wr-glow)"' : ''}/>
+                    <!-- I/O label -->
+                    <text x="${swX + swW/2}" y="${swY + swH - 4}" text-anchor="middle"
+                          style="fill:${glowOn ? 'rgba(255,255,255,0.7)' : 'rgba(255,255,255,0.2)'}; font-size:6px; font-weight:700;">I / O</text>
+                    <title>Open ${escHtml(r.vendor || 'router')} admin UI at ${adminUrl}</title>
+                </a>
             `;
 
             // Ports — 8 total, right of the brand panel. WAN first, then
@@ -4021,7 +4050,7 @@
                 }
             }
 
-            svg.insertAdjacentHTML('beforeend', chassisHtml + brandHtml + portsHtml);
+            svg.insertAdjacentHTML('beforeend', chassisHtml + brandHtml + portsHtml + pwrBtnHtml);
             const wanPortCx = portStartX + jackW / 2;
             routerPortPositions[r.ip] = { wanCx: wanPortCx, wanCy: uy, lanPorts };
         }

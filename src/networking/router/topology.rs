@@ -451,6 +451,21 @@ fn identify_vendor(text: &str, router: &mut DiscoveredRouter) {
         ("merc", "Mercusys", |title, _| {
             ("Mercusys".into(), title.as_deref().unwrap_or("Mercusys").to_string())
         }),
+        ("mwlogin", "Mercusys", |title, _| {
+            ("Mercusys".into(), title.as_deref().unwrap_or("Mercusys").to_string())
+        }),
+        ("ac12", "Mercusys", |title, _| {
+            ("Mercusys".into(), format!("Mercusys {}", title.as_deref().unwrap_or("AC12")))
+        }),
+        ("ac10", "Mercusys", |title, _| {
+            ("Mercusys".into(), format!("Mercusys {}", title.as_deref().unwrap_or("AC10")))
+        }),
+        ("mr70x", "Mercusys", |title, _| {
+            ("Mercusys".into(), format!("Mercusys {}", title.as_deref().unwrap_or("MR70X")))
+        }),
+        ("mr30g", "Mercusys", |title, _| {
+            ("Mercusys".into(), format!("Mercusys {}", title.as_deref().unwrap_or("MR30G")))
+        }),
         ("tenda", "Tenda", |title, _| {
             ("Tenda".into(), title.as_deref().unwrap_or("Tenda").to_string())
         }),
