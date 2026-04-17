@@ -3740,35 +3740,47 @@
             return baseUnitH + extraRows * oneUH;
         });
 
-        // Group nodes by primary gateway IP. Use the TOP-LEVEL
-        // topo.routers (backend-deduplicated by IP across all cluster
-        // nodes) as the canonical router list, then match each server
-        // to its gateway by checking the node's own routers[].ip.
-        // This avoids the per-node-dedup pitfall where IPv6 link-local
-        // gateways (fe80::1) or inconsistent array ordering between
-        // nodes caused the same gateway to appear multiple times.
+        // Group nodes by their default gateway. Two-phase approach:
+        //
+        // Phase 1: if there's only ONE unique router in the deduped
+        // list, ALL servers share that gateway. Don't bother matching
+        // per-node — just assign every server to it. This covers the
+        // Hetzner / OVH / any-VLAN pattern where multiple servers sit
+        // behind the same upstream gateway and is impossible to break.
+        //
+        // Phase 2: if there are MULTIPLE unique routers, try to match
+        // each node to its gateway by checking the node's own
+        // routers[] array. Nodes that don't match anything go
+        // ungrouped (direct cable to cloud).
         const gwGroups = new Map();   // gateway_ip → { router, nodeIndices: [] }
         const noGwNodes = [];         // indices of nodes with no gateway
 
-        // Seed groups from the deduplicated router list.
-        for (const r of discoveredRouters) {
-            if (r.ip && !gwGroups.has(r.ip)) {
-                gwGroups.set(r.ip, { router: r, nodeIndices: [] });
+        if (discoveredRouters.length === 1) {
+            // Single gateway — every server uses it.
+            const r = discoveredRouters[0];
+            gwGroups.set(r.ip, {
+                router: r,
+                nodeIndices: topo.nodes.map((_, i) => i),
+            });
+        } else if (discoveredRouters.length > 1) {
+            // Multiple gateways — seed groups then match per-node.
+            for (const r of discoveredRouters) {
+                if (r.ip && !gwGroups.has(r.ip)) {
+                    gwGroups.set(r.ip, { router: r, nodeIndices: [] });
+                }
             }
+            topo.nodes.forEach((node, idx) => {
+                const gw = (node.routers || []).find(r => r.ip && !r.ip.startsWith('fe80'));
+                if (gw && gwGroups.has(gw.ip)) {
+                    gwGroups.get(gw.ip).nodeIndices.push(idx);
+                } else {
+                    noGwNodes.push(idx);
+                }
+            });
+        } else {
+            // No routers discovered — all nodes ungrouped.
+            topo.nodes.forEach((_, idx) => noGwNodes.push(idx));
         }
-
-        // Assign each node to its primary gateway group.
-        topo.nodes.forEach((node, idx) => {
-            // Find this node's first IPv4 gateway (skip fe80:: link-local —
-            // those are per-interface and aren't the "real" upstream router
-            // the user sees in their network).
-            const gw = (node.routers || []).find(r => r.ip && !r.ip.startsWith('fe80'));
-            if (gw && gwGroups.has(gw.ip)) {
-                gwGroups.get(gw.ip).nodeIndices.push(idx);
-            } else {
-                noGwNodes.push(idx);
-            }
-        });
 
         // Build the rack item sequence: [router, server, server, …, router, server, …, ungrouped servers].
         // Skip gateway groups with no servers (e.g. IPv6-only gateways
@@ -3925,62 +3937,92 @@
             const label = r.name || r.ip;
             const sublabel = r.vendor ? `${r.vendor}${r.model && r.model !== r.vendor ? ' · ' + r.model : ''}` : r.ip;
 
-            // 1U amber-tinted chassis — visually distinct from server dark-blue.
-            svg.insertAdjacentHTML('beforeend', `
-                <g style="cursor:pointer;" ${r.web_url ? `data-admin-url="${escHtml(r.web_url)}"` : ''} onclick="if(this.dataset.adminUrl)window.open(this.dataset.adminUrl,'_blank')">
-                    <rect x="${apX}" y="${uy}" width="${apW}" height="${routerUnitH}" rx="6"
-                          fill="rgba(251,191,36,0.08)" stroke="rgba(251,191,36,0.4)" stroke-width="1.5"/>
-                    <text x="${apX + 14}" y="${uy + 17}" style="fill:#fbbf24; font-size:13px; font-weight:700;">${emoji} ${escHtml(label.slice(0,30))}</text>
-                    <text x="${apX + 14}" y="${uy + 32}" style="fill:#94a3b8; font-size:10px;">${escHtml(sublabel.slice(0,40))} · ${escHtml(r.ip)}${r.reachable ? '' : ' · ⚫ offline'}</text>
-                    ${r.web_url ? `<text x="${apX + apW - 14}" y="${uy + 17}" text-anchor="end" style="fill:#60a5fa; font-size:10px; cursor:pointer;">↗ admin</text>` : ''}
-                    <title>${escHtml([r.name || 'Router', 'IP: ' + r.ip, r.vendor ? 'Vendor: ' + r.vendor : '', r.model ? 'Model: ' + r.model : '', r.web_url ? 'Admin: ' + r.web_url : ''].filter(Boolean).join('\\n'))}</title>
-                </g>
-            `);
-
-            // ─── RJ45-style ports on the router chassis ───
-            // Same visual language as the server ports (trapezoidal
-            // jacks with contact pins) so routers and servers look like
-            // they belong in the same rack. WAN port on the left, LAN
-            // ports on the right — matches how most rack-mount routers
-            // lay out their rear panel.
-            const jackW = 32, jackH = routerUnitH - 12;
-            const portsCY = uy + routerUnitH / 2;
-
-            // WAN port (left side) — cable goes UP to cloud.
-            const wanPx = apX + 40;
-            const wanPy = portsCY - jackH / 2;
-            const wanJackPath = `M ${wanPx+2},${wanPy+jackH-2} L ${wanPx+2},${wanPy+6} L ${wanPx+5},${wanPy+2} L ${wanPx+jackW-5},${wanPy+2} L ${wanPx+jackW-2},${wanPy+6} L ${wanPx+jackW-2},${wanPy+jackH-2} Z`;
-            svg.insertAdjacentHTML('beforeend', `
-                <path d="${wanJackPath}" fill="url(#wr-jack)" stroke="#000" stroke-width="0.6"/>
-                ${Array.from({length:8}).map((_,j) =>
-                    `<line x1="${wanPx+5+j*((jackW-10)/7)}" y1="${wanPy+6}" x2="${wanPx+5+j*((jackW-10)/7)}" y2="${wanPy+jackH-4}" stroke="#fbbf24" stroke-width="0.7" opacity="0.7"/>`
-                ).join('')}
-                <circle cx="${wanPx+8}" cy="${wanPy-2}" r="2" fill="url(#wr-led-green)"/>
-                <circle cx="${wanPx+jackW-8}" cy="${wanPy-2}" r="2" fill="${r.reachable ? 'url(#wr-led-amber)' : 'url(#wr-led-off)'}"/>
-                <text x="${wanPx+jackW/2}" y="${wanPy+jackH+10}" text-anchor="middle" style="fill:#fbbf24; font-size:9px; font-weight:600;">WAN</text>
-            `);
-
-            // LAN ports (right side, one per server in this gateway group).
-            const lanPorts = [];
-            const serverCount = ri.serverIndices.length;
-            const lanStartX = apX + apW * 0.35;
-            const lanSpacing = Math.min(jackW + 16, (apW * 0.6) / Math.max(serverCount, 1));
-            for (let si = 0; si < serverCount; si++) {
-                const lpx = lanStartX + si * lanSpacing;
-                const lpy = portsCY - jackH / 2;
-                lanPorts.push({ cx: lpx + jackW / 2, cy: uy + routerUnitH, nodeIdx: ri.serverIndices[si] });
-                const lanJackPath = `M ${lpx+2},${lpy+jackH-2} L ${lpx+2},${lpy+6} L ${lpx+5},${lpy+2} L ${lpx+jackW-5},${lpy+2} L ${lpx+jackW-2},${lpy+6} L ${lpx+jackW-2},${lpy+jackH-2} Z`;
-                svg.insertAdjacentHTML('beforeend', `
-                    <path d="${lanJackPath}" fill="url(#wr-jack)" stroke="#000" stroke-width="0.6"/>
-                    ${Array.from({length:8}).map((_,j) =>
-                        `<line x1="${lpx+5+j*((jackW-10)/7)}" y1="${lpy+6}" x2="${lpx+5+j*((jackW-10)/7)}" y2="${lpy+jackH-4}" stroke="#3b82f6" stroke-width="0.7" opacity="0.7"/>`
-                    ).join('')}
-                    <circle cx="${lpx+8}" cy="${lpy-2}" r="2" fill="url(#wr-led-green)"/>
-                    <circle cx="${lpx+jackW-8}" cy="${lpy-2}" r="2" fill="url(#wr-led-amber)"/>
-                    <text x="${lpx+jackW/2}" y="${lpy+jackH+10}" text-anchor="middle" style="fill:#94a3b8; font-size:8px;">LAN${si}</text>
-                `);
+            // ─── Router chassis: rack-mount network appliance ───
+            // Layout mirrors real rack-mount routers: brand panel on the
+            // left (~120px), then a row of 8 RJ45 ports to the right.
+            // Port 0 = WAN (gold pins), ports 1–N = LAN (blue, one per
+            // server), remaining ports = empty/unused (dark, no LEDs).
+            // This puts all ports right-aligned with the server ports
+            // below so cables run vertically without crossing.
+            const chassis = document.createElementNS(ns, 'g');
+            chassis.style.cursor = r.web_url ? 'pointer' : 'default';
+            if (r.web_url) {
+                chassis.dataset.adminUrl = r.web_url;
+                chassis.addEventListener('click', function() {
+                    if (this.dataset.adminUrl) window.open(this.dataset.adminUrl, '_blank');
+                });
             }
-            routerPortPositions[r.ip] = { wanCx: wanPx + jackW / 2, wanCy: uy, lanPorts };
+
+            // Chassis body — amber tint
+            const chassisHtml = `
+                <rect x="${apX}" y="${uy}" width="${apW}" height="${routerUnitH}" rx="4"
+                      fill="rgba(251,191,36,0.06)" stroke="rgba(251,191,36,0.35)" stroke-width="1.5"/>
+            `;
+
+            // Brand panel (left strip) — vendor emoji + name + IP
+            const brandW = 130;
+            const brandHtml = `
+                <rect x="${apX}" y="${uy}" width="${brandW}" height="${routerUnitH}" rx="4"
+                      fill="rgba(251,191,36,0.12)"/>
+                <text x="${apX + 10}" y="${uy + 18}" style="fill:#fbbf24; font-size:12px; font-weight:700;">${emoji}</text>
+                <text x="${apX + 28}" y="${uy + 18}" style="fill:#fbbf24; font-size:11px; font-weight:600;">${escHtml((r.vendor || r.name || 'Router').slice(0,12))}</text>
+                <text x="${apX + 10}" y="${uy + 32}" style="fill:#94a3b8; font-size:9px;">${escHtml(r.ip)}</text>
+                <text x="${apX + 10}" y="${uy + 44}" style="fill:#64748b; font-size:8px;">${escHtml((r.model || '').slice(0,16))}</text>
+                ${r.reachable ? '' : '<circle cx="' + (apX + brandW - 10) + '" cy="' + (uy + 12) + '" r="3" fill="#ef4444"/>'}
+                <title>${escHtml([r.name || 'Router', 'IP: ' + r.ip, r.vendor ? 'Vendor: ' + r.vendor : '', r.model ? 'Model: ' + r.model : '', r.web_url ? 'Admin: ' + r.web_url : ''].filter(Boolean).join('\n'))}</title>
+            `;
+
+            // Ports — 8 total, right of the brand panel. WAN first, then
+            // LAN (one per connected server), then empty jacks to fill.
+            const totalPorts = 8;
+            const jackW = 32, jackH = routerUnitH - 18;
+            const portStartX = apX + brandW + 16;
+            const jackGap = 6;
+            const portsCY = uy + routerUnitH / 2 + 2;
+            const lanPorts = [];
+            let portsHtml = '';
+
+            for (let pi = 0; pi < totalPorts; pi++) {
+                const px = portStartX + pi * (jackW + jackGap);
+                const py = portsCY - jackH / 2;
+                const jackPath = `M ${px+2},${py+jackH-2} L ${px+2},${py+5} L ${px+5},${py+2} L ${px+jackW-5},${py+2} L ${px+jackW-2},${py+5} L ${px+jackW-2},${py+jackH-2} Z`;
+
+                if (pi === 0) {
+                    // WAN port — gold pins, cable goes to cloud.
+                    portsHtml += `
+                        <path d="${jackPath}" fill="url(#wr-jack)" stroke="#000" stroke-width="0.6"/>
+                        ${Array.from({length:8}).map((_,j) =>
+                            `<line x1="${px+5+j*((jackW-10)/7)}" y1="${py+5}" x2="${px+5+j*((jackW-10)/7)}" y2="${py+jackH-3}" stroke="#fbbf24" stroke-width="0.7" opacity="0.8"/>`
+                        ).join('')}
+                        <circle cx="${px+8}" cy="${py-2}" r="2" fill="url(#wr-led-green)"/>
+                        <circle cx="${px+jackW-8}" cy="${py-2}" r="2" fill="${r.reachable ? 'url(#wr-led-amber)' : 'url(#wr-led-off)'}"/>
+                        <text x="${px+jackW/2}" y="${py+jackH+9}" text-anchor="middle" style="fill:#fbbf24; font-size:8px; font-weight:600;">WAN</text>
+                    `;
+                } else if (pi - 1 < serverCount) {
+                    // LAN port — blue pins, cable from a server's WAN port.
+                    const si = pi - 1;
+                    lanPorts.push({ cx: px + jackW / 2, cy: uy + routerUnitH, nodeIdx: ri.serverIndices[si] });
+                    portsHtml += `
+                        <path d="${jackPath}" fill="url(#wr-jack)" stroke="#000" stroke-width="0.6"/>
+                        ${Array.from({length:8}).map((_,j) =>
+                            `<line x1="${px+5+j*((jackW-10)/7)}" y1="${py+5}" x2="${px+5+j*((jackW-10)/7)}" y2="${py+jackH-3}" stroke="#3b82f6" stroke-width="0.7" opacity="0.7"/>`
+                        ).join('')}
+                        <circle cx="${px+8}" cy="${py-2}" r="2" fill="url(#wr-led-green)"/>
+                        <circle cx="${px+jackW-8}" cy="${py-2}" r="2" fill="url(#wr-led-amber)"/>
+                        <text x="${px+jackW/2}" y="${py+jackH+9}" text-anchor="middle" style="fill:#94a3b8; font-size:8px;">LAN${si}</text>
+                    `;
+                } else {
+                    // Empty port — dark, no LEDs, no label. Looks like an
+                    // unused jack on the back of real network gear.
+                    portsHtml += `
+                        <path d="${jackPath}" fill="rgba(15,23,42,0.7)" stroke="#1e293b" stroke-width="0.5"/>
+                    `;
+                }
+            }
+
+            svg.insertAdjacentHTML('beforeend', chassisHtml + brandHtml + portsHtml);
+            const wanPortCx = portStartX + jackW / 2;
+            routerPortPositions[r.ip] = { wanCx: wanPortCx, wanCy: uy, lanPorts };
         }
 
         // Rack appliances + ports ─────────────────────────────────
