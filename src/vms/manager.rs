@@ -134,11 +134,19 @@ pub struct VmConfig {
     pub memory_mb: u32,
     pub disk_size_gb: u32,
     pub iso_path: Option<String>,
+    // `running` and `auto_start` predate our habit of defaulting every
+    // optional field, so an older VM config written before some later
+    // field existed could fail to deserialize as a whole and silently
+    // drop the VM from the UI list. Defaulting to false on missing
+    // keeps old configs loadable and running is recomputed at list
+    // time from the live process check anyway.
+    #[serde(default)]
     pub running: bool,
     pub vnc_port: Option<u16>,
     #[serde(default)]
     pub vnc_ws_port: Option<u16>,
     pub mac_address: Option<String>,
+    #[serde(default)]
     pub auto_start: bool,
     #[serde(default)]
     pub wolfnet_ip: Option<String>,
@@ -262,26 +270,45 @@ impl VmManager {
             return self.virsh_list_all();
         }
 
-        // Standalone: scan local config files
+        // Standalone: scan local config files. Parse failures are logged
+        // rather than silently swallowed — an un-loggable drop here was
+        // why a user saw a VM vanish from the UI after upgrade while it
+        // was still running and still listed in WolfRun.
         let mut vms = Vec::new();
         if let Ok(entries) = fs::read_dir(&self.base_dir) {
             for entry in entries.flatten() {
-                 let path = entry.path();
-                 if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                     if let Ok(content) = fs::read_to_string(&path) {
-                         if let Ok(mut vm) = serde_json::from_str::<VmConfig>(&content) {
-                             vm.running = self.check_running(&vm.name);
-                             if vm.running {
-                                 vm.vnc_port = self.read_runtime_vnc_port(&vm.name);
-                                 vm.vnc_ws_port = self.read_runtime_ws_port(&vm.name);
-                             } else {
-                                 vm.vnc_port = None;
-                                 vm.vnc_ws_port = None;
-                             }
-                             vms.push(vm);
-                         }
-                     }
-                 }
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
+                // Skip sidecar runtime files — they're plain port metadata,
+                // not VmConfig, so parsing them always fails spuriously.
+                if path.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.ends_with(".runtime.json"))
+                    .unwrap_or(false)
+                { continue; }
+                let content = match fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("Failed to read VM config {}: {}", path.display(), e);
+                        continue;
+                    }
+                };
+                let mut vm = match serde_json::from_str::<VmConfig>(&content) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("Failed to parse VM config {}: {} — the VM will not appear in the list until this is fixed", path.display(), e);
+                        continue;
+                    }
+                };
+                vm.running = self.check_running(&vm.name);
+                if vm.running {
+                    vm.vnc_port = self.read_runtime_vnc_port(&vm.name);
+                    vm.vnc_ws_port = self.read_runtime_ws_port(&vm.name);
+                } else {
+                    vm.vnc_port = None;
+                    vm.vnc_ws_port = None;
+                }
+                vms.push(vm);
             }
         }
         vms
@@ -1194,6 +1221,24 @@ impl VmManager {
              return Err("VM already running".to_string());
         }
 
+        // Reconcile WolfUSB assignments BEFORE QEMU spawns. For a cross-
+        // node assignment (or a just-migrated VM) this is where the
+        // usbip-client systemd unit gets installed+started on this node,
+        // which makes the passthrough USB device appear on the host
+        // before QEMU's `-device usb-host,vendorid=...,productid=...`
+        // runs and tries to bind to it. Without this, a VM migrating
+        // from one node to another would fail at spawn with "usb-host:
+        // device not found" because the usbip mount hadn't been set up
+        // yet. The hook is idempotent — if everything's already wired
+        // up (systemd unit running, dev path present) it's a fast
+        // no-op. It also rewrites wolfusb-config.json with the new
+        // target_node_id on a migration, which is the mechanism that
+        // makes USB assignments follow VMs across nodes.
+        {
+            let self_id = crate::agent::self_node_id();
+            crate::wolfusb::on_container_started(name, "vm", &self_id);
+        }
+
         let config_path = self.vm_config_path(name);
         let log_path = self.base_dir.join(format!("{}.log", name));
 
@@ -1634,7 +1679,6 @@ impl VmManager {
         });
         let runtime_path = self.base_dir.join(format!("{}.runtime.json", name));
         let _ = fs::write(&runtime_path, runtime.to_string());
-        
 
         Ok(())
     }

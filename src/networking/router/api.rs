@@ -84,6 +84,102 @@ fn replicate_config_to_cluster(state: S) {
     });
 }
 
+/// Proxy a read (GET) of `/api/{path}?{query}` to the node that owns a
+/// given resource. Used by per-node read endpoints (lease list, query
+/// log tail) so the user doesn't see empty lists when viewing a LAN
+/// whose dnsmasq lives on a different node.
+///
+/// Mirrors the URL fallback + auth style of the existing
+/// `replicate_config_to_cluster` and top-level `node_proxy`: try HTTPS
+/// on the main port first, then plaintext HTTP on the internal port
+/// (port+1, WolfNet-only), then plaintext HTTP on the main port. Every
+/// attempt carries the cluster secret header so the peer authorises
+/// the request.
+///
+/// Returns an `HttpResponse` that passes through the upstream status
+/// and body. If every URL fails, returns 502 Bad Gateway.
+async fn proxy_router_get_to_node(
+    state: S,
+    node_id: &str,
+    api_path: &str,
+    query_string: &str,
+) -> HttpResponse {
+    let node = match state.cluster.get_node(node_id) {
+        Some(n) => n,
+        None => return HttpResponse::NotFound().body(format!("node {} not found", node_id)),
+    };
+    if node.is_self {
+        return HttpResponse::BadRequest().body("refusing to proxy to self");
+    }
+
+    let qs = if query_string.is_empty() { String::new() } else { format!("?{}", query_string) };
+    let internal_port = node.port + 1;
+    let urls = [
+        format!("https://{}:{}/api/{}{}", node.address, node.port, api_path, qs),
+        format!("http://{}:{}/api/{}{}", node.address, internal_port, api_path, qs),
+        format!("http://{}:{}/api/{}{}", node.address, node.port, api_path, qs),
+    ];
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .danger_accept_invalid_certs(true)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return HttpResponse::InternalServerError()
+            .body(format!("http client build failed: {}", e)),
+    };
+
+    let mut last_err = String::new();
+    for url in &urls {
+        let res = client.get(url)
+            .header("X-WolfStack-Secret", &state.cluster_secret)
+            .send().await;
+        match res {
+            Ok(r) => {
+                let status = r.status();
+                let actix_status = actix_web::http::StatusCode::from_u16(status.as_u16())
+                    .unwrap_or(actix_web::http::StatusCode::BAD_GATEWAY);
+                // Preserve the upstream content type so /leases stays
+                // application/json and /query-log stays JSON too.
+                let content_type = r.headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("application/json")
+                    .to_string();
+                match r.bytes().await {
+                    Ok(body) => {
+                        return HttpResponse::build(actix_status)
+                            .insert_header(("content-type", content_type))
+                            .body(body);
+                    }
+                    Err(e) => { last_err = format!("read body: {}", e); continue; }
+                }
+            }
+            Err(e) => { last_err = format!("{} → {}", url, e); continue; }
+        }
+    }
+    HttpResponse::BadGateway()
+        .body(format!("all upstream URLs failed, last error: {}", last_err))
+}
+
+/// Minimal query-param encoder — only escapes the handful of bytes that
+/// actually break a URL. Sufficient for passing through `?lines=N`
+/// style values we control on both ends.
+fn urlencoding_minimal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.as_bytes() {
+        let c = *byte;
+        if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c == b'.' || c == b'~' {
+            out.push(c as char);
+        } else {
+            out.push_str(&format!("%{:02X}", c));
+        }
+    }
+    out
+}
+
 /// Receive a RouterConfig from another cluster node. Persists it,
 /// re-applies firewall, restarts dnsmasq for any LANs hosted here.
 /// Called by the master/originator after a local edit.
@@ -560,14 +656,22 @@ pub async fn delete_segment(req: HttpRequest, state: S, path: web::Path<String>)
 pub async fn get_leases(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
-    let cfg = state.router.config.read().unwrap();
-    let seg = match cfg.lans.iter().find(|l| l.id == id) {
-        Some(s) => s.clone(),
-        None => return HttpResponse::NotFound().body("LAN not found"),
+    // Snapshot the segment owner, then drop the lock before any await.
+    // Holding a std::sync::RwLock across .await would compile but would
+    // stall any concurrent reader for the full RTT of the remote fetch.
+    let owner_node_id = {
+        let cfg = state.router.config.read().unwrap();
+        match cfg.lans.iter().find(|l| l.id == id) {
+            Some(s) => s.node_id.clone(),
+            None => return HttpResponse::NotFound().body("LAN not found"),
+        }
     };
-    // If this LAN is on a remote node, proxy to it. MVP: local only.
-    if seg.node_id != crate::agent::self_node_id() {
-        return HttpResponse::Ok().json(Vec::<dhcp::Lease>::new());
+    if owner_node_id != crate::agent::self_node_id() {
+        return proxy_router_get_to_node(
+            state, &owner_node_id,
+            &format!("router/segments/{}/leases", id),
+            "",
+        ).await;
     }
     HttpResponse::Ok().json(dhcp::read_leases(&id))
 }
@@ -651,22 +755,27 @@ pub async fn get_query_log(
 ) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
-    let cfg = state.router.config.read().unwrap();
-    let lan = match cfg.lans.iter().find(|l| l.id == id) {
-        Some(s) => s.clone(),
-        None => return HttpResponse::NotFound().body("LAN not found"),
+    // Snapshot fields before any await — see note in get_leases.
+    let (owner_node_id, query_log_enabled) = {
+        let cfg = state.router.config.read().unwrap();
+        match cfg.lans.iter().find(|l| l.id == id) {
+            Some(s) => (s.node_id.clone(), s.dns.query_log),
+            None => return HttpResponse::NotFound().body("LAN not found"),
+        }
     };
-    drop(cfg);
 
-    if lan.node_id != crate::agent::self_node_id() {
-        // Remote node — MVP reports not-available. Could proxy in future.
-        return HttpResponse::Ok().json(serde_json::json!({
-            "enabled": lan.dns.query_log,
-            "lines": [],
-            "error": "Log viewing for remote-node LANs is not yet implemented. Log in to that node directly.",
-        }));
+    if owner_node_id != crate::agent::self_node_id() {
+        // Preserve the caller's ?lines=N query so the remote node trims
+        // the same amount before sending it back.
+        let qs = query.get("lines")
+            .map(|v| format!("lines={}", urlencoding_minimal(v)))
+            .unwrap_or_default();
+        return proxy_router_get_to_node(
+            state, &owner_node_id,
+            &format!("router/segments/{}/query-log", id),
+            &qs,
+        ).await;
     }
-
     let want_lines: usize = query.get("lines").and_then(|s| s.parse().ok()).unwrap_or(200).min(2000);
     let log_path = format!("/var/lib/wolfstack-router/lan-{}.log", id);
     let text = std::fs::read_to_string(&log_path).unwrap_or_default();
@@ -689,7 +798,7 @@ pub async fn get_query_log(
     }
 
     HttpResponse::Ok().json(serde_json::json!({
-        "enabled": lan.dns.query_log,
+        "enabled": query_log_enabled,
         "lines": tail,
         "total_entries": all.len(),
         "unique_clients": unique_clients.into_iter().collect::<Vec<_>>(),
