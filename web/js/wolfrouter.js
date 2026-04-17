@@ -3729,7 +3729,7 @@
         // This produces an accurate "trace the cable" view:
         //   Server WAN port → router LAN port → router WAN port → cloud
         const discoveredRouters = topo.routers || [];
-        const routerUnitH = 42;  // 1U router chassis
+        const routerUnitH = 56;  // 1U router chassis — tall enough for RJ45 jacks + LEDs + labels
         const nodeCount = topo.nodes.length;
 
         // Per-node heights (unchanged formula, just computed up front).
@@ -3740,16 +3740,30 @@
             return baseUnitH + extraRows * oneUH;
         });
 
-        // Group nodes by primary gateway IP. Dedup routers by IP so a
-        // gateway shared by 3 Hetzner boxes shows once, not three times.
+        // Group nodes by primary gateway IP. Use the TOP-LEVEL
+        // topo.routers (backend-deduplicated by IP across all cluster
+        // nodes) as the canonical router list, then match each server
+        // to its gateway by checking the node's own routers[].ip.
+        // This avoids the per-node-dedup pitfall where IPv6 link-local
+        // gateways (fe80::1) or inconsistent array ordering between
+        // nodes caused the same gateway to appear multiple times.
         const gwGroups = new Map();   // gateway_ip → { router, nodeIndices: [] }
         const noGwNodes = [];         // indices of nodes with no gateway
+
+        // Seed groups from the deduplicated router list.
+        for (const r of discoveredRouters) {
+            if (r.ip && !gwGroups.has(r.ip)) {
+                gwGroups.set(r.ip, { router: r, nodeIndices: [] });
+            }
+        }
+
+        // Assign each node to its primary gateway group.
         topo.nodes.forEach((node, idx) => {
-            const gw = (node.routers || [])[0];
-            if (gw && gw.ip) {
-                if (!gwGroups.has(gw.ip)) {
-                    gwGroups.set(gw.ip, { router: gw, nodeIndices: [] });
-                }
+            // Find this node's first IPv4 gateway (skip fe80:: link-local —
+            // those are per-interface and aren't the "real" upstream router
+            // the user sees in their network).
+            const gw = (node.routers || []).find(r => r.ip && !r.ip.startsWith('fe80'));
+            if (gw && gwGroups.has(gw.ip)) {
                 gwGroups.get(gw.ip).nodeIndices.push(idx);
             } else {
                 noGwNodes.push(idx);
@@ -3757,10 +3771,11 @@
         });
 
         // Build the rack item sequence: [router, server, server, …, router, server, …, ungrouped servers].
-        // Each item has a type ('router'|'server'), a height, and
-        // enough info to render + cable later.
+        // Skip gateway groups with no servers (e.g. IPv6-only gateways
+        // that no node matched to after the fe80 filter above).
         const rackItems = [];
         for (const [, grp] of gwGroups) {
+            if (!grp.nodeIndices.length) continue;
             rackItems.push({ type: 'router', router: grp.router, height: routerUnitH, serverIndices: grp.nodeIndices });
             for (const idx of grp.nodeIndices) {
                 rackItems.push({ type: 'server', nodeIdx: idx, height: nodeHeights[idx], gatewayIp: grp.router.ip });
@@ -3922,29 +3937,50 @@
                 </g>
             `);
 
-            // WAN port icon (top-left of router chassis) — cable target for cloud.
-            const wanPx = apX + 50, wanPy = uy;
+            // ─── RJ45-style ports on the router chassis ───
+            // Same visual language as the server ports (trapezoidal
+            // jacks with contact pins) so routers and servers look like
+            // they belong in the same rack. WAN port on the left, LAN
+            // ports on the right — matches how most rack-mount routers
+            // lay out their rear panel.
+            const jackW = 32, jackH = routerUnitH - 12;
+            const portsCY = uy + routerUnitH / 2;
+
+            // WAN port (left side) — cable goes UP to cloud.
+            const wanPx = apX + 40;
+            const wanPy = portsCY - jackH / 2;
+            const wanJackPath = `M ${wanPx+2},${wanPy+jackH-2} L ${wanPx+2},${wanPy+6} L ${wanPx+5},${wanPy+2} L ${wanPx+jackW-5},${wanPy+2} L ${wanPx+jackW-2},${wanPy+6} L ${wanPx+jackW-2},${wanPy+jackH-2} Z`;
             svg.insertAdjacentHTML('beforeend', `
-                <rect x="${wanPx - 6}" y="${wanPy - 2}" width="12" height="6" rx="1.5"
-                      fill="#fbbf24" opacity="0.6"/>
-                <text x="${wanPx}" y="${wanPy - 5}" text-anchor="middle" style="fill:#fbbf24; font-size:8px; font-weight:600;">WAN</text>
+                <path d="${wanJackPath}" fill="url(#wr-jack)" stroke="#000" stroke-width="0.6"/>
+                ${Array.from({length:8}).map((_,j) =>
+                    `<line x1="${wanPx+5+j*((jackW-10)/7)}" y1="${wanPy+6}" x2="${wanPx+5+j*((jackW-10)/7)}" y2="${wanPy+jackH-4}" stroke="#fbbf24" stroke-width="0.7" opacity="0.7"/>`
+                ).join('')}
+                <circle cx="${wanPx+8}" cy="${wanPy-2}" r="2" fill="url(#wr-led-green)"/>
+                <circle cx="${wanPx+jackW-8}" cy="${wanPy-2}" r="2" fill="${r.reachable ? 'url(#wr-led-amber)' : 'url(#wr-led-off)'}"/>
+                <text x="${wanPx+jackW/2}" y="${wanPy+jackH+10}" text-anchor="middle" style="fill:#fbbf24; font-size:9px; font-weight:600;">WAN</text>
             `);
 
-            // LAN port positions along the bottom edge — one per server in this gateway group.
+            // LAN ports (right side, one per server in this gateway group).
             const lanPorts = [];
             const serverCount = ri.serverIndices.length;
-            const lanStartX = apX + apW * 0.4;
-            const lanSpacing = Math.min(60, (apW * 0.55) / Math.max(serverCount, 1));
+            const lanStartX = apX + apW * 0.35;
+            const lanSpacing = Math.min(jackW + 16, (apW * 0.6) / Math.max(serverCount, 1));
             for (let si = 0; si < serverCount; si++) {
                 const lpx = lanStartX + si * lanSpacing;
-                const lpy = uy + routerUnitH;
-                lanPorts.push({ cx: lpx, cy: lpy, nodeIdx: ri.serverIndices[si] });
+                const lpy = portsCY - jackH / 2;
+                lanPorts.push({ cx: lpx + jackW / 2, cy: uy + routerUnitH, nodeIdx: ri.serverIndices[si] });
+                const lanJackPath = `M ${lpx+2},${lpy+jackH-2} L ${lpx+2},${lpy+6} L ${lpx+5},${lpy+2} L ${lpx+jackW-5},${lpy+2} L ${lpx+jackW-2},${lpy+6} L ${lpx+jackW-2},${lpy+jackH-2} Z`;
                 svg.insertAdjacentHTML('beforeend', `
-                    <rect x="${lpx - 6}" y="${lpy - 4}" width="12" height="6" rx="1.5"
-                          fill="#3b82f6" opacity="0.5"/>
+                    <path d="${lanJackPath}" fill="url(#wr-jack)" stroke="#000" stroke-width="0.6"/>
+                    ${Array.from({length:8}).map((_,j) =>
+                        `<line x1="${lpx+5+j*((jackW-10)/7)}" y1="${lpy+6}" x2="${lpx+5+j*((jackW-10)/7)}" y2="${lpy+jackH-4}" stroke="#3b82f6" stroke-width="0.7" opacity="0.7"/>`
+                    ).join('')}
+                    <circle cx="${lpx+8}" cy="${lpy-2}" r="2" fill="url(#wr-led-green)"/>
+                    <circle cx="${lpx+jackW-8}" cy="${lpy-2}" r="2" fill="url(#wr-led-amber)"/>
+                    <text x="${lpx+jackW/2}" y="${lpy+jackH+10}" text-anchor="middle" style="fill:#94a3b8; font-size:8px;">LAN${si}</text>
                 `);
             }
-            routerPortPositions[r.ip] = { wanCx: wanPx, wanCy: wanPy, lanPorts };
+            routerPortPositions[r.ip] = { wanCx: wanPx + jackW / 2, wanCy: uy, lanPorts };
         }
 
         // Rack appliances + ports ─────────────────────────────────

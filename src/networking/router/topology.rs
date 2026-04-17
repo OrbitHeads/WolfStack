@@ -291,6 +291,12 @@ pub fn discover_routers() -> Vec<DiscoveredRouter> {
             Some(g) if !g.is_empty() => g.to_string(),
             _ => continue,
         };
+        // Skip IPv6 link-local gateways (fe80::) — they're per-interface
+        // artifacts, not real upstream routers the user wants to see in
+        // the rack. They can't be probed via HTTP without %iface scope
+        // notation, and they all resolve to the same physical device as
+        // the IPv4 gateway anyway.
+        if gw.starts_with("fe80") { continue; }
         if !seen.insert(gw.clone()) { continue; }
         routers.push(probe_router(&gw));
     }
