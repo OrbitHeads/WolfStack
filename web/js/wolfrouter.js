@@ -3975,6 +3975,7 @@
             // Ports — 8 total, right of the brand panel. WAN first, then
             // LAN (one per connected server), then empty jacks to fill.
             const totalPorts = 8;
+            const serverCount = ri.serverIndices.length;
             const jackW = 32, jackH = routerUnitH - 18;
             const portStartX = apX + brandW + 16;
             const jackGap = 6;
