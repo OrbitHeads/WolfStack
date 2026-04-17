@@ -13488,6 +13488,9 @@ async function openLxcSettings(name) {
                                     <input type="text" class="form-control lxc-nic-field" data-nic="${nic.index}" data-field="vlan" value="${escapeHtml(nic.vlan)}" placeholder="None">
                                 </div>
                             </div>
+                            <div style="display:flex;justify-content:flex-end;margin-top:10px;">
+                                <button class="btn btn-sm btn-primary" onclick="saveLxcSettings('${name}')">💾 Save Settings</button>
+                            </div>
                         </div>
                     </div>
                 `).join('')}
@@ -13620,8 +13623,13 @@ async function openLxcSettings(name) {
                 </details>
             </div>
 
-            <!-- Save/Cancel Bar -->
-            <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px;padding-top:12px;border-top:1px solid var(--border);">
+            <!-- Save/Cancel Bar — sticky at the bottom so it's always
+                 visible even when a NIC editor or raw-config textarea
+                 pushes the page way past the fold. Users were missing
+                 the button entirely because expanding the Network tab's
+                 NIC editor scrolled it off-screen with no hint that
+                 "scroll further down to save" was needed. -->
+            <div style="position:sticky;bottom:0;display:flex;justify-content:flex-end;gap:8px;padding:12px 0;border-top:1px solid var(--border);background:var(--bg-primary,#1e1e2e);z-index:10;">
                 <button class="btn btn-sm" onclick="closeContainerDetail()">Cancel</button>
                 <button class="btn btn-sm btn-primary" onclick="saveLxcSettings('${name}')">💾 Save Settings</button>
             </div>
