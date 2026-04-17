@@ -15785,21 +15785,34 @@ function selectLxcTemplate(distro, release, arch, variant) {
             }
         });
 
-    // Fetch WolfNet status and suggest an IP
+    // Fetch WolfNet status and suggest an IP. Also updates the
+    // network preview line so the user sees the exact IP their
+    // container will get BEFORE they click Create.
     fetch(apiUrl('/api/wolfnet/status'))
         .then(r => r.json())
         .then(status => {
             const statusEl = document.getElementById('lxc-wolfnet-status');
             const ipInput = document.getElementById('lxc-wolfnet-ip');
+            const preview = document.getElementById('lxc-net-preview');
             if (status.available) {
-                statusEl.innerHTML = '<span style="color:var(--success);">● Active</span> — ' + status.subnet;
+                statusEl.innerHTML = '<span style="color:var(--success);">● Active</span> — subnet ' + status.subnet;
                 ipInput.value = status.next_available_ip;
                 ipInput.placeholder = status.next_available_ip;
+                if (preview) preview.innerHTML = `This container will be reachable at <code>${status.next_available_ip}</code> via WolfNet from every cluster node.`;
+                // Keep preview in sync if user types a different IP.
+                ipInput.addEventListener('input', () => {
+                    if (preview && (document.getElementById('lxc-net-mode')?.value || 'wolfnet') === 'wolfnet') {
+                        preview.innerHTML = `This container will be reachable at <code>${ipInput.value || status.next_available_ip}</code> via WolfNet from every cluster node.`;
+                    }
+                });
             } else {
-                statusEl.innerHTML = '<span style="color:var(--text-muted);">● Not available</span>';
+                statusEl.innerHTML = '<span style="color:var(--text-muted);">● Not available</span> — <a href="#" onclick="selectView(\'networking\'); return false;" style="color:var(--primary);">set up WolfNet first</a>';
                 ipInput.value = '';
                 ipInput.placeholder = 'WolfNet not running';
                 ipInput.disabled = true;
+                // Auto-switch to bridge mode if WolfNet isn't available —
+                // don't leave the user on a broken default.
+                if (typeof lxcSelectNetPreset === 'function') lxcSelectNetPreset('bridge');
             }
         })
         .catch(() => {

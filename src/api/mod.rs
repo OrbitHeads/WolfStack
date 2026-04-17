@@ -3275,10 +3275,20 @@ pub async fn lxc_create(
 ) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
 
-    // Auto-assign WolfNet IP if not specified but WolfNet is available
-    let wolfnet_ip = match body.wolfnet_ip.as_deref() {
-        Some(ip) if !ip.is_empty() => Some(ip.to_string()),
-        _ => containers::next_available_wolfnet_ip(),
+    // Auto-assign WolfNet IP only when the user chose WolfNet mode (or
+    // no mode = legacy/default). Bridge and Host modes explicitly don't
+    // want a WolfNet IP — auto-assigning one from the pool was a bug
+    // that burned addresses the user never intended to use and
+    // confused the "simple WolfNet setup" path by attaching WolfNet
+    // even on bridge-mode containers.
+    let net_mode = body.network_mode.as_deref().unwrap_or("wolfnet");
+    let wolfnet_ip = if net_mode == "wolfnet" || net_mode.is_empty() {
+        match body.wolfnet_ip.as_deref() {
+            Some(ip) if !ip.is_empty() => Some(ip.to_string()),
+            _ => containers::next_available_wolfnet_ip(),
+        }
+    } else {
+        None
     };
 
     // On Proxmox, pct_create handles password, memory, and CPU natively
