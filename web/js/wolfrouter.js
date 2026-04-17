@@ -4202,7 +4202,12 @@
             if (!rp) continue;
             const x1 = rp.wanCx, y1 = rp.wanCy;
             const sx = spineX + spineSlot * 3;
-            const path = `M ${x1},${y1} V ${rackY + ri.y - 4} H ${sx} V ${rackY - 6} H ${cloudCX} V ${cloudCY + 30}`;
+            // UP from WAN port to just above the chassis, LEFT to
+            // spine, UP along spine to rack exit, RIGHT to cloud
+            // center, UP to cloud bottom. Previous version went DOWN
+            // first then UP, creating a U-bend that crossed itself.
+            const clearY = rackY + ri.y - 6;  // just above this router's top edge
+            const path = `M ${x1},${y1} V ${clearY} H ${sx} V ${rackY - 6} H ${cloudCX} V ${cloudCY + 30}`;
             cables.push({ path, color: '#fbbf24', bps: 1, kind: 'wan-uplink', cableKey: 'gw::' + ri.router.ip });
             spineSlot++;
         }
