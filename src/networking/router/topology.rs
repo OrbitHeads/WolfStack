@@ -318,25 +318,33 @@ fn probe_router(ip: &str) -> DiscoveredRouter {
         reachable: false,
     };
 
-    // Try HTTPS then HTTP with a short timeout. curl -D - writes
-    // response headers to stdout (NOT stderr) when combined with
-    // -o /dev/null. The -w write-out string is also appended to
-    // stdout. So everything we need to fingerprint is in stdout.
-    for scheme in &["https", "http"] {
+    // Try HTTP first — most consumer routers (Mecusys, TP-Link,
+    // Netgear, etc) only have HTTP; trying HTTPS first wastes the
+    // 2s timeout on a connection that will never complete. Use `-i`
+    // so curl outputs headers + body together — we need BOTH the
+    // Server header AND the <title> tag to identify the vendor.
+    // The old `-o /dev/null` approach discarded the body entirely,
+    // which meant routers whose identity was only in the page title
+    // (not in the Server header) showed as "unknown" or worse, the
+    // dig error output leaked through as the name.
+    for scheme in &["http", "https"] {
         let url = format!("{}://{}", scheme, ip);
         let out = std::process::Command::new("curl")
-            .args(["-skL", "--max-time", "2",
-                   "-D", "-",           // dump headers to stdout
-                   "-o", "/dev/null",   // discard body
-                   &url])
+            .args(["-skLi", "--max-time", "2", &url])
             .output();
         if let Ok(o) = out {
-            let text = String::from_utf8_lossy(&o.stdout).to_string();
+            // Cap at 8KB — enough for headers + <title>. Avoids
+            // buffering a 2MB router firmware-update page.
+            let raw = &o.stdout[..o.stdout.len().min(8192)];
+            let text = String::from_utf8_lossy(raw).to_string();
             if !text.is_empty() {
                 router.reachable = true;
                 router.web_url = url.clone();
                 identify_vendor(&text, &mut router);
-                if !router.vendor.is_empty() { break; }
+                // Stop probing once we have a name (not just the IP).
+                if !router.vendor.is_empty() || (router.name != ip && !router.name.is_empty()) {
+                    break;
+                }
             }
         }
     }
@@ -351,15 +359,26 @@ fn probe_router(ip: &str) -> DiscoveredRouter {
         }
     }
 
-    // Reverse DNS as a last-resort name.
+    // Reverse DNS as a last-resort name. Filter out dig error
+    // messages (lines starting with ";;") which leak through as the
+    // router name when the DNS server is unreachable — the user was
+    // seeing ";; communications error to xxx ;; no servers could be
+    // reached" as the router label in the rack view.
     if router.name == router.ip {
         if let Ok(o) = std::process::Command::new("dig")
             .args(["+short", "-x", ip, "+time=1", "+tries=1"])
             .output()
         {
-            let rdns = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let rdns: String = String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| !l.trim_start().starts_with(";;"))
+                .collect::<Vec<_>>()
+                .join("")
+                .trim()
+                .trim_end_matches('.')
+                .to_string();
             if !rdns.is_empty() && rdns != ip {
-                router.name = rdns.trim_end_matches('.').to_string();
+                router.name = rdns;
             }
         }
     }
@@ -425,6 +444,21 @@ fn identify_vendor(text: &str, router: &mut DiscoveredRouter) {
         }),
         ("draytek", "DrayTek", |title, _| {
             ("DrayTek".into(), title.as_deref().unwrap_or("DrayTek Vigor").to_string())
+        }),
+        ("mercusys", "Mercusys", |title, _| {
+            ("Mercusys".into(), title.as_deref().unwrap_or("Mercusys").to_string())
+        }),
+        ("merc", "Mercusys", |title, _| {
+            ("Mercusys".into(), title.as_deref().unwrap_or("Mercusys").to_string())
+        }),
+        ("tenda", "Tenda", |title, _| {
+            ("Tenda".into(), title.as_deref().unwrap_or("Tenda").to_string())
+        }),
+        ("huawei", "Huawei", |title, _| {
+            ("Huawei".into(), title.as_deref().unwrap_or("Huawei").to_string())
+        }),
+        ("zyxel", "ZyXEL", |title, _| {
+            ("ZyXEL".into(), title.as_deref().unwrap_or("ZyXEL").to_string())
         }),
     ];
 
