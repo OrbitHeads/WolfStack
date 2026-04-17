@@ -13,6 +13,7 @@ use std::time::Duration;
 
 /// Quick-and-dirty upstream check — `dig +short @<forwarder> example.com`
 /// with a tight timeout. Returns the responding forwarder or None.
+#[allow(dead_code)]
 pub fn probe_forwarder(forwarder: &str) -> Option<Duration> {
     use std::time::Instant;
     let start = Instant::now();
@@ -29,6 +30,7 @@ pub fn probe_forwarder(forwarder: &str) -> Option<Duration> {
 
 /// List every local DNS record across every LAN served by this node —
 /// used by the UI to show "what hostnames can this cluster resolve?"
+#[allow(dead_code)]
 pub fn cluster_local_records(config: &RouterConfig) -> Vec<(String, LocalDnsRecord)> {
     let mut out = Vec::new();
     for lan in &config.lans {

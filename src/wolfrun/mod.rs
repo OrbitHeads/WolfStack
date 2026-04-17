@@ -493,6 +493,7 @@ impl WolfRunState {
     /// used by the UI to warn users before they delete a container
     /// that will just be reconciled back into existence by this
     /// service. Returns the list of (service_id, service_name) pairs.
+    #[allow(dead_code)]
     pub fn services_managing(&self, container_name: &str) -> Vec<(String, String)> {
         self.services.read().unwrap().iter()
             .filter(|s| s.instances.iter().any(|i| i.container_name == container_name))

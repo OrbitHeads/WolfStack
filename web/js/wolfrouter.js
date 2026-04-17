@@ -4180,36 +4180,41 @@
             }
         }
 
-        // WAN cables — two kinds now:
+        // WAN cables — spine routing pattern for clean large installs.
         //
-        // 1. Server WAN port → router LAN port (short internal cable
-        //    within the rack, for servers with a detected gateway)
-        // 2. Router WAN port → cloud (uplink cable, one per gateway)
-        // 3. Server WAN port → cloud (direct, for servers with NO
-        //    detected gateway — the legacy path)
+        // Every cable runs: port → UP → LEFT to the rack rail → UP
+        // along the rail to the target. This collects all cables on
+        // the left edge so they don't cross each other horizontally
+        // in the middle of the rack. On a 4-server setup the
+        // difference is dramatic — no spaghetti.
         //
-        // This traces the real traffic flow: server → router → internet.
+        // Three cable types:
+        //   1. Router WAN port → cloud (uplink)
+        //   2. Server WAN port → router LAN port (through the rack)
+        //   3. Server WAN port → cloud (direct, no gateway)
         const cables = [];
-        let wanRailIdx = 0;
+        const spineX = rackX + 8;  // left rack rail inner edge
+        let spineSlot = 0;         // stagger each cable 3px apart on the spine
 
-        // Router WAN port → cloud cables (one per gateway).
+        // Router WAN port → cloud.
         for (const ri of routerItems) {
             const rp = routerPortPositions[ri.router.ip];
             if (!rp) continue;
             const x1 = rp.wanCx, y1 = rp.wanCy;
-            const railY = rackY - 10 - (wanRailIdx * 6);
-            const x2 = cloudCX, y2 = cloudCY + 30;
-            const path = `M ${x1},${y1} V ${railY} H ${x2} V ${y2}`;
+            const sx = spineX + spineSlot * 3;
+            const path = `M ${x1},${y1} V ${rackY + ri.y - 4} H ${sx} V ${rackY - 6} H ${cloudCX} V ${cloudCY + 30}`;
             cables.push({ path, color: '#fbbf24', bps: 1, kind: 'wan-uplink', cableKey: 'gw::' + ri.router.ip });
-            wanRailIdx++;
+            spineSlot++;
         }
 
-        // Server WAN ports → either router LAN port or cloud.
+        // Server WAN ports.
         for (const node of topo.nodes) {
             for (const port of (portsByNode[node.node_id] || [])) {
                 if (port.role !== 'wan' || !port.link_up) continue;
                 const x1 = port.cx, y1 = port.portTop;
                 const chassisTop = port.chassisTop ?? (port.portTop - 30);
+                const sx = spineX + spineSlot * 3;
+                const cableKey = node.node_id + '::' + port.name;
 
                 // Find the server's gateway group.
                 const gwIp = rackItems.find(ri => ri.type === 'server' && topo.nodes[ri.nodeIdx]?.node_id === node.node_id)?.gatewayIp;
@@ -4217,19 +4222,15 @@
                 const lanPort = rp?.lanPorts?.find(lp => lp.nodeIdx === topo.nodes.findIndex(n => n.node_id === node.node_id));
 
                 if (lanPort) {
-                    // Cable from server WAN port UP to the router's LAN port.
-                    const railY = chassisTop - 8 - (wanRailIdx * 4);
-                    const path = `M ${x1},${y1} V ${railY} H ${lanPort.cx} V ${lanPort.cy}`;
-                    const cableKey = node.node_id + '::' + port.name;
+                    // Server → LEFT to spine → UP to router LAN port row → RIGHT to port.
+                    const path = `M ${x1},${y1} V ${chassisTop - 6} H ${sx} V ${lanPort.cy + 4} H ${lanPort.cx} V ${lanPort.cy}`;
                     cables.push({ path, color: port.color, bps: port.bps, kind: 'wan', cableKey });
                 } else {
-                    // No gateway detected — direct cable to cloud.
-                    const railY = chassisTop - 14 - (wanRailIdx * 6);
-                    const path = `M ${x1},${y1} V ${railY} H ${cloudCX} V ${cloudCY + 30}`;
-                    const cableKey = node.node_id + '::' + port.name;
+                    // No gateway — spine route direct to cloud.
+                    const path = `M ${x1},${y1} V ${chassisTop - 6} H ${sx} V ${rackY - 6} H ${cloudCX} V ${cloudCY + 30}`;
                     cables.push({ path, color: port.color, bps: port.bps, kind: 'wan', cableKey });
                 }
-                wanRailIdx++;
+                spineSlot++;
             }
         }
         // (No more port "patch tails" — they overlapped the iface name

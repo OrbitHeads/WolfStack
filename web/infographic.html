@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=1080">
+<title>WolfStack Infographic</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700;800;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+
+  :root {
+    --bg: #0A0E1A;
+    --bg2: #111827;
+    --red: #DC2626;
+    --red-light: #EF4444;
+    --red-glow: rgba(220,38,38,0.35);
+    --white: #F0F2F8;
+    --muted: #6B7494;
+    --subtle: #1E2A4A;
+  }
+
+  body {
+    width: 1080px;
+    height: 1350px;
+    background: var(--bg);
+    font-family: 'Outfit', sans-serif;
+    color: var(--white);
+    overflow: hidden;
+    position: relative;
+  }
+
+  /* ── Atmosphere ── */
+  body::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background:
+      radial-gradient(ellipse 900px 500px at 50% 0%, rgba(220,38,38,0.08) 0%, transparent 70%),
+      radial-gradient(ellipse 600px 400px at 80% 85%, rgba(220,38,38,0.05) 0%, transparent 70%),
+      radial-gradient(ellipse 400px 300px at 10% 60%, rgba(59,130,246,0.03) 0%, transparent 70%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* Subtle grid texture */
+  body::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.015) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.015) 1px, transparent 1px);
+    background-size: 60px 60px;
+    mask-image: radial-gradient(ellipse 80% 70% at 50% 40%, black 30%, transparent 80%);
+    -webkit-mask-image: radial-gradient(ellipse 80% 70% at 50% 40%, black 30%, transparent 80%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .frame {
+    position: relative;
+    z-index: 1;
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    padding: 56px 64px 48px;
+  }
+
+  /* ── Logo ── */
+  .logo-row {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    margin-bottom: 8px;
+  }
+
+  .logo-row svg {
+    height: 62px;
+    width: auto;
+  }
+
+  /* ── Tagline ── */
+  .tagline {
+    font-size: 21px;
+    font-weight: 300;
+    letter-spacing: 0.5px;
+    color: var(--muted);
+    margin-bottom: 44px;
+  }
+
+  /* ── Hero ── */
+  .hero {
+    margin-bottom: 48px;
+  }
+
+  .hero h1 {
+    font-size: 52px;
+    font-weight: 900;
+    line-height: 1.08;
+    letter-spacing: -1.5px;
+    max-width: 820px;
+  }
+
+  .hero h1 .accent {
+    background: linear-gradient(135deg, var(--red) 0%, var(--red-light) 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .hero p {
+    margin-top: 18px;
+    font-size: 19px;
+    font-weight: 300;
+    line-height: 1.65;
+    color: #9CA3BF;
+    max-width: 780px;
+  }
+
+  /* ── Stat Strip ── */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+    margin-bottom: 48px;
+  }
+
+  .stat {
+    background: linear-gradient(160deg, rgba(30,42,74,0.55) 0%, rgba(17,24,39,0.65) 100%);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 16px;
+    padding: 24px 20px 22px;
+    text-align: center;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .stat::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, transparent, var(--red), transparent);
+    opacity: 0.7;
+  }
+
+  .stat .num {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 38px;
+    font-weight: 600;
+    color: var(--white);
+    line-height: 1;
+    margin-bottom: 6px;
+  }
+
+  .stat .num .plus {
+    color: var(--red-light);
+    font-weight: 400;
+  }
+
+  .stat .label {
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1.8px;
+    color: var(--muted);
+  }
+
+  /* ── Divider ── */
+  .divider {
+    height: 1px;
+    background: linear-gradient(90deg, transparent 0%, var(--subtle) 20%, var(--red) 50%, var(--subtle) 80%, transparent 100%);
+    margin-bottom: 44px;
+    opacity: 0.5;
+  }
+
+  /* ── Features ── */
+  .features-title {
+    font-size: 13px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 3px;
+    color: var(--red-light);
+    margin-bottom: 28px;
+  }
+
+  .features {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px 28px;
+    margin-bottom: auto;
+  }
+
+  .feat {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    padding: 14px 16px;
+    border-radius: 12px;
+    background: rgba(17,24,39,0.4);
+    border: 1px solid rgba(255,255,255,0.03);
+  }
+
+  .feat-icon {
+    flex-shrink: 0;
+    width: 38px;
+    height: 38px;
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    background: rgba(220,38,38,0.1);
+    border: 1px solid rgba(220,38,38,0.2);
+  }
+
+  .feat-text h3 {
+    font-size: 15.5px;
+    font-weight: 700;
+    letter-spacing: -0.2px;
+    margin-bottom: 3px;
+  }
+
+  .feat-text p {
+    font-size: 12.5px;
+    font-weight: 400;
+    color: var(--muted);
+    line-height: 1.45;
+  }
+
+  /* ── Replaces Strip ── */
+  .replaces {
+    margin-top: 40px;
+    padding: 20px 28px;
+    border-radius: 14px;
+    background: linear-gradient(135deg, rgba(220,38,38,0.08) 0%, rgba(17,24,39,0.6) 100%);
+    border: 1px solid rgba(220,38,38,0.15);
+    display: flex;
+    align-items: center;
+    gap: 20px;
+  }
+
+  .replaces-label {
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    color: var(--red-light);
+    white-space: nowrap;
+  }
+
+  .replaces-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  .replaces-list span {
+    font-size: 13px;
+    font-weight: 600;
+    color: #8892A8;
+    padding: 5px 14px;
+    border-radius: 20px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.07);
+    text-decoration: line-through;
+    text-decoration-color: rgba(220,38,38,0.5);
+    text-decoration-thickness: 1.5px;
+  }
+
+  /* ── Footer ── */
+  .footer {
+    margin-top: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-top: 24px;
+    border-top: 1px solid rgba(255,255,255,0.06);
+  }
+
+  .footer-url {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 20px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    color: var(--white);
+  }
+
+  .footer-url .slash {
+    color: var(--red);
+  }
+
+  .footer-meta {
+    text-align: right;
+  }
+
+  .footer-meta .license {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--muted);
+    letter-spacing: 0.5px;
+  }
+
+  .footer-meta .install {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11.5px;
+    color: #4B5574;
+    margin-top: 4px;
+  }
+
+  /* ── Corner Accents ── */
+  .corner {
+    position: absolute;
+    width: 40px;
+    height: 40px;
+    z-index: 2;
+  }
+  .corner::before, .corner::after {
+    content: '';
+    position: absolute;
+    background: var(--red);
+    opacity: 0.25;
+  }
+  .corner-tl { top: 28px; left: 28px; }
+  .corner-tl::before { top:0;left:0;width:20px;height:2px; }
+  .corner-tl::after { top:0;left:0;width:2px;height:20px; }
+  .corner-tr { top: 28px; right: 28px; }
+  .corner-tr::before { top:0;right:0;width:20px;height:2px; }
+  .corner-tr::after { top:0;right:0;width:2px;height:20px; }
+  .corner-bl { bottom: 28px; left: 28px; }
+  .corner-bl::before { bottom:0;left:0;width:20px;height:2px; }
+  .corner-bl::after { bottom:0;left:0;width:2px;height:20px; }
+  .corner-br { bottom: 28px; right: 28px; }
+  .corner-br::before { bottom:0;right:0;width:20px;height:2px; }
+  .corner-br::after { bottom:0;right:0;width:2px;height:20px; }
+</style>
+</head>
+<body>
+
+<div class="corner corner-tl"></div>
+<div class="corner corner-tr"></div>
+<div class="corner corner-bl"></div>
+<div class="corner corner-br"></div>
+
+<div class="frame">
+
+  <!-- Logo -->
+  <div class="logo-row">
+    <svg width="320" height="68" viewBox="0 0 900 190" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path d="M35.0807 6.41666C34.0733 6.77203 33.2635 7.58148 32.8882 8.56863C32.6906 9.14117 32.5129 11.2142 32.2956 15.4984C31.861 24.0274 30.9919 40.9866 30.6166 47.9756C30.5178 49.9893 30.34 53.5825 30.2215 55.9714C29.9252 61.8746 29.9252 61.9141 29.2734 62.151C27.3178 62.8815 14.6562 68.7846 14.2809 69.14C13.5895 69.7915 13.4118 70.2061 12.2859 73.7401C11.7328 75.4775 10.2908 79.9986 9.08587 83.809C3.73283 100.551 4.14764 99.0703 4.5822 100.314C4.918 101.281 5.47109 101.953 6.28096 102.427C6.73528 102.663 10.5871 103.572 16.592 104.855C21.866 105.961 26.2314 106.928 26.3302 107.007C26.4092 107.066 25.8956 108.725 25.2043 110.679C21.9648 119.84 21.866 120.156 22.1228 121.261C22.4191 122.485 23.4265 123.67 24.4537 124.006C25.1648 124.243 30.6363 124.183 38.1424 123.848L41.0066 123.729L41.2437 124.302C41.3622 124.618 42.0338 126.473 42.7449 128.428C44.4041 133.028 50.7053 150.461 53.7868 158.931C56.5522 166.532 56.5127 166.453 59.2583 167.657C60.8781 168.348 69.9052 172.376 81.8754 177.726C88.8087 180.846 89.3223 181.043 90.1322 181.043C90.8828 181.023 91.0606 180.964 99.4556 177.193C108.522 173.146 114.646 170.402 118.813 168.565C122.586 166.887 123.495 166.334 123.929 165.486C124.068 165.189 124.7 163.531 125.332 161.794C125.944 160.056 126.971 157.213 127.603 155.476C128.236 153.738 130.606 147.243 132.838 141.064C135.07 134.864 137.421 128.448 138.033 126.77L139.139 123.729L141.727 123.867C143.129 123.927 146.744 124.045 149.727 124.104C155.001 124.243 155.179 124.223 155.969 123.828C157.035 123.275 157.707 122.466 158.023 121.301C158.319 120.235 158.438 120.63 155.317 111.745C154.408 109.198 153.756 107.066 153.835 107.007C153.914 106.928 158.28 105.961 163.554 104.835C168.828 103.73 173.371 102.703 173.648 102.565C174.615 102.051 175.386 101.064 175.623 99.9982C175.84 99.0505 175.801 98.8334 175.149 96.7209C174.418 94.332 170.764 82.8416 169.48 78.8733C169.065 77.5702 168.255 75.0629 167.702 73.286C166.616 69.8705 166.141 69.0413 164.877 68.449C164.541 68.2713 162.033 67.0472 159.307 65.7245C156.601 64.4017 153.46 62.9012 152.354 62.3682C150.793 61.6377 150.319 61.3218 150.24 60.9664C150.181 60.7097 150.082 59.3475 150.023 57.9457C149.964 56.5242 149.786 52.8915 149.628 49.8511C149.47 46.8107 149.253 42.5068 149.134 40.2758C149.035 38.0449 148.897 35.5177 148.838 34.6491C148.779 33.7804 148.601 30.4438 148.443 27.2455C147.672 12.0631 147.514 9.5163 147.337 8.78581C146.942 7.36432 145.243 6.12051 143.682 6.12051C142.813 6.12051 141.786 6.67331 137.282 9.63475C134.734 11.3327 131.258 13.6031 129.579 14.7087C127.9 15.8143 124.522 18.0255 122.073 19.6444C119.623 21.2634 116.127 23.5733 114.27 24.7776C112.433 25.9819 108.641 28.4695 105.875 30.3056C99.2185 34.6886 94.3593 37.8869 91.989 39.4268L90.0532 40.6707L88.4334 39.6243C87.5445 39.032 84.5421 37.0577 81.7767 35.2413C76.878 32.0035 73.1249 29.5356 65.5398 24.5407C57.3621 19.1903 54.1028 17.0384 51.3572 15.2417C49.7769 14.1954 46.2807 11.9052 43.5547 10.1086C40.8486 8.31198 38.2807 6.69305 37.8264 6.49564C36.898 6.06128 36.1276 6.04155 35.0807 6.41666Z" fill="white"/>
+      <path d="M52.029 85.5659C51.9105 85.862 55.8413 95.6348 56.908 97.767C57.5993 99.1293 57.224 98.9713 68.8585 102.644C70.5967 103.196 72.177 103.65 72.335 103.65C72.8881 103.65 72.8683 103.157 72.2757 101.36C71.1893 98.1224 69.3918 95.2596 66.6659 92.4167C62.7943 88.3694 58.2314 85.9805 53.2932 85.3882C52.3253 85.2697 52.1278 85.2895 52.029 85.5659Z" fill="white"/>
+      <path d="M124.641 85.6647C117.925 87.0862 111.92 91.9825 108.463 98.8333C107.594 100.571 106.765 103.137 106.962 103.453C107.16 103.769 107.495 103.71 111.169 102.545C113.085 101.933 116.088 101.005 117.826 100.452C121.224 99.3861 121.797 99.1491 122.29 98.5963C122.903 97.9053 127.88 85.9609 127.722 85.566C127.584 85.2106 126.695 85.2304 124.641 85.6647Z" fill="white"/>
+      <path d="M240.974 21.5596L239.944 25.3467L198.429 178.04L197.827 180.253H168.523L169.554 176.466L211.069 23.7725L211.671 21.5596H240.974Z" fill="#DC2626" stroke="#DC2626" stroke-width="6"/>
+      <text x="260" y="152" font-family="'Outfit','Noto Sans','Liberation Sans',Arial,sans-serif" font-weight="900" font-size="145" letter-spacing="-2" fill="white">STACK</text>
+    </svg>
+  </div>
+
+  <div class="tagline">One Binary. Your Entire Infrastructure.</div>
+
+  <!-- Hero -->
+  <div class="hero">
+    <h1>
+      Stop duct-taping your<br>
+      infrastructure <span class="accent">together.</span>
+    </h1>
+    <p>
+      WolfStack replaces Proxmox, Portainer, Uptime Kuma &amp; Ansible
+      with a single Rust binary. Containers, VMs, networking, storage,
+      backups, monitoring &amp; automation — one dashboard.
+    </p>
+  </div>
+
+  <!-- Stats -->
+  <div class="stats">
+    <div class="stat">
+      <div class="num">500<span class="plus">+</span></div>
+      <div class="label">Apps</div>
+    </div>
+    <div class="stat">
+      <div class="num">1</div>
+      <div class="label">Binary</div>
+    </div>
+    <div class="stat">
+      <div class="num">0</div>
+      <div class="label">Databases</div>
+    </div>
+    <div class="stat">
+      <div class="num">8</div>
+      <div class="label">Distros</div>
+    </div>
+  </div>
+
+  <div class="divider"></div>
+
+  <!-- Features -->
+  <div class="features-title">Everything Built In</div>
+
+  <div class="features">
+    <div class="feat">
+      <div class="feat-icon">&#x1F4E6;</div>
+      <div class="feat-text">
+        <h3>Docker, LXC &amp; KVM</h3>
+        <p>Manage containers and VMs from a unified dashboard</p>
+      </div>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#x1F310;</div>
+      <div class="feat-text">
+        <h3>WolfNet Mesh</h3>
+        <p>Encrypted peer-to-peer networking across datacenters</p>
+      </div>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#x1F4CA;</div>
+      <div class="feat-text">
+        <h3>Status Pages</h3>
+        <p>Public uptime monitoring with 90-day history</p>
+      </div>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#x1F916;</div>
+      <div class="feat-text">
+        <h3>AI Health Monitor</h3>
+        <p>Claude &amp; Gemini powered anomaly detection</p>
+      </div>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#x1F504;</div>
+      <div class="feat-text">
+        <h3>WolfRun HA</h3>
+        <p>Automatic container failover with zero downtime</p>
+      </div>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#x1F512;</div>
+      <div class="feat-text">
+        <h3>Backups &amp; SSL</h3>
+        <p>S3 backup scheduling &amp; Let's Encrypt automation</p>
+      </div>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#x26A1;</div>
+      <div class="feat-text">
+        <h3>WolfFlow</h3>
+        <p>Visual workflow automation with cron scheduling</p>
+      </div>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#x1F578;&#xFE0F;</div>
+      <div class="feat-text">
+        <h3>Kubernetes</h3>
+        <p>k3s, MicroK8s &amp; kubeadm cluster management</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Replaces -->
+  <div class="replaces">
+    <div class="replaces-label">Replaces</div>
+    <div class="replaces-list">
+      <span>Proxmox</span>
+      <span>Portainer</span>
+      <span>Uptime Kuma</span>
+      <span>Ansible</span>
+      <span>Cockpit</span>
+      <span>CasaOS</span>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <div class="footer">
+    <div class="footer-url">wolf<span class="slash">/</span>stack.org</div>
+    <div class="footer-meta">
+      <div class="license">MIT Licensed &middot; Free Forever</div>
+      <div class="install">curl -sSL wolfstack.org/install | sudo bash</div>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>

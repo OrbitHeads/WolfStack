@@ -250,6 +250,7 @@ pub fn start_all_for_node(config: &RouterConfig, self_node_id: &str) {
 }
 
 /// Stop every LAN instance on this node (used on shutdown).
+#[allow(dead_code)]
 pub fn stop_all_for_node(config: &RouterConfig, self_node_id: &str) {
     for lan in &config.lans {
         if lan.node_id != self_node_id { continue; }

@@ -1,0 +1,183 @@
+<!-- Written by Paul Clevett -->
+<!-- (C)Copyright Wolf Software Systems Ltd -->
+<!-- https://wolf.uk.com -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WolfStack — Welcome</title>
+    <link rel="icon" type="image/png" href="images/wolfstack-icon.png">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #0a0e1a;
+            --bg-card: rgba(17, 24, 43, 0.85);
+            --border: rgba(220, 38, 38, 0.15);
+            --accent: #dc2626;
+            --accent-light: #f87171;
+            --text-primary: #e2e8f0;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
+            --green: #10b981;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+        .bg-effect { position: fixed; inset: 0; z-index: 0; overflow: hidden; }
+        .bg-effect::before {
+            content: ''; position: absolute; width: 600px; height: 600px;
+            background: radial-gradient(circle, rgba(220,38,38,0.12) 0%, transparent 70%);
+            top: -200px; right: -200px; animation: float1 15s ease-in-out infinite;
+        }
+        .bg-effect::after {
+            content: ''; position: absolute; width: 500px; height: 500px;
+            background: radial-gradient(circle, rgba(16,185,129,0.08) 0%, transparent 70%);
+            bottom: -100px; left: -100px; animation: float2 20s ease-in-out infinite;
+        }
+        @keyframes float1 { 0%,100% { transform: translate(0,0); } 50% { transform: translate(-80px,60px); } }
+        @keyframes float2 { 0%,100% { transform: translate(0,0); } 50% { transform: translate(60px,-40px); } }
+
+        .container {
+            position: relative; z-index: 1; width: 480px; max-width: 90vw;
+        }
+        .card {
+            background: var(--bg-card); border: 1px solid var(--border);
+            border-radius: 16px; padding: 48px 40px;
+            backdrop-filter: blur(24px); box-shadow: 0 25px 50px rgba(0,0,0,0.4);
+            animation: slideUp 0.6s ease-out;
+        }
+        @keyframes slideUp { from { opacity:0; transform:translateY(30px); } to { opacity:1; transform:translateY(0); } }
+
+        .logo-section { text-align: center; margin-bottom: 32px; }
+        .logo-section h1 { font-size: 24px; font-weight: 700; color: var(--accent-light); margin-top: 8px; }
+        .logo-section p { color: var(--text-muted); font-size: 14px; margin-top: 6px; }
+
+        .status-bar {
+            display: flex; align-items: center; gap: 10px;
+            background: rgba(15, 23, 42, 0.6); border: 1px solid var(--border);
+            border-radius: 10px; padding: 14px 16px; margin-bottom: 24px;
+            transition: all 0.3s;
+        }
+        .status-dot {
+            width: 10px; height: 10px; border-radius: 50%;
+            background: #f59e0b; animation: pulse 1.5s ease-in-out infinite;
+            flex-shrink: 0;
+        }
+        .status-dot.ready { background: var(--green); animation: none; }
+        @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
+        .status-text { font-size: 14px; color: var(--text-secondary); }
+        .status-text.ready { color: var(--green); font-weight: 500; }
+
+        .creds-box {
+            background: rgba(15, 23, 42, 0.6); border: 1px solid var(--border);
+            border-radius: 10px; padding: 16px 20px; margin-bottom: 24px;
+        }
+        .creds-title {
+            font-size: 11px; font-weight: 600; text-transform: uppercase;
+            letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 10px;
+        }
+        .creds-row {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 4px 0; font-size: 14px;
+        }
+        .creds-label { color: var(--text-secondary); }
+        .creds-value {
+            font-family: 'JetBrains Mono', monospace; font-weight: 500;
+            color: var(--text-primary); background: rgba(220,38,38,0.1);
+            padding: 2px 10px; border-radius: 6px;
+        }
+
+        .go-btn {
+            display: block; width: 100%; padding: 14px; text-align: center;
+            background: linear-gradient(135deg, var(--accent), #b91c1c);
+            border: none; border-radius: 10px; color: white;
+            font-family: 'Inter', sans-serif; font-size: 15px; font-weight: 600;
+            cursor: pointer; transition: all 0.25s; text-decoration: none;
+        }
+        .go-btn:hover { transform: translateY(-1px); box-shadow: 0 8px 25px rgba(220,38,38,0.35); }
+        .go-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: none; }
+
+        .hint {
+            text-align: center; margin-top: 16px; font-size: 12px; color: var(--text-muted);
+        }
+
+        .copyright {
+            text-align: center; margin-top: 24px; color: var(--text-muted); font-size: 12px;
+        }
+        .copyright a { color: var(--accent-light); text-decoration: none; }
+        .copyright a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="bg-effect"></div>
+    <div class="container">
+        <div class="card">
+            <div class="logo-section">
+                <img src="images/wolfstack-logo.png" alt="WolfStack" style="height:48px;">
+                <h1>WolfStack Live USB</h1>
+                <p>Server Management Platform</p>
+            </div>
+
+            <div class="status-bar" id="statusBar">
+                <div class="status-dot" id="statusDot"></div>
+                <div class="status-text" id="statusText">Starting services...</div>
+            </div>
+
+            <div class="creds-box">
+                <div class="creds-title">Login Credentials</div>
+                <div class="creds-row">
+                    <span class="creds-label">Username</span>
+                    <span class="creds-value">wolfstack</span>
+                </div>
+                <div class="creds-row">
+                    <span class="creds-label">Password</span>
+                    <span class="creds-value">wolfstack</span>
+                </div>
+            </div>
+
+            <a href="/login.html" class="go-btn" id="goBtn" style="pointer-events:none;opacity:0.5;">
+                Waiting for WolfStack...
+            </a>
+
+            <p class="hint">The dashboard will be available once services have started.<br>Check the terminal window for detailed progress.</p>
+        </div>
+        <div class="copyright">
+            &copy; 2026 <a href="https://wolf.uk.com/" target="_blank" rel="noopener">Wolf Software Systems Ltd</a>
+        </div>
+    </div>
+
+    <script>
+    (function() {
+        const dot = document.getElementById('statusDot');
+        const text = document.getElementById('statusText');
+        const btn = document.getElementById('goBtn');
+
+        async function poll() {
+            try {
+                const r = await fetch('/api/settings/login-disabled', {cache:'no-store'});
+                if (r.ok) {
+                    dot.classList.add('ready');
+                    text.textContent = 'WolfStack is ready!';
+                    text.classList.add('ready');
+                    btn.textContent = 'Open Dashboard';
+                    btn.style.pointerEvents = '';
+                    btn.style.opacity = '';
+                    return;
+                }
+            } catch(e) {}
+            setTimeout(poll, 2000);
+        }
+        poll();
+    })();
+    </script>
+</body>
+</html>

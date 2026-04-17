@@ -16,6 +16,7 @@ use std::sync::{LazyLock, RwLock};
 use std::time::Instant;
 
 /// Aggregated cluster topology for the rack view.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterTopology {
     pub nodes: Vec<NodeTopology>,

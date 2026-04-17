@@ -394,6 +394,7 @@ pub fn invalidate_count_caches() {
 }
 
 /// Invalidate all container list/stats caches (call after create/delete/start/stop).
+#[allow(dead_code)]
 pub fn invalidate_list_caches() {
     *DOCKER_LIST_CACHE.lock().unwrap() = None;
     *DOCKER_STATS_CACHE.lock().unwrap() = None;

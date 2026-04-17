@@ -50,6 +50,7 @@ pub enum Zone {
     Custom(String),
 }
 
+#[allow(dead_code)]
 impl Zone {
     /// Short slug used for ipset names and log tags. Must be <= 24 chars
     /// (ipset's limit minus our "wr-zone-" prefix).
