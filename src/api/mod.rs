@@ -22,6 +22,7 @@ use crate::appstore;
 
 
 mod pve_console;
+mod cluster_browser_proxy;
 
 /// Build ordered URLs to try for inter-node communication.
 /// Tries: HTTPS on main port, HTTP on internal port (port+1), HTTP on main port.
@@ -3756,38 +3757,45 @@ pub async fn cluster_browser_start(
         Ok(u) => u,
         Err(resp) => return resp,
     };
-    // Default homepage = our /cluster-home on the host's WolfNet IP so
-    // the in-container Firefox can reach it. Use plain HTTP — when
-    // WolfStack runs HTTPS the cert is usually self-signed, and a
-    // freshly-launched Firefox profile balks at that. The inter_node
-    // port is always plain HTTP on TLS-enabled installs and serves the
-    // same /cluster-home route, so target that. On non-TLS installs
-    // the api port is itself HTTP, so fall back to it.
-    let host_ip = local_wolfnet_ip().unwrap_or_else(|| "127.0.0.1".into());
+    // Default homepage = our /cluster-home reachable from inside the
+    // browser container. Docker bridge containers can't reach the
+    // host's wolfnet0 IP or 127.0.0.1, so we use host.docker.internal
+    // (wired up via --add-host in spawn_container) which resolves to
+    // the bridge gateway — the host listens there for any 0.0.0.0
+    // bound service. Use plain HTTP regardless of WolfStack's TLS
+    // mode: a fresh Firefox profile rejects self-signed certs, and
+    // the inter_node port is always plain HTTP on TLS installs.
     let port_cfg = crate::ports::PortConfig::load();
     let homepage_port = if state.tls_enabled { port_cfg.inter_node } else { port_cfg.api };
     // Embed the user as a query param so /cluster-home renders that
     // user's pinned URLs alongside the cluster-wide discovered list.
     let default_homepage = format!(
-        "http://{}:{}/cluster-home?user={}",
-        host_ip, homepage_port,
+        "http://host.docker.internal:{}/cluster-home?user={}",
+        homepage_port,
         urlencoding_simple(&user)
     );
     let homepage = body.homepage.clone().filter(|s| !s.trim().is_empty()).unwrap_or(default_homepage);
+    let tls = state.tls_enabled;
+
+    // Capture the host:port the client used to reach WolfStack BEFORE
+    // spawn_blocking — connection_info() returns a borrow that can't
+    // cross the await. This becomes the base of the proxy URL so the
+    // browser's ws/wss goes back to WolfStack on the same port the
+    // user is already connected to.
+    let wolfstack_authority = req.connection_info().host().to_string();
+    let wolfstack_scheme = if state.tls_enabled { "https" } else { "http" };
 
     let result = tokio::task::spawn_blocking(move || {
-        crate::cluster_browser::start_session(&user, &homepage)
+        crate::cluster_browser::start_session(&user, &homepage, tls)
     }).await;
-
-    // External URL: use the host the browser is currently connected to,
-    // not the WolfNet IP — for users on a public domain
-    // (e.g. cynthia.wolfterritories.org) the WolfNet IP is unreachable.
-    let connect_host = client_facing_host(&req).unwrap_or_else(|| host_ip.clone());
 
     match result {
         Ok(Ok(session)) => HttpResponse::Ok().json(serde_json::json!({
             "session": session,
-            "connect_url": format!("http://{}:{}", connect_host, session.web_port),
+            "connect_url": format!(
+                "{}://{}/api/cluster-browser/session/{}/",
+                wolfstack_scheme, wolfstack_authority, session.id
+            ),
         })),
         Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})),
@@ -3818,31 +3826,41 @@ pub async fn cluster_browser_start_stream(
         Err(resp) => return resp,
     };
 
-    let host_ip = local_wolfnet_ip().unwrap_or_else(|| "127.0.0.1".into());
+    // Firefox runs inside a Docker container that can't reach the
+    // host's wolfnet0 IP — see cluster_browser_start for full comment.
     let port_cfg = crate::ports::PortConfig::load();
     let homepage_port = if state.tls_enabled { port_cfg.inter_node } else { port_cfg.api };
     // Embed the user as a query param so /cluster-home renders that
     // user's pinned URLs alongside the cluster-wide discovered list.
     let default_homepage = format!(
-        "http://{}:{}/cluster-home?user={}",
-        host_ip, homepage_port,
+        "http://host.docker.internal:{}/cluster-home?user={}",
+        homepage_port,
         urlencoding_simple(&user)
     );
     let homepage = body.homepage.clone().filter(|s| !s.trim().is_empty()).unwrap_or(default_homepage);
-    // External connect URL: same reasoning as cluster_browser_start.
-    let connect_host = client_facing_host(&req).unwrap_or_else(|| host_ip.clone());
+    let tls = state.tls_enabled;
+
+    // Capture the host:port and scheme the client used to reach
+    // WolfStack BEFORE the blocking thread spawn — connection_info()
+    // borrows from req which is !Send across the thread boundary.
+    // Connect URL points to the in-process reverse proxy, not a
+    // per-session port, so ws/wss rides whatever port WolfStack is on.
+    let wolfstack_authority = req.connection_info().host().to_string();
+    let wolfstack_scheme = if state.tls_enabled { "https" } else { "http" };
 
     let (std_tx, std_rx) = std::sync::mpsc::channel::<String>();
     let (tok_tx, mut tok_rx) = tokio::sync::mpsc::channel::<String>(256);
 
     std::thread::spawn(move || {
-        let result = crate::cluster_browser::start_session_streamed(&user, &homepage, std_tx.clone());
+        let result = crate::cluster_browser::start_session_streamed(&user, &homepage, tls, std_tx.clone());
         match result {
             Ok(session) => {
                 let payload = serde_json::json!({
                     "session": session,
-                    // Plain HTTP — KasmVNC inside the container is HTTP only.
-                    "connect_url": format!("http://{}:{}", connect_host, session.web_port),
+                    "connect_url": format!(
+                        "{}://{}/api/cluster-browser/session/{}/",
+                        wolfstack_scheme, wolfstack_authority, session.id
+                    ),
                 });
                 let _ = std_tx.send(format!("[done] {}", payload));
             }
@@ -3907,41 +3925,6 @@ pub async fn cluster_browser_homepage(
         .insert_header(("Content-Type", "text/html; charset=utf-8"))
         .insert_header(("Cache-Control", "no-cache"))
         .body(html)
-}
-
-/// Hostname the user's browser is currently talking to, derived from the
-/// request's `Host` header (or `X-Forwarded-Host` if a reverse proxy is
-/// in front of us). Used to build externally-reachable URLs (cluster
-/// browser session popup, etc.) — using `local_wolfnet_ip()` for those
-/// fails for anyone outside the WolfNet who reached the dashboard via a
-/// public domain. Strips the port — the caller is going to append its
-/// own. Returns None if no usable header is present.
-fn client_facing_host(req: &HttpRequest) -> Option<String> {
-    let raw = req.headers().get("X-Forwarded-Host")
-        .or_else(|| req.headers().get("Host"))
-        .and_then(|v| v.to_str().ok())?;
-    // X-Forwarded-Host may be a comma-separated list; take the first.
-    let first = raw.split(',').next()?.trim();
-    // Strip :port if present — careful with IPv6 literals "[::1]:8553".
-    let host = if first.starts_with('[') {
-        // IPv6 literal: keep through the closing bracket
-        first.split(']').next().map(|s| format!("{}]", s)).unwrap_or_else(|| first.to_string())
-    } else {
-        first.split(':').next().unwrap_or(first).to_string()
-    };
-    if host.is_empty() { None } else { Some(host) }
-}
-
-fn local_wolfnet_ip() -> Option<String> {
-    let out = std::process::Command::new("ip")
-        .args(["-4", "addr", "show", "wolfnet0"])
-        .output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    text.lines()
-        .find(|l| l.contains("inet "))
-        .and_then(|l| l.trim().split_whitespace().nth(1))
-        .and_then(|s| s.split('/').next())
-        .map(|s| s.to_string())
 }
 
 /// Minimal percent-encoder for the `user` query param embedded in the
@@ -17597,6 +17580,14 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/cluster-browser/sessions/start-stream", web::post().to(cluster_browser_start_stream))
         .route("/api/cluster-browser/sessions/{id}", web::delete().to(cluster_browser_stop))
         .route("/api/cluster-browser/image-status", web::get().to(cluster_browser_image_status))
+        // Reverse proxy so every selkies request (HTML, assets, /websocket)
+        // rides WolfStack's own port — see cluster_browser_proxy module docs.
+        // Catch-all `.*` path segment forwards the rest of the URL to the
+        // container untouched.
+        .route(
+            "/api/cluster-browser/session/{id}/{tail:.*}",
+            web::to(cluster_browser_proxy::cluster_browser_proxy),
+        )
         .route("/cluster-home", web::get().to(cluster_browser_homepage))
         .route("/api/agent/cluster-name", web::post().to(agent_set_cluster_name))
         .route("/api/agent/wolfnet-routes", web::post().to(agent_set_wolfnet_routes))

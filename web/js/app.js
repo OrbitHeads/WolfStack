@@ -34412,7 +34412,7 @@ async function loadClusterBrowserSessions() {
                     <strong style="flex:1;">Browser ${escapeHtml(s.id)}</strong>
                 </div>
                 <div style="font-size:12px;color:var(--text-muted);margin-bottom:4px;">Started: ${escapeHtml(started)}</div>
-                <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px;">User: ${escapeHtml(s.user)} · Port: ${s.web_port}</div>
+                <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px;">User: ${escapeHtml(s.user)}</div>
                 <div style="display:flex;gap:6px;">
                     <button class="btn btn-sm btn-primary" onclick="window.open('${escapeAttr(url)}', '_blank', 'width=1280,height=800')">🖥️ Open</button>
                     <button class="btn btn-sm" onclick="clusterBrowserStop('${escapeAttr(s.id)}')">⏹️ Stop</button>
@@ -34424,19 +34424,42 @@ async function loadClusterBrowserSessions() {
     }
 }
 
-/// Build the URL the user opens to access a browser session. The
-/// linuxserver/firefox image's KasmVNC web UI binds plain HTTP on
-/// container port 3000 — even when WolfStack itself runs on HTTPS,
-/// the session port is HTTP. Hard-code the scheme rather than mirror
-/// `location.protocol`, otherwise the popup tries https:// and gets
-/// "ERR_SSL_PROTOCOL_ERROR".
+/// Build the URL the user opens to access a browser session. Every
+/// session is reverse-proxied through WolfStack's own port so the
+/// browser sees ws/wss on the same port it's already using — this
+/// works behind Cloudflare, corporate HTTP proxies, and anything
+/// else that restricts traffic to well-known ports. The backend
+/// returns a fully-qualified connect_url on start; this builder is
+/// just the fallback used for listing existing sessions.
 function clusterBrowserConnectUrl(session) {
-    return `http://${location.hostname}:${session.web_port}`;
+    return `${location.protocol}//${location.host}/api/cluster-browser/session/${encodeURIComponent(session.id)}/`;
 }
 
 async function clusterBrowserStart() {
     const btn = event?.target;
     if (btn) { btn.disabled = true; btn.textContent = '⏳ Starting…'; }
+
+    // Open the popup SYNCHRONOUSLY inside the click handler. If we wait
+    // until the session is ready (awaits on fetch + SSE stream, plus the
+    // first-run 700 MB image pull) the browser revokes the user-gesture
+    // grant and refuses cross-origin navigation — the popup opens but
+    // stays on about:blank. Opening now and assigning popup.location
+    // later keeps the original gesture attached.
+    const popup = window.open('about:blank', '_blank', 'width=1280,height=800');
+    if (popup && popup.document) {
+        try {
+            popup.document.title = 'WolfStack Cluster Browser — starting…';
+            popup.document.body.innerHTML = `
+                <div style="background:#0d0f14;color:#e8eaf0;font-family:system-ui,-apple-system,sans-serif;min-height:100vh;margin:0;display:flex;align-items:center;justify-content:center;">
+                    <div style="text-align:center;padding:48px;">
+                        <div style="font-size:56px;margin-bottom:12px;">🦊</div>
+                        <h2 style="margin:0 0 8px;font-weight:600;">Starting Cluster Browser…</h2>
+                        <p style="color:#9ba0ad;font-size:14px;margin:0;max-width:420px;">Launching Firefox on a cluster node. First run downloads the browser image (~700 MB); subsequent sessions start in seconds. This window will navigate automatically when ready.</p>
+                    </div>
+                </div>`;
+            popup.document.body.style.margin = '0';
+        } catch (e) { /* cross-origin write blocked — harmless */ }
+    }
 
     // Progress modal so the user sees what's going on. First-time start
     // pulls a ~700 MB browser image; we'd otherwise spin silently for
@@ -34491,18 +34514,38 @@ async function clusterBrowserStart() {
             setStatus(`Failed: ${failed}`);
             overlay.markFailed();
             showToast('Failed to start session: ' + failed, 'error');
+            if (popup && !popup.closed) {
+                try {
+                    popup.document.body.innerHTML = `
+                        <div style="background:#0d0f14;color:#e8eaf0;font-family:system-ui,sans-serif;min-height:100vh;margin:0;display:flex;align-items:center;justify-content:center;">
+                            <div style="text-align:center;padding:48px;max-width:480px;">
+                                <div style="font-size:56px;margin-bottom:12px;">❌</div>
+                                <h2 style="margin:0 0 8px;color:#ef4444;">Failed to start session</h2>
+                                <pre style="background:#161922;border:1px solid #2a2e3c;padding:12px;border-radius:8px;text-align:left;white-space:pre-wrap;word-break:break-word;font-size:12px;color:#cbd2de;">${escapeHtml(failed)}</pre>
+                            </div>
+                        </div>`;
+                } catch (e) {}
+            }
             return;
         }
         setStatus('Browser ready — opening in a new window…');
         showToast('Browser session started', 'success', 4000);
         loadClusterBrowserSessions();
         // KasmVNC inside the container takes a few seconds to bind its
-        // web port. Stagger the popup so it doesn't land on
+        // web port. Stagger the navigation so the popup doesn't land on
         // "connection refused" on the first try.
         const url = connectUrl || (session ? clusterBrowserConnectUrl(session) : null);
         if (url) {
             setTimeout(() => {
-                window.open(url, '_blank', 'width=1280,height=800');
+                if (popup && !popup.closed) {
+                    try { popup.location.href = url; }
+                    catch (e) { window.open(url, '_blank', 'width=1280,height=800'); }
+                } else {
+                    // User closed the loading popup — reopen. This path
+                    // loses the original user-gesture so some browsers
+                    // may block it; that's why we keep the popup open.
+                    window.open(url, '_blank', 'width=1280,height=800');
+                }
                 overlay.close();
             }, 3000);
         } else {
@@ -34512,6 +34555,9 @@ async function clusterBrowserStart() {
         setStatus('Failed: ' + e.message);
         overlay.markFailed();
         showToast('Failed to start session: ' + e.message, 'error');
+        if (popup && !popup.closed) {
+            try { popup.close(); } catch (err) {}
+        }
     } finally {
         if (btn) { btn.disabled = false; btn.textContent = '🚀 Start browser session'; }
     }

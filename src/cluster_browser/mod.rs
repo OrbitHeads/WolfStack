@@ -33,14 +33,22 @@ pub struct BrowserSession {
     pub id: String,
     /// Docker container name: wolfstack-browser-<id>.
     pub container_name: String,
-    /// Host port mapped to the container's KasmVNC web port (3000).
+    /// Host port mapped to the container's web UI port (either 3000 for
+    /// HTTP or 3001 for HTTPS — chosen at start to match WolfStack's
+    /// own TLS mode so the popup scheme doesn't fight the parent page).
     pub web_port: u16,
+    /// "http" or "https". Persisted so the UI builds the right URL
+    /// even when listing sessions after a restart.
+    #[serde(default = "default_scheme")]
+    pub scheme: String,
     /// User who started the session, used to namespace the persistent
     /// profile volume so bookmarks/cookies survive across sessions.
     pub user: String,
     /// Unix epoch seconds.
     pub started_at: u64,
 }
+
+fn default_scheme() -> String { "http".to_string() }
 
 static SESSIONS: Mutex<Vec<BrowserSession>> = Mutex::new(Vec::new());
 
@@ -244,28 +252,30 @@ fn pull_image_with_progress(tx: &std::sync::mpsc::Sender<String>) -> Result<(), 
 pub fn start_session_streamed(
     user: &str,
     homepage: &str,
+    tls: bool,
     tx: std::sync::mpsc::Sender<String>,
 ) -> Result<BrowserSession, String> {
     pull_image_with_progress(&tx)?;
     let _ = tx.send("Starting browser container...".into());
-    let session = spawn_container(user, homepage)?;
+    let session = spawn_container(user, homepage, tls)?;
     let _ = tx.send(format!("Container running on port {}", session.web_port));
     Ok(session)
 }
 
-/// Spin up a new browser session for `user`. Returns the session
-/// metadata; the caller is responsible for telling the user where to
-/// connect (the KasmVNC web UI is served from
-/// `http://<wolfstack-host>:<web_port>`).
-pub fn start_session(user: &str, homepage: &str) -> Result<BrowserSession, String> {
+/// Spin up a new browser session for `user`. `tls` selects the
+/// container-side port (3000 for HTTP, 3001 for HTTPS) so the session
+/// scheme matches WolfStack's own — an HTTPS-hosted WolfStack gets an
+/// HTTPS session (one-time self-signed cert accept), an HTTP-hosted
+/// one gets plain HTTP.
+pub fn start_session(user: &str, homepage: &str, tls: bool) -> Result<BrowserSession, String> {
     ensure_image()?;
-    spawn_container(user, homepage)
+    spawn_container(user, homepage, tls)
 }
 
 /// Internal helper — does the actual `docker run`. Assumes the image
 /// has already been pulled. Used by both the streaming and non-
 /// streaming start paths.
-fn spawn_container(user: &str, homepage: &str) -> Result<BrowserSession, String> {
+fn spawn_container(user: &str, homepage: &str, tls: bool) -> Result<BrowserSession, String> {
     let id = random_id();
     let container_name = format!("wolfstack-browser-{}", id);
     let web_port = allocate_port().ok_or("No free port in 33000-33999 range")?;
@@ -284,12 +294,16 @@ fn spawn_container(user: &str, homepage: &str) -> Result<BrowserSession, String>
     // services grid the moment Firefox finishes booting.
     let firefox_cli = format!("--new-window {}", homepage);
 
-    // linuxserver/baseimage-kasmvnc serves HTTPS on container port 3000
-    // (with a self-signed cert) and plain HTTP on 3001. We map the HTTP
-    // side so the browser doesn't refuse to load the KasmVNC JS over an
-    // untrusted cert and so the popup tab works on first click without
-    // the user clicking through a cert warning.
-    let port_mapping = format!("{}:3001", web_port);
+    // Always bind the container's HTTP port (3000 in linuxserver's
+    // baseimage-kasmvnc) to 127.0.0.1 only. WolfStack reverse-proxies
+    // the session through its own port via /api/cluster-browser/session/{id}/
+    // so the browser sees ws/wss on WolfStack's port — works behind
+    // Cloudflare, corporate HTTP proxies, and any environment that
+    // restricts traffic to well-known ports. The `tls` arg controls
+    // the reported scheme (used by the connect URL below), not the
+    // container, which is always plain HTTP.
+    let container_port = 3000u16;
+    let port_mapping = format!("127.0.0.1:{}:{}", web_port, container_port);
     let env_homepage = format!("FIREFOX_CLI={}", firefox_cli);
     let volume_mount = format!("{}:/config", volume_name);
 
@@ -312,6 +326,15 @@ fn spawn_container(user: &str, homepage: &str) -> Result<BrowserSession, String>
         // SHM size — Firefox/Chromium often crash with the Docker
         // default 64MB. Bump to 1GB.
         "--shm-size", "1gb",
+        // Docker on Linux doesn't give containers a way to reach host
+        // services by default — containers on the bridge network can't
+        // hit the host's wolfnet0 IP or 127.0.0.1 because the host's
+        // localhost is a different namespace. `host-gateway` makes
+        // Docker resolve host.docker.internal to the bridge gateway IP
+        // (typically 172.17.0.1), which the host DOES listen on for
+        // 0.0.0.0-bound services. Firefox gets pointed at this
+        // hostname below so /cluster-home actually loads.
+        "--add-host=host.docker.internal:host-gateway",
         "--label", "wolfstack-browser=true",
         "--label", "wolfstack-browser-user=", // filled below
         IMAGE,
@@ -336,10 +359,16 @@ fn spawn_container(user: &str, homepage: &str) -> Result<BrowserSession, String>
         ));
     }
 
+    // The session's scheme follows WolfStack's own — the browser
+    // reaches it via WolfStack's reverse proxy, not the container's
+    // port directly, so the connect URL scheme matches what the user
+    // sees on the parent WolfStack page.
+    let scheme = if tls { "https" } else { "http" };
     let session = BrowserSession {
         id,
         container_name,
         web_port,
+        scheme: scheme.to_string(),
         user: user_safe,
         started_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
     };
