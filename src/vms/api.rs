@@ -942,12 +942,24 @@ async fn vm_import_external(
 
     // Respect TMPDIR so operators whose target `/tmp` is a small tmpfs
     // can point upload staging at a roomy disk via the wolfstack
-    // systemd unit's `Environment=TMPDIR=/big/tmp` line.
-    let import_dir = std::env::var("TMPDIR")
+    // systemd unit's `Environment=TMPDIR=/big/tmp` line. Guard against
+    // an empty-string TMPDIR (systemd `Environment=TMPDIR=` to clear)
+    // so we don't land on a relative path that makes create_dir_all
+    // silently succeed against CWD.
+    let import_dir = std::env::var("TMPDIR").ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join("wolfstack-vm-imports");
-    let _ = std::fs::create_dir_all(&import_dir);
+    if let Err(e) = std::fs::create_dir_all(&import_dir) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!(
+                "Failed to create upload staging directory {} (check TMPDIR or service permissions): {}",
+                import_dir.display(), e
+            )
+        }));
+    }
 
     let mut new_name: Option<String> = None;
     let mut storage: Option<String> = None;

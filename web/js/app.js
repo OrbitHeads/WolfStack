@@ -14431,7 +14431,6 @@ async function doMigrateLxc(name) {
             const migrateBody = { target_node: target };
             if (targetNode) { migrateBody.target_address = targetNode.address; migrateBody.target_port = targetNode.port || 8553; }
             if (migrateStorage) migrateBody.storage = migrateStorage;
-            if (stagingDir) migrateBody.staging_dir = stagingDir;
             const resp = await fetch(apiUrl(`/api/containers/lxc/${name}/migrate`), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -14751,9 +14750,10 @@ async function doMigrateVm(name) {
 // crossing the cluster.
 async function migrateVmDiskStorage(name) {
     // Fetch storage candidates from this node's /api/storage/list so
-    // the operator picks from real mount points, not a free-form path
-    // (which worked too, but typos → silent failure).
+    // the operator picks from real mount points / PVE storage IDs,
+    // not a free-form path (which worked too, but typos → silent fail).
     let storages = [];
+    let isProxmoxHost = false;
     try {
         const r = await fetch(apiUrl('/api/storage/list'));
         if (r.ok) {
@@ -14761,6 +14761,10 @@ async function migrateVmDiskStorage(name) {
             storages = (d.storages || d || []).filter(s =>
                 !s.content || s.content.includes('images') || s.content.includes('rootdir')
             );
+            // PVE storages have a `type` field like "lvmthin" / "dir"
+            // AND usually an `id` column that differs from `path`.
+            // Detect so we can show the right hint text.
+            isProxmoxHost = storages.some(s => s.type && s.type !== 'native');
         }
     } catch {}
 
@@ -14768,7 +14772,12 @@ async function migrateVmDiskStorage(name) {
         const free = typeof formatBytes === 'function'
             ? formatBytes((s.available_bytes || s.available_gb * 1073741824) || 0)
             : (s.available_gb ? s.available_gb + ' GB' : '—') + ' free';
-        return `<option value="${escapeAttr(s.path || s.id)}">${escapeHtml(s.path || s.id)} (${free})</option>`;
+        // On Proxmox hosts the "target" the backend calls `qm move_disk`
+        // with is the PVE storage ID, not a path. Prefer s.id for PVE
+        // rows so the operator picks the correct token.
+        const val = isProxmoxHost ? (s.id || s.path) : (s.path || s.id);
+        const label = isProxmoxHost ? `${s.id}${s.type ? ' ('+s.type+')' : ''}` : (s.path || s.id);
+        return `<option value="${escapeAttr(val)}">${escapeHtml(label)} (${free})</option>`;
     }).join('');
 
     const modal = document.createElement('div');
@@ -14778,12 +14787,13 @@ async function migrateVmDiskStorage(name) {
         <div style="background:var(--card-bg,#1e1e2e);border:1px solid var(--border,#333);border-radius:12px;padding:28px 36px;min-width:440px;max-width:560px;box-shadow:0 20px 60px rgba(0,0,0,0.5);">
             <h3 style="margin:0 0 10px;color:var(--text,#fff);">Migrate VM Disk Storage</h3>
             <p style="margin:0 0 14px;color:var(--text-muted,#aaa);font-size:0.9em;">Move <strong>${escapeHtml(name)}</strong>'s disks to a different storage pool on <em>this</em> node. VM must be stopped; the config is updated to point at the new pool after copy.</p>
+            ${isProxmoxHost ? '<div style="background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.25);border-radius:6px;padding:8px 12px;margin-bottom:8px;font-size:12px;color:var(--text,#fff);">Proxmox host detected — target is a PVE <strong>storage ID</strong> (e.g. <code>local-lvm</code>, <code>wolfpool</code>). The server will call <code>qm move_disk</code> for every disk slot.</div>' : ''}
             <div style="display:flex;flex-direction:column;gap:12px;">
                 <div>
-                    <label style="font-size:13px;color:var(--text-muted,#aaa);">Target storage path</label>
-                    <input id="vm-disk-migrate-target" list="vm-disk-migrate-options" placeholder="/wolfpool/vms" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;">
+                    <label style="font-size:13px;color:var(--text-muted,#aaa);">${isProxmoxHost ? 'Target PVE storage ID' : 'Target storage path'}</label>
+                    <input id="vm-disk-migrate-target" list="vm-disk-migrate-options" placeholder="${isProxmoxHost ? 'local-lvm' : '/wolfpool/vms'}" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;">
                     <datalist id="vm-disk-migrate-options">${opts}</datalist>
-                    <span style="font-size:11px;color:var(--text-muted,#666);margin-top:2px;display:block;">Pick from known mounts or type a path. Target directory must exist; free-space is pre-flighted before any copy.</span>
+                    <span style="font-size:11px;color:var(--text-muted,#666);margin-top:2px;display:block;">${isProxmoxHost ? 'Pick from the PVE storage IDs above, or type one. PVE handles the copy and config update atomically.' : 'Pick from known mounts or type a path. Target directory must exist; free-space is pre-flighted before any copy.'}</span>
                 </div>
                 <label style="font-size:13px;color:var(--text-muted,#aaa);display:flex;align-items:center;gap:8px;cursor:pointer;">
                     <input type="checkbox" id="vm-disk-migrate-remove-source"/>

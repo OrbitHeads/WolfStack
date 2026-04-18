@@ -3145,16 +3145,7 @@ fn migration_staging_root(explicit: Option<&str>) -> PathBuf {
 
 /// Export a VM as a tar.gz archive containing config JSON + disk images.
 /// Returns the archive path. The VM must be stopped first.
-/// Back-compat wrapper — delegates to `export_vm_with_staging` with
-/// no explicit staging override. All current internal callers go
-/// through the `_with_staging` variant; this wrapper stays for any
-/// external integration that might be using the shorter name.
-#[allow(dead_code)]
-pub fn export_vm(name: &str) -> Result<PathBuf, String> {
-    export_vm_with_staging(name, None)
-}
-
-/// Same as `export_vm` but lets the operator pick the staging root
+/// Same as `export_vm_with_staging(name, None)` but lets the operator pick the staging root
 /// instead of the hardcoded `/tmp`. Live migration of large VMs on
 /// hosts with small tmpfs-backed `/tmp` was failing here; this
 /// parameter lets the dialog route the staging to a roomy disk.
@@ -3554,17 +3545,49 @@ pub fn migrate_storage(
             name
         ));
     }
-    // Belt-and-braces: also check for the QEMU process, since the
-    // config flag can drift from reality after a crash.
-    if let Ok(o) = Command::new("pgrep").args(["-f", &format!("guest={}", name)]).output() {
-        if o.status.success() && !o.stdout.is_empty() {
-            return Err(format!(
-                "VM '{}' has a live qemu process — shutdown first",
-                name
-            ));
+    // Belt-and-braces: also check for a live QEMU process, since the
+    // config flag can drift from reality after a crash. Must match the
+    // exact pattern WolfStack uses to launch QEMU (from check_running):
+    // `qemu-system-{x86_64,aarch64} ... -name <name>`. The earlier
+    // `guest=<name>` check was a bug — WolfStack never passes that
+    // flag, so the check was silently inert and a crashed-but-lingering
+    // qemu would slip through.
+    for qemu_bin in &["qemu-system-x86_64", "qemu-system-aarch64"] {
+        if let Ok(o) = Command::new("pgrep")
+            .args(["-f", &format!("{}.*-name {}", qemu_bin, name)])
+            .output()
+        {
+            if o.status.success() {
+                return Err(format!(
+                    "VM '{}' has a live {} process — shutdown first",
+                    name, qemu_bin
+                ));
+            }
+        }
+    }
+    // Proxmox-managed VMs ask `qm` instead — same check, different OS.
+    if let Some(vmid) = config.vmid.filter(|_| containers::is_proxmox()) {
+        if let Ok(o) = Command::new("qm").args(["status", &vmid.to_string()]).output() {
+            let s = String::from_utf8_lossy(&o.stdout).to_lowercase();
+            if s.contains("status: running") {
+                return Err(format!(
+                    "VM '{}' (vmid {}) is running on Proxmox — stop it via `qm stop` first",
+                    name, vmid
+                ));
+            }
         }
     }
 
+    // Proxmox-managed VMs: shell out to `qm move_disk`. PVE handles
+    // the copy between storage pools (zfs send/recv, dd for LVM-thin,
+    // etc.) AND updates the VM config — we must not write to disk
+    // ourselves or PVE's /etc/pve overlay would be out of sync.
+    if let Some(vmid) = config.vmid.filter(|_| containers::is_proxmox()) {
+        return migrate_storage_proxmox(vmid, target, remove_source);
+    }
+
+    // Native / libvirt path. Validate the target is a directory. For
+    // PVE we'd accept a storage ID (e.g. "local-lvm"), not a path.
     let target_path = Path::new(target);
     if !target_path.exists() {
         return Err(format!(
@@ -3578,7 +3601,14 @@ pub fn migrate_storage(
 
     // Figure out where the OS disk currently lives.
     let source_os_storage = config.storage_path.clone().unwrap_or_else(|| VM_BASE.to_string());
-    if source_os_storage == target {
+    // Normalise trailing slashes so `/pool` and `/pool/` compare equal.
+    // Operator-written config paths drift between the two forms; a
+    // byte-exact comparison missed the "same storage" case and produced
+    // a confusing "target file already exists — refuse to overwrite"
+    // error instead of a clean "source == target".
+    let src_norm = source_os_storage.trim_end_matches('/');
+    let tgt_norm = target.trim_end_matches('/');
+    if src_norm == tgt_norm {
         return Err("source and target storage paths are the same".into());
     }
     let source_os_disk = Path::new(&source_os_storage).join(format!("{}.qcow2", name));
@@ -3617,6 +3647,20 @@ pub fn migrate_storage(
             .map_err(|e| format!("copy OS disk {} → {}: {}",
                 source_os_disk.display(), target_os_disk.display(), e))?;
         copied.push(target_os_disk.clone());
+    } else if config.extra_disks.is_empty() {
+        // No OS disk AND no extras = nothing to copy. A stored config
+        // pointing at a missing qcow2 is almost certainly stale; refuse
+        // rather than silently rewriting storage_path to a location
+        // that has no data.
+        return Err(format!(
+            "OS disk not found at {} and no extra disks to migrate — config may be stale",
+            source_os_disk.display()
+        ));
+    } else {
+        warn!(
+            "migrate_storage: OS disk for VM '{}' not found at {} — only extra disks will be migrated",
+            name, source_os_disk.display()
+        );
     }
 
     // Copy each extra disk.
@@ -3686,6 +3730,168 @@ pub fn migrate_storage(
         "migrated VM '{}' disks from {} → {} ({} files copied)",
         name, source_os_storage, target, copied.len()
     ))
+}
+
+/// Proxmox branch for migrate_storage. PVE owns the VM config, the
+/// volumes, and the copy mechanics — we must not touch qcow2 files
+/// directly. Instead: parse `qm config <vmid>`, find every disk slot
+/// whose storage prefix differs from the target, and call
+/// `qm move_disk <vmid> <slot> <target>` for each. PVE runs the
+/// actual copy (zfs send/recv, dd, qemu-img depending on storage
+/// type) and rewrites the VM config in /etc/pve atomically.
+///
+/// `target` here is a PVE STORAGE ID (e.g. `local-lvm`, `wolfpool`),
+/// not a filesystem path. The UI's datalist sources both kinds from
+/// /api/storage/list so operators can pick whichever their VM needs.
+fn migrate_storage_proxmox(
+    vmid: u32, target: &str, remove_source: bool,
+) -> Result<String, String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("target PVE storage id is required".into());
+    }
+    // Parse `qm config <vmid>` for disk slots. Output format:
+    //   scsi0: local-lvm:vm-101-disk-0,size=32G
+    //   ide2: none,media=cdrom                  ← skip (cdrom)
+    //   virtio0: wolfpool:vm-101-disk-1,size=64G
+    let cfg_out = Command::new("qm")
+        .args(["config", &vmid.to_string()])
+        .output()
+        .map_err(|e| format!("qm config failed: {}", e))?;
+    if !cfg_out.status.success() {
+        return Err(format!(
+            "qm config {} failed: {}",
+            vmid, String::from_utf8_lossy(&cfg_out.stderr).trim()
+        ));
+    }
+    let cfg_text = String::from_utf8_lossy(&cfg_out.stdout);
+
+    let slots = parse_pve_disk_slots(&cfg_text, target);
+
+    if slots.is_empty() {
+        return Err(format!(
+            "vmid {}: no disk slots needing migration — all disks already on '{}' (or no qcow/raw volumes found)",
+            vmid, target
+        ));
+    }
+
+    let mut moved: Vec<String> = Vec::new();
+    for (slot, from) in &slots {
+        let mut cmd = Command::new("qm");
+        cmd.args(["move_disk", &vmid.to_string(), slot, target]);
+        if remove_source { cmd.args(["--delete", "1"]); }
+        let out = cmd.output()
+            .map_err(|e| format!("qm move_disk {} {} {}: {}", vmid, slot, target, e))?;
+        if !out.status.success() {
+            return Err(format!(
+                "qm move_disk {} {} → {} failed: {} (prior disks already moved: [{}])",
+                vmid, slot, target,
+                String::from_utf8_lossy(&out.stderr).trim(),
+                moved.join(", ")
+            ));
+        }
+        moved.push(format!("{} ({}→{})", slot, from, target));
+    }
+
+    Ok(format!(
+        "vmid {}: moved {} disk(s) to '{}' via qm move_disk [{}]",
+        vmid, moved.len(), target, moved.join(", ")
+    ))
+}
+
+/// Parse `qm config <vmid>` output into a list of
+/// (slot, current_storage) pairs for disks that aren't already on
+/// `target`. Extracted from `migrate_storage_proxmox` so the slot
+/// detection + cdrom/passthrough filter can be unit-tested without
+/// shelling out to qm.
+fn parse_pve_disk_slots(cfg_text: &str, target: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in cfg_text.lines() {
+        let Some((slot, rest)) = line.split_once(':') else { continue; };
+        let slot = slot.trim();
+        let rest = rest.trim();
+        // Disk slot names: scsi0..scsi30, virtio0..15, sata0..5, ide0..3.
+        // Each is a prefix followed only by decimal digits.
+        let is_disk_slot = ["scsi", "virtio", "sata", "ide"].iter()
+            .any(|prefix| slot.strip_prefix(prefix)
+                .map(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+                .unwrap_or(false));
+        if !is_disk_slot { continue; }
+        // cdrom / passthrough entries have no storage-colon: either
+        // `none,media=cdrom` or `/dev/sdX,...`. Skip those — only
+        // real disks have the `<storage>:<volume>` shape.
+        let first_part = rest.split(',').next().unwrap_or("");
+        let Some((current_storage, _vol)) = first_part.split_once(':') else { continue; };
+        let current_storage = current_storage.trim();
+        if current_storage.is_empty() || current_storage == "none" { continue; }
+        // Skip cdrom-style entries that sneak a colon (rare, but
+        // defensive) — media=cdrom is the telltale.
+        if rest.contains("media=cdrom") { continue; }
+        if current_storage == target { continue; } // already there — skip silently
+        out.push((slot.to_string(), current_storage.to_string()));
+    }
+    out
+}
+
+#[cfg(test)]
+mod pve_slot_tests {
+    use super::*;
+
+    #[test]
+    fn parses_typical_qm_config() {
+        let cfg = "agent: 1\n\
+                   boot: order=scsi0\n\
+                   cores: 2\n\
+                   cpu: host\n\
+                   ide2: none,media=cdrom\n\
+                   memory: 2048\n\
+                   name: test-vm\n\
+                   scsi0: local-lvm:vm-101-disk-0,size=32G\n\
+                   scsi1: local-lvm:vm-101-disk-1,size=16G\n\
+                   virtio0: wolfpool:vm-101-disk-2,size=64G\n\
+                   scsihw: virtio-scsi-pci\n\
+                   smbios1: uuid=...\n\
+                   sockets: 1\n";
+        let slots = parse_pve_disk_slots(cfg, "wolfpool");
+        // Two scsi0/scsi1 entries on local-lvm should move;
+        // virtio0 already on wolfpool is skipped; ide2 cdrom is skipped.
+        assert_eq!(slots.len(), 2);
+        assert!(slots.iter().any(|(s, st)| s == "scsi0" && st == "local-lvm"));
+        assert!(slots.iter().any(|(s, st)| s == "scsi1" && st == "local-lvm"));
+    }
+
+    #[test]
+    fn skips_cdrom_entries_even_with_storage_colon() {
+        let cfg = "ide0: local:iso/debian-12.iso,media=cdrom\n\
+                   scsi0: local-lvm:vm-42-disk-0,size=8G\n";
+        let slots = parse_pve_disk_slots(cfg, "wolfpool");
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].0, "scsi0");
+    }
+
+    #[test]
+    fn ignores_non_disk_slot_lines() {
+        // `net0: virtio=AA:...,bridge=vmbr0` starts with "net0" — not
+        // a disk slot. Also `scsihw` / `smbios1` / `sockets` — not
+        // disks despite prefix-substring coincidences.
+        let cfg = "net0: virtio=00:11:22:33:44:55,bridge=vmbr0\n\
+                   scsihw: virtio-scsi-pci\n\
+                   smbios1: uuid=abc\n\
+                   sockets: 1\n\
+                   scsi0: local-lvm:vm-1-disk-0,size=4G\n";
+        let slots = parse_pve_disk_slots(cfg, "wolfpool");
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].0, "scsi0");
+    }
+
+    #[test]
+    fn skips_disks_already_on_target() {
+        let cfg = "scsi0: wolfpool:vm-1-disk-0,size=4G\n\
+                   scsi1: local-lvm:vm-1-disk-1,size=8G\n";
+        let slots = parse_pve_disk_slots(cfg, "wolfpool");
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].0, "scsi1");
+    }
 }
 
 /// Bytes free on the filesystem backing `path`. Used for the
