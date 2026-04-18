@@ -80,11 +80,19 @@ pub async fn run_turn(
 
     let system_prompt = build_system_prompt(agent, state).await;
 
-    // Only Claude gets the full tool_use loop in this ship. Everyone
-    // else falls back to plain chat without tool access.
+    // Claude and Gemini both get native tool loops. OpenRouter /
+    // local fall back to plain chat without tool access — their
+    // function-calling protocols differ enough that implementing each
+    // is a separate ship. Gemini's addition closes the old gap where
+    // the system prompt advertised tools and Gemini "complied" by
+    // emitting tool-looking TEXT (e.g. ``**tool_code** print(list_nodes())``)
+    // instead of a real function call.
     match cfg.provider.as_str() {
         "claude" => {
             claude_tool_loop(agent, &cfg, &system_prompt, &history, user_message, state).await
+        }
+        "gemini" => {
+            gemini_tool_loop(agent, &cfg, &system_prompt, &history, user_message, state).await
         }
         _ => {
             let reply = crate::ai::simple_chat(&cfg, &system_prompt, &history, user_message).await?;
@@ -95,6 +103,237 @@ pub async fn run_turn(
             })
         }
     }
+}
+
+/// Gemini tool loop — mirrors the Claude loop but on Google's
+/// `generateContent` endpoint with `functionDeclarations`.
+///
+/// Differences from Claude:
+/// - System instruction is a top-level `systemInstruction` field, not
+///   part of the messages array.
+/// - Messages are called `contents`; roles are `user` and `model`
+///   (not `user`/`assistant`).
+/// - Tool calls come back as a `functionCall` part on a model turn.
+/// - Tool results are sent as a `functionResponse` part on a user turn.
+/// - No explicit stop_reason — we stop when the model emits text with
+///   no functionCall, or we hit MAX_ROUNDS.
+async fn gemini_tool_loop(
+    agent: &Agent,
+    cfg: &crate::ai::AiConfig,
+    system_prompt: &str,
+    history: &[crate::ai::ChatMessage],
+    user_message: &str,
+    state: &crate::api::AppState,
+) -> Result<AgentTurn, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("http client: {}", e))?;
+
+    // Build the initial contents array. Gemini uses "model" for the
+    // assistant role; translate from our canonical "assistant".
+    let mut contents: Vec<serde_json::Value> = Vec::new();
+    for m in history {
+        if m.role != "user" && m.role != "assistant" { continue; }
+        let role = if m.role == "assistant" { "model" } else { "user" };
+        contents.push(serde_json::json!({
+            "role": role,
+            "parts": [{ "text": m.content }],
+        }));
+    }
+    contents.push(serde_json::json!({
+        "role": "user",
+        "parts": [{ "text": user_message }],
+    }));
+
+    let function_decls = build_gemini_function_decls(agent);
+    let mut trace: Vec<ToolCallTrace> = Vec::new();
+
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+        cfg.model, cfg.gemini_api_key
+    );
+
+    for _round in 0..MAX_ROUNDS {
+        let mut body = serde_json::json!({
+            "contents": contents,
+            "systemInstruction": {
+                "parts": [{ "text": system_prompt }]
+            },
+        });
+        if !function_decls.is_empty() {
+            body["tools"] = serde_json::json!([{
+                "functionDeclarations": function_decls.clone(),
+            }]);
+            // AUTO lets the model decide; forced would demand a call
+            // every turn which breaks the natural "answer when done"
+            // termination condition.
+            body["toolConfig"] = serde_json::json!({
+                "functionCallingConfig": { "mode": "AUTO" }
+            });
+        }
+
+        let resp = client.post(&url).json(&body).send().await
+            .map_err(|e| format!("Gemini API error: {}", e))?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| format!("read body: {}", e))?;
+        if !status.is_success() {
+            return Err(format!("Gemini API {} — {}", status, text));
+        }
+        let payload: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| format!("parse response: {} — body: {}",
+                e, text.chars().take(200).collect::<String>()))?;
+
+        let parts = payload["candidates"][0]["content"]["parts"]
+            .as_array().cloned().unwrap_or_default();
+        let finish_reason = payload["candidates"][0]["finishReason"]
+            .as_str().unwrap_or("").to_string();
+
+        let mut text_pieces: Vec<String> = Vec::new();
+        let mut function_calls: Vec<(String, serde_json::Value)> = Vec::new();
+        for part in &parts {
+            if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                if !t.is_empty() { text_pieces.push(t.to_string()); }
+            }
+            if let Some(fc) = part.get("functionCall") {
+                let name = fc.get("name").and_then(|v| v.as_str())
+                    .unwrap_or("").to_string();
+                let args = fc.get("args").cloned()
+                    .unwrap_or(serde_json::json!({}));
+                if !name.is_empty() {
+                    function_calls.push((name, args));
+                }
+            }
+        }
+
+        // No tool call → we've landed. Return whatever text Gemini
+        // produced (or a helpful placeholder if the model returned an
+        // empty model turn, which happens when safety filters trim).
+        if function_calls.is_empty() {
+            let reply = if text_pieces.is_empty() {
+                match finish_reason.as_str() {
+                    "SAFETY" => "(Gemini blocked the response under its safety filters. Rephrase the request.)".to_string(),
+                    "RECITATION" => "(Gemini blocked the response as possible copyright recitation.)".to_string(),
+                    "MAX_TOKENS" => "(Gemini hit max tokens before producing any text.)".to_string(),
+                    other if !other.is_empty() => format!("(Gemini returned finishReason={} with no text)", other),
+                    _ => "(Gemini returned an empty response)".to_string(),
+                }
+            } else {
+                text_pieces.join("\n")
+            };
+            return Ok(AgentTurn {
+                response: reply,
+                tool_calls: trace,
+                stop_reason: finish_reason,
+            });
+        }
+
+        // Persist the model turn carrying the functionCall(s) so the
+        // next request shows Gemini its own previous output.
+        contents.push(serde_json::json!({
+            "role": "model",
+            "parts": parts,
+        }));
+
+        // Dispatch each functionCall, collect functionResponse parts.
+        let mut response_parts: Vec<serde_json::Value> = Vec::new();
+        for (name, args) in &function_calls {
+            let result = dispatch::dispatch(agent, name, args, state).await;
+            trace.push(ToolCallTrace {
+                tool: name.clone(),
+                arguments: args.clone(),
+                ok: result.ok,
+                status: result.status.clone(),
+            });
+            // Gemini expects the response under a named key; use the
+            // function name itself to keep it self-describing.
+            response_parts.push(serde_json::json!({
+                "functionResponse": {
+                    "name": name,
+                    "response": {
+                        "status": result.status,
+                        "ok": result.ok,
+                        "data": result.data,
+                    }
+                }
+            }));
+        }
+        contents.push(serde_json::json!({
+            "role": "user",
+            "parts": response_parts,
+        }));
+    }
+
+    warn!("wolfagents: agent {} (gemini) hit MAX_ROUNDS ({}) — abandoning turn", agent.id, MAX_ROUNDS);
+    Ok(AgentTurn {
+        response: format!(
+            "(agent aborted after {} tool-use rounds — increase the round cap or \
+             tighten the system prompt so the agent reaches a conclusion faster)",
+            MAX_ROUNDS
+        ),
+        tool_calls: trace,
+        stop_reason: "max_rounds".to_string(),
+    })
+}
+
+/// Build Gemini-shaped function declarations from the agent's
+/// allowed_tools list. Same pool of ToolId + input_schema_for as the
+/// Claude path — only the envelope differs. Gemini's Schema-ish
+/// subset doesn't support some JSON-Schema keywords (e.g. `default`,
+/// `anyOf` with null); we strip those via `normalise_schema_for_gemini`.
+fn build_gemini_function_decls(agent: &Agent) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for name in &agent.allowed_tools {
+        let Some(tool) = ToolId::from_str(name) else { continue; };
+        let raw_schema = input_schema_for(tool);
+        let parameters = normalise_schema_for_gemini(raw_schema);
+        out.push(serde_json::json!({
+            "name": tool.as_str(),
+            "description": tool.risk_note(),
+            "parameters": parameters,
+        }));
+    }
+    out
+}
+
+/// Gemini accepts a subset of JSON Schema under the name "Schema".
+/// In particular it rejects `["string", "null"]` unions (use nullable),
+/// doesn't understand `default`, and doesn't allow `additionalProperties`.
+/// This function walks the schema and rewrites the few forms we actually
+/// emit. New schema shapes added later may need extensions here.
+fn normalise_schema_for_gemini(mut v: serde_json::Value) -> serde_json::Value {
+    // Turn `"type": ["string", "null"]` → `"type": "string", "nullable": true`.
+    if let Some(t) = v.get("type").cloned() {
+        if let Some(arr) = t.as_array() {
+            let non_null: Vec<&serde_json::Value> = arr.iter()
+                .filter(|x| x.as_str() != Some("null")).collect();
+            let has_null = arr.iter().any(|x| x.as_str() == Some("null"));
+            if non_null.len() == 1 {
+                v["type"] = non_null[0].clone();
+                if has_null { v["nullable"] = serde_json::Value::Bool(true); }
+            }
+        }
+    }
+    // Recurse into `properties`.
+    if let Some(props) = v.get_mut("properties").and_then(|p| p.as_object_mut()) {
+        let keys: Vec<String> = props.keys().cloned().collect();
+        for k in keys {
+            if let Some(child) = props.remove(&k) {
+                props.insert(k, normalise_schema_for_gemini(child));
+            }
+        }
+    }
+    // Recurse into `items`.
+    if let Some(items) = v.get("items").cloned() {
+        v["items"] = normalise_schema_for_gemini(items);
+    }
+    // Strip `default` and `additionalProperties` — Gemini ignores or
+    // rejects these; our callers don't rely on them.
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("default");
+        obj.remove("additionalProperties");
+    }
+    v
 }
 
 /// Compose the per-turn system prompt. Order: agent's personality
