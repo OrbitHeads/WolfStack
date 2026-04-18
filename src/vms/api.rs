@@ -4,9 +4,92 @@
 
 use actix_web::{web, HttpResponse, HttpRequest};
 use serde::Deserialize;
-use crate::api::{AppState, require_auth, build_node_urls};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use crate::api::{
+    AppState, MigrationTasks, require_auth, build_node_urls,
+    migration_create, migration_update, migration_fail, migration_done, migration_progress,
+};
 use super::manager::{VmConfig, StorageVolume, UsbDevice, PciDevice};
 use super::passthrough;
+
+/// Format a byte count for human display: "1.4 GB" / "812 MB" / etc.
+fn format_bytes_human(b: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = b as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 { v /= 1024.0; i += 1; }
+    if i == 0 { format!("{} B", b) } else { format!("{:.1} {}", v, UNITS[i]) }
+}
+
+/// Poll the VM export directory for the in-progress tar.gz and report
+/// its growing size to the migration task. Runs until `stop` is set,
+/// typically when the export completes. Expected archive size is raw
+/// disk bytes; gzip typically yields ~50 % so the bar will appear to
+/// stall near 50 % then jump — still better than no signal at all.
+async fn poll_export_archive_size(
+    tasks: MigrationTasks,
+    tid: String,
+    staging_dir: Option<String>,
+    vm_name: String,
+    expected_total: Option<u64>,
+    stop: Arc<AtomicBool>,
+) {
+    let root = super::manager::migration_staging_root(staging_dir.as_deref())
+        .join("wolfstack-vm-exports");
+    let prefix = format!("vm-{}-", vm_name);
+    while !stop.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let Ok(entries) = std::fs::read_dir(&root) else { continue; };
+        let mut newest: Option<(std::time::SystemTime, u64)> = None;
+        for entry in entries.flatten() {
+            let Some(fname) = entry.file_name().to_str().map(|s| s.to_string()) else { continue; };
+            if !fname.starts_with(&prefix) || !fname.ends_with(".tar.gz") { continue; }
+            let Ok(md) = entry.metadata() else { continue; };
+            let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
+            let size = md.len();
+            if newest.map(|(t, _)| mtime > t).unwrap_or(true) {
+                newest = Some((mtime, size));
+            }
+        }
+        if let Some((_, size)) = newest {
+            migration_progress(&tasks, &tid, Some(size), expected_total, None);
+        }
+    }
+}
+
+/// Build a reqwest body that streams `archive_bytes` in 4 MiB chunks
+/// while updating the migration task's bytes_done counter. Each call
+/// returns a fresh stream so callers can retry across multiple import
+/// URLs without having to pre-clone the whole archive again. Reports
+/// *reads-from-memory*, not TCP ACKs — on slow networks the reported
+/// percent races ahead of actual wire transmission by up to one
+/// kernel-TCP-buffer worth of bytes, which is acceptable feedback.
+fn build_progress_body(
+    archive_bytes: &[u8],
+    total: u64,
+    tasks: MigrationTasks,
+    tid: String,
+) -> (reqwest::Body, u64) {
+    let archive = Arc::new(archive_bytes.to_vec());
+    let chunk_size: usize = 4 * 1024 * 1024;
+    let arc = archive.clone();
+    let stream = futures::stream::unfold(0usize, move |pos| {
+        let arc = arc.clone();
+        let tasks = tasks.clone();
+        let tid = tid.clone();
+        async move {
+            if pos >= arc.len() { return None; }
+            let end = (pos + chunk_size).min(arc.len());
+            let chunk = arc[pos..end].to_vec();
+            let new_pos = end;
+            migration_progress(&tasks, &tid, Some(new_pos as u64), Some(arc.len() as u64), None);
+            Some((Ok::<Vec<u8>, std::io::Error>(chunk), new_pos))
+        }
+    });
+    (reqwest::Body::wrap_stream(stream), total)
+}
 
 pub fn config(cfg: &mut web::ServiceConfig) {
     cfg.service(
@@ -636,7 +719,11 @@ struct VmMigrateExternalRequest {
     proxmox: bool,
 }
 
-/// POST /api/vms/{name}/migrate — migrate VM to another cluster node
+/// POST /api/vms/{name}/migrate — migrate VM to another cluster node.
+/// Spawns a background task so the HTTP call returns immediately with a
+/// `task_id`; the frontend polls `/api/migration/{id}/status` to drive
+/// its progress bar. Phases are: `preflight` → `stopping` → `export` →
+/// `upload` → `import` → `done` / `failed`.
 async fn vm_migrate(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -645,9 +732,10 @@ async fn vm_migrate(
 ) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let name = path.into_inner();
-    let new_name = body.new_name.as_deref().unwrap_or(&name);
+    let new_name = body.new_name.as_deref().unwrap_or(&name).to_string();
 
-    // Find target node — fall back to address/port if not in local cluster state
+    // Resolve target node synchronously so bad targets produce a 4xx
+    // rather than a task stuck in preflight.
     let node = match state.cluster.get_node(&body.target_node) {
         Some(n) => n,
         None => {
@@ -691,110 +779,174 @@ async fn vm_migrate(
         return HttpResponse::BadRequest().json(serde_json::json!({"error": "Cannot migrate to the same node"}));
     }
 
-    // Stop VM temporarily for a consistent export, then restart
-    {
-        let manager = state.vms.lock().unwrap();
-        if let Err(e) = manager.stop_vm(&name, true) {
-            tracing::warn!("Failed to stop VM '{}' before migration: {}", name, e);
-        }
-    }
+    // Precompute the expected archive size (pre-compression) so the
+    // export progress bar has a sensible denominator. gzip on qcow2
+    // typically compresses to ~40-60% of raw, so the bar will appear
+    // to stall around 50% — better than no signal at all.
+    let expected_total: Option<u64> = super::manager::read_vm_config(&name)
+        .ok()
+        .map(|c| super::manager::total_disk_bytes(&c))
+        .filter(|b| *b > 0);
 
-    // Export (outside of mutex — this is I/O heavy). staging_dir lets
-    // the operator point export staging at a big disk instead of /tmp.
-    let archive_path = match super::manager::export_vm_with_staging(
-        &name, body.staging_dir.as_deref(),
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            // Restart source on failure
-            let manager = state.vms.lock().unwrap();
-            let _ = manager.start_vm(&name);
-            return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("Export failed: {}", e)}));
-        }
-    };
+    let tasks = state.migration_tasks.clone();
+    let task_id = migration_create(&tasks);
 
-    // Restart source immediately after export — source stays running
-    {
-        let manager = state.vms.lock().unwrap();
-        let _ = manager.start_vm(&name);
-    }
-
-    // Read archive
-    let archive_bytes = match std::fs::read(&archive_path) {
-        Ok(b) => b,
-        Err(e) => {
-            super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
-            return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("Read archive: {}", e)}));
-        }
-    };
-
-    // Build import URLs for the target node
-    let import_urls = if node.node_type == "proxmox" {
-        let mut urls = build_node_urls(&node.address, 8553, "/api/vms/import-external");
-        urls.extend(build_node_urls(&node.address, 8552, "/api/vms/import-external"));
-        urls
-    } else {
-        build_node_urls(&node.address, node.port, "/api/vms/import-external")
-    };
-
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(3600))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap_or_default();
-
-    let file_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-    let mut last_err: Option<String> = None;
-
+    let tid = task_id.clone();
+    let state_clone = state.clone();
     let storage_val = body.storage.as_deref().unwrap_or("").to_string();
+    let staging_dir = body.staging_dir.clone();
     let tgt_staging_val = body.target_staging_dir.as_deref().unwrap_or("").to_string();
-    let proxmox_val = if body.proxmox { "1" } else { "" }.to_string();
+    let proxmox_val = body.proxmox;
+    let target_label = body.target_node.clone();
 
-    for import_url in &import_urls {
-        let mut form = reqwest::multipart::Form::new()
-            .text("new_name", new_name.to_string())
-            .text("storage", storage_val.clone())
-            .part("archive", reqwest::multipart::Part::bytes(archive_bytes.clone())
-                .file_name(file_name.clone()));
-        // Send the optional fields only when set so old targets
-        // (pre-v18.7.18) silently ignore unknown multipart parts.
-        if !tgt_staging_val.is_empty() {
-            form = form.text("target_staging_dir", tgt_staging_val.clone());
-        }
-        if !proxmox_val.is_empty() {
-            form = form.text("proxmox", proxmox_val.clone());
-        }
-
-        match client.post(import_url)
-            .header("X-WolfStack-Secret", state.cluster_secret.clone())
-            .multipart(form)
-            .send()
-            .await
+    tokio::spawn(async move {
+        migration_update(&state_clone.migration_tasks, &tid, "stopping", &format!("Stopping VM '{}' for consistent export…", name));
         {
-            Ok(r) => {
+            let manager = state_clone.vms.lock().unwrap();
+            if let Err(e) = manager.stop_vm(&name, true) {
+                tracing::warn!("Failed to stop VM '{}' before migration: {}", name, e);
+            }
+        }
+
+        migration_update(&state_clone.migration_tasks, &tid, "export",
+            &format!("Packaging disk archive{}…",
+                expected_total.map(|b| format!(" (~{})", format_bytes_human(b))).unwrap_or_default()));
+
+        // The exporter writes into /<staging>/wolfstack-vm-exports/ and
+        // names the tarball `vm-<name>-<timestamp>.tar.gz`. We can't
+        // know the exact final name in advance, so the watcher globs
+        // that directory for the newest file once it appears.
+        let watcher_staging = staging_dir.clone();
+        let watcher_name = name.clone();
+        let watcher_tasks = state_clone.migration_tasks.clone();
+        let watcher_tid = tid.clone();
+        let watcher_expected = expected_total;
+        let watcher_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher_flag = watcher_stop.clone();
+        tokio::spawn(async move {
+            poll_export_archive_size(
+                watcher_tasks, watcher_tid, watcher_staging, watcher_name,
+                watcher_expected, watcher_flag,
+            ).await;
+        });
+
+        let export_result = {
+            let name_owned = name.clone();
+            let staging_owned = staging_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                super::manager::export_vm_with_staging(&name_owned, staging_owned.as_deref())
+            }).await.unwrap_or_else(|e| Err(format!("export task join: {}", e)))
+        };
+        watcher_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let archive_path = match export_result {
+            Ok(p) => p,
+            Err(e) => {
+                let manager = state_clone.vms.lock().unwrap();
+                let _ = manager.start_vm(&name);
+                migration_fail(&state_clone.migration_tasks, &tid, &format!("Export failed: {}", e));
+                return;
+            }
+        };
+
+        // Source stays running from here — destination gets the consistent copy.
+        {
+            let manager = state_clone.vms.lock().unwrap();
+            let _ = manager.start_vm(&name);
+        }
+
+        let archive_bytes = match std::fs::read(&archive_path) {
+            Ok(b) => b,
+            Err(e) => {
                 super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
-                if r.status().is_success() {
-                    // Source stays running, destination is stopped
-                    return HttpResponse::Ok().json(serde_json::json!({
-                        "message": format!("VM '{}' transferred to '{}' on node '{}'. Destination is stopped — start it manually when ready.", name, new_name, body.target_node)
-                    }));
-                } else {
-                    let err_text = r.text().await.unwrap_or_default();
-                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("Import on target failed: {}", err_text)}));
+                migration_fail(&state_clone.migration_tasks, &tid, &format!("Read archive: {}", e));
+                return;
+            }
+        };
+
+        let total_bytes = archive_bytes.len() as u64;
+        migration_update(&state_clone.migration_tasks, &tid, "upload",
+            &format!("Uploading {} to {}…", format_bytes_human(total_bytes), target_label));
+        migration_progress(&state_clone.migration_tasks, &tid, Some(0), Some(total_bytes), Some(0.0));
+
+        let import_urls = if node.node_type == "proxmox" {
+            let mut urls = build_node_urls(&node.address, 8553, "/api/vms/import-external");
+            urls.extend(build_node_urls(&node.address, 8552, "/api/vms/import-external"));
+            urls
+        } else {
+            build_node_urls(&node.address, node.port, "/api/vms/import-external")
+        };
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(3600))
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap_or_default();
+
+        let file_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let mut last_err: Option<String> = None;
+        let mut finished = false;
+
+        for import_url in &import_urls {
+            // Build a streaming body so upload progress is reported
+            // per-chunk. The whole archive already lives in memory, so
+            // we just slice it on the outgoing stream side.
+            let (body, _total) = build_progress_body(
+                &archive_bytes, total_bytes, state_clone.migration_tasks.clone(), tid.clone(),
+            );
+            let part = reqwest::multipart::Part::stream_with_length(body, total_bytes)
+                .file_name(file_name.clone())
+                .mime_str("application/octet-stream").unwrap_or_else(|_| reqwest::multipart::Part::text("".to_string()));
+
+            let mut form = reqwest::multipart::Form::new()
+                .text("new_name", new_name.clone())
+                .text("storage", storage_val.clone())
+                .part("archive", part);
+            if !tgt_staging_val.is_empty() {
+                form = form.text("target_staging_dir", tgt_staging_val.clone());
+            }
+            if proxmox_val {
+                form = form.text("proxmox", "1".to_string());
+            }
+
+            match client.post(import_url)
+                .header("X-WolfStack-Secret", state_clone.cluster_secret.clone())
+                .multipart(form)
+                .send()
+                .await
+            {
+                Ok(r) => {
+                    super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
+                    if r.status().is_success() {
+                        migration_done(&state_clone.migration_tasks, &tid,
+                            &format!("VM '{}' transferred to '{}' on node '{}'. Destination is stopped — start it manually when ready.",
+                                name, new_name, target_label));
+                    } else {
+                        let err_text = r.text().await.unwrap_or_default();
+                        migration_fail(&state_clone.migration_tasks, &tid, &format!("Import on target failed: {}", err_text));
+                    }
+                    finished = true;
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                    continue;
                 }
             }
-            Err(e) => {
-                last_err = Some(e.to_string());
-                continue;
-            }
         }
-    }
 
-    // All URLs failed
-    super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
-    HttpResponse::BadGateway().json(serde_json::json!({
-        "error": format!("Transfer to {} failed on all ports/protocols: {}", node.address, last_err.unwrap_or_default())
+        if !finished {
+            super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
+            migration_fail(&state_clone.migration_tasks, &tid,
+                &format!("Transfer to {} failed on all ports/protocols: {}",
+                    node.address, last_err.unwrap_or_default()));
+        }
+    });
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "task_id": task_id,
+        "message": "Migration started"
     }))
 }
 
@@ -802,6 +954,12 @@ async fn vm_migrate(
 /// different storage path on the same node. Counterpart to the
 /// `/api/containers/lxc/{name}/disk/migrate` endpoint for LXC; same
 /// shape (`target` path + `remove_source` flag).
+///
+/// Spawns a background task and returns a `task_id` immediately so the
+/// frontend can show a real progress bar instead of blocking on the
+/// response. Native path polls the target file sizes; Proxmox path
+/// shells out to `qm move_disk` with stderr streamed and scraped for
+/// the `(NN.N%)` counter PVE prints.
 async fn vm_disk_migrate(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -810,13 +968,237 @@ async fn vm_disk_migrate(
 ) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let name = path.into_inner();
-    match super::manager::migrate_storage(&name, &body.target, body.remove_source) {
-        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
-        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    let target = body.target.trim().to_string();
+    let remove_source = body.remove_source;
+    if target.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "target is required"}));
+    }
+
+    // Pre-read the config so the task_id-returning response can 404
+    // cleanly and the bytes_total is known up front.
+    let (expected_total, is_pve, pve_vmid) = match super::manager::read_vm_config(&name) {
+        Ok(cfg) => {
+            let vmid = cfg.vmid.filter(|_| crate::containers::is_proxmox());
+            let total = super::manager::total_disk_bytes(&cfg);
+            (total, vmid.is_some(), vmid)
+        }
+        Err(e) => {
+            return HttpResponse::NotFound().json(serde_json::json!({"error": e}));
+        }
+    };
+
+    let tasks = state.migration_tasks.clone();
+    let task_id = migration_create(&tasks);
+    let tid = task_id.clone();
+    let tasks_for_task = tasks.clone();
+
+    tokio::spawn(async move {
+        migration_update(&tasks_for_task, &tid, "disk_copy",
+            &format!("Moving '{}' disks → {}{}…", name, target,
+                if expected_total > 0 { format!(" ({})", format_bytes_human(expected_total)) } else { String::new() }));
+
+        if is_pve {
+            let vmid = pve_vmid.unwrap();
+            let slots = match super::manager::pve_disk_slots_for_vmid(vmid, &target) {
+                Ok(s) => s,
+                Err(e) => {
+                    migration_fail(&tasks_for_task, &tid, &format!("qm config: {}", e));
+                    return;
+                }
+            };
+            if slots.is_empty() {
+                migration_fail(&tasks_for_task, &tid,
+                    &format!("vmid {}: no disk slots needing migration — all disks already on '{}' (or no qcow/raw volumes found)",
+                        vmid, target));
+                return;
+            }
+            let slot_count = slots.len();
+            let mut moved = Vec::new();
+            for (idx, (slot, from)) in slots.iter().enumerate() {
+                migration_update(&tasks_for_task, &tid, "disk_copy",
+                    &format!("[{}/{}] Moving {} ({} → {})…", idx + 1, slot_count, slot, from, target));
+                if let Err(e) = run_qm_move_disk_with_progress(
+                    &tasks_for_task, &tid, vmid, slot, &target, remove_source,
+                    idx, slot_count,
+                ).await {
+                    migration_fail(&tasks_for_task, &tid,
+                        &format!("qm move_disk {} {} → {} failed: {} (prior moved: [{}])",
+                            vmid, slot, target, e, moved.join(", ")));
+                    return;
+                }
+                moved.push(format!("{} ({}→{})", slot, from, target));
+            }
+            migration_done(&tasks_for_task, &tid,
+                &format!("vmid {}: moved {} disk(s) to '{}' via qm move_disk [{}]",
+                    vmid, moved.len(), target, moved.join(", ")));
+            return;
+        }
+
+        // Native path: start a watcher on the target directory so the
+        // operator sees bytes appear as fs::copy writes them.
+        let watch_stop = Arc::new(AtomicBool::new(false));
+        let watcher_flag = watch_stop.clone();
+        let watcher_tasks = tasks_for_task.clone();
+        let watcher_tid = tid.clone();
+        let watcher_target = target.clone();
+        let watcher_vm = name.clone();
+        tokio::spawn(async move {
+            poll_disk_copy_size(
+                watcher_tasks, watcher_tid, watcher_target, watcher_vm,
+                expected_total, watcher_flag,
+            ).await;
+        });
+
+        let migrate_result = {
+            let name_owned = name.clone();
+            let target_owned = target.clone();
+            tokio::task::spawn_blocking(move || {
+                super::manager::migrate_storage(&name_owned, &target_owned, remove_source)
+            }).await.unwrap_or_else(|e| Err(format!("migrate task join: {}", e)))
+        };
+        watch_stop.store(true, Ordering::Relaxed);
+
+        match migrate_result {
+            Ok(msg) => migration_done(&tasks_for_task, &tid, &msg),
+            Err(e) => migration_fail(&tasks_for_task, &tid, &e),
+        }
+    });
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "task_id": task_id,
+        "message": "Disk migration started"
+    }))
+}
+
+/// Poll the target storage directory for a VM's migrated disk files
+/// and report the sum of their sizes to the migration task. Used by
+/// the native `fs::copy` disk-migrate path where there's no progress
+/// stream from the copy itself — we watch the result instead. Stops
+/// when `stop` is flipped (migration task has finished or failed).
+async fn poll_disk_copy_size(
+    tasks: MigrationTasks,
+    tid: String,
+    target_dir: String,
+    vm_name: String,
+    expected_total: u64,
+    stop: Arc<AtomicBool>,
+) {
+    let target_path = std::path::Path::new(&target_dir);
+    while !stop.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let Ok(entries) = std::fs::read_dir(target_path) else { continue; };
+        let mut total: u64 = 0;
+        // The OS disk is `<name>.qcow2`; extras are `<extraname>.<ext>`.
+        // We can't easily distinguish extras vs pre-existing files, so
+        // count files that were clearly just created: any file mtime'd
+        // within the last 60 seconds, plus the OS-disk filename match.
+        let os_disk_name = format!("{}.qcow2", vm_name);
+        let now = std::time::SystemTime::now();
+        for entry in entries.flatten() {
+            let Some(fname) = entry.file_name().to_str().map(|s| s.to_string()) else { continue; };
+            let Ok(md) = entry.metadata() else { continue; };
+            let recent = md.modified().ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .map(|d| d.as_secs() < 300)
+                .unwrap_or(false);
+            if fname == os_disk_name || recent {
+                total += md.len();
+            }
+        }
+        if expected_total > 0 {
+            migration_progress(&tasks, &tid, Some(total), Some(expected_total), None);
+        } else {
+            migration_progress(&tasks, &tid, Some(total), None, None);
+        }
     }
 }
 
-/// POST /api/vms/{name}/migrate-external — migrate VM to another cluster
+/// Run `qm move_disk` for a single PVE disk slot, streaming its stderr
+/// and parsing the `(NN.N%)` counter PVE prints. Per-slot progress is
+/// mapped onto the overall percent so the bar advances smoothly across
+/// multi-disk VMs: slot 2 of 4 at 50 % → overall 37.5 %.
+async fn run_qm_move_disk_with_progress(
+    tasks: &MigrationTasks,
+    tid: &str,
+    vmid: u32,
+    slot: &str,
+    target: &str,
+    remove_source: bool,
+    slot_index: usize,
+    slot_count: usize,
+) -> Result<(), String> {
+    use tokio::process::Command as TokioCommand;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let mut cmd = TokioCommand::new("qm");
+    cmd.arg("move_disk").arg(vmid.to_string()).arg(slot).arg(target);
+    if remove_source { cmd.arg("--delete").arg("1"); }
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| format!("spawn qm: {}", e))?;
+    let stdout = child.stdout.take().ok_or("missing stdout")?;
+    let stderr = child.stderr.take().ok_or("missing stderr")?;
+
+    let tasks_s = tasks.clone();
+    let tid_s = tid.to_string();
+    let stdout_reader = tokio::spawn(async move {
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            scan_pve_percent(&line, &tasks_s, &tid_s, slot_index, slot_count);
+        }
+    });
+
+    let tasks_e = tasks.clone();
+    let tid_e = tid.to_string();
+    let mut captured_err = String::new();
+    let stderr_reader = tokio::spawn(async move {
+        let mut buf = String::new();
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            scan_pve_percent(&line, &tasks_e, &tid_e, slot_index, slot_count);
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+        buf
+    });
+
+    let status = child.wait().await.map_err(|e| format!("qm wait: {}", e))?;
+    let _ = stdout_reader.await;
+    if let Ok(buf) = stderr_reader.await { captured_err = buf; }
+    if !status.success() {
+        return Err(captured_err.trim().to_string());
+    }
+    Ok(())
+}
+
+/// Scan a `qm move_disk` / `qm importdisk` output line for the
+/// `(NN.N%)` counter and update the task's overall percent mapped
+/// across multiple slots.
+fn scan_pve_percent(
+    line: &str,
+    tasks: &MigrationTasks,
+    tid: &str,
+    slot_index: usize,
+    slot_count: usize,
+) {
+    // Format: "transferred 4.0 GiB of 32.0 GiB (12.50%)" — we only
+    // care about the bracketed percent. Avoid pulling in regex for
+    // one pattern; a tiny hand-rolled scan is faster and clearer.
+    if let Some(open) = line.rfind('(') {
+        if let Some(close) = line[open..].find('%') {
+            let inside = &line[open + 1..open + close];
+            if let Ok(p) = inside.trim().parse::<f64>() {
+                let overall = (slot_index as f64 + p / 100.0) / slot_count.max(1) as f64 * 100.0;
+                migration_progress(tasks, tid, None, None, Some(overall));
+            }
+        }
+    }
+}
+
+/// POST /api/vms/{name}/migrate-external — migrate VM to another cluster.
+/// Returns a `task_id` immediately; progress is reported via
+/// `/api/migration/{id}/status`.
 async fn vm_migrate_external(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -825,127 +1207,184 @@ async fn vm_migrate_external(
 ) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let name = path.into_inner();
-    let new_name = body.new_name.as_deref().unwrap_or(&name);
+    let new_name = body.new_name.as_deref().unwrap_or(&name).to_string();
 
-    // Pre-flight: verify we can reach the destination before doing the expensive export
-    let preflight_urls = crate::api::build_external_urls(&body.target_url, "/api/storage/list");
-    let preflight_client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(10))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap_or_default();
+    let expected_total: Option<u64> = super::manager::read_vm_config(&name)
+        .ok()
+        .map(|c| super::manager::total_disk_bytes(&c))
+        .filter(|b| *b > 0);
 
-    let mut preflight_ok = false;
-    let mut preflight_err = String::new();
-    for url in &preflight_urls {
-        match preflight_client.get(url)
-            .header("X-WolfStack-Secret", state.cluster_secret.clone())
-            .send()
-            .await
-        {
-            Ok(_) => { preflight_ok = true; break; } // any response = reachable
-            Err(e) => { preflight_err = format!("{}: {}", url, e); }
-        }
-    }
-    if !preflight_ok {
-        return HttpResponse::BadGateway().json(serde_json::json!({
-            "error": format!("Pre-flight check failed — cannot reach destination: {}", preflight_err)
-        }));
-    }
-
-    // Stop VM temporarily for a consistent export, then restart
-    {
-        let manager = state.vms.lock().unwrap();
-        if let Err(e) = manager.stop_vm(&name, true) {
-            tracing::warn!("Failed to stop VM '{}' before migration: {}", name, e);
-        }
-    }
-
-    // Export
-    let archive_path = match super::manager::export_vm_with_staging(
-        &name, body.staging_dir.as_deref(),
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            let manager = state.vms.lock().unwrap();
-            let _ = manager.start_vm(&name);
-            return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("Export failed: {}", e)}));
-        }
-    };
-
-    // Restart source immediately after export — source stays running
-    {
-        let manager = state.vms.lock().unwrap();
-        let _ = manager.start_vm(&name);
-    }
-
-    // Read archive
-    let archive_bytes = match std::fs::read(&archive_path) {
-        Ok(b) => b,
-        Err(e) => {
-            super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
-            return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("Read archive: {}", e)}));
-        }
-    };
-
-    // Build URLs to try — automatically tries WolfStack (8553) and Proxmox (8006) ports
-    let import_urls = crate::api::build_external_urls(&body.target_url, "/api/vms/import-external");
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3600))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap_or_default();
-
-    let file_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let tasks = state.migration_tasks.clone();
+    let task_id = migration_create(&tasks);
+    let tid = task_id.clone();
+    let state_clone = state.clone();
+    let target_url = body.target_url.clone();
+    let target_token = body.target_token.clone();
     let storage_val = body.storage.as_deref().unwrap_or("").to_string();
+    let staging_dir = body.staging_dir.clone();
     let tgt_staging_val = body.target_staging_dir.as_deref().unwrap_or("").to_string();
-    let proxmox_val = if body.proxmox { "1" } else { "" }.to_string();
-    let mut last_err: Option<String> = None;
+    let proxmox_val = body.proxmox;
+    let target_label = target_url.replace("https://", "").replace("http://", "").split('/').next().unwrap_or(&target_url).to_string();
 
-    for import_url in &import_urls {
-        let mut form = reqwest::multipart::Form::new()
-            .text("new_name", new_name.to_string())
-            .text("storage", storage_val.clone())
-            .part("archive", reqwest::multipart::Part::bytes(archive_bytes.clone())
-                .file_name(file_name.clone()));
-        if !tgt_staging_val.is_empty() {
-            form = form.text("target_staging_dir", tgt_staging_val.clone());
+    tokio::spawn(async move {
+        migration_update(&state_clone.migration_tasks, &tid, "preflight", &format!("Checking connectivity to {}…", target_label));
+        let preflight_urls = crate::api::build_external_urls(&target_url, "/api/storage/list");
+        let preflight_client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10))
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap_or_default();
+
+        let mut preflight_ok = false;
+        let mut preflight_err = String::new();
+        for url in &preflight_urls {
+            match preflight_client.get(url)
+                .header("X-WolfStack-Secret", state_clone.cluster_secret.clone())
+                .send()
+                .await
+            {
+                Ok(_) => { preflight_ok = true; break; }
+                Err(e) => { preflight_err = format!("{}: {}", url, e); }
+            }
         }
-        if !proxmox_val.is_empty() {
-            form = form.text("proxmox", proxmox_val.clone());
+        if !preflight_ok {
+            migration_fail(&state_clone.migration_tasks, &tid,
+                &format!("Pre-flight check failed — cannot reach destination: {}", preflight_err));
+            return;
         }
 
-        match client.post(import_url)
-            .header("X-Transfer-Token", &body.target_token)
-            .header("X-WolfStack-Secret", state.cluster_secret.clone())
-            .multipart(form)
-            .send()
-            .await
+        migration_update(&state_clone.migration_tasks, &tid, "stopping", &format!("Stopping VM '{}' for consistent export…", name));
         {
-            Ok(r) => {
+            let manager = state_clone.vms.lock().unwrap();
+            if let Err(e) = manager.stop_vm(&name, true) {
+                tracing::warn!("Failed to stop VM '{}' before migration: {}", name, e);
+            }
+        }
+
+        migration_update(&state_clone.migration_tasks, &tid, "export",
+            &format!("Packaging disk archive{}…",
+                expected_total.map(|b| format!(" (~{})", format_bytes_human(b))).unwrap_or_default()));
+
+        let watcher_stop = Arc::new(AtomicBool::new(false));
+        let watcher_flag = watcher_stop.clone();
+        let watcher_tasks = state_clone.migration_tasks.clone();
+        let watcher_tid = tid.clone();
+        let watcher_staging = staging_dir.clone();
+        let watcher_name = name.clone();
+        let watcher_expected = expected_total;
+        tokio::spawn(async move {
+            poll_export_archive_size(
+                watcher_tasks, watcher_tid, watcher_staging, watcher_name,
+                watcher_expected, watcher_flag,
+            ).await;
+        });
+
+        let export_result = {
+            let name_owned = name.clone();
+            let staging_owned = staging_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                super::manager::export_vm_with_staging(&name_owned, staging_owned.as_deref())
+            }).await.unwrap_or_else(|e| Err(format!("export task join: {}", e)))
+        };
+        watcher_stop.store(true, Ordering::Relaxed);
+
+        let archive_path = match export_result {
+            Ok(p) => p,
+            Err(e) => {
+                let manager = state_clone.vms.lock().unwrap();
+                let _ = manager.start_vm(&name);
+                migration_fail(&state_clone.migration_tasks, &tid, &format!("Export failed: {}", e));
+                return;
+            }
+        };
+
+        {
+            let manager = state_clone.vms.lock().unwrap();
+            let _ = manager.start_vm(&name);
+        }
+
+        let archive_bytes = match std::fs::read(&archive_path) {
+            Ok(b) => b,
+            Err(e) => {
                 super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
-                if r.status().is_success() {
-                    // Source stays running, destination is stopped
-                    return HttpResponse::Ok().json(serde_json::json!({
-                        "message": format!("VM '{}' transferred to {}. Destination is stopped — start it manually when ready.", name, body.target_url)
-                    }));
-                } else {
-                    let err = r.text().await.unwrap_or_default();
-                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("External import failed: {}", err)}));
+                migration_fail(&state_clone.migration_tasks, &tid, &format!("Read archive: {}", e));
+                return;
+            }
+        };
+
+        let total_bytes = archive_bytes.len() as u64;
+        migration_update(&state_clone.migration_tasks, &tid, "upload",
+            &format!("Uploading {} to {}…", format_bytes_human(total_bytes), target_label));
+        migration_progress(&state_clone.migration_tasks, &tid, Some(0), Some(total_bytes), Some(0.0));
+
+        let import_urls = crate::api::build_external_urls(&target_url, "/api/vms/import-external");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3600))
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap_or_default();
+        let file_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let mut last_err: Option<String> = None;
+        let mut finished = false;
+
+        for import_url in &import_urls {
+            let (body, _) = build_progress_body(
+                &archive_bytes, total_bytes, state_clone.migration_tasks.clone(), tid.clone(),
+            );
+            let part = reqwest::multipart::Part::stream_with_length(body, total_bytes)
+                .file_name(file_name.clone())
+                .mime_str("application/octet-stream").unwrap_or_else(|_| reqwest::multipart::Part::text("".to_string()));
+
+            let mut form = reqwest::multipart::Form::new()
+                .text("new_name", new_name.clone())
+                .text("storage", storage_val.clone())
+                .part("archive", part);
+            if !tgt_staging_val.is_empty() {
+                form = form.text("target_staging_dir", tgt_staging_val.clone());
+            }
+            if proxmox_val {
+                form = form.text("proxmox", "1".to_string());
+            }
+
+            match client.post(import_url)
+                .header("X-Transfer-Token", &target_token)
+                .header("X-WolfStack-Secret", state_clone.cluster_secret.clone())
+                .multipart(form)
+                .send()
+                .await
+            {
+                Ok(r) => {
+                    super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
+                    if r.status().is_success() {
+                        migration_done(&state_clone.migration_tasks, &tid,
+                            &format!("VM '{}' transferred to {}. Destination is stopped — start it manually when ready.",
+                                name, target_url));
+                    } else {
+                        let err = r.text().await.unwrap_or_default();
+                        migration_fail(&state_clone.migration_tasks, &tid,
+                            &format!("External import failed: {}", err));
+                    }
+                    finished = true;
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                    continue;
                 }
             }
-            Err(e) => {
-                last_err = Some(e.to_string());
-                continue;
-            }
         }
-    }
+        if !finished {
+            super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
+            migration_fail(&state_clone.migration_tasks, &tid,
+                &format!("Transfer to {} failed on all ports: {}",
+                    target_url, last_err.unwrap_or_default()));
+        }
+    });
 
-    super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
-    HttpResponse::BadGateway().json(serde_json::json!({
-        "error": format!("Transfer to {} failed on all ports: {}", body.target_url, last_err.unwrap_or_default())
+    HttpResponse::Ok().json(serde_json::json!({
+        "task_id": task_id,
+        "message": "Migration started"
     }))
 }
 

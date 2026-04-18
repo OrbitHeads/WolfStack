@@ -3132,7 +3132,7 @@ const VM_BASE: &str = "/var/lib/wolfstack/vms";
 /// tar.gz on top), so operators whose `/tmp` is a small tmpfs hit
 /// "no space left on device" long before their target storage fills.
 /// Letting them point staging at a roomy filesystem is the fix.
-fn migration_staging_root(explicit: Option<&str>) -> PathBuf {
+pub fn migration_staging_root(explicit: Option<&str>) -> PathBuf {
     if let Some(p) = explicit {
         let p = p.trim();
         if !p.is_empty() { return PathBuf::from(p); }
@@ -4101,6 +4101,62 @@ fn migrate_storage_proxmox(
         "vmid {}: moved {} disk(s) to '{}' via qm move_disk [{}]",
         vmid, moved.len(), target, moved.join(", ")
     ))
+}
+
+/// Read a VM's stored config JSON from disk. Lightweight accessor so
+/// callers that want to pre-compute things (disk sizes, extras,
+/// Proxmox vmid) don't have to hold the VmManager mutex or redo the
+/// path math. Returns the canonical config blob as stored in
+/// /var/lib/wolfstack/vms/<name>.json.
+pub fn read_vm_config(name: &str) -> Result<VmConfig, String> {
+    if name.contains('/') || name.contains("..") || name.contains('\0') || name.is_empty() {
+        return Err("Invalid VM name".to_string());
+    }
+    let path = Path::new(VM_BASE).join(format!("{}.json", name));
+    let content = fs::read_to_string(&path)
+        .map_err(|e| format!("read VM config {}: {}", path.display(), e))?;
+    serde_json::from_str(&content).map_err(|e| format!("parse VM config: {}", e))
+}
+
+/// Sum the on-disk size of the OS disk + every extra disk for a VM.
+/// Used by the disk-migrate progress bar to derive `bytes_total` up
+/// front. Returns 0 for disks that don't exist on disk — same
+/// forgiveness model as `migrate_storage`.
+pub fn total_disk_bytes(config: &VmConfig) -> u64 {
+    let base = Path::new(VM_BASE);
+    let mut total: u64 = 0;
+    let os_disk = if let Some(ref sp) = config.storage_path {
+        Path::new(sp).join(format!("{}.qcow2", config.name))
+    } else {
+        base.join(format!("{}.qcow2", config.name))
+    };
+    if os_disk.exists() {
+        if let Ok(md) = fs::metadata(&os_disk) { total += md.len(); }
+    }
+    for disk in &config.extra_disks {
+        let p = disk.file_path();
+        if p.exists() {
+            if let Ok(md) = fs::metadata(&p) { total += md.len(); }
+        }
+    }
+    total
+}
+
+/// Public wrapper around the private PVE slot parser so the api layer
+/// can enumerate disks for per-slot progress reporting before invoking
+/// `qm move_disk` itself.
+pub fn pve_disk_slots_for_vmid(vmid: u32, target: &str) -> Result<Vec<(String, String)>, String> {
+    let out = Command::new("qm")
+        .args(["config", &vmid.to_string()])
+        .output()
+        .map_err(|e| format!("qm config failed: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "qm config {}: {}",
+            vmid, String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(parse_pve_disk_slots(&String::from_utf8_lossy(&out.stdout), target))
 }
 
 /// Parse `qm config <vmid>` output into a list of

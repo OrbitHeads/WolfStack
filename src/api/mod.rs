@@ -150,11 +150,21 @@ pub struct AlertLogEntry {
 #[derive(Clone, Serialize)]
 pub struct MigrationTask {
     pub id: String,
-    pub stage: String,       // "preflight", "export", "upload", "import", "done", "failed"
+    pub stage: String,       // "preflight", "export", "upload", "import", "disk_copy", "done", "failed"
     pub message: String,
     pub completed: bool,
     pub error: Option<String>,
     pub started_at: u64,
+    /// 0.0–100.0 for the current stage, None when the stage has no
+    /// progress signal (e.g. stopping a VM is treated as instantaneous).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub percent: Option<f64>,
+    /// Bytes observed on the target so far for this stage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_done: Option<u64>,
+    /// Total bytes expected for this stage (archive size, disk size, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_total: Option<u64>,
 }
 
 /// Load or generate the join token from /etc/wolfstack/join-token
@@ -4754,17 +4764,51 @@ async fn lxc_import_endpoint_inner(
     }
 }
 
-/// Helper: update a migration task's status
-fn migration_update(tasks: &Arc<std::sync::RwLock<std::collections::HashMap<String, MigrationTask>>>, id: &str, stage: &str, message: &str) {
+pub type MigrationTasks = Arc<std::sync::RwLock<std::collections::HashMap<String, MigrationTask>>>;
+
+/// Helper: update a migration task's stage/message. Resets the
+/// per-stage progress counters so a stage transition always starts
+/// with a blank progress bar rather than showing the previous stage's
+/// percentage.
+pub fn migration_update(tasks: &MigrationTasks, id: &str, stage: &str, message: &str) {
     if let Ok(mut map) = tasks.write() {
         if let Some(task) = map.get_mut(id) {
             task.stage = stage.to_string();
             task.message = message.to_string();
+            task.percent = None;
+            task.bytes_done = None;
+            task.bytes_total = None;
         }
     }
 }
 
-fn migration_fail(tasks: &Arc<std::sync::RwLock<std::collections::HashMap<String, MigrationTask>>>, id: &str, error: &str) {
+/// Update the per-stage progress indicators without changing the
+/// current stage. Pass `percent` alone (a 0.0–100.0 float) when there
+/// are no byte counts, or pass byte counts and let the helper
+/// recompute percent.
+pub fn migration_progress(
+    tasks: &MigrationTasks,
+    id: &str,
+    bytes_done: Option<u64>,
+    bytes_total: Option<u64>,
+    percent: Option<f64>,
+) {
+    if let Ok(mut map) = tasks.write() {
+        if let Some(task) = map.get_mut(id) {
+            if let Some(b) = bytes_done { task.bytes_done = Some(b); }
+            if let Some(b) = bytes_total { task.bytes_total = Some(b); }
+            if let Some(p) = percent {
+                task.percent = Some(p.clamp(0.0, 100.0));
+            } else if let (Some(d), Some(t)) = (task.bytes_done, task.bytes_total) {
+                if t > 0 {
+                    task.percent = Some(((d as f64 / t as f64) * 100.0).clamp(0.0, 100.0));
+                }
+            }
+        }
+    }
+}
+
+pub fn migration_fail(tasks: &MigrationTasks, id: &str, error: &str) {
     if let Ok(mut map) = tasks.write() {
         if let Some(task) = map.get_mut(id) {
             task.stage = "failed".to_string();
@@ -4775,14 +4819,43 @@ fn migration_fail(tasks: &Arc<std::sync::RwLock<std::collections::HashMap<String
     }
 }
 
-fn migration_done(tasks: &Arc<std::sync::RwLock<std::collections::HashMap<String, MigrationTask>>>, id: &str, message: &str) {
+pub fn migration_done(tasks: &MigrationTasks, id: &str, message: &str) {
     if let Ok(mut map) = tasks.write() {
         if let Some(task) = map.get_mut(id) {
             task.stage = "done".to_string();
             task.message = message.to_string();
             task.completed = true;
+            task.percent = Some(100.0);
         }
     }
+}
+
+/// Create a new migration task entry and return the generated id. The
+/// task starts in `preflight` stage — callers transition it via
+/// `migration_update` as soon as real work begins.
+pub fn migration_create(tasks: &MigrationTasks) -> String {
+    let id = format!(
+        "mig_{}",
+        uuid::Uuid::new_v4().to_string().replace('-', "")[..12].to_string()
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Ok(mut map) = tasks.write() {
+        map.insert(id.clone(), MigrationTask {
+            id: id.clone(),
+            stage: "preflight".to_string(),
+            message: "Preparing…".to_string(),
+            completed: false,
+            error: None,
+            started_at: now,
+            percent: None,
+            bytes_done: None,
+            bytes_total: None,
+        });
+    }
+    id
 }
 
 /// GET /api/migration/{id}/status — poll migration task progress
@@ -4818,19 +4891,8 @@ pub async fn lxc_migrate_external(
     let tasks = state.migration_tasks.clone();
 
     // Create task entry
-    let task_id = format!("mig_{}", uuid::Uuid::new_v4().to_string().replace('-', "")[..12].to_string());
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    {
-        let mut map = tasks.write().unwrap();
-        map.insert(task_id.clone(), MigrationTask {
-            id: task_id.clone(),
-            stage: "preflight".to_string(),
-            message: "Checking destination connectivity...".to_string(),
-            completed: false,
-            error: None,
-            started_at: now,
-        });
-    }
+    let task_id = migration_create(&tasks);
+    migration_update(&tasks, &task_id, "preflight", "Checking destination connectivity...");
 
     let tid = task_id.clone();
     // Spawn migration in background

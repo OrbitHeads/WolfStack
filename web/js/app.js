@@ -14606,45 +14606,19 @@ async function doMigrateVm(name) {
     document.getElementById('vm-migrate-modal')?.remove();
 
     const targetLabel = isExternal ? extUrl.replace(/https?:\/\//, '').split('/')[0] : target;
-    const taskId = taskLogStart(`Migrating VM '${name}' to ${targetLabel}`);
+    const logTaskId = taskLogStart(`Migrating VM '${name}' to ${targetLabel}`);
 
+    // Stage → step mapping. The backend emits these stage strings in
+    // order; we promote each step to done/active based on the current
+    // stage. preflight & stopping count as "before export" (spinner on
+    // the export step; it's the first real long step anyway).
     const steps = [
-        { id: 'export', label: 'Creating disk archive', icon: '💾' },
-        { id: 'upload', label: isExternal ? `Uploading to ${extUrl.replace(/https?:\/\//, '').split('/')[0]}` : 'Transferring to target node', icon: '📤' },
-        { id: 'import', label: 'Importing on target node (stopped)', icon: '📥' },
+        { id: 'export', label: 'Creating disk archive', icon: '💾', stages: ['preflight', 'stopping', 'export'] },
+        { id: 'upload', label: isExternal ? `Uploading to ${targetLabel}` : 'Transferring to target node', icon: '📤', stages: ['upload'] },
+        { id: 'import', label: 'Importing on target node (stopped)', icon: '📥', stages: ['import'] },
     ];
 
-    const modal = document.createElement('div');
-    modal.id = 'vm-op-modal';
-    modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:10000;backdrop-filter:blur(4px);';
-    modal.innerHTML = `
-        <div style="background:var(--card-bg,#1e1e2e);border:1px solid var(--border,#333);border-radius:12px;padding:28px 36px;min-width:440px;max-width:540px;box-shadow:0 20px 60px rgba(0,0,0,0.5);">
-            <h3 style="margin:0 0 6px;color:var(--text,#fff);">Migrating VM</h3>
-            <p style="margin:0 0 16px;color:var(--text-muted,#aaa);font-size:0.85em;">Moving <strong>${name}</strong> — this may take a while for large disk images.</p>
-            <div id="vm-migrate-steps" style="display:flex;flex-direction:column;gap:6px;margin-bottom:16px;">
-                ${steps.map(s => `
-                    <div id="vmstep-${s.id}" style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:8px;background:var(--bg-secondary,#161622);transition:all 0.3s;">
-                        <span class="mstep-icon" style="width:24px;text-align:center;font-size:14px;color:var(--text-muted,#555);">${s.icon}</span>
-                        <span style="flex:1;font-size:0.88em;color:var(--text-muted,#666);">${s.label}</span>
-                        <span class="mstep-status" style="font-size:12px;color:var(--text-muted,#555);min-width:20px;text-align:center;"></span>
-                    </div>
-                `).join('')}
-            </div>
-            <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
-                <div id="vm-migrate-spinner" style="width:20px;height:20px;border:3px solid var(--border,#555);border-top:3px solid #3b82f6;border-radius:50%;animation:spin 1s linear infinite;flex-shrink:0;"></div>
-                <span id="vm-migrate-elapsed" style="font-size:0.82em;color:var(--text-muted,#888);">Elapsed: 0s</span>
-            </div>
-            <div id="vm-op-result" style="display:none;margin-top:12px;padding:12px;border-radius:8px;text-align:left;font-size:0.9em;"></div>
-            <button id="vm-op-close" style="display:none;margin-top:12px;" class="btn" onclick="document.getElementById('vm-op-modal')?.remove()">Close</button>
-        </div>
-    `;
-    if (!document.getElementById('lxc-spin-style')) {
-        const s = document.createElement('style'); s.id = 'lxc-spin-style';
-        s.textContent = '@keyframes spin { to { transform: rotate(360deg); } }';
-        document.head.appendChild(s);
-    }
-    document.body.appendChild(modal);
-
+    showVmMigrateProgressModal(name, steps);
     const startTime = Date.now();
     const elapsedEl = document.getElementById('vm-migrate-elapsed');
     const elapsedTimer = setInterval(() => {
@@ -14653,50 +14627,9 @@ async function doMigrateVm(name) {
         elapsedEl.textContent = mins > 0 ? `Elapsed: ${mins}m ${secs % 60}s` : `Elapsed: ${secs}s`;
     }, 1000);
 
-    function setVmStepActive(stepId) {
-        const el = document.getElementById('vmstep-' + stepId);
-        if (!el) return;
-        el.style.background = 'rgba(59,130,246,0.15)';
-        el.style.border = '1px solid rgba(59,130,246,0.3)';
-        el.querySelector('.mstep-status').innerHTML = '<div style="width:14px;height:14px;border:2px solid var(--border,#555);border-top:2px solid #3b82f6;border-radius:50%;animation:spin 1s linear infinite;display:inline-block;"></div>';
-        el.querySelector('span:nth-child(2)').style.color = 'var(--text,#fff)';
-    }
-    function setVmStepDone(stepId) {
-        const el = document.getElementById('vmstep-' + stepId);
-        if (!el) return;
-        el.style.background = 'rgba(16,185,129,0.08)';
-        el.style.border = '1px solid rgba(16,185,129,0.2)';
-        el.querySelector('.mstep-status').textContent = '✅';
-        el.querySelector('span:nth-child(2)').style.color = '#10b981';
-    }
-    function setVmStepFailed(stepId) {
-        const el = document.getElementById('vmstep-' + stepId);
-        if (!el) return;
-        el.style.background = 'rgba(239,68,68,0.1)';
-        el.style.border = '1px solid rgba(239,68,68,0.2)';
-        el.querySelector('.mstep-status').textContent = '❌';
-        el.querySelector('span:nth-child(2)').style.color = '#ef4444';
-    }
-
-    let currentStep = 0;
-    const stepTimings = [3000, 15000, 60000, 90000]; // VM disks are larger, longer timings
-    const stepTimers = [];
-
-    setVmStepActive(steps[0].id);
-    for (let i = 0; i < stepTimings.length; i++) {
-        stepTimers.push(setTimeout(() => {
-            setVmStepDone(steps[i].id);
-            if (i + 1 < steps.length) {
-                setVmStepActive(steps[i + 1].id);
-                currentStep = i + 1;
-            }
-        }, stepTimings[i]));
-    }
-
     try {
         let resp;
         if (isExternal) {
-            // External migration: always run on the LOCAL server (not proxied)
             const extBody = { target_url: extUrl, target_token: extToken };
             if (migrateStorage) extBody.storage = migrateStorage;
             if (stagingDir) extBody.staging_dir = stagingDir;
@@ -14722,49 +14655,217 @@ async function doMigrateVm(name) {
             });
         }
 
-        stepTimers.forEach(t => clearTimeout(t));
+        const kickoff = await resp.json().catch(() => ({}));
+        if (!resp.ok || !kickoff.task_id) {
+            clearInterval(elapsedTimer);
+            vmMigrateProgressFinish(null, false, kickoff.error || 'Failed to start migration');
+            updateTaskLogEntry(logTaskId, { status: 'failed', description: `Migrate VM '${name}': ${kickoff.error || 'start failed'}` });
+            return;
+        }
+
+        const final = await pollVmMigrationProgress(kickoff.task_id, steps, isExternal);
         clearInterval(elapsedTimer);
         const totalSecs = Math.floor((Date.now() - startTime) / 1000);
         const totalMins = Math.floor(totalSecs / 60);
-        elapsedEl.textContent = totalMins > 0 ? `Completed in ${totalMins}m ${totalSecs % 60}s` : `Completed in ${totalSecs}s`;
+        if (elapsedEl) {
+            elapsedEl.textContent = totalMins > 0 ? `Completed in ${totalMins}m ${totalSecs % 60}s` : `Completed in ${totalSecs}s`;
+        }
+        if (final.ok) {
+            vmMigrateProgressFinish(steps, true, final.message || 'VM migrated successfully');
+            updateTaskLogEntry(logTaskId, { status: 'completed', description: `Migrated VM '${name}' to ${targetLabel}` });
+            setTimeout(loadVms, 500);
+        } else {
+            vmMigrateProgressFinish(steps, false, final.error || 'Unknown error', final.failedStage);
+            updateTaskLogEntry(logTaskId, { status: 'failed', description: `Migrate VM '${name}': ${final.error || 'Unknown error'}` });
+        }
+    } catch (e) {
+        clearInterval(elapsedTimer);
+        vmMigrateProgressFinish(steps, false, e.message);
+        updateTaskLogEntry(logTaskId, { status: 'failed', description: `Migrate VM '${name}': ${e.message}` });
+    }
+}
 
+/// Renders the progress dialog. Called by both doMigrateVm and
+/// doMigrateVmDiskStorage. Inserts the modal into the DOM, wires up
+/// the elapsed timer display, and ensures the spin keyframes style is
+/// present. Steps array shape: { id, label, icon, stages: [string] }.
+function showVmMigrateProgressModal(name, steps) {
+    const modal = document.createElement('div');
+    modal.id = 'vm-op-modal';
+    modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:10000;backdrop-filter:blur(4px);';
+    modal.innerHTML = `
+        <div style="background:var(--card-bg,#1e1e2e);border:1px solid var(--border,#333);border-radius:12px;padding:28px 36px;min-width:480px;max-width:580px;box-shadow:0 20px 60px rgba(0,0,0,0.5);">
+            <h3 style="margin:0 0 6px;color:var(--text,#fff);">Migrating VM</h3>
+            <p style="margin:0 0 16px;color:var(--text-muted,#aaa);font-size:0.85em;">Moving <strong>${name}</strong> — progress is polled live from the server.</p>
+            <div id="vm-migrate-steps" style="display:flex;flex-direction:column;gap:6px;margin-bottom:14px;">
+                ${steps.map(s => `
+                    <div id="vmstep-${s.id}" style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:8px;background:var(--bg-secondary,#161622);transition:all 0.3s;">
+                        <span class="mstep-icon" style="width:24px;text-align:center;font-size:14px;color:var(--text-muted,#555);">${s.icon}</span>
+                        <span style="flex:1;font-size:0.88em;color:var(--text-muted,#666);">${s.label}</span>
+                        <span class="mstep-status" style="font-size:12px;color:var(--text-muted,#555);min-width:20px;text-align:center;"></span>
+                    </div>
+                `).join('')}
+            </div>
+            <div id="vm-migrate-bar-wrap" style="margin-bottom:8px;">
+                <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-muted,#888);margin-bottom:4px;">
+                    <span id="vm-migrate-msg">Starting…</span>
+                    <span id="vm-migrate-bytes"></span>
+                </div>
+                <div style="height:8px;background:var(--bg-secondary,#161622);border-radius:6px;overflow:hidden;border:1px solid var(--border,#333);">
+                    <div id="vm-migrate-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#3b82f6,#60a5fa);transition:width 400ms ease-out;"></div>
+                </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+                <div id="vm-migrate-spinner" style="width:20px;height:20px;border:3px solid var(--border,#555);border-top:3px solid #3b82f6;border-radius:50%;animation:spin 1s linear infinite;flex-shrink:0;"></div>
+                <span id="vm-migrate-elapsed" style="font-size:0.82em;color:var(--text-muted,#888);">Elapsed: 0s</span>
+            </div>
+            <div id="vm-op-result" style="display:none;margin-top:12px;padding:12px;border-radius:8px;text-align:left;font-size:0.9em;"></div>
+            <button id="vm-op-close" style="display:none;margin-top:12px;" class="btn" onclick="document.getElementById('vm-op-modal')?.remove()">Close</button>
+        </div>
+    `;
+    if (!document.getElementById('lxc-spin-style')) {
+        const s = document.createElement('style'); s.id = 'lxc-spin-style';
+        s.textContent = '@keyframes spin { to { transform: rotate(360deg); } }';
+        document.head.appendChild(s);
+    }
+    document.body.appendChild(modal);
+}
+
+function vmMigrateStepActive(stepId) {
+    const el = document.getElementById('vmstep-' + stepId);
+    if (!el) return;
+    el.style.background = 'rgba(59,130,246,0.15)';
+    el.style.border = '1px solid rgba(59,130,246,0.3)';
+    el.querySelector('.mstep-status').innerHTML = '<div style="width:14px;height:14px;border:2px solid var(--border,#555);border-top:2px solid #3b82f6;border-radius:50%;animation:spin 1s linear infinite;display:inline-block;"></div>';
+    el.querySelector('span:nth-child(2)').style.color = 'var(--text,#fff)';
+}
+function vmMigrateStepDone(stepId) {
+    const el = document.getElementById('vmstep-' + stepId);
+    if (!el) return;
+    el.style.background = 'rgba(16,185,129,0.08)';
+    el.style.border = '1px solid rgba(16,185,129,0.2)';
+    el.querySelector('.mstep-status').textContent = '✅';
+    el.querySelector('span:nth-child(2)').style.color = '#10b981';
+}
+function vmMigrateStepFailed(stepId) {
+    const el = document.getElementById('vmstep-' + stepId);
+    if (!el) return;
+    el.style.background = 'rgba(239,68,68,0.1)';
+    el.style.border = '1px solid rgba(239,68,68,0.2)';
+    el.querySelector('.mstep-status').textContent = '❌';
+    el.querySelector('span:nth-child(2)').style.color = '#ef4444';
+}
+
+function formatMigrateBytes(done, total) {
+    if (done == null) return '';
+    const fmt = (n) => {
+        if (n < 1024) return n + ' B';
+        if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+        if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
+        return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+    };
+    if (total != null && total > 0) return `${fmt(done)} / ${fmt(total)}`;
+    return fmt(done);
+}
+
+/// Poll /api/migration/{id}/status every second and update the modal's
+/// steps + progress bar. Resolves with `{ok, message?, error?, failedStage?}`
+/// once the task reaches `done` or `failed`. Any network hiccup during
+/// polling keeps retrying — the migration runs server-side so a
+/// transient fetch failure shouldn't abort the UI.
+async function pollVmMigrationProgress(taskId, steps) {
+    const barEl = document.getElementById('vm-migrate-bar');
+    const msgEl = document.getElementById('vm-migrate-msg');
+    const bytesEl = document.getElementById('vm-migrate-bytes');
+    const stageToStep = {};
+    steps.forEach(s => (s.stages || [s.id]).forEach(stg => { stageToStep[stg] = s.id; }));
+    let lastStage = null;
+    let failedStage = null;
+
+    while (true) {
+        await new Promise(r => setTimeout(r, 1000));
         let data;
-        try { data = await resp.json(); } catch { data = {}; }
+        try {
+            const r = await fetch(apiUrl(`/api/migration/${taskId}/status`));
+            if (!r.ok) { continue; }
+            data = await r.json();
+        } catch { continue; }
 
-        const resultEl = document.getElementById('vm-op-result');
-        const spinner = document.getElementById('vm-migrate-spinner');
-        if (spinner) spinner.style.display = 'none';
-        document.getElementById('vm-op-close').style.display = '';
+        const stage = data.stage || '';
+        const msg = data.message || '';
+        const pct = typeof data.percent === 'number' ? data.percent : null;
+        const done = typeof data.bytes_done === 'number' ? data.bytes_done : null;
+        const total = typeof data.bytes_total === 'number' ? data.bytes_total : null;
 
-        if (resp.ok) {
-            steps.forEach(s => setVmStepDone(s.id));
+        if (msgEl) msgEl.textContent = msg || '…';
+        if (bytesEl) bytesEl.textContent = formatMigrateBytes(done, total);
+        if (barEl) {
+            if (pct != null) {
+                barEl.style.width = Math.max(0, Math.min(100, pct)).toFixed(1) + '%';
+                barEl.style.background = 'linear-gradient(90deg,#3b82f6,#60a5fa)';
+            } else {
+                barEl.style.width = '100%';
+                barEl.style.background = 'repeating-linear-gradient(45deg,rgba(59,130,246,0.4) 0 10px,rgba(59,130,246,0.15) 10px 20px)';
+            }
+        }
+
+        // Promote steps as the stage advances
+        if (stage && stage !== lastStage) {
+            const currentStepId = stageToStep[stage];
+            if (currentStepId) {
+                // Mark every previous step done
+                for (const s of steps) {
+                    if (s.id === currentStepId) break;
+                    vmMigrateStepDone(s.id);
+                }
+                vmMigrateStepActive(currentStepId);
+            }
+            lastStage = stage;
+        }
+
+        if (data.completed) {
+            if (stage === 'done') {
+                for (const s of steps) vmMigrateStepDone(s.id);
+                return { ok: true, message: msg };
+            } else {
+                failedStage = stageToStep[lastStage] || (steps[steps.length - 1] && steps[steps.length - 1].id);
+                return { ok: false, error: data.error || msg || 'Unknown error', failedStage };
+            }
+        }
+    }
+}
+
+function vmMigrateProgressFinish(steps, ok, message, failedStepId) {
+    const resultEl = document.getElementById('vm-op-result');
+    const spinner = document.getElementById('vm-migrate-spinner');
+    const barWrap = document.getElementById('vm-migrate-bar-wrap');
+    if (spinner) spinner.style.display = 'none';
+    const closeBtn = document.getElementById('vm-op-close');
+    if (closeBtn) closeBtn.style.display = '';
+    if (ok) {
+        if (steps) for (const s of steps) vmMigrateStepDone(s.id);
+        if (barWrap) {
+            const bar = document.getElementById('vm-migrate-bar');
+            if (bar) { bar.style.width = '100%'; bar.style.background = 'linear-gradient(90deg,#10b981,#34d399)'; }
+        }
+        if (resultEl) {
             resultEl.style.display = 'block';
             resultEl.style.background = 'rgba(16,185,129,0.15)';
             resultEl.style.color = '#10b981';
-            resultEl.textContent = data.message || 'VM migrated successfully';
-            updateTaskLogEntry(taskId, { status: 'completed', description: `Migrated VM '${name}' to ${targetLabel}` });
-            setTimeout(loadVms, 500);
-        } else {
-            steps.slice(0, currentStep).forEach(s => setVmStepDone(s.id));
-            setVmStepFailed(steps[currentStep].id);
+            resultEl.textContent = message;
+        }
+    } else {
+        if (steps && failedStepId) vmMigrateStepFailed(failedStepId);
+        if (barWrap) {
+            const bar = document.getElementById('vm-migrate-bar');
+            if (bar) { bar.style.background = 'linear-gradient(90deg,#ef4444,#f87171)'; }
+        }
+        if (resultEl) {
             resultEl.style.display = 'block';
             resultEl.style.background = 'rgba(239,68,68,0.15)';
             resultEl.style.color = '#ef4444';
-            resultEl.textContent = data.error || 'Unknown error';
-            updateTaskLogEntry(taskId, { status: 'failed', description: `Migrate VM '${name}': ${data.error || 'Unknown error'}` });
+            resultEl.textContent = message;
         }
-    } catch (e) {
-        stepTimers.forEach(t => clearTimeout(t));
-        clearInterval(elapsedTimer);
-        steps.slice(0, currentStep).forEach(s => setVmStepDone(s.id));
-        setVmStepFailed(steps[currentStep].id);
-        const spinner = document.getElementById('vm-migrate-spinner');
-        if (spinner) spinner.style.display = 'none';
-        const r = document.getElementById('vm-op-result');
-        r.style.display = 'block'; r.style.background = 'rgba(239,68,68,0.15)'; r.style.color = '#ef4444';
-        r.textContent = e.message;
-        document.getElementById('vm-op-close').style.display = '';
-        updateTaskLogEntry(taskId, { status: 'failed', description: `Migrate VM '${name}': ${e.message}` });
     }
 }
 
@@ -14840,27 +14941,48 @@ async function doMigrateVmDiskStorage(name, btn) {
     const removeSource = !!overlay.querySelector('#vm-disk-migrate-remove-source')?.checked;
     if (!target) { showToast('Pick or enter a target storage path', 'error'); return; }
     if (!(await showConfirm(`Migrate ${name}'s disks to ${target}? ${removeSource ? '(source will be removed after successful copy)' : '(source will be kept)'}`))) return;
-    const taskId = taskLogStart(`Migrating VM '${name}' disks to ${target}`);
+    overlay.remove?.();
+
+    const logTaskId = taskLogStart(`Migrating VM '${name}' disks to ${target}`);
+    const steps = [
+        { id: 'disk_copy', label: `Copying disks → ${target}`, icon: '💾', stages: ['preflight', 'disk_copy'] },
+    ];
+    showVmMigrateProgressModal(name, steps);
+    const startTime = Date.now();
+    const elapsedEl = document.getElementById('vm-migrate-elapsed');
+    const elapsedTimer = setInterval(() => {
+        const secs = Math.floor((Date.now() - startTime) / 1000);
+        const mins = Math.floor(secs / 60);
+        elapsedEl.textContent = mins > 0 ? `Elapsed: ${mins}m ${secs % 60}s` : `Elapsed: ${secs}s`;
+    }, 1000);
+
     try {
         const r = await fetch(apiUrl(`/api/vms/${encodeURIComponent(name)}/disk/migrate`), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ target, remove_source: removeSource }),
         });
-        const data = await r.json().catch(() => ({}));
-        if (!r.ok) {
-            const errMsg = data.error || ('HTTP ' + r.status);
-            showToast('Migrate failed: ' + errMsg, 'error');
-            updateTaskLogEntry(taskId, { status: 'failed', description: `VM '${name}' disk migrate: ${errMsg}` });
+        const kickoff = await r.json().catch(() => ({}));
+        if (!r.ok || !kickoff.task_id) {
+            clearInterval(elapsedTimer);
+            vmMigrateProgressFinish(steps, false, kickoff.error || ('HTTP ' + r.status));
+            updateTaskLogEntry(logTaskId, { status: 'failed', description: `VM '${name}' disk migrate: ${kickoff.error || r.status}` });
             return;
         }
-        showToast(data.message || 'Disk migration complete', 'success', 8000);
-        updateTaskLogEntry(taskId, { status: 'completed', description: data.message || `Migrated '${name}' disks to ${target}` });
-        overlay.remove?.();
-        if (typeof loadVms === 'function') loadVms();
+        const final = await pollVmMigrationProgress(kickoff.task_id, steps);
+        clearInterval(elapsedTimer);
+        if (final.ok) {
+            vmMigrateProgressFinish(steps, true, final.message || 'Disk migration complete');
+            updateTaskLogEntry(logTaskId, { status: 'completed', description: final.message || `Migrated '${name}' disks to ${target}` });
+            if (typeof loadVms === 'function') loadVms();
+        } else {
+            vmMigrateProgressFinish(steps, false, final.error || 'Unknown error', final.failedStage);
+            updateTaskLogEntry(logTaskId, { status: 'failed', description: `VM '${name}' disk migrate: ${final.error || 'Unknown error'}` });
+        }
     } catch (e) {
-        showToast('Error: ' + e.message, 'error');
-        updateTaskLogEntry(taskId, { status: 'failed', description: `VM '${name}' disk migrate: ${e.message}` });
+        clearInterval(elapsedTimer);
+        vmMigrateProgressFinish(steps, false, e.message);
+        updateTaskLogEntry(logTaskId, { status: 'failed', description: `VM '${name}' disk migrate: ${e.message}` });
     }
 }
 

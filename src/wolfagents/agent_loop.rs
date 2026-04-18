@@ -496,15 +496,25 @@ fn build_gemini_function_decls(agent: &Agent) -> Vec<serde_json::Value> {
 /// This function walks the schema and rewrites the few forms we actually
 /// emit. New schema shapes added later may need extensions here.
 fn normalise_schema_for_gemini(mut v: serde_json::Value) -> serde_json::Value {
-    // Turn `"type": ["string", "null"]` → `"type": "string", "nullable": true`.
+    // Gemini rejects multi-type unions in `type`. Narrow every array
+    // form to a single string: `["string", "null"]` → `"string"` +
+    // `nullable: true`, and `["string", "array", "null"]` → pick the
+    // first non-null (loses the union flexibility but the model can
+    // still pass values Gemini will accept). Done iteratively so the
+    // same code handles 2- and 3+ element unions.
     if let Some(t) = v.get("type").cloned() {
         if let Some(arr) = t.as_array() {
             let non_null: Vec<&serde_json::Value> = arr.iter()
                 .filter(|x| x.as_str() != Some("null")).collect();
             let has_null = arr.iter().any(|x| x.as_str() == Some("null"));
-            if non_null.len() == 1 {
+            if !non_null.is_empty() {
                 v["type"] = non_null[0].clone();
                 if has_null { v["nullable"] = serde_json::Value::Bool(true); }
+            } else if has_null {
+                // Pure `["null"]` — fall back to string+nullable so the
+                // field remains present in the declaration.
+                v["type"] = serde_json::Value::String("string".to_string());
+                v["nullable"] = serde_json::Value::Bool(true);
             }
         }
     }
