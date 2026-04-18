@@ -4411,6 +4411,21 @@
                                         intervals = less load on nodes</small>
                                 </div>
 
+                                <div class="form-group" style="margin-bottom:16px;">
+                                    <label style="font-size:13px;">Security scan interval (SSH brute-force, crypto
+                                        miners, world-readable secrets)</label>
+                                    <select id="alerting-security-scan-interval" class="form-control"
+                                        style="max-width:240px;">
+                                        <option value="3600">Every 1 hour</option>
+                                        <option value="14400" selected>Every 4 hours</option>
+                                        <option value="28800">Every 8 hours</option>
+                                        <option value="43200">Every 12 hours</option>
+                                    </select>
+                                    <small style="color:var(--text-muted);">Heavier than threshold checks (journalctl,
+                                        lsof, port probes). Longer intervals save CPU and AI tokens; on-demand scans
+                                        from System Check still run instantly.</small>
+                                </div>
+
                                 <h4 style="margin:0 0 12px 0;font-size:14px;color:var(--accent-light);">🔔 Events</h4>
                                 <div style="display:grid;gap:10px;">
                                     <label

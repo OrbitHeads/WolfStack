@@ -14194,6 +14194,12 @@ pub async fn alerts_config_save(req: HttpRequest, state: web::Data<AppState>, bo
         // Clamp to sensible range: 30 seconds to 1 hour
         config.check_interval_secs = i.max(30).min(3600);
     }
+    if let Some(i) = v.get("security_scan_interval_secs").and_then(|v| v.as_u64()) {
+        // Clamp to 1 hour minimum (matches the UI dropdown floor) and
+        // 24 hours maximum to keep at least one scan per day even if
+        // a user picks the highest setting offered.
+        config.security_scan_interval_secs = i.max(3600).min(24 * 3600);
+    }
 
     match config.save() {
         Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "saved": true })),

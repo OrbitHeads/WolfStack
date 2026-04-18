@@ -25635,6 +25635,10 @@ async function loadAlertingConfig() {
         if (c.check_interval_secs) {
             document.getElementById('alerting-check-interval').value = String(c.check_interval_secs);
         }
+        if (c.security_scan_interval_secs) {
+            const secEl = document.getElementById('alerting-security-scan-interval');
+            if (secEl) secEl.value = String(c.security_scan_interval_secs);
+        }
         const channels = [];
         if (c.has_discord) channels.push('\u2705 Discord');
         if (c.has_slack) channels.push('\u2705 Slack');
@@ -25668,6 +25672,7 @@ async function saveAlertingConfig() {
         alert_containers: document.getElementById('alerting-evt-containers').checked,
         container_memory_threshold: parseInt(document.getElementById('alerting-container-mem').value),
         check_interval_secs: parseInt(document.getElementById('alerting-check-interval').value) || 60,
+        security_scan_interval_secs: parseInt((document.getElementById('alerting-security-scan-interval') || {}).value) || 14400,
     };
     const discord = document.getElementById('alerting-discord').value.trim();
     const slack = document.getElementById('alerting-slack').value.trim();

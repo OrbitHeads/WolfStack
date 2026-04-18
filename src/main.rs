@@ -359,14 +359,14 @@ async fn main() -> std::io::Result<()> {
         // crypto miner, world-readable cluster_secret, etc). Cooldown keeps
         // the same finding from spamming channels.
         //
-        // Interval is 15 minutes — a compromise between detection latency
-        // (you want to find out about a crypto miner within the hour, not
-        // tomorrow) and cluster cost (each node runs its own scan, and
-        // some checks like journalctl can take 100ms–2s on a busy host).
-        // At 15 min the duty cycle is well under 1% per node; active
-        // attacks that started in the last 5 minutes still get caught on
-        // the next tick. If operators want tighter detection, the
-        // on-demand scan via /api/system-check runs the exact same code.
+        // Interval is operator-configurable via Settings → Alerting
+        // (`security_scan_interval_secs`, default 4 h). Each scan does
+        // journalctl/lsof/port-probe work that costs CPU + (when AI
+        // assistance is on) tokens — at 15 min that adds up across a
+        // cluster. 4 h still catches attackers within the hour at worst
+        // and operators can run on-demand scans via /api/system-check.
+        // Clamped to a 60-second floor so misconfiguration can't turn
+        // it into a busy-loop.
         tokio::spawn(async move {
             // Startup delay so the first scan happens after cluster discovery
             // settles — avoids noisy "scanner errored" at boot.
@@ -424,7 +424,14 @@ async fn main() -> std::io::Result<()> {
                 let now = std::time::Instant::now();
                 recent_alerts.retain(|_, t| now.duration_since(*t) < prune_cutoff);
 
-                tokio::time::sleep(std::time::Duration::from_secs(15 * 60)).await;
+                // Re-read interval every iteration so a settings change
+                // applies on the next sleep without needing a restart.
+                // 60-second floor stops accidental zero/tiny values from
+                // turning the scanner into a busy loop.
+                let interval = crate::alerting::AlertConfig::load()
+                    .security_scan_interval_secs
+                    .max(60);
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
             }
         });
 

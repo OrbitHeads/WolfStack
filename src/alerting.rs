@@ -139,6 +139,16 @@ pub struct AlertConfig {
     // ── Check interval ──
     #[serde(default = "default_check_interval")]
     pub check_interval_secs: u64,  // how often to check thresholds (seconds)
+
+    /// How often the security scanner re-runs (SSH brute-force,
+    /// crypto miners, world-readable secrets, etc). Separate from
+    /// `check_interval_secs` because security scans are heavier
+    /// (journalctl, lsof, port scans) and don't benefit from sub-hour
+    /// cadences — an attacker who got in 15 minutes ago vs 4 hours ago
+    /// gets the same forensic outcome. Defaults to 4 h to keep the
+    /// per-node duty cycle low at cluster scale.
+    #[serde(default = "default_security_scan_interval")]
+    pub security_scan_interval_secs: u64,
 }
 
 fn default_cpu_threshold() -> f32 { 90.0 }
@@ -147,6 +157,7 @@ fn default_disk_threshold() -> f32 { 90.0 }
 fn default_true() -> bool { true }
 fn default_container_mem_threshold() -> f32 { 90.0 }
 fn default_check_interval() -> u64 { 60 }
+fn default_security_scan_interval() -> u64 { 4 * 60 * 60 }
 
 impl Default for AlertConfig {
     fn default() -> Self {
@@ -167,6 +178,7 @@ impl Default for AlertConfig {
             alert_containers: true,
             container_memory_threshold: 90.0,
             check_interval_secs: 60,
+            security_scan_interval_secs: 4 * 60 * 60,
         }
     }
 }
@@ -220,6 +232,7 @@ impl AlertConfig {
             "alert_containers": self.alert_containers,
             "container_memory_threshold": self.container_memory_threshold,
             "check_interval_secs": self.check_interval_secs,
+            "security_scan_interval_secs": self.security_scan_interval_secs,
         })
     }
 }
