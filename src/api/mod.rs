@@ -14660,6 +14660,121 @@ pub async fn system_install_package(
 /// The reply comes back as TwiML in the response body so Twilio
 /// delivers it to the user synchronously — no outbound API call
 /// needed for the common case.
+// ─── Cluster filesystem proxy ───
+//
+// These three endpoints let a WolfAgent tool on one node read, write,
+// or delete a file on a different cluster node. They require
+// X-WolfStack-Secret (inter-node auth) — a human session token is not
+// accepted. The wolfagents safety denylist (the same one that guards
+// exec_* and wolfstack_api) is applied on BOTH sides so both the
+// caller's node and the target node enforce the path allowlist.
+
+#[derive(Deserialize)]
+pub struct ClusterFileOp {
+    pub path: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub append: bool,
+}
+
+pub async fn cluster_file_read(
+    req: HttpRequest, state: web::Data<AppState>, body: web::Json<ClusterFileOp>,
+) -> HttpResponse {
+    // Only accept cluster-secret auth — user sessions MUST NOT hit this
+    // endpoint. A logged-in user who wants cross-node file access goes
+    // through the dashboard's own per-node browser, not through this
+    // inter-node channel.
+    match require_auth(&req, &state) {
+        Ok(u) if u == "cluster-node" => {}
+        Ok(_) => return HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "cluster file endpoint requires cluster-secret auth, not a user session"
+        })),
+        Err(resp) => return resp,
+    }
+    let path = body.path.trim();
+    if path.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "path required"}));
+    }
+    if let Err(e) = crate::wolfagents::safety::validate_path(path) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": e}));
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let max = 1024 * 1024;
+            let truncated = bytes.len() > max;
+            let slice = &bytes[..max.min(bytes.len())];
+            HttpResponse::Ok().json(serde_json::json!({
+                "path": path,
+                "content": String::from_utf8_lossy(slice),
+                "total_bytes": bytes.len(),
+                "truncated": truncated,
+            }))
+        }
+        Err(e) => HttpResponse::NotFound().json(serde_json::json!({"error": format!("read: {}", e)})),
+    }
+}
+
+pub async fn cluster_file_write(
+    req: HttpRequest, state: web::Data<AppState>, body: web::Json<ClusterFileOp>,
+) -> HttpResponse {
+    match require_auth(&req, &state) {
+        Ok(u) if u == "cluster-node" => {}
+        Ok(_) => return HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "cluster file endpoint requires cluster-secret auth"
+        })),
+        Err(resp) => return resp,
+    }
+    let path = body.path.trim();
+    if path.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "path required"}));
+    }
+    if body.content.len() > 8 * 1024 * 1024 {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "content exceeds 8 MB"}));
+    }
+    if let Err(e) = crate::wolfagents::safety::validate_path(path) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": e}));
+    }
+    let res = if body.append {
+        use std::io::Write;
+        std::fs::OpenOptions::new().create(true).append(true).open(path)
+            .and_then(|mut f| f.write_all(body.content.as_bytes()))
+    } else {
+        std::fs::write(path, body.content.as_bytes())
+    };
+    match res {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({
+            "path": path, "bytes": body.content.len(), "appended": body.append,
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("write: {}", e)
+        })),
+    }
+}
+
+pub async fn cluster_file_delete(
+    req: HttpRequest, state: web::Data<AppState>, body: web::Json<ClusterFileOp>,
+) -> HttpResponse {
+    match require_auth(&req, &state) {
+        Ok(u) if u == "cluster-node" => {}
+        Ok(_) => return HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "cluster file endpoint requires cluster-secret auth"
+        })),
+        Err(resp) => return resp,
+    }
+    let path = body.path.trim();
+    if path.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "path required"}));
+    }
+    if let Err(e) = crate::wolfagents::safety::validate_path(path) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": e}));
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({"path": path})),
+        Err(e) => HttpResponse::NotFound().json(serde_json::json!({"error": format!("delete: {}", e)})),
+    }
+}
+
 pub async fn whatsapp_webhook(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -18425,6 +18540,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/storage/providers/{name}/config", web::get().to(storage_provider_config))
         .route("/api/storage/providers/{name}/config", web::post().to(storage_provider_config_save))
         .route("/api/system/logs", web::get().to(system_logs))
+        // Cluster-internal file operations — require cluster-secret auth.
+        // Used by WolfAgent tools to read/write/delete files across the
+        // cluster; never reachable via a human session token.
+        .route("/api/cluster/file/read", web::post().to(cluster_file_read))
+        .route("/api/cluster/file/write", web::post().to(cluster_file_write))
+        .route("/api/cluster/file/delete", web::post().to(cluster_file_delete))
         // Disk partition info
         .route("/api/storage/disk-info", web::get().to(storage_disk_info))
         // Disk Partitioning & Formatting

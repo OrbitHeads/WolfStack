@@ -925,7 +925,11 @@ fn input_schema_for(tool: ToolId) -> serde_json::Value {
             "required": ["path"],
             "properties": {
                 "path": { "type": "string" },
-                "max_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576 }
+                "max_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576 },
+                "node": {
+                    "type": "string",
+                    "description": "Cluster node to read from — hostname or node id. Omit / 'self' = this node. Example: 'wolf-1' to read /etc/motd on wolf-1."
+                }
             }
         }),
         ToolId::DescribeCluster => serde_json::json!({
@@ -1015,7 +1019,11 @@ fn input_schema_for(tool: ToolId) -> serde_json::Value {
             "properties": {
                 "path": { "type": "string" },
                 "content": { "type": "string" },
-                "append": { "type": "boolean", "default": false }
+                "append": { "type": "boolean", "default": false },
+                "node": {
+                    "type": "string",
+                    "description": "Cluster node to write to — hostname or node id. Omit / 'self' = this node."
+                }
             }
         }),
         ToolId::ExecInContainer => serde_json::json!({
@@ -1040,7 +1048,13 @@ fn input_schema_for(tool: ToolId) -> serde_json::Value {
         ToolId::DeleteFile => serde_json::json!({
             "type": "object",
             "required": ["path"],
-            "properties": { "path": { "type": "string" } }
+            "properties": {
+                "path": { "type": "string" },
+                "node": {
+                    "type": "string",
+                    "description": "Cluster node to delete on — hostname or node id. Omit / 'self' = this node."
+                }
+            }
         }),
         ToolId::WolfstackApi => serde_json::json!({
             "type": "object",

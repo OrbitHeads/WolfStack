@@ -189,7 +189,7 @@ pub async fn dispatch(
         ToolId::ListAlerts => tool_list_alerts(arguments).await,
         ToolId::ReadLog => tool_read_log(arguments, agent, state).await,
         ToolId::CheckDiskUsage => tool_check_disk_usage(arguments, agent, state).await,
-        ToolId::ReadFile => tool_read_file(arguments, agent).await,
+        ToolId::ReadFile => tool_read_file(arguments, agent, state).await,
         ToolId::ListApiEndpoints => tool_list_api_endpoints(agent).await,
         ToolId::DescribeCluster => tool_describe_cluster(arguments, agent, state).await,
         ToolId::ListWorkflows => tool_list_workflows(arguments, state).await,
@@ -200,12 +200,12 @@ pub async fn dispatch(
         ToolId::RestartContainer => tool_restart_container(arguments, agent, state).await,
         ToolId::RunWorkflow => tool_run_workflow(arguments, state).await,
         ToolId::ScheduleWorkflow => tool_schedule_workflow(arguments, state).await,
-        ToolId::WriteFile => tool_write_file(arguments, agent).await,
+        ToolId::WriteFile => tool_write_file(arguments, agent, state).await,
         ToolId::SendEmail => tool_send_email(arguments, agent, state).await,
 
         ToolId::ExecInContainer => tool_exec_in_container(arguments, agent, state).await,
-        ToolId::ExecOnNode => tool_exec_on_node(arguments, agent).await,
-        ToolId::DeleteFile => tool_delete_file(arguments, agent).await,
+        ToolId::ExecOnNode => tool_exec_on_node(arguments, agent, state).await,
+        ToolId::DeleteFile => tool_delete_file(arguments, agent, state).await,
 
         ToolId::WolfstackApi => tool_wolfstack_api(arguments, agent, state).await,
     };
@@ -665,9 +665,12 @@ fn parse_df(text: &str) -> (u32, u64, u64) {
     (0, 0, 0)
 }
 
-async fn tool_read_file(args: &serde_json::Value, agent: &Agent) -> ToolResult {
+async fn tool_read_file(
+    args: &serde_json::Value, agent: &Agent, state: &crate::api::AppState,
+) -> ToolResult {
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
     let max_bytes = args.get("max_bytes").and_then(|v| v.as_u64()).unwrap_or(65536).min(1024 * 1024) as usize;
+    let node = args.get("node").and_then(|v| v.as_str()).unwrap_or("").trim();
     if path.is_empty() {
         return ToolResult::err("read_file requires a `path` argument".into());
     }
@@ -680,22 +683,76 @@ async fn tool_read_file(args: &serde_json::Value, agent: &Agent) -> ToolResult {
             path
         ));
     }
-    match std::fs::read(path) {
-        Ok(bytes) => {
-            let truncated = bytes.len() > max_bytes;
-            let slice = &bytes[..max_bytes.min(bytes.len())];
-            let content = String::from_utf8_lossy(slice).to_string();
+    // Local read when no node specified, "self", this node's id, or
+    // the cluster entry for `node` resolves to the self-node.
+    let self_id = crate::agent::self_node_id();
+    let is_local = node.is_empty() || node == "self" || node == self_id
+        || state.cluster.get_all_nodes().iter()
+            .find(|n| n.id == node || n.hostname == node)
+            .map(|n| n.is_self)
+            .unwrap_or(false);
+    if is_local {
+        return match std::fs::read(path) {
+            Ok(bytes) => {
+                let truncated = bytes.len() > max_bytes;
+                let slice = &bytes[..max_bytes.min(bytes.len())];
+                let content = String::from_utf8_lossy(slice).to_string();
+                ToolResult::ok(
+                    format!("read {} bytes from {} (this node)", slice.len(), path),
+                    serde_json::json!({
+                        "path": path, "node": "self",
+                        "content": content,
+                        "truncated": truncated,
+                        "total_bytes": bytes.len(),
+                    }),
+                )
+            }
+            Err(e) => ToolResult::err(format!("read failed: {}", e)),
+        };
+    }
+    // Remote read via cluster-secret-auth'd /api/cluster/file/read.
+    read_file_on_remote(state, node, path).await
+}
+
+async fn read_file_on_remote(
+    state: &crate::api::AppState, node_spec: &str, path: &str,
+) -> ToolResult {
+    let nodes = state.cluster.get_all_nodes();
+    let Some(node) = nodes.iter().find(|n| n.id == node_spec || n.hostname == node_spec) else {
+        return ToolResult::err(format!("no node with id or hostname '{}'", node_spec));
+    };
+    if !node.online {
+        return ToolResult::err(format!("node '{}' is offline", node.hostname));
+    }
+    let http = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .danger_accept_invalid_certs(true)
+        .build() { Ok(c) => c, Err(e) => return ToolResult::err(format!("http client: {}", e)) };
+    let scheme = if node.port == 443 || node.port == 8553 { "https" } else { "http" };
+    let url = format!("{}://{}:{}/api/cluster/file/read", scheme, node.address, node.port);
+    let resp = http.post(&url)
+        .header("X-WolfStack-Secret", &state.cluster_secret)
+        .json(&serde_json::json!({ "path": path }))
+        .send().await;
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            let val: serde_json::Value = r.json().await.unwrap_or_else(|_| serde_json::json!({}));
             ToolResult::ok(
-                format!("read {} bytes from {}", slice.len(), path),
+                format!("read from {} on {}", path, node.hostname),
                 serde_json::json!({
-                    "path": path,
-                    "content": content,
-                    "truncated": truncated,
-                    "total_bytes": bytes.len(),
+                    "path": path, "node": node.hostname,
+                    "content": val.get("content").cloned().unwrap_or_default(),
+                    "truncated": val.get("truncated").and_then(|v| v.as_bool()).unwrap_or(false),
+                    "total_bytes": val.get("total_bytes").and_then(|v| v.as_u64()).unwrap_or(0),
                 }),
             )
         }
-        Err(e) => ToolResult::err(format!("read failed: {}", e)),
+        Ok(r) => {
+            let code = r.status();
+            let body = r.text().await.unwrap_or_default();
+            ToolResult::err(format!("remote read on {} returned {}: {}", node.hostname, code, body))
+        }
+        Err(e) => ToolResult::err(format!("remote read on {} failed: {}", node.hostname, e)),
     }
 }
 
@@ -765,12 +822,15 @@ async fn tool_describe_cluster(
 // ═══════════════════════════════════════════════════
 
 async fn tool_restart_container(
-    args: &serde_json::Value, agent: &Agent, _state: &crate::api::AppState,
+    args: &serde_json::Value, agent: &Agent, state: &crate::api::AppState,
 ) -> ToolResult {
     let runtime = args.get("runtime").and_then(|v| v.as_str()).unwrap_or("");
     let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
     if runtime.is_empty() || name.is_empty() {
         return ToolResult::err("restart_container requires `runtime` (docker|lxc) and `name`".into());
+    }
+    if runtime != "docker" && runtime != "lxc" {
+        return ToolResult::err(format!("unsupported runtime '{}'", runtime));
     }
     if !matches_container_pattern(name, &agent.target_scope.allowed_container_patterns) {
         return ToolResult::err(format!(
@@ -778,29 +838,81 @@ async fn tool_restart_container(
             name
         ));
     }
-    let args_vec = match runtime {
-        "docker" => vec!["docker".to_string(), "restart".to_string(), name.to_string()],
-        "lxc" => vec!["lxc-stop".to_string(), "-n".to_string(), name.to_string()],
-        _ => return ToolResult::err(format!("unsupported runtime '{}'", runtime)),
+
+    // Discover the host node FIRST, then restart exactly once. Using
+    // local-first-or-error-then-fan-out would double-restart across
+    // nodes that happened to have containers of the same name.
+    let local_has = match runtime {
+        "docker" => std::process::Command::new("docker")
+            .args(["inspect", "--type=container", name, "--format", "{{.Id}}"])
+            .output().map(|o| o.status.success()).unwrap_or(false),
+        "lxc" => std::process::Command::new("lxc-info")
+            .args(["-n", name])
+            .output().map(|o| o.status.success()).unwrap_or(false),
+        _ => unreachable!(),
     };
-    let mut cmd = std::process::Command::new(&args_vec[0]);
-    for a in &args_vec[1..] { cmd.arg(a); }
-    let out = cmd.output();
-    match out {
-        Ok(o) if o.status.success() => ToolResult::ok(
-            format!("restarted {}:{}", runtime, name),
-            serde_json::json!({
-                "runtime": runtime, "name": name,
-                "stdout": String::from_utf8_lossy(&o.stdout).trim().to_string(),
-            }),
-        ),
-        Ok(o) => ToolResult::err(format!(
-            "restart failed (exit {}): {}",
-            o.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&o.stderr).trim()
-        )),
-        Err(e) => ToolResult::err(format!("spawn failed: {}", e)),
+    if local_has {
+        let local_cmd = match runtime {
+            "docker" => vec!["docker", "restart", name],
+            "lxc" => vec!["lxc-stop", "-r", "-n", name],
+            _ => unreachable!(),
+        };
+        let mut cmd = std::process::Command::new(local_cmd[0]);
+        for a in &local_cmd[1..] { cmd.arg(a); }
+        return match cmd.output() {
+            Ok(o) if o.status.success() => ToolResult::ok(
+                format!("restarted {}:{} on self", runtime, name),
+                serde_json::json!({
+                    "runtime": runtime, "name": name, "node": "self",
+                    "stdout": String::from_utf8_lossy(&o.stdout).trim().to_string(),
+                }),
+            ),
+            Ok(o) => ToolResult::err(format!(
+                "restart failed (exit {}): {}",
+                o.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&o.stderr).trim()
+            )),
+            Err(e) => ToolResult::err(format!("spawn failed: {}", e)),
+        };
     }
+
+    // Not local — find the owning node via inventory, then restart once.
+    let http = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .danger_accept_invalid_certs(true)
+        .build() { Ok(c) => c, Err(_) => return ToolResult::err("http client build failed".into()) };
+    for node in state.cluster.get_all_nodes().iter().filter(|n| n.online && !n.is_self) {
+        let scheme = if node.port == 443 || node.port == 8553 { "https" } else { "http" };
+        let list_path = if runtime == "docker" { "/api/containers/docker" } else { "/api/containers/lxc" };
+        let list_url = format!("{}://{}:{}{}", scheme, node.address, node.port, list_path);
+        let Ok(list_r) = http.get(&list_url)
+            .header("X-WolfStack-Secret", &state.cluster_secret)
+            .send().await else { continue; };
+        if !list_r.status().is_success() { continue; }
+        let Ok(list_val) = list_r.json::<serde_json::Value>().await else { continue; };
+        let arr = list_val.get("containers").cloned().unwrap_or(list_val);
+        let has_it = arr.as_array().map(|a| a.iter().any(|c|
+            c.get("name").and_then(|v| v.as_str()) == Some(name))).unwrap_or(false);
+        if !has_it { continue; }
+        let action_url = format!("{}://{}:{}/api/containers/{}/{}/action",
+            scheme, node.address, node.port, runtime, name);
+        let resp = http.post(&action_url)
+            .header("X-WolfStack-Secret", &state.cluster_secret)
+            .json(&serde_json::json!({ "action": "restart" }))
+            .send().await;
+        let Ok(r) = resp else { continue; };
+        if !r.status().is_success() { continue; }
+        return ToolResult::ok(
+            format!("restarted {}:{} on {}", runtime, name, node.hostname),
+            serde_json::json!({
+                "runtime": runtime, "name": name, "node": node.hostname,
+            }),
+        );
+    }
+    ToolResult::err(format!(
+        "container {}:{} not found on any online node in the cluster",
+        runtime, name
+    ))
 }
 
 async fn tool_run_workflow(args: &serde_json::Value, state: &crate::api::AppState) -> ToolResult {
@@ -934,10 +1046,13 @@ async fn tool_schedule_workflow(args: &serde_json::Value, state: &crate::api::Ap
     }
 }
 
-async fn tool_write_file(args: &serde_json::Value, agent: &Agent) -> ToolResult {
+async fn tool_write_file(
+    args: &serde_json::Value, agent: &Agent, state: &crate::api::AppState,
+) -> ToolResult {
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
     let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
     let append = args.get("append").and_then(|v| v.as_bool()).unwrap_or(false);
+    let node = args.get("node").and_then(|v| v.as_str()).unwrap_or("").trim();
     if path.is_empty() {
         return ToolResult::err("write_file requires a `path` argument".into());
     }
@@ -953,19 +1068,64 @@ async fn tool_write_file(args: &serde_json::Value, agent: &Agent) -> ToolResult 
     if content.len() > 8 * 1024 * 1024 {
         return ToolResult::err("content exceeds 8 MB — write_file refuses large payloads".into());
     }
-    let result = if append {
-        use std::io::Write;
-        std::fs::OpenOptions::new().create(true).append(true).open(path)
-            .and_then(|mut f| f.write_all(content.as_bytes()))
-    } else {
-        std::fs::write(path, content.as_bytes())
+    let self_id = crate::agent::self_node_id();
+    let is_local = node.is_empty() || node == "self" || node == self_id
+        || state.cluster.get_all_nodes().iter()
+            .find(|n| n.id == node || n.hostname == node)
+            .map(|n| n.is_self).unwrap_or(false);
+    if is_local {
+        let result = if append {
+            use std::io::Write;
+            std::fs::OpenOptions::new().create(true).append(true).open(path)
+                .and_then(|mut f| f.write_all(content.as_bytes()))
+        } else {
+            std::fs::write(path, content.as_bytes())
+        };
+        return match result {
+            Ok(()) => ToolResult::ok(
+                format!("wrote {} bytes to {} (this node)", content.len(), path),
+                serde_json::json!({ "path": path, "node": "self", "bytes": content.len(), "appended": append }),
+            ),
+            Err(e) => ToolResult::err(format!("write failed: {}", e)),
+        };
+    }
+    // Remote write via cluster-secret-auth'd /api/cluster/file/write.
+    write_file_on_remote(state, node, path, content, append).await
+}
+
+async fn write_file_on_remote(
+    state: &crate::api::AppState, node_spec: &str, path: &str, content: &str, append: bool,
+) -> ToolResult {
+    let nodes = state.cluster.get_all_nodes();
+    let Some(node) = nodes.iter().find(|n| n.id == node_spec || n.hostname == node_spec) else {
+        return ToolResult::err(format!("no node with id or hostname '{}'", node_spec));
     };
-    match result {
-        Ok(()) => ToolResult::ok(
-            format!("wrote {} bytes to {}", content.len(), path),
-            serde_json::json!({ "path": path, "bytes": content.len(), "appended": append }),
+    if !node.online {
+        return ToolResult::err(format!("node '{}' is offline", node.hostname));
+    }
+    let http = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .danger_accept_invalid_certs(true)
+        .build() { Ok(c) => c, Err(e) => return ToolResult::err(format!("http client: {}", e)) };
+    let scheme = if node.port == 443 || node.port == 8553 { "https" } else { "http" };
+    let url = format!("{}://{}:{}/api/cluster/file/write", scheme, node.address, node.port);
+    let resp = http.post(&url)
+        .header("X-WolfStack-Secret", &state.cluster_secret)
+        .json(&serde_json::json!({ "path": path, "content": content, "append": append }))
+        .send().await;
+    match resp {
+        Ok(r) if r.status().is_success() => ToolResult::ok(
+            format!("wrote {} bytes to {} on {}", content.len(), path, node.hostname),
+            serde_json::json!({
+                "path": path, "node": node.hostname, "bytes": content.len(), "appended": append,
+            }),
         ),
-        Err(e) => ToolResult::err(format!("write failed: {}", e)),
+        Ok(r) => {
+            let code = r.status();
+            let body = r.text().await.unwrap_or_default();
+            ToolResult::err(format!("remote write on {} returned {}: {}", node.hostname, code, body))
+        }
+        Err(e) => ToolResult::err(format!("remote write on {} failed: {}", node.hostname, e)),
     }
 }
 
@@ -974,7 +1134,7 @@ async fn tool_write_file(args: &serde_json::Value, agent: &Agent) -> ToolResult 
 // ═══════════════════════════════════════════════════
 
 async fn tool_exec_in_container(
-    args: &serde_json::Value, agent: &Agent, _state: &crate::api::AppState,
+    args: &serde_json::Value, agent: &Agent, state: &crate::api::AppState,
 ) -> ToolResult {
     let runtime = args.get("runtime").and_then(|v| v.as_str()).unwrap_or("docker");
     let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -992,15 +1152,87 @@ async fn tool_exec_in_container(
             name
         ));
     }
-    let exec = match runtime {
-        "docker" => format!("docker exec {} sh -c {}", name, shell_escape(command)),
-        "lxc" => format!("lxc-attach -n {} -- sh -c {}", name, shell_escape(command)),
-        _ => return ToolResult::err(format!("unsupported runtime '{}'", runtime)),
+    if runtime != "docker" && runtime != "lxc" {
+        return ToolResult::err(format!("unsupported runtime '{}'", runtime));
+    }
+
+    // Find which node hosts the container BEFORE executing. Using
+    // exit status from the exec itself to decide "wrong node" vs
+    // "command failed" is ambiguous — a command that legitimately
+    // exited non-zero would then get re-run on every other node's
+    // container of the same name, multiplying side effects. Instead:
+    //   1. Ask docker/lxc locally if the container exists here.
+    //   2. If not, fan out calling /api/containers/docker and /lxc
+    //      to find which node's inventory lists it.
+    //   3. Exec on exactly that one node.
+    let local_has = match runtime {
+        "docker" => std::process::Command::new("docker")
+            .args(["inspect", "--type=container", name, "--format", "{{.Id}}"])
+            .output().map(|o| o.status.success()).unwrap_or(false),
+        "lxc" => std::process::Command::new("lxc-info")
+            .args(["-n", name])
+            .output().map(|o| o.status.success()).unwrap_or(false),
+        _ => unreachable!(),
     };
-    run_shell_with_timeout(&exec, timeout_secs).await
+    if local_has {
+        let local_exec = match runtime {
+            "docker" => format!("docker exec {} sh -c {}", name, shell_escape(command)),
+            "lxc" => format!("lxc-attach -n {} -- sh -c {}", name, shell_escape(command)),
+            _ => unreachable!(),
+        };
+        return run_shell_with_timeout(&local_exec, timeout_secs).await;
+    }
+
+    // Not local — fan out to find which online node owns it.
+    let http = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs + 5))
+        .danger_accept_invalid_certs(true)
+        .build() { Ok(c) => c, Err(e) => return ToolResult::err(format!("http client build failed: {}", e)) };
+    for node in state.cluster.get_all_nodes().iter().filter(|n| n.online && !n.is_self) {
+        let scheme = if node.port == 443 || node.port == 8553 { "https" } else { "http" };
+        // Check inventory first (cheap list call) so we don't
+        // gratuitously exec on the wrong node.
+        let list_path = if runtime == "docker" { "/api/containers/docker" } else { "/api/containers/lxc" };
+        let list_url = format!("{}://{}:{}{}", scheme, node.address, node.port, list_path);
+        let Ok(list_r) = http.get(&list_url)
+            .header("X-WolfStack-Secret", &state.cluster_secret)
+            .send().await else { continue; };
+        if !list_r.status().is_success() { continue; }
+        let Ok(list_val) = list_r.json::<serde_json::Value>().await else { continue; };
+        let arr = list_val.get("containers").cloned().unwrap_or(list_val);
+        let has_it = arr.as_array().map(|a| a.iter().any(|c|
+            c.get("name").and_then(|v| v.as_str()) == Some(name))).unwrap_or(false);
+        if !has_it { continue; }
+        // Found it — exec there.
+        let exec_url = format!("{}://{}:{}/api/containers/{}/{}/exec",
+            scheme, node.address, node.port, runtime, name);
+        let resp = http.post(&exec_url)
+            .header("X-WolfStack-Secret", &state.cluster_secret)
+            .json(&serde_json::json!({ "command": command }))
+            .send().await;
+        let Ok(r) = resp else { continue; };
+        if !r.status().is_success() { continue; }
+        let Ok(val) = r.json::<serde_json::Value>().await else { continue; };
+        let stdout = val.get("stdout").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let stderr = val.get("stderr").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let exit = val.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(0);
+        return ToolResult::ok(
+            format!("exec {}:{} on {} (exit {})", runtime, name, node.hostname, exit),
+            serde_json::json!({
+                "runtime": runtime, "name": name, "node": node.hostname,
+                "exit_code": exit, "stdout": stdout, "stderr": stderr,
+            }),
+        );
+    }
+    ToolResult::err(format!(
+        "container {}:{} not found on any online node in the cluster",
+        runtime, name
+    ))
 }
 
-async fn tool_exec_on_node(args: &serde_json::Value, agent: &Agent) -> ToolResult {
+async fn tool_exec_on_node(
+    args: &serde_json::Value, agent: &Agent, state: &crate::api::AppState,
+) -> ToolResult {
     let node_id = args.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
     let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
     let timeout_secs = args.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(30).min(600);
@@ -1018,23 +1250,76 @@ async fn tool_exec_on_node(args: &serde_json::Value, agent: &Agent) -> ToolResul
             node_id
         ));
     }
-    // MVP: only local-node exec. Cross-node exec would proxy over
-    // HTTPS via /api/system/exec (no such endpoint exists yet) or
-    // through the cluster-secret-auth'd agent channel. Surface the
-    // limitation rather than silently ignoring.
-    if node_id != self_id {
-        return ToolResult::err(format!(
-            "cross-node exec is not yet wired — this tool currently only runs on \
-             the local node ({}). Use wolfstack_api to call a remote node via \
-             /api/nodes/{}/proxy/... if that node has a suitable endpoint.",
-            self_id, node_id
-        ));
+
+    // Self-node: full shell. Same as before — agent's safety denylist
+    // already applied above, and operator's access_level decided if
+    // we even got here.
+    if node_id == self_id {
+        return run_shell_with_timeout(command, timeout_secs).await;
     }
-    run_shell_with_timeout(command, timeout_secs).await
+
+    // Cross-node: forward to the remote's /api/ai/exec. That endpoint
+    // applies its OWN read-only safety allowlist on top of ours — so
+    // remote exec is effectively read-only (df, cat, ps, systemctl
+    // status, etc.). That's enough for "check disk on sophie" /
+    // "what's running on sophie" questions; for destructive cross-
+    // node ops, use exec_in_container (which routes via the container
+    // runtime) or deploy the action as a WolfFlow step.
+    let nodes = state.cluster.get_all_nodes();
+    let Some(node) = nodes.iter().find(|n| n.id == node_id || n.hostname == node_id) else {
+        return ToolResult::err(format!("no node with id or hostname '{}'", node_id));
+    };
+    if !node.online {
+        return ToolResult::err(format!("node '{}' is offline", node_id));
+    }
+    let http = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs + 5))
+        .danger_accept_invalid_certs(true)
+        .build() { Ok(c) => c, Err(e) => return ToolResult::err(format!("http client build failed: {}", e)) };
+    let scheme = if node.port == 443 || node.port == 8553 { "https" } else { "http" };
+    let url = format!("{}://{}:{}/api/ai/exec", scheme, node.address, node.port);
+    let resp = http.post(&url)
+        .header("X-WolfStack-Secret", &state.cluster_secret)
+        .json(&serde_json::json!({ "command": command }))
+        .send().await;
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            match r.json::<serde_json::Value>().await {
+                Ok(val) => {
+                    // /api/ai/exec returns {output, exit_code} on success,
+                    // {error} on rejected (unsafe / blocked) commands.
+                    if let Some(err) = val.get("error").and_then(|v| v.as_str()) {
+                        ToolResult::err(format!(
+                            "remote exec rejected on {}: {}. Remote exec is read-only; \
+                             for destructive ops use exec_in_container or a WolfFlow step.",
+                            node.hostname, err))
+                    } else {
+                        ToolResult::ok(
+                            format!("exec on {} (exit {})",
+                                node.hostname,
+                                val.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(0)),
+                            serde_json::json!({
+                                "node": node.hostname,
+                                "command": command,
+                                "output": val.get("output").and_then(|v| v.as_str()).unwrap_or(""),
+                                "exit_code": val.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(0),
+                            }),
+                        )
+                    }
+                }
+                Err(e) => ToolResult::err(format!("remote response parse failed: {}", e)),
+            }
+        }
+        Ok(r) => ToolResult::err(format!("remote exec HTTP {} on {}", r.status(), node.hostname)),
+        Err(e) => ToolResult::err(format!("remote exec failed on {}: {}", node.hostname, e)),
+    }
 }
 
-async fn tool_delete_file(args: &serde_json::Value, agent: &Agent) -> ToolResult {
+async fn tool_delete_file(
+    args: &serde_json::Value, agent: &Agent, state: &crate::api::AppState,
+) -> ToolResult {
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let node = args.get("node").and_then(|v| v.as_str()).unwrap_or("").trim();
     if path.is_empty() {
         return ToolResult::err("delete_file requires a `path` argument".into());
     }
@@ -1047,12 +1332,49 @@ async fn tool_delete_file(args: &serde_json::Value, agent: &Agent) -> ToolResult
             path
         ));
     }
-    match std::fs::remove_file(path) {
-        Ok(()) => ToolResult::ok(
-            format!("deleted {}", path),
-            serde_json::json!({ "path": path }),
+    let self_id = crate::agent::self_node_id();
+    let is_local = node.is_empty() || node == "self" || node == self_id
+        || state.cluster.get_all_nodes().iter()
+            .find(|n| n.id == node || n.hostname == node)
+            .map(|n| n.is_self).unwrap_or(false);
+    if is_local {
+        return match std::fs::remove_file(path) {
+            Ok(()) => ToolResult::ok(
+                format!("deleted {} (this node)", path),
+                serde_json::json!({ "path": path, "node": "self" }),
+            ),
+            Err(e) => ToolResult::err(format!("delete failed: {}", e)),
+        };
+    }
+    // Remote delete via cluster-secret-auth'd /api/cluster/file/delete.
+    let nodes = state.cluster.get_all_nodes();
+    let Some(n) = nodes.iter().find(|x| x.id == node || x.hostname == node) else {
+        return ToolResult::err(format!("no node with id or hostname '{}'", node));
+    };
+    if !n.online {
+        return ToolResult::err(format!("node '{}' is offline", n.hostname));
+    }
+    let http = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .danger_accept_invalid_certs(true)
+        .build() { Ok(c) => c, Err(e) => return ToolResult::err(format!("http client: {}", e)) };
+    let scheme = if n.port == 443 || n.port == 8553 { "https" } else { "http" };
+    let url = format!("{}://{}:{}/api/cluster/file/delete", scheme, n.address, n.port);
+    let resp = http.post(&url)
+        .header("X-WolfStack-Secret", &state.cluster_secret)
+        .json(&serde_json::json!({ "path": path }))
+        .send().await;
+    match resp {
+        Ok(r) if r.status().is_success() => ToolResult::ok(
+            format!("deleted {} on {}", path, n.hostname),
+            serde_json::json!({ "path": path, "node": n.hostname }),
         ),
-        Err(e) => ToolResult::err(format!("delete failed: {}", e)),
+        Ok(r) => {
+            let code = r.status();
+            let body = r.text().await.unwrap_or_default();
+            ToolResult::err(format!("remote delete on {} returned {}: {}", n.hostname, code, body))
+        }
+        Err(e) => ToolResult::err(format!("remote delete on {} failed: {}", n.hostname, e)),
     }
 }
 
