@@ -25480,10 +25480,20 @@ async function loadUsers() {
             html += '<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">';
             html += '<span style="padding:2px 6px;border-radius:4px;background:var(--bg-tertiary);border:1px solid var(--border);font-size:10px;text-transform:uppercase;font-weight:600;">' + escapeHtml(user.role) + '</span>';
             if (user.totp_enabled) html += ' <span style="padding:2px 6px;border-radius:4px;background:rgba(34,197,94,0.1);color:var(--success);border:1px solid rgba(34,197,94,0.3);font-size:10px;font-weight:600;">2FA ENABLED</span>';
+            // Cluster access badge — admins have implicit all-access, so only
+            // surface the allowlist for non-admin users to avoid visual noise.
+            if (user.role !== 'admin') {
+                const ac = Array.isArray(user.allowed_clusters) ? user.allowed_clusters : [];
+                const label = ac.length === 0 ? 'ALL CLUSTERS' : ac.join(', ');
+                const tone = ac.length === 0 ? 'rgba(234,179,8,0.12);color:#eab308;border:1px solid rgba(234,179,8,0.35)'
+                                               : 'rgba(59,130,246,0.12);color:#60a5fa;border:1px solid rgba(59,130,246,0.35)';
+                html += ' <span style="padding:2px 6px;border-radius:4px;background:' + tone + ';font-size:10px;font-weight:600;" title="Clusters this user can see">🌐 ' + escapeHtml(label) + '</span>';
+            }
             if (user.created_at) html += ' <span style="margin-left:8px;">Created: ' + escapeHtml(user.created_at) + '</span>';
             html += '</div></div><div style="display:flex;gap:6px;">';
             if (!user.totp_enabled) html += '<button class="btn btn-sm" onclick="setupTotp(\'' + escapeHtml(user.username) + '\')" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);font-size:11px;">Enable 2FA</button>';
             else html += '<button class="btn btn-sm" onclick="disableTotp(\'' + escapeHtml(user.username) + '\')" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);font-size:11px;">Disable 2FA</button>';
+            html += '<button class="btn btn-sm" onclick="editUserClusters(\'' + escapeHtml(user.username) + '\')" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);font-size:11px;">Clusters</button>';
             html += '<button class="btn btn-sm" onclick="changePassword(\'' + escapeHtml(user.username) + '\')" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);font-size:11px;">Password</button>';
             html += '<button class="btn btn-sm" onclick="deleteUser(\'' + escapeHtml(user.username) + '\')" style="background:rgba(220,38,38,0.1);border:1px solid rgba(220,38,38,0.3);color:var(--danger, #ef4444);font-size:11px;">Delete</button>';
             html += '</div></div>';
@@ -25515,6 +25525,39 @@ async function deleteUser(username) {
         const data = await resp.json();
         if (data.success) { showToast('User deleted', 'success'); taskLog('Deleted user: ' + username); loadUsers(); }
         else showToast(data.error || 'Failed', 'error');
+    } catch (e) { showToast('Error: ' + e.message, 'error'); }
+}
+
+// Prompt the operator for a comma-separated list of cluster names
+// this user may see. Empty → all clusters (explicit reset). Requires
+// admin to call; the backend enforces that.
+async function editUserClusters(username) {
+    try {
+        const resp = await fetch('/api/auth/users');
+        const users = await resp.json();
+        const u = (users || []).find(x => x.username === username);
+        const current = (u && Array.isArray(u.allowed_clusters)) ? u.allowed_clusters.join(', ') : '';
+        const next = prompt(
+            'Clusters this user is allowed to see (comma-separated).\n' +
+            'Leave blank to grant access to ALL clusters.\n\n' +
+            'Current: ' + (current || '(all)'),
+            current
+        );
+        if (next === null) return;
+        const allowed_clusters = next.split(',').map(s => s.trim()).filter(Boolean);
+        const put = await fetch('/api/auth/users/' + encodeURIComponent(username) + '/clusters', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ allowed_clusters }),
+        });
+        const data = await put.json();
+        if (put.ok && data.success) {
+            showToast('Cluster access updated', 'success');
+            loadUsers();
+        } else {
+            showToast(data.error || ('HTTP ' + put.status), 'error');
+        }
     } catch (e) { showToast('Error: ' + e.message, 'error'); }
 }
 

@@ -626,6 +626,15 @@ pub async fn create_user(req: HttpRequest, state: web::Data<AppState>, body: web
 
     let email = body["email"].as_str().unwrap_or("").trim().to_string();
 
+    // Allowed clusters — comma-free list from the create form. Empty =
+    // see-everything (matches the existing default for legacy users);
+    // for restricted team members the operator fills this in.
+    let allowed_clusters: Vec<String> = body.get("allowed_clusters")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+
     let user = crate::auth::users::WolfUser {
         username: username.clone(),
         password_hash,
@@ -635,6 +644,7 @@ pub async fn create_user(req: HttpRequest, state: web::Data<AppState>, body: web
         display_name,
         email,
         created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        allowed_clusters,
     };
 
     let mut store = crate::auth::users::UserStore::load();
@@ -723,6 +733,48 @@ pub async fn confirm_2fa(req: HttpRequest, state: web::Data<AppState>, path: web
             user.totp_enabled = true;
             match store.save() {
                 Ok(()) => HttpResponse::Ok().json(serde_json::json!({"success": true})),
+                Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
+            }
+        }
+        None => HttpResponse::NotFound().json(serde_json::json!({"error": "User not found"})),
+    }
+}
+
+/// PUT /api/auth/users/{username}/clusters — update which clusters
+/// this user is allowed to see. Empty list = all clusters (legacy
+/// behaviour, admins always pass regardless). Non-empty list = only
+/// the named clusters show up in /api/nodes responses and related
+/// per-cluster views. Requires admin auth — we don't let a restricted
+/// user re-widen their own scope.
+pub async fn update_user_clusters(
+    req: HttpRequest, state: web::Data<AppState>,
+    path: web::Path<String>, body: web::Json<serde_json::Value>,
+) -> HttpResponse {
+    let caller = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
+    let store = crate::auth::users::UserStore::load();
+    let caller_is_admin = store.find(&caller)
+        .map(|u| u.role == "admin").unwrap_or(false);
+    if !caller_is_admin {
+        return HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "Only admin users can change cluster access"
+        }));
+    }
+    let username = path.into_inner();
+    let new_clusters: Vec<String> = body.get("allowed_clusters")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+    let mut store = crate::auth::users::UserStore::load();
+    match store.find_mut(&username) {
+        Some(user) => {
+            user.allowed_clusters = new_clusters.clone();
+            match store.save() {
+                Ok(()) => HttpResponse::Ok().json(serde_json::json!({
+                    "success": true,
+                    "username": username,
+                    "allowed_clusters": new_clusters,
+                })),
                 Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
             }
         }
@@ -936,21 +988,58 @@ pub async fn systemd_service_action(req: HttpRequest, state: web::Data<AppState>
 
 /// GET /api/nodes — all cluster nodes
 pub async fn get_nodes(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let caller = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
     let nodes = state.cluster.get_all_nodes();
+    // Per-user cluster filter. Cluster-node callers (inter-node
+    // traffic via X-WolfStack-Secret) always see everything; the
+    // helper returns "cluster-node" for those and find() below misses,
+    // so the unfiltered path kicks in. Admin users also pass through
+    // — the helper handles that.
+    let filtered = filter_nodes_for_caller(&caller, nodes);
     HttpResponse::Ok().json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "nodes": nodes,
+        "nodes": filtered,
         "tls_enabled": state.tls_enabled,
     }))
 }
 
+/// Filter a nodes list down to what the caller (by username) is
+/// allowed to see. The "cluster-node" pseudo-caller (inter-node
+/// auth) and any user not found in the store pass everything through
+/// — this is the safe default for service-to-service and for cases
+/// where a session exists without a matching user record.
+fn filter_nodes_for_caller(caller: &str, nodes: Vec<crate::agent::Node>) -> Vec<crate::agent::Node> {
+    if caller == "cluster-node" { return nodes; }
+    let store = crate::auth::users::UserStore::load();
+    let Some(user) = store.find(caller) else { return nodes; };
+    if user.role == "admin" || user.allowed_clusters.is_empty() {
+        return nodes;
+    }
+    nodes.into_iter()
+        .filter(|n| user.can_access_cluster(n.cluster_name.as_deref()))
+        .collect()
+}
+
 /// GET /api/nodes/{id} — single node details
 pub async fn get_node(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let caller = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
     let id = path.into_inner();
     match state.cluster.get_node(&id) {
-        Some(node) => HttpResponse::Ok().json(node),
+        Some(node) => {
+            // Refuse if the caller can't see this cluster — same rule
+            // as /api/nodes, applied to the single-node view.
+            let store = crate::auth::users::UserStore::load();
+            if caller != "cluster-node" {
+                if let Some(user) = store.find(&caller) {
+                    if !user.can_access_cluster(node.cluster_name.as_deref()) {
+                        return HttpResponse::Forbidden().json(serde_json::json!({
+                            "error": "You don't have access to this cluster"
+                        }));
+                    }
+                }
+            }
+            HttpResponse::Ok().json(node)
+        },
         None => HttpResponse::NotFound().json(serde_json::json!({
             "error": "Node not found"
         })),
@@ -18168,6 +18257,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/auth/users/{username}/2fa/setup", web::post().to(setup_2fa))
         .route("/api/auth/users/{username}/2fa/confirm", web::post().to(confirm_2fa))
         .route("/api/auth/users/{username}/2fa/disable", web::post().to(disable_2fa))
+        .route("/api/auth/users/{username}/clusters", web::put().to(update_user_clusters))
         // Dashboard
         .route("/api/metrics", web::get().to(get_metrics))
         .route("/api/metrics/history", web::get().to(get_metrics_history))

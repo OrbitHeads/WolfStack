@@ -88,6 +88,29 @@ pub struct WolfUser {
     /// When the user was created
     #[serde(default)]
     pub created_at: String,
+    /// Cluster names this user is allowed to see / act on. Empty =
+    /// all clusters (backward-compatible default for existing users).
+    /// Admin-role users always pass the access check regardless of
+    /// this list so an operator can't lock themselves out.
+    #[serde(default)]
+    pub allowed_clusters: Vec<String>,
+}
+
+impl WolfUser {
+    /// Can this user see nodes / containers / metrics / etc. that live
+    /// inside the given cluster? Admins bypass the allowlist, empty
+    /// allowlist = all clusters, otherwise exact cluster-name match.
+    /// Pass None for `cluster_name` (unassigned / proxmox edge case)
+    /// to mean "visible to everyone" — those nodes haven't been
+    /// grouped yet so we default to showing them rather than hiding.
+    pub fn can_access_cluster(&self, cluster_name: Option<&str>) -> bool {
+        if self.role == "admin" { return true; }
+        if self.allowed_clusters.is_empty() { return true; }
+        match cluster_name {
+            Some(c) => self.allowed_clusters.iter().any(|x| x == c),
+            None => true,
+        }
+    }
 }
 
 fn default_role() -> String { "admin".into() }
