@@ -460,6 +460,12 @@ async fn main() -> std::io::Result<()> {
             });
         }
 
+        // WolfAgents: one-shot migration for pre-v18.6.1 agents that
+        // were created with an empty allowed_tools list. Runs before
+        // the API starts serving so the first agent chat after upgrade
+        // already has its tools available.
+        wolfagents::migrate_empty_allowed_tools();
+
         // WolfUSB: init with cluster secret and restore assignments on startup
         wolfusb::init(&cluster_secret);
         {

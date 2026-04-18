@@ -320,6 +320,42 @@ fn tighten_dir_perms(path: &Path) {
 #[cfg(not(unix))]
 fn tighten_dir_perms(_path: &Path) {}
 
+/// One-shot migration for agents created before v18.6.1, when the
+/// default for new agents was an empty `allowed_tools` list. The
+/// expected UX changed to "tick all tools on by default; operator
+/// unchecks what they don't want", so pre-existing agents silently
+/// ran tool-less and refused every tool call — which looked to users
+/// like the AI was lying about sending emails. This rewrites any
+/// assignment whose `allowed_tools` is empty to the full registry.
+///
+/// Safe to re-run: idempotent (no-op once every agent has a populated
+/// list). Runs once at `main.rs` startup, before the API starts
+/// accepting requests.
+pub fn migrate_empty_allowed_tools() -> bool {
+    let mut agents = load_all();
+    let mut changed = 0usize;
+    let all_tools: Vec<String> = tools::ToolId::ALL.iter()
+        .map(|t| t.as_str().to_string()).collect();
+    for a in agents.iter_mut() {
+        if a.allowed_tools.is_empty() {
+            a.allowed_tools = all_tools.clone();
+            changed += 1;
+        }
+    }
+    if changed > 0 {
+        if let Err(e) = save_all(&agents) {
+            tracing::warn!("wolfagents: failed to save tool migration: {}", e);
+            return false;
+        }
+        tracing::info!(
+            "wolfagents: migrated {} agents from empty allowed_tools to full catalogue",
+            changed);
+        true
+    } else {
+        false
+    }
+}
+
 /// Insert or update one agent (matched by id). Convenience wrapper
 /// over load_all+save_all so the API handlers stay readable.
 pub fn upsert(agent: Agent) -> Result<(), String> {

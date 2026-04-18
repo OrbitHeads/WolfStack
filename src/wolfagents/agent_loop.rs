@@ -251,6 +251,15 @@ fn agent_scope_section(agent: &Agent) -> String {
          level forbids it. In that case, say exactly which tool would be needed so the operator \
          can grant it.\n"
     );
+    out.push_str(
+        "\nCRITICAL: Do NOT claim you have performed an action unless you actually issued a \
+         `tool_use` block for it AND received a successful `tool_result` back. No pre-emptive \
+         confirmations, no 'sending now…' theatre. If you didn't call the tool, you didn't do \
+         the thing. If a tool returned an error, tell the user the error verbatim — never \
+         summarise a failure as success. This is especially true for `send_email`, \
+         `exec_*`, and anything that touches cluster state: lying about success here causes \
+         real operational confusion.\n"
+    );
     out
 }
 
