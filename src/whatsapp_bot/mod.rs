@@ -113,7 +113,8 @@ pub async fn handle_inbound(
     // simple_chat (which was triggering UNEXPECTED_TOOL_CALL with
     // Gemini when the system prompt advertised tools).
     let reply = match crate::wolfagents::chat_with_agent_full(
-        &agent.id, body, state
+        &agent.id, body, state,
+        crate::wolfagents::ChatSurface::WhatsApp,
     ).await {
         Ok(r) => r,
         Err(e) => format!("(agent error) {}", e),

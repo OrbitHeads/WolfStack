@@ -176,7 +176,8 @@ async fn handle_telegram_chat(
     // the system prompt advertised tools that weren't registered.
     // Now every turn gets the same dispatcher the dashboard uses.
     let reply = match crate::wolfagents::chat_with_agent_full(
-        &agent.id, content, state.get_ref()
+        &agent.id, content, state.get_ref(),
+        crate::wolfagents::ChatSurface::Telegram,
     ).await {
         Ok(r) => r,
         Err(e) => format!("(agent error) {}", e),

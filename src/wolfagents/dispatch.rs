@@ -242,35 +242,101 @@ async fn tool_list_nodes(state: &crate::api::AppState) -> ToolResult {
 }
 
 async fn tool_list_containers(
-    args: &serde_json::Value, agent: &Agent, _state: &crate::api::AppState,
+    args: &serde_json::Value, agent: &Agent, state: &crate::api::AppState,
 ) -> ToolResult {
     let filter_cluster = args.get("cluster").and_then(|v| v.as_str());
     let filter_pattern = args.get("name_pattern").and_then(|v| v.as_str());
-    // We proxy to the local list_running_containers for now — a full
-    // cluster-wide gather would need per-node HTTP fans which belongs
-    // in its own path. Agents who need cluster-wide coverage should
-    // call `wolfstack_api` against /api/containers.
-    let items = crate::containers::list_running_containers();
-    let list: Vec<serde_json::Value> = items.into_iter()
-        .filter(|(_runtime, name, _status)| {
+    // Cluster-wide gather: start with this node's containers, then
+    // fan out to every online remote node via cluster-secret-auth'd
+    // HTTP. Previously this only returned LOCAL containers, which made
+    // agents confidently report "no LXC containers" when the LXC lived
+    // on a different node in the same cluster.
+    let nodes = state.cluster.get_all_nodes();
+    let self_node = nodes.iter().find(|n| n.is_self);
+    let self_hostname = self_node.map(|n| n.hostname.clone()).unwrap_or_default();
+    let self_cluster = self_node.and_then(|n| n.cluster_name.clone()).unwrap_or_default();
+
+    let mut out: Vec<(String, String, String, String, String)> = Vec::new(); // (runtime, name, status, node, cluster)
+    for (runtime, name, status) in crate::containers::list_running_containers() {
+        out.push((runtime, name, status, self_hostname.clone(), self_cluster.clone()));
+    }
+
+    // Remote nodes — one HTTP call per online non-self node.
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .ok();
+    if let Some(http) = http {
+        for node in nodes.iter().filter(|n| n.online && !n.is_self) {
+            // Skip nodes outside the caller's cluster filter — saves
+            // per-node HTTP when the agent asked for one cluster.
+            if let Some(fc) = filter_cluster {
+                if node.cluster_name.as_deref() != Some(fc) { continue; }
+            }
+            // WolfStack listens on 8553 with TLS by default. The
+            // remote exposes separate /api/containers/docker and
+            // /api/containers/lxc endpoints; call both.
+            let scheme = if node.port == 443 || node.port == 8553 { "https" } else { "http" };
+            let push_from_array = |arr: serde_json::Value, runtime: &str, out: &mut Vec<(String, String, String, String, String)>| {
+                if let Some(a) = arr.as_array() {
+                    for c in a {
+                        let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let status = c.get("state").and_then(|v| v.as_str())
+                            .or_else(|| c.get("status").and_then(|v| v.as_str()))
+                            .unwrap_or("").to_string();
+                        if name.is_empty() { continue; }
+                        out.push((runtime.to_string(), name, status,
+                            node.hostname.clone(),
+                            node.cluster_name.clone().unwrap_or_default()));
+                    }
+                }
+            };
+            for (path, runtime) in &[
+                ("/api/containers/docker", "docker"),
+                ("/api/containers/lxc", "lxc"),
+            ] {
+                let url = format!("{}://{}:{}{}", scheme, node.address, node.port, path);
+                let resp = http.get(&url)
+                    .header("X-WolfStack-Secret", &state.cluster_secret)
+                    .send().await;
+                let Ok(r) = resp else { continue; };
+                if !r.status().is_success() { continue; }
+                let Ok(val) = r.json::<serde_json::Value>().await else { continue; };
+                // Most endpoints return {"containers": [...]} — unwrap
+                // that, else treat the whole response as the array.
+                let arr = val.get("containers").cloned().unwrap_or(val);
+                push_from_array(arr, runtime, &mut out);
+            }
+        }
+    }
+
+    // Apply filters.
+    let list: Vec<serde_json::Value> = out.into_iter()
+        .filter(|(_, name, _, _, cluster)| {
             if let Some(p) = filter_pattern {
                 if !glob_match(p, name) { return false; }
             }
-            // Agent scope enforcement: even if the agent asks for any
-            // pattern, narrow to its own allowlist.
+            if let Some(fc) = filter_cluster {
+                if cluster != fc { return false; }
+            }
+            // Agent scope enforcement: narrow to its container pattern allowlist.
             matches_container_pattern(name, &agent.target_scope.allowed_container_patterns)
         })
-        .map(|(runtime, name, status)| serde_json::json!({
+        .map(|(runtime, name, status, node, cluster)| serde_json::json!({
             "runtime": runtime,
             "name": name,
             "status": status,
+            "node": node,
+            "cluster": cluster,
         }))
         .collect();
-    // Cluster filter is informational for now — the local list doesn't
-    // carry cluster membership. Pass through for the model to see.
-    let _ = filter_cluster;
     ToolResult::ok(
-        format!("{} containers match filter + scope", list.len()),
+        format!(
+            "{} containers match filter + scope across {} node(s)",
+            list.len(),
+            nodes.iter().filter(|n| n.online).count(),
+        ),
         serde_json::json!({ "containers": list }),
     )
 }

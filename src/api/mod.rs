@@ -15081,7 +15081,10 @@ pub async fn agents_chat(
     // agents with allowed_tools can actually call the dispatcher.
     // Discord/Telegram/WhatsApp receivers stay on the no-AppState
     // `chat_with_agent` fallback because they don't plumb AppState.
-    match crate::wolfagents::chat_with_agent_full(&id, &msg, state.get_ref()).await {
+    match crate::wolfagents::chat_with_agent_full(
+        &id, &msg, state.get_ref(),
+        crate::wolfagents::ChatSurface::Dashboard,
+    ).await {
         Ok(reply) => HttpResponse::Ok().json(serde_json::json!({
             "agent_id": id,
             "response": reply,

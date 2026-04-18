@@ -306,7 +306,8 @@ async fn handle_discord_chat(
     // callers invoke tools the agent has granted instead of silently
     // falling back to simple_chat.
     let reply = match crate::wolfagents::chat_with_agent_full(
-        &agent.id, content, state.get_ref()
+        &agent.id, content, state.get_ref(),
+        crate::wolfagents::ChatSurface::Discord,
     ).await {
         Ok(r) => r,
         Err(e) => format!("(agent error) {}", e),

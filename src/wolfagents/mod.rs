@@ -504,10 +504,24 @@ fn consume_chat_budget(agent_id: &str) -> Result<(), String> {
 /// cluster state, router state, and the cluster secret. Legacy
 /// callers that don't have AppState handy can use
 /// `chat_with_agent_simple` which falls back to no-tools mode.
+/// Which surface the chat turn originated from. Lets the mirror skip
+/// the originating surface — otherwise Telegram-initiated turns would
+/// loop back to Telegram (dashboard mirror echoes the user's question
+/// and the reply, Telegram user then sees both the natural reply AND
+/// the mirrored pair) and make the chat unreadable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatSurface {
+    Dashboard,
+    Telegram,
+    Discord,
+    WhatsApp,
+}
+
 pub async fn chat_with_agent_full(
     agent_id: &str,
     message: &str,
     state: &crate::api::AppState,
+    surface: ChatSurface,
 ) -> Result<String, String> {
     // Check agent exists BEFORE consuming the rate-limit budget.
     // Otherwise an attacker probing random IDs would populate the
@@ -557,11 +571,13 @@ pub async fn chat_with_agent_full(
         tracing::warn!("wolfagents: failed to bump last_active_at: {}", e);
     }
 
-    // Mirror the exchange to any bound external chat surface so
-    // dashboard-initiated turns show up in the shared Telegram /
-    // Discord chat and everyone following the agent there sees the
-    // latest answer. Fire-and-forget — failures are logged.
-    mirror_exchange_to_surfaces(&agent, message, &reply);
+    // Mirror the exchange to any bound external chat surface EXCEPT
+    // the one this turn came from. Dashboard turns go to every bound
+    // surface; Telegram turns mirror to Discord (but not back to
+    // Telegram — the natural reply already landed there), etc. This
+    // enables cross-surface bridging while preventing the duplicate-
+    // post feedback loop we had in v18.7.8.
+    mirror_exchange_to_surfaces(&agent, message, &reply, surface);
 
     Ok(reply)
 }
@@ -571,9 +587,11 @@ pub async fn chat_with_agent_full(
 /// logged but don't propagate to the dashboard caller. Bot-authored
 /// messages are filtered by `from.is_bot` in the receivers, so
 /// mirroring our own posts back can't produce a reply loop.
-fn mirror_exchange_to_surfaces(agent: &Agent, user_msg: &str, reply: &str) {
-    // Telegram
-    if let Some(tg) = agent.telegram.clone() {
+fn mirror_exchange_to_surfaces(agent: &Agent, user_msg: &str, reply: &str, origin: ChatSurface) {
+    // Telegram — skip if the turn originated from Telegram so we don't
+    // echo the natural reply back into the same chat.
+    if origin == ChatSurface::Telegram { /* skip */ }
+    else if let Some(tg) = agent.telegram.clone() {
         let bot_token = resolved_telegram_token(&tg);
         let user_msg = user_msg.to_string();
         let reply = reply.to_string();
@@ -604,8 +622,9 @@ fn mirror_exchange_to_surfaces(agent: &Agent, user_msg: &str, reply: &str) {
             }
         });
     }
-    // Discord
-    if let Some(d) = agent.discord.clone() {
+    // Discord — skip if the turn came from Discord.
+    if origin == ChatSurface::Discord { /* skip */ }
+    else if let Some(d) = agent.discord.clone() {
         let bot_token = resolved_discord_token(&d);
         let user_msg = user_msg.to_string();
         let reply = reply.to_string();
