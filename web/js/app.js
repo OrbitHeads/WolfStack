@@ -3451,7 +3451,8 @@ function renderVms(vms) {
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#ef4444;" onclick="vmAction('${vm.name}', 'stop', this)" title="Stop (graceful ACPI shutdown)">⏹️</button>
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#b91c1c;" onclick="if (confirm('Force-stop ${vm.name}? The guest will not shut down cleanly — unsaved data may be lost.')) vmAction('${vm.name}', 'force-stop', this)" title="Force Stop (power off immediately)">⛔</button>` :
                 `<button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="showVmSettings('${vm.name}')" title="Settings">⚙️</button>
-                         <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#3b82f6;" onclick="migrateVm('${vm.name}')" title="Migrate">🚀</button>
+                         <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#3b82f6;" onclick="migrateVm('${vm.name}')" title="Migrate to another node">🚀</button>
+                         <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#8b5cf6;" onclick="migrateVmDiskStorage('${vm.name}')" title="Move disk to different storage (same node)">💾</button>
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#22c55e;" onclick="vmAction('${vm.name}', 'start', this)" title="Start">▶️</button>
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#ef4444;" onclick="deleteVm('${vm.name}')" title="Delete">🗑️</button>`
             }
@@ -11943,7 +11944,8 @@ function renderVmCards(vms) {
                 <button class="btn btn-sm" style="${!isRunning ? bd : bs}" ${!isRunning ? 'disabled' : `onclick="openVmConsole('${vm.name}')"`} title="Serial terminal (guest must have serial console enabled)">💻</button>
                 <button class="btn btn-sm" style="${bs}" onclick="showVmSettings('${vm.name}')" title="Settings">⚙️</button>
                 <button class="btn btn-sm" style="${bs}" onclick="showVmLogs('${vm.name}')" title="Logs">📜</button>
-                <button class="btn btn-sm" style="${bs}" onclick="migrateVm('${vm.name}')" title="Migrate">🚀</button>
+                <button class="btn btn-sm" style="${bs}" onclick="migrateVm('${vm.name}')" title="Migrate to another node">🚀</button>
+                <button class="btn btn-sm" style="${bs}" onclick="migrateVmDiskStorage('${vm.name}')" title="Move disk to different storage (same node)">💾</button>
                 ${!isRunning ? `<button class="btn btn-sm" style="${bs}color:#ef4444;" onclick="deleteVm('${vm.name}')" title="Delete">🗑️</button>` : ''}
             </div>
             <div style="padding:10px 12px;">
@@ -14429,6 +14431,7 @@ async function doMigrateLxc(name) {
             const migrateBody = { target_node: target };
             if (targetNode) { migrateBody.target_address = targetNode.address; migrateBody.target_port = targetNode.port || 8553; }
             if (migrateStorage) migrateBody.storage = migrateStorage;
+            if (stagingDir) migrateBody.staging_dir = stagingDir;
             const resp = await fetch(apiUrl(`/api/containers/lxc/${name}/migrate`), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -14502,6 +14505,9 @@ async function migrateVm(name) {
                         <option value="">Default</option>
                     </select>
                     <span id="vm-migrate-storage-hint" style="font-size:11px;color:var(--text-muted,#666);margin-top:2px;display:block;">Select a target node to load available storages</span></div>
+                <div><label style="font-size:13px;color:var(--text-muted,#aaa);">Source Staging Directory <span style="color:var(--text-muted,#666);font-weight:normal;">(optional)</span></label>
+                    <input id="vm-migrate-staging" type="text" placeholder="/tmp  (default — pick somewhere larger if VM disk &gt; /tmp size)" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;">
+                    <span style="font-size:11px;color:var(--text-muted,#666);margin-top:2px;display:block;">Where the export tarball is staged on THIS node before upload. Needs ~2× the VM disk size free. Leave blank for /tmp / $TMPDIR.</span></div>
                 <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px;">
                     <button class="btn" onclick="document.getElementById('vm-migrate-modal')?.remove()">Cancel</button>
                     <button class="btn" style="background:#ef4444;color:#fff;" onclick="doMigrateVm('${name}')">Migrate</button>
@@ -14571,6 +14577,7 @@ async function doMigrateVm(name) {
     const rawExtUrl = document.getElementById('vm-migrate-ext-url')?.value.trim() || '';
     const extToken = document.getElementById('vm-migrate-ext-token')?.value.trim() || '';
     const migrateStorage = document.getElementById('vm-migrate-storage')?.value || '';
+    const stagingDir = (document.getElementById('vm-migrate-staging')?.value || '').trim();
 
     const isExternal = target === '__external__';
     if (isExternal && (!rawExtUrl || !extToken)) { showToast('Enter URL and token', 'error'); return; }
@@ -14672,6 +14679,7 @@ async function doMigrateVm(name) {
             // External migration: always run on the LOCAL server (not proxied)
             const extBody = { target_url: extUrl, target_token: extToken };
             if (migrateStorage) extBody.storage = migrateStorage;
+            if (stagingDir) extBody.staging_dir = stagingDir;
             resp = await fetch(`/api/vms/${name}/migrate-external`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -14682,6 +14690,7 @@ async function doMigrateVm(name) {
             const migrateBody = { target_node: target };
             if (targetNode) { migrateBody.target_address = targetNode.address; migrateBody.target_port = targetNode.port || 8553; }
             if (migrateStorage) migrateBody.storage = migrateStorage;
+            if (stagingDir) migrateBody.staging_dir = stagingDir;
             resp = await fetch(apiUrl(`/api/vms/${name}/migrate`), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -14732,6 +14741,91 @@ async function doMigrateVm(name) {
         r.textContent = e.message;
         document.getElementById('vm-op-close').style.display = '';
         updateTaskLogEntry(taskId, { status: 'failed', description: `Migrate VM '${name}': ${e.message}` });
+    }
+}
+
+// Move a stopped VM's disks to a different storage pool on the SAME
+// node. Mirrors the LXC disk-migrate dialog — same shape (target +
+// remove-source checkbox), different endpoint. Intended for shifting
+// a VM from /var/lib/wolfstack/vms onto a bigger ZFS pool without
+// crossing the cluster.
+async function migrateVmDiskStorage(name) {
+    // Fetch storage candidates from this node's /api/storage/list so
+    // the operator picks from real mount points, not a free-form path
+    // (which worked too, but typos → silent failure).
+    let storages = [];
+    try {
+        const r = await fetch(apiUrl('/api/storage/list'));
+        if (r.ok) {
+            const d = await r.json();
+            storages = (d.storages || d || []).filter(s =>
+                !s.content || s.content.includes('images') || s.content.includes('rootdir')
+            );
+        }
+    } catch {}
+
+    const opts = storages.map(s => {
+        const free = typeof formatBytes === 'function'
+            ? formatBytes((s.available_bytes || s.available_gb * 1073741824) || 0)
+            : (s.available_gb ? s.available_gb + ' GB' : '—') + ' free';
+        return `<option value="${escapeAttr(s.path || s.id)}">${escapeHtml(s.path || s.id)} (${free})</option>`;
+    }).join('');
+
+    const modal = document.createElement('div');
+    modal.className = 'modal-overlay';
+    modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:10000;backdrop-filter:blur(4px);';
+    modal.innerHTML = `
+        <div style="background:var(--card-bg,#1e1e2e);border:1px solid var(--border,#333);border-radius:12px;padding:28px 36px;min-width:440px;max-width:560px;box-shadow:0 20px 60px rgba(0,0,0,0.5);">
+            <h3 style="margin:0 0 10px;color:var(--text,#fff);">Migrate VM Disk Storage</h3>
+            <p style="margin:0 0 14px;color:var(--text-muted,#aaa);font-size:0.9em;">Move <strong>${escapeHtml(name)}</strong>'s disks to a different storage pool on <em>this</em> node. VM must be stopped; the config is updated to point at the new pool after copy.</p>
+            <div style="display:flex;flex-direction:column;gap:12px;">
+                <div>
+                    <label style="font-size:13px;color:var(--text-muted,#aaa);">Target storage path</label>
+                    <input id="vm-disk-migrate-target" list="vm-disk-migrate-options" placeholder="/wolfpool/vms" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;">
+                    <datalist id="vm-disk-migrate-options">${opts}</datalist>
+                    <span style="font-size:11px;color:var(--text-muted,#666);margin-top:2px;display:block;">Pick from known mounts or type a path. Target directory must exist; free-space is pre-flighted before any copy.</span>
+                </div>
+                <label style="font-size:13px;color:var(--text-muted,#aaa);display:flex;align-items:center;gap:8px;cursor:pointer;">
+                    <input type="checkbox" id="vm-disk-migrate-remove-source"/>
+                    <span>Remove source files after successful copy</span>
+                </label>
+                <span style="font-size:11px;color:var(--text-muted,#666);">Default OFF — keep the source until you've confirmed the new copy boots. Turn on only if you need the space back immediately.</span>
+                <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px;">
+                    <button class="btn" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+                    <button class="btn" style="background:#3b82f6;color:#fff;" onclick="doMigrateVmDiskStorage('${escapeAttr(name)}', this)">Migrate Disk</button>
+                </div>
+            </div>
+        </div>`;
+    document.body.appendChild(modal);
+}
+
+async function doMigrateVmDiskStorage(name, btn) {
+    const overlay = btn?.closest?.('.modal-overlay') || document;
+    const target = (overlay.querySelector('#vm-disk-migrate-target')?.value || '').trim();
+    const removeSource = !!overlay.querySelector('#vm-disk-migrate-remove-source')?.checked;
+    if (!target) { showToast('Pick or enter a target storage path', 'error'); return; }
+    if (!(await showConfirm(`Migrate ${name}'s disks to ${target}? ${removeSource ? '(source will be removed after successful copy)' : '(source will be kept)'}`))) return;
+    const taskId = taskLogStart(`Migrating VM '${name}' disks to ${target}`);
+    try {
+        const r = await fetch(apiUrl(`/api/vms/${encodeURIComponent(name)}/disk/migrate`), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ target, remove_source: removeSource }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            const errMsg = data.error || ('HTTP ' + r.status);
+            showToast('Migrate failed: ' + errMsg, 'error');
+            updateTaskLogEntry(taskId, { status: 'failed', description: `VM '${name}' disk migrate: ${errMsg}` });
+            return;
+        }
+        showToast(data.message || 'Disk migration complete', 'success', 8000);
+        updateTaskLogEntry(taskId, { status: 'completed', description: data.message || `Migrated '${name}' disks to ${target}` });
+        overlay.remove?.();
+        if (typeof loadVms === 'function') loadVms();
+    } catch (e) {
+        showToast('Error: ' + e.message, 'error');
+        updateTaskLogEntry(taskId, { status: 'failed', description: `VM '${name}' disk migrate: ${e.message}` });
     }
 }
 
