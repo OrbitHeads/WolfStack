@@ -1753,6 +1753,7 @@
                                     <input id="wolfagents-field-discord-id" type="text" class="form-control" placeholder="Channel ID (snowflake)">
                                     <input id="wolfagents-field-discord-label" type="text" class="form-control" placeholder="Label e.g. #ops-alerts">
                                 </div>
+                                <input id="wolfagents-field-discord-token" type="password" class="form-control" placeholder="Bot token — optional override (leave blank to inherit Settings → Alerting)" autocomplete="off" style="margin-top:6px;">
                             </div>
                             <div style="margin-top:8px;">
                                 <label style="font-size:12px; color:var(--text-muted);">Telegram chat binding</label>
@@ -1760,12 +1761,17 @@
                                     <input id="wolfagents-field-telegram-id" type="text" class="form-control" placeholder="Chat ID e.g. -1001234567890">
                                     <input id="wolfagents-field-telegram-label" type="text" class="form-control" placeholder="Label e.g. @wolfgrid-ops">
                                 </div>
+                                <input id="wolfagents-field-telegram-token" type="password" class="form-control" placeholder="Bot token from @BotFather — optional override (leave blank to inherit Settings → Alerting)" autocomplete="off" style="margin-top:6px;">
                             </div>
                             <div style="margin-top:8px;">
                                 <label style="font-size:12px; color:var(--text-muted);">WhatsApp (Twilio) binding</label>
                                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
                                     <input id="wolfagents-field-whatsapp-number" type="text" class="form-control" placeholder="whatsapp:+14155551234">
                                     <input id="wolfagents-field-whatsapp-label" type="text" class="form-control" placeholder="Label e.g. Ops Line">
+                                </div>
+                                <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:6px;">
+                                    <input id="wolfagents-field-whatsapp-sid" type="text" class="form-control" placeholder="Twilio SID — optional override" autocomplete="off">
+                                    <input id="wolfagents-field-whatsapp-auth" type="password" class="form-control" placeholder="Twilio auth token — optional override" autocomplete="off">
                                 </div>
                             </div>
                         </div>

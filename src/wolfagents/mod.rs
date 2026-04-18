@@ -42,6 +42,10 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Discord binding — agent reads and replies in one channel.
+/// `bot_token` is optional: when present the agent runs on its OWN
+/// Discord bot (separate gateway session). When absent WolfStack uses
+/// the global token from AlertConfig so the existing single-bot
+/// deployments keep working unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscordBinding {
     /// Discord channel ID (snowflake, as a string).
@@ -49,17 +53,28 @@ pub struct DiscordBinding {
     /// Human label for the UI — e.g. "#ops-alerts in Wolf Labs".
     #[serde(default)]
     pub channel_label: String,
+    /// Optional per-agent bot token. Empty/None = inherit the global
+    /// AlertConfig.discord_bot_token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_token: Option<String>,
 }
 
 /// Telegram binding — agent reads and replies in one chat (DM or
 /// group). Chat IDs are int64 but Telegram's API returns them as
 /// numbers and accepts them as either number or string; we store as
 /// string so negative group-chat IDs don't lose precision.
+/// `bot_token` is optional: when present the agent runs on its OWN
+/// Telegram bot (separate long-polling task). When absent WolfStack
+/// uses the global AlertConfig.telegram_bot_token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelegramBinding {
     pub chat_id: String,
     #[serde(default)]
     pub chat_label: String,
+    /// Optional per-agent bot token. Empty/None = inherit the global
+    /// AlertConfig.telegram_bot_token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_token: Option<String>,
 }
 
 /// WhatsApp binding via Twilio. The "number" is the user's WhatsApp
@@ -67,11 +82,19 @@ pub struct TelegramBinding {
 /// convention, e.g. `whatsapp:+14155551234`). WolfStack replies from
 /// the Twilio-configured WhatsApp sender — set separately in Twilio
 /// config fields, not on the agent.
+/// `twilio_sid` + `twilio_auth` are optional per-agent overrides —
+/// when both are set WolfStack uses them for the outbound reply
+/// (webhook validation still uses the auth token that Twilio signs
+/// with, so set the override auth to match your Twilio sub-account).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WhatsAppBinding {
     pub number: String,
     #[serde(default)]
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub twilio_sid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub twilio_auth: Option<String>,
 }
 
 /// How much authority the agent has over mutating/destructive tools.

@@ -37736,10 +37736,14 @@ function wolfAgentsOpenCreate() {
     document.getElementById('wolfagents-field-scope-email').value = '';
     document.getElementById('wolfagents-field-discord-id').value = '';
     document.getElementById('wolfagents-field-discord-label').value = '';
+    var _dt = document.getElementById('wolfagents-field-discord-token'); if (_dt) _dt.value = '';
     const tgId = document.getElementById('wolfagents-field-telegram-id'); if (tgId) tgId.value = '';
     const tgLabel = document.getElementById('wolfagents-field-telegram-label'); if (tgLabel) tgLabel.value = '';
+    var _tt = document.getElementById('wolfagents-field-telegram-token'); if (_tt) _tt.value = '';
     const waNum = document.getElementById('wolfagents-field-whatsapp-number'); if (waNum) waNum.value = '';
     const waLabel = document.getElementById('wolfagents-field-whatsapp-label'); if (waLabel) waLabel.value = '';
+    var _ws = document.getElementById('wolfagents-field-whatsapp-sid'); if (_ws) _ws.value = '';
+    var _wa = document.getElementById('wolfagents-field-whatsapp-auth'); if (_wa) _wa.value = '';
     _wolfAgentsRenderInheritedAi(null);
     // Default new agents to ALL tools ticked. Combined with the default
     // access_level=read_only this is still safe — mutating/destructive
@@ -37885,10 +37889,14 @@ async function wolfAgentsOpenEdit() {
         document.getElementById('wolfagents-field-scope-email').value = _arrayToCsv(scope.allowed_email_recipients);
         document.getElementById('wolfagents-field-discord-id').value = (a.discord && a.discord.channel_id) || '';
         document.getElementById('wolfagents-field-discord-label').value = (a.discord && a.discord.channel_label) || '';
+        var _dt2 = document.getElementById('wolfagents-field-discord-token'); if (_dt2) _dt2.value = (a.discord && a.discord.bot_token) || '';
         const tgId = document.getElementById('wolfagents-field-telegram-id'); if (tgId) tgId.value = (a.telegram && a.telegram.chat_id) || '';
         const tgLabel = document.getElementById('wolfagents-field-telegram-label'); if (tgLabel) tgLabel.value = (a.telegram && a.telegram.chat_label) || '';
+        var _tt2 = document.getElementById('wolfagents-field-telegram-token'); if (_tt2) _tt2.value = (a.telegram && a.telegram.bot_token) || '';
         const waNum = document.getElementById('wolfagents-field-whatsapp-number'); if (waNum) waNum.value = (a.whatsapp && a.whatsapp.number) || '';
         const waLabel = document.getElementById('wolfagents-field-whatsapp-label'); if (waLabel) waLabel.value = (a.whatsapp && a.whatsapp.label) || '';
+        var _ws2 = document.getElementById('wolfagents-field-whatsapp-sid'); if (_ws2) _ws2.value = (a.whatsapp && a.whatsapp.twilio_sid) || '';
+        var _wa2 = document.getElementById('wolfagents-field-whatsapp-auth'); if (_wa2) _wa2.value = (a.whatsapp && a.whatsapp.twilio_auth) || '';
         _wolfAgentsRenderInheritedAi(a);
         _wolfAgentsRenderToolCheckboxes(a.allowed_tools || []);
         _wolfAgentsRenderAvatarPicker(a.avatar || '');
@@ -37925,22 +37933,30 @@ async function wolfAgentsSaveFromModal() {
     if (!payload.name) { showToast('Name is required', 'warn'); return; }
     const discordId = (document.getElementById('wolfagents-field-discord-id').value || '').trim();
     const discordLabel = (document.getElementById('wolfagents-field-discord-label').value || '').trim();
+    const discordToken = (document.getElementById('wolfagents-field-discord-token')?.value || '').trim();
     if (discordId) {
         payload.discord = { channel_id: discordId, channel_label: discordLabel };
+        if (discordToken) payload.discord.bot_token = discordToken;
     } else if (_wolfAgentsEditId) {
         payload.discord = null;
     }
     const tgId = (document.getElementById('wolfagents-field-telegram-id')?.value || '').trim();
     const tgLabel = (document.getElementById('wolfagents-field-telegram-label')?.value || '').trim();
+    const tgToken = (document.getElementById('wolfagents-field-telegram-token')?.value || '').trim();
     if (tgId) {
         payload.telegram = { chat_id: tgId, chat_label: tgLabel };
+        if (tgToken) payload.telegram.bot_token = tgToken;
     } else if (_wolfAgentsEditId) {
         payload.telegram = null;
     }
     const waNum = (document.getElementById('wolfagents-field-whatsapp-number')?.value || '').trim();
     const waLabel = (document.getElementById('wolfagents-field-whatsapp-label')?.value || '').trim();
+    const waSid = (document.getElementById('wolfagents-field-whatsapp-sid')?.value || '').trim();
+    const waAuth = (document.getElementById('wolfagents-field-whatsapp-auth')?.value || '').trim();
     if (waNum) {
         payload.whatsapp = { number: waNum, label: waLabel };
+        if (waSid) payload.whatsapp.twilio_sid = waSid;
+        if (waAuth) payload.whatsapp.twilio_auth = waAuth;
     } else if (_wolfAgentsEditId) {
         payload.whatsapp = null;
     }

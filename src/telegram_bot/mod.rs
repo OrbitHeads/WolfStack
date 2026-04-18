@@ -110,11 +110,20 @@ async fn poll_once(
             if from.is_bot { continue; }
         }
         let chat_id = msg.chat.id;
-        // Route to the agent bound to this chat.
+        // Route to the agent bound to this chat AND this bot. Two agents
+        // may share a chat_id string on different bots, so we must match
+        // on both — otherwise bot X would reply for agent B that's
+        // actually on bot Y.
+        let global_token = crate::alerting::AlertConfig::load().telegram_bot_token;
         let agents = crate::wolfagents::load_all();
-        let Some(agent) = agents.iter().find(|a|
-            a.telegram.as_ref().map(|t| t.chat_id.as_str()) == Some(&chat_id.to_string())
-        ).cloned() else { continue; };
+        let Some(agent) = agents.iter().find(|a| {
+            let Some(tg) = &a.telegram else { return false; };
+            if tg.chat_id != chat_id.to_string() { return false; }
+            let agent_token = tg.bot_token.as_deref()
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or(global_token.as_str());
+            agent_token == bot_token
+        }).cloned() else { continue; };
         let http_reply = http.clone();
         let token = bot_token.to_string();
         let content = text;
@@ -174,38 +183,91 @@ async fn send_telegram_message(
     Ok(())
 }
 
-/// Supervisor: loops forever, (re)starts a long-polling loop whenever
-/// the operator has both a bot token AND the receiver flag enabled.
-/// When misconfigured or disabled, sleeps and re-checks.
+/// Supervisor: reconciles the set of bot tokens WolfStack needs to
+/// long-poll. Every 30 seconds it asks (a) AlertConfig for the global
+/// fallback token and the receiver-enabled flag, and (b) agents.json
+/// for every per-agent `telegram.bot_token` override. For each unique
+/// token it keeps one polling task running; tokens that disappear from
+/// the desired set get their tasks aborted. This lets operators pair
+/// each agent with its own @BotFather bot — one agent → one bot →
+/// one @-mention in any chat that bot is added to.
 pub async fn supervise_forever() {
     tokio::time::sleep(Duration::from_secs(30)).await;
+    use std::collections::HashMap;
+    use tokio::task::JoinHandle;
+    let mut running: HashMap<String, JoinHandle<()>> = HashMap::new();
+    loop {
+        let desired = desired_token_set();
+        // Spawn tasks for newly-desired tokens.
+        for token in &desired {
+            if !running.contains_key(token) {
+                let tok = token.clone();
+                info!("telegram_bot: starting long-poll task for bot ending …{}", tok_tail(&tok));
+                let handle = tokio::spawn(async move { long_poll_forever(tok).await; });
+                running.insert(token.clone(), handle);
+            }
+        }
+        // Abort tasks whose tokens are no longer in the desired set.
+        let stale: Vec<String> = running.keys()
+            .filter(|k| !desired.contains(*k))
+            .cloned().collect();
+        for token in stale {
+            if let Some(h) = running.remove(&token) {
+                info!("telegram_bot: stopping long-poll task for bot ending …{}", tok_tail(&token));
+                h.abort();
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
+}
+
+/// Compute the set of bot tokens that should have an active long-poll
+/// right now. Global token counts only when the receiver flag is on;
+/// per-agent override tokens always count because the agent wouldn't
+/// have set one if they didn't want it running.
+fn desired_token_set() -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let cfg = crate::alerting::AlertConfig::load();
+    if cfg.telegram_receiver_enabled && !cfg.telegram_bot_token.trim().is_empty() {
+        out.insert(cfg.telegram_bot_token.clone());
+    }
+    for agent in crate::wolfagents::load_all() {
+        if let Some(tg) = &agent.telegram {
+            if let Some(t) = &tg.bot_token {
+                let t = t.trim();
+                if !t.is_empty() { out.insert(t.to_string()); }
+            }
+        }
+    }
+    out
+}
+
+/// Last 6 chars of a bot token — enough to distinguish in logs without
+/// leaking the full credential.
+fn tok_tail(t: &str) -> String {
+    t.chars().rev().take(6).collect::<String>().chars().rev().collect()
+}
+
+/// Per-token polling loop — runs until aborted by the supervisor.
+/// Each bot keeps its own `offset` so Telegram's ack semantics are
+/// correct per-bot (offsets are scoped to the bot that issued them).
+async fn long_poll_forever(bot_token: String) {
     let http = match reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
     {
         Ok(c) => c,
         Err(e) => {
-            warn!("telegram_bot: cannot build http client: {}", e);
+            warn!("telegram_bot: cannot build http client for …{}: {}", tok_tail(&bot_token), e);
             return;
         }
     };
     let mut offset: i64 = 0;
     loop {
-        let cfg = crate::alerting::AlertConfig::load();
-        if cfg.telegram_bot_token.trim().is_empty() || !cfg.telegram_receiver_enabled {
-            // Not enabled — sleep and re-check.
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            continue;
-        }
-        match poll_once(&http, &cfg.telegram_bot_token, offset).await {
-            Ok(next) => {
-                if next != offset {
-                    info!("telegram_bot: advanced offset {} → {}", offset, next);
-                }
-                offset = next;
-            }
+        match poll_once(&http, &bot_token, offset).await {
+            Ok(next) => { offset = next; }
             Err(e) => {
-                warn!("telegram_bot: poll error — {}", e);
+                warn!("telegram_bot (bot …{}): poll error — {}", tok_tail(&bot_token), e);
                 tokio::time::sleep(Duration::from_secs(10)).await;
             }
         }

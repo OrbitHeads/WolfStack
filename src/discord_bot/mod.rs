@@ -249,11 +249,21 @@ pub async fn run_once(bot_token: String) -> Result<(), String> {
                         // Skip our own + any other bot to stop loops.
                         if msg.author.bot { continue; }
                         if own_user_id.as_deref() == Some(&msg.author.id) { continue; }
-                        // Find the bound agent for this channel.
+                        // Find the bound agent for this channel AND this
+                        // specific bot. In a multi-bot deployment two
+                        // agents might share a channel_id on different
+                        // bots; matching on token too stops bot X from
+                        // replying for agent B which is actually on bot Y.
+                        let global_token = crate::alerting::AlertConfig::load().discord_bot_token;
                         let agents = crate::wolfagents::load_all();
-                        let Some(agent) = agents.iter().find(|a|
-                            a.discord.as_ref().map(|d| d.channel_id.as_str()) == Some(&msg.channel_id)
-                        ).cloned() else { continue; };
+                        let Some(agent) = agents.iter().find(|a| {
+                            let Some(d) = &a.discord else { return false; };
+                            if d.channel_id != msg.channel_id { return false; }
+                            let agent_token = d.bot_token.as_deref()
+                                .filter(|t| !t.trim().is_empty())
+                                .unwrap_or(global_token.as_str());
+                            agent_token == bot_token
+                        }).cloned() else { continue; };
                         // Fire the chat turn in a task so the recv
                         // loop keeps draining. Agent turns can take
                         // seconds; blocking the loop would stall
@@ -328,28 +338,74 @@ async fn send_discord_message(
     Ok(())
 }
 
-/// Supervisor loop — spawned once at startup. Watches AlertConfig for
-/// a bot token and (re)connects whenever one is present. When the
-/// gateway drops, waits 30s and retries. When the token is cleared,
-/// sleeps idly and re-checks every 60s. All network activity happens
-/// inside `run_once`; this function is pure control flow.
+/// Supervisor loop — spawned once at startup. Reconciles the set of
+/// Discord bot tokens that should have a gateway session running. The
+/// desired set is the union of:
+///   - the global `AlertConfig.discord_bot_token` (when non-empty), and
+///   - every per-agent `discord.bot_token` override.
+/// For each unique token the supervisor keeps one gateway session
+/// (run_once) alive; tokens that leave the set have their session
+/// aborted. Sessions that exit on their own (gateway dropped, error)
+/// are auto-restarted on the next reconciliation tick, with a 30s
+/// cooldown to avoid hammering the gateway.
 pub async fn supervise_forever() {
-    // Short startup delay so the rest of the stack initialises first
-    // (cluster discovery, AI config). Saves noise in the logs.
+    // Short startup delay so the rest of the stack initialises first.
     tokio::time::sleep(Duration::from_secs(30)).await;
+    use std::collections::HashMap;
+    use tokio::task::JoinHandle;
+    let mut running: HashMap<String, JoinHandle<()>> = HashMap::new();
     loop {
-        let cfg = crate::alerting::AlertConfig::load();
-        let token = cfg.discord_bot_token.clone();
-        if token.trim().is_empty() {
-            // No token configured — idle, re-check shortly.
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            continue;
+        let desired = desired_token_set();
+        // Prune finished / dead tasks so they restart on the next pass.
+        let finished: Vec<String> = running.iter()
+            .filter(|(_, h)| h.is_finished())
+            .map(|(k, _)| k.clone()).collect();
+        for token in finished { running.remove(&token); }
+        // Spawn sessions for newly-desired tokens.
+        for token in &desired {
+            if !running.contains_key(token) {
+                let tok = token.clone();
+                info!("discord_bot: starting gateway session for bot ending …{}", tok_tail(&tok));
+                let handle = tokio::spawn(async move {
+                    match run_once(tok.clone()).await {
+                        Ok(()) => info!("discord_bot (…{}): gateway exited cleanly", tok_tail(&tok)),
+                        Err(e) => warn!("discord_bot (…{}): gateway errored: {}", tok_tail(&tok), e),
+                    }
+                });
+                running.insert(token.clone(), handle);
+            }
         }
-        info!("discord_bot: supervisor starting gateway loop");
-        match run_once(token).await {
-            Ok(()) => info!("discord_bot: gateway loop exited cleanly; reconnecting in 30s"),
-            Err(e) => warn!("discord_bot: gateway loop errored ({}); reconnecting in 30s", e),
+        // Abort sessions whose tokens are no longer in the desired set.
+        let stale: Vec<String> = running.keys()
+            .filter(|k| !desired.contains(*k)).cloned().collect();
+        for token in stale {
+            if let Some(h) = running.remove(&token) {
+                info!("discord_bot: stopping gateway session for bot ending …{}", tok_tail(&token));
+                h.abort();
+            }
         }
         tokio::time::sleep(Duration::from_secs(30)).await;
     }
+}
+
+/// Desired set of bot tokens — union of global and per-agent overrides.
+fn desired_token_set() -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let cfg = crate::alerting::AlertConfig::load();
+    if !cfg.discord_bot_token.trim().is_empty() {
+        out.insert(cfg.discord_bot_token.clone());
+    }
+    for agent in crate::wolfagents::load_all() {
+        if let Some(d) = &agent.discord {
+            if let Some(t) = &d.bot_token {
+                let t = t.trim();
+                if !t.is_empty() { out.insert(t.to_string()); }
+            }
+        }
+    }
+    out
+}
+
+fn tok_tail(t: &str) -> String {
+    t.chars().rev().take(6).collect::<String>().chars().rev().collect()
 }
