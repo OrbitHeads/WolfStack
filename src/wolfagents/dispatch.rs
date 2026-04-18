@@ -341,18 +341,70 @@ async fn tool_list_containers(
     )
 }
 
-async fn tool_get_metrics(_args: &serde_json::Value, _state: &crate::api::AppState) -> ToolResult {
-    let metrics = tokio::task::spawn_blocking(|| {
-        let mut mon = crate::monitoring::SystemMonitor::new();
-        mon.collect()
-    }).await;
-    match metrics {
-        Ok(m) => ToolResult::ok(
-            "metrics snapshot",
-            serde_json::to_value(&m).unwrap_or(serde_json::Value::Null),
-        ),
-        Err(e) => ToolResult::err(format!("metrics collection panicked: {}", e)),
+async fn tool_get_metrics(args: &serde_json::Value, state: &crate::api::AppState) -> ToolResult {
+    // Optional `node` arg — hostname filter. Without it we fan out to
+    // every online cluster node so the agent can answer "how's sophie
+    // doing?" accurately instead of silently reporting the metrics of
+    // whichever node runs wolfstack.
+    let target = args.get("node").and_then(|v| v.as_str());
+    let nodes = state.cluster.get_all_nodes();
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .ok();
+
+    let mut per_node: Vec<serde_json::Value> = Vec::new();
+    for node in &nodes {
+        if !node.online { continue; }
+        if let Some(t) = target {
+            if node.hostname != t && node.id != t { continue; }
+        }
+        // Local node collects directly — no HTTP hop needed.
+        if node.is_self {
+            let metrics = tokio::task::spawn_blocking(|| {
+                let mut mon = crate::monitoring::SystemMonitor::new();
+                mon.collect()
+            }).await.ok();
+            if let Some(m) = metrics {
+                per_node.push(serde_json::json!({
+                    "node": node.hostname,
+                    "id": node.id,
+                    "cluster": node.cluster_name,
+                    "metrics": m,
+                }));
+            }
+            continue;
+        }
+        // Remote node — GET /api/metrics with cluster-secret auth.
+        let Some(http) = http.as_ref() else { continue; };
+        let scheme = if node.port == 443 || node.port == 8553 { "https" } else { "http" };
+        let url = format!("{}://{}:{}/api/metrics", scheme, node.address, node.port);
+        let resp = http.get(&url)
+            .header("X-WolfStack-Secret", &state.cluster_secret)
+            .send().await;
+        let Ok(r) = resp else { continue; };
+        if !r.status().is_success() { continue; }
+        let Ok(val) = r.json::<serde_json::Value>().await else { continue; };
+        per_node.push(serde_json::json!({
+            "node": node.hostname,
+            "id": node.id,
+            "cluster": node.cluster_name,
+            "metrics": val,
+        }));
     }
+    if per_node.is_empty() {
+        return ToolResult::err(if let Some(t) = target {
+            format!("no online node matches '{}'", t)
+        } else {
+            "no online nodes in cluster".to_string()
+        });
+    }
+    ToolResult::ok(
+        format!("metrics from {} node(s)", per_node.len()),
+        serde_json::json!({ "nodes": per_node }),
+    )
 }
 
 async fn tool_list_alerts(_args: &serde_json::Value) -> ToolResult {
@@ -371,80 +423,220 @@ async fn tool_list_alerts(_args: &serde_json::Value) -> ToolResult {
 }
 
 async fn tool_read_log(
-    args: &serde_json::Value, _agent: &Agent, _state: &crate::api::AppState,
+    args: &serde_json::Value, _agent: &Agent, state: &crate::api::AppState,
 ) -> ToolResult {
     let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
     let lines = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(100).min(2000) as usize;
+    let target_node = args.get("node").and_then(|v| v.as_str());
     if target.is_empty() {
         return ToolResult::err("read_log requires a `target` argument (container name or systemd unit)".into());
     }
-    // Shell out to journalctl --unit=<target> or docker logs <target>.
-    // Safe by construction — we're only reading.
-    let try_journal = std::process::Command::new("journalctl")
-        .args(["-u", target, "-n", &lines.to_string(), "--no-pager", "--output=short"])
-        .output();
-    if let Ok(o) = try_journal {
-        if o.status.success() && !o.stdout.is_empty() {
-            let text = String::from_utf8_lossy(&o.stdout).to_string();
-            return ToolResult::ok(
-                format!("journalctl tail of {} ({} lines)", target, lines),
-                serde_json::json!({ "source": "journalctl", "target": target, "log": text }),
-            );
+
+    // Try local journalctl + docker logs FIRST — cheap, handles the
+    // self-node case without an HTTP hop and still works for systemd
+    // units that only exist locally.
+    if target_node.is_none() || target_node == Some("self") {
+        let try_journal = std::process::Command::new("journalctl")
+            .args(["-u", target, "-n", &lines.to_string(), "--no-pager", "--output=short"])
+            .output();
+        if let Ok(o) = try_journal {
+            if o.status.success() && !o.stdout.is_empty() {
+                let text = String::from_utf8_lossy(&o.stdout).to_string();
+                return ToolResult::ok(
+                    format!("journalctl tail of {} ({} lines, this node)", target, lines),
+                    serde_json::json!({ "source": "journalctl", "target": target, "node": "self", "log": text }),
+                );
+            }
+        }
+        if let Ok(o) = std::process::Command::new("docker")
+            .args(["logs", "--tail", &lines.to_string(), target])
+            .output()
+        {
+            if o.status.success() {
+                let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+                return ToolResult::ok(
+                    format!("docker logs tail of {} ({} lines, this node)", target, lines),
+                    serde_json::json!({
+                        "source": "docker", "target": target, "node": "self",
+                        "stdout": stdout, "stderr": stderr,
+                    }),
+                );
+            }
         }
     }
-    // Fallback: docker logs.
-    if let Ok(o) = std::process::Command::new("docker")
-        .args(["logs", "--tail", &lines.to_string(), target])
-        .output()
-    {
-        if o.status.success() {
-            let stdout = String::from_utf8_lossy(&o.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+
+    // Not found locally — fan out to every online remote node.
+    // Discover which node hosts a container named `target` by walking
+    // the cluster's container cache, then call that node's log endpoint.
+    let nodes = state.cluster.get_all_nodes();
+    let http = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .danger_accept_invalid_certs(true)
+        .build() { Ok(c) => c, Err(_) => return ToolResult::err("http client build failed".into()) };
+
+    for node in &nodes {
+        if !node.online || node.is_self { continue; }
+        if let Some(t) = target_node {
+            if node.hostname != t && node.id != t { continue; }
+        }
+        let scheme = if node.port == 443 || node.port == 8553 { "https" } else { "http" };
+        // Try docker-style first, then lxc-style. Whichever exists on
+        // the remote for this container name wins; both endpoints
+        // 404 cleanly when the container isn't theirs.
+        for (path, runtime) in &[
+            (format!("/api/containers/docker/{}/logs?lines={}", target, lines), "docker"),
+            (format!("/api/containers/lxc/{}/logs?lines={}", target, lines), "lxc"),
+        ] {
+            let url = format!("{}://{}:{}{}", scheme, node.address, node.port, path);
+            let resp = http.get(&url)
+                .header("X-WolfStack-Secret", &state.cluster_secret)
+                .send().await;
+            let Ok(r) = resp else { continue; };
+            if !r.status().is_success() { continue; }
+            let text = r.text().await.unwrap_or_default();
+            // Some endpoints return JSON, some plain text — try JSON
+            // first, fall back to the raw body.
+            let log_payload: serde_json::Value = serde_json::from_str(&text)
+                .unwrap_or_else(|_| serde_json::Value::String(text.clone()));
             return ToolResult::ok(
-                format!("docker logs tail of {} ({} lines)", target, lines),
+                format!("{} logs tail of {} ({} lines, on node {})",
+                    runtime, target, lines, node.hostname),
                 serde_json::json!({
-                    "source": "docker",
+                    "source": *runtime,
                     "target": target,
-                    "stdout": stdout,
-                    "stderr": stderr,
+                    "node": node.hostname,
+                    "log": log_payload,
                 }),
             );
         }
     }
     ToolResult::err(format!(
-        "no log found for '{}' — neither systemd unit nor docker container matched",
+        "no log found for '{}' — not a local systemd unit or docker container, \
+         and no online cluster node reported having a matching docker or lxc container. \
+         Try list_containers to confirm the name.",
         target
     ))
 }
 
 async fn tool_check_disk_usage(
-    args: &serde_json::Value, agent: &Agent, _state: &crate::api::AppState,
+    args: &serde_json::Value, agent: &Agent, state: &crate::api::AppState,
 ) -> ToolResult {
     let container_pattern = args.get("container_pattern").and_then(|v| v.as_str())
         .unwrap_or("*");
     let threshold_pct = args.get("threshold_pct").and_then(|v| v.as_u64()).unwrap_or(90) as u32;
-    let containers = crate::containers::list_running_containers();
+    let filter_cluster = args.get("cluster").and_then(|v| v.as_str());
+
+    // Walk the cluster-wide container list built the same way
+    // list_containers does, so "check disk on all region-* containers"
+    // answers correctly whether they live on cynthia, sophie, or any
+    // other online node.
+    let nodes = state.cluster.get_all_nodes();
+    let self_hostname = nodes.iter().find(|n| n.is_self)
+        .map(|n| n.hostname.clone()).unwrap_or_default();
+
+    // Collect (runtime, name, node_hostname, cluster) across the cluster.
+    let mut targets: Vec<(String, String, String, String, bool, String, u16)> = Vec::new();
+    // (runtime, name, node_hostname, cluster_name, is_self, node_address, node_port)
+    for (runtime, name, _status) in crate::containers::list_running_containers() {
+        targets.push((runtime, name, self_hostname.clone(),
+            nodes.iter().find(|n| n.is_self)
+                .and_then(|n| n.cluster_name.clone()).unwrap_or_default(),
+            true, String::new(), 0));
+    }
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .danger_accept_invalid_certs(true)
+        .build().ok();
+    if let Some(http) = http.as_ref() {
+        for node in nodes.iter().filter(|n| n.online && !n.is_self) {
+            if let Some(fc) = filter_cluster {
+                if node.cluster_name.as_deref() != Some(fc) { continue; }
+            }
+            let scheme = if node.port == 443 || node.port == 8553 { "https" } else { "http" };
+            for (path, runtime) in &[
+                ("/api/containers/docker", "docker"),
+                ("/api/containers/lxc", "lxc"),
+            ] {
+                let url = format!("{}://{}:{}{}", scheme, node.address, node.port, path);
+                let Ok(r) = http.get(&url)
+                    .header("X-WolfStack-Secret", &state.cluster_secret)
+                    .send().await
+                else { continue; };
+                if !r.status().is_success() { continue; }
+                let Ok(val) = r.json::<serde_json::Value>().await else { continue; };
+                let arr = val.get("containers").cloned().unwrap_or(val);
+                if let Some(a) = arr.as_array() {
+                    for c in a {
+                        if let Some(name) = c.get("name").and_then(|v| v.as_str()) {
+                            targets.push((
+                                runtime.to_string(), name.to_string(),
+                                node.hostname.clone(),
+                                node.cluster_name.clone().unwrap_or_default(),
+                                false, node.address.clone(), node.port,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Apply filters.
+    let filtered: Vec<_> = targets.into_iter()
+        .filter(|(_, name, _, cluster, _, _, _)| {
+            if !glob_match(container_pattern, name) { return false; }
+            if let Some(fc) = filter_cluster {
+                if cluster != fc { return false; }
+            }
+            matches_container_pattern(name, &agent.target_scope.allowed_container_patterns)
+        })
+        .collect();
+
+    // For each target, exec `df -P /` — locally or via the remote exec
+    // endpoint on whichever node the container lives on.
     let mut results = Vec::new();
-    for (runtime, name, _status) in containers {
-        if !glob_match(container_pattern, &name) { continue; }
-        if !matches_container_pattern(&name, &agent.target_scope.allowed_container_patterns) { continue; }
-        // Run `df -P /` inside the container — portable across distros.
-        let output = match runtime.as_str() {
-            "docker" => std::process::Command::new("docker")
-                .args(["exec", &name, "df", "-P", "/"])
-                .output(),
-            "lxc" => std::process::Command::new("lxc-attach")
-                .args(["-n", &name, "--", "df", "-P", "/"])
-                .output(),
-            _ => continue,
-        };
-        let (used_pct, avail_kb, total_kb) = match output {
-            Ok(o) if o.status.success() => parse_df(&String::from_utf8_lossy(&o.stdout)),
+    for (runtime, name, node_hostname, cluster, is_self, address, port) in filtered {
+        let df_output: Option<String> = if is_self {
+            let out = match runtime.as_str() {
+                "docker" => std::process::Command::new("docker")
+                    .args(["exec", &name, "df", "-P", "/"]).output(),
+                "lxc" => std::process::Command::new("lxc-attach")
+                    .args(["-n", &name, "--", "df", "-P", "/"]).output(),
+                _ => continue,
+            };
+            match out {
+                Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).to_string()),
+                _ => None,
+            }
+        } else if let Some(http) = http.as_ref() {
+            // Remote exec via /api/containers/{runtime}/{id}/exec —
+            // runs `df -P /` in the container on the remote node.
+            let scheme = if port == 443 || port == 8553 { "https" } else { "http" };
+            let url = format!("{}://{}:{}/api/containers/{}/{}/exec",
+                scheme, address, port, runtime, name);
+            let body = serde_json::json!({ "command": "df -P /" });
+            match http.post(&url)
+                .header("X-WolfStack-Secret", &state.cluster_secret)
+                .json(&body).send().await
+            {
+                Ok(r) if r.status().is_success() => {
+                    r.json::<serde_json::Value>().await.ok()
+                        .and_then(|v| v.get("stdout").and_then(|s| s.as_str()).map(String::from))
+                }
+                _ => None,
+            }
+        } else { None };
+
+        let (used_pct, avail_kb, total_kb) = match df_output {
+            Some(text) if !text.is_empty() => parse_df(&text),
             _ => (0, 0, 0),
         };
         results.push(serde_json::json!({
             "container": name,
             "runtime": runtime,
+            "node": node_hostname,
+            "cluster": cluster,
             "used_pct": used_pct,
             "available_kb": avail_kb,
             "total_kb": total_kb,
@@ -452,7 +644,8 @@ async fn tool_check_disk_usage(
         }));
     }
     ToolResult::ok(
-        format!("checked {} containers against threshold {}%", results.len(), threshold_pct),
+        format!("checked {} containers across cluster against threshold {}%",
+            results.len(), threshold_pct),
         serde_json::json!({ "threshold_pct": threshold_pct, "containers": results }),
     )
 }
