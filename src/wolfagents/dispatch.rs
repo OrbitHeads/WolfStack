@@ -192,6 +192,7 @@ pub async fn dispatch(
         ToolId::ReadFile => tool_read_file(arguments, agent).await,
         ToolId::ListApiEndpoints => tool_list_api_endpoints(agent).await,
         ToolId::DescribeCluster => tool_describe_cluster(arguments, agent, state).await,
+        ToolId::ListWorkflows => tool_list_workflows(arguments, state).await,
 
         ToolId::RestartContainer => tool_restart_container(arguments, agent, state).await,
         ToolId::RunWorkflow => tool_run_workflow(arguments, state).await,
@@ -539,26 +540,130 @@ async fn tool_restart_container(
     }
 }
 
-async fn tool_run_workflow(args: &serde_json::Value, _state: &crate::api::AppState) -> ToolResult {
+async fn tool_run_workflow(args: &serde_json::Value, state: &crate::api::AppState) -> ToolResult {
     let id = args.get("workflow_id").and_then(|v| v.as_str()).unwrap_or("");
     if id.is_empty() {
         return ToolResult::err("run_workflow requires `workflow_id`".into());
     }
-    // We can't easily run_workflow from here without AppState.wolfflow
-    // — delegate to the API via wolfstack_api. For now surface the
-    // hint to use that tool instead.
-    ToolResult::err(format!(
-        "direct workflow dispatch not wired yet — use wolfstack_api with \
-         method=POST path=/api/wolfflow/workflows/{}/run",
-        id
-    ))
+    let Some(workflow) = state.wolfflow.get_workflow(id) else {
+        let available: Vec<String> = state.wolfflow.list_workflows(None)
+            .into_iter().map(|w| format!("{} (id={})", w.name, w.id)).collect();
+        return ToolResult::err(format!(
+            "no workflow with id '{}'. Available: [{}]",
+            id,
+            available.join(", ")
+        ));
+    };
+    let wf_state = state.wolfflow.clone();
+    let cluster = state.cluster.clone();
+    let secret = state.cluster_secret.clone();
+    let ai_config = state.ai_agent.config.lock().unwrap().clone();
+    let wf_name = workflow.name.clone();
+    // Fire-and-forget exactly like the API trigger. The agent gets
+    // back "enqueued" — if it needs the run's outcome, it can poll
+    // `list_workflows` or use wolfstack_api against /api/wolfflow/runs.
+    tokio::spawn(async move {
+        crate::wolfflow::execute_workflow(
+            &wf_state, &cluster, &secret, &workflow, "agent", Some(ai_config)
+        ).await;
+    });
+    ToolResult::ok(
+        format!("workflow_triggered: {}", wf_name),
+        serde_json::json!({ "workflow_id": id, "workflow_name": wf_name, "trigger": "agent" }),
+    )
 }
 
-async fn tool_schedule_workflow(args: &serde_json::Value, _state: &crate::api::AppState) -> ToolResult {
-    let _ = args;
-    ToolResult::err("schedule_workflow not wired yet — use wolfstack_api against \
-                     the workflow's cron field (PUT /api/wolfflow/workflows/<id>) \
-                     to set a schedule.".into())
+async fn tool_list_workflows(args: &serde_json::Value, state: &crate::api::AppState) -> ToolResult {
+    let cluster = args.get("cluster").and_then(|v| v.as_str());
+    let workflows = state.wolfflow.list_workflows(cluster);
+    let summary: Vec<serde_json::Value> = workflows.iter().map(|w| serde_json::json!({
+        "id": w.id,
+        "name": w.name,
+        "cluster": w.cluster,
+        "enabled": w.enabled,
+        "schedule": w.schedule,
+        "step_count": w.steps.len(),
+    })).collect();
+    ToolResult::ok(
+        format!("{} workflows", summary.len()),
+        serde_json::json!({ "workflows": summary }),
+    )
+}
+
+async fn tool_schedule_workflow(args: &serde_json::Value, state: &crate::api::AppState) -> ToolResult {
+    let id = args.get("workflow_id").and_then(|v| v.as_str()).unwrap_or("");
+    if id.is_empty() {
+        return ToolResult::err("schedule_workflow requires `workflow_id`".into());
+    }
+    // `schedule` can be a 5-field cron expression or null to clear the
+    // schedule. We accept both explicit null and a missing field as
+    // "clear the schedule" (the agent may have been told "unschedule X").
+    // `cron` is accepted as an alias — natural word for the field, and
+    // models sometimes emit that even when the schema says `schedule`.
+    let schedule_arg = args.get("schedule").or_else(|| args.get("cron"));
+    let new_schedule: Option<String> = match schedule_arg {
+        Some(v) if v.is_null() => None,
+        Some(v) => match v.as_str() {
+            Some(s) if s.trim().is_empty() => None,
+            Some(s) => {
+                // Validate the cron expression before storing it. The
+                // scheduler silently skips workflows whose cron fails to
+                // parse, so an agent emitting "every 5 minutes" would
+                // look accepted but never run. We require five whitespace
+                // fields and each field to contain only the character
+                // classes the matcher understands.
+                let fields: Vec<&str> = s.split_whitespace().collect();
+                if fields.len() != 5 {
+                    return ToolResult::err(format!(
+                        "invalid cron expression '{}': expected 5 fields (min hour dom month dow), got {}",
+                        s, fields.len()));
+                }
+                for (i, f) in fields.iter().enumerate() {
+                    if !f.chars().all(|c| c == '*' || c == ',' || c == '-'
+                                       || c == '/' || c.is_ascii_digit()) {
+                        return ToolResult::err(format!(
+                            "invalid cron expression '{}': field {} ('{}') contains unsupported characters",
+                            s, i + 1, f));
+                    }
+                }
+                Some(s.to_string())
+            }
+            None => return ToolResult::err("`schedule` must be a string or null".into()),
+        },
+        None => None,
+    };
+    let Some(mut wf) = state.wolfflow.get_workflow(id) else {
+        return ToolResult::err(format!("no workflow with id '{}'", id));
+    };
+    let before = wf.schedule.clone();
+    wf.schedule = new_schedule.clone();
+    // Enable handling:
+    //   - explicit `enabled: true/false` argument wins (agent intent is clear),
+    //   - otherwise, default to enabling when setting a schedule because a
+    //     scheduled workflow that stays disabled never fires, which would
+    //     silently defeat the agent's intent.
+    match args.get("enabled").and_then(|v| v.as_bool()) {
+        Some(b) => wf.enabled = b,
+        None if new_schedule.is_some() => wf.enabled = true,
+        None => {} // clearing the schedule leaves enabled as-is
+    }
+    match state.wolfflow.update_workflow(id, wf) {
+        Some(updated) => ToolResult::ok(
+            format!(
+                "workflow '{}' schedule: {} -> {}",
+                updated.name,
+                before.as_deref().unwrap_or("(none)"),
+                updated.schedule.as_deref().unwrap_or("(none)"),
+            ),
+            serde_json::json!({
+                "workflow_id": id,
+                "name": updated.name,
+                "schedule": updated.schedule,
+                "enabled": updated.enabled,
+            }),
+        ),
+        None => ToolResult::err(format!("update_workflow({}) returned None", id)),
+    }
 }
 
 async fn tool_write_file(args: &serde_json::Value, agent: &Agent) -> ToolResult {

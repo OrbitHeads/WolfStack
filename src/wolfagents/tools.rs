@@ -73,6 +73,7 @@ pub enum ToolId {
     ReadFile,
     ListApiEndpoints,
     DescribeCluster,
+    ListWorkflows,
 
     // ── Mutating ───────────────────────────────────────────────
     RestartContainer,
@@ -103,6 +104,7 @@ impl ToolId {
             ToolId::ReadFile => "read_file",
             ToolId::ListApiEndpoints => "list_api_endpoints",
             ToolId::DescribeCluster => "describe_cluster",
+            ToolId::ListWorkflows => "list_workflows",
             ToolId::RestartContainer => "restart_container",
             ToolId::RunWorkflow => "run_workflow",
             ToolId::ScheduleWorkflow => "schedule_workflow",
@@ -126,6 +128,7 @@ impl ToolId {
             ToolId::ReadFile => "Read a file from a node",
             ToolId::ListApiEndpoints => "List available WolfStack API endpoints",
             ToolId::DescribeCluster => "Describe a cluster in detail",
+            ToolId::ListWorkflows => "List WolfFlow workflows",
             ToolId::RestartContainer => "Restart container (Docker/LXC)",
             ToolId::RunWorkflow => "Run a WolfFlow workflow",
             ToolId::ScheduleWorkflow => "Schedule a WolfFlow workflow",
@@ -160,7 +163,7 @@ impl ToolId {
             ToolId::ListNodes | ToolId::ListContainers | ToolId::GetMetrics
             | ToolId::ListAlerts | ToolId::ReadLog | ToolId::CheckDiskUsage
             | ToolId::ReadFile | ToolId::ListApiEndpoints
-            | ToolId::DescribeCluster => Danger::Safe,
+            | ToolId::DescribeCluster | ToolId::ListWorkflows => Danger::Safe,
 
             ToolId::RestartContainer | ToolId::RunWorkflow
             | ToolId::ScheduleWorkflow | ToolId::WriteFile
@@ -182,6 +185,7 @@ impl ToolId {
             "read_file" => Some(ToolId::ReadFile),
             "list_api_endpoints" => Some(ToolId::ListApiEndpoints),
             "describe_cluster" => Some(ToolId::DescribeCluster),
+            "list_workflows" => Some(ToolId::ListWorkflows),
             "restart_container" => Some(ToolId::RestartContainer),
             "run_workflow" => Some(ToolId::RunWorkflow),
             "schedule_workflow" => Some(ToolId::ScheduleWorkflow),
@@ -207,6 +211,7 @@ impl ToolId {
         ToolId::ReadFile,
         ToolId::ListApiEndpoints,
         ToolId::DescribeCluster,
+        ToolId::ListWorkflows,
         ToolId::RestartContainer,
         ToolId::RunWorkflow,
         ToolId::ScheduleWorkflow,

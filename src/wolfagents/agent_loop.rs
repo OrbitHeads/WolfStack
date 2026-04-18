@@ -176,7 +176,21 @@ async fn cluster_snapshot_section(agent: &Agent, state: &crate::api::AppState) -
 fn agent_scope_section(agent: &Agent) -> String {
     let scope = &agent.target_scope;
     let mut out = String::from("## Your Scope\n");
-    out.push_str(&format!("- access_level: `{:?}`\n", agent.access_level));
+    let level_hint = match agent.access_level {
+        crate::wolfagents::AccessLevel::ReadOnly =>
+            "read_only — safe/read tools (list_nodes, get_metrics, check_disk_usage, \
+             read_log, list_workflows, etc.) run freely. Mutating and destructive \
+             tools are refused. This is NOT a chat-only agent — you SHOULD call \
+             read tools to answer questions about the cluster.",
+        crate::wolfagents::AccessLevel::ReadWrite =>
+            "read_write — safe and mutating tools run freely. Destructive tools \
+             queue for operator approval.",
+        crate::wolfagents::AccessLevel::ConfirmAll =>
+            "confirm_all — every non-read tool queues for operator approval.",
+        crate::wolfagents::AccessLevel::Trusted =>
+            "trusted — all tools run freely, subject only to the hardcoded safety denylist.",
+    };
+    out.push_str(&format!("- access_level: `{:?}` — {}\n", agent.access_level, level_hint));
     if scope.allowed_clusters.is_empty() {
         out.push_str("- clusters: (all)\n");
     } else {
@@ -464,6 +478,12 @@ fn input_schema_for(tool: ToolId) -> serde_json::Value {
                 "name": { "type": "string" }
             }
         }),
+        ToolId::ListWorkflows => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "cluster": { "type": "string", "description": "Optional cluster name filter" }
+            }
+        }),
         ToolId::RunWorkflow => serde_json::json!({
             "type": "object",
             "required": ["workflow_id"],
@@ -471,10 +491,17 @@ fn input_schema_for(tool: ToolId) -> serde_json::Value {
         }),
         ToolId::ScheduleWorkflow => serde_json::json!({
             "type": "object",
-            "required": ["workflow_id", "cron"],
+            "required": ["workflow_id"],
             "properties": {
                 "workflow_id": { "type": "string" },
-                "cron": { "type": "string", "description": "5-field cron expression" }
+                "schedule": {
+                    "type": ["string", "null"],
+                    "description": "5-field cron expression (min hour dom month dow), or null to clear the schedule"
+                },
+                "enabled": {
+                    "type": "boolean",
+                    "description": "Explicit enable/disable. Omit to enable automatically when setting a schedule, or leave the workflow's current state when clearing one."
+                }
             }
         }),
         ToolId::WriteFile => serde_json::json!({

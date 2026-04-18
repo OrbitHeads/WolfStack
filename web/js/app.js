@@ -37204,16 +37204,98 @@ async function wolfAgentsLoadMemory(id) {
     }
 }
 
+// Minimal markdown → safe HTML for chat messages. Escape FIRST, then
+// recognize markers on the escaped text — no tag injection possible
+// from the LLM. Handles the markers actually seen in model output:
+// fenced code blocks, inline code, bold/italic, links, bullet + numbered
+// lists, and simple headings. Deliberately does NOT try to be a full
+// markdown parser — misformatted edge cases degrade to escaped text.
+function _wolfAgentsMarkdown(src) {
+    let s = escapeHtml(src || '');
+    // Fenced code blocks first — their contents should NOT get further
+    // markdown processing. Capture, replace with a placeholder, reinsert
+    // at the end as <pre><code>. The placeholder uses a per-call random
+    // nonce so a model response containing a literal collision with our
+    // marker can't splice a foreign code block into a neighbouring message.
+    const codeBlocks = [];
+    const nonce = Math.random().toString(36).slice(2, 12)
+                + Math.random().toString(36).slice(2, 12);
+    s = s.replace(/```([a-zA-Z0-9_-]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+        const idx = codeBlocks.length;
+        codeBlocks.push({ lang, code });
+        return `\u0000CB_${nonce}_${idx}\u0000`;
+    });
+    // Inline code — single backticks, non-greedy.
+    s = s.replace(/`([^`\n]+)`/g, '<code style="background:rgba(148,163,184,0.18); padding:1px 5px; border-radius:3px;">$1</code>');
+    // Bold (**text**) before italic so *b* inside **b** isn't mangled.
+    s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+    // Italic (*text* or _text_) — avoid matching list bullets at BOL.
+    s = s.replace(/(^|[^*\w])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+    s = s.replace(/(^|[^_\w])_([^_\n]+)_(?!_)/g, '$1<em>$2</em>');
+    // Links: [text](url). Restrict URL to http/https/mailto for safety.
+    s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+|mailto:[^\s)]+)\)/g,
+        '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    // Headings — line starts with one to three #s.
+    s = s.replace(/(^|\n)### (.+)/g, '$1<h5 style="margin:10px 0 4px;">$2</h5>');
+    s = s.replace(/(^|\n)## (.+)/g, '$1<h4 style="margin:12px 0 4px;">$2</h4>');
+    s = s.replace(/(^|\n)# (.+)/g, '$1<h3 style="margin:14px 0 4px;">$2</h3>');
+    // Lists — consecutive lines beginning with "- ", "* ", or "1. ".
+    // Transform each run of list lines into a <ul> or <ol> block.
+    const lines = s.split('\n');
+    const out = [];
+    let i = 0;
+    while (i < lines.length) {
+        const ln = lines[i];
+        const ulMatch = ln.match(/^\s*[-*]\s+(.*)$/);
+        const olMatch = ln.match(/^\s*\d+\.\s+(.*)$/);
+        if (ulMatch || olMatch) {
+            const tag = ulMatch ? 'ul' : 'ol';
+            const items = [];
+            while (i < lines.length) {
+                const m2 = lines[i].match(ulMatch ? /^\s*[-*]\s+(.*)$/ : /^\s*\d+\.\s+(.*)$/);
+                if (!m2) break;
+                items.push(`<li>${m2[1]}</li>`);
+                i++;
+            }
+            out.push(`<${tag} style="margin:6px 0 6px 22px; padding:0;">${items.join('')}</${tag}>`);
+        } else {
+            out.push(ln);
+            i++;
+        }
+    }
+    s = out.join('\n');
+    // Paragraph-ish line breaks — a single \n becomes <br>, a blank line
+    // separates paragraphs. The outer <div> already has white-space
+    // defaulted to normal, so we explicitly bridge newlines.
+    s = s.replace(/\n{2,}/g, '</p><p style="margin:6px 0;">');
+    s = s.replace(/\n/g, '<br>');
+    s = '<p style="margin:0;">' + s + '</p>';
+    // Restore code blocks using the same nonce the insertion side used.
+    const restoreRe = new RegExp(`\\u0000CB_${nonce}_(\\d+)\\u0000`, 'g');
+    s = s.replace(restoreRe, (_, idx) => {
+        const { lang, code } = codeBlocks[parseInt(idx, 10)];
+        const langAttr = lang ? ` data-lang="${escapeHtml(lang)}"` : '';
+        return `<pre style="background:rgba(15,23,42,0.6); padding:10px; border-radius:6px; overflow-x:auto; margin:8px 0;"><code${langAttr} style="font-family:monospace; font-size:12px;">${code}</code></pre>`;
+    });
+    return s;
+}
+
 function wolfAgentsMessageHtml(role, content, ts) {
     const isUser = role === 'user';
     const align = isUser ? 'flex-end' : 'flex-start';
     const bg = isUser ? 'rgba(99,102,241,0.18)' : 'rgba(168,85,247,0.12)';
     const border = isUser ? 'rgba(99,102,241,0.4)' : 'rgba(168,85,247,0.3)';
     const tsLabel = ts ? new Date(ts * 1000).toLocaleTimeString() : '';
+    // User messages stay as plain text so the user sees exactly what they
+    // typed; agent replies get markdown rendering so **bold** / lists /
+    // code blocks render as intended rather than as raw asterisks.
+    const body = isUser
+        ? `<div style="white-space:pre-wrap; word-break:break-word;">${escapeHtml(content)}</div>`
+        : `<div style="word-break:break-word; line-height:1.45;">${_wolfAgentsMarkdown(content)}</div>`;
     return `<div style="display:flex; justify-content:${align}; margin-bottom:10px;">
         <div style="max-width:80%; background:${bg}; border:1px solid ${border}; border-radius:10px; padding:10px 14px;">
             <div style="font-size:10px; color:var(--text-muted); margin-bottom:4px;">${isUser ? 'You' : 'Agent'}${tsLabel ? ' · ' + escapeHtml(tsLabel) : ''}</div>
-            <div style="white-space:pre-wrap; word-break:break-word;">${escapeHtml(content)}</div>
+            ${body}
         </div>
     </div>`;
 }

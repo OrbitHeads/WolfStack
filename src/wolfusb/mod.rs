@@ -27,6 +27,15 @@ static CLUSTER_SECRET: OnceLock<String> = OnceLock::new();
 /// Initialize the WolfUSB module with the cluster secret (call from main.rs)
 pub fn init(cluster_secret: &str) {
     let _ = CLUSTER_SECRET.set(cluster_secret.to_string());
+    // One-shot on boot: migrate any legacy `wolfusb-bus-addr` busids to
+    // the canonical sysfs port-path form. Only rewrites assignments whose
+    // device is currently plugged in (we need a sysfs entry to migrate to).
+    let mut config = WolfUsbConfig::load();
+    if migrate_assignments_to_port_paths(&mut config) {
+        if let Err(e) = config.save() {
+            warn!("WolfUSB: failed to save migrated assignments: {}", e);
+        }
+    }
 }
 
 fn get_secret() -> &'static str {
@@ -400,11 +409,25 @@ pub fn list_local_devices_with_status(config: &WolfUsbConfig) -> (Vec<UsbDevice>
         Ok(json_str) => {
             match serde_json::from_str::<Vec<WolfUsbDeviceJson>>(&json_str) {
                 Ok(raw_devices) => {
+                    // Walk sysfs once — we correlate each libusb device with
+                    // its kernel port path so the busid we register is the
+                    // stable sysfs name (e.g. "wolfusb-1-1.5" for a device
+                    // behind a hub), not the synthetic bus-addr pair that
+                    // changes on every replug and breaks usbip-host on hubs.
+                    let sysfs = sysfs_list_devices();
                     let devices = raw_devices.into_iter()
                         .filter(|d| d.vendor_id != 0x1d6b) // Filter root hubs
                         .filter(|d| !is_virtual_bus(d.device_id.bus_number))
                         .map(|d| {
-                            let busid = format!("wolfusb-{}-{}", d.device_id.bus_number, d.device_id.address);
+                            let port = sysfs.iter()
+                                .find(|s| s.bus == d.device_id.bus_number
+                                     && s.addr == d.device_id.address)
+                                .map(|s| s.port_path.clone())
+                                // Fall back to the legacy form if sysfs is
+                                // unavailable (should not happen on Linux).
+                                .unwrap_or_else(|| format!("{}-{}",
+                                    d.device_id.bus_number, d.device_id.address));
+                            let busid = format!("wolfusb-{}", port);
                             let usb_id = format!("{:04x}:{:04x}", d.vendor_id, d.product_id);
                             let product = match (&d.manufacturer, &d.product) {
                                 (Some(m), Some(p)) => format!("{} : {} ({usb_id})", m, p),
@@ -412,6 +435,10 @@ pub fn list_local_devices_with_status(config: &WolfUsbConfig) -> (Vec<UsbDevice>
                                 (Some(m), None) => format!("{} ({usb_id})", m),
                                 (None, None) => format!("USB Device ({usb_id})"),
                             };
+                            // Match assignments by either busid (exact, post-
+                            // migration) or usb_id (vendor:product, covers the
+                            // pre-migration window where stored busid is still
+                            // the old bus-addr form for this device).
                             let assigned = config.assignments.iter()
                                 .find(|a| a.busid == busid || a.usb_id == usb_id)
                                 .map(|a| format!("{}:{} on {}", a.target_type, a.target_name, a.target_hostname));
@@ -439,7 +466,182 @@ pub fn list_local_devices_with_status(config: &WolfUsbConfig) -> (Vec<UsbDevice>
     }
 }
 
-/// Parse "wolfusb-BUS-ADDR" into (bus, addr)
+/// Rewrite legacy `wolfusb-X-Y` (bus-addr) busids in the assignment
+/// config to their canonical `wolfusb-<port_path>` form, using a match
+/// against currently-attached sysfs devices. Called once at startup and
+/// again whenever the assignment list is loaded. Safe to re-run — a
+/// busid whose port-path already matches the existing value is left
+/// untouched. An assignment whose device isn't currently plugged in is
+/// also left untouched (we'd have nothing stable to migrate to).
+///
+/// Returns `true` if at least one assignment was rewritten.
+pub fn migrate_assignments_to_port_paths(config: &mut WolfUsbConfig) -> bool {
+    let sysfs = sysfs_list_devices();
+    if sysfs.is_empty() { return false; }
+    let mut rewrote = 0usize;
+    for a in config.assignments.iter_mut() {
+        let port = busid_port_path(&a.busid);
+        // If the busid already matches an exact sysfs port path, nothing to do.
+        if sysfs.iter().any(|s| s.port_path == port) { continue; }
+
+        // Pass 1 (PREFERRED): usb_id (vendor:product) lookup. Stable across
+        // replugs and unambiguous when there's exactly one device of that
+        // model plugged in. If two identical sticks are on the host we skip
+        // — the operator must unassign + re-detect rather than let us guess.
+        let mut target: Option<&SysfsUsbDevice> = None;
+        if !a.usb_id.is_empty() {
+            if let Some((vid, pid)) = a.usb_id.split_once(':') {
+                let matches: Vec<_> = sysfs.iter()
+                    .filter(|s| s.id_vendor.eq_ignore_ascii_case(vid)
+                             && s.id_product.eq_ignore_ascii_case(pid))
+                    .collect();
+                if matches.len() == 1 { target = Some(matches[0]); }
+            }
+        }
+        // Pass 2 (LEGACY ONLY): bus+addr lookup, but ONLY when the config
+        // has no usb_id stored (truly old entries written before we tracked
+        // it). If usb_id IS set and Pass 1 didn't match (stick unplugged
+        // or ambiguous), we refuse to guess via bus+addr — a different
+        // device coincidentally at that bus+addr would get wrongly migrated.
+        if target.is_none() && a.usb_id.is_empty() {
+            let parts: Vec<&str> = port.splitn(2, '-').collect();
+            if parts.len() == 2 {
+                if let (Ok(bus), Ok(addr)) = (parts[0].parse::<u8>(), parts[1].parse::<u8>()) {
+                    target = sysfs.iter().find(|s| s.bus == bus && s.addr == addr);
+                }
+            }
+        }
+        let Some(dev) = target else { continue; };
+        if dev.port_path == port { continue; } // already canonical
+        let old = a.busid.clone();
+        a.busid = format!("wolfusb-{}", dev.port_path);
+        rewrote += 1;
+        warn!("WolfUSB: migrated assignment busid {} -> {} (device at kernel port {})",
+            old, a.busid, dev.port_path);
+    }
+    rewrote > 0
+}
+
+/// Extract the port-path part of a busid — everything after the
+/// `wolfusb-` prefix. For post-migration busids this IS the kernel
+/// sysfs directory name under `/sys/bus/usb/devices/` (e.g. `1-1.5`
+/// for a device behind a hub). For pre-migration legacy busids it's
+/// the bus-addr pair (e.g. `1-5`) which coincidentally equals the
+/// sysfs name only for direct-attached devices.
+fn busid_port_path(busid: &str) -> &str {
+    busid.strip_prefix("wolfusb-").unwrap_or(busid)
+}
+
+/// One device entry reported by sysfs — we need this pair of facts
+/// together in a bunch of call sites (attach, detach, dev_path, diagnose,
+/// migration).
+#[derive(Debug, Clone)]
+struct SysfsUsbDevice {
+    /// Kernel port path — the sysfs directory name itself (e.g. `1-1.5`).
+    port_path: String,
+    /// Current bus number. Can differ from the port-path prefix if the
+    /// sysfs entry moved between roots, though in practice they match.
+    bus: u8,
+    /// Current device number. NOT stable across replugs — the same
+    /// physical port can carry a different devnum after a disconnect.
+    addr: u8,
+    /// Vendor ID as four-hex-chars, for cross-matching against config.
+    id_vendor: String,
+    /// Product ID as four-hex-chars.
+    id_product: String,
+}
+
+/// Walk `/sys/bus/usb/devices/`, skipping interface entries and root
+/// hub synthetic names, and return one record per real USB device.
+/// Cheap enough to call on every list / attach / diagnose — sysfs
+/// lookups are in-memory kernel reads.
+fn sysfs_list_devices() -> Vec<SysfsUsbDevice> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir("/sys/bus/usb/devices") {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Interface nodes (`1-1.5:1.0`) and synthetic root hubs (`usb1`)
+        // aren't device nodes we want to expose.
+        if name.contains(':') || name.starts_with("usb") { continue; }
+        let path = entry.path();
+        let Some(bus) = std::fs::read_to_string(path.join("busnum"))
+            .ok().and_then(|s| s.trim().parse::<u8>().ok())
+            else { continue; };
+        let Some(addr) = std::fs::read_to_string(path.join("devnum"))
+            .ok().and_then(|s| s.trim().parse::<u8>().ok())
+            else { continue; };
+        let id_vendor = std::fs::read_to_string(path.join("idVendor"))
+            .map(|s| s.trim().to_string()).unwrap_or_default();
+        let id_product = std::fs::read_to_string(path.join("idProduct"))
+            .map(|s| s.trim().to_string()).unwrap_or_default();
+        out.push(SysfsUsbDevice {
+            port_path: name, bus, addr, id_vendor, id_product,
+        });
+    }
+    out
+}
+
+/// Resolve a busid to the CURRENT (bus, addr) as reported by sysfs.
+/// Re-reads each call because USB device numbers are not stable across
+/// reconnects — the same physical port can carry a different devnum
+/// after an unplug/replug. Accepts both the new (port-path) and legacy
+/// (bus-addr) busid forms.
+fn busid_to_bus_addr(busid: &str) -> Option<(u8, u8)> {
+    let port = busid_port_path(busid);
+    let devices = sysfs_list_devices();
+    // Exact port_path match — the canonical post-migration path.
+    if let Some(d) = devices.iter().find(|d| d.port_path == port) {
+        return Some((d.bus, d.addr));
+    }
+    // No legacy bus+addr fallback: that would silently resolve to a
+    // DIFFERENT device currently sitting at the same bus:addr after
+    // a replug. Migration runs at startup (`init()`) to rewrite any
+    // genuine legacy busid to its canonical port-path form; if the
+    // device is unplugged at that point migration skips it, and this
+    // resolver returns None so callers (attach/detach/diagnose) fail
+    // cleanly with "busid not currently attached" rather than acting
+    // on the wrong device.
+    None
+}
+
+/// Find the /dev/bus/usb path for a device by busid. Resolves busid →
+/// (bus, addr) via sysfs at call time, then returns the canonical
+/// `/dev/bus/usb/BBB/AAA` path if the device is currently plugged in.
+fn find_dev_path(busid: &str) -> Option<String> {
+    let (bus, addr) = busid_to_bus_addr(busid)?;
+    let path = format!("/dev/bus/usb/{:03}/{:03}", bus, addr);
+    if std::path::Path::new(&path).exists() { Some(path) } else { None }
+}
+
+/// Kernel port path for a busid — returns the part after `wolfusb-`
+/// when the sysfs entry exists under that name. Used by diagnose() to
+/// surface the hub-attached mismatch clearly to operators.
+fn sysfs_port_path_for(busid: &str) -> Option<String> {
+    let port = busid_port_path(busid);
+    let devices = sysfs_list_devices();
+    if devices.iter().any(|d| d.port_path == port) {
+        return Some(port.to_string());
+    }
+    // Legacy fallback — busid was "N-M" from an earlier build; walk
+    // sysfs by (bus, addr) to find the real port path.
+    let parts: Vec<&str> = port.splitn(2, '-').collect();
+    if parts.len() == 2 {
+        if let (Ok(bus), Ok(addr)) = (parts[0].parse::<u8>(), parts[1].parse::<u8>()) {
+            return devices.into_iter()
+                .find(|d| d.bus == bus && d.addr == addr)
+                .map(|d| d.port_path);
+        }
+    }
+    None
+}
+
+/// Kept for test-only use and legacy callers that want to parse a
+/// bus-addr style busid. New code should go through `busid_to_bus_addr`
+/// which resolves via sysfs and handles both formats.
+#[cfg(test)]
 fn parse_busid(busid: &str) -> Result<(u8, u8), String> {
     let stripped = busid.strip_prefix("wolfusb-").unwrap_or(busid);
     let parts: Vec<&str> = stripped.splitn(2, '-').collect();
@@ -451,48 +653,12 @@ fn parse_busid(busid: &str) -> Result<(u8, u8), String> {
     Ok((bus, addr))
 }
 
-/// Find the /dev/bus/usb path for a device by bus:addr
-fn find_dev_path(busid: &str) -> Option<String> {
-    let (bus, addr) = parse_busid(busid).ok()?;
-    let path = format!("/dev/bus/usb/{:03}/{:03}", bus, addr);
-    if std::path::Path::new(&path).exists() {
-        Some(path)
-    } else {
-        None
-    }
-}
-
-/// Walk /sys/bus/usb/devices/ and return the kernel port path (e.g. "1-1.5")
-/// for a device matching the given bus:addr. Returns None if the device is
-/// absent from sysfs, or if we can't read the directory. Used by diagnose()
-/// so operators can see when libusb's synthetic busid (bus:addr) differs from
-/// the kernel's sysfs name — the root cause of usbip-host failures for
-/// hub-attached devices.
-fn sysfs_port_path_for(busid: &str) -> Option<String> {
-    let (bus, addr) = parse_busid(busid).ok()?;
-    let entries = std::fs::read_dir("/sys/bus/usb/devices").ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        // Skip interface entries (contain ':') and usbN roots — we want
-        // real device nodes whose name is the port path like "1-1.5".
-        if name.contains(':') || name.starts_with("usb") { continue; }
-        let path = entry.path();
-        let busnum = std::fs::read_to_string(path.join("busnum"))
-            .ok().and_then(|s| s.trim().parse::<u8>().ok());
-        let devnum = std::fs::read_to_string(path.join("devnum"))
-            .ok().and_then(|s| s.trim().parse::<u8>().ok());
-        if busnum == Some(bus) && devnum == Some(addr) {
-            return Some(name);
-        }
-    }
-    None
-}
-
 /// Attach to a remote USB device via wolfusb attach command.
 /// Legacy path retained for compatibility — the new mount-based flow doesn't use this.
 #[allow(dead_code)]
 fn wolfusb_attach_device(source_address: &str, busid: &str) -> Result<u64, String> {
-    let (bus, addr) = parse_busid(busid)?;
+    let (bus, addr) = busid_to_bus_addr(busid)
+        .ok_or_else(|| format!("busid {} not present on this host", busid))?;
     let server = format!("{}:3240", source_address);
 
     let output = run_wolfusb(&[
@@ -515,7 +681,8 @@ fn wolfusb_attach_device(source_address: &str, busid: &str) -> Result<u64, Strin
 
 /// Detach from a remote USB device
 fn wolfusb_detach_device(source_address: &str, busid: &str, session_id: u64) -> Result<(), String> {
-    let (bus, addr) = parse_busid(busid)?;
+    let (bus, addr) = busid_to_bus_addr(busid)
+        .ok_or_else(|| format!("busid {} not present on this host", busid))?;
     let server = format!("{}:3240", source_address);
 
     run_wolfusb(&[
@@ -655,32 +822,72 @@ pub fn diagnose(busid: &str) -> Vec<DiagnosticStep> {
                     // The JSON has {"bus_number":N,"address":M} — substring
                     // matching "wolfusb-N-M" against that text never hits.
                     // Parse the busid and check the structured fields.
-                    let (has_device, detail) = match parse_busid(busid) {
-                        Ok((bus, addr_n)) => {
-                            match serde_json::from_str::<Vec<WolfUsbDeviceJson>>(&out_str) {
+                    // Resolve the busid against the SOURCE's sysfs via its
+                    // wolfusb list JSON. When source_is_self we can cheat and
+                    // use local sysfs; otherwise we only have the JSON, so we
+                    // rely on bus+addr for the cross-check.
+                    let (has_device, detail) = if source_is_self {
+                        match busid_to_bus_addr(busid) {
+                            Some((bus, addr_n)) => match serde_json::from_str::<Vec<WolfUsbDeviceJson>>(&out_str) {
                                 Ok(list) => {
                                     let found = list.iter().any(|d|
                                         d.device_id.bus_number == bus
                                         && d.device_id.address == addr_n);
                                     if found {
-                                        (true, format!("busid {} is in the source's exportable device list", busid))
+                                        (true, format!("busid {} is in the source's exportable device list (resolves to bus={} addr={})", busid, bus, addr_n))
                                     } else {
                                         let seen: Vec<String> = list.iter()
                                             .map(|d| format!("{}-{}", d.device_id.bus_number, d.device_id.address))
                                             .collect();
                                         (false, format!(
-                                            "Source lists bus:addr {}:{} as NOT exportable. \
-                                             Source sees: [{}]. The stick may be behind a hub \
-                                             (kernel sysfs path differs from libusb bus:addr), \
-                                             or already claimed. Try Re-attach to force prepare-for-export.",
-                                            bus, addr_n, seen.join(", ")))
+                                            "Source resolved {} to bus:addr {}:{} but that pair is NOT in the wolfusb export list. \
+                                             Source sees: [{}]. Device may be claimed by another driver. \
+                                             Try Re-attach to force prepare-for-export.",
+                                            busid, bus, addr_n, seen.join(", ")))
                                     }
                                 }
                                 Err(e) => (false, format!(
                                     "Could not parse source's wolfusb list JSON: {}", e)),
-                            }
+                            },
+                            None => (false, format!(
+                                "busid {} does not match any currently-attached USB device in sysfs — \
+                                 was the stick unplugged? Replug and try again.", busid)),
                         }
-                        Err(e) => (false, e),
+                    } else {
+                        // Remote source — can't query sysfs, but we can still
+                        // look up the port path in the JSON by walking its
+                        // fields. The JSON doesn't carry port_path, only bus+addr,
+                        // so fall back to the legacy numeric parse here.
+                        match busid_port_path(busid).splitn(2, '-').collect::<Vec<_>>().as_slice() {
+                            [bus_s, addr_s] => match (bus_s.parse::<u8>(), addr_s.parse::<u8>()) {
+                                (Ok(bus), Ok(addr_n)) => match serde_json::from_str::<Vec<WolfUsbDeviceJson>>(&out_str) {
+                                    Ok(list) => {
+                                        let found = list.iter().any(|d|
+                                            d.device_id.bus_number == bus
+                                            && d.device_id.address == addr_n);
+                                        if found {
+                                            (true, format!("busid {} is in the remote source's exportable device list", busid))
+                                        } else {
+                                            let seen: Vec<String> = list.iter()
+                                                .map(|d| format!("{}-{}", d.device_id.bus_number, d.device_id.address))
+                                                .collect();
+                                            (false, format!(
+                                                "Remote source lists bus:addr {}:{} as NOT exportable. \
+                                                 Source sees: [{}]. Device may be behind a hub or claimed.",
+                                                bus, addr_n, seen.join(", ")))
+                                        }
+                                    }
+                                    Err(e) => (false, format!(
+                                        "Could not parse source's wolfusb list JSON: {}", e)),
+                                },
+                                _ => (false, format!(
+                                    "busid {} is in the new port-path format (contains a dot) — \
+                                     can't remote-check a hub-attached device via wolfusb list yet. \
+                                     Run Diagnose from the source node for a structured sysfs check.",
+                                    busid)),
+                            },
+                            _ => (false, format!("malformed busid {}", busid)),
+                        }
                     };
                     out.push(DiagnosticStep {
                         step: "Device exported on source".into(),
@@ -705,26 +912,24 @@ pub fn diagnose(busid: &str) -> Vec<DiagnosticStep> {
     // behind a hub and usbip-host operations that take a kernel path will
     // fail even though the device is visible to libusb.
     if source_is_self {
-        if let Ok((bus, addr_n)) = parse_busid(busid) {
-            let libusb_form = format!("{}-{}", bus, addr_n);
-            match sysfs_port_path_for(busid) {
-                Some(port) => {
-                    let matches = port == libusb_form;
-                    out.push(DiagnosticStep {
-                        step: "Kernel sysfs port path".into(),
-                        ok: matches,
-                        detail: if matches {
-                            format!("Kernel sees device at port {} — matches WolfStack busid.", port)
-                        } else {
-                            format!(
-                                "Kernel sees device at port {}, WolfStack has it as {}. \
-                                 This device is behind a hub — usbip-host needs the kernel \
-                                 port path. Unassign + re-detect the device on this node, or \
-                                 manually run: `usbip bind --busid={}` on source, \
-                                 `usbip attach -r <source_ip> -b {}` on target.",
-                                port, libusb_form, port, port
-                            )
-                        },
+        let stored = busid_port_path(busid);
+        match sysfs_port_path_for(busid) {
+            Some(port) => {
+                let matches = port == stored;
+                out.push(DiagnosticStep {
+                    step: "Kernel sysfs port path".into(),
+                    ok: matches,
+                    detail: if matches {
+                        format!("Kernel sees device at port {} — matches WolfStack busid.", port)
+                    } else {
+                        format!(
+                            "Kernel sees device at port {}, WolfStack has it as {}. \
+                             Pre-migration busid for a hub-attached device — restart WolfStack \
+                             to auto-migrate, or unassign + re-detect on this node. Manual recovery: \
+                             `usbip bind --busid={}` on source, `usbip attach -r <source_ip> -b {}` on target.",
+                            port, stored, port, port
+                        )
+                    },
                     });
                 }
                 None => {
@@ -732,15 +937,16 @@ pub fn diagnose(busid: &str) -> Vec<DiagnosticStep> {
                         step: "Kernel sysfs port path".into(),
                         ok: false,
                         detail: format!(
-                            "No /sys/bus/usb/devices entry matches bus {} addr {}. \
-                             The device may have been unplugged, or its address changed after \
-                             a replug (USB addresses are not stable across reconnects).",
-                            bus, addr_n
+                            "No /sys/bus/usb/devices entry resolves busid {}. \
+                             The device may have been unplugged, or its address has changed \
+                             since registration (USB device numbers are not stable across \
+                             reconnects — the kernel port path stored in the busid is the \
+                             stable identifier).",
+                            busid
                         ),
                     });
                 }
             }
-        }
     }
 
     // Target side — mount unit + host bus presence.
@@ -1304,7 +1510,13 @@ fn find_new_device(before: &[String]) -> Option<String> {
 
 /// Install a systemd unit for `wolfusb mount` so it runs as a supervised daemon
 fn install_mount_unit(unit_name: &str, source_address: &str, busid: &str) -> Result<(), String> {
-    let (bus, addr) = parse_busid(busid)?;
+    // Resolve the busid to the device's current bus+addr via sysfs. NOTE:
+    // these are NOT stable across replugs; if the device is unplugged and
+    // reconnected, the mount unit will be stale and Re-attach should be run
+    // to regenerate it. Long-term fix is to teach wolfusb mount to take a
+    // port path directly so this hardcoded numeric pair goes away.
+    let (bus, addr) = busid_to_bus_addr(busid)
+        .ok_or_else(|| format!("busid {} is not currently attached on this host — replug and retry", busid))?;
     let secret = get_secret();
     let unit_path = format!("/etc/systemd/system/{}", unit_name);
     let key_arg = if secret.is_empty() {
@@ -2166,4 +2378,62 @@ pub fn merge_remote_assignments(remote_assignments: &[UsbAssignment]) {
     if config.assignments.len() != before { changed = true; }
 
     if changed { let _ = config.save(); }
+}
+
+// ─── Tests ───
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_parse_busid_direct_attach() {
+        // `wolfusb-1-5` under the legacy format maps to bus=1, addr=5.
+        assert_eq!(parse_busid("wolfusb-1-5").unwrap(), (1, 5));
+    }
+
+    #[test]
+    fn legacy_parse_busid_without_prefix() {
+        assert_eq!(parse_busid("2-7").unwrap(), (2, 7));
+    }
+
+    #[test]
+    fn legacy_parse_busid_rejects_port_path() {
+        // `1-1.5` cannot parse as u8 addr; callers should go through
+        // busid_to_bus_addr which handles both formats via sysfs.
+        assert!(parse_busid("wolfusb-1-1.5").is_err());
+    }
+
+    #[test]
+    fn busid_port_path_strips_prefix() {
+        assert_eq!(busid_port_path("wolfusb-1-1.5"), "1-1.5");
+        assert_eq!(busid_port_path("wolfusb-1-5"), "1-5");
+        assert_eq!(busid_port_path("1-1.2.3"), "1-1.2.3");
+    }
+
+    #[test]
+    fn migration_leaves_unmatched_config_untouched() {
+        // With no matching sysfs device, migration is a no-op.
+        let mut c = WolfUsbConfig {
+            enabled: true,
+            assignments: vec![UsbAssignment {
+                busid: "wolfusb-99-99".into(),
+                label: "fake".into(),
+                usb_id: "dead:beef".into(),
+                source_node_id: "n1".into(),
+                source_hostname: "host".into(),
+                source_address: "127.0.0.1".into(),
+                target_type: "docker".into(),
+                target_name: "c1".into(),
+                target_node_id: "n1".into(),
+                target_hostname: "host".into(),
+                active: false,
+                session_id: None,
+                virtual_busid: None,
+            }],
+        };
+        let before = c.assignments[0].busid.clone();
+        migrate_assignments_to_port_paths(&mut c);
+        assert_eq!(c.assignments[0].busid, before);
+    }
 }
