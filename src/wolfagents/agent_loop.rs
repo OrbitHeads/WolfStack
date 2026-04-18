@@ -94,7 +94,23 @@ pub async fn run_turn(
         "gemini" => {
             gemini_tool_loop(agent, &cfg, &system_prompt, &history, user_message, state).await
         }
+        "openrouter" => {
+            openai_tool_loop(
+                agent, &cfg, "https://openrouter.ai/api/v1",
+                &cfg.openrouter_api_key, &system_prompt, &history,
+                user_message, state,
+            ).await
+        }
+        "local" => {
+            openai_tool_loop(
+                agent, &cfg, &cfg.local_url,
+                &cfg.local_api_key, &system_prompt, &history,
+                user_message, state,
+            ).await
+        }
         _ => {
+            // Anything truly unknown still falls through so misconfig
+            // doesn't kill the chat — e.g. a provider name typo.
             let reply = crate::ai::simple_chat(&cfg, &system_prompt, &history, user_message).await?;
             Ok(AgentTurn {
                 response: reply,
@@ -103,6 +119,184 @@ pub async fn run_turn(
             })
         }
     }
+}
+
+/// OpenAI-compatible tool loop — used for OpenRouter and any local
+/// OpenAI-compatible server (Ollama, LM Studio, vLLM, llama.cpp
+/// server, etc.). The wire format is standardised: `tools` carries an
+/// array of `{"type": "function", "function": {...}}` entries, the
+/// model responds with a `tool_calls` field on the assistant message,
+/// tool results come back as `{"role": "tool", "tool_call_id": ..., "content": ...}`.
+///
+/// Not every local model supports this — Ollama gates it behind model
+/// families that were fine-tuned for function calling (llama3.1+,
+/// qwen2.5, etc.). When the server returns a plain text reply without
+/// `tool_calls`, we treat it as the final answer same as Claude/Gemini.
+async fn openai_tool_loop(
+    agent: &Agent,
+    cfg: &crate::ai::AiConfig,
+    base_url: &str,
+    api_key: &str,
+    system_prompt: &str,
+    history: &[crate::ai::ChatMessage],
+    user_message: &str,
+    state: &crate::api::AppState,
+) -> Result<AgentTurn, String> {
+    if base_url.trim().is_empty() {
+        return Err("Local/OpenRouter base URL not configured — set it in Settings → AI Agent".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()
+        .map_err(|e| format!("http client: {}", e))?;
+
+    // Normalise base_url → fully-qualified chat/completions URL. Matches
+    // the heuristic in ai::call_local so operators can paste either
+    // `http://host:11434`, `http://host:11434/v1`, or the fully-
+    // qualified `/chat/completions` URL.
+    let url = {
+        let trimmed = base_url.trim_end_matches('/');
+        if trimmed.ends_with("/chat/completions") { trimmed.to_string() }
+        else if trimmed.ends_with("/v1") { format!("{}/chat/completions", trimmed) }
+        else { format!("{}/v1/chat/completions", trimmed) }
+    };
+
+    // Initial messages: system + history + new user turn. `role: "tool"`
+    // entries will be appended when we dispatch tool calls.
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+    messages.push(serde_json::json!({ "role": "system", "content": system_prompt }));
+    for m in history {
+        if m.role != "user" && m.role != "assistant" { continue; }
+        messages.push(serde_json::json!({ "role": m.role, "content": m.content }));
+    }
+    messages.push(serde_json::json!({ "role": "user", "content": user_message }));
+
+    let tools_json = build_openai_tools(agent);
+    let mut trace: Vec<ToolCallTrace> = Vec::new();
+
+    for _round in 0..MAX_ROUNDS {
+        let mut body = serde_json::json!({
+            "model": cfg.model,
+            "messages": messages,
+            "temperature": 0.7,
+        });
+        if !tools_json.is_empty() {
+            body["tools"] = serde_json::json!(tools_json);
+            body["tool_choice"] = serde_json::json!("auto");
+        }
+
+        let mut req = client.post(&url)
+            .header("content-type", "application/json")
+            .json(&body);
+        if !api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", api_key));
+        }
+        let resp = req.send().await
+            .map_err(|e| format!("OpenAI-compat API error ({}): {}", url, e))?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| format!("read body: {}", e))?;
+        if !status.is_success() {
+            return Err(format!("OpenAI-compat API {} — {}", status, text));
+        }
+        let payload: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| format!("parse response: {} — body: {}",
+                e, text.chars().take(200).collect::<String>()))?;
+
+        let choice = &payload["choices"][0];
+        let msg = &choice["message"];
+        let finish_reason = choice["finish_reason"].as_str().unwrap_or("").to_string();
+        let content_text = msg["content"].as_str().unwrap_or("").to_string();
+        let tool_calls_json = msg["tool_calls"].as_array().cloned().unwrap_or_default();
+
+        // No tool calls → terminal turn. Some local servers never emit
+        // tool_calls even when given tools; the content is their final
+        // answer.
+        if tool_calls_json.is_empty() {
+            return Ok(AgentTurn {
+                response: if content_text.is_empty() {
+                    format!("(empty response; finish_reason={})", finish_reason)
+                } else { content_text },
+                tool_calls: trace,
+                stop_reason: finish_reason,
+            });
+        }
+
+        // Parse each tool_call into (id, name, parsed_args).
+        struct PendingCall { id: String, name: String, args: serde_json::Value }
+        let mut pending: Vec<PendingCall> = Vec::new();
+        for tc in &tool_calls_json {
+            let id = tc["id"].as_str().unwrap_or("").to_string();
+            let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+            // `arguments` is a JSON-encoded string per OpenAI's spec.
+            // Parse defensively — some local models emit the raw object.
+            let args_raw = &tc["function"]["arguments"];
+            let args: serde_json::Value = if let Some(s) = args_raw.as_str() {
+                serde_json::from_str(s).unwrap_or_else(|_| serde_json::json!({}))
+            } else {
+                args_raw.clone()
+            };
+            pending.push(PendingCall { id, name, args });
+        }
+
+        // Echo the assistant turn (including tool_calls) back so the
+        // next request has the context OpenAI expects.
+        messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": if content_text.is_empty() { serde_json::Value::Null }
+                       else { serde_json::Value::String(content_text) },
+            "tool_calls": tool_calls_json,
+        }));
+
+        // Dispatch each call and append a tool-role message per result.
+        for call in &pending {
+            let result = dispatch::dispatch(agent, &call.name, &call.args, state).await;
+            trace.push(ToolCallTrace {
+                tool: call.name.clone(),
+                arguments: call.args.clone(),
+                ok: result.ok,
+                status: result.status.clone(),
+            });
+            let content = serde_json::to_string(&serde_json::json!({
+                "status": result.status,
+                "ok": result.ok,
+                "data": result.data,
+            })).unwrap_or_else(|_| result.status.clone());
+            messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": content,
+            }));
+        }
+    }
+
+    warn!("wolfagents: agent {} (openai-compat) hit MAX_ROUNDS", agent.id);
+    Ok(AgentTurn {
+        response: format!(
+            "(agent aborted after {} tool-use rounds — increase the round cap or \
+             tighten the system prompt so the agent reaches a conclusion faster)",
+            MAX_ROUNDS
+        ),
+        tool_calls: trace,
+        stop_reason: "max_rounds".to_string(),
+    })
+}
+
+/// Build OpenAI-shaped tool descriptors. No schema rewriting needed —
+/// OpenAI's Chat Completions API accepts full JSON Schema.
+fn build_openai_tools(agent: &Agent) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for name in &agent.allowed_tools {
+        let Some(tool) = ToolId::from_str(name) else { continue; };
+        out.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": tool.as_str(),
+                "description": tool.risk_note(),
+                "parameters": input_schema_for(tool),
+            }
+        }));
+    }
+    out
 }
 
 /// Gemini tool loop — mirrors the Claude loop but on Google's
