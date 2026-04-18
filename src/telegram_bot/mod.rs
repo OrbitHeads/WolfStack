@@ -61,8 +61,18 @@ struct TgUpdatesResponse {
 #[derive(Debug, Deserialize)]
 struct TgUpdate {
     update_id: i64,
+    /// Direct message (DM with the bot, group chat where the bot is a
+    /// member). Present for chats of type `private`, `group`,
+    /// `supergroup`.
     #[serde(default)]
     message: Option<TgMessage>,
+    /// Channel post (the bot has been added as admin of a broadcast
+    /// channel). Telegram delivers this as `channel_post`, NOT
+    /// `message` — that's why a bot silently ignores channel traffic
+    /// when the code only looks at `message`. Same payload shape,
+    /// so we reuse TgMessage.
+    #[serde(default)]
+    channel_post: Option<TgMessage>,
 }
 
 /// Payload sent to `sendMessage`. We only use `chat_id` + `text` — no
@@ -104,9 +114,14 @@ async fn poll_once(
         // Always advance past this update so retries don't replay it,
         // even if we decide not to process it.
         next_offset = next_offset.max(upd.update_id + 1);
-        let Some(msg) = upd.message else { continue; };
+        // Accept message (DM / group) or channel_post (broadcast
+        // channel). The payload shape is identical, so we normalise
+        // to a single variable and route downstream the same way.
+        let Some(msg) = upd.message.or(upd.channel_post) else { continue; };
         let Some(text) = msg.text.clone() else { continue; };
         if let Some(from) = &msg.from {
+            // Bot's own posts (including our own mirrors) carry
+            // from.is_bot = true. Skipping them stops reply loops.
             if from.is_bot { continue; }
         }
         let chat_id = msg.chat.id;
@@ -163,7 +178,7 @@ async fn handle_telegram_chat(
     }
 }
 
-async fn send_telegram_message(
+pub async fn send_telegram_message(
     http: &reqwest::Client,
     bot_token: &str,
     chat_id: i64,

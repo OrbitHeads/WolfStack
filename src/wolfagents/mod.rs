@@ -553,11 +553,114 @@ pub async fn chat_with_agent_full(
     }
 
     agent.last_active_at = Some(now);
-    if let Err(e) = upsert(agent) {
+    if let Err(e) = upsert(agent.clone()) {
         tracing::warn!("wolfagents: failed to bump last_active_at: {}", e);
     }
 
+    // Mirror the exchange to any bound external chat surface so
+    // dashboard-initiated turns show up in the shared Telegram /
+    // Discord chat and everyone following the agent there sees the
+    // latest answer. Fire-and-forget — failures are logged.
+    mirror_exchange_to_surfaces(&agent, message, &reply);
+
     Ok(reply)
+}
+
+/// Post the user question + assistant reply to every external chat
+/// surface the agent is bound to. Fire-and-forget — failures are
+/// logged but don't propagate to the dashboard caller. Bot-authored
+/// messages are filtered by `from.is_bot` in the receivers, so
+/// mirroring our own posts back can't produce a reply loop.
+fn mirror_exchange_to_surfaces(agent: &Agent, user_msg: &str, reply: &str) {
+    // Telegram
+    if let Some(tg) = agent.telegram.clone() {
+        let bot_token = resolved_telegram_token(&tg);
+        let user_msg = user_msg.to_string();
+        let reply = reply.to_string();
+        let agent_id = agent.id.clone();
+        tokio::spawn(async move {
+            if bot_token.trim().is_empty() { return; }
+            let Ok(chat_id) = tg.chat_id.parse::<i64>() else {
+                tracing::warn!("wolfagents mirror: bad telegram chat_id on agent {}", agent_id);
+                return;
+            };
+            let http = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15)).build()
+            {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let q = format!("👤 {}", truncate_for_chat(&user_msg, 3500));
+            let a = truncate_for_chat(&reply, 3900);
+            if let Err(e) = crate::telegram_bot::send_telegram_message(
+                &http, &bot_token, chat_id, &q).await
+            {
+                tracing::warn!("wolfagents mirror (telegram): {}", e);
+            }
+            if let Err(e) = crate::telegram_bot::send_telegram_message(
+                &http, &bot_token, chat_id, &a).await
+            {
+                tracing::warn!("wolfagents mirror (telegram): {}", e);
+            }
+        });
+    }
+    // Discord
+    if let Some(d) = agent.discord.clone() {
+        let bot_token = resolved_discord_token(&d);
+        let user_msg = user_msg.to_string();
+        let reply = reply.to_string();
+        let agent_id = agent.id.clone();
+        tokio::spawn(async move {
+            if bot_token.trim().is_empty() { return; }
+            let http = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15)).build()
+            {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let q = format!("👤 {}", truncate_for_chat(&user_msg, 1900));
+            let a = truncate_for_chat(&reply, 1900);
+            if let Err(e) = crate::discord_bot::send_discord_message(
+                &http, &bot_token, &d.channel_id, &q).await
+            {
+                tracing::warn!("wolfagents mirror (discord) for {}: {}", agent_id, e);
+            }
+            if let Err(e) = crate::discord_bot::send_discord_message(
+                &http, &bot_token, &d.channel_id, &a).await
+            {
+                tracing::warn!("wolfagents mirror (discord) for {}: {}", agent_id, e);
+            }
+        });
+    }
+    // WhatsApp — not mirrored. Twilio's WhatsApp API only allows
+    // outbound messages within a 24-hour window following an inbound
+    // message from the same user, and we don't track the last-inbound
+    // number per agent. Dashboard replies therefore stay on the
+    // dashboard; the agent still replies to WhatsApp-initiated
+    // conversations via the TwiML webhook path.
+}
+
+fn resolved_telegram_token(tg: &TelegramBinding) -> String {
+    if let Some(t) = &tg.bot_token {
+        let t = t.trim();
+        if !t.is_empty() { return t.to_string(); }
+    }
+    crate::alerting::AlertConfig::load().telegram_bot_token
+}
+
+fn resolved_discord_token(d: &DiscordBinding) -> String {
+    if let Some(t) = &d.bot_token {
+        let t = t.trim();
+        if !t.is_empty() { return t.to_string(); }
+    }
+    crate::alerting::AlertConfig::load().discord_bot_token
+}
+
+fn truncate_for_chat(s: &str, max: usize) -> String {
+    if s.chars().count() <= max { return s.to_string(); }
+    let mut out: String = s.chars().take(max).collect();
+    out.push_str("\n…(truncated)");
+    out
 }
 
 /// Legacy no-AppState entry point for callers that only need basic

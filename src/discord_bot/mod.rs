@@ -316,7 +316,7 @@ async fn handle_discord_chat(
 
 /// POST a message to a Discord channel. Thin wrapper around the HTTP
 /// API so the gateway code doesn't need to know REST endpoints.
-async fn send_discord_message(
+pub async fn send_discord_message(
     http: &reqwest::Client,
     bot_token: &str,
     channel_id: &str,
