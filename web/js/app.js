@@ -18906,6 +18906,99 @@ async function _aiRefreshVisibleInfra() {
     } catch(e) { _aiVisibleInfra = null; }
 }
 
+// Is the operator asking the main AI chat to build a WolfAgent? We
+// match a small set of verbs so "what's an agent?" or "which agents
+// are running?" don't accidentally trigger the drafting flow.
+function _aiLooksLikeAgentBuildRequest(text) {
+    var t = (text || '').toLowerCase();
+    if (!t.includes('agent')) return false;
+    var verbs = /\b(build|create|make|new|set\s*up|spin\s*up|draft)\b/;
+    return verbs.test(t);
+}
+
+// Render an agent proposal card inline in the AI chat. Operator can
+// edit the name + prompt + recipients in-place, then Create → POSTs
+// to /api/agents with whatever fields the preview carries.
+function _aiRenderAgentProposal(p) {
+    var wrap = document.createElement('div');
+    wrap.style.cssText = 'background:var(--bg-tertiary);border:1px solid var(--border);border-radius:12px;padding:14px 16px;max-width:85%;align-self:flex-start;font-size:13px;color:var(--text); display:flex; flex-direction:column; gap:8px;';
+    var name = p.name || 'New Agent';
+    var prompt = p.system_prompt || '';
+    var accessLevel = p.access_level || 'read_only';
+    var tools = Array.isArray(p.allowed_tools) ? p.allowed_tools : [];
+    var scope = p.target_scope || {};
+    var scopeLines = [];
+    var pushLine = function(label, arr) {
+        if (arr && arr.length) scopeLines.push('<div style="font-size:11px; color:var(--text-muted);">' + escapeHtml(label) + ': <span style="color:var(--text);">' + escapeHtml(arr.join(', ')) + '</span></div>');
+    };
+    pushLine('Clusters', scope.allowed_clusters);
+    pushLine('Containers', scope.allowed_container_patterns);
+    pushLine('Hosts', scope.allowed_hosts);
+    pushLine('Paths', scope.allowed_paths);
+    pushLine('API paths', scope.allowed_api_paths);
+    pushLine('Email recipients', scope.allowed_email_recipients);
+    wrap.innerHTML =
+        '<div style="font-weight:600; font-size:14px;">🐺 Proposed agent: <span id="aiprop-name" contenteditable="true" style="border-bottom:1px dashed var(--border); padding:1px 4px;">' + escapeHtml(name) + '</span></div>' +
+        '<div style="font-size:12px; color:var(--text-muted);">Access level: <strong style="color:var(--text);">' + escapeHtml(accessLevel) + '</strong></div>' +
+        '<div>' +
+            '<div style="font-size:11px; color:var(--text-muted); margin-bottom:2px;">System prompt</div>' +
+            '<div id="aiprop-prompt" contenteditable="true" style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:6px; padding:8px; font-size:12px; white-space:pre-wrap;">' + escapeHtml(prompt) + '</div>' +
+        '</div>' +
+        '<div>' +
+            '<div style="font-size:11px; color:var(--text-muted); margin-bottom:2px;">Allowed tools</div>' +
+            '<div style="display:flex; flex-wrap:wrap; gap:4px;">' +
+                tools.map(function(t) { return '<span style="background:rgba(168,85,247,0.12); color:#c4b5fd; padding:2px 8px; border-radius:4px; font-size:11px; font-family:var(--font-mono,monospace);">' + escapeHtml(t) + '</span>'; }).join('') +
+            '</div>' +
+        '</div>' +
+        (scopeLines.length ? '<div style="margin-top:4px; display:flex; flex-direction:column; gap:2px;">' + scopeLines.join('') + '</div>' : '') +
+        '<div style="display:flex; gap:8px; margin-top:6px;">' +
+            '<button class="btn btn-primary btn-sm" id="aiprop-create">Create agent</button>' +
+            '<button class="btn btn-sm" id="aiprop-cancel">Dismiss</button>' +
+        '</div>';
+    // Attach the full proposal object so the Create handler has the
+    // scope arrays (which aren't rendered editable in this simple card).
+    wrap._proposal = p;
+    setTimeout(function() {
+        var createBtn = wrap.querySelector('#aiprop-create');
+        var cancelBtn = wrap.querySelector('#aiprop-cancel');
+        if (createBtn) createBtn.onclick = function() { _aiCreateProposedAgent(wrap); };
+        if (cancelBtn) cancelBtn.onclick = function() { wrap.remove(); };
+    }, 0);
+    return wrap;
+}
+
+async function _aiCreateProposedAgent(cardEl) {
+    var base = cardEl._proposal || {};
+    // Pick up any operator edits to name / prompt in the card.
+    var nameEl = cardEl.querySelector('#aiprop-name');
+    var promptEl = cardEl.querySelector('#aiprop-prompt');
+    var payload = {
+        name: (nameEl && nameEl.textContent || base.name || '').trim(),
+        system_prompt: (promptEl && promptEl.textContent || base.system_prompt || ''),
+        access_level: base.access_level || 'read_only',
+        allowed_tools: Array.isArray(base.allowed_tools) ? base.allowed_tools : [],
+        target_scope: base.target_scope || {},
+    };
+    if (!payload.name) { showToast('Agent name is required', 'warn'); return; }
+    try {
+        var resp = await fetch('/api/agents', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify(payload),
+        });
+        var data = await resp.json();
+        if (resp.ok && data.id) {
+            cardEl.innerHTML = '<div style="color:#10b981;">✅ Agent <strong>' + escapeHtml(data.name) + '</strong> created. <a href="#" onclick="selectView(\'wolfagents\'); return false;">Open WolfAgents →</a></div>';
+            if (typeof wolfAgentsLoad === 'function') wolfAgentsLoad();
+        } else {
+            showToast('Create failed: ' + (data.error || ('HTTP ' + resp.status)), 'error');
+        }
+    } catch (e) {
+        showToast('Create failed: ' + e.message, 'error');
+    }
+}
+
 async function sendAiMessage() {
     var input = document.getElementById('ai-chat-input');
     var msg = (input.value || '').trim();
@@ -18934,6 +19027,41 @@ async function sendAiMessage() {
     // Update status
     var statusEl = document.getElementById('ai-chat-status');
     if (statusEl) statusEl.textContent = 'Thinking...';
+
+    // Intent shortcut: "build me an agent / create an agent / make an agent"
+    // routes to the agent-proposal endpoint so the chat renders a
+    // reviewable preview card instead of a freeform reply the operator
+    // would then have to transcribe into the Edit Agent modal by hand.
+    if (_aiLooksLikeAgentBuildRequest(msg)) {
+        try {
+            var p = await fetch('/api/agents/build', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'include',
+                body: JSON.stringify({ request: msg }),
+            });
+            var pd = await p.json();
+            var t2 = document.getElementById('ai-typing'); if (t2) t2.remove();
+            if (p.ok && pd.proposal) {
+                messages.appendChild(_aiRenderAgentProposal(pd.proposal));
+            } else {
+                var errDiv = document.createElement('div');
+                errDiv.style.cssText = 'background:var(--bg-tertiary);border-radius:12px;padding:12px 16px;max-width:85%;align-self:flex-start;font-size:13px;color:var(--text);';
+                errDiv.innerHTML = '<span style="color:var(--danger);">⚠️ Could not draft agent: ' + escapeHtml(pd.error || ('HTTP ' + p.status)) + '</span>';
+                messages.appendChild(errDiv);
+            }
+            messages.scrollTop = messages.scrollHeight;
+            if (statusEl) statusEl.textContent = 'Ready';
+        } catch (e) {
+            var t3 = document.getElementById('ai-typing'); if (t3) t3.remove();
+            var errDiv2 = document.createElement('div');
+            errDiv2.style.cssText = 'background:var(--bg-tertiary);border-radius:12px;padding:12px 16px;max-width:85%;align-self:flex-start;font-size:13px;color:var(--danger);';
+            errDiv2.textContent = 'Error drafting agent: ' + e.message;
+            messages.appendChild(errDiv2);
+            if (statusEl) statusEl.textContent = 'Ready';
+        }
+        return;
+    }
 
     try {
         // Build navigation context so the AI knows what the user is looking at
@@ -37494,6 +37622,7 @@ function wolfAgentsOpenCreate() {
     document.getElementById('wolfagents-field-scope-hosts').value = '';
     document.getElementById('wolfagents-field-scope-paths').value = '';
     document.getElementById('wolfagents-field-scope-api').value = '';
+    document.getElementById('wolfagents-field-scope-email').value = '';
     document.getElementById('wolfagents-field-discord-id').value = '';
     document.getElementById('wolfagents-field-discord-label').value = '';
     const tgId = document.getElementById('wolfagents-field-telegram-id'); if (tgId) tgId.value = '';
@@ -37633,6 +37762,7 @@ async function wolfAgentsOpenEdit() {
         document.getElementById('wolfagents-field-scope-hosts').value = _arrayToCsv(scope.allowed_hosts);
         document.getElementById('wolfagents-field-scope-paths').value = _arrayToCsv(scope.allowed_paths);
         document.getElementById('wolfagents-field-scope-api').value = _arrayToCsv(scope.allowed_api_paths);
+        document.getElementById('wolfagents-field-scope-email').value = _arrayToCsv(scope.allowed_email_recipients);
         document.getElementById('wolfagents-field-discord-id').value = (a.discord && a.discord.channel_id) || '';
         document.getElementById('wolfagents-field-discord-label').value = (a.discord && a.discord.channel_label) || '';
         const tgId = document.getElementById('wolfagents-field-telegram-id'); if (tgId) tgId.value = (a.telegram && a.telegram.chat_id) || '';
@@ -37664,6 +37794,7 @@ async function wolfAgentsSaveFromModal() {
             allowed_hosts: _csvToArray(document.getElementById('wolfagents-field-scope-hosts').value),
             allowed_paths: _csvToArray(document.getElementById('wolfagents-field-scope-paths').value),
             allowed_api_paths: _csvToArray(document.getElementById('wolfagents-field-scope-api').value),
+            allowed_email_recipients: _csvToArray(document.getElementById('wolfagents-field-scope-email').value),
         },
         allowed_tools: _wolfAgentsReadToolCheckboxes(),
     };

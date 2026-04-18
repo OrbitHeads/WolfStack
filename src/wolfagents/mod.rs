@@ -133,6 +133,14 @@ pub struct TargetScope {
     /// at least one explicit match.
     #[serde(default)]
     pub allowed_api_paths: Vec<String>,
+    /// Email recipients the `send_email` tool may address. Each entry
+    /// is either a full address (`paul@wolf.uk.com`, exact match) or a
+    /// domain match (`@wolf.uk.com`, matches any local-part at that
+    /// domain). Empty = the tool uses the AiConfig default `email_to`
+    /// only. This keeps a prompt-injected agent from emailing arbitrary
+    /// external addresses.
+    #[serde(default)]
+    pub allowed_email_recipients: Vec<String>,
 }
 
 /// One named agent. Persisted as an entry in

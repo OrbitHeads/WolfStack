@@ -201,6 +201,7 @@ pub async fn dispatch(
         ToolId::RunWorkflow => tool_run_workflow(arguments, state).await,
         ToolId::ScheduleWorkflow => tool_schedule_workflow(arguments, state).await,
         ToolId::WriteFile => tool_write_file(arguments, agent).await,
+        ToolId::SendEmail => tool_send_email(arguments, agent, state).await,
 
         ToolId::ExecInContainer => tool_exec_in_container(arguments, agent, state).await,
         ToolId::ExecOnNode => tool_exec_on_node(arguments, agent).await,
@@ -965,6 +966,153 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+// ─── send_email ─────────────────────────────────────────────────────────
+
+/// Send an email via the AiConfig's existing SMTP relay. Gated by the
+/// agent's allowed_email_recipients scope so a prompt-injected agent
+/// can't address arbitrary external inboxes.
+///
+/// The SMTP credentials and host live on AiConfig because it already
+/// powers the alerting emails and the operator has a UI for it in
+/// Settings → AI Agent. We reuse the transport rather than shipping a
+/// second SMTP configuration.
+async fn tool_send_email(
+    args: &serde_json::Value, agent: &Agent, _state: &crate::api::AppState,
+) -> ToolResult {
+    let subject = args.get("subject").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("");
+    let html = args.get("html").and_then(|v| v.as_bool()).unwrap_or(false);
+    if subject.is_empty() {
+        return ToolResult::err("send_email requires a non-empty `subject`".into());
+    }
+    if body.is_empty() {
+        return ToolResult::err("send_email requires a non-empty `body`".into());
+    }
+    if body.len() > 256 * 1024 {
+        return ToolResult::err("send_email body exceeds 256 KB".into());
+    }
+
+    // Collect recipients: either a string (single address) or an array.
+    let recipients: Vec<String> = match args.get("to") {
+        Some(v) if v.is_string() => vec![v.as_str().unwrap().trim().to_string()],
+        Some(v) if v.is_array() => v.as_array().unwrap().iter()
+            .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty()).collect(),
+        Some(_) => return ToolResult::err("`to` must be a string or array of strings".into()),
+        None => Vec::new(),
+    };
+
+    let config = crate::ai::AiConfig::load();
+    if config.smtp_host.is_empty() || config.smtp_user.is_empty() {
+        return ToolResult::err(
+            "SMTP is not configured on this WolfStack. Configure Settings → AI Agent → Email first.".into());
+    }
+
+    // If `to` is omitted, fall back to the AiConfig default alerting
+    // recipient — matches the "just notify my usual inbox" pattern.
+    let effective: Vec<String> = if recipients.is_empty() {
+        if config.email_to.trim().is_empty() {
+            return ToolResult::err(
+                "No `to` specified and no default recipient configured in AiConfig.email_to.".into());
+        }
+        vec![config.email_to.clone()]
+    } else {
+        recipients
+    };
+
+    // Recipient-scope check. Empty allowed_email_recipients means
+    // "only the AiConfig default is allowed" — prevents agents from
+    // silently widening the blast radius.
+    let allowed = &agent.target_scope.allowed_email_recipients;
+    for r in &effective {
+        if !recipient_permitted(r, allowed, &config.email_to) {
+            return ToolResult::err(format!(
+                "recipient '{}' is not in the agent's allowed_email_recipients scope. \
+                 Add it (exact address or `@domain` suffix) in Edit Agent → Target Scope.", r));
+        }
+    }
+
+    // Build + send. Reuse AiConfig's SMTP plumbing so auth / TLS mode
+    // stay consistent with the existing alerting path.
+    if let Err(e) = send_email_generic(&config, &effective, subject, body, html) {
+        return ToolResult::err(format!("SMTP send failed: {}", e));
+    }
+    ToolResult::ok(
+        format!("email sent to {} recipient(s)", effective.len()),
+        serde_json::json!({
+            "to": effective,
+            "subject": subject,
+            "html": html,
+            "bytes": body.len(),
+        }),
+    )
+}
+
+/// Is `addr` permitted under the scope? The rules:
+///   - `allowed` empty → only the AiConfig default recipient is OK.
+///   - entry starts with `@` → matches any address at that domain.
+///   - otherwise exact match (case-insensitive).
+fn recipient_permitted(addr: &str, allowed: &[String], default_to: &str) -> bool {
+    let a = addr.to_ascii_lowercase();
+    if allowed.is_empty() {
+        return !default_to.is_empty()
+            && default_to.to_ascii_lowercase() == a;
+    }
+    for entry in allowed {
+        let e = entry.trim().to_ascii_lowercase();
+        if e.is_empty() { continue; }
+        if e.starts_with('@') {
+            if a.ends_with(&e) { return true; }
+        } else if a == e {
+            return true;
+        }
+    }
+    false
+}
+
+fn send_email_generic(
+    config: &crate::ai::AiConfig,
+    to: &[String],
+    subject: &str,
+    body: &str,
+    html: bool,
+) -> Result<(), String> {
+    use lettre::{Message, SmtpTransport, Transport};
+    use lettre::transport::smtp::authentication::Credentials;
+    use lettre::message::{SinglePart, header::ContentType};
+
+    let from_addr: lettre::message::Mailbox = format!("WolfStack Agent <{}>", config.smtp_user)
+        .parse().map_err(|e| format!("from: {}", e))?;
+    let mut builder = Message::builder().from(from_addr).subject(subject);
+    for r in to {
+        let mb: lettre::message::Mailbox = r.parse()
+            .map_err(|e| format!("to '{}': {}", r, e))?;
+        builder = builder.to(mb);
+    }
+    let email = if html {
+        builder.singlepart(SinglePart::builder()
+            .header(ContentType::TEXT_HTML)
+            .body(body.to_string()))
+            .map_err(|e| format!("build html: {}", e))?
+    } else {
+        builder.body(body.to_string())
+            .map_err(|e| format!("build text: {}", e))?
+    };
+    let creds = Credentials::new(config.smtp_user.clone(), config.smtp_pass.clone());
+    let mailer = match config.smtp_tls.as_str() {
+        "tls" => SmtpTransport::relay(&config.smtp_host)
+            .map_err(|e| format!("relay: {}", e))?
+            .port(config.smtp_port).credentials(creds).build(),
+        "none" => SmtpTransport::builder_dangerous(&config.smtp_host)
+            .port(config.smtp_port).credentials(creds).build(),
+        _ => SmtpTransport::starttls_relay(&config.smtp_host)
+            .map_err(|e| format!("starttls: {}", e))?
+            .port(config.smtp_port).credentials(creds).build(),
+    };
+    mailer.send(&email).map_err(|e| format!("send: {}", e))?;
+    Ok(())
+}
+
 // ─── web_fetch / web_render ─────────────────────────────────────────────
 
 /// Maximum bytes read from any web fetch. A model that asks for a
@@ -1486,6 +1634,26 @@ mod web_tool_tests {
         let first_path = ranked[0]["path"].as_str().unwrap();
         assert!(first_path == "a" || first_path == "c",
             "unexpected first match {}", first_path);
+    }
+
+    #[test]
+    fn email_recipient_scope_rules() {
+        // Empty allowlist → only the AiConfig default is OK.
+        assert!(recipient_permitted("paul@wolf.uk.com", &[], "paul@wolf.uk.com"));
+        assert!(!recipient_permitted("paul@wolf.uk.com", &[], "ops@wolf.uk.com"));
+        assert!(!recipient_permitted("attacker@evil.com", &[], "paul@wolf.uk.com"));
+        // Empty allowlist AND empty default → reject everything.
+        assert!(!recipient_permitted("paul@wolf.uk.com", &[], ""));
+        // Explicit address match (case-insensitive).
+        let allow1 = vec!["paul@wolf.uk.com".to_string()];
+        assert!(recipient_permitted("paul@wolf.uk.com", &allow1, ""));
+        assert!(recipient_permitted("Paul@Wolf.UK.com", &allow1, ""));
+        assert!(!recipient_permitted("other@wolf.uk.com", &allow1, ""));
+        // Domain match via @suffix.
+        let allow2 = vec!["@wolf.uk.com".to_string()];
+        assert!(recipient_permitted("anyone@wolf.uk.com", &allow2, ""));
+        assert!(recipient_permitted("ops@wolf.uk.com", &allow2, ""));
+        assert!(!recipient_permitted("attacker@evil.com", &allow2, ""));
     }
 
     #[test]

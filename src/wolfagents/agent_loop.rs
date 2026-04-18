@@ -538,6 +538,20 @@ fn input_schema_for(tool: ToolId) -> serde_json::Value {
                 }
             }
         }),
+        ToolId::SendEmail => serde_json::json!({
+            "type": "object",
+            "required": ["subject", "body"],
+            "properties": {
+                "to": {
+                    "type": ["string", "array", "null"],
+                    "description": "Recipient email address, or an array of addresses. Omit to use the default alerting recipient from Settings → AI Agent. Recipients must fall under the agent's allowed_email_recipients scope.",
+                    "items": { "type": "string" }
+                },
+                "subject": { "type": "string" },
+                "body": { "type": "string", "description": "Plain text body, or HTML when `html` is true." },
+                "html": { "type": "boolean", "description": "Send as HTML. Default false (plain text).", "default": false }
+            }
+        }),
         ToolId::WriteFile => serde_json::json!({
             "type": "object",
             "required": ["path", "content"],

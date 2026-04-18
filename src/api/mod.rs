@@ -14698,6 +14698,118 @@ pub async fn agents_get(req: HttpRequest, state: web::Data<AppState>, path: web:
 /// (plus optional overrides for system_prompt, model, provider,
 /// allowed_tools, discord). Missing fields pick up defaults from
 /// `wolfagents::new_default` which seeds from AiConfig.
+/// POST /api/agents/build — draft a WolfAgent from a natural-language
+/// request. The main AI chat calls this when the operator says "build
+/// me an agent that..." — we ask the configured LLM to translate the
+/// request into a concrete agent record (name, system_prompt, access
+/// level, target scope, tool allowlist). The response is NOT persisted
+/// — the frontend renders it as a preview with a Create button so the
+/// operator can review + edit before committing. This keeps the LLM
+/// from silently creating agents that the operator didn't authorise.
+pub async fn agents_build_proposal(
+    req: HttpRequest, state: web::Data<AppState>,
+    body: web::Json<serde_json::Value>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let request_text = body.get("request").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if request_text.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "`request` field is required"
+        }));
+    }
+    let ai_config = state.ai_agent.config.lock()
+        .unwrap_or_else(|p| p.into_inner()).clone();
+    if !ai_config.is_configured() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "AI is not configured — set provider + key in Settings → AI Agent first"
+        }));
+    }
+    // Build the tool catalogue string the LLM will pick from.
+    let tool_lines: Vec<String> = crate::wolfagents::tools::ToolId::ALL.iter().map(|t| {
+        let danger = match t.danger() {
+            crate::wolfagents::tools::Danger::Safe => "safe",
+            crate::wolfagents::tools::Danger::Mutating => "mutating",
+            crate::wolfagents::tools::Danger::Destructive => "destructive",
+        };
+        format!("- {} ({}): {}", t.as_str(), danger, t.label())
+    }).collect();
+    let clusters: Vec<String> = state.cluster.get_all_nodes().iter()
+        .filter_map(|n| n.cluster_name.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter().collect();
+
+    let system = format!(
+        "You are a WolfStack agent designer. The operator describes the agent they \
+         want in natural language; you respond with a single JSON object describing \
+         the agent. No prose, no markdown fences, just the JSON.\n\n\
+         Known clusters: [{}]\n\n\
+         Tool catalogue (pick the MINIMUM set — unchecked tools are refused):\n{}\n\n\
+         Schema:\n\
+         {{\n\
+           \"name\": string (short, memorable — e.g. \"DiskWatchdog\"),\n\
+           \"system_prompt\": string (1-3 sentences describing the agent's role + output format),\n\
+           \"access_level\": \"read_only\" | \"read_write\" | \"confirm_all\" | \"trusted\",\n\
+           \"allowed_tools\": [\"tool_name\", ...],\n\
+           \"target_scope\": {{\n\
+             \"allowed_clusters\": [string, ...],\n\
+             \"allowed_container_patterns\": [string, ...],\n\
+             \"allowed_hosts\": [string, ...],\n\
+             \"allowed_paths\": [string, ...],\n\
+             \"allowed_api_paths\": [string, ...],\n\
+             \"allowed_email_recipients\": [string, ...]\n\
+           }}\n\
+         }}\n\n\
+         Rules:\n\
+         - Default access_level to read_only unless the request clearly implies mutation.\n\
+         - Grant send_email only when the request asks to 'report', 'email', 'notify', or 'alert'. \
+           Set allowed_email_recipients to the user's email if they give one, otherwise leave empty.\n\
+         - Use glob patterns for allowed_container_patterns (e.g. 'regions-*').\n\
+         - Use exact cluster names; if the request names a cluster, put it in allowed_clusters.\n\
+         - Never add a destructive tool unless the request clearly asks for destructive action.\n\
+         - Output ONLY the JSON object. No explanation, no fences.",
+        clusters.join(", "),
+        tool_lines.join("\n"),
+    );
+    let reply = match crate::ai::simple_chat(&ai_config, &system, &[], request_text).await {
+        Ok(r) => r,
+        Err(e) => return HttpResponse::BadGateway().json(serde_json::json!({
+            "error": format!("AI call failed: {}", e)
+        })),
+    };
+    // Extract the JSON object from the reply. Models sometimes wrap it
+    // in ```json fences despite the instruction; strip those tolerantly.
+    let cleaned = extract_json_object(&reply);
+    let proposal: serde_json::Value = match serde_json::from_str(&cleaned) {
+        Ok(v) => v,
+        Err(e) => return HttpResponse::BadGateway().json(serde_json::json!({
+            "error": format!("AI response was not valid JSON: {}", e),
+            "raw_response": reply,
+        })),
+    };
+    // Validate tool names so the UI doesn't offer a proposal the
+    // backend would later reject on create. Silently drop unknowns
+    // rather than failing outright — the operator can edit anyway.
+    let mut proposal = proposal;
+    if let Some(tools) = proposal.get_mut("allowed_tools").and_then(|v| v.as_array_mut()) {
+        tools.retain(|t| t.as_str()
+            .and_then(crate::wolfagents::tools::ToolId::from_str)
+            .is_some());
+    }
+    HttpResponse::Ok().json(serde_json::json!({ "proposal": proposal, "raw": reply }))
+}
+
+/// Best-effort extraction of a JSON object from an LLM response that
+/// might be wrapped in ```json fences or trailing prose. Returns the
+/// substring from the first `{` to the last `}`.
+fn extract_json_object(s: &str) -> String {
+    let start = s.find('{');
+    let end = s.rfind('}');
+    match (start, end) {
+        (Some(a), Some(b)) if b > a => s[a..=b].to_string(),
+        _ => s.to_string(),
+    }
+}
+
 pub async fn agents_create(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let v = body.into_inner();
@@ -18484,6 +18596,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // actix matches in registration order, and the dynamic route
         // would otherwise swallow `/api/agents/tools` as `id="tools"`.
         .route("/api/agents/tools", web::get().to(agents_tool_catalogue))
+        .route("/api/agents/build", web::post().to(agents_build_proposal))
         .route("/api/agents/{id}", web::get().to(agents_get))
         .route("/api/agents/{id}", web::put().to(agents_update))
         .route("/api/agents/{id}", web::delete().to(agents_delete))

@@ -83,6 +83,7 @@ pub enum ToolId {
     RunWorkflow,
     ScheduleWorkflow,
     WriteFile,
+    SendEmail,
 
     // ── Destructive ────────────────────────────────────────────
     ExecInContainer,
@@ -115,6 +116,7 @@ impl ToolId {
             ToolId::RunWorkflow => "run_workflow",
             ToolId::ScheduleWorkflow => "schedule_workflow",
             ToolId::WriteFile => "write_file",
+            ToolId::SendEmail => "send_email",
             ToolId::ExecInContainer => "exec_in_container",
             ToolId::ExecOnNode => "exec_on_node",
             ToolId::DeleteFile => "delete_file",
@@ -142,6 +144,7 @@ impl ToolId {
             ToolId::RunWorkflow => "Run a WolfFlow workflow",
             ToolId::ScheduleWorkflow => "Schedule a WolfFlow workflow",
             ToolId::WriteFile => "Write a file on a node (under allowed paths)",
+            ToolId::SendEmail => "Send an email via the configured SMTP relay (subject, body, optional HTML)",
             ToolId::ExecInContainer => "Execute a shell command inside a container",
             ToolId::ExecOnNode => "Execute a shell command on a cluster node",
             ToolId::DeleteFile => "Delete a file on a node",
@@ -178,7 +181,7 @@ impl ToolId {
 
             ToolId::RestartContainer | ToolId::RunWorkflow
             | ToolId::ScheduleWorkflow | ToolId::WriteFile
-            | ToolId::WolfstackApi => Danger::Mutating,
+            | ToolId::SendEmail | ToolId::WolfstackApi => Danger::Mutating,
 
             ToolId::ExecInContainer | ToolId::ExecOnNode
             | ToolId::DeleteFile => Danger::Destructive,
@@ -204,6 +207,7 @@ impl ToolId {
             "run_workflow" => Some(ToolId::RunWorkflow),
             "schedule_workflow" => Some(ToolId::ScheduleWorkflow),
             "write_file" => Some(ToolId::WriteFile),
+            "send_email" => Some(ToolId::SendEmail),
             "exec_in_container" => Some(ToolId::ExecInContainer),
             "exec_on_node" => Some(ToolId::ExecOnNode),
             "delete_file" => Some(ToolId::DeleteFile),
@@ -233,6 +237,7 @@ impl ToolId {
         ToolId::RunWorkflow,
         ToolId::ScheduleWorkflow,
         ToolId::WriteFile,
+        ToolId::SendEmail,
         ToolId::ExecInContainer,
         ToolId::ExecOnNode,
         ToolId::DeleteFile,
