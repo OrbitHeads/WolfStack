@@ -34,6 +34,7 @@ fn default_timeout() -> u64 { 300 }
 fn default_true() -> bool { true }
 fn default_eq() -> String { "eq".to_string() }
 fn default_http_method() -> String { "GET".to_string() }
+fn default_ai_max_tokens() -> u32 { 1024 }
 
 // ═══════════════════════════════════════════════
 // ─── Data Types ───
@@ -228,7 +229,59 @@ pub enum ActionType {
         #[serde(default)]
         params: serde_json::Value,
     },
+
+    // ─── AI / Agent Nodes ───
+
+    /// Invoke the configured AI model with a prompt and capture the
+    /// response. Lets workflows branch on AI judgment ("is this a real
+    /// alert?", "summarise this disk-full report"). The prompt body
+    /// supports `{{step_name.key}}` template substitution like other
+    /// action types so prior steps can feed into the question. The
+    /// response text lands in the step's stdout for downstream steps
+    /// (typically a Condition) to act on.
+    ///
+    /// Uses the global AI config — no per-agent context. For a
+    /// per-agent persistent conversation, use `AgentChat` (which
+    /// pulls the agent's memory + tool allowlist from WolfAgents).
+    AiInvoke {
+        /// User-side prompt — what to ask the model. Templated.
+        prompt: String,
+        /// Optional system prompt override — defaults to a generic
+        /// "you are an ops assistant" if omitted.
+        #[serde(default)]
+        system_prompt: Option<String>,
+        /// Override the configured AI model (e.g. swap to a smaller
+        /// faster one for routine summaries). Defaults to AiConfig.model.
+        #[serde(default)]
+        model: Option<String>,
+        /// Override the configured provider. Defaults to AiConfig.provider.
+        #[serde(default)]
+        provider: Option<String>,
+        /// Cap response length so a runaway model can't fill the
+        /// step's stdout buffer. Tokens, not characters.
+        #[serde(default = "default_ai_max_tokens")]
+        max_tokens: u32,
+    },
+
+    /// Send a message to a named WolfAgent and wait for its response.
+    /// Unlike AiInvoke this uses the agent's persistent memory + tool
+    /// allowlist, so the agent can take actions during the turn (e.g.
+    /// restart a container, fetch metrics) and remember the
+    /// conversation for next time.
+    AgentChat {
+        /// Agent ID from /api/agents.
+        agent_id: String,
+        /// Message to send. Templated.
+        message: String,
+        /// Seconds to wait for the agent to finish its turn. Agent
+        /// tool-use loops can take a while so this defaults higher
+        /// than the generic action timeout.
+        #[serde(default = "default_agent_chat_timeout")]
+        timeout_secs: u64,
+    },
 }
+
+fn default_agent_chat_timeout() -> u64 { 180 }
 
 /// What to do when a step fails
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1130,6 +1183,55 @@ pub async fn execute_action_local(action: &ActionType) -> Result<StepOutput, Str
                 format!("Integration action: instance={}, operation={}", instance_id, operation),
                 data,
             ))
+        }
+
+        // ─── AI invocation (no per-agent context, no tools) ───
+        ActionType::AiInvoke { prompt, system_prompt, model, provider, max_tokens: _max_tokens } => {
+            // Clone and override provider/model on the effective config
+            // so workflows can ask a cheaper/faster model for routine
+            // summaries without editing global AI settings.
+            let mut cfg = crate::ai::AiConfig::load();
+            if let Some(p) = provider { cfg.provider = p.clone(); }
+            if let Some(m) = model { cfg.model = m.clone(); }
+            let sys = system_prompt.clone().unwrap_or_else(|| {
+                "You are an operations assistant inside a WolfFlow workflow. Answer concisely. \
+                 Output plain text — no JSON, no markdown formatting unless explicitly asked. \
+                 If the answer is yes/no, start with 'YES' or 'NO' on its own line so a downstream \
+                 Condition step can branch on it.".to_string()
+            });
+            // `max_tokens` is captured here for future use when
+            // simple_chat gains a token cap; Claude/Gemini currently
+            // cap at 4096 internally. Kept in the schema so workflows
+            // authored now keep working when we wire it through.
+            match crate::ai::simple_chat(&cfg, &sys, &[], prompt).await {
+                Ok(reply) => {
+                    let mut data = serde_json::Map::new();
+                    data.insert("response".to_string(), serde_json::json!(reply));
+                    data.insert("model".to_string(), serde_json::json!(cfg.model));
+                    data.insert("provider".to_string(), serde_json::json!(cfg.provider));
+                    Ok(structured_output(reply, data))
+                }
+                Err(e) => Err(format!("AiInvoke failed: {}", e)),
+            }
+        }
+
+        // ─── Per-agent persistent chat ───
+        ActionType::AgentChat { agent_id, message, timeout_secs } => {
+            let deadline = std::time::Duration::from_secs(*timeout_secs);
+            let agent_id_c = agent_id.clone();
+            let message_c = message.clone();
+            match tokio::time::timeout(deadline,
+                crate::wolfagents::chat_with_agent(&agent_id_c, &message_c)
+            ).await {
+                Ok(Ok(reply)) => {
+                    let mut data = serde_json::Map::new();
+                    data.insert("agent_id".to_string(), serde_json::json!(agent_id));
+                    data.insert("response".to_string(), serde_json::json!(reply));
+                    Ok(structured_output(reply, data))
+                }
+                Ok(Err(e)) => Err(format!("AgentChat failed: {}", e)),
+                Err(_) => Err(format!("AgentChat timed out after {}s", timeout_secs)),
+            }
         }
     }
 }
@@ -2284,6 +2386,34 @@ pub fn toolbox_actions() -> serde_json::Value {
             "fields": [
                 { "name": "channel", "label": "Channel", "type": "text", "default": "master", "placeholder": "master" }
             ]
+        },
+        {
+            "action": "ai_invoke",
+            "label": "AI Invoke",
+            "description": "Ask the configured AI model a question and capture its response. Stateless — no memory between runs. Use {{step_name.key}} templates in the prompt. For yes/no decisions the system prompt tells the model to start with YES or NO so a Condition step can branch.",
+            "icon": "fa-robot",
+            "category": "ai",
+            "fields": [
+                { "name": "prompt", "label": "Prompt", "type": "textarea", "required": true, "placeholder": "Is the following disk-full alert a real problem or routine log-file growth?\n\n{{Check Disk.detail}}" },
+                { "name": "system_prompt", "label": "System Prompt (optional)", "type": "textarea", "placeholder": "Leave blank to use the default ops-assistant system prompt" },
+                { "name": "model", "label": "Model Override (optional)", "type": "text", "placeholder": "e.g. claude-haiku-4-5 for routine questions" },
+                { "name": "provider", "label": "Provider Override (optional)", "type": "select", "options": ["", "claude", "gemini", "openrouter", "local"], "default": "" },
+                { "name": "max_tokens", "label": "Max Response Tokens", "type": "number", "default": 1024, "placeholder": "1024" }
+            ],
+            "outputs": ["response", "model", "provider"]
+        },
+        {
+            "action": "agent_chat",
+            "label": "Agent Chat",
+            "description": "Send a message to a named WolfAgent. The agent has persistent memory across turns and its own tool allowlist, so it can act during the conversation. Use for stateful ops assistants (e.g. an agent that watches a specific cluster).",
+            "icon": "fa-comments",
+            "category": "ai",
+            "fields": [
+                { "name": "agent_id", "label": "Agent ID", "type": "text", "required": true, "placeholder": "from /api/agents" },
+                { "name": "message", "label": "Message", "type": "textarea", "required": true, "placeholder": "Can be templated with {{step_name.key}}" },
+                { "name": "timeout_secs", "label": "Timeout (s)", "type": "number", "default": 180 }
+            ],
+            "outputs": ["response", "agent_id"]
         }
     ])
 }
@@ -2517,7 +2647,11 @@ mod tests {
     fn toolbox_returns_all_actions() {
         let actions = toolbox_actions();
         let arr = actions.as_array().unwrap();
-        assert_eq!(arr.len(), 16); // 8 original + 8 new (service nodes + docker + http + condition + integration)
+        // 16 base actions + AiInvoke + AgentChat added in v18.1.
+        // Bump this when you add a new toolbox entry — the frontend's
+        // editor relies on one card per action, so `len` IS the right
+        // assertion even if it reads like a fragile hardcode.
+        assert_eq!(arr.len(), 18);
         // Check that each action has required fields
         for a in arr {
             assert!(a.get("action").is_some());
@@ -2525,5 +2659,12 @@ mod tests {
             assert!(a.get("description").is_some());
             assert!(a.get("fields").is_some());
         }
+        // The two AI actions should be present by name so refactors
+        // don't accidentally drop them.
+        let names: Vec<&str> = arr.iter()
+            .filter_map(|a| a.get("action").and_then(|n| n.as_str()))
+            .collect();
+        assert!(names.contains(&"ai_invoke"), "toolbox missing ai_invoke");
+        assert!(names.contains(&"agent_chat"), "toolbox missing agent_chat");
     }
 }

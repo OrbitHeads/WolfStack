@@ -123,6 +123,7 @@ fn scan_cluster_ip_conflicts(
             install_hint: Some(
                 "Open each container's Settings → Network → WolfNet and assign a unique IP. Use 🔍 Next Available to find a free one.".into()),
             ai_helpful: true,
+            install_package: None,
         });
     }
 }
@@ -176,6 +177,7 @@ fn ok(name: &str, detail: &str, version: Option<String>) -> DependencyCheck {
         detail: detail.into(),
         install_hint: None,
         ai_helpful: false,
+        install_package: None,
     }
 }
 
@@ -188,6 +190,7 @@ fn warn(name: &str, detail: &str, fix: Option<String>) -> DependencyCheck {
         detail: detail.into(),
         install_hint: fix,
         ai_helpful: true,
+        install_package: None,
     }
 }
 
@@ -202,6 +205,7 @@ fn critical(name: &str, detail: &str, fix: Option<String>) -> DependencyCheck {
         detail: detail.into(),
         install_hint: fix,
         ai_helpful: true,
+        install_package: None,
     }
 }
 
@@ -234,6 +238,7 @@ fn scan_listening_services(out: &mut Vec<DependencyCheck>) {
                 detail: "ss not available — install iproute2 to scan listening sockets.".into(),
                 install_hint: None,
                 ai_helpful: false,
+                install_package: None,
             });
             return;
         }

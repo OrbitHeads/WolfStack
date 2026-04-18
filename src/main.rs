@@ -37,6 +37,11 @@ mod kubernetes;
 mod icons;
 mod tui;
 mod wolfflow;
+mod wolfagents;
+mod discord_bot;
+mod telegram_bot;
+mod whatsapp_bot;
+mod mcp;
 mod wolfnote;
 mod wolfusb;
 mod paths;
@@ -570,6 +575,24 @@ async fn main() -> std::io::Result<()> {
                     m.reapply_passthrough_offloads();
                 }).await.ok();
             }
+        });
+
+        // Discord bot supervisor — idle until the operator configures
+        // a bot token in Settings → Alerting, then connects to the
+        // Discord gateway and routes messages in agent-bound channels
+        // to the right WolfAgent. Fails open: if the token is invalid
+        // or Discord is unreachable, the supervisor retries every 30s
+        // without affecting the rest of the server.
+        tokio::spawn(async move {
+            crate::discord_bot::supervise_forever().await;
+        });
+
+        // Telegram receiver — same idea as Discord but simpler
+        // (HTTP long-polling; no gateway, no heartbeat). Idle until
+        // the operator turns on telegram_receiver_enabled AND a
+        // telegram_bot_token is set.
+        tokio::spawn(async move {
+            crate::telegram_bot::supervise_forever().await;
         });
 
         // Background: session + login rate limiter + reset token cleanup

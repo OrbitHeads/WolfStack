@@ -1610,6 +1610,39 @@ impl VmManager {
         // command line, so usb-host can attach.
         if !config.usb_devices.is_empty() || !config.pci_devices.is_empty() {
             write_log(&format!("Passthrough: {} USB, {} PCI", config.usb_devices.len(), config.pci_devices.len()));
+
+            // Pre-flight each USB passthrough against the host's actual
+            // USB bus. QEMU's `-device usb-host` silently fails to bind
+            // when the device isn't present — the VM boots without the
+            // device and the operator sees a QEMU log saying "passed
+            // through" with no actual hardware inside the guest. This
+            // catches the "migration orphaned my USB" case before QEMU
+            // spawns so the operator sees a clear, actionable error
+            // rather than a confusing empty lsusb inside the VM.
+            let mut missing_usb: Vec<String> = Vec::new();
+            for u in &config.usb_devices {
+                let present = super::passthrough::usb_device_present_on_host(&u.vendor_id, &u.product_id);
+                if !present {
+                    missing_usb.push(format!("{}:{} ({})",
+                        u.vendor_id, u.product_id,
+                        u.label.clone().unwrap_or_else(|| "no label".into())));
+                }
+            }
+            if !missing_usb.is_empty() {
+                let msg = format!(
+                    "USB passthrough pre-flight failed — the following devices \
+                     are NOT on this host's USB bus: {}. \
+                     Open WolfStack → WolfUSB and click Re-attach on each assignment \
+                     (or use Diagnose to see where the chain broke). This usually \
+                     means the VM migrated from another node and the source node's \
+                     usbip export wasn't set up for cross-node access. Aborting \
+                     VM start rather than booting with silently-missing hardware.",
+                    missing_usb.join(", ")
+                );
+                write_log(&msg);
+                return Err(msg);
+            }
+
             if let Err(e) = super::passthrough::append_qemu_passthrough_args(&mut cmd, &config) {
                 write_log(&format!("Passthrough configuration error: {}", e));
                 return Err(format!("Passthrough configuration error: {}", e));

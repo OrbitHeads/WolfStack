@@ -5989,6 +5989,7 @@ pub async fn system_check_run(
                 detail: format!("Security scan task failed: {}. Non-fatal — dependency checks above are still accurate.", e),
                 install_hint: None,
                 ai_helpful: false,
+                install_package: None,
             });
         }
     }
@@ -10982,6 +10983,212 @@ pub async fn wolfusb_attach(req: HttpRequest, state: web::Data<AppState>, body: 
     }
 }
 
+/// GET /api/wolfusb/diagnose/{busid} — read-only walk of the
+/// passthrough chain for one assignment. Returns an ordered list of
+/// {step, ok, detail} so the UI can render a top-to-bottom checklist.
+/// No side effects — safe to call on a cron or from an on-page refresh.
+pub async fn wolfusb_diagnose(
+    req: HttpRequest, state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let busid = path.into_inner();
+    let steps = crate::wolfusb::diagnose(&busid);
+    let overall_ok = steps.iter().all(|s| s.ok);
+    HttpResponse::Ok().json(serde_json::json!({
+        "busid": busid,
+        "ok": overall_ok,
+        "steps": steps,
+    }))
+}
+
+/// POST /api/wolfusb/prepare-for-export — called on the SOURCE node
+/// (the one with the physical USB device) by a TARGET node that's
+/// about to attach. Idempotent; ensures wolfusb-server is running,
+/// confirms the device is on the host bus, confirms usbip-host kernel
+/// module is loaded. Returns the checklist so the caller can surface
+/// failures to the user before attempting attach.
+pub async fn wolfusb_prepare_for_export(
+    req: HttpRequest, state: web::Data<AppState>,
+    body: web::Json<serde_json::Value>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let busid = body.get("busid").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if busid.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": "busid required" }));
+    }
+    let steps = tokio::task::spawn_blocking(move || {
+        crate::wolfusb::prepare_for_export(&busid)
+    }).await.unwrap_or_else(|e| vec![crate::wolfusb::ReattachStep {
+        step: "prepare-for-export task".into(),
+        ok: false,
+        detail: format!("task panicked: {}", e),
+    }]);
+    let overall_ok = steps.iter().all(|s| s.ok);
+    HttpResponse::Ok().json(serde_json::json!({
+        "ok": overall_ok,
+        "steps": steps,
+    }))
+}
+
+/// POST /api/wolfusb/reattach/{busid} — full recovery flow.
+///
+/// Call from any node the operator is logged into. We look up the
+/// assignment's target node and proxy to it if we're not that node.
+/// On the target we:
+///   1. (if cross-node) Call source's /api/wolfusb/prepare-for-export
+///      so the device is unbound locally and ready for usbip-host
+///      to claim it.
+///   2. Run wolfusb::reattach_local which wipes any stale mount unit
+///      and re-runs the attach chain.
+/// Returns the combined step list so the UI shows everything that
+/// happened — this is the UI for fixing Papa's "migration orphaned
+/// my USB" scenario without SSHing into nodes.
+pub async fn wolfusb_reattach(
+    req: HttpRequest, state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let busid = path.into_inner();
+
+    // Look up the assignment to find source + target.
+    let config = crate::wolfusb::WolfUsbConfig::load();
+    let assignment = config.assignments.iter().find(|a| a.busid == busid).cloned();
+    let Some(a) = assignment else {
+        return HttpResponse::NotFound().json(serde_json::json!({
+            "error": format!("no assignment for busid {}", busid),
+        }));
+    };
+
+    let self_id = crate::agent::self_node_id();
+
+    // Step A: if target is not us, proxy to target and let THEY run
+    // the recovery. Keeps all the node-local kernel/systemd work on
+    // the node that actually needs it.
+    if a.target_node_id != self_id {
+        let nodes = state.cluster.get_all_nodes();
+        let Some(target) = nodes.iter().find(|n| n.id == a.target_node_id) else {
+            return HttpResponse::BadGateway().json(serde_json::json!({
+                "error": format!("target node {} not in cluster", a.target_node_id),
+            }));
+        };
+        let urls = build_node_urls(&target.address, target.port,
+            &format!("/api/wolfusb/reattach/{}", urlencoding_simple(&busid)));
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .danger_accept_invalid_certs(true)
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => return HttpResponse::InternalServerError()
+                .json(serde_json::json!({ "error": format!("http client: {}", e) })),
+        };
+        for url in &urls {
+            let res = client.post(url)
+                .header("X-WolfStack-Secret", &state.cluster_secret)
+                .send().await;
+            match res {
+                Ok(r) if r.status().is_success() => {
+                    let body = r.bytes().await.unwrap_or_default();
+                    return HttpResponse::Ok()
+                        .content_type("application/json")
+                        .body(body);
+                }
+                Ok(r) => {
+                    return HttpResponse::build(
+                        actix_web::http::StatusCode::from_u16(r.status().as_u16())
+                            .unwrap_or(actix_web::http::StatusCode::BAD_GATEWAY)
+                    ).body(r.bytes().await.unwrap_or_default());
+                }
+                Err(_) => continue,
+            }
+        }
+        return HttpResponse::BadGateway().json(serde_json::json!({
+            "error": format!("could not reach target node {}", target.hostname),
+        }));
+    }
+
+    // Step B: we ARE the target. If cross-node, ask source to prepare
+    // for export first. Accumulate the source's steps into the result.
+    let mut all_steps: Vec<crate::wolfusb::ReattachStep> = Vec::new();
+    if a.source_node_id != self_id {
+        let nodes = state.cluster.get_all_nodes();
+        let Some(source) = nodes.iter().find(|n| n.id == a.source_node_id) else {
+            all_steps.push(crate::wolfusb::ReattachStep {
+                step: "Locate source node".into(),
+                ok: false,
+                detail: format!("source node {} not in cluster — check node membership", a.source_node_id),
+            });
+            return HttpResponse::Ok().json(serde_json::json!({ "ok": false, "steps": all_steps }));
+        };
+        let urls = build_node_urls(&source.address, source.port, "/api/wolfusb/prepare-for-export");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .danger_accept_invalid_certs(true)
+            .build().ok();
+        let body = serde_json::json!({ "busid": busid });
+        let mut source_reached = false;
+        if let Some(c) = client {
+            for url in &urls {
+                if let Ok(resp) = c.post(url)
+                    .header("X-WolfStack-Secret", &state.cluster_secret)
+                    .json(&body)
+                    .send().await
+                {
+                    if resp.status().is_success() {
+                        source_reached = true;
+                        if let Ok(v) = resp.json::<serde_json::Value>().await {
+                            if let Some(arr) = v.get("steps").and_then(|s| s.as_array()) {
+                                for step in arr {
+                                    all_steps.push(crate::wolfusb::ReattachStep {
+                                        step: format!("[{}] {}", source.hostname,
+                                            step.get("step").and_then(|x| x.as_str()).unwrap_or("?")),
+                                        ok: step.get("ok").and_then(|x| x.as_bool()).unwrap_or(false),
+                                        detail: step.get("detail").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                                    });
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if !source_reached {
+            all_steps.push(crate::wolfusb::ReattachStep {
+                step: "Contact source node".into(),
+                ok: false,
+                detail: format!(
+                    "Could not reach {} on any URL — check the node is online and \
+                     cluster-secret auth is working.", source.hostname
+                ),
+            });
+            return HttpResponse::Ok().json(serde_json::json!({ "ok": false, "steps": all_steps }));
+        }
+    }
+
+    // Step C: run the local reattach — cleans stale mount unit and
+    // reruns attach_and_passthrough. spawn_blocking because it shells
+    // systemctl + wolfusb.
+    let busid_c = busid.clone();
+    let local_steps = tokio::task::spawn_blocking(move || {
+        crate::wolfusb::reattach_local(&busid_c)
+    }).await.unwrap_or_else(|e| vec![crate::wolfusb::ReattachStep {
+        step: "local reattach task".into(),
+        ok: false,
+        detail: format!("task panicked: {}", e),
+    }]);
+    all_steps.extend(local_steps);
+    let overall_ok = all_steps.iter().all(|s| s.ok);
+    HttpResponse::Ok().json(serde_json::json!({
+        "busid": busid,
+        "ok": overall_ok,
+        "steps": all_steps,
+    }))
+}
+
 // ─── MySQL Database Editor API ───
 
 /// GET /api/mysql/detect — check if MySQL is installed on this node
@@ -14200,6 +14407,35 @@ pub async fn alerts_config_save(req: HttpRequest, state: web::Data<AppState>, bo
         // a user picks the highest setting offered.
         config.security_scan_interval_secs = i.max(3600).min(24 * 3600);
     }
+    // Discord bot token is write-only from the UI's perspective —
+    // masked in to_masked_json so the frontend never sees it back.
+    // Only overwrite when a non-empty value arrives, so a save with
+    // the field blank doesn't wipe a previously-configured token.
+    if let Some(t) = v.get("discord_bot_token").and_then(|v| v.as_str()) {
+        let trimmed = t.trim();
+        if !trimmed.is_empty() {
+            config.discord_bot_token = trimmed.to_string();
+        }
+    }
+    // Telegram receiver flag — boolean. No secret-handling special-
+    // casing; the *token* is already in telegram_bot_token (long-
+    // standing outbound field).
+    if let Some(b) = v.get("telegram_receiver_enabled").and_then(|v| v.as_bool()) {
+        config.telegram_receiver_enabled = b;
+    }
+    if let Some(s) = v.get("twilio_account_sid").and_then(|v| v.as_str()) {
+        config.twilio_account_sid = s.trim().to_string();
+    }
+    // Twilio auth token: write-only, same shape as discord_bot_token.
+    if let Some(t) = v.get("twilio_auth_token").and_then(|v| v.as_str()) {
+        let trimmed = t.trim();
+        if !trimmed.is_empty() {
+            config.twilio_auth_token = trimmed.to_string();
+        }
+    }
+    if let Some(s) = v.get("twilio_whatsapp_from").and_then(|v| v.as_str()) {
+        config.twilio_whatsapp_from = s.trim().to_string();
+    }
 
     match config.save() {
         Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "saved": true })),
@@ -14217,6 +14453,361 @@ pub async fn alerts_test(req: HttpRequest, state: web::Data<AppState>) -> HttpRe
         serde_json::json!({ "channel": ch, "success": r.is_ok(), "error": r.as_ref().err().map(|e| e.to_string()) })
     }).collect();
     HttpResponse::Ok().json(serde_json::json!({ "sent": ok_count, "results": details }))
+}
+
+// ─── System package install ───
+
+#[derive(Deserialize)]
+pub struct InstallPackageRequest {
+    /// Logical package name from the allowlist in
+    /// `crate::installer::packages` — `cron`, `qemu`, etc. The
+    /// per-distro mapping happens server-side; the caller never sees
+    /// the actual apt/pacman name.
+    pub package: String,
+}
+
+/// POST /api/system/install-package — install a system package by
+/// its WolfStack-internal logical name. Used by the System Check UI's
+/// "Install" button when a dependency is missing. Restricted to the
+/// fixed allowlist server-side so the endpoint can't be abused as a
+/// generic apt/pacman shell. Runs the install synchronously off the
+/// async executor since package managers are blocking subprocesses.
+pub async fn system_install_package(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<InstallPackageRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let pkg = body.into_inner().package;
+    let result = tokio::task::spawn_blocking(move || {
+        crate::installer::packages::install(&pkg)
+    }).await;
+    match result {
+        Ok(Ok(report)) => HttpResponse::Ok().json(serde_json::json!({
+            "success": report.success,
+            "package": report.package,
+            "binary": report.binary,
+            "message": report.message,
+            "service_started": report.service_started,
+        })),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({
+            "success": false,
+            "error": e,
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "success": false,
+            "error": format!("install task panicked: {}", e),
+        })),
+    }
+}
+
+// ─── WhatsApp webhook (inbound via Twilio) ───
+
+/// POST /api/whatsapp/webhook — Twilio delivers inbound WhatsApp
+/// messages here as `application/x-www-form-urlencoded` form data.
+///
+/// This endpoint is reachable without a session cookie because Twilio
+/// doesn't hold one — instead we validate the `X-Twilio-Signature`
+/// header (HMAC-SHA1 of URL+sorted-params signed with our Twilio auth
+/// token). Any request that fails the signature check is rejected
+/// with 403 without touching agents or the LLM.
+///
+/// The reply comes back as TwiML in the response body so Twilio
+/// delivers it to the user synchronously — no outbound API call
+/// needed for the common case.
+pub async fn whatsapp_webhook(
+    req: HttpRequest,
+    body: web::Bytes,
+) -> HttpResponse {
+    let cfg = crate::alerting::AlertConfig::load();
+    if cfg.twilio_auth_token.is_empty() {
+        return HttpResponse::ServiceUnavailable()
+            .body("WhatsApp receiver not configured — set Twilio auth token in Settings → Alerting");
+    }
+
+    // Parse x-www-form-urlencoded body. Twilio always uses this
+    // content type for webhook calls. We parse manually rather than
+    // pulling in the `url` crate — the format is well-defined and
+    // we already have `urlencoding` for the per-value decode.
+    let form_str = match std::str::from_utf8(&body) {
+        Ok(s) => s,
+        Err(_) => return HttpResponse::BadRequest().body("non-utf8 body"),
+    };
+    let params: Vec<(String, String)> = form_str
+        .split('&')
+        .filter(|kv| !kv.is_empty())
+        .filter_map(|kv| {
+            // `+` → space is an x-www-form-urlencoded thing that
+            // straight %-decoding doesn't handle. Swap before decoding.
+            let replace_plus = |s: &str| s.replace('+', " ");
+            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+            let dk = urlencoding::decode(&replace_plus(k)).ok()?.into_owned();
+            let dv = urlencoding::decode(&replace_plus(v)).ok()?.into_owned();
+            Some((dk, dv))
+        })
+        .collect();
+
+    // Build the signed URL: Twilio signs the full URL it posted to
+    // (scheme + host + path + query). Reconstruct from actix's
+    // connection_info which respects X-Forwarded-* when a proxy is
+    // in front of us.
+    let conn = req.connection_info();
+    let scheme = conn.scheme();
+    let host = conn.host();
+    let path = req.uri().path();
+    let query = req.uri().query().map(|q| format!("?{}", q)).unwrap_or_default();
+    let webhook_url = format!("{}://{}{}{}", scheme, host, path, query);
+
+    let signature = req.headers().get("X-Twilio-Signature")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if !crate::whatsapp_bot::validate_twilio_signature(
+        &cfg.twilio_auth_token, &webhook_url, &params, signature
+    ) {
+        tracing::warn!("whatsapp_webhook: signature validation failed — rejecting");
+        return HttpResponse::Forbidden().body("signature validation failed");
+    }
+
+    // Pull the `From` and `Body` fields out of the validated params.
+    let from = params.iter().find(|(k, _)| k == "From").map(|(_, v)| v.clone()).unwrap_or_default();
+    let msg_body = params.iter().find(|(k, _)| k == "Body").map(|(_, v)| v.clone()).unwrap_or_default();
+    if from.is_empty() || msg_body.is_empty() {
+        return HttpResponse::Ok()
+            .content_type("application/xml")
+            .body(crate::whatsapp_bot::twiml_empty());
+    }
+
+    // Route to agent. `handle_inbound` does the rate-limiting + agent
+    // lookup + chat_with_agent call; returns None when no agent is
+    // bound to this phone number (empty TwiML so Twilio doesn't retry).
+    let reply = crate::whatsapp_bot::handle_inbound(&from, &msg_body).await;
+    let twiml = match reply {
+        Some(text) => crate::whatsapp_bot::twiml_reply(&text),
+        None => crate::whatsapp_bot::twiml_empty(),
+    };
+    HttpResponse::Ok()
+        .content_type("application/xml")
+        .body(twiml)
+}
+
+// ─── MCP-shaped tool surface ───
+
+/// POST /api/mcp/tools/list — MCP-compatible tool catalogue.
+/// Returns `{ "tools": [...] }` with each entry carrying name,
+/// description, and a JSON Schema for its arguments.
+pub async fn mcp_tools_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    HttpResponse::Ok().json(serde_json::json!({
+        "tools": crate::mcp::catalogue(),
+    }))
+}
+
+/// POST /api/mcp/tools/call — invoke a tool by name.
+/// Body: `{ "name": "...", "arguments": {...} }`
+/// Returns MCP-shaped `{ "content": [{ "type": "text", "text": ... }] }`.
+pub async fn mcp_tools_call(
+    req: HttpRequest, state: web::Data<AppState>,
+    body: web::Json<crate::mcp::ToolCall>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match crate::mcp::dispatch(body.into_inner(), state.get_ref()).await {
+        Ok(result) => HttpResponse::Ok().json(result),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({
+            "isError": true,
+            "content": [{ "type": "text", "text": e }],
+        })),
+    }
+}
+
+// ─── WolfAgents API ───
+
+/// GET /api/agents — list every registered agent.
+pub async fn agents_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    HttpResponse::Ok().json(crate::wolfagents::load_all())
+}
+
+/// GET /api/agents/{id} — one agent by id.
+pub async fn agents_get(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    match crate::wolfagents::load(&id) {
+        Some(a) => HttpResponse::Ok().json(a),
+        None => HttpResponse::NotFound().json(serde_json::json!({"error": "agent not found"})),
+    }
+}
+
+/// POST /api/agents — create a new agent. Body: `{"name": "..."}`
+/// (plus optional overrides for system_prompt, model, provider,
+/// allowed_tools, discord). Missing fields pick up defaults from
+/// `wolfagents::new_default` which seeds from AiConfig.
+pub async fn agents_create(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let v = body.into_inner();
+    let name = match v.get("name").and_then(|n| n.as_str()) {
+        Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+        _ => return HttpResponse::BadRequest().json(serde_json::json!({"error": "name is required"})),
+    };
+    let mut agent = crate::wolfagents::new_default(name);
+    // Apply optional overrides from the body so the create-and-
+    // customise-in-one-call path works from the UI.
+    if let Some(s) = v.get("system_prompt").and_then(|x| x.as_str()) {
+        agent.system_prompt = s.to_string();
+    }
+    if let Some(m) = v.get("model").and_then(|x| x.as_str()) {
+        agent.model = m.to_string();
+    }
+    if let Some(p) = v.get("provider").and_then(|x| x.as_str()) {
+        agent.provider = p.to_string();
+    }
+    if let Some(arr) = v.get("allowed_tools").and_then(|x| x.as_array()) {
+        agent.allowed_tools = arr.iter().filter_map(|t| t.as_str().map(String::from)).collect();
+    }
+    if let Some(n) = v.get("memory_max_lines").and_then(|x| x.as_u64()) {
+        agent.memory_max_lines = (n as usize).clamp(4, 4096);
+    }
+    if let Some(d) = v.get("discord") {
+        if let Ok(parsed) = serde_json::from_value::<crate::wolfagents::DiscordBinding>(d.clone()) {
+            agent.discord = Some(parsed);
+        }
+    }
+    match crate::wolfagents::upsert(agent.clone()) {
+        Ok(()) => HttpResponse::Ok().json(agent),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// PUT /api/agents/{id} — update fields on an existing agent. Body
+/// is the full agent JSON (same shape as create). Missing fields fall
+/// back to the stored agent's values so partial updates work.
+pub async fn agents_update(
+    req: HttpRequest, state: web::Data<AppState>,
+    path: web::Path<String>, body: web::Json<serde_json::Value>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let mut agent = match crate::wolfagents::load(&id) {
+        Some(a) => a,
+        None => return HttpResponse::NotFound().json(serde_json::json!({"error": "agent not found"})),
+    };
+    let v = body.into_inner();
+    if let Some(n) = v.get("name").and_then(|x| x.as_str()) { if !n.trim().is_empty() { agent.name = n.trim().to_string(); } }
+    if let Some(s) = v.get("system_prompt").and_then(|x| x.as_str()) { agent.system_prompt = s.to_string(); }
+    if let Some(m) = v.get("model").and_then(|x| x.as_str()) { agent.model = m.to_string(); }
+    if let Some(p) = v.get("provider").and_then(|x| x.as_str()) { agent.provider = p.to_string(); }
+    if let Some(arr) = v.get("allowed_tools").and_then(|x| x.as_array()) {
+        agent.allowed_tools = arr.iter().filter_map(|t| t.as_str().map(String::from)).collect();
+    }
+    if let Some(n) = v.get("memory_max_lines").and_then(|x| x.as_u64()) {
+        agent.memory_max_lines = (n as usize).clamp(4, 4096);
+    }
+    // Discord block: null clears the binding, missing leaves it as-is,
+    // object replaces.
+    if let Some(d) = v.get("discord") {
+        if d.is_null() {
+            agent.discord = None;
+        } else if let Ok(parsed) = serde_json::from_value::<crate::wolfagents::DiscordBinding>(d.clone()) {
+            agent.discord = Some(parsed);
+        }
+    }
+    match crate::wolfagents::upsert(agent.clone()) {
+        Ok(()) => HttpResponse::Ok().json(agent),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// DELETE /api/agents/{id} — remove an agent and its memory.
+pub async fn agents_delete(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    match crate::wolfagents::delete(&id) {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({"deleted": true})),
+        Err(e) => HttpResponse::NotFound().json(serde_json::json!({"error": e})),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct AgentChatRequest {
+    /// The user's message. No templating here — that's a WolfFlow
+    /// concern; this endpoint is the raw chat surface.
+    pub message: String,
+}
+
+/// POST /api/agents/{id}/chat — send a message to an agent and get
+/// its reply. Appends both sides to the agent's JSONL memory. The
+/// chat runs synchronously; calls with very long-running agent turns
+/// (future tool-use) will move to a job-queue shape — not needed yet.
+pub async fn agents_chat(
+    req: HttpRequest, state: web::Data<AppState>,
+    path: web::Path<String>, body: web::Json<AgentChatRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let msg = body.into_inner().message;
+    if msg.trim().is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "message is empty"}));
+    }
+    match crate::wolfagents::chat_with_agent(&id, &msg).await {
+        Ok(reply) => HttpResponse::Ok().json(serde_json::json!({
+            "agent_id": id,
+            "response": reply,
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// GET /api/agents/tools — the catalogue of tools an agent can be
+/// granted. Drives the checklist in the Edit Agent modal. Static — the
+/// set is hard-coded in the binary, so the list itself doesn't
+/// require auth, but we still gate behind the normal session check
+/// since the rest of the agent surface is authenticated.
+pub async fn agents_tool_catalogue(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    HttpResponse::Ok().json(crate::wolfagents::tools::catalogue())
+}
+
+/// GET /api/agents/{id}/audit?limit=N — last N tool invocations for
+/// this agent. Included the "denied" entries so operators can see when
+/// the agent has tried to do things it's not allowed to do (a signal
+/// the system prompt and tool allowlist may be out of sync).
+pub async fn agents_audit(
+    req: HttpRequest, state: web::Data<AppState>,
+    path: web::Path<String>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    if crate::wolfagents::load(&id).is_none() {
+        return HttpResponse::NotFound().json(serde_json::json!({"error": "agent not found"}));
+    }
+    let limit: usize = query.get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100)
+        .min(1000);
+    HttpResponse::Ok().json(crate::wolfagents::tools::tail_audit(&id, limit))
+}
+
+/// GET /api/agents/{id}/memory?limit=N — return the last N memory
+/// entries for an agent. Used by the UI to hydrate the conversation
+/// panel when opening an agent. Default N=40.
+pub async fn agents_memory(
+    req: HttpRequest, state: web::Data<AppState>,
+    path: web::Path<String>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    // Confirm the agent exists — otherwise a stale UI can keep
+    // pulling memory for a deleted agent indefinitely.
+    if crate::wolfagents::load(&id).is_none() {
+        return HttpResponse::NotFound().json(serde_json::json!({"error": "agent not found"}));
+    }
+    let limit: usize = query.get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40)
+        .min(500);
+    HttpResponse::Ok().json(crate::wolfagents::load_recent_memory(&id, limit))
 }
 
 // ─── WolfRun API ───
@@ -17556,6 +18147,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/wolfusb/assign", web::post().to(wolfusb_assign))
         .route("/api/wolfusb/unassign", web::post().to(wolfusb_unassign))
         .route("/api/wolfusb/attach", web::post().to(wolfusb_attach))
+        .route("/api/wolfusb/diagnose/{busid}", web::get().to(wolfusb_diagnose))
+        .route("/api/wolfusb/prepare-for-export", web::post().to(wolfusb_prepare_for_export))
+        .route("/api/wolfusb/reattach/{busid}", web::post().to(wolfusb_reattach))
         .route("/api/wolfusb/sync", web::post().to(wolfusb_sync))
         // VR Terminal
         .route("/api/vr-terminal/create", web::post().to(crate::vr_terminal::vr_term_create))
@@ -17685,6 +18279,23 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/alerts/config", web::get().to(alerts_config_get))
         .route("/api/alerts/config", web::post().to(alerts_config_save))
         .route("/api/alerts/test", web::post().to(alerts_test))
+        .route("/api/system/install-package", web::post().to(system_install_package))
+        // WolfAgents — named AI agents with persistent memory.
+        .route("/api/agents", web::get().to(agents_list))
+        .route("/api/agents", web::post().to(agents_create))
+        .route("/api/agents/{id}", web::get().to(agents_get))
+        .route("/api/agents/{id}", web::put().to(agents_update))
+        .route("/api/agents/{id}", web::delete().to(agents_delete))
+        .route("/api/agents/tools", web::get().to(agents_tool_catalogue))
+        .route("/api/agents/{id}/chat", web::post().to(agents_chat))
+        .route("/api/agents/{id}/memory", web::get().to(agents_memory))
+        .route("/api/agents/{id}/audit", web::get().to(agents_audit))
+        // MCP-shaped tool surface so external agent harnesses can call
+        // WolfStack's read-only capabilities without reinventing each one.
+        .route("/api/mcp/tools/list", web::post().to(mcp_tools_list))
+        .route("/api/mcp/tools/call", web::post().to(mcp_tools_call))
+        // WhatsApp inbound via Twilio — unauth, signature-validated.
+        .route("/api/whatsapp/webhook", web::post().to(whatsapp_webhook))
         // Integrations (auth required)
         .route("/api/integrations/connectors", web::get().to(integrations_connectors))
         .route("/api/integrations", web::get().to(integrations_list))

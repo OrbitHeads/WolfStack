@@ -382,6 +382,34 @@ pub fn find_conflicts(target: &VmConfig, others: &[VmConfig]) -> Vec<String> {
 
 // ─── Native QEMU argument builders ───
 
+/// Is a USB device with `vendor_id:product_id` present on this host?
+///
+/// Checks `lsusb` output for a matching `ID xxxx:yyyy` line. Used by
+/// `start_vm`'s pre-flight so we catch "device not on host bus" before
+/// QEMU spawns and silently fails to bind. Lowercases both sides
+/// because `lsusb` output is hex in lowercase while our VmConfig stores
+/// in mixed case.
+pub fn usb_device_present_on_host(vendor_id: &str, product_id: &str) -> bool {
+    let needle = format!("{}:{}", vendor_id.to_ascii_lowercase(), product_id.to_ascii_lowercase());
+    let Ok(output) = Command::new("lsusb").output() else { return false; };
+    if !output.status.success() { return false; }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // lsusb lines look like: "Bus 001 Device 042: ID 1a86:7523 QinHeng..."
+    // We check for the "ID xxxx:yyyy " pattern (ASCII lowercase) so a
+    // device whose label happens to contain matching text doesn't trigger
+    // a false positive.
+    for line in stdout.lines() {
+        let lower = line.to_ascii_lowercase();
+        if let Some(idx) = lower.find(" id ") {
+            let rest = &lower[idx + 4..];
+            if rest.starts_with(&needle) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Append `-device usb-host,...` and `-device vfio-pci,...` arguments for each
 /// configured passthrough device. The caller is responsible for having `-usb`
 /// already on the command line (the native start path already does).

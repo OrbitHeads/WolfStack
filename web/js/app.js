@@ -1106,7 +1106,7 @@ function selectView(page) {
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     document.querySelector(`.nav-item[data-page="${page}"]`)?.classList.add('active');
 
-    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', 'cluster-browser': 'Cluster Browser' };
+    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', wolfagents: 'WolfAgents', 'cluster-browser': 'Cluster Browser' };
     document.getElementById('page-title').textContent = titles[page] || page;
 
     if (page === 'datacenter') {
@@ -1140,6 +1140,8 @@ function selectView(page) {
         initTopology3D();
     } else if (page === 'wolfflow') {
         loadWolfFlowList();
+    } else if (page === 'wolfagents') {
+        wolfAgentsLoad();
     } else if (page === 'cluster-browser') {
         loadClusterBrowser();
     }
@@ -24063,8 +24065,16 @@ function renderSystemCheckResults(data) {
             const key = `${cat.replace(/\s+/g, '')}-${idx}`;
             window._systemCheckCache[key] = c;
             const aiTarget = `sc-ai-${key}`;
+            const installTarget = `sc-install-${key}`;
             const aiBtn = (aiEnabled && (c.status === 'warning' || c.status === 'missing') && c.ai_helpful)
                 ? `<button class="btn btn-sm" style="font-size:11px; white-space:nowrap;" data-sc-key="${escapeHtml(key)}" onclick="askAiAboutCheck('${aiTarget}', window._systemCheckCache['${escapeHtml(key)}'], '${escapeHtml(targetNodeId)}')">🤖 Ask AI</button>`
+                : '';
+            // One-click install — only shown when the dependency check
+            // marks itself install_package: <name> and the status is
+            // missing. Routes through the node proxy when looking at a
+            // remote node, otherwise hits the local API.
+            const installBtn = (c.status === 'missing' && c.install_package)
+                ? `<button class="btn btn-sm btn-primary" style="font-size:11px; white-space:nowrap;" onclick="installSystemPackage('${escapeAttr(c.install_package)}', '${installTarget}', '${escapeAttr(targetNodeId)}')">📦 Install</button>`
                 : '';
             return `<div style="display:flex; align-items:flex-start; gap:12px; padding:10px 12px; border-bottom:1px solid var(--border);">
                 <div style="flex-shrink:0; width:28px; text-align:center; font-size:16px;">${m.icon}</div>
@@ -24077,8 +24087,9 @@ function renderSystemCheckResults(data) {
                     <div style="font-size:12px; color:var(--text-muted); margin-top:2px;">${escapeHtml(c.detail)}</div>
                     ${hint}
                     <div id="${aiTarget}" style="display:none; margin-top:8px; background:rgba(168,85,247,0.08); border:1px solid rgba(168,85,247,0.3); border-radius:6px; padding:10px; font-size:12px; color:var(--text); white-space:pre-wrap;"></div>
+                    <div id="${installTarget}" style="display:none; margin-top:8px; background:rgba(34,197,94,0.08); border:1px solid rgba(34,197,94,0.3); border-radius:6px; padding:10px; font-size:12px; color:var(--text); white-space:pre-wrap;"></div>
                 </div>
-                <div style="flex-shrink:0;">${aiBtn}</div>
+                <div style="flex-shrink:0; display:flex; flex-direction:column; gap:6px;">${installBtn}${aiBtn}</div>
             </div>`;
         }).join('');
         return `<div style="margin-bottom:16px; background:var(--bg-card); border:1px solid var(--border); border-radius:8px; overflow:hidden;">
@@ -24102,6 +24113,39 @@ function renderSystemCheckResults(data) {
         ${aiBanner}
         ${catHtml}
     `;
+}
+
+async function installSystemPackage(packageName, targetId, nodeId) {
+    const target = document.getElementById(targetId);
+    if (!target) return;
+    target.style.display = 'block';
+    target.textContent = `📦 Installing ${packageName}…`;
+    // Route through the node proxy when scanning a remote node, so the
+    // install runs on the node that actually has the missing package.
+    const url = nodeId
+        ? `/api/nodes/${encodeURIComponent(nodeId)}/proxy/system/install-package`
+        : '/api/system/install-package';
+    try {
+        const r = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ package: packageName }),
+        });
+        const data = await r.json();
+        if (data.success) {
+            target.style.background = 'rgba(34,197,94,0.12)';
+            const svc = data.service_started === true ? ' (service started)'
+                      : data.service_started === false ? ' (install ok, but service did not start — start it manually)'
+                      : '';
+            target.textContent = `✅ ${data.message || 'Installed'}${svc}\nRe-run the System Check to verify.`;
+        } else {
+            target.style.background = 'rgba(239,68,68,0.12)';
+            target.textContent = `❌ Install failed: ${data.error || `HTTP ${r.status}`}`;
+        }
+    } catch (e) {
+        target.style.background = 'rgba(239,68,68,0.12)';
+        target.textContent = `❌ ${e.message || String(e)}`;
+    }
 }
 
 async function askAiAboutCheck(targetId, check, nodeId) {
@@ -25639,6 +25683,26 @@ async function loadAlertingConfig() {
             const secEl = document.getElementById('alerting-security-scan-interval');
             if (secEl) secEl.value = String(c.security_scan_interval_secs);
         }
+        // Telegram receiver toggle (inbound messages → agents).
+        const tgRx = document.getElementById('alerting-telegram-receiver');
+        if (tgRx) tgRx.checked = !!c.telegram_receiver_enabled;
+        // Discord bot token is write-only — the server responds with
+        // has_discord_bot boolean; show a placeholder hint rather than
+        // the masked token.
+        const dbt = document.getElementById('alerting-discord-bot-token');
+        if (dbt) dbt.placeholder = c.has_discord_bot
+            ? 'Token set — leave blank to keep, or paste a new one to replace'
+            : 'Discord dev portal → Bot → Token';
+        // Twilio: SID + From are plain text (no secret), auth token
+        // is write-only.
+        const tsid = document.getElementById('alerting-twilio-sid');
+        if (tsid) tsid.value = c.twilio_account_sid || '';
+        const twf = document.getElementById('alerting-twilio-whatsapp-from');
+        if (twf) twf.value = c.twilio_whatsapp_from || '';
+        const twAuth = document.getElementById('alerting-twilio-token');
+        if (twAuth) twAuth.placeholder = c.has_twilio_auth
+            ? 'Auth token set — leave blank to keep, or paste a new one to replace'
+            : 'twilio.com/console → Account Info → Auth Token';
         const channels = [];
         if (c.has_discord) channels.push('\u2705 Discord');
         if (c.has_slack) channels.push('\u2705 Slack');
@@ -36813,8 +36877,11 @@ async function refreshWolfUsbDevices() {
                         + '<td style="font-family:monospace;">' + escapeHtml(a.busid) + '</td>'
                         + '<td>' + escapeHtml(a.source_hostname || '?') + '</td>'
                         + '<td>' + icon + ' ' + escapeHtml(a.target_name) + ' <span style="color:var(--text-muted);font-size:10px;">on ' + escapeHtml(a.target_hostname || '?') + '</span></td>'
-                        + '<td><button class="btn btn-sm" onclick="wolfusbUnassign(\'' + escapeAttr(a.busid) + '\',\'' + escapeAttr(a.source_node_id) + '\')" style="padding:3px 8px;font-size:10px;background:rgba(239,68,68,0.1);color:#ef4444;border-color:rgba(239,68,68,0.3);">Remove</button></td>'
-                        + '</tr>';
+                        + '<td style="white-space:nowrap;">'
+                        + '<button class="btn btn-sm" onclick="wolfusbDiagnose(\'' + escapeAttr(a.busid) + '\')" style="padding:3px 8px;font-size:10px;margin-right:4px;" title="Walk the passthrough chain and show exactly where it broke">🔍 Diagnose</button>'
+                        + '<button class="btn btn-sm" onclick="wolfusbReattach(\'' + escapeAttr(a.busid) + '\')" style="padding:3px 8px;font-size:10px;margin-right:4px;background:rgba(59,130,246,0.12);color:#3b82f6;border-color:rgba(59,130,246,0.3);" title="Re-run the full attach chain — use after a migration breaks passthrough">🔄 Re-attach</button>'
+                        + '<button class="btn btn-sm" onclick="wolfusbUnassign(\'' + escapeAttr(a.busid) + '\',\'' + escapeAttr(a.source_node_id) + '\')" style="padding:3px 8px;font-size:10px;background:rgba(239,68,68,0.1);color:#ef4444;border-color:rgba(239,68,68,0.3);">Remove</button>'
+                        + '</td></tr>';
                 });
                 ahtml += '</tbody></table>';
                 assignBody.innerHTML = ahtml;
@@ -36893,4 +36960,362 @@ async function wolfusbUnassign(busid, sourceNodeId) {
         if (data.ok) { showToast(data.message || 'Removed', 'success'); refreshWolfUsbDevices(); }
         else { showToast('Failed: ' + (data.error || ''), 'error'); }
     } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+}
+
+// ═══════════════════════════════════════════════
+// WolfUSB — Diagnose + Re-attach recovery flow
+// ═══════════════════════════════════════════════
+//
+// Papa-Schlumpf's case: a VM migrated between nodes and the USB
+// passthrough went stale (QEMU logs "passthrough" but the device
+// never appears inside the guest). Operators need to see WHERE the
+// chain broke and run a targeted recovery without SSHing into nodes.
+//
+// Diagnose = read-only walk of the chain. Re-attach = runs the
+// recovery. Both render a modal with per-step pass/fail so failures
+// are visible instead of buried in journalctl.
+
+function _wolfusbOpenStepsModal(title, busid) {
+    // Build a simple modal that the step fetchers can populate.
+    const existing = document.getElementById('wolfusb-steps-modal');
+    if (existing) existing.remove();
+    const modal = document.createElement('div');
+    modal.id = 'wolfusb-steps-modal';
+    modal.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:1000; display:flex; align-items:center; justify-content:center;';
+    modal.innerHTML = `
+        <div class="card" style="width:640px; max-width:92vw; max-height:88vh; overflow-y:auto;">
+            <div class="card-header" style="display:flex; align-items:center; justify-content:space-between;">
+                <h3 style="margin:0;">${escapeHtml(title)}</h3>
+                <button class="btn btn-sm" onclick="document.getElementById('wolfusb-steps-modal').remove()">×</button>
+            </div>
+            <div class="card-body">
+                <div style="font-size:11px; color:var(--text-muted); font-family:var(--font-mono,monospace); margin-bottom:8px;">busid: ${escapeHtml(busid)}</div>
+                <div id="wolfusb-steps-body" style="min-height:80px;"><div style="color:var(--text-muted); font-size:13px;">Running…</div></div>
+            </div>
+        </div>`;
+    document.body.appendChild(modal);
+}
+
+function _wolfusbRenderSteps(steps, overallOk) {
+    const body = document.getElementById('wolfusb-steps-body');
+    if (!body) return;
+    if (!Array.isArray(steps) || steps.length === 0) {
+        body.innerHTML = `<div style="color:#ef4444; font-size:13px;">No step data returned — check WolfStack logs.</div>`;
+        return;
+    }
+    const rows = steps.map(s => {
+        const icon = s.ok ? '✅' : '❌';
+        const color = s.ok ? '#22c55e' : '#ef4444';
+        return `<div style="display:flex; gap:10px; padding:8px 0; border-bottom:1px solid var(--border);">
+            <div style="width:22px; font-size:16px;">${icon}</div>
+            <div style="flex:1; min-width:0;">
+                <div style="font-weight:600; color:${color}; font-size:13px;">${escapeHtml(s.step)}</div>
+                <div style="font-size:12px; color:var(--text); margin-top:2px; white-space:pre-wrap; word-break:break-word;">${escapeHtml(s.detail)}</div>
+            </div>
+        </div>`;
+    }).join('');
+    const banner = overallOk
+        ? `<div style="background:rgba(34,197,94,0.1); border:1px solid rgba(34,197,94,0.3); border-radius:6px; padding:8px 12px; margin-bottom:10px; color:#22c55e; font-size:13px;">✅ All checks passed</div>`
+        : `<div style="background:rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.3); border-radius:6px; padding:8px 12px; margin-bottom:10px; color:#ef4444; font-size:13px;">❌ One or more checks failed — see the red row below for the fix.</div>`;
+    body.innerHTML = banner + rows;
+}
+
+async function wolfusbDiagnose(busid) {
+    _wolfusbOpenStepsModal('🔍 USB passthrough diagnostics', busid);
+    try {
+        const resp = await fetch(apiUrl('/api/wolfusb/diagnose/' + encodeURIComponent(busid)));
+        const data = await resp.json();
+        if (!resp.ok && !data.steps) {
+            _wolfusbRenderSteps([{ step: 'Fetch diagnose', ok: false, detail: data.error || ('HTTP ' + resp.status) }], false);
+            return;
+        }
+        _wolfusbRenderSteps(data.steps || [], !!data.ok);
+    } catch (e) {
+        _wolfusbRenderSteps([{ step: 'Fetch diagnose', ok: false, detail: e.message || String(e) }], false);
+    }
+}
+
+async function wolfusbReattach(busid) {
+    if (!await showConfirm(
+        'Re-attach will stop any stale USB mount unit, re-bind the device on ' +
+        'the source node, and re-run the passthrough chain. Safe to run on a ' +
+        'healthy assignment (idempotent). Continue?')) return;
+    _wolfusbOpenStepsModal('🔄 USB re-attach', busid);
+    try {
+        const resp = await fetch(apiUrl('/api/wolfusb/reattach/' + encodeURIComponent(busid)), {
+            method: 'POST',
+        });
+        const data = await resp.json();
+        _wolfusbRenderSteps(data.steps || [], !!data.ok);
+        if (data.ok) {
+            // Let the assignments table reflect any new state.
+            setTimeout(refreshWolfUsbDevices, 500);
+        }
+    } catch (e) {
+        _wolfusbRenderSteps([{ step: 'Fetch reattach', ok: false, detail: e.message || String(e) }], false);
+    }
+}
+
+// ═══════════════════════════════════════════════
+// WolfAgents — named AI agents with persistent memory
+// ═══════════════════════════════════════════════
+//
+// State: the currently opened agent's id (for chat panel + edit). The
+// list itself is re-fetched on demand; no client-side caching beyond
+// the active chat, because agents are low-volume and we want the UI
+// to always reflect disk state (another operator may have edited one).
+let _wolfAgentsActiveId = null;
+
+async function wolfAgentsLoad() {
+    const grid = document.getElementById('wolfagents-list');
+    if (!grid) return;
+    grid.innerHTML = `<div style="color:var(--text-muted); font-size:13px; padding:24px; text-align:center; grid-column:1/-1;">Loading agents…</div>`;
+    try {
+        const resp = await fetch('/api/agents', { credentials: 'include' });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const agents = await resp.json();
+        if (!Array.isArray(agents) || agents.length === 0) {
+            grid.innerHTML = `<div style="color:var(--text-muted); font-size:13px; padding:48px; text-align:center; grid-column:1/-1; border:1px dashed var(--border); border-radius:10px;">
+                <div style="font-size:36px; margin-bottom:8px;">🐺</div>
+                <div style="font-weight:600; color:var(--text); margin-bottom:6px;">No agents yet</div>
+                <div>Create your first agent — name it, give it a role, start chatting.</div>
+                <button class="btn btn-primary" style="margin-top:14px;" onclick="wolfAgentsOpenCreate()">+ New Agent</button>
+            </div>`;
+            return;
+        }
+        grid.innerHTML = agents.map(a => wolfAgentsCardHtml(a)).join('');
+    } catch (e) {
+        grid.innerHTML = `<div style="color:#ef4444; font-size:13px; padding:24px; text-align:center; grid-column:1/-1;">Failed to load agents: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function wolfAgentsCardHtml(a) {
+    const lastActive = a.last_active_at
+        ? new Date(a.last_active_at * 1000).toLocaleString()
+        : '—';
+    const toolCount = (a.allowed_tools || []).length;
+    const discord = a.discord
+        ? `<span style="font-size:10px; background:rgba(88,101,242,0.15); color:#8a93f0; padding:2px 6px; border-radius:3px; margin-left:6px;">Discord</span>`
+        : '';
+    return `<div class="card" style="cursor:pointer; transition:transform 0.12s, border-color 0.12s;" onclick="wolfAgentsOpenChat('${escapeAttr(a.id)}')"
+                onmouseover="this.style.transform='translateY(-2px)'; this.style.borderColor='rgba(168,85,247,0.45)';"
+                onmouseout="this.style.transform=''; this.style.borderColor='';">
+        <div class="card-body">
+            <div style="display:flex; align-items:center; gap:10px; margin-bottom:8px;">
+                <div style="width:36px; height:36px; background:linear-gradient(135deg,#a855f7,#6366f1); border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:20px;">🐺</div>
+                <div style="flex:1; min-width:0;">
+                    <div style="font-weight:600; font-size:14px;">${escapeHtml(a.name)} ${discord}</div>
+                    <div style="font-size:11px; color:var(--text-muted); font-family:var(--font-mono,monospace);">${escapeHtml(a.id)}</div>
+                </div>
+            </div>
+            <div style="font-size:12px; color:var(--text-muted); margin-bottom:4px;">${escapeHtml(a.provider)} · <span style="font-family:var(--font-mono,monospace);">${escapeHtml(a.model)}</span></div>
+            <div style="font-size:12px; color:var(--text); margin:8px 0; max-height:48px; overflow:hidden; text-overflow:ellipsis; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;">${escapeHtml((a.system_prompt || '').slice(0, 160))}</div>
+            <div style="display:flex; justify-content:space-between; font-size:11px; color:var(--text-muted); margin-top:10px; padding-top:8px; border-top:1px solid var(--border);">
+                <span>${toolCount} tool${toolCount === 1 ? '' : 's'}</span>
+                <span>Last: ${escapeHtml(lastActive)}</span>
+            </div>
+        </div>
+    </div>`;
+}
+
+async function wolfAgentsOpenChat(id) {
+    _wolfAgentsActiveId = id;
+    try {
+        const resp = await fetch(`/api/agents/${encodeURIComponent(id)}`, { credentials: 'include' });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const agent = await resp.json();
+        document.getElementById('wolfagents-chat-title').textContent = `💬 ${agent.name}`;
+        document.getElementById('wolfagents-chat-meta').textContent = `${agent.provider} · ${agent.model}`;
+        document.getElementById('wolfagents-chat').style.display = '';
+        // Scroll into view so it's obvious we opened.
+        document.getElementById('wolfagents-chat').scrollIntoView({ behavior: 'smooth', block: 'center' });
+        await wolfAgentsLoadMemory(id);
+    } catch (e) {
+        showToast('Failed to open agent: ' + e.message, 'error');
+    }
+}
+
+function wolfAgentsCloseChat() {
+    _wolfAgentsActiveId = null;
+    document.getElementById('wolfagents-chat').style.display = 'none';
+    document.getElementById('wolfagents-chat-log').innerHTML = '';
+}
+
+async function wolfAgentsLoadMemory(id) {
+    const log = document.getElementById('wolfagents-chat-log');
+    log.innerHTML = `<div style="color:var(--text-muted); font-size:12px;">Loading history…</div>`;
+    try {
+        const resp = await fetch(`/api/agents/${encodeURIComponent(id)}/memory?limit=100`, { credentials: 'include' });
+        const mem = resp.ok ? await resp.json() : [];
+        if (!Array.isArray(mem) || mem.length === 0) {
+            log.innerHTML = `<div style="color:var(--text-muted); font-size:12px;">No history yet. Say hello.</div>`;
+            return;
+        }
+        log.innerHTML = mem.map(m => wolfAgentsMessageHtml(m.role, m.content, m.ts)).join('');
+        log.scrollTop = log.scrollHeight;
+    } catch (e) {
+        log.innerHTML = `<div style="color:#ef4444; font-size:12px;">Failed to load history: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function wolfAgentsMessageHtml(role, content, ts) {
+    const isUser = role === 'user';
+    const align = isUser ? 'flex-end' : 'flex-start';
+    const bg = isUser ? 'rgba(99,102,241,0.18)' : 'rgba(168,85,247,0.12)';
+    const border = isUser ? 'rgba(99,102,241,0.4)' : 'rgba(168,85,247,0.3)';
+    const tsLabel = ts ? new Date(ts * 1000).toLocaleTimeString() : '';
+    return `<div style="display:flex; justify-content:${align}; margin-bottom:10px;">
+        <div style="max-width:80%; background:${bg}; border:1px solid ${border}; border-radius:10px; padding:10px 14px;">
+            <div style="font-size:10px; color:var(--text-muted); margin-bottom:4px;">${isUser ? 'You' : 'Agent'}${tsLabel ? ' · ' + escapeHtml(tsLabel) : ''}</div>
+            <div style="white-space:pre-wrap; word-break:break-word;">${escapeHtml(content)}</div>
+        </div>
+    </div>`;
+}
+
+async function wolfAgentsSendMessage() {
+    const id = _wolfAgentsActiveId;
+    if (!id) return;
+    const inp = document.getElementById('wolfagents-chat-input');
+    const msg = (inp.value || '').trim();
+    if (!msg) return;
+    inp.value = '';
+    inp.disabled = true;
+    const log = document.getElementById('wolfagents-chat-log');
+    const nowSec = Math.floor(Date.now() / 1000);
+    log.insertAdjacentHTML('beforeend', wolfAgentsMessageHtml('user', msg, nowSec));
+    const thinking = document.createElement('div');
+    thinking.innerHTML = wolfAgentsMessageHtml('assistant', '⏳ thinking…', nowSec);
+    log.appendChild(thinking);
+    log.scrollTop = log.scrollHeight;
+    try {
+        const resp = await fetch(`/api/agents/${encodeURIComponent(id)}/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ message: msg }),
+        });
+        const data = await resp.json();
+        thinking.remove();
+        if (resp.ok && data.response) {
+            log.insertAdjacentHTML('beforeend', wolfAgentsMessageHtml('assistant', data.response, Math.floor(Date.now() / 1000)));
+        } else {
+            log.insertAdjacentHTML('beforeend', wolfAgentsMessageHtml('assistant', `⚠️ ${data.error || ('HTTP ' + resp.status)}`, Math.floor(Date.now() / 1000)));
+        }
+        log.scrollTop = log.scrollHeight;
+    } catch (e) {
+        thinking.remove();
+        log.insertAdjacentHTML('beforeend', wolfAgentsMessageHtml('assistant', `⚠️ ${e.message}`, Math.floor(Date.now() / 1000)));
+    } finally {
+        inp.disabled = false;
+        inp.focus();
+    }
+}
+
+function wolfAgentsOpenCreate() {
+    // Clear the modal to defaults for a new agent.
+    _wolfAgentsEditId = null;
+    document.getElementById('wolfagents-modal-title').textContent = 'New Agent';
+    document.getElementById('wolfagents-field-name').value = '';
+    document.getElementById('wolfagents-field-system').value = 'You are a helpful operations assistant. Answer concisely. When unsure, say so.';
+    document.getElementById('wolfagents-field-provider').value = 'claude';
+    document.getElementById('wolfagents-field-model').value = '';
+    document.getElementById('wolfagents-field-memlines').value = '40';
+    document.getElementById('wolfagents-field-discord-id').value = '';
+    document.getElementById('wolfagents-field-discord-label').value = '';
+    document.getElementById('wolfagents-modal').style.display = 'flex';
+}
+
+let _wolfAgentsEditId = null;
+
+async function wolfAgentsOpenEdit() {
+    const id = _wolfAgentsActiveId;
+    if (!id) return;
+    try {
+        const resp = await fetch(`/api/agents/${encodeURIComponent(id)}`, { credentials: 'include' });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const a = await resp.json();
+        _wolfAgentsEditId = id;
+        document.getElementById('wolfagents-modal-title').textContent = `Edit — ${a.name}`;
+        document.getElementById('wolfagents-field-name').value = a.name || '';
+        document.getElementById('wolfagents-field-system').value = a.system_prompt || '';
+        document.getElementById('wolfagents-field-provider').value = a.provider || 'claude';
+        document.getElementById('wolfagents-field-model').value = a.model || '';
+        document.getElementById('wolfagents-field-memlines').value = a.memory_max_lines || 40;
+        document.getElementById('wolfagents-field-discord-id').value = (a.discord && a.discord.channel_id) || '';
+        document.getElementById('wolfagents-field-discord-label').value = (a.discord && a.discord.channel_label) || '';
+        document.getElementById('wolfagents-modal').style.display = 'flex';
+    } catch (e) {
+        showToast('Failed to load agent: ' + e.message, 'error');
+    }
+}
+
+function wolfAgentsCloseModal() {
+    document.getElementById('wolfagents-modal').style.display = 'none';
+}
+
+async function wolfAgentsSaveFromModal() {
+    const payload = {
+        name: (document.getElementById('wolfagents-field-name').value || '').trim(),
+        system_prompt: document.getElementById('wolfagents-field-system').value,
+        provider: document.getElementById('wolfagents-field-provider').value,
+        model: (document.getElementById('wolfagents-field-model').value || '').trim(),
+        memory_max_lines: parseInt(document.getElementById('wolfagents-field-memlines').value) || 40,
+    };
+    if (!payload.name) { showToast('Name is required', 'warn'); return; }
+    const discordId = (document.getElementById('wolfagents-field-discord-id').value || '').trim();
+    const discordLabel = (document.getElementById('wolfagents-field-discord-label').value || '').trim();
+    if (discordId) {
+        payload.discord = { channel_id: discordId, channel_label: discordLabel };
+    } else if (_wolfAgentsEditId) {
+        // Editing: explicit null clears a previously-set binding.
+        payload.discord = null;
+    }
+    const method = _wolfAgentsEditId ? 'PUT' : 'POST';
+    const url = _wolfAgentsEditId
+        ? `/api/agents/${encodeURIComponent(_wolfAgentsEditId)}`
+        : '/api/agents';
+    try {
+        const resp = await fetch(url, {
+            method,
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+            showToast('Failed: ' + (data.error || `HTTP ${resp.status}`), 'error');
+            return;
+        }
+        showToast(_wolfAgentsEditId ? 'Agent updated' : 'Agent created', 'success');
+        wolfAgentsCloseModal();
+        wolfAgentsLoad();
+        // If this was an edit of the currently-open chat, refresh its header
+        if (_wolfAgentsEditId && _wolfAgentsActiveId === _wolfAgentsEditId) {
+            await wolfAgentsOpenChat(_wolfAgentsActiveId);
+        }
+    } catch (e) {
+        showToast('Failed: ' + e.message, 'error');
+    }
+}
+
+async function wolfAgentsDelete() {
+    const id = _wolfAgentsActiveId;
+    if (!id) return;
+    if (!await showConfirm('Delete this agent and its entire memory? This cannot be undone.')) return;
+    try {
+        const resp = await fetch(`/api/agents/${encodeURIComponent(id)}`, {
+            method: 'DELETE',
+            credentials: 'include',
+        });
+        if (!resp.ok) {
+            const d = await resp.json().catch(() => ({}));
+            showToast('Failed: ' + (d.error || `HTTP ${resp.status}`), 'error');
+            return;
+        }
+        showToast('Agent deleted', 'success');
+        wolfAgentsCloseChat();
+        wolfAgentsLoad();
+    } catch (e) {
+        showToast('Failed: ' + e.message, 'error');
+    }
 }

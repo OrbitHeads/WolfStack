@@ -49,6 +49,14 @@ pub struct DependencyCheck {
     /// Fires true when AI is genuinely useful here (i.e. it's not a
     /// plain "apt install X" fix but something where context matters).
     pub ai_helpful: bool,
+    /// Logical package name the System Check UI's "Install" button
+    /// passes to `POST /api/system/install-package`. Set this when the
+    /// fix is straightforward (apt/pacman/dnf install X) and the
+    /// package is in `installer::packages::PACKAGES`. `None` means no
+    /// auto-install button — the user has to follow `install_hint`
+    /// manually (e.g. for kernel modules, manual config, etc.).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub install_package: Option<String>,
 }
 
 /// Is a binary on PATH? Returns (found, version-string).
@@ -133,6 +141,7 @@ pub fn run_checks() -> Vec<DependencyCheck> {
             status: DepStatus::Ok, version: ver,
             detail: "Proxmox hypervisor detected — PVE integration active".into(),
             install_hint: None, ai_helpful: false,
+            install_package: None,
         });
     }
 
@@ -179,6 +188,13 @@ pub fn run_checks() -> Vec<DependencyCheck> {
     out.push(check_kernel_module("usbip_host", "USB",
         "USB sharing (server) — export local USB to the cluster"));
 
+    // ─── Scheduling / cron ──────────────────────────────────────
+    // Arch ships zero cron daemon by default; Settings → Cron and any
+    // crontab-based feature silently fail with "command not found"
+    // until cronie is installed. Surface as a Missing finding with the
+    // one-click installer hooked up to /api/system/install-package.
+    out.push(check_cron());
+
     // ─── Architecture-specific guards ───────────────────────────
     if arch == "powerpc64" || arch == "powerpc64le" {
         out.push(DependencyCheck {
@@ -187,6 +203,7 @@ pub fn run_checks() -> Vec<DependencyCheck> {
             detail: "IBM Power architecture — some VM backends (amd64 ISOs) won't boot here".into(),
             install_hint: Some("Use ppc64le ISOs for VM installs".into()),
             ai_helpful: true,
+            install_package: None,
         });
     }
     if is_alpine {
@@ -263,6 +280,7 @@ fn simple_inner(
         detail,
         install_hint: if found { None } else { Some(install) },
         ai_helpful,
+        install_package: None,
     }
 }
 
@@ -275,6 +293,7 @@ fn check_docker() -> DependencyCheck {
             detail: "Docker not installed — app store Docker installs will fail".into(),
             install_hint: Some(hint("docker.io", "docker-ce", "docker", "docker")),
             ai_helpful: true,
+            install_package: None,
         };
     }
     // Can we actually talk to the daemon? `docker info` exits non-zero
@@ -289,6 +308,7 @@ fn check_docker() -> DependencyCheck {
             status: DepStatus::Ok, version: ver,
             detail: "Docker installed, daemon reachable".into(),
             install_hint: None, ai_helpful: false,
+            install_package: None,
         };
     }
     // It's there but something's off. Build a detailed reason from the
@@ -316,6 +336,7 @@ fn check_docker() -> DependencyCheck {
             "usermod -aG docker $USER && newgrp docker".into()
         }),
         ai_helpful: true,
+        install_package: None,
     }
 }
 
@@ -329,6 +350,7 @@ fn check_containerd() -> DependencyCheck {
             detail: "containerd not installed — Docker will not start without it".into(),
             install_hint: Some(hint("containerd", "containerd.io", "containerd", "containerd")),
             ai_helpful: false,
+            install_package: None,
         };
     }
     DependencyCheck {
@@ -339,6 +361,7 @@ fn check_containerd() -> DependencyCheck {
                 else       { "containerd installed but service is not running".into() },
         install_hint: if running { None } else { Some("systemctl enable --now containerd".into()) },
         ai_helpful: !running,
+        install_package: None,
     }
 }
 
@@ -365,6 +388,7 @@ fn check_qemu() -> DependencyCheck {
             ))
         },
         ai_helpful: !found,
+        install_package: if found { None } else { Some("qemu".into()) },
     }
 }
 
@@ -380,6 +404,7 @@ fn check_brctl() -> DependencyCheck {
             detail: if brctl_ok { "brctl present".into() }
                     else        { "ip link (iproute2) present — brctl not required".into() },
             install_hint: None, ai_helpful: false,
+            install_package: None,
         };
     }
     DependencyCheck {
@@ -388,6 +413,7 @@ fn check_brctl() -> DependencyCheck {
         detail: "Neither brctl nor iproute2 found — bridges can't be created".into(),
         install_hint: Some(hint("bridge-utils", "bridge-utils", "bridge-utils", "bridge-utils")),
         ai_helpful: false,
+        install_package: None,
     }
 }
 
@@ -405,6 +431,7 @@ fn check_tun() -> DependencyCheck {
             Some("modprobe tun && mkdir -p /dev/net && mknod /dev/net/tun c 10 200".into())
         },
         ai_helpful: !exists,
+        install_package: None,
     }
 }
 
@@ -427,6 +454,7 @@ fn check_fuse3() -> DependencyCheck {
                 else     { "libfuse3 not found — user-space mounts (S3, SSHFS, WolfDisk) will fail".into() },
         install_hint: if found { None } else { Some(hint("libfuse3-3", "fuse3", "fuse3", "fuse3")) },
         ai_helpful: !found,
+        install_package: None,
     }
 }
 
@@ -443,6 +471,7 @@ fn check_kernel_module(modname: &str, category: &str, why: &str) -> DependencyCh
             status: DepStatus::Ok, version: None,
             detail: format!("{} loaded", modname),
             install_hint: None, ai_helpful: false,
+            install_package: None,
         };
     }
     // Does modprobe know about it without actually loading?
@@ -465,6 +494,43 @@ fn check_kernel_module(modname: &str, category: &str, why: &str) -> DependencyCh
             ))
         },
         ai_helpful: !known,
+        install_package: None,
+    }
+}
+
+fn check_cron() -> DependencyCheck {
+    let (found, ver) = bin_check("crontab", &["-V"]);
+    // The binary alone isn't enough — without a running daemon, jobs
+    // never fire. Probe the most common unit names across distros.
+    let svc_up = svc_active("cronie") || svc_active("cron")
+        || svc_active("crond") || svc_active("vixie-cron");
+    let status = if !found { DepStatus::Missing }
+                 else if !svc_up { DepStatus::Warning }
+                 else { DepStatus::Ok };
+    let detail = if !found {
+        "No `crontab` on PATH — Settings → Cron and any scheduled task feature will fail. Common on Arch (no cron ships by default) and minimal containers.".into()
+    } else if !svc_up {
+        "crontab installed but no cron daemon (cronie/cron/crond) is active — jobs won't run until you enable+start the service.".into()
+    } else {
+        "crontab + active cron daemon — scheduled jobs will run.".into()
+    };
+    let install_hint = if !found {
+        Some(hint("cron", "cronie", "cronie", "cron"))
+    } else if !svc_up {
+        Some("systemctl enable --now cronie  (or `cron` on Debian/Ubuntu)".into())
+    } else { None };
+    DependencyCheck {
+        name: "cron".into(),
+        category: "Scheduling".into(),
+        status,
+        version: ver,
+        detail,
+        install_hint,
+        ai_helpful: false,
+        // Wire the one-click installer for the Missing case. When the
+        // daemon's just stopped we don't auto-install (already there)
+        // — the user just needs to start it; the hint above tells them.
+        install_package: if !found { Some("cron".into()) } else { None },
     }
 }
 
@@ -487,6 +553,7 @@ fn check_kernel() -> DependencyCheck {
             Some("Upgrade your kernel package — WolfStack needs 5.4+ for WolfNet/cgroup2".into())
         } else { None },
         ai_helpful: too_old,
+        install_package: None,
     }
 }
 

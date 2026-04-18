@@ -502,6 +502,386 @@ fn wolfusb_detach_device(source_address: &str, busid: &str, session_id: u64) -> 
     Ok(())
 }
 
+// ─── Recovery & diagnostics ───
+//
+// These functions power the "Re-attach" and "Diagnose" buttons in
+// the WolfUSB page. The goal is to give operators a visible,
+// step-by-step view of the passthrough chain so silent failures
+// (usbip-server unreachable, device not exported, stale mount unit)
+// stop being invisible.
+
+/// One step in the diagnostic walk. `ok=false` with a meaningful
+/// `detail` tells the operator exactly where the chain broke.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DiagnosticStep {
+    pub step: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// Walk the full passthrough chain for an assignment and report
+/// per-step pass/fail. Read-only — safe to call repeatedly. Returns
+/// the steps in order so the UI can render a checklist the operator
+/// reads top-to-bottom.
+pub fn diagnose(busid: &str) -> Vec<DiagnosticStep> {
+    let mut out = Vec::new();
+    let config = WolfUsbConfig::load();
+    let Some(a) = config.assignments.iter().find(|a| a.busid == busid).cloned() else {
+        out.push(DiagnosticStep {
+            step: "Find assignment".into(),
+            ok: false,
+            detail: format!("No assignment exists for busid {} — was it unassigned from another node?", busid),
+        });
+        return out;
+    };
+    out.push(DiagnosticStep {
+        step: "Find assignment".into(),
+        ok: true,
+        detail: format!(
+            "source={} → target={} ({}:{})",
+            a.source_hostname, a.target_hostname, a.target_type, a.target_name
+        ),
+    });
+
+    let self_id = crate::agent::self_node_id();
+    let source_is_self = a.source_node_id == self_id;
+    let target_is_self = a.target_node_id == self_id;
+
+    // Kernel modules — source needs usbip-host, target needs vhci_hcd.
+    let kmod = kernel_module_status();
+    if source_is_self {
+        out.push(DiagnosticStep {
+            step: "Source kernel modules".into(),
+            ok: kmod.usbip_host_loaded,
+            detail: if kmod.usbip_host_loaded {
+                "usbip-host module loaded on this (source) node".into()
+            } else {
+                format!("usbip-host NOT loaded. {}", kmod.install_hint)
+            },
+        });
+    }
+    if target_is_self {
+        out.push(DiagnosticStep {
+            step: "Target kernel modules".into(),
+            ok: kmod.vhci_hcd_loaded,
+            detail: if kmod.vhci_hcd_loaded {
+                "vhci_hcd module loaded on this (target) node".into()
+            } else {
+                format!("vhci_hcd NOT loaded. {}", kmod.install_hint)
+            },
+        });
+    }
+
+    // Source reachability — TCP probe the usbip port.
+    if !a.source_address.is_empty() {
+        let addr = format!("{}:3240", a.source_address);
+        let reachable = std::net::TcpStream::connect_timeout(
+            &match addr.parse::<std::net::SocketAddr>() {
+                Ok(s) => s,
+                // Fall back to DNS-resolving a hostname — we only do
+                // this on failure to avoid the blocking path when the
+                // address is a literal.
+                Err(_) => match std::net::ToSocketAddrs::to_socket_addrs(&addr) {
+                    Ok(mut iter) => match iter.next() {
+                        Some(s) => s,
+                        None => {
+                            out.push(DiagnosticStep {
+                                step: "Source reachable (port 3240)".into(),
+                                ok: false,
+                                detail: format!("could not resolve {}", a.source_address),
+                            });
+                            return out;
+                        }
+                    },
+                    Err(e) => {
+                        out.push(DiagnosticStep {
+                            step: "Source reachable (port 3240)".into(),
+                            ok: false,
+                            detail: format!("DNS resolution failed for {}: {}", a.source_address, e),
+                        });
+                        return out;
+                    }
+                }
+            },
+            std::time::Duration::from_secs(3),
+        ).is_ok();
+        out.push(DiagnosticStep {
+            step: "Source reachable (port 3240)".into(),
+            ok: reachable,
+            detail: if reachable {
+                format!("TCP connect to {} succeeded", addr)
+            } else {
+                format!(
+                    "Cannot reach {}. Is wolfusb-server running on the source? \
+                     `systemctl status wolfusb` on {} will confirm.",
+                    addr, a.source_hostname
+                )
+            },
+        });
+        // Ask the source's wolfusb server for the device list and
+        // check the busid is in the inventory.
+        if reachable {
+            let listed = run_wolfusb_with_fallback(&[
+                "list", "--server", &addr, "--json"
+            ]);
+            match listed {
+                Ok(out_str) => {
+                    let has_device = out_str.contains(busid);
+                    out.push(DiagnosticStep {
+                        step: "Device exported on source".into(),
+                        ok: has_device,
+                        detail: if has_device {
+                            format!("busid {} is in the source's exportable device list", busid)
+                        } else {
+                            format!(
+                                "Source's wolfusb server does NOT list busid {}. \
+                                 The stick may need to be unplugged/replugged, or usbip-host \
+                                 is already claimed by another process. \
+                                 Try Re-attach to force prepare-for-export.",
+                                busid
+                            )
+                        },
+                    });
+                }
+                Err(e) => {
+                    out.push(DiagnosticStep {
+                        step: "Device exported on source".into(),
+                        ok: false,
+                        detail: format!("wolfusb list failed: {}", e),
+                    });
+                }
+            }
+        }
+    }
+
+    // Target side — mount unit + host bus presence.
+    if target_is_self {
+        let unit_name = format!(
+            "wolfusb-mount@{}-{}.service",
+            busid.replace('-', "_"), a.target_name
+        );
+        let unit_active = Command::new("systemctl")
+            .args(["is-active", "--quiet", &unit_name])
+            .status().map(|s| s.success()).unwrap_or(false);
+        let unit_exists = std::path::Path::new(
+            &format!("/etc/systemd/system/{}", unit_name)
+        ).exists();
+        out.push(DiagnosticStep {
+            step: "Mount unit on target".into(),
+            ok: unit_exists && unit_active,
+            detail: if unit_active {
+                format!("systemd unit {} is active", unit_name)
+            } else if unit_exists {
+                format!(
+                    "Mount unit {} exists but is NOT active. `journalctl -u {} -n 30` \
+                     will show why it failed to start.",
+                    unit_name, unit_name
+                )
+            } else {
+                format!(
+                    "No mount unit installed. Click Re-attach to install it, or \
+                     reassign the device from the WolfUSB page."
+                )
+            },
+        });
+        // Final proof — is the device actually on the host's USB bus?
+        let device_present = find_dev_path(busid).is_some();
+        out.push(DiagnosticStep {
+            step: "Device present on target bus".into(),
+            ok: device_present,
+            detail: if device_present {
+                "Device found in /dev/bus/usb — QEMU's -device usb-host should find it".into()
+            } else {
+                "Device NOT on this host's USB bus. QEMU's -device usb-host will silently \
+                 fail to bind it. This is the root cause for a VM that 'says passthrough' \
+                 but doesn't actually have the device.".into()
+            },
+        });
+    }
+
+    out
+}
+
+/// Report for one step of a re-attach recovery run. Same shape as
+/// DiagnosticStep but distinct so the UI can render them differently
+/// (diagnose is passive, reattach is mutating).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReattachStep {
+    pub step: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// Force-rerun the full attach chain for an existing assignment. Used
+/// by the "Re-attach" button when a migration or mount failure has
+/// left a passthrough stale. This function runs on the TARGET node
+/// (the API layer proxies the call if needed). It:
+///
+/// 1. If cross-node: POSTs to source's /api/wolfusb/prepare-for-export
+///    to ensure the device is unbound locally and usbip-bound.
+/// 2. Stops+removes any stale mount unit for this busid+target.
+/// 3. Runs attach_and_passthrough which re-installs the mount unit,
+///    waits for the device to appear, and calls passthrough_to_vm /
+///    passthrough_to_docker / passthrough_to_lxc.
+///
+/// Returns a vector of steps so the UI can show what succeeded and
+/// where the chain broke.
+pub fn reattach_local(busid: &str) -> Vec<ReattachStep> {
+    let mut out = Vec::new();
+    let config = WolfUsbConfig::load();
+    let Some(a) = config.assignments.iter().find(|a| a.busid == busid).cloned() else {
+        out.push(ReattachStep {
+            step: "Find assignment".into(),
+            ok: false,
+            detail: format!("No assignment exists for busid {}", busid),
+        });
+        return out;
+    };
+    let self_id = crate::agent::self_node_id();
+    if a.target_node_id != self_id {
+        out.push(ReattachStep {
+            step: "Locate target node".into(),
+            ok: false,
+            detail: format!(
+                "Assignment target is {} but we're {} — the API should have \
+                 proxied the reattach to the target node. This likely means \
+                 the target is offline.",
+                a.target_hostname, self_id
+            ),
+        });
+        return out;
+    }
+    out.push(ReattachStep {
+        step: "Locate target node".into(),
+        ok: true,
+        detail: format!("target is this node ({})", a.target_hostname),
+    });
+
+    // Stop any stale mount unit so attach_and_passthrough starts from
+    // a clean slate. Failures here are non-fatal — either the unit
+    // doesn't exist (nothing to stop) or it's already dead.
+    let unit_name = format!(
+        "wolfusb-mount@{}-{}.service",
+        busid.replace('-', "_"), a.target_name
+    );
+    let _ = Command::new("systemctl").args(["stop", &unit_name]).status();
+    let _ = Command::new("systemctl").args(["reset-failed", &unit_name]).status();
+    out.push(ReattachStep {
+        step: "Clean stale mount unit".into(),
+        ok: true,
+        detail: format!("systemctl stop {} (idempotent)", unit_name),
+    });
+
+    // The right path depends on whether source is local or remote.
+    if a.source_node_id == self_id {
+        // Local: device is physically here. Run the direct-passthrough
+        // code, same as a fresh assignment.
+        match local_passthrough(busid, &a.target_type, &a.target_name) {
+            Ok(m) => out.push(ReattachStep {
+                step: "Local passthrough".into(),
+                ok: true,
+                detail: m,
+            }),
+            Err(e) => out.push(ReattachStep {
+                step: "Local passthrough".into(),
+                ok: false,
+                detail: e,
+            }),
+        }
+        return out;
+    }
+
+    // Cross-node: we need the source to have the device usbip-bound
+    // BEFORE we try attach_and_passthrough, otherwise usbip-attach
+    // will silently fail. The API layer (not this function) is in
+    // charge of calling source's prepare-for-export endpoint first
+    // — we just assume that happened and try to attach.
+    match attach_and_passthrough(&a.source_address, busid, &a.target_type, &a.target_name) {
+        Ok(m) => out.push(ReattachStep {
+            step: "Attach + passthrough".into(),
+            ok: true,
+            detail: m,
+        }),
+        Err(e) => out.push(ReattachStep {
+            step: "Attach + passthrough".into(),
+            ok: false,
+            detail: e,
+        }),
+    }
+    out
+}
+
+/// Prepare the LOCAL node to export a USB device via usbip. Called on
+/// the SOURCE node by a TARGET node that's trying to attach cross-
+/// node (typically after a VM migration).
+///
+/// Steps:
+/// 1. Ensure the wolfusb server is running (systemd supervised).
+/// 2. Confirm the device is actually present on the host bus.
+/// 3. Confirm the kernel module usbip-host is loaded (required for
+///    the server to hand the device to usbip-host).
+/// 4. Return OK — the actual `usbip bind` happens when the target's
+///    `wolfusb mount` connects and requests it.
+///
+/// Returns a list of steps so the target sees exactly what the source
+/// did (or didn't) do. Safe to call repeatedly — everything here is
+/// idempotent.
+pub fn prepare_for_export(busid: &str) -> Vec<ReattachStep> {
+    let mut out = Vec::new();
+    // Step 1: wolfusb server. ensure_wolfusb_server is idempotent —
+    // it installs the systemd unit if missing and starts it if not
+    // running.
+    ensure_wolfusb_server();
+    let server_active = Command::new("systemctl")
+        .args(["is-active", "--quiet", "wolfusb.service"])
+        .status().map(|s| s.success()).unwrap_or(false);
+    out.push(ReattachStep {
+        step: "wolfusb server".into(),
+        ok: server_active,
+        detail: if server_active {
+            "systemd unit wolfusb.service is active".into()
+        } else {
+            "wolfusb.service failed to start. `journalctl -u wolfusb -n 40` for detail.".into()
+        },
+    });
+    if !server_active { return out; }
+
+    // Step 2: device present on our bus. If it was claimed by a dead
+    // QEMU, the device will still be here but claimed by another
+    // driver — the wolfusb server will try to re-bind it to usbip-
+    // host when the target connects. If it's not here at all the
+    // device was physically unplugged or moved to another host.
+    let device_present = find_dev_path(busid).is_some();
+    out.push(ReattachStep {
+        step: "Device on local bus".into(),
+        ok: device_present,
+        detail: if device_present {
+            format!("busid {} visible on /dev/bus/usb", busid)
+        } else {
+            format!(
+                "busid {} is NOT on this host. Device may be unplugged, \
+                 or on a different physical host.",
+                busid
+            )
+        },
+    });
+
+    // Step 3: kernel module. Without usbip-host the server can't bind
+    // devices for export, period.
+    let kmod = kernel_module_status();
+    out.push(ReattachStep {
+        step: "Kernel module usbip-host".into(),
+        ok: kmod.usbip_host_loaded,
+        detail: if kmod.usbip_host_loaded {
+            "usbip-host loaded".into()
+        } else {
+            format!("usbip-host NOT loaded. {}", kmod.install_hint)
+        },
+    });
+
+    out
+}
+
 // ─── Install ───
 
 /// Shell-escape a string for use inside single quotes

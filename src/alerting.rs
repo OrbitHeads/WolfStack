@@ -110,6 +110,37 @@ pub struct AlertConfig {
     #[serde(default)]
     pub telegram_chat_id: String,
 
+    /// Discord *bot* token — distinct from `discord_webhook`. Used by
+    /// the Discord receiver to log in as a bot, receive messages in
+    /// bound channels, and reply on behalf of WolfAgents. Never send
+    /// this to anyone — it grants full bot-account control. Masked
+    /// in the frontend via `to_masked_json()`.
+    #[serde(default)]
+    pub discord_bot_token: String,
+
+    /// Enable the Telegram receiver loop. The bot token from
+    /// `telegram_bot_token` has been there for outbound alerts for
+    /// ages — we gate inbound behind this separate flag so existing
+    /// installs don't suddenly start long-polling messages without
+    /// operator consent.
+    #[serde(default)]
+    pub telegram_receiver_enabled: bool,
+
+    /// Twilio account SID — used for WhatsApp replies. Twilio's
+    /// inbound webhook delivers messages to /api/whatsapp/webhook,
+    /// outbound replies go through the REST API with these creds.
+    #[serde(default)]
+    pub twilio_account_sid: String,
+    /// Twilio auth token — signed HMAC header on inbound webhooks is
+    /// validated against this. Masked in `to_masked_json()`.
+    #[serde(default)]
+    pub twilio_auth_token: String,
+    /// Twilio-registered WhatsApp sender in E.164 form with the
+    /// `whatsapp:` prefix — e.g. `whatsapp:+14155238886` (the
+    /// Twilio sandbox number). Used as the "From" on replies.
+    #[serde(default)]
+    pub twilio_whatsapp_from: String,
+
     // ── Threshold rules ──
     #[serde(default = "default_cpu_threshold")]
     pub cpu_threshold: f32,     // percentage (0-100)
@@ -179,6 +210,11 @@ impl Default for AlertConfig {
             container_memory_threshold: 90.0,
             check_interval_secs: 60,
             security_scan_interval_secs: 4 * 60 * 60,
+            discord_bot_token: String::new(),
+            telegram_receiver_enabled: false,
+            twilio_account_sid: String::new(),
+            twilio_auth_token: String::new(),
+            twilio_whatsapp_from: String::new(),
         }
     }
 }
@@ -193,14 +229,28 @@ impl AlertConfig {
         }
     }
 
-    /// Save config to disk
+    /// Save config to disk. Sets 0o600 on the file because it can
+    /// carry secrets (Discord/Slack webhook URLs, Telegram bot token,
+    /// SMTP password, and — once wired — a Discord *bot* token that's
+    /// vastly more sensitive than a webhook). /etc/wolfstack defaults
+    /// to 755, so without this the file would be world-readable.
     pub fn save(&self) -> Result<(), String> {
         let path = alerts_config_file();
         if let Some(dir) = std::path::Path::new(&path).parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&path, json).map_err(|e| format!("Failed to write alerts config: {}", e))
+        std::fs::write(&path, json).map_err(|e| format!("Failed to write alerts config: {}", e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&path) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o600);
+                let _ = std::fs::set_permissions(&path, perms);
+            }
+        }
+        Ok(())
     }
 
     /// Check if any notification channel is configured
@@ -233,6 +283,11 @@ impl AlertConfig {
             "container_memory_threshold": self.container_memory_threshold,
             "check_interval_secs": self.check_interval_secs,
             "security_scan_interval_secs": self.security_scan_interval_secs,
+            "has_discord_bot": !self.discord_bot_token.is_empty(),
+            "telegram_receiver_enabled": self.telegram_receiver_enabled,
+            "twilio_account_sid": self.twilio_account_sid,
+            "has_twilio_auth": !self.twilio_auth_token.is_empty(),
+            "twilio_whatsapp_from": self.twilio_whatsapp_from,
         })
     }
 }

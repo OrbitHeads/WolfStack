@@ -1323,6 +1323,44 @@ fn build_system_prompt(knowledge: &str, server_context: &str) -> String {
     )
 }
 
+// ─── Simple / stateless chat helper ───
+
+/// Single-shot prompt-to-response against the configured AI provider.
+/// No tool use, no cluster context, no persistent history — just the
+/// conversation history you pass in plus one user message. Returns the
+/// model's text reply.
+///
+/// Used by:
+/// - WolfFlow's `AiInvoke` action (stateless "ask the AI a question")
+/// - WolfAgents (which supplies its own per-agent history from disk)
+/// - any caller that wants a lightweight LLM call without spinning up
+///   the full AiAgent with its cluster-command-execution loop.
+///
+/// The config parameter lets the caller pick a provider/model/key
+/// combination other than AiConfig::load()'s defaults — useful for
+/// per-agent model choice without editing global AI settings.
+pub async fn simple_chat(
+    config: &AiConfig,
+    system_prompt: &str,
+    history: &[ChatMessage],
+    user_message: &str,
+) -> Result<String, String> {
+    if !config.is_configured() {
+        return Err("AI not configured — set provider/key in Settings → AI Agent".to_string());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("http client: {}", e))?;
+    match config.provider.as_str() {
+        "gemini" => call_gemini(&client, &config.gemini_api_key, &config.model, system_prompt, history, user_message).await,
+        "openrouter" => call_local(&client, "https://openrouter.ai/api/v1", &config.openrouter_api_key, &config.model, system_prompt, history, user_message).await,
+        "local" => call_local(&client, &config.local_url, &config.local_api_key, &config.model, system_prompt, history, user_message).await,
+        // Default to Claude (also covers empty/default provider string).
+        _ => call_claude(&client, &config.claude_api_key, &config.model, system_prompt, history, user_message).await,
+    }
+}
+
 // ─── LLM API Calls ───
 
 /// Call a local/self-hosted AI via the OpenAI-compatible chat completions API.

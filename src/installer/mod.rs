@@ -4,6 +4,8 @@
 
 //! Installer — manages installation and status of Wolf suite components
 
+pub mod packages;
+
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 use std::sync::Mutex;
