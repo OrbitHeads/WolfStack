@@ -23643,8 +23643,10 @@ function applyTheme(themeId) {
     // Save preference
     savePref('wolfstack-theme', themeId);
 
-    // Swap logo for light/dark backgrounds
-    const lightThemes = ['light', 'arctic'];
+    // Swap logo for light/dark backgrounds. `light`, `arctic`, and
+    // `fruit` are the light-surface themes — they want the dark-ink
+    // logo so the wolf silhouette stays visible against white/cream.
+    const lightThemes = ['light', 'arctic', 'fruit'];
     const logoSrc = lightThemes.includes(themeId) ? 'images/wolfstack-logo-dark.png' : 'images/wolfstack-logo.png';
     document.querySelectorAll('img[alt="WolfStack"]').forEach(img => { img.src = logoSrc; });
 
