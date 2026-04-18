@@ -37211,17 +37211,45 @@ async function wolfAgentsSendMessage() {
     }
 }
 
+// Populate the "inherited from Settings" info line in the agent modal
+// with the current global AI config, so operators see what provider +
+// model an agent will actually use without having to pick it again.
+async function _wolfAgentsRenderInheritedAi(agent) {
+    const el = document.getElementById('wolfagents-ai-inherited-detail');
+    if (!el) return;
+    // If the agent itself has overrides (backend stores them even
+    // though the UI no longer sets them on create), show the override.
+    if (agent && (agent.provider || agent.model)) {
+        const provider = agent.provider || '(global default)';
+        const model = agent.model || '(global default)';
+        el.innerHTML = `Override — <code>${escapeHtml(provider)}</code> · <code>${escapeHtml(model)}</code>. <a href="#" onclick="selectView('settings'); return false;">Settings → AI Agent</a> still manages API keys.`;
+        return;
+    }
+    try {
+        const r = await fetch('/api/ai/config', { credentials: 'include' });
+        if (r.ok) {
+            const cfg = await r.json();
+            const provider = cfg.provider || '(not set)';
+            const model = cfg.model || '(not set)';
+            el.innerHTML = `Inherits <code>${escapeHtml(provider)}</code> · <code>${escapeHtml(model)}</code> from <a href="#" onclick="selectView('settings'); return false;">Settings → AI Agent</a>`;
+            return;
+        }
+    } catch (e) { /* fall through to default label */ }
+    el.innerHTML = `Inherits from <a href="#" onclick="selectView('settings'); return false;">Settings → AI Agent</a>`;
+}
+
 function wolfAgentsOpenCreate() {
-    // Clear the modal to defaults for a new agent.
+    // Clear the modal to defaults for a new agent. Provider/model
+    // deliberately NOT set here — the backend picks them up from the
+    // global AiConfig on first chat (see wolfagents::chat_with_agent).
     _wolfAgentsEditId = null;
     document.getElementById('wolfagents-modal-title').textContent = 'New Agent';
     document.getElementById('wolfagents-field-name').value = '';
     document.getElementById('wolfagents-field-system').value = 'You are a helpful operations assistant. Answer concisely. When unsure, say so.';
-    document.getElementById('wolfagents-field-provider').value = 'claude';
-    document.getElementById('wolfagents-field-model').value = '';
     document.getElementById('wolfagents-field-memlines').value = '40';
     document.getElementById('wolfagents-field-discord-id').value = '';
     document.getElementById('wolfagents-field-discord-label').value = '';
+    _wolfAgentsRenderInheritedAi(null);
     document.getElementById('wolfagents-modal').style.display = 'flex';
 }
 
@@ -37238,11 +37266,10 @@ async function wolfAgentsOpenEdit() {
         document.getElementById('wolfagents-modal-title').textContent = `Edit — ${a.name}`;
         document.getElementById('wolfagents-field-name').value = a.name || '';
         document.getElementById('wolfagents-field-system').value = a.system_prompt || '';
-        document.getElementById('wolfagents-field-provider').value = a.provider || 'claude';
-        document.getElementById('wolfagents-field-model').value = a.model || '';
         document.getElementById('wolfagents-field-memlines').value = a.memory_max_lines || 40;
         document.getElementById('wolfagents-field-discord-id').value = (a.discord && a.discord.channel_id) || '';
         document.getElementById('wolfagents-field-discord-label').value = (a.discord && a.discord.channel_label) || '';
+        _wolfAgentsRenderInheritedAi(a);
         document.getElementById('wolfagents-modal').style.display = 'flex';
     } catch (e) {
         showToast('Failed to load agent: ' + e.message, 'error');
@@ -37254,11 +37281,15 @@ function wolfAgentsCloseModal() {
 }
 
 async function wolfAgentsSaveFromModal() {
+    // Provider + model deliberately NOT sent here. On create, the
+    // backend's `new_default` seeds them from the global AiConfig so
+    // the agent inherits whatever is configured in Settings → AI
+    // Agent. On edit, omitting these fields means we leave whatever
+    // was there untouched (the agents_update handler only overwrites
+    // fields that arrive in the body).
     const payload = {
         name: (document.getElementById('wolfagents-field-name').value || '').trim(),
         system_prompt: document.getElementById('wolfagents-field-system').value,
-        provider: document.getElementById('wolfagents-field-provider').value,
-        model: (document.getElementById('wolfagents-field-model').value || '').trim(),
         memory_max_lines: parseInt(document.getElementById('wolfagents-field-memlines').value) || 40,
     };
     if (!payload.name) { showToast('Name is required', 'warn'); return; }

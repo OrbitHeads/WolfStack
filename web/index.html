@@ -1639,20 +1639,9 @@
                             <label style="font-size:12px; color:var(--text-muted);">System prompt — the agent's personality/role</label>
                             <textarea id="wolfagents-field-system" class="form-control" rows="6" placeholder="You are Spitfire, the incident commander. Answer in one sentence. If asked to act, ask a clarifying question unless the intent is unambiguous."></textarea>
                         </div>
-                        <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
-                            <div>
-                                <label style="font-size:12px; color:var(--text-muted);">Provider</label>
-                                <select id="wolfagents-field-provider" class="form-control">
-                                    <option value="claude">Claude</option>
-                                    <option value="gemini">Gemini</option>
-                                    <option value="openrouter">OpenRouter</option>
-                                    <option value="local">Local</option>
-                                </select>
-                            </div>
-                            <div>
-                                <label style="font-size:12px; color:var(--text-muted);">Model</label>
-                                <input id="wolfagents-field-model" type="text" class="form-control" placeholder="claude-opus-4-7">
-                            </div>
+                        <div id="wolfagents-ai-inherited" style="font-size:12px; color:var(--text-muted); background:var(--bg-input); border:1px solid var(--border); border-radius:6px; padding:8px 12px;">
+                            <span style="font-weight:600; color:var(--text);">AI model:</span>
+                            <span id="wolfagents-ai-inherited-detail">Inherits from <a href="#" onclick="selectView('settings'); return false;">Settings → AI Agent</a></span>
                         </div>
                         <div>
                             <label style="font-size:12px; color:var(--text-muted);">Memory max lines (rolling window fed back to the model)</label>
