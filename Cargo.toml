@@ -1,6 +1,6 @@
 [package]
 name = "wolfstack"
-version = "18.1.1"
+version = "18.2.0"
 edition = "2024"
 authors = ["Wolf Software Systems Ltd"]
 description = "Server management platform for the Wolf software suite"
@@ -57,6 +57,7 @@ hmac = "0.12"
 data-encoding = "2"
 hex = "0.4"
 base64 = "0.22"
+regex = "1"
 urlencoding = "2"
 rand = "0.8"
 sha-crypt = "0.5"

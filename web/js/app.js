@@ -37045,8 +37045,32 @@ async function wolfusbReattach(busid) {
         const resp = await fetch(apiUrl('/api/wolfusb/reattach/' + encodeURIComponent(busid)), {
             method: 'POST',
         });
-        const data = await resp.json();
-        _wolfusbRenderSteps(data.steps || [], !!data.ok);
+        // Backend returns either {ok, steps: [...]} on the normal path
+        // OR {error: "..."} when it couldn't even start (target node
+        // unreachable, assignment missing). Surface the error as a
+        // single red row rather than the unhelpful "no step data" so
+        // the operator sees WHY the recovery couldn't run.
+        const data = await resp.json().catch(() => ({}));
+        if (Array.isArray(data.steps) && data.steps.length > 0) {
+            _wolfusbRenderSteps(data.steps, !!data.ok);
+        } else if (data.error) {
+            _wolfusbRenderSteps([{
+                step: `Re-attach failed (HTTP ${resp.status})`,
+                ok: false,
+                detail: data.error + '\n\nCommon causes: you are running Re-attach ' +
+                    'from a node that is not the target, and the inter-node proxy ' +
+                    'to the target failed (check cluster secret match, or that ' +
+                    'the target node is online). Workaround: open WolfStack ' +
+                    'directly on the target node and click Re-attach there.',
+            }], false);
+        } else {
+            _wolfusbRenderSteps([{
+                step: `Re-attach returned HTTP ${resp.status}`,
+                ok: false,
+                detail: 'No step data and no error field — check wolfstack logs: ' +
+                    '`journalctl -u wolfstack -n 80 --no-pager | grep -i reattach`',
+            }], false);
+        }
         if (data.ok) {
             // Let the assignments table reflect any new state.
             setTimeout(refreshWolfUsbDevices, 500);
@@ -37125,14 +37149,36 @@ async function wolfAgentsOpenChat(id) {
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const agent = await resp.json();
         document.getElementById('wolfagents-chat-title').textContent = `💬 ${agent.name}`;
-        document.getElementById('wolfagents-chat-meta').textContent = `${agent.provider} · ${agent.model}`;
+        const providerLabel = agent.provider || '(global)';
+        const modelLabel = agent.model || '(global default)';
+        const scopeBits = [];
+        if (agent.access_level) scopeBits.push(agent.access_level);
+        const ts = agent.target_scope || {};
+        if (ts.allowed_clusters && ts.allowed_clusters.length) scopeBits.push(`clusters: ${ts.allowed_clusters.join(', ')}`);
+        if (ts.allowed_container_patterns && ts.allowed_container_patterns.length) scopeBits.push(`containers: ${ts.allowed_container_patterns.join(', ')}`);
+        const scopeLine = scopeBits.length ? ` · ${scopeBits.join(' · ')}` : '';
+        document.getElementById('wolfagents-chat-meta').textContent = `${providerLabel} · ${modelLabel}${scopeLine}`;
         document.getElementById('wolfagents-chat').style.display = '';
-        // Scroll into view so it's obvious we opened.
+        // Default to the chat tab on open.
+        wolfAgentsShowTab('chat');
         document.getElementById('wolfagents-chat').scrollIntoView({ behavior: 'smooth', block: 'center' });
         await wolfAgentsLoadMemory(id);
+        // Refresh the pending badge in the background so operators see
+        // the 🔴 count without having to click the Pending tab first.
+        _wolfAgentsRefreshPendingBadge(id).catch(() => {});
     } catch (e) {
         showToast('Failed to open agent: ' + e.message, 'error');
     }
+}
+
+async function _wolfAgentsRefreshPendingBadge(id) {
+    try {
+        const resp = await fetch(`/api/agents/${encodeURIComponent(id)}/pending`, { credentials: 'include' });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        const openCount = (data.entries || []).filter(e => e.status === 'pending').length;
+        _wolfAgentsUpdatePendingBadge(openCount);
+    } catch (_) { /* non-fatal */ }
 }
 
 function wolfAgentsCloseChat() {
@@ -37238,18 +37284,78 @@ async function _wolfAgentsRenderInheritedAi(agent) {
     el.innerHTML = `Inherits from <a href="#" onclick="selectView('settings'); return false;">Settings → AI Agent</a>`;
 }
 
+// Cached tool catalogue — fetched once, reused for each modal open.
+let _wolfAgentsToolCatalogue = null;
+
+async function _wolfAgentsFetchToolCatalogue() {
+    if (_wolfAgentsToolCatalogue) return _wolfAgentsToolCatalogue;
+    try {
+        const resp = await fetch('/api/agents/tools', { credentials: 'include' });
+        _wolfAgentsToolCatalogue = resp.ok ? await resp.json() : [];
+    } catch (e) {
+        _wolfAgentsToolCatalogue = [];
+    }
+    return _wolfAgentsToolCatalogue;
+}
+
+async function _wolfAgentsRenderToolCheckboxes(allowedTools) {
+    const container = document.getElementById('wolfagents-field-tools-list');
+    if (!container) return;
+    const catalogue = await _wolfAgentsFetchToolCatalogue();
+    const selected = new Set(allowedTools || []);
+    if (!Array.isArray(catalogue) || catalogue.length === 0) {
+        container.innerHTML = '<div style="grid-column:1/-1; color:#ef4444; font-size:12px;">Failed to load tool catalogue — check /api/agents/tools.</div>';
+        return;
+    }
+    container.innerHTML = catalogue.map(t => `
+        <label style="display:flex; align-items:flex-start; gap:6px; font-size:12px; padding:4px; border-radius:4px; cursor:pointer;">
+            <input type="checkbox" class="wolfagents-tool-checkbox" data-tool="${escapeAttr(t.id)}" ${selected.has(t.id) ? 'checked' : ''} style="margin-top:2px;">
+            <div style="flex:1; min-width:0;">
+                <div style="font-weight:600;">${escapeHtml(t.label)}</div>
+                <div style="color:var(--text-muted); font-size:11px; line-height:1.35;">${escapeHtml(t.risk_note)}</div>
+            </div>
+        </label>
+    `).join('');
+}
+
+function _wolfAgentsReadToolCheckboxes() {
+    const boxes = document.querySelectorAll('.wolfagents-tool-checkbox');
+    const out = [];
+    boxes.forEach(b => { if (b.checked) out.push(b.getAttribute('data-tool')); });
+    return out;
+}
+
+// Helpers for comma-separated text fields in the scope section.
+function _csvToArray(s) {
+    return (s || '').split(',').map(x => x.trim()).filter(x => x.length > 0);
+}
+function _arrayToCsv(arr) {
+    return (arr || []).join(', ');
+}
+
 function wolfAgentsOpenCreate() {
     // Clear the modal to defaults for a new agent. Provider/model
     // deliberately NOT set here — the backend picks them up from the
-    // global AiConfig on first chat (see wolfagents::chat_with_agent).
+    // global AiConfig on first chat.
     _wolfAgentsEditId = null;
     document.getElementById('wolfagents-modal-title').textContent = 'New Agent';
     document.getElementById('wolfagents-field-name').value = '';
     document.getElementById('wolfagents-field-system').value = 'You are a helpful operations assistant. Answer concisely. When unsure, say so.';
     document.getElementById('wolfagents-field-memlines').value = '40';
+    document.getElementById('wolfagents-field-access-level').value = 'read_only';
+    document.getElementById('wolfagents-field-scope-clusters').value = '';
+    document.getElementById('wolfagents-field-scope-containers').value = '';
+    document.getElementById('wolfagents-field-scope-hosts').value = '';
+    document.getElementById('wolfagents-field-scope-paths').value = '';
+    document.getElementById('wolfagents-field-scope-api').value = '';
     document.getElementById('wolfagents-field-discord-id').value = '';
     document.getElementById('wolfagents-field-discord-label').value = '';
+    const tgId = document.getElementById('wolfagents-field-telegram-id'); if (tgId) tgId.value = '';
+    const tgLabel = document.getElementById('wolfagents-field-telegram-label'); if (tgLabel) tgLabel.value = '';
+    const waNum = document.getElementById('wolfagents-field-whatsapp-number'); if (waNum) waNum.value = '';
+    const waLabel = document.getElementById('wolfagents-field-whatsapp-label'); if (waLabel) waLabel.value = '';
     _wolfAgentsRenderInheritedAi(null);
+    _wolfAgentsRenderToolCheckboxes([]);
     document.getElementById('wolfagents-modal').style.display = 'flex';
 }
 
@@ -37267,9 +37373,21 @@ async function wolfAgentsOpenEdit() {
         document.getElementById('wolfagents-field-name').value = a.name || '';
         document.getElementById('wolfagents-field-system').value = a.system_prompt || '';
         document.getElementById('wolfagents-field-memlines').value = a.memory_max_lines || 40;
+        document.getElementById('wolfagents-field-access-level').value = a.access_level || 'read_only';
+        const scope = a.target_scope || {};
+        document.getElementById('wolfagents-field-scope-clusters').value = _arrayToCsv(scope.allowed_clusters);
+        document.getElementById('wolfagents-field-scope-containers').value = _arrayToCsv(scope.allowed_container_patterns);
+        document.getElementById('wolfagents-field-scope-hosts').value = _arrayToCsv(scope.allowed_hosts);
+        document.getElementById('wolfagents-field-scope-paths').value = _arrayToCsv(scope.allowed_paths);
+        document.getElementById('wolfagents-field-scope-api').value = _arrayToCsv(scope.allowed_api_paths);
         document.getElementById('wolfagents-field-discord-id').value = (a.discord && a.discord.channel_id) || '';
         document.getElementById('wolfagents-field-discord-label').value = (a.discord && a.discord.channel_label) || '';
+        const tgId = document.getElementById('wolfagents-field-telegram-id'); if (tgId) tgId.value = (a.telegram && a.telegram.chat_id) || '';
+        const tgLabel = document.getElementById('wolfagents-field-telegram-label'); if (tgLabel) tgLabel.value = (a.telegram && a.telegram.chat_label) || '';
+        const waNum = document.getElementById('wolfagents-field-whatsapp-number'); if (waNum) waNum.value = (a.whatsapp && a.whatsapp.number) || '';
+        const waLabel = document.getElementById('wolfagents-field-whatsapp-label'); if (waLabel) waLabel.value = (a.whatsapp && a.whatsapp.label) || '';
         _wolfAgentsRenderInheritedAi(a);
+        _wolfAgentsRenderToolCheckboxes(a.allowed_tools || []);
         document.getElementById('wolfagents-modal').style.display = 'flex';
     } catch (e) {
         showToast('Failed to load agent: ' + e.message, 'error');
@@ -37281,16 +37399,19 @@ function wolfAgentsCloseModal() {
 }
 
 async function wolfAgentsSaveFromModal() {
-    // Provider + model deliberately NOT sent here. On create, the
-    // backend's `new_default` seeds them from the global AiConfig so
-    // the agent inherits whatever is configured in Settings → AI
-    // Agent. On edit, omitting these fields means we leave whatever
-    // was there untouched (the agents_update handler only overwrites
-    // fields that arrive in the body).
     const payload = {
         name: (document.getElementById('wolfagents-field-name').value || '').trim(),
         system_prompt: document.getElementById('wolfagents-field-system').value,
         memory_max_lines: parseInt(document.getElementById('wolfagents-field-memlines').value) || 40,
+        access_level: document.getElementById('wolfagents-field-access-level').value || 'read_only',
+        target_scope: {
+            allowed_clusters: _csvToArray(document.getElementById('wolfagents-field-scope-clusters').value),
+            allowed_container_patterns: _csvToArray(document.getElementById('wolfagents-field-scope-containers').value),
+            allowed_hosts: _csvToArray(document.getElementById('wolfagents-field-scope-hosts').value),
+            allowed_paths: _csvToArray(document.getElementById('wolfagents-field-scope-paths').value),
+            allowed_api_paths: _csvToArray(document.getElementById('wolfagents-field-scope-api').value),
+        },
+        allowed_tools: _wolfAgentsReadToolCheckboxes(),
     };
     if (!payload.name) { showToast('Name is required', 'warn'); return; }
     const discordId = (document.getElementById('wolfagents-field-discord-id').value || '').trim();
@@ -37298,8 +37419,21 @@ async function wolfAgentsSaveFromModal() {
     if (discordId) {
         payload.discord = { channel_id: discordId, channel_label: discordLabel };
     } else if (_wolfAgentsEditId) {
-        // Editing: explicit null clears a previously-set binding.
         payload.discord = null;
+    }
+    const tgId = (document.getElementById('wolfagents-field-telegram-id')?.value || '').trim();
+    const tgLabel = (document.getElementById('wolfagents-field-telegram-label')?.value || '').trim();
+    if (tgId) {
+        payload.telegram = { chat_id: tgId, chat_label: tgLabel };
+    } else if (_wolfAgentsEditId) {
+        payload.telegram = null;
+    }
+    const waNum = (document.getElementById('wolfagents-field-whatsapp-number')?.value || '').trim();
+    const waLabel = (document.getElementById('wolfagents-field-whatsapp-label')?.value || '').trim();
+    if (waNum) {
+        payload.whatsapp = { number: waNum, label: waLabel };
+    } else if (_wolfAgentsEditId) {
+        payload.whatsapp = null;
     }
     const method = _wolfAgentsEditId ? 'PUT' : 'POST';
     const url = _wolfAgentsEditId
@@ -37320,13 +37454,170 @@ async function wolfAgentsSaveFromModal() {
         showToast(_wolfAgentsEditId ? 'Agent updated' : 'Agent created', 'success');
         wolfAgentsCloseModal();
         wolfAgentsLoad();
-        // If this was an edit of the currently-open chat, refresh its header
         if (_wolfAgentsEditId && _wolfAgentsActiveId === _wolfAgentsEditId) {
             await wolfAgentsOpenChat(_wolfAgentsActiveId);
         }
     } catch (e) {
         showToast('Failed: ' + e.message, 'error');
     }
+}
+
+// ─── Tab switching + pending-queue + audit-log ─────────────────
+
+function wolfAgentsShowTab(tab) {
+    const panes = { chat: 'wolfagents-pane-chat', pending: 'wolfagents-pane-pending', audit: 'wolfagents-pane-audit' };
+    const tabs  = { chat: 'wolfagents-tab-chat',   pending: 'wolfagents-tab-pending',   audit: 'wolfagents-tab-audit'  };
+    for (const key of Object.keys(panes)) {
+        const paneEl = document.getElementById(panes[key]);
+        const tabEl = document.getElementById(tabs[key]);
+        if (paneEl) paneEl.style.display = (key === tab) ? '' : 'none';
+        if (tabEl) tabEl.style.borderBottom = (key === tab) ? '2px solid var(--accent-primary,#6366f1)' : '';
+    }
+    if (tab === 'pending') wolfAgentsLoadPending();
+    if (tab === 'audit')   wolfAgentsLoadAudit();
+}
+
+async function wolfAgentsLoadPending() {
+    const id = _wolfAgentsActiveId;
+    const list = document.getElementById('wolfagents-pending-list');
+    if (!id || !list) return;
+    list.innerHTML = '<div style="color:var(--text-muted); padding:24px; text-align:center;">Loading…</div>';
+    try {
+        const resp = await fetch(`/api/agents/${encodeURIComponent(id)}/pending`, { credentials: 'include' });
+        const data = await resp.json();
+        const entries = (data.entries || []).slice().sort((a, b) => b.seq - a.seq);
+        const openCount = entries.filter(e => e.status === 'pending').length;
+        _wolfAgentsUpdatePendingBadge(openCount);
+        if (entries.length === 0) {
+            list.innerHTML = '<div style="color:var(--text-muted); padding:24px; text-align:center;">No pending actions yet — the agent hasn\'t requested anything that needs approval.</div>';
+            return;
+        }
+        list.innerHTML = entries.map(e => {
+            const badge = {
+                pending:  '<span style="background:rgba(234,179,8,0.15); color:#eab308; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600;">⏳ PENDING</span>',
+                approved: '<span style="background:rgba(34,197,94,0.15); color:#22c55e; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600;">✅ APPROVED</span>',
+                denied:   '<span style="background:rgba(239,68,68,0.15); color:#ef4444; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600;">❌ DENIED</span>',
+                expired:  '<span style="background:rgba(156,163,175,0.15); color:#9ca3af; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600;">⌛ EXPIRED</span>',
+            }[e.status] || e.status;
+            const args = JSON.stringify(e.arguments, null, 2);
+            const decidedBy = e.decided_by ? `<div style="font-size:11px; color:var(--text-muted); margin-top:4px;">Decided by <b>${escapeHtml(e.decided_by)}</b>${e.decision_note ? ' — ' + escapeHtml(e.decision_note) : ''}</div>` : '';
+            const execResult = e.execution_result
+                ? `<details style="margin-top:6px;"><summary style="cursor:pointer; font-size:11px; color:var(--text-muted);">Execution result</summary><pre style="font-size:11px; background:var(--bg-input); border:1px solid var(--border); padding:8px; border-radius:4px; margin-top:4px; white-space:pre-wrap; word-break:break-word;">${escapeHtml(JSON.stringify(e.execution_result, null, 2))}</pre></details>`
+                : '';
+            const actions = e.status === 'pending'
+                ? `<div style="display:flex; gap:6px; margin-top:8px;">
+                       <button class="btn btn-sm btn-primary" onclick="wolfAgentsApprovePending(${e.seq})">✅ Approve + Run</button>
+                       <button class="btn btn-sm" style="background:rgba(239,68,68,0.15); color:#ef4444; border-color:rgba(239,68,68,0.3);" onclick="wolfAgentsDenyPending(${e.seq})">❌ Deny</button>
+                   </div>`
+                : '';
+            return `<div style="border:1px solid var(--border); border-radius:8px; padding:12px; margin-bottom:10px; background:var(--bg-card);">
+                <div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
+                    <div><strong>#${e.seq}</strong> <code>${escapeHtml(e.tool)}</code></div>
+                    <div>${badge}</div>
+                </div>
+                <div style="font-size:12px; color:var(--text-muted); margin-top:4px;">${escapeHtml(e.reason || '')}</div>
+                <pre style="font-size:11px; background:var(--bg-input); border:1px solid var(--border); padding:8px; border-radius:4px; margin-top:6px; white-space:pre-wrap; word-break:break-word; max-height:200px; overflow-y:auto;">${escapeHtml(args)}</pre>
+                ${decidedBy}
+                ${execResult}
+                ${actions}
+            </div>`;
+        }).join('');
+    } catch (e) {
+        list.innerHTML = `<div style="color:#ef4444; padding:16px;">Failed to load: ${escapeHtml(e.message || String(e))}</div>`;
+    }
+}
+
+function _wolfAgentsUpdatePendingBadge(count) {
+    const badge = document.getElementById('wolfagents-tab-pending-badge');
+    if (!badge) return;
+    if (count > 0) { badge.textContent = count; badge.style.display = ''; }
+    else { badge.style.display = 'none'; }
+}
+
+async function wolfAgentsApprovePending(seq) {
+    const id = _wolfAgentsActiveId;
+    if (!id) return;
+    const note = await showPrompt('Optional approval note (shown in audit log):', '');
+    if (note === null) return; // cancelled
+    try {
+        const resp = await fetch(`/api/agents/${encodeURIComponent(id)}/pending/${seq}/approve`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ note: note || null }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+            showToast('Failed: ' + (data.error || `HTTP ${resp.status}`), 'error');
+            return;
+        }
+        const ok = data.execution && data.execution.ok;
+        showToast(ok ? `Approved + ran #${seq}` : `Approved #${seq} but execution reported an error — check Pending tab for details`, ok ? 'success' : 'warn');
+        wolfAgentsLoadPending();
+    } catch (e) {
+        showToast('Failed: ' + e.message, 'error');
+    }
+}
+
+async function wolfAgentsDenyPending(seq) {
+    const id = _wolfAgentsActiveId;
+    if (!id) return;
+    const note = await showPrompt('Denial reason (shown to the agent on its next turn):', '');
+    if (note === null) return;
+    try {
+        const resp = await fetch(`/api/agents/${encodeURIComponent(id)}/pending/${seq}/deny`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ note: note || null }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+            showToast('Failed: ' + (data.error || `HTTP ${resp.status}`), 'error');
+            return;
+        }
+        showToast(`Denied #${seq}`, 'info');
+        wolfAgentsLoadPending();
+    } catch (e) {
+        showToast('Failed: ' + e.message, 'error');
+    }
+}
+
+async function wolfAgentsLoadAudit() {
+    const id = _wolfAgentsActiveId;
+    const list = document.getElementById('wolfagents-audit-list');
+    if (!id || !list) return;
+    list.innerHTML = '<div style="color:var(--text-muted); padding:24px; text-align:center;">Loading…</div>';
+    try {
+        const resp = await fetch(`/api/agents/${encodeURIComponent(id)}/audit?limit=200`, { credentials: 'include' });
+        const data = await resp.json();
+        const entries = Array.isArray(data) ? data.slice().reverse() : [];
+        if (entries.length === 0) {
+            list.innerHTML = '<div style="color:var(--text-muted); padding:24px; text-align:center;">No tool invocations yet.</div>';
+            return;
+        }
+        list.innerHTML = entries.map(e => {
+            const ts = e.ts ? new Date(e.ts * 1000).toLocaleString() : '';
+            const denied = (e.outcome || '').startsWith('denied');
+            const colour = denied ? '#ef4444' : 'var(--text)';
+            return `<div style="padding:6px 0; border-bottom:1px solid var(--border); color:${colour};">
+                <span style="color:var(--text-muted);">${escapeHtml(ts)}</span>
+                <b>${escapeHtml(e.tool || '')}</b>
+                — <span>${escapeHtml(e.outcome || '')}</span>
+                ${e.reason ? `<div style="color:var(--text-muted); margin-left:12px; white-space:pre-wrap;">${escapeHtml(e.reason)}</div>` : ''}
+            </div>`;
+        }).join('');
+    } catch (e) {
+        list.innerHTML = `<div style="color:#ef4444; padding:16px;">Failed to load: ${escapeHtml(e.message || String(e))}</div>`;
+    }
+}
+
+// Lightweight prompt fallback when the app doesn't already have one.
+async function showPrompt(msg, def) {
+    if (typeof window.showPromptModal === 'function') return await window.showPromptModal(msg, def);
+    // Native browser prompt is ugly but functional and works everywhere.
+    const r = window.prompt(msg, def || '');
+    return r;
 }
 
 async function wolfAgentsDelete() {

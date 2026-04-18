@@ -1600,7 +1600,7 @@
                 <div style="color:var(--text-muted); font-size:13px; padding:24px; text-align:center; grid-column:1/-1;">Loading agents…</div>
             </div>
 
-            <!-- Chat panel, hidden until an agent is opened -->
+            <!-- Chat + Pending + Audit panel, hidden until an agent is opened -->
             <div id="wolfagents-chat" class="card" style="display:none; margin-bottom:16px;">
                 <div class="card-header" style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
                     <div>
@@ -1613,12 +1613,32 @@
                         <button class="btn btn-sm" onclick="wolfAgentsCloseChat()">×</button>
                     </div>
                 </div>
+                <div style="display:flex; gap:4px; padding:6px 16px 0; border-bottom:1px solid var(--border);">
+                    <button id="wolfagents-tab-chat" class="btn btn-sm" onclick="wolfAgentsShowTab('chat')" style="border-bottom:2px solid var(--accent-primary,#6366f1);">💬 Chat</button>
+                    <button id="wolfagents-tab-pending" class="btn btn-sm" onclick="wolfAgentsShowTab('pending')" style="position:relative;">
+                        ⏳ Pending
+                        <span id="wolfagents-tab-pending-badge" style="display:none; position:absolute; top:-4px; right:-4px; background:#ef4444; color:#fff; font-size:10px; font-weight:700; padding:1px 6px; border-radius:10px;">0</span>
+                    </button>
+                    <button id="wolfagents-tab-audit" class="btn btn-sm" onclick="wolfAgentsShowTab('audit')">📋 Audit</button>
+                </div>
                 <div class="card-body">
-                    <div id="wolfagents-chat-log" style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px; padding:16px; height:360px; overflow-y:auto; font-size:13px; line-height:1.55;"></div>
-                    <div style="display:flex; gap:8px; margin-top:12px;">
-                        <input id="wolfagents-chat-input" type="text" class="form-control" placeholder="Type a message and press Enter"
-                               onkeydown="if(event.key==='Enter' && !event.shiftKey){event.preventDefault();wolfAgentsSendMessage();}">
-                        <button class="btn btn-primary" onclick="wolfAgentsSendMessage()">Send</button>
+                    <div id="wolfagents-pane-chat">
+                        <div id="wolfagents-chat-log" style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px; padding:16px; height:360px; overflow-y:auto; font-size:13px; line-height:1.55;"></div>
+                        <div style="display:flex; gap:8px; margin-top:12px;">
+                            <input id="wolfagents-chat-input" type="text" class="form-control" placeholder="Type a message and press Enter"
+                                   onkeydown="if(event.key==='Enter' && !event.shiftKey){event.preventDefault();wolfAgentsSendMessage();}">
+                            <button class="btn btn-primary" onclick="wolfAgentsSendMessage()">Send</button>
+                        </div>
+                    </div>
+                    <div id="wolfagents-pane-pending" style="display:none;">
+                        <div id="wolfagents-pending-list" style="font-size:13px;">
+                            <div style="color:var(--text-muted); padding:24px; text-align:center;">Loading…</div>
+                        </div>
+                    </div>
+                    <div id="wolfagents-pane-audit" style="display:none;">
+                        <div id="wolfagents-audit-list" style="font-size:12px; font-family:var(--font-mono,monospace);">
+                            <div style="color:var(--text-muted); padding:24px; text-align:center;">Loading…</div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1647,11 +1667,84 @@
                             <label style="font-size:12px; color:var(--text-muted);">Memory max lines (rolling window fed back to the model)</label>
                             <input id="wolfagents-field-memlines" type="number" class="form-control" value="40" min="4" max="4096">
                         </div>
-                        <div style="border-top:1px solid var(--border); padding-top:10px;">
-                            <label style="font-size:12px; color:var(--text-muted);">Discord channel binding (optional — routes messages in this channel to the agent; requires Discord bot token in Settings → Alerting)</label>
-                            <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
-                                <input id="wolfagents-field-discord-id" type="text" class="form-control" placeholder="Channel ID (snowflake)">
-                                <input id="wolfagents-field-discord-label" type="text" class="form-control" placeholder="Label e.g. #ops-alerts">
+
+                        <div style="border-top:1px solid var(--border); padding-top:12px;">
+                            <label style="font-size:13px; font-weight:600;">🛡️ Access Level</label>
+                            <select id="wolfagents-field-access-level" class="form-control" style="margin-top:4px;">
+                                <option value="read_only" selected>Read-only — observe cluster, never mutate (safest)</option>
+                                <option value="read_write">Read + Write — mutating tools run freely; destructive tools ask for approval</option>
+                                <option value="confirm_all">Confirm All — every non-read tool queues for operator approval</option>
+                                <option value="trusted">Trusted — everything runs freely (still subject to hardcoded safety denylist)</option>
+                            </select>
+                            <small style="color:var(--text-muted); display:block; margin-top:4px;">
+                                Hardcoded safety (rm -rf /, disk wipes, firewall flush, systemctl stop wolfstack, etc.) applies regardless of this setting and CANNOT be overridden.
+                            </small>
+                        </div>
+
+                        <div style="border-top:1px solid var(--border); padding-top:12px;">
+                            <label style="font-size:13px; font-weight:600;">🎯 Target Scope</label>
+                            <small style="color:var(--text-muted); display:block; margin-bottom:6px;">
+                                Empty = no constraint on that axis. Comma-separate multiple entries.
+                            </small>
+                            <div style="display:grid; gap:8px;">
+                                <div>
+                                    <label style="font-size:12px; color:var(--text-muted);">Allowed clusters</label>
+                                    <input id="wolfagents-field-scope-clusters" type="text" class="form-control" placeholder="e.g. wolfgrid, lab">
+                                </div>
+                                <div>
+                                    <label style="font-size:12px; color:var(--text-muted);">Container name patterns (glob with *)</label>
+                                    <input id="wolfagents-field-scope-containers" type="text" class="form-control" placeholder="e.g. regions*, *-prod">
+                                </div>
+                                <div>
+                                    <label style="font-size:12px; color:var(--text-muted);">Allowed host node IDs</label>
+                                    <input id="wolfagents-field-scope-hosts" type="text" class="form-control" placeholder="e.g. node-a1b2, node-c3d4">
+                                </div>
+                                <div>
+                                    <label style="font-size:12px; color:var(--text-muted);">Filesystem path prefixes (write/exec)</label>
+                                    <input id="wolfagents-field-scope-paths" type="text" class="form-control" placeholder="e.g. /home/wolfgrid1/assetcache, /var/lib/myapp">
+                                </div>
+                                <div>
+                                    <label style="font-size:12px; color:var(--text-muted);">WolfStack API path allowlist (METHOD:path or just path)</label>
+                                    <input id="wolfagents-field-scope-api" type="text" class="form-control" placeholder="e.g. GET:/api/nodes, POST:/api/wolfflow/workflows/*/run">
+                                </div>
+                            </div>
+                        </div>
+
+                        <div style="border-top:1px solid var(--border); padding-top:12px;">
+                            <label style="font-size:13px; font-weight:600;">🧰 Allowed Tools</label>
+                            <small style="color:var(--text-muted); display:block; margin-bottom:6px;">
+                                Each tool must be explicitly granted. Newly created agents start with zero tools — even read-only ones.
+                            </small>
+                            <div id="wolfagents-field-tools-list" style="display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px; max-height:240px; overflow-y:auto; padding:8px; background:var(--bg-input); border:1px solid var(--border); border-radius:6px;">
+                                <div style="grid-column:1/-1; color:var(--text-muted); font-size:12px;">Loading tool catalogue…</div>
+                            </div>
+                        </div>
+
+                        <div style="border-top:1px solid var(--border); padding-top:12px;">
+                            <label style="font-size:13px; font-weight:600;">📡 Chat Bindings</label>
+                            <small style="color:var(--text-muted); display:block; margin-bottom:6px;">
+                                Optional — let users talk to this agent through Discord, Telegram, or WhatsApp. Requires the corresponding credentials in Settings → Alerting.
+                            </small>
+                            <div>
+                                <label style="font-size:12px; color:var(--text-muted);">Discord channel binding</label>
+                                <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+                                    <input id="wolfagents-field-discord-id" type="text" class="form-control" placeholder="Channel ID (snowflake)">
+                                    <input id="wolfagents-field-discord-label" type="text" class="form-control" placeholder="Label e.g. #ops-alerts">
+                                </div>
+                            </div>
+                            <div style="margin-top:8px;">
+                                <label style="font-size:12px; color:var(--text-muted);">Telegram chat binding</label>
+                                <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+                                    <input id="wolfagents-field-telegram-id" type="text" class="form-control" placeholder="Chat ID e.g. -1001234567890">
+                                    <input id="wolfagents-field-telegram-label" type="text" class="form-control" placeholder="Label e.g. @wolfgrid-ops">
+                                </div>
+                            </div>
+                            <div style="margin-top:8px;">
+                                <label style="font-size:12px; color:var(--text-muted);">WhatsApp (Twilio) binding</label>
+                                <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+                                    <input id="wolfagents-field-whatsapp-number" type="text" class="form-control" placeholder="whatsapp:+14155551234">
+                                    <input id="wolfagents-field-whatsapp-label" type="text" class="form-control" placeholder="Label e.g. Ops Line">
+                                </div>
                             </div>
                         </div>
                     </div>

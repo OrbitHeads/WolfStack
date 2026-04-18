@@ -30,6 +30,10 @@
 //!   receiver loop routes messages in that channel to this agent and
 //!   posts the reply back.
 
+pub mod agent_loop;
+pub mod dispatch;
+pub mod pending;
+pub mod safety;
 pub mod tools;
 
 use serde::{Deserialize, Serialize};
@@ -70,6 +74,67 @@ pub struct WhatsAppBinding {
     pub label: String,
 }
 
+/// How much authority the agent has over mutating/destructive tools.
+/// Paired with the per-tool danger classification in
+/// [`tools::Danger`] to decide whether a given call runs freely,
+/// needs operator approval, or is refused outright. Defaults to
+/// `ReadOnly` so a newly-created agent can never surprise an
+/// operator with a write by accident.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessLevel {
+    /// Safe tools only (list/get/metrics). Any mutating or
+    /// destructive tool call is refused before it runs.
+    ReadOnly,
+    /// Safe + mutating tools run freely. Destructive tools need
+    /// operator approval via the confirmation queue.
+    ReadWrite,
+    /// Every non-safe tool needs operator approval. Use for agents
+    /// with a wide tool grant but low trust.
+    ConfirmAll,
+    /// Godmode — every tool runs without prompting (still within the
+    /// per-agent allowlist + target scope + hardcoded safety
+    /// denylist, which NO access level can bypass). Use sparingly.
+    Trusted,
+}
+
+impl Default for AccessLevel {
+    fn default() -> Self { AccessLevel::ReadOnly }
+}
+
+/// Per-agent target scope — where the agent is allowed to look and
+/// act. Every mutating tool checks its arguments against this before
+/// execution. An empty vec means "no constraint on this axis" so
+/// the defaults are safely-wide rather than safely-narrow — pair
+/// this with a restrictive `access_level` for a sensible default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TargetScope {
+    /// Cluster names the agent can see or act within (matched against
+    /// `Node.cluster_name`). Empty = all clusters.
+    #[serde(default)]
+    pub allowed_clusters: Vec<String>,
+    /// Glob-style patterns (`regions*`, `*-prod`) matched against
+    /// container names. Empty = all containers/VMs.
+    #[serde(default)]
+    pub allowed_container_patterns: Vec<String>,
+    /// Specific node IDs the agent can touch via exec_on_node or
+    /// direct node-scoped API calls. Empty = all nodes.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    /// Filesystem prefixes for write/delete/exec path arguments —
+    /// e.g. `/home/wolfgrid1/assetcache` lets the agent clean that
+    /// directory but not touch `/etc` or `/root`. Empty = no path
+    /// restriction (still subject to the hardcoded safety denylist).
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
+    /// API path regex allowlist for the `wolfstack_api` tool. Each
+    /// entry is `"<METHOD>:<regex>"` e.g. `"GET:^/api/nodes$"`.
+    /// Empty = all GETs allowed (read-only), POST/PUT/DELETE require
+    /// at least one explicit match.
+    #[serde(default)]
+    pub allowed_api_paths: Vec<String>,
+}
+
 /// One named agent. Persisted as an entry in
 /// `/etc/wolfstack/agents.json` (a `Vec<Agent>`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +159,24 @@ pub struct Agent {
     /// invoke. Empty = chat-only, no side effects.
     #[serde(default)]
     pub allowed_tools: Vec<String>,
+    /// How much authority the agent has over mutating/destructive
+    /// tools. Defaults to ReadOnly so a newly-created agent can never
+    /// surprise an operator.
+    #[serde(default)]
+    pub access_level: AccessLevel,
+    /// Per-agent scope — where the agent is allowed to look + act.
+    /// Empty scope = no constraint on that axis (rely on access_level
+    /// and the hardcoded safety denylist for safety).
+    #[serde(default)]
+    pub target_scope: TargetScope,
+    /// Prepend the WolfStack knowledge base + a live cluster snapshot
+    /// to every turn so the agent understands the platform it's
+    /// running on. Operators who want to save tokens can disable; by
+    /// default we pay the ~4k-token overhead because uninformed
+    /// agents waste more tokens flailing through tool calls than the
+    /// KB costs.
+    #[serde(default = "default_true_fn")]
+    pub include_cluster_context: bool,
     /// Max lines of memory (one JSONL line = one role+content pair)
     /// to feed back into the model on each turn. Higher = better
     /// recall, more tokens per call.
@@ -123,6 +206,7 @@ pub struct Agent {
 }
 
 fn default_memory_max_lines() -> usize { 40 }
+fn default_true_fn() -> bool { true }
 
 const AGENTS_FILE: &str = "/etc/wolfstack/agents.json";
 const AGENTS_DIR: &str = "/etc/wolfstack/agents";
@@ -338,74 +422,115 @@ fn consume_chat_budget(agent_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn chat_with_agent(agent_id: &str, message: &str) -> Result<String, String> {
+/// Chat with an agent by id. Dispatches to either the full Claude
+/// tool_use loop (when the agent is on Claude + has tools allowlisted)
+/// or a plain single-shot chat (every other path). Memory + audit +
+/// rate-limiting happen around either shape identically.
+///
+/// Takes an explicit `AppState` because the tool dispatcher needs
+/// cluster state, router state, and the cluster secret. Legacy
+/// callers that don't have AppState handy can use
+/// `chat_with_agent_simple` which falls back to no-tools mode.
+pub async fn chat_with_agent_full(
+    agent_id: &str,
+    message: &str,
+    state: &crate::api::AppState,
+) -> Result<String, String> {
     // Check agent exists BEFORE consuming the rate-limit budget.
     // Otherwise an attacker probing random IDs would populate the
-    // bucket map indefinitely, and each "rate limit exceeded" reply
-    // still reveals whether the ID was recently queried. Fail-fast
-    // on unknown IDs is both faster and more private.
+    // bucket map indefinitely.
     let mut agent = load(agent_id)
         .ok_or_else(|| format!("agent '{}' not found", agent_id))?;
-    // Light input cap — 64 KB is way more than any sane chat message
-    // and stops a caller stuffing a megabyte into one turn to blow up
-    // the model's context window / token bill. Checked BEFORE the
-    // budget consumes so a single giant message doesn't also burn a
-    // rate-limit slot.
     if message.len() > 64 * 1024 {
         return Err("message exceeds 64 KB — split into smaller prompts".to_string());
     }
     consume_chat_budget(agent_id)?;
 
-    // Build the chat history from disk. One extra slot reserved so the
-    // model sees pairs as pairs — never feed it an orphan user turn.
     let recent = load_recent_memory(agent_id, agent.memory_max_lines);
     let history: Vec<crate::ai::ChatMessage> = recent.into_iter()
         .map(|m| crate::ai::ChatMessage {
             role: m.role,
             content: m.content,
-            // ChatMessage expects milliseconds-since-epoch; our
-            // MemoryEntry stores seconds, so scale. Value is only
-            // used for display ordering in the AI module's internal
-            // history view, not for the model call itself.
             timestamp: (m.ts as i64).saturating_mul(1000),
         })
         .collect();
 
-    // Effective AI config — inherit provider keys/endpoints from the
-    // global AiConfig but override provider + model per-agent. This
-    // way one agent can use Claude (for nuanced ops reasoning) while
-    // another uses a fast local model (for routine status questions).
-    let mut cfg = crate::ai::AiConfig::load();
-    if !agent.provider.is_empty() { cfg.provider = agent.provider.clone(); }
-    if !agent.model.is_empty() { cfg.model = agent.model.clone(); }
+    // Run the full tool_use loop. For Claude + tools this kicks off
+    // a multi-round dispatch; for every other provider it falls back
+    // to plain simple_chat inside the loop.
+    let turn = agent_loop::run_turn(&agent, history, message, state).await?;
+    let reply = turn.response.clone();
 
-    let reply = crate::ai::simple_chat(&cfg, &agent.system_prompt, &history, message).await?;
-
-    // Persist the exchange. Failures are non-fatal here — the user has
-    // already seen the reply; we just lose persistent memory for this
-    // turn. Log it so operators notice.
+    // Persist exchange.
     let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     if let Err(e) = append_memory(agent_id, &MemoryEntry {
         role: "user".to_string(),
         content: message.to_string(),
         ts: now,
     }) {
-        tracing::warn!("wolfagents: failed to append user turn to memory: {}", e);
+        tracing::warn!("wolfagents: failed to append user turn: {}", e);
     }
     if let Err(e) = append_memory(agent_id, &MemoryEntry {
         role: "assistant".to_string(),
         content: reply.clone(),
         ts: now,
     }) {
-        tracing::warn!("wolfagents: failed to append assistant turn to memory: {}", e);
+        tracing::warn!("wolfagents: failed to append assistant turn: {}", e);
     }
 
-    // Bump last_active_at on the agent record so the UI can sort by
-    // recently-active. Failures here are non-fatal too — worst case
-    // the "last active" display is stale until the next chat.
+    agent.last_active_at = Some(now);
+    if let Err(e) = upsert(agent) {
+        tracing::warn!("wolfagents: failed to bump last_active_at: {}", e);
+    }
+
+    Ok(reply)
+}
+
+/// Legacy no-AppState entry point for callers that only need basic
+/// chat (Discord / Telegram / WhatsApp receivers, which don't have
+/// AppState in their handler scope). Falls back to simple_chat so
+/// tool access is unavailable — we ship this knowingly because the
+/// chat surfaces are lower-risk than the dashboard.
+pub async fn chat_with_agent(agent_id: &str, message: &str) -> Result<String, String> {
+    let mut agent = load(agent_id)
+        .ok_or_else(|| format!("agent '{}' not found", agent_id))?;
+    if message.len() > 64 * 1024 {
+        return Err("message exceeds 64 KB — split into smaller prompts".to_string());
+    }
+    consume_chat_budget(agent_id)?;
+
+    let recent = load_recent_memory(agent_id, agent.memory_max_lines);
+    let history: Vec<crate::ai::ChatMessage> = recent.into_iter()
+        .map(|m| crate::ai::ChatMessage {
+            role: m.role,
+            content: m.content,
+            timestamp: (m.ts as i64).saturating_mul(1000),
+        })
+        .collect();
+    let mut cfg = crate::ai::AiConfig::load();
+    if !agent.provider.is_empty() { cfg.provider = agent.provider.clone(); }
+    if !agent.model.is_empty() { cfg.model = agent.model.clone(); }
+
+    let reply = crate::ai::simple_chat(&cfg, &agent.system_prompt, &history, message).await?;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    if let Err(e) = append_memory(agent_id, &MemoryEntry {
+        role: "user".to_string(),
+        content: message.to_string(),
+        ts: now,
+    }) {
+        tracing::warn!("wolfagents: failed to append user turn: {}", e);
+    }
+    if let Err(e) = append_memory(agent_id, &MemoryEntry {
+        role: "assistant".to_string(),
+        content: reply.clone(),
+        ts: now,
+    }) {
+        tracing::warn!("wolfagents: failed to append assistant turn: {}", e);
+    }
+
     agent.last_active_at = Some(now);
     if let Err(e) = upsert(agent) {
         tracing::warn!("wolfagents: failed to bump last_active_at: {}", e);
@@ -448,6 +573,9 @@ pub fn new_default(name: String) -> Agent {
         model: cfg.model,
         provider: cfg.provider,
         allowed_tools: Vec::new(),
+        access_level: AccessLevel::ReadOnly,
+        target_scope: TargetScope::default(),
+        include_cluster_context: true,
         memory_max_lines: default_memory_max_lines(),
         discord: None,
         telegram: None,

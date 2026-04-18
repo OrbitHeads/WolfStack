@@ -37,30 +37,56 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::Agent;
+use super::{Agent, AccessLevel};
+
+/// How risky a tool is. Combined with the agent's AccessLevel to
+/// decide whether a call runs freely, needs operator approval, or is
+/// refused outright. See `authorise` below for the full policy matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Danger {
+    /// Read-only cluster observation. Always allowed when the tool is
+    /// on the agent's allowlist, regardless of access level.
+    Safe,
+    /// Changes cluster state but the change is recoverable (restart a
+    /// container, create a workflow, write a file under an allowed
+    /// path). Needs at least ReadWrite.
+    Mutating,
+    /// Irrecoverable or high-blast-radius: arbitrary shell exec,
+    /// file deletion, rm -rf. Needs explicit approval under ConfirmAll
+    /// or ReadWrite; only runs freely under Trusted.
+    Destructive,
+}
 
 /// Canonical tool identifiers. String form is what agents pass when
 /// they emit a tool-use request, and what operators see as checkboxes
 /// in the Edit Agent modal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolId {
-    /// List every cluster node (id, hostname, status). No args.
+    // ── Safe / read-only ───────────────────────────────────────
     ListNodes,
-    /// List containers/VMs cluster-wide with basic state. No args.
     ListContainers,
-    /// Get current metrics snapshot for one node (CPU, mem, disk).
     GetMetrics,
-    /// Restart a specific container by (runtime, name). Restricted
-    /// to runtimes "docker"/"lxc"; VM restart is deliberately separate
-    /// (it's destructive enough to deserve its own permission).
-    RestartContainer,
-    /// Run a named WolfFlow workflow. No args beyond the workflow id.
-    RunWorkflow,
-    /// Return recent alerts (last 50) from /api/alerts.
     ListAlerts,
-    /// Read one line of a VM or container's log tail. Argument-gated
-    /// so the agent can explain what happened, not dump raw streams.
     ReadLog,
+    CheckDiskUsage,
+    ReadFile,
+    ListApiEndpoints,
+    DescribeCluster,
+
+    // ── Mutating ───────────────────────────────────────────────
+    RestartContainer,
+    RunWorkflow,
+    ScheduleWorkflow,
+    WriteFile,
+
+    // ── Destructive ────────────────────────────────────────────
+    ExecInContainer,
+    ExecOnNode,
+    DeleteFile,
+
+    // ── Universal WolfStack API (danger varies by method) ──────
+    WolfstackApi,
 }
 
 impl ToolId {
@@ -71,10 +97,20 @@ impl ToolId {
             ToolId::ListNodes => "list_nodes",
             ToolId::ListContainers => "list_containers",
             ToolId::GetMetrics => "get_metrics",
-            ToolId::RestartContainer => "restart_container",
-            ToolId::RunWorkflow => "run_workflow",
             ToolId::ListAlerts => "list_alerts",
             ToolId::ReadLog => "read_log",
+            ToolId::CheckDiskUsage => "check_disk_usage",
+            ToolId::ReadFile => "read_file",
+            ToolId::ListApiEndpoints => "list_api_endpoints",
+            ToolId::DescribeCluster => "describe_cluster",
+            ToolId::RestartContainer => "restart_container",
+            ToolId::RunWorkflow => "run_workflow",
+            ToolId::ScheduleWorkflow => "schedule_workflow",
+            ToolId::WriteFile => "write_file",
+            ToolId::ExecInContainer => "exec_in_container",
+            ToolId::ExecOnNode => "exec_on_node",
+            ToolId::DeleteFile => "delete_file",
+            ToolId::WolfstackApi => "wolfstack_api",
         }
     }
 
@@ -84,10 +120,20 @@ impl ToolId {
             ToolId::ListNodes => "List nodes",
             ToolId::ListContainers => "List containers & VMs",
             ToolId::GetMetrics => "Read metrics (CPU/mem/disk)",
-            ToolId::RestartContainer => "Restart container (Docker/LXC)",
-            ToolId::RunWorkflow => "Run a WolfFlow workflow",
             ToolId::ListAlerts => "List recent alerts",
             ToolId::ReadLog => "Read container/VM logs",
+            ToolId::CheckDiskUsage => "Check disk usage in containers",
+            ToolId::ReadFile => "Read a file from a node",
+            ToolId::ListApiEndpoints => "List available WolfStack API endpoints",
+            ToolId::DescribeCluster => "Describe a cluster in detail",
+            ToolId::RestartContainer => "Restart container (Docker/LXC)",
+            ToolId::RunWorkflow => "Run a WolfFlow workflow",
+            ToolId::ScheduleWorkflow => "Schedule a WolfFlow workflow",
+            ToolId::WriteFile => "Write a file on a node (under allowed paths)",
+            ToolId::ExecInContainer => "Execute a shell command inside a container",
+            ToolId::ExecOnNode => "Execute a shell command on a cluster node",
+            ToolId::DeleteFile => "Delete a file on a node",
+            ToolId::WolfstackApi => "Call any WolfStack REST API endpoint",
         }
     }
 
@@ -95,14 +141,33 @@ impl ToolId {
     /// UI shows this under each checkbox so operators know what they
     /// just enabled.
     pub fn risk_note(self) -> &'static str {
+        match self.danger() {
+            Danger::Safe => "Read-only — observation, no state change.",
+            Danger::Mutating =>
+                "Changes cluster state. Needs access_level ≥ read_write.",
+            Danger::Destructive =>
+                "Irrecoverable or high blast-radius. Needs access_level = trusted to run \
+                 without confirmation; otherwise queued for operator approval.",
+        }
+    }
+
+    /// Classify the tool by how risky it is. The universal
+    /// `wolfstack_api` tool is classified as Mutating; the
+    /// per-request method check (GET vs POST/DELETE) further narrows
+    /// this at call time inside the dispatcher.
+    pub fn danger(self) -> Danger {
         match self {
             ToolId::ListNodes | ToolId::ListContainers | ToolId::GetMetrics
-            | ToolId::ListAlerts | ToolId::ReadLog =>
-                "Read-only — the agent can observe but not change cluster state.",
-            ToolId::RestartContainer =>
-                "The agent can restart containers by name on any node. Can be disruptive.",
-            ToolId::RunWorkflow =>
-                "The agent can trigger any workflow you have. Inherits whatever permissions that workflow has.",
+            | ToolId::ListAlerts | ToolId::ReadLog | ToolId::CheckDiskUsage
+            | ToolId::ReadFile | ToolId::ListApiEndpoints
+            | ToolId::DescribeCluster => Danger::Safe,
+
+            ToolId::RestartContainer | ToolId::RunWorkflow
+            | ToolId::ScheduleWorkflow | ToolId::WriteFile
+            | ToolId::WolfstackApi => Danger::Mutating,
+
+            ToolId::ExecInContainer | ToolId::ExecOnNode
+            | ToolId::DeleteFile => Danger::Destructive,
         }
     }
 
@@ -111,10 +176,20 @@ impl ToolId {
             "list_nodes" => Some(ToolId::ListNodes),
             "list_containers" => Some(ToolId::ListContainers),
             "get_metrics" => Some(ToolId::GetMetrics),
-            "restart_container" => Some(ToolId::RestartContainer),
-            "run_workflow" => Some(ToolId::RunWorkflow),
             "list_alerts" => Some(ToolId::ListAlerts),
             "read_log" => Some(ToolId::ReadLog),
+            "check_disk_usage" => Some(ToolId::CheckDiskUsage),
+            "read_file" => Some(ToolId::ReadFile),
+            "list_api_endpoints" => Some(ToolId::ListApiEndpoints),
+            "describe_cluster" => Some(ToolId::DescribeCluster),
+            "restart_container" => Some(ToolId::RestartContainer),
+            "run_workflow" => Some(ToolId::RunWorkflow),
+            "schedule_workflow" => Some(ToolId::ScheduleWorkflow),
+            "write_file" => Some(ToolId::WriteFile),
+            "exec_in_container" => Some(ToolId::ExecInContainer),
+            "exec_on_node" => Some(ToolId::ExecOnNode),
+            "delete_file" => Some(ToolId::DeleteFile),
+            "wolfstack_api" => Some(ToolId::WolfstackApi),
             _ => None,
         }
     }
@@ -126,11 +201,88 @@ impl ToolId {
         ToolId::ListNodes,
         ToolId::ListContainers,
         ToolId::GetMetrics,
-        ToolId::RestartContainer,
-        ToolId::RunWorkflow,
         ToolId::ListAlerts,
         ToolId::ReadLog,
+        ToolId::CheckDiskUsage,
+        ToolId::ReadFile,
+        ToolId::ListApiEndpoints,
+        ToolId::DescribeCluster,
+        ToolId::RestartContainer,
+        ToolId::RunWorkflow,
+        ToolId::ScheduleWorkflow,
+        ToolId::WriteFile,
+        ToolId::ExecInContainer,
+        ToolId::ExecOnNode,
+        ToolId::DeleteFile,
+        ToolId::WolfstackApi,
     ];
+}
+
+/// Decision from the authorisation step — tells the dispatcher
+/// whether to run the tool, queue it for approval, or reject outright.
+#[derive(Debug, Clone)]
+pub enum AuthDecision {
+    /// Tool runs immediately — allowlist + scope + policy all pass.
+    Allow,
+    /// Tool is allowed in principle but needs a human ✓ first.
+    /// Dispatcher queues the call on pending.jsonl and returns a
+    /// placeholder "awaiting approval" result to the agent.
+    NeedsConfirmation { reason: String },
+    /// Tool is refused. `reason` is safe to surface to the operator
+    /// + audit log.
+    Deny { reason: String },
+}
+
+/// Decide whether a specific tool call is authorised for an agent.
+/// Runs the checks in strict order:
+///   1. Allowlist — is the tool listed in agent.allowed_tools?
+///   2. Danger vs AccessLevel policy — does the agent have enough
+///      authority to run this class of tool?
+///   3. Returns Allow, NeedsConfirmation, or Deny.
+///
+/// The hardcoded safety denylist (src/wolfagents/safety.rs) is NOT
+/// checked here — it's checked inside each dispatcher, against the
+/// specific command/path/API the tool is about to act on. Keeping it
+/// there means safety applies to EVERY entry point (curated tools,
+/// wolfstack_api, future plugin tools) without relying on the
+/// authoriser remembering to call it.
+pub fn authorise(agent: &Agent, tool: ToolId) -> AuthDecision {
+    let tool_name = tool.as_str();
+    if !agent.allowed_tools.iter().any(|t| t == tool_name) {
+        return AuthDecision::Deny {
+            reason: format!("tool '{}' is not in the agent's allowed_tools list", tool_name),
+        };
+    }
+    match (tool.danger(), agent.access_level) {
+        (Danger::Safe, _) => AuthDecision::Allow,
+
+        (Danger::Mutating, AccessLevel::ReadOnly) => AuthDecision::Deny {
+            reason: format!(
+                "tool '{}' is mutating but the agent's access_level is read_only",
+                tool_name
+            ),
+        },
+        (Danger::Mutating, AccessLevel::ConfirmAll) => AuthDecision::NeedsConfirmation {
+            reason: format!("mutating tool '{}' requires operator approval under confirm_all", tool_name),
+        },
+        (Danger::Mutating, AccessLevel::ReadWrite)
+        | (Danger::Mutating, AccessLevel::Trusted) => AuthDecision::Allow,
+
+        (Danger::Destructive, AccessLevel::ReadOnly) => AuthDecision::Deny {
+            reason: format!(
+                "tool '{}' is destructive but the agent's access_level is read_only",
+                tool_name
+            ),
+        },
+        (Danger::Destructive, AccessLevel::ReadWrite)
+        | (Danger::Destructive, AccessLevel::ConfirmAll) => AuthDecision::NeedsConfirmation {
+            reason: format!(
+                "destructive tool '{}' requires operator approval",
+                tool_name
+            ),
+        },
+        (Danger::Destructive, AccessLevel::Trusted) => AuthDecision::Allow,
+    }
 }
 
 /// Serialised view of one tool, used by the API to feed the frontend's

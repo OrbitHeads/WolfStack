@@ -11065,11 +11065,28 @@ pub async fn wolfusb_reattach(
     // Step A: if target is not us, proxy to target and let THEY run
     // the recovery. Keeps all the node-local kernel/systemd work on
     // the node that actually needs it.
+    //
+    // Failures on this path return a `steps: [...]` shape (not a bare
+    // `error`) so the UI's per-step renderer has something to draw
+    // instead of the generic "No step data returned" fallback. The
+    // single step describes exactly which proxy hop failed and why,
+    // which is the information the operator actually needs.
     if a.target_node_id != self_id {
         let nodes = state.cluster.get_all_nodes();
         let Some(target) = nodes.iter().find(|n| n.id == a.target_node_id) else {
-            return HttpResponse::BadGateway().json(serde_json::json!({
-                "error": format!("target node {} not in cluster", a.target_node_id),
+            return HttpResponse::Ok().json(serde_json::json!({
+                "ok": false,
+                "steps": [{
+                    "step": "Locate target node",
+                    "ok": false,
+                    "detail": format!(
+                        "Target node {} is not in this cluster's membership. \
+                         The VM may have been migrated away from it, or the \
+                         node was removed. Try running Re-attach from a node \
+                         that currently sees {} as a cluster peer.",
+                        a.target_node_id, a.target_node_id
+                    ),
+                }],
             }));
         };
         let urls = build_node_urls(&target.address, target.port,
@@ -11081,9 +11098,16 @@ pub async fn wolfusb_reattach(
             .build()
         {
             Ok(c) => c,
-            Err(e) => return HttpResponse::InternalServerError()
-                .json(serde_json::json!({ "error": format!("http client: {}", e) })),
+            Err(e) => return HttpResponse::Ok().json(serde_json::json!({
+                "ok": false,
+                "steps": [{
+                    "step": "Build inter-node HTTP client",
+                    "ok": false,
+                    "detail": format!("http client build failed: {}", e),
+                }],
+            })),
         };
+        let mut last_err = String::new();
         for url in &urls {
             let res = client.post(url)
                 .header("X-WolfStack-Secret", &state.cluster_secret)
@@ -11096,16 +11120,48 @@ pub async fn wolfusb_reattach(
                         .body(body);
                 }
                 Ok(r) => {
-                    return HttpResponse::build(
-                        actix_web::http::StatusCode::from_u16(r.status().as_u16())
-                            .unwrap_or(actix_web::http::StatusCode::BAD_GATEWAY)
-                    ).body(r.bytes().await.unwrap_or_default());
+                    // Upstream returned a non-2xx — this usually means
+                    // the cluster-secret didn't match or the target has
+                    // auth misconfigured. Wrap in a step so the UI can
+                    // show it clearly instead of dumping raw bytes.
+                    let code = r.status().as_u16();
+                    let body_text = r.bytes().await
+                        .ok()
+                        .and_then(|b| String::from_utf8(b.to_vec()).ok())
+                        .unwrap_or_default();
+                    let trimmed = body_text.chars().take(400).collect::<String>();
+                    return HttpResponse::Ok().json(serde_json::json!({
+                        "ok": false,
+                        "steps": [{
+                            "step": format!("Proxy to target {} (HTTP {})", target.hostname, code),
+                            "ok": false,
+                            "detail": format!(
+                                "The target node returned HTTP {}. Common cause: \
+                                 cluster-secret mismatch between this node and {}. \
+                                 Workaround: open WolfStack directly on {} and click \
+                                 Re-attach there.\n\nUpstream body: {}",
+                                code, target.hostname, target.hostname, trimmed
+                            ),
+                        }],
+                    }));
                 }
-                Err(_) => continue,
+                Err(e) => { last_err = format!("{} → {}", url, e); continue; }
             }
         }
-        return HttpResponse::BadGateway().json(serde_json::json!({
-            "error": format!("could not reach target node {}", target.hostname),
+        return HttpResponse::Ok().json(serde_json::json!({
+            "ok": false,
+            "steps": [{
+                "step": format!("Proxy to target {}", target.hostname),
+                "ok": false,
+                "detail": format!(
+                    "Could not reach {} on any of the attempted URLs. Check \
+                     that the target node is online (Datacenter page shows \
+                     its state) and that this node's cluster secret matches \
+                     {}'s. Workaround: open WolfStack directly on {} and \
+                     click Re-attach there.\n\nLast error: {}",
+                    target.hostname, target.hostname, target.hostname, last_err
+                ),
+            }],
         }));
     }
 
@@ -14672,9 +14728,36 @@ pub async fn agents_create(req: HttpRequest, state: web::Data<AppState>, body: w
             agent.discord = Some(parsed);
         }
     }
+    apply_access_fields(&mut agent, &v);
     match crate::wolfagents::upsert(agent.clone()) {
         Ok(()) => HttpResponse::Ok().json(agent),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// Apply access_level + target_scope + include_cluster_context from
+/// the incoming JSON body to an agent record. Shared between create
+/// and update so the two paths stay in sync. Missing fields leave
+/// the existing value in place; setting target_scope to an empty
+/// object clears all scope restrictions (intentional — the operator
+/// may want to widen scope).
+fn apply_access_fields(agent: &mut crate::wolfagents::Agent, v: &serde_json::Value) {
+    if let Some(level) = v.get("access_level").and_then(|x| x.as_str()) {
+        agent.access_level = match level {
+            "read_only" => crate::wolfagents::AccessLevel::ReadOnly,
+            "read_write" => crate::wolfagents::AccessLevel::ReadWrite,
+            "confirm_all" => crate::wolfagents::AccessLevel::ConfirmAll,
+            "trusted" => crate::wolfagents::AccessLevel::Trusted,
+            _ => agent.access_level, // unknown value: keep existing
+        };
+    }
+    if let Some(scope_v) = v.get("target_scope") {
+        if let Ok(parsed) = serde_json::from_value::<crate::wolfagents::TargetScope>(scope_v.clone()) {
+            agent.target_scope = parsed;
+        }
+    }
+    if let Some(b) = v.get("include_cluster_context").and_then(|x| x.as_bool()) {
+        agent.include_cluster_context = b;
     }
 }
 
@@ -14711,6 +14794,7 @@ pub async fn agents_update(
             agent.discord = Some(parsed);
         }
     }
+    apply_access_fields(&mut agent, &v);
     match crate::wolfagents::upsert(agent.clone()) {
         Ok(()) => HttpResponse::Ok().json(agent),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
@@ -14748,7 +14832,11 @@ pub async fn agents_chat(
     if msg.trim().is_empty() {
         return HttpResponse::BadRequest().json(serde_json::json!({"error": "message is empty"}));
     }
-    match crate::wolfagents::chat_with_agent(&id, &msg).await {
+    // Dashboard chats use the full tool_use loop — Claude-provider
+    // agents with allowed_tools can actually call the dispatcher.
+    // Discord/Telegram/WhatsApp receivers stay on the no-AppState
+    // `chat_with_agent` fallback because they don't plumb AppState.
+    match crate::wolfagents::chat_with_agent_full(&id, &msg, state.get_ref()).await {
         Ok(reply) => HttpResponse::Ok().json(serde_json::json!({
             "agent_id": id,
             "response": reply,
@@ -14765,6 +14853,92 @@ pub async fn agents_chat(
 pub async fn agents_tool_catalogue(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     HttpResponse::Ok().json(crate::wolfagents::tools::catalogue())
+}
+
+/// GET /api/agents/{id}/pending — list pending tool-use actions for
+/// this agent. Each entry has {seq, tool, arguments, reason, ts_queued}
+/// and is status=pending (approve/deny entries with other status are
+/// included too so the UI can show recent history).
+pub async fn agents_pending_list(
+    req: HttpRequest, state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    if crate::wolfagents::load(&id).is_none() {
+        return HttpResponse::NotFound().json(serde_json::json!({"error": "agent not found"}));
+    }
+    // Load everything — UI filters by status. Keeps the history
+    // viewable on the same tab.
+    let all = crate::wolfagents::pending::load_all(&id);
+    HttpResponse::Ok().json(serde_json::json!({ "entries": all }))
+}
+
+#[derive(Deserialize)]
+pub struct PendingDecisionBody {
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// POST /api/agents/{id}/pending/{seq}/approve — run the tool now,
+/// record the result. The agent sees the outcome on its next chat turn.
+pub async fn agents_pending_approve(
+    req: HttpRequest, state: web::Data<AppState>,
+    path: web::Path<(String, u64)>,
+    body: web::Json<PendingDecisionBody>,
+) -> HttpResponse {
+    let Ok(user) = require_auth(&req, &state) else {
+        return HttpResponse::Unauthorized().json(serde_json::json!({"error": "unauthorised"}));
+    };
+    let (agent_id, seq) = path.into_inner();
+    let Some(agent) = crate::wolfagents::load(&agent_id) else {
+        return HttpResponse::NotFound().json(serde_json::json!({"error": "agent not found"}));
+    };
+    let entry = match crate::wolfagents::pending::approve(&agent_id, seq, &user, body.into_inner().note) {
+        Ok(e) => e,
+        Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({"error": e})),
+    };
+    // Re-run the tool with the approval in hand. Dispatcher will
+    // re-check authorise() and see our overriding "skip_auth_for_seq"
+    // hint — but we don't carry that yet; simplest path: call the
+    // individual tool branch directly by simulating a Trusted agent
+    // for just this call.
+    let trusted = crate::wolfagents::Agent {
+        access_level: crate::wolfagents::AccessLevel::Trusted,
+        ..agent
+    };
+    let result = crate::wolfagents::dispatch::dispatch(
+        &trusted, &entry.tool, &entry.arguments, state.get_ref()
+    ).await;
+    let result_json = serde_json::json!({
+        "ok": result.ok, "status": result.status, "data": result.data,
+    });
+    let _ = crate::wolfagents::pending::record_execution(&agent_id, seq, result_json.clone());
+    HttpResponse::Ok().json(serde_json::json!({
+        "approved": true,
+        "seq": seq,
+        "execution": result_json,
+    }))
+}
+
+/// POST /api/agents/{id}/pending/{seq}/deny — reject the pending action.
+/// Agent sees the denial on next turn.
+pub async fn agents_pending_deny(
+    req: HttpRequest, state: web::Data<AppState>,
+    path: web::Path<(String, u64)>,
+    body: web::Json<PendingDecisionBody>,
+) -> HttpResponse {
+    let Ok(user) = require_auth(&req, &state) else {
+        return HttpResponse::Unauthorized().json(serde_json::json!({"error": "unauthorised"}));
+    };
+    let (agent_id, seq) = path.into_inner();
+    if crate::wolfagents::load(&agent_id).is_none() {
+        return HttpResponse::NotFound().json(serde_json::json!({"error": "agent not found"}));
+    }
+    match crate::wolfagents::pending::deny(&agent_id, seq, &user, body.into_inner().note) {
+        Ok(entry) => HttpResponse::Ok().json(serde_json::json!({ "denied": true, "entry": entry })),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({"error": e})),
+    }
 }
 
 /// GET /api/agents/{id}/audit?limit=N — last N tool invocations for
@@ -18290,6 +18464,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/agents/{id}/chat", web::post().to(agents_chat))
         .route("/api/agents/{id}/memory", web::get().to(agents_memory))
         .route("/api/agents/{id}/audit", web::get().to(agents_audit))
+        .route("/api/agents/{id}/pending", web::get().to(agents_pending_list))
+        .route("/api/agents/{id}/pending/{seq}/approve", web::post().to(agents_pending_approve))
+        .route("/api/agents/{id}/pending/{seq}/deny", web::post().to(agents_pending_deny))
         // MCP-shaped tool surface so external agent harnesses can call
         // WolfStack's read-only capabilities without reinventing each one.
         .route("/api/mcp/tools/list", web::post().to(mcp_tools_list))
