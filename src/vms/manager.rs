@@ -3122,9 +3122,43 @@ fn disk_info_from_qemu_img(path: &str) -> (u32, String) {
 
 const VM_BASE: &str = "/var/lib/wolfstack/vms";
 
+/// Pick the base directory for export / import staging. Precedence:
+///   1. explicit per-call `staging_dir` argument (operator's pick
+///      from the migrate dialog) — fastest, most specific.
+///   2. `$TMPDIR` environment variable (systemd Environment= line).
+///   3. `/tmp` (the long-standing default).
+///
+/// Migration staging can be 2× the VM disk size (staged copy + the
+/// tar.gz on top), so operators whose `/tmp` is a small tmpfs hit
+/// "no space left on device" long before their target storage fills.
+/// Letting them point staging at a roomy filesystem is the fix.
+fn migration_staging_root(explicit: Option<&str>) -> PathBuf {
+    if let Some(p) = explicit {
+        let p = p.trim();
+        if !p.is_empty() { return PathBuf::from(p); }
+    }
+    if let Ok(v) = std::env::var("TMPDIR") {
+        if !v.trim().is_empty() { return PathBuf::from(v); }
+    }
+    PathBuf::from("/tmp")
+}
+
 /// Export a VM as a tar.gz archive containing config JSON + disk images.
 /// Returns the archive path. The VM must be stopped first.
+/// Back-compat wrapper — delegates to `export_vm_with_staging` with
+/// no explicit staging override. All current internal callers go
+/// through the `_with_staging` variant; this wrapper stays for any
+/// external integration that might be using the shorter name.
+#[allow(dead_code)]
 pub fn export_vm(name: &str) -> Result<PathBuf, String> {
+    export_vm_with_staging(name, None)
+}
+
+/// Same as `export_vm` but lets the operator pick the staging root
+/// instead of the hardcoded `/tmp`. Live migration of large VMs on
+/// hosts with small tmpfs-backed `/tmp` was failing here; this
+/// parameter lets the dialog route the staging to a roomy disk.
+pub fn export_vm_with_staging(name: &str, staging_dir: Option<&str>) -> Result<PathBuf, String> {
     // Validate name to prevent path traversal
     if name.contains('/') || name.contains("..") || name.contains('\0') || name.is_empty() {
         return Err("Invalid VM name".to_string());
@@ -3142,10 +3176,12 @@ pub fn export_vm(name: &str) -> Result<PathBuf, String> {
     let config: VmConfig = serde_json::from_str(&content)
         .map_err(|e| format!("Failed to parse VM config: {}", e))?;
 
-    // Create export staging directory
-    let export_dir = PathBuf::from("/tmp/wolfstack-vm-exports");
+    // Create export staging directory under the operator's chosen root
+    // (or $TMPDIR / /tmp). Needs ~2× the VM disk size free: one copy
+    // in the staged directory + the tar.gz on top.
+    let export_dir = migration_staging_root(staging_dir).join("wolfstack-vm-exports");
     fs::create_dir_all(&export_dir)
-        .map_err(|e| format!("Failed to create export dir: {}", e))?;
+        .map_err(|e| format!("Failed to create export dir {}: {}", export_dir.display(), e))?;
 
     // Stage files into a temp directory, then tar from there
     let staging = export_dir.join(format!("staging-{}-{}", name, uuid::Uuid::new_v4()));
@@ -3257,6 +3293,17 @@ pub fn export_vm(name: &str) -> Result<PathBuf, String> {
 /// Import a VM from a tar.gz archive. Extracts to the VM base directory.
 /// Returns a success message with the VM name.
 pub fn import_vm(archive_path: &str, new_name: Option<&str>, storage: Option<&str>) -> Result<String, String> {
+    import_vm_with_staging(archive_path, new_name, storage, None)
+}
+
+/// Same as `import_vm` but respects a staging-dir override so an
+/// operator on the target side can point extraction at a big disk
+/// when `/tmp` is too small for a multi-GB VM archive. Falls back
+/// to `$TMPDIR` then `/tmp`.
+pub fn import_vm_with_staging(
+    archive_path: &str, new_name: Option<&str>, storage: Option<&str>,
+    staging_dir: Option<&str>,
+) -> Result<String, String> {
     // Validate new_name to prevent path traversal
     if let Some(n) = new_name {
         if n.contains('/') || n.contains("..") || n.contains('\0') || n.is_empty() {
@@ -3268,8 +3315,10 @@ pub fn import_vm(archive_path: &str, new_name: Option<&str>, storage: Option<&st
     fs::create_dir_all(base)
         .map_err(|e| format!("Failed to create VM dir: {}", e))?;
 
-    // Extract to a unique temp directory to avoid race conditions
-    let tmp = PathBuf::from(format!("/tmp/wolfstack-vm-import-{}", uuid::Uuid::new_v4()));
+    // Extract to a unique temp directory under the operator's chosen
+    // staging root. Needs ~1× VM disk size free.
+    let tmp = migration_staging_root(staging_dir)
+        .join(format!("wolfstack-vm-import-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&tmp)
         .map_err(|e| format!("Failed to create import temp dir: {}", e))?;
 
@@ -3461,6 +3510,195 @@ pub fn import_vm(archive_path: &str, new_name: Option<&str>, storage: Option<&st
 /// Clean up an export archive
 pub fn export_cleanup(archive_path: &str) {
     let _ = fs::remove_file(archive_path);
+}
+
+/// Move a VM's disks to a new storage path on the SAME node. Companion
+/// to `containers::lxc_storage::migrate` for VMs. Used when an
+/// operator wants to shift a stopped VM from local /var/lib to a
+/// bigger ZFS pool (or similar) without doing a full cross-node
+/// migration. Both the OS disk and every extra disk move; the
+/// VmConfig.storage_path + extra_disks[].storage_path are rewritten
+/// to point at the new location.
+///
+/// Refuses to operate on a running VM — a live qcow2 copy would be
+/// inconsistent and the VM would crash once it's pointed at the copy.
+///
+/// `remove_source=false` (default) copies and leaves the source
+/// alone, so the operator can verify the new copy boots before
+/// reclaiming space manually. `remove_source=true` deletes the
+/// source file AFTER a successful copy.
+pub fn migrate_storage(
+    name: &str, target: &str, remove_source: bool,
+) -> Result<String, String> {
+    if name.contains('/') || name.contains("..") || name.contains('\0') || name.is_empty() {
+        return Err("Invalid VM name".to_string());
+    }
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("target storage path is required".into());
+    }
+
+    let base = Path::new(VM_BASE);
+    let config_path = base.join(format!("{}.json", name));
+    if !config_path.exists() {
+        return Err(format!("VM config not found: {}", config_path.display()));
+    }
+    let content = fs::read_to_string(&config_path)
+        .map_err(|e| format!("Failed to read VM config: {}", e))?;
+    let mut config: VmConfig = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse VM config: {}", e))?;
+
+    if config.running {
+        return Err(format!(
+            "VM '{}' is marked running — stop it first (live qcow2 copy produces a corrupted target).",
+            name
+        ));
+    }
+    // Belt-and-braces: also check for the QEMU process, since the
+    // config flag can drift from reality after a crash.
+    if let Ok(o) = Command::new("pgrep").args(["-f", &format!("guest={}", name)]).output() {
+        if o.status.success() && !o.stdout.is_empty() {
+            return Err(format!(
+                "VM '{}' has a live qemu process — shutdown first",
+                name
+            ));
+        }
+    }
+
+    let target_path = Path::new(target);
+    if !target_path.exists() {
+        return Err(format!(
+            "target storage directory '{}' does not exist — mount/create it first",
+            target
+        ));
+    }
+    if !target_path.is_dir() {
+        return Err(format!("target storage '{}' is not a directory", target));
+    }
+
+    // Figure out where the OS disk currently lives.
+    let source_os_storage = config.storage_path.clone().unwrap_or_else(|| VM_BASE.to_string());
+    if source_os_storage == target {
+        return Err("source and target storage paths are the same".into());
+    }
+    let source_os_disk = Path::new(&source_os_storage).join(format!("{}.qcow2", name));
+    let target_os_disk = target_path.join(format!("{}.qcow2", name));
+
+    // Free-space pre-flight: add up the sizes we're about to copy.
+    let mut bytes_needed: u64 = 0;
+    if source_os_disk.exists() {
+        bytes_needed += fs::metadata(&source_os_disk).map(|m| m.len()).unwrap_or(0);
+    }
+    for disk in &config.extra_disks {
+        let p = disk.file_path();
+        if p.exists() {
+            bytes_needed += fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+        }
+    }
+    if let Some(avail) = available_bytes(target) {
+        if avail < bytes_needed {
+            return Err(format!(
+                "target '{}' has {} bytes free, but migration needs {} bytes",
+                target, avail, bytes_needed
+            ));
+        }
+    }
+
+    // Copy the OS disk.
+    let mut copied: Vec<PathBuf> = Vec::new();
+    if source_os_disk.exists() {
+        if target_os_disk.exists() {
+            return Err(format!(
+                "target file {} already exists — refuse to overwrite",
+                target_os_disk.display()
+            ));
+        }
+        fs::copy(&source_os_disk, &target_os_disk)
+            .map_err(|e| format!("copy OS disk {} → {}: {}",
+                source_os_disk.display(), target_os_disk.display(), e))?;
+        copied.push(target_os_disk.clone());
+    }
+
+    // Copy each extra disk.
+    let mut new_extras: Vec<StorageVolume> = Vec::new();
+    for disk in &config.extra_disks {
+        let src = disk.file_path();
+        let dst = target_path.join(format!("{}.{}", disk.name, disk.format));
+        if src.exists() {
+            if dst.exists() {
+                // Roll back what we've copied so far.
+                for p in &copied { let _ = fs::remove_file(p); }
+                return Err(format!(
+                    "target file {} already exists — refuse to overwrite",
+                    dst.display()
+                ));
+            }
+            if let Err(e) = fs::copy(&src, &dst) {
+                for p in &copied { let _ = fs::remove_file(p); }
+                return Err(format!("copy extra disk {} → {}: {}",
+                    src.display(), dst.display(), e));
+            }
+            copied.push(dst);
+        }
+        let mut moved_disk = disk.clone();
+        moved_disk.storage_path = target.to_string();
+        new_extras.push(moved_disk);
+    }
+
+    // Rewrite the config to point at the new storage.
+    config.storage_path = Some(target.to_string());
+    config.extra_disks = new_extras;
+    let json = serde_json::to_string_pretty(&config)
+        .map_err(|e| format!("serialise config: {}", e))?;
+    if let Err(e) = fs::write(&config_path, &json) {
+        for p in &copied { let _ = fs::remove_file(p); }
+        return Err(format!("rewrite config: {}", e));
+    }
+
+    // Delete sources if requested. Errors here are non-fatal — the
+    // copy already succeeded and the config points at the new copy,
+    // so a stale source file on disk isn't a correctness problem.
+    if remove_source {
+        if source_os_disk.exists() {
+            if let Err(e) = fs::remove_file(&source_os_disk) {
+                warn!("migrate_storage: failed to remove source OS disk {}: {}",
+                    source_os_disk.display(), e);
+            }
+        }
+        // For extras we need the OLD paths — the old disk list was
+        // just replaced, so we walk the pre-replace list.
+        // (Avoid re-reading config from disk — it's already updated.
+        // Reconstruct the old paths from the saved content instead.)
+        if let Ok(old_cfg) = serde_json::from_str::<VmConfig>(&content) {
+            for disk in &old_cfg.extra_disks {
+                let p = disk.file_path();
+                if p.exists() {
+                    if let Err(e) = fs::remove_file(&p) {
+                        warn!("migrate_storage: failed to remove source extra disk {}: {}",
+                            p.display(), e);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(format!(
+        "migrated VM '{}' disks from {} → {} ({} files copied)",
+        name, source_os_storage, target, copied.len()
+    ))
+}
+
+/// Bytes free on the filesystem backing `path`. Used for the
+/// migrate_storage pre-flight. Returns None if we can't read it —
+/// caller treats that as "couldn't check, proceed and let the OS
+/// report the space error if it happens".
+fn available_bytes(path: &str) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let cpath = std::ffi::CString::new(std::ffi::OsStr::new(path).as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(cpath.as_ptr(), &mut stat) };
+    if rc != 0 { return None; }
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
 }
 
 /// Pre-flight a Proxmox VM config before `qm start`.

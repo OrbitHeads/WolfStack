@@ -24,6 +24,7 @@ pub fn config(cfg: &mut web::ServiceConfig) {
             .route("/{name}/add-serial", web::post().to(vm_add_serial))
             .route("/{name}/migrate", web::post().to(vm_migrate))
             .route("/{name}/migrate-external", web::post().to(vm_migrate_external))
+            .route("/{name}/disk/migrate", web::post().to(vm_disk_migrate))
             .route("/{name}/volumes", web::post().to(add_volume))
             .route("/{name}/volumes/{vol}", web::delete().to(remove_volume))
             .route("/{name}/volumes/{vol}/resize", web::post().to(resize_volume))
@@ -579,11 +580,31 @@ async fn resize_volume(req: HttpRequest, state: web::Data<AppState>, path: web::
 struct VmMigrateRequest {
     target_node: String,
     new_name: Option<String>,
+    /// Destination storage path on the target node — where the final
+    /// qcow2(s) end up after import.
     storage: Option<String>,
+    /// Staging root on the SOURCE node for the export tarball. The
+    /// default `/tmp` is often a small tmpfs; operators whose VMs
+    /// don't fit can point this at a big disk (e.g. /var/wolftmp).
+    /// Honoured on the source side only — the target node picks its
+    /// own staging root (TMPDIR env or its own setting).
+    #[serde(default)]
+    staging_dir: Option<String>,
     #[serde(default)]
     target_address: Option<String>,
     #[serde(default)]
     target_port: Option<u16>,
+}
+
+#[derive(Deserialize)]
+pub struct VmDiskMigrateRequest {
+    /// Target storage path on the same node.
+    pub target: String,
+    /// Whether to delete source files after a successful copy.
+    /// Default false — we keep the source so the operator can verify
+    /// the new copy boots before reclaiming space.
+    #[serde(default)]
+    pub remove_source: bool,
 }
 
 #[derive(Deserialize)]
@@ -594,6 +615,9 @@ struct VmMigrateExternalRequest {
     new_name: Option<String>,
     storage: Option<String>,
     delete_source: Option<bool>, // accepted but ignored — source is never deleted
+    /// Staging root on the source node — same semantics as vm_migrate.
+    #[serde(default)]
+    staging_dir: Option<String>,
 }
 
 /// POST /api/vms/{name}/migrate — migrate VM to another cluster node
@@ -659,8 +683,11 @@ async fn vm_migrate(
         }
     }
 
-    // Export (outside of mutex — this is I/O heavy)
-    let archive_path = match super::manager::export_vm(&name) {
+    // Export (outside of mutex — this is I/O heavy). staging_dir lets
+    // the operator point export staging at a big disk instead of /tmp.
+    let archive_path = match super::manager::export_vm_with_staging(
+        &name, body.staging_dir.as_deref(),
+    ) {
         Ok(p) => p,
         Err(e) => {
             // Restart source on failure
@@ -745,7 +772,25 @@ async fn vm_migrate(
     }))
 }
 
-/// POST /api/vms/{name}/migrate-external — migrate VM to external cluster
+/// POST /api/vms/{name}/disk/migrate — move a stopped VM's disks to a
+/// different storage path on the same node. Counterpart to the
+/// `/api/containers/lxc/{name}/disk/migrate` endpoint for LXC; same
+/// shape (`target` path + `remove_source` flag).
+async fn vm_disk_migrate(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<VmDiskMigrateRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let name = path.into_inner();
+    match super::manager::migrate_storage(&name, &body.target, body.remove_source) {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// POST /api/vms/{name}/migrate-external — migrate VM to another cluster
 async fn vm_migrate_external(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -792,7 +837,9 @@ async fn vm_migrate_external(
     }
 
     // Export
-    let archive_path = match super::manager::export_vm(&name) {
+    let archive_path = match super::manager::export_vm_with_staging(
+        &name, body.staging_dir.as_deref(),
+    ) {
         Ok(p) => p,
         Err(e) => {
             let manager = state.vms.lock().unwrap();
@@ -893,7 +940,13 @@ async fn vm_import_external(
 
     use futures::StreamExt;
 
-    let import_dir = std::path::PathBuf::from("/tmp/wolfstack-vm-imports");
+    // Respect TMPDIR so operators whose target `/tmp` is a small tmpfs
+    // can point upload staging at a roomy disk via the wolfstack
+    // systemd unit's `Environment=TMPDIR=/big/tmp` line.
+    let import_dir = std::env::var("TMPDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+        .join("wolfstack-vm-imports");
     let _ = std::fs::create_dir_all(&import_dir);
 
     let mut new_name: Option<String> = None;
