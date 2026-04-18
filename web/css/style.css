@@ -168,6 +168,79 @@
     --shadow-glow: 0 0 30px rgba(34, 197, 94, 0.12);
 }
 
+/* ─── Punk (Cyberpunk 2077) Theme ───
+   Deep violet-black, iconic cyberpunk yellow HUD, hot-pink accents,
+   cyan secondary text. High-contrast and a touch glitchy — chosen for
+   night-shift operators who want their dashboard to look like a street
+   kiosk in Night City rather than a corporate tool. */
+[data-theme="punk"] {
+    --bg-primary: #0a0612;
+    --bg-secondary: #130a1f;
+    --bg-card: #1a1030;
+    --bg-card-hover: #241848;
+    --bg-input: #080410;
+    --border: #2a1850;
+    --border-light: #4a2880;
+    --text-primary: #fffce0;
+    --text-secondary: #00f0ff;
+    --text-muted: #7a6680;
+    --accent: #ff007a;
+    --accent-light: #ff4da6;
+    --accent-glow: rgba(255, 0, 122, 0.28);
+    --success: #00ff88;
+    --success-bg: rgba(0, 255, 136, 0.12);
+    --warning: #fcee0a;
+    --warning-bg: rgba(252, 238, 10, 0.14);
+    --danger: #ff0040;
+    --danger-bg: rgba(255, 0, 64, 0.14);
+    --info: #00f0ff;
+    --info-bg: rgba(0, 240, 255, 0.14);
+    --gradient-main: linear-gradient(135deg, #ff007a 0%, #fcee0a 50%, #00f0ff 100%);
+    --gradient-success: linear-gradient(135deg, #00ff88 0%, #00f0ff 100%);
+    --gradient-danger: linear-gradient(135deg, #ff0040 0%, #ff007a 100%);
+    --shadow-sm: 0 1px 3px rgba(255, 0, 122, 0.25);
+    --shadow-md: 0 4px 20px rgba(255, 0, 122, 0.22);
+    --shadow-lg: 0 10px 40px rgba(0, 240, 255, 0.18);
+    --shadow-glow: 0 0 30px rgba(255, 0, 122, 0.4);
+}
+
+/* ─── Fruit (Apple UX) Theme ───
+   Clean light theme using iOS / macOS system colours exactly as Apple
+   publishes them: systemBlue #007aff as the accent, systemGreen for
+   success, systemRed for danger, systemOrange for warning. The palette
+   tracks Apple's light mode so the dashboard feels at home next to a
+   macOS window. */
+[data-theme="fruit"] {
+    --bg-primary: #f2f2f7;
+    --bg-secondary: #ffffff;
+    --bg-card: #ffffff;
+    --bg-card-hover: #f7f7fa;
+    --bg-input: #f2f2f7;
+    --border: #e5e5ea;
+    --border-light: #d1d1d6;
+    --text-primary: #1c1c1e;
+    --text-secondary: #3c3c43;
+    --text-muted: #8e8e93;
+    --accent: #007aff;
+    --accent-light: #5ac8fa;
+    --accent-glow: rgba(0, 122, 255, 0.14);
+    --success: #34c759;
+    --success-bg: rgba(52, 199, 89, 0.1);
+    --warning: #ff9500;
+    --warning-bg: rgba(255, 149, 0, 0.1);
+    --danger: #ff3b30;
+    --danger-bg: rgba(255, 59, 48, 0.08);
+    --info: #5ac8fa;
+    --info-bg: rgba(90, 200, 250, 0.1);
+    --gradient-main: linear-gradient(135deg, #007aff 0%, #5ac8fa 100%);
+    --gradient-success: linear-gradient(135deg, #34c759 0%, #30d158 100%);
+    --gradient-danger: linear-gradient(135deg, #ff3b30 0%, #ff453a 100%);
+    --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.04);
+    --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.06);
+    --shadow-lg: 0 10px 40px rgba(0, 0, 0, 0.08);
+    --shadow-glow: 0 0 24px rgba(0, 122, 255, 0.14);
+}
+
 /* ─── Amber Terminal Theme ─── */
 [data-theme="amber"] {
     --bg-primary: #0a0800;
@@ -777,6 +850,32 @@
 [data-theme="arctic"] .log-viewer {
     background: #f0f7fc;
     color: #1e4a6e;
+}
+
+/* ─── Fruit (Apple) light-mode element overrides ─── */
+[data-theme="fruit"] .top-bar {
+    background: rgba(255, 255, 255, 0.85);
+    backdrop-filter: saturate(180%) blur(20px);
+    -webkit-backdrop-filter: saturate(180%) blur(20px);
+}
+
+[data-theme="fruit"] .log-viewer {
+    background: #f9f9fb;
+    color: #1c1c1e;
+}
+
+/* ─── Punk (Cyberpunk 2077) flourish — scanline + neon text accents ───
+   A subtle 1px scanline and a neon glow on headings so the theme
+   actually reads as cyberpunk rather than just "dark with pink". */
+[data-theme="punk"] .card h1,
+[data-theme="punk"] .card h2,
+[data-theme="punk"] .card h3 {
+    text-shadow: 0 0 8px rgba(255, 0, 122, 0.55);
+}
+
+[data-theme="punk"] .log-viewer {
+    background: #0a0612;
+    color: #00f0ff;
 }
 
 /* ─── Trek Theme — LCARS-inspired Star Trek aesthetic ─── */
