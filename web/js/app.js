@@ -37747,6 +37747,10 @@ function wolfAgentsOpenCreate() {
     var _ws = document.getElementById('wolfagents-field-whatsapp-sid'); if (_ws) _ws.value = '';
     var _wa = document.getElementById('wolfagents-field-whatsapp-auth'); if (_wa) _wa.value = '';
     _wolfAgentsRenderInheritedAi(null);
+    // Force-refresh the catalogue — a previous session might have
+    // cached an older tool list and the user would see a stale set of
+    // checkboxes after a wolfstack upgrade until they reloaded.
+    _wolfAgentsToolCatalogue = null;
     // Default new agents to ALL tools ticked. Combined with the default
     // access_level=read_only this is still safe — mutating/destructive
     // tools are refused by the authoriser until the operator raises the
@@ -37900,6 +37904,9 @@ async function wolfAgentsOpenEdit() {
         var _ws2 = document.getElementById('wolfagents-field-whatsapp-sid'); if (_ws2) _ws2.value = (a.whatsapp && a.whatsapp.twilio_sid) || '';
         var _wa2 = document.getElementById('wolfagents-field-whatsapp-auth'); if (_wa2) _wa2.value = (a.whatsapp && a.whatsapp.twilio_auth) || '';
         _wolfAgentsRenderInheritedAi(a);
+        // Same cache invalidation as create path — makes sure a freshly
+        // deployed backend's new tools show up without a hard reload.
+        _wolfAgentsToolCatalogue = null;
         _wolfAgentsRenderToolCheckboxes(a.allowed_tools || []);
         _wolfAgentsRenderAvatarPicker(a.avatar || '');
         document.getElementById('wolfagents-modal').style.display = 'flex';
@@ -37936,6 +37943,15 @@ async function wolfAgentsSaveFromModal() {
     const discordId = (document.getElementById('wolfagents-field-discord-id').value || '').trim();
     const discordLabel = (document.getElementById('wolfagents-field-discord-label').value || '').trim();
     const discordToken = (document.getElementById('wolfagents-field-discord-token')?.value || '').trim();
+    // Easy mistake: paste the bot token into the channel ID field
+    // because they sit next to each other. Discord snowflakes are
+    // 17–20 digits, nothing else; reject anything that contains
+    // characters no snowflake would ever have so the user corrects it
+    // instead of silently storing junk.
+    if (discordId && !/^\d{17,20}$/.test(discordId)) {
+        showToast('Discord channel ID must be a 17–20 digit snowflake (the number after /channels/ in the URL). Did you paste a bot token into the wrong field?', 'error');
+        return;
+    }
     if (discordId) {
         payload.discord = { channel_id: discordId, channel_label: discordLabel };
         if (discordToken) payload.discord.bot_token = discordToken;
@@ -37945,9 +37961,26 @@ async function wolfAgentsSaveFromModal() {
     const tgId = (document.getElementById('wolfagents-field-telegram-id')?.value || '').trim();
     const tgLabel = (document.getElementById('wolfagents-field-telegram-label')?.value || '').trim();
     const tgToken = (document.getElementById('wolfagents-field-telegram-token')?.value || '').trim();
+    // Telegram chat IDs are signed 64-bit integers. Bot tokens look
+    // like `\d+:[A-Za-z0-9_-]+` — a colon is the dead giveaway. Flag
+    // the likely field swap before it hits the backend.
+    if (tgId && !/^-?\d+$/.test(tgId)) {
+        showToast('Telegram Chat ID must be a number like 123456789 or -1001234567890. A colon in the value looks like a bot token — paste it into the Bot token field instead.', 'error');
+        return;
+    }
+    // Bot tokens always contain a colon; catch "pasted chat_id into
+    // bot_token" with a soft warning. Not a hard failure because we
+    // don't want to block non-Telegram tokens on principle.
+    if (tgToken && !tgToken.includes(':')) {
+        showToast('Telegram bot token looks malformed — @BotFather tokens always have a colon, e.g. 123456789:AA…', 'warn');
+    }
     if (tgId) {
         payload.telegram = { chat_id: tgId, chat_label: tgLabel };
         if (tgToken) payload.telegram.bot_token = tgToken;
+    } else if (tgToken) {
+        // Operator set a bot token but no chat ID — that's meaningless,
+        // the binding needs both. Save nothing and tell them why.
+        showToast('Telegram bot token set but Chat ID is empty — add a chat ID so the bot knows where to listen.', 'warn');
     } else if (_wolfAgentsEditId) {
         payload.telegram = null;
     }
