@@ -1580,10 +1580,38 @@ async fn call_gemini(
     let json: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| format!("Gemini JSON error: {}", e))?;
 
-    json["candidates"][0]["content"]["parts"][0]["text"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| format!("Unexpected Gemini response format: {}", text))
+    // Normal happy path — extract the text part.
+    if let Some(s) = json["candidates"][0]["content"]["parts"][0]["text"].as_str() {
+        return Ok(s.to_string());
+    }
+
+    // Gemini sometimes returns `finishReason` without content. The
+    // common one in no-tools callers is UNEXPECTED_TOOL_CALL — the
+    // model decided to emit a function call, but this code path
+    // (simple_chat) didn't register any tools, so Gemini aborts with
+    // no text. Turn these into a clean, user-facing error rather than
+    // dumping raw JSON into the chat window.
+    let finish_reason = json["candidates"][0]["finishReason"].as_str().unwrap_or("");
+    match finish_reason {
+        "UNEXPECTED_TOOL_CALL" => Err(
+            "Gemini tried to call a tool but this code path doesn't expose any — \
+             the agent is reachable from a surface (Telegram / Discord / WhatsApp) \
+             that currently runs without tool access. Chat from the dashboard \
+             for full tool use, or switch this agent's provider to Claude which \
+             tolerates no-tool fallbacks.".to_string()),
+        "SAFETY" => Err(
+            "Gemini blocked this response under its safety filters. Rephrase the \
+             request or try a different prompt.".to_string()),
+        "RECITATION" => Err(
+            "Gemini blocked the response as potential recitation of copyrighted \
+             content. Rephrase the request.".to_string()),
+        "MAX_TOKENS" => Err(
+            "Gemini stopped at the max-token limit before emitting any text. \
+             Shorten the conversation history or switch to a model with a larger \
+             output budget.".to_string()),
+        "" => Err(format!("Unexpected Gemini response format: {}", text)),
+        other => Err(format!("Gemini returned finishReason={} with no text content.", other)),
+    }
 }
 
 // ─── Email Alerts ───

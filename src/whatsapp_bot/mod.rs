@@ -95,7 +95,11 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// Resolve an inbound WhatsApp message to an agent reply. Returns
 /// None when no agent is bound to the sender number — the webhook
 /// responds with empty TwiML in that case so Twilio doesn't retry.
-pub async fn handle_inbound(from: &str, body: &str) -> Option<String> {
+pub async fn handle_inbound(
+    from: &str,
+    body: &str,
+    state: &crate::api::AppState,
+) -> Option<String> {
     let body = body.trim();
     if body.is_empty() { return None; }
     // Find the agent bound to this phone number. Binding stores the
@@ -104,7 +108,13 @@ pub async fn handle_inbound(from: &str, body: &str) -> Option<String> {
     let agent = agents.iter().find(|a|
         a.whatsapp.as_ref().map(|w| w.number.as_str()) == Some(from)
     )?.clone();
-    let reply = match crate::wolfagents::chat_with_agent(&agent.id, body).await {
+    // Full tool-use loop so WhatsApp-originated chats can actually act
+    // on cluster state rather than falling back to tool-less
+    // simple_chat (which was triggering UNEXPECTED_TOOL_CALL with
+    // Gemini when the system prompt advertised tools).
+    let reply = match crate::wolfagents::chat_with_agent_full(
+        &agent.id, body, state
+    ).await {
         Ok(r) => r,
         Err(e) => format!("(agent error) {}", e),
     };

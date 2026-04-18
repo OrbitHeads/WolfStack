@@ -589,16 +589,24 @@ async fn main() -> std::io::Result<()> {
         // to the right WolfAgent. Fails open: if the token is invalid
         // or Discord is unreachable, the supervisor retries every 30s
         // without affecting the rest of the server.
+        // Clone the shared AppState into each surface-supervisor task
+        // so Telegram / Discord-originated chats can run the full
+        // tool-use loop — not just simple_chat. Without this, models
+        // that follow the system-prompt tool directive (Gemini, some
+        // Claude revisions) would get UNEXPECTED_TOOL_CALL errors
+        // because the no-tools fallback couldn't honour the prompt.
+        let discord_state = app_state.clone();
         tokio::spawn(async move {
-            crate::discord_bot::supervise_forever().await;
+            crate::discord_bot::supervise_forever(discord_state).await;
         });
 
         // Telegram receiver — same idea as Discord but simpler
         // (HTTP long-polling; no gateway, no heartbeat). Idle until
         // the operator turns on telegram_receiver_enabled AND a
         // telegram_bot_token is set.
+        let telegram_state = app_state.clone();
         tokio::spawn(async move {
-            crate::telegram_bot::supervise_forever().await;
+            crate::telegram_bot::supervise_forever(telegram_state).await;
         });
 
         // Background: session + login rate limiter + reset token cleanup

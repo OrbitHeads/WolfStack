@@ -34,6 +34,7 @@
 //!   1 per 5s per token so a tight reconnect loop on a bad token
 //!   would be our fault; 30s is well over that.
 
+use actix_web::web;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -41,6 +42,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{info, warn};
+
+type AppData = web::Data<crate::api::AppState>;
 
 /// Gateway opcodes we care about. Full list is in the Discord docs;
 /// opcodes we don't send never need to appear here.
@@ -94,7 +97,7 @@ struct IdentifyProperties {
 
 /// Main entry point — spawned from `main.rs` as a long-lived tokio
 /// task. Returns when the connection dies (caller restarts us).
-pub async fn run_once(bot_token: String) -> Result<(), String> {
+pub async fn run_once(bot_token: String, state: AppData) -> Result<(), String> {
     // ── Step 1: resolve gateway URL ─────────────────────────────
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
@@ -270,8 +273,9 @@ pub async fn run_once(bot_token: String) -> Result<(), String> {
                         // heartbeat seq updates.
                         let http_reply = http.clone();
                         let token = bot_token.clone();
+                        let s = state.clone();
                         tokio::spawn(async move {
-                            handle_discord_chat(http_reply, &token, &agent, msg).await;
+                            handle_discord_chat(http_reply, &token, &agent, msg, s).await;
                         });
                     }
                     _ => { /* ignore — presence, typing, etc. */ }
@@ -291,13 +295,19 @@ async fn handle_discord_chat(
     bot_token: &str,
     agent: &crate::wolfagents::Agent,
     msg: DiscordMessage,
+    state: AppData,
 ) {
     // Quick input trim — Discord messages are up to 2000 chars; no
     // need for a server-side cap on top of the agent's own cap.
     let content = msg.content.trim();
     if content.is_empty() { return; }
 
-    let reply = match crate::wolfagents::chat_with_agent(&agent.id, content).await {
+    // Full tool-use loop, same as the dashboard path — lets Discord
+    // callers invoke tools the agent has granted instead of silently
+    // falling back to simple_chat.
+    let reply = match crate::wolfagents::chat_with_agent_full(
+        &agent.id, content, state.get_ref()
+    ).await {
         Ok(r) => r,
         Err(e) => format!("(agent error) {}", e),
     };
@@ -348,7 +358,7 @@ pub async fn send_discord_message(
 /// aborted. Sessions that exit on their own (gateway dropped, error)
 /// are auto-restarted on the next reconciliation tick, with a 30s
 /// cooldown to avoid hammering the gateway.
-pub async fn supervise_forever() {
+pub async fn supervise_forever(state: AppData) {
     // Short startup delay so the rest of the stack initialises first.
     tokio::time::sleep(Duration::from_secs(30)).await;
     use std::collections::HashMap;
@@ -365,9 +375,10 @@ pub async fn supervise_forever() {
         for token in &desired {
             if !running.contains_key(token) {
                 let tok = token.clone();
+                let s = state.clone();
                 info!("discord_bot: starting gateway session for bot ending …{}", tok_tail(&tok));
                 let handle = tokio::spawn(async move {
-                    match run_once(tok.clone()).await {
+                    match run_once(tok.clone(), s).await {
                         Ok(()) => info!("discord_bot (…{}): gateway exited cleanly", tok_tail(&tok)),
                         Err(e) => warn!("discord_bot (…{}): gateway errored: {}", tok_tail(&tok), e),
                     }

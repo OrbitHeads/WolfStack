@@ -23,9 +23,12 @@
 //! * **Bot reply loop**: we skip messages where `from.is_bot` is
 //!   true, same as Discord.
 
+use actix_web::web;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::{info, warn};
+
+type AppData = web::Data<crate::api::AppState>;
 
 /// Minimal shape of a Telegram `Message`. Only fields we route on.
 #[derive(Debug, Clone, Deserialize)]
@@ -90,6 +93,7 @@ async fn poll_once(
     http: &reqwest::Client,
     bot_token: &str,
     offset: i64,
+    state: &AppData,
 ) -> Result<i64, String> {
     let url = format!(
         "https://api.telegram.org/bot{}/getUpdates?timeout=50&offset={}",
@@ -142,8 +146,9 @@ async fn poll_once(
         let http_reply = http.clone();
         let token = bot_token.to_string();
         let content = text;
+        let s = state.clone();
         tokio::spawn(async move {
-            handle_telegram_chat(http_reply, &token, &agent, chat_id, content, msg.message_id).await;
+            handle_telegram_chat(http_reply, &token, &agent, chat_id, content, msg.message_id, s).await;
         });
     }
     Ok(next_offset)
@@ -160,10 +165,19 @@ async fn handle_telegram_chat(
     chat_id: i64,
     content: String,
     _source_msg_id: i64,
+    state: AppData,
 ) {
     let content = content.trim();
     if content.is_empty() { return; }
-    let reply = match crate::wolfagents::chat_with_agent(&agent.id, content).await {
+    // Route through the full tool-use loop — the surface-initiated
+    // chat was previously falling back to simple_chat, which meant
+    // Telegram-originated turns couldn't call tools. Gemini in
+    // particular rejected that shape with UNEXPECTED_TOOL_CALL when
+    // the system prompt advertised tools that weren't registered.
+    // Now every turn gets the same dispatcher the dashboard uses.
+    let reply = match crate::wolfagents::chat_with_agent_full(
+        &agent.id, content, state.get_ref()
+    ).await {
         Ok(r) => r,
         Err(e) => format!("(agent error) {}", e),
     };
@@ -206,7 +220,7 @@ pub async fn send_telegram_message(
 /// the desired set get their tasks aborted. This lets operators pair
 /// each agent with its own @BotFather bot — one agent → one bot →
 /// one @-mention in any chat that bot is added to.
-pub async fn supervise_forever() {
+pub async fn supervise_forever(state: AppData) {
     tokio::time::sleep(Duration::from_secs(30)).await;
     use std::collections::HashMap;
     use tokio::task::JoinHandle;
@@ -217,8 +231,9 @@ pub async fn supervise_forever() {
         for token in &desired {
             if !running.contains_key(token) {
                 let tok = token.clone();
+                let s = state.clone();
                 info!("telegram_bot: starting long-poll task for bot ending …{}", tok_tail(&tok));
-                let handle = tokio::spawn(async move { long_poll_forever(tok).await; });
+                let handle = tokio::spawn(async move { long_poll_forever(tok, s).await; });
                 running.insert(token.clone(), handle);
             }
         }
@@ -266,7 +281,7 @@ fn tok_tail(t: &str) -> String {
 /// Per-token polling loop — runs until aborted by the supervisor.
 /// Each bot keeps its own `offset` so Telegram's ack semantics are
 /// correct per-bot (offsets are scoped to the bot that issued them).
-async fn long_poll_forever(bot_token: String) {
+async fn long_poll_forever(bot_token: String, state: AppData) {
     let http = match reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
@@ -279,7 +294,7 @@ async fn long_poll_forever(bot_token: String) {
     };
     let mut offset: i64 = 0;
     loop {
-        match poll_once(&http, &bot_token, offset).await {
+        match poll_once(&http, &bot_token, offset, &state).await {
             Ok(next) => { offset = next; }
             Err(e) => {
                 warn!("telegram_bot (bot …{}): poll error — {}", tok_tail(&bot_token), e);

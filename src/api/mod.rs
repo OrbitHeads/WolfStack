@@ -14662,6 +14662,7 @@ pub async fn system_install_package(
 /// needed for the common case.
 pub async fn whatsapp_webhook(
     req: HttpRequest,
+    state: web::Data<AppState>,
     body: web::Bytes,
 ) -> HttpResponse {
     let cfg = crate::alerting::AlertConfig::load();
@@ -14726,7 +14727,7 @@ pub async fn whatsapp_webhook(
     // Route to agent. `handle_inbound` does the rate-limiting + agent
     // lookup + chat_with_agent call; returns None when no agent is
     // bound to this phone number (empty TwiML so Twilio doesn't retry).
-    let reply = crate::whatsapp_bot::handle_inbound(&from, &msg_body).await;
+    let reply = crate::whatsapp_bot::handle_inbound(&from, &msg_body, state.get_ref()).await;
     let twiml = match reply {
         Some(text) => crate::whatsapp_bot::twiml_reply(&text),
         None => crate::whatsapp_bot::twiml_empty(),
