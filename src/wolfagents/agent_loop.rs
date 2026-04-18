@@ -976,6 +976,10 @@ fn input_schema_for(tool: ToolId) -> serde_json::Value {
                     "type": "array",
                     "items": { "type": "string", "enum": ["memory", "audit", "alerts"] },
                     "description": "Which corpora to search. Default: all three."
+                },
+                "node": {
+                    "type": "string",
+                    "description": "Which node's memory / audit / alert files to search. Omit or 'self' = this node only. A hostname or node id = just that remote. '*' or 'all' = fan out to every online node and merge results."
                 }
             }
         }),

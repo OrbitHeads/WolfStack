@@ -139,7 +139,7 @@ impl ToolId {
             ToolId::ListWorkflows => "List WolfFlow workflows",
             ToolId::WebFetch => "Fetch a public web URL (HTTP/HTTPS, no JS)",
             ToolId::WebRender => "Fetch a web URL via headless Chromium (JS-heavy sites; requires chromium on the host)",
-            ToolId::SemanticSearch => "Search past agent memory / alerts / audit logs on THIS node (BM25; memory files are per-node, so this searches where the agent is running)",
+            ToolId::SemanticSearch => "BM25 search across past agent memory / alerts / audit logs on any cluster node (pass `node` = hostname, '*' for cluster-wide merge, or omit for self)",
             ToolId::RestartContainer => "Restart container (Docker/LXC)",
             ToolId::RunWorkflow => "Run a WolfFlow workflow",
             ToolId::ScheduleWorkflow => "Schedule a WolfFlow workflow",

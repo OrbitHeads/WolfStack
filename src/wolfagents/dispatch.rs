@@ -195,7 +195,7 @@ pub async fn dispatch(
         ToolId::ListWorkflows => tool_list_workflows(arguments, state).await,
         ToolId::WebFetch => tool_web_fetch(arguments, false).await,
         ToolId::WebRender => tool_web_fetch(arguments, true).await,
-        ToolId::SemanticSearch => tool_semantic_search(arguments, agent).await,
+        ToolId::SemanticSearch => tool_semantic_search(arguments, agent, state).await,
 
         ToolId::RestartContainer => tool_restart_container(arguments, agent, state).await,
         ToolId::RunWorkflow => tool_run_workflow(arguments, state).await,
@@ -1989,38 +1989,119 @@ fn which_exists(bin: &str) -> bool {
 /// well enough without bundling a 25 MB ONNX model. The tool surface
 /// is stable; when a real vector index lands later, callers don't
 /// notice.
-async fn tool_semantic_search(args: &serde_json::Value, _agent: &Agent) -> ToolResult {
+async fn tool_semantic_search(
+    args: &serde_json::Value, _agent: &Agent, state: &crate::api::AppState,
+) -> ToolResult {
     let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("").trim();
     if query.is_empty() {
         return ToolResult::err("semantic_search requires a `query` string".into());
     }
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10)
         .clamp(1, 50) as usize;
-    let sources: Vec<&str> = args.get("sources").and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|x| x.as_str()).collect())
-        .unwrap_or_else(|| vec!["memory", "audit", "alerts"]);
-    let docs = collect_search_corpus(&sources);
-    let ranked = bm25_rank(query, &docs, limit);
+    let sources: Vec<String> = args.get("sources").and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_else(|| vec!["memory".into(), "audit".into(), "alerts".into()]);
+    let node = args.get("node").and_then(|v| v.as_str()).unwrap_or("").trim();
+
+    // Memory / audit / alert files are per-node. Three modes:
+    //   - no node / "self" / this node's id → local only (fast path)
+    //   - "*" or "all" → fan out to every online node, merge + re-rank
+    //   - specific node → HTTP to just that node
+    let self_id = crate::agent::self_node_id();
+    let is_local_only = node.is_empty() || node == "self" || node == self_id
+        || state.cluster.get_all_nodes().iter()
+            .find(|n| n.id == node || n.hostname == node)
+            .map(|n| n.is_self).unwrap_or(false);
+    if is_local_only {
+        let src_refs: Vec<&str> = sources.iter().map(|s| s.as_str()).collect();
+        let docs = collect_search_corpus(&src_refs);
+        let ranked = bm25_rank(query, &docs, limit);
+        return ToolResult::ok(
+            format!("{} matches for '{}' across {} docs (this node)",
+                ranked.len(), query, docs.len()),
+            serde_json::json!({
+                "query": query, "sources": sources, "node": "self",
+                "total_docs": docs.len(), "matches": ranked,
+            }),
+        );
+    }
+    // Cluster-wide or specific remote.
+    let want_all = node == "*" || node == "all";
+    let nodes = state.cluster.get_all_nodes();
+    let http = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .danger_accept_invalid_certs(true)
+        .build() { Ok(c) => c, Err(e) => return ToolResult::err(format!("http client: {}", e)) };
+
+    // Collect raw matches with their source-node tag, then BM25 already
+    // gave each one a score — we just sort globally and take top-N.
+    let mut gathered: Vec<serde_json::Value> = Vec::new();
+    // Start with local matches for the "*" mode so cluster-wide
+    // includes self too.
+    if want_all {
+        let src_refs: Vec<&str> = sources.iter().map(|s| s.as_str()).collect();
+        let docs = collect_search_corpus(&src_refs);
+        for m in bm25_rank(query, &docs, limit * 2) {
+            let mut obj = m;
+            if let Some(o) = obj.as_object_mut() {
+                o.insert("node".into(), serde_json::json!(
+                    nodes.iter().find(|n| n.is_self).map(|n| n.hostname.clone()).unwrap_or_default()
+                ));
+            }
+            gathered.push(obj);
+        }
+    }
+    for n in nodes.iter().filter(|n| n.online && !n.is_self) {
+        if !want_all && !(n.id == node || n.hostname == node) { continue; }
+        let scheme = if n.port == 443 || n.port == 8553 { "https" } else { "http" };
+        let url = format!("{}://{}:{}/api/cluster/semantic/search",
+            scheme, n.address, n.port);
+        let resp = http.post(&url)
+            .header("X-WolfStack-Secret", &state.cluster_secret)
+            .json(&serde_json::json!({
+                "query": query, "limit": limit * 2, "sources": sources,
+            }))
+            .send().await;
+        let Ok(r) = resp else { continue; };
+        if !r.status().is_success() { continue; }
+        let Ok(val) = r.json::<serde_json::Value>().await else { continue; };
+        if let Some(arr) = val.get("matches").and_then(|v| v.as_array()) {
+            for m in arr {
+                let mut obj = m.clone();
+                if let Some(o) = obj.as_object_mut() {
+                    o.insert("node".into(), serde_json::json!(n.hostname));
+                }
+                gathered.push(obj);
+            }
+        }
+    }
+    // Global re-rank — sort by score (desc), take top-N.
+    gathered.sort_by(|a, b| {
+        let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    gathered.truncate(limit);
     ToolResult::ok(
-        format!("{} matches for '{}' across {} docs", ranked.len(), query, docs.len()),
+        format!("{} matches for '{}' ({})", gathered.len(), query,
+            if want_all { "cluster-wide".to_string() } else { format!("node={}", node) }),
         serde_json::json!({
-            "query": query,
-            "sources": sources,
-            "total_docs": docs.len(),
-            "matches": ranked,
+            "query": query, "sources": sources,
+            "node": if want_all { "*" } else { node },
+            "matches": gathered,
         }),
     )
 }
 
 /// A single document in the search corpus — a line from memory/audit/
 /// alerts, tagged with where it came from so matches carry source.
-struct SearchDoc {
+pub(crate) struct SearchDoc {
     source: String,
     path: String,
     text: String,
 }
 
-fn collect_search_corpus(sources: &[&str]) -> Vec<SearchDoc> {
+pub(crate) fn collect_search_corpus(sources: &[&str]) -> Vec<SearchDoc> {
     let mut out = Vec::new();
     if sources.contains(&"memory") {
         if let Ok(agents_dir) = std::fs::read_dir("/etc/wolfstack/agents") {
@@ -2101,7 +2182,7 @@ fn tokenise(text: &str) -> Vec<String> {
 
 /// Classic BM25 with k1=1.5, b=0.75. Returns the top `limit` docs by
 /// score, formatted for the tool response.
-fn bm25_rank(query: &str, docs: &[SearchDoc], limit: usize) -> Vec<serde_json::Value> {
+pub(crate) fn bm25_rank(query: &str, docs: &[SearchDoc], limit: usize) -> Vec<serde_json::Value> {
     if docs.is_empty() { return Vec::new(); }
     let q_terms: Vec<String> = tokenise(query);
     if q_terms.is_empty() { return Vec::new(); }

@@ -14752,6 +14752,46 @@ pub async fn cluster_file_write(
     }
 }
 
+/// POST /api/cluster/semantic/search — cluster-secret-auth'd BM25
+/// search against THIS node's agent memory / alerts / audit corpora.
+/// Used by WolfAgent tool `semantic_search` when the caller wants to
+/// search a different node. Mirrors the tool's args on the wire.
+#[derive(Deserialize)]
+pub struct ClusterSemanticQuery {
+    pub query: String,
+    #[serde(default)]
+    pub limit: Option<u64>,
+    #[serde(default)]
+    pub sources: Option<Vec<String>>,
+}
+
+pub async fn cluster_semantic_search(
+    req: HttpRequest, state: web::Data<AppState>, body: web::Json<ClusterSemanticQuery>,
+) -> HttpResponse {
+    match require_auth(&req, &state) {
+        Ok(u) if u == "cluster-node" => {}
+        Ok(_) => return HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "cluster semantic-search endpoint requires cluster-secret auth, not a user session"
+        })),
+        Err(resp) => return resp,
+    }
+    let query = body.query.trim();
+    if query.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "query required"}));
+    }
+    let limit = body.limit.unwrap_or(10).clamp(1, 50) as usize;
+    let sources: Vec<&str> = body.sources.as_ref()
+        .map(|arr| arr.iter().map(|s| s.as_str()).collect())
+        .unwrap_or_else(|| vec!["memory", "audit", "alerts"]);
+    let docs = crate::wolfagents::dispatch::collect_search_corpus(&sources);
+    let matches = crate::wolfagents::dispatch::bm25_rank(query, &docs, limit);
+    HttpResponse::Ok().json(serde_json::json!({
+        "query": query,
+        "total_docs": docs.len(),
+        "matches": matches,
+    }))
+}
+
 pub async fn cluster_file_delete(
     req: HttpRequest, state: web::Data<AppState>, body: web::Json<ClusterFileOp>,
 ) -> HttpResponse {
@@ -18546,6 +18586,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/cluster/file/read", web::post().to(cluster_file_read))
         .route("/api/cluster/file/write", web::post().to(cluster_file_write))
         .route("/api/cluster/file/delete", web::post().to(cluster_file_delete))
+        .route("/api/cluster/semantic/search", web::post().to(cluster_semantic_search))
         // Disk partition info
         .route("/api/storage/disk-info", web::get().to(storage_disk_info))
         // Disk Partitioning & Formatting
