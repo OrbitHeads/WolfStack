@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bgn" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#fde68a"/><stop offset="60%" stop-color="#f97316"/><stop offset="100%" stop-color="#9a3412"/></linearGradient>
+    <linearGradient id="furn" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#fb923c"/><stop offset="100%" stop-color="#7c2d12"/></linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="18" fill="url(#bgn)"/>
+  <!-- sun behind head -->
+  <circle cx="64" cy="60" r="46" fill="#fbbf24" opacity="0.45"/>
+  <path d="M24 48 L32 14 L56 38 Z" fill="#7c2d12"/>
+  <path d="M104 48 L96 14 L72 38 Z" fill="#7c2d12"/>
+  <path d="M33 42 L36 22 L48 36 Z" fill="#fecaca"/>
+  <path d="M95 42 L92 22 L80 36 Z" fill="#fecaca"/>
+  <path d="M28 70 Q28 36 64 34 Q100 36 100 70 Q100 102 64 106 Q28 102 28 70 Z" fill="url(#furn)"/>
+  <path d="M28 72 Q22 78 26 86 Q32 88 34 80 Z" fill="#9a3412"/>
+  <path d="M100 72 Q106 78 102 86 Q96 88 94 80 Z" fill="#9a3412"/>
+  <ellipse cx="64" cy="84" rx="24" ry="16" fill="#fed7aa"/>
+  <ellipse cx="48" cy="62" rx="7" ry="8" fill="#fff"/>
+  <ellipse cx="80" cy="62" rx="7" ry="8" fill="#fff"/>
+  <circle cx="48" cy="64" r="4.2" fill="#eab308"/>
+  <circle cx="80" cy="64" r="4.2" fill="#eab308"/>
+  <circle cx="48" cy="64" r="2" fill="#422006"/>
+  <circle cx="80" cy="64" r="2" fill="#422006"/>
+  <!-- little tongue -->
+  <path d="M60 96 Q64 102 68 96 L68 92 Q64 94 60 92 Z" fill="#ef4444"/>
+  <path d="M58 78 Q64 74 70 78 Q72 86 64 89 Q56 86 58 78 Z" fill="#1c1917"/>
+  <path d="M64 89 L64 93" stroke="#1c1917" stroke-width="1.6" stroke-linecap="round"/>
+  <path d="M64 93 Q56 96 52 92" stroke="#1c1917" stroke-width="1.6" fill="none" stroke-linecap="round"/>
+  <path d="M64 93 Q72 96 76 92" stroke="#1c1917" stroke-width="1.6" fill="none" stroke-linecap="round"/>
+  <!-- small flame accent -->
+  <path d="M112 22 Q108 26 110 32 Q114 34 116 30 Q118 26 115 22 Q117 18 114 14 Q110 18 112 22 Z" fill="#f97316"/>
+  <path d="M113 24 Q111 27 112 30 Q114 31 115 29 Q116 26 114 22 Z" fill="#fde68a"/>
+</svg>

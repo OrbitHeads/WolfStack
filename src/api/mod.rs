@@ -14742,6 +14742,29 @@ pub async fn agents_create(req: HttpRequest, state: web::Data<AppState>, body: w
 /// object clears all scope restrictions (intentional — the operator
 /// may want to widen scope).
 fn apply_access_fields(agent: &mut crate::wolfagents::Agent, v: &serde_json::Value) {
+    // Avatar: either a bare filename (e.g. "wolf-grey.svg" → served from
+    // /images/agent-avatars/) or a data: URL from a user upload. null
+    // clears the field, which makes the UI fall back to a deterministic
+    // built-in pick. We cap data URLs at 512 KB to keep agents.json from
+    // ballooning when lots of agents carry custom uploads.
+    if let Some(v_av) = v.get("avatar") {
+        if v_av.is_null() {
+            agent.avatar = None;
+        } else if let Some(s) = v_av.as_str() {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                agent.avatar = None;
+            } else if trimmed.len() > 512 * 1024 {
+                tracing::warn!(
+                    "wolfagents: rejecting avatar >512 KB for agent {} ({} bytes)",
+                    agent.id, trimmed.len());
+                // Preserve the existing avatar rather than failing the
+                // whole update on this one field.
+            } else {
+                agent.avatar = Some(trimmed.to_string());
+            }
+        }
+    }
     if let Some(level) = v.get("access_level").and_then(|x| x.as_str()) {
         agent.access_level = match level {
             "read_only" => crate::wolfagents::AccessLevel::ReadOnly,
@@ -18457,10 +18480,13 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // WolfAgents — named AI agents with persistent memory.
         .route("/api/agents", web::get().to(agents_list))
         .route("/api/agents", web::post().to(agents_create))
+        // Static /tools MUST be registered before the {id} catch-all —
+        // actix matches in registration order, and the dynamic route
+        // would otherwise swallow `/api/agents/tools` as `id="tools"`.
+        .route("/api/agents/tools", web::get().to(agents_tool_catalogue))
         .route("/api/agents/{id}", web::get().to(agents_get))
         .route("/api/agents/{id}", web::put().to(agents_update))
         .route("/api/agents/{id}", web::delete().to(agents_delete))
-        .route("/api/agents/tools", web::get().to(agents_tool_catalogue))
         .route("/api/agents/{id}/chat", web::post().to(agents_chat))
         .route("/api/agents/{id}/memory", web::get().to(agents_memory))
         .route("/api/agents/{id}/audit", web::get().to(agents_audit))

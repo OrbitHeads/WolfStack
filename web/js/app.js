@@ -37089,6 +37089,9 @@ async function wolfusbReattach(busid) {
 // the active chat, because agents are low-volume and we want the UI
 // to always reflect disk state (another operator may have edited one).
 let _wolfAgentsActiveId = null;
+// Full agent record for the currently-open chat — lets message-bubble
+// rendering access the avatar without re-fetching per turn.
+let _wolfAgentsActiveAgent = null;
 
 async function wolfAgentsLoad() {
     const grid = document.getElementById('wolfagents-list');
@@ -37113,6 +37116,45 @@ async function wolfAgentsLoad() {
     }
 }
 
+// Built-in wolf avatars — SVG cartoons bundled under /images/agent-avatars.
+// Order matters: used as the deterministic fallback when an agent has no
+// avatar set (hash the agent id into the list so each agent keeps a
+// consistent look across sessions without a config write).
+const WOLF_AVATARS = [
+    { file: 'wolf-grey.svg',   label: 'Grey' },
+    { file: 'wolf-red.svg',    label: 'Red' },
+    { file: 'wolf-arctic.svg', label: 'Arctic' },
+    { file: 'wolf-shadow.svg', label: 'Shadow' },
+    { file: 'wolf-cyber.svg',  label: 'Cyber' },
+    { file: 'wolf-sunset.svg', label: 'Sunset' },
+];
+
+// Resolve an agent record's avatar to an <img> src. Three cases:
+//   - `data:` URL from an operator upload — use verbatim.
+//   - bare filename ("wolf-grey.svg") — served from the built-in folder.
+//   - null/empty — deterministic pick from the built-in set, keyed on
+//     the agent's id so the same agent always gets the same wolf.
+function _wolfAgentsAvatarSrc(a) {
+    const av = a && a.avatar;
+    if (typeof av === 'string' && av.startsWith('data:')) return av;
+    if (typeof av === 'string' && av && !av.includes('/') && !av.includes(':')) {
+        return `/images/agent-avatars/${av}`;
+    }
+    // Deterministic hash → pick one of the built-ins. Keeps each agent
+    // visually distinct without forcing a write to agents.json.
+    const id = (a && a.id) || '';
+    let h = 0;
+    for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) & 0x7fffffff;
+    const pick = WOLF_AVATARS[h % WOLF_AVATARS.length];
+    return `/images/agent-avatars/${pick.file}`;
+}
+
+function _wolfAgentsAvatarImg(a, size) {
+    const px = size || 36;
+    const src = _wolfAgentsAvatarSrc(a);
+    return `<img src="${escapeAttr(src)}" alt="" width="${px}" height="${px}" style="width:${px}px; height:${px}px; border-radius:${Math.round(px * 0.22)}px; object-fit:cover; background:linear-gradient(135deg,#a855f7,#6366f1); flex-shrink:0;" onerror="this.onerror=null; this.src='/images/agent-avatars/wolf-grey.svg';">`;
+}
+
 function wolfAgentsCardHtml(a) {
     const lastActive = a.last_active_at
         ? new Date(a.last_active_at * 1000).toLocaleString()
@@ -37126,7 +37168,7 @@ function wolfAgentsCardHtml(a) {
                 onmouseout="this.style.transform=''; this.style.borderColor='';">
         <div class="card-body">
             <div style="display:flex; align-items:center; gap:10px; margin-bottom:8px;">
-                <div style="width:36px; height:36px; background:linear-gradient(135deg,#a855f7,#6366f1); border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:20px;">🐺</div>
+                ${_wolfAgentsAvatarImg(a, 42)}
                 <div style="flex:1; min-width:0;">
                     <div style="font-weight:600; font-size:14px;">${escapeHtml(a.name)} ${discord}</div>
                     <div style="font-size:11px; color:var(--text-muted); font-family:var(--font-mono,monospace);">${escapeHtml(a.id)}</div>
@@ -37148,7 +37190,9 @@ async function wolfAgentsOpenChat(id) {
         const resp = await fetch(`/api/agents/${encodeURIComponent(id)}`, { credentials: 'include' });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const agent = await resp.json();
-        document.getElementById('wolfagents-chat-title').textContent = `💬 ${agent.name}`;
+        document.getElementById('wolfagents-chat-title').textContent = agent.name;
+        document.getElementById('wolfagents-chat-avatar').innerHTML = _wolfAgentsAvatarImg(agent, 40);
+        _wolfAgentsActiveAgent = agent;
         const providerLabel = agent.provider || '(global)';
         const modelLabel = agent.model || '(global default)';
         const scopeBits = [];
@@ -37306,12 +37350,18 @@ function wolfAgentsMessageHtml(role, content, ts) {
     const body = isUser
         ? `<div style="white-space:pre-wrap; word-break:break-word;">${escapeHtml(content)}</div>`
         : `<div style="word-break:break-word; line-height:1.45;">${_wolfAgentsMarkdown(content)}</div>`;
-    return `<div style="display:flex; justify-content:${align}; margin-bottom:10px;">
-        <div style="max-width:80%; background:${bg}; border:1px solid ${border}; border-radius:10px; padding:10px 14px;">
-            <div style="font-size:10px; color:var(--text-muted); margin-bottom:4px;">${isUser ? 'You' : 'Agent'}${tsLabel ? ' · ' + escapeHtml(tsLabel) : ''}</div>
-            ${body}
-        </div>
+    const senderLabel = isUser ? 'You' : (_wolfAgentsActiveAgent && _wolfAgentsActiveAgent.name) || 'Agent';
+    // Assistant bubbles lead with the agent avatar so threads with
+    // multiple agents stay visually distinct; user bubbles don't need
+    // an avatar (the alignment already disambiguates).
+    const avatar = isUser
+        ? ''
+        : `<div style="margin-right:8px; align-self:flex-start; padding-top:2px;">${_wolfAgentsAvatarImg(_wolfAgentsActiveAgent, 28)}</div>`;
+    const bubble = `<div style="max-width:80%; background:${bg}; border:1px solid ${border}; border-radius:10px; padding:10px 14px;">
+        <div style="font-size:10px; color:var(--text-muted); margin-bottom:4px;">${escapeHtml(senderLabel)}${tsLabel ? ' · ' + escapeHtml(tsLabel) : ''}</div>
+        ${body}
     </div>`;
+    return `<div style="display:flex; justify-content:${align}; margin-bottom:10px; align-items:flex-start;">${avatar}${bubble}</div>`;
 }
 
 async function wolfAgentsSendMessage() {
@@ -37452,7 +37502,114 @@ function wolfAgentsOpenCreate() {
     const waLabel = document.getElementById('wolfagents-field-whatsapp-label'); if (waLabel) waLabel.value = '';
     _wolfAgentsRenderInheritedAi(null);
     _wolfAgentsRenderToolCheckboxes([]);
+    _wolfAgentsRenderAvatarPicker(null);
     document.getElementById('wolfagents-modal').style.display = 'flex';
+}
+
+// Build the thumbnail strip under the avatar preview and wire each one
+// to set the hidden field + preview when clicked. Called on both create
+// and edit so the built-ins always show up regardless of entry path.
+function _wolfAgentsRenderAvatarPicker(currentAvatar) {
+    const picker = document.getElementById('wolfagents-field-avatar-picker');
+    const hidden = document.getElementById('wolfagents-field-avatar');
+    const preview = document.getElementById('wolfagents-field-avatar-preview');
+    if (!picker || !hidden || !preview) return;
+    picker.innerHTML = '';
+    for (const w of WOLF_AVATARS) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.title = w.label;
+        btn.style.cssText = 'width:40px; height:40px; border-radius:8px; border:2px solid transparent; padding:0; cursor:pointer; background:transparent;';
+        btn.innerHTML = `<img src="/images/agent-avatars/${w.file}" width="36" height="36" style="border-radius:8px; display:block;">`;
+        btn.onclick = () => {
+            hidden.value = w.file;
+            preview.src = `/images/agent-avatars/${w.file}`;
+            for (const c of picker.children) c.style.borderColor = 'transparent';
+            btn.style.borderColor = 'rgba(168,85,247,0.7)';
+        };
+        picker.appendChild(btn);
+    }
+    hidden.value = currentAvatar || '';
+    if (currentAvatar && currentAvatar.startsWith('data:')) {
+        preview.src = currentAvatar;
+    } else if (currentAvatar) {
+        preview.src = `/images/agent-avatars/${currentAvatar}`;
+        // Highlight the matching built-in.
+        const idx = WOLF_AVATARS.findIndex(w => w.file === currentAvatar);
+        if (idx >= 0) picker.children[idx].style.borderColor = 'rgba(168,85,247,0.7)';
+    } else {
+        preview.src = '/images/agent-avatars/wolf-grey.svg';
+    }
+    // Reset the file input so the same file can be re-selected if needed.
+    const upload = document.getElementById('wolfagents-field-avatar-upload');
+    if (upload) upload.value = '';
+}
+
+// Read an uploaded image file, downscale to 128×128 on a <canvas>, and
+// stash the resulting data URL in the hidden field. Keeps agents.json
+// lean (a typical downscale lands around 10–30 KB) and avoids shipping
+// the operator's full-resolution photo over to every chat load.
+function wolfAgentsHandleAvatarUpload(ev) {
+    const file = ev.target.files && ev.target.files[0];
+    if (!file) return;
+    if (file.size > 4 * 1024 * 1024) {
+        showToast('Avatar must be smaller than 4 MB (will be downscaled to 128px anyway)', 'warn');
+        ev.target.value = '';
+        return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+        // SVGs can go straight into the data URL — they're already
+        // vector and small, no point running them through a canvas.
+        if (file.type === 'image/svg+xml') {
+            const hidden = document.getElementById('wolfagents-field-avatar');
+            const preview = document.getElementById('wolfagents-field-avatar-preview');
+            hidden.value = reader.result;
+            preview.src = reader.result;
+            const picker = document.getElementById('wolfagents-field-avatar-picker');
+            for (const c of picker.children) c.style.borderColor = 'transparent';
+            return;
+        }
+        const img = new Image();
+        img.onload = () => {
+            const canvas = document.createElement('canvas');
+            canvas.width = 128; canvas.height = 128;
+            const ctx = canvas.getContext('2d');
+            // Fit the shorter edge, centre crop — avoids stretching
+            // portraits into square tiles.
+            const srcSize = Math.min(img.width, img.height);
+            const sx = (img.width - srcSize) / 2;
+            const sy = (img.height - srcSize) / 2;
+            ctx.drawImage(img, sx, sy, srcSize, srcSize, 0, 0, 128, 128);
+            // PNG at default quality; jpeg-convert as a fallback if the
+            // result overruns the backend's 512 KB cap (rare at 128×128).
+            let dataUrl = canvas.toDataURL('image/png');
+            if (dataUrl.length > 500 * 1024) {
+                dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+            }
+            const hidden = document.getElementById('wolfagents-field-avatar');
+            const preview = document.getElementById('wolfagents-field-avatar-preview');
+            hidden.value = dataUrl;
+            preview.src = dataUrl;
+            const picker = document.getElementById('wolfagents-field-avatar-picker');
+            for (const c of picker.children) c.style.borderColor = 'transparent';
+        };
+        img.onerror = () => showToast('Could not read image — try a different file', 'error');
+        img.src = reader.result;
+    };
+    reader.onerror = () => showToast('Could not read file', 'error');
+    reader.readAsDataURL(file);
+}
+
+function wolfAgentsClearAvatar() {
+    const hidden = document.getElementById('wolfagents-field-avatar');
+    const preview = document.getElementById('wolfagents-field-avatar-preview');
+    if (hidden) hidden.value = '';
+    if (preview) preview.src = '/images/agent-avatars/wolf-grey.svg';
+    const picker = document.getElementById('wolfagents-field-avatar-picker');
+    if (picker) for (const c of picker.children) c.style.borderColor = 'transparent';
+    const upload = document.getElementById('wolfagents-field-avatar-upload');
+    if (upload) upload.value = '';
 }
 
 let _wolfAgentsEditId = null;
@@ -37484,6 +37641,7 @@ async function wolfAgentsOpenEdit() {
         const waLabel = document.getElementById('wolfagents-field-whatsapp-label'); if (waLabel) waLabel.value = (a.whatsapp && a.whatsapp.label) || '';
         _wolfAgentsRenderInheritedAi(a);
         _wolfAgentsRenderToolCheckboxes(a.allowed_tools || []);
+        _wolfAgentsRenderAvatarPicker(a.avatar || '');
         document.getElementById('wolfagents-modal').style.display = 'flex';
     } catch (e) {
         showToast('Failed to load agent: ' + e.message, 'error');
@@ -37509,6 +37667,10 @@ async function wolfAgentsSaveFromModal() {
         },
         allowed_tools: _wolfAgentsReadToolCheckboxes(),
     };
+    // Avatar: empty string means "clear" (backend sends null), non-empty
+    // is either a built-in filename or a data: URL from the uploader.
+    const avatarVal = (document.getElementById('wolfagents-field-avatar')?.value || '').trim();
+    payload.avatar = avatarVal || null;
     if (!payload.name) { showToast('Name is required', 'warn'); return; }
     const discordId = (document.getElementById('wolfagents-field-discord-id').value || '').trim();
     const discordLabel = (document.getElementById('wolfagents-field-discord-label').value || '').trim();

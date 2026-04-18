@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <radialGradient id="bga" cx="50%" cy="30%" r="80%"><stop offset="0%" stop-color="#e0f2fe"/><stop offset="100%" stop-color="#7dd3fc"/></radialGradient>
+    <linearGradient id="fura" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#f8fafc"/><stop offset="100%" stop-color="#cbd5e1"/></linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="18" fill="url(#bga)"/>
+  <path d="M24 48 L32 14 L56 38 Z" fill="#cbd5e1"/>
+  <path d="M104 48 L96 14 L72 38 Z" fill="#cbd5e1"/>
+  <path d="M33 42 L36 22 L48 36 Z" fill="#fbcfe8"/>
+  <path d="M95 42 L92 22 L80 36 Z" fill="#fbcfe8"/>
+  <path d="M28 70 Q28 36 64 34 Q100 36 100 70 Q100 102 64 106 Q28 102 28 70 Z" fill="url(#fura)"/>
+  <path d="M28 72 Q22 78 26 86 Q32 88 34 80 Z" fill="#e2e8f0"/>
+  <path d="M100 72 Q106 78 102 86 Q96 88 94 80 Z" fill="#e2e8f0"/>
+  <ellipse cx="64" cy="84" rx="24" ry="16" fill="#ffffff"/>
+  <ellipse cx="48" cy="62" rx="7" ry="8" fill="#fff"/>
+  <ellipse cx="80" cy="62" rx="7" ry="8" fill="#fff"/>
+  <circle cx="48" cy="64" r="4.2" fill="#3b82f6"/>
+  <circle cx="80" cy="64" r="4.2" fill="#3b82f6"/>
+  <circle cx="48" cy="64" r="2" fill="#1e3a8a"/>
+  <circle cx="80" cy="64" r="2" fill="#1e3a8a"/>
+  <circle cx="46.5" cy="62.5" r="1.2" fill="#fff"/>
+  <circle cx="78.5" cy="62.5" r="1.2" fill="#fff"/>
+  <!-- snowflake on right cheek -->
+  <g transform="translate(100 66)" stroke="#60a5fa" stroke-width="1.2" stroke-linecap="round">
+    <line x1="-4" y1="0" x2="4" y2="0"/>
+    <line x1="0" y1="-4" x2="0" y2="4"/>
+    <line x1="-3" y1="-3" x2="3" y2="3"/>
+    <line x1="-3" y1="3" x2="3" y2="-3"/>
+  </g>
+  <path d="M58 78 Q64 74 70 78 Q72 86 64 89 Q56 86 58 78 Z" fill="#334155"/>
+  <path d="M64 89 L64 95" stroke="#334155" stroke-width="1.6" stroke-linecap="round"/>
+  <path d="M64 95 Q56 99 52 94" stroke="#334155" stroke-width="1.6" fill="none" stroke-linecap="round"/>
+  <path d="M64 95 Q72 99 76 94" stroke="#334155" stroke-width="1.6" fill="none" stroke-linecap="round"/>
+  <!-- sparkle above head -->
+  <path d="M64 12 L66 18 L72 20 L66 22 L64 28 L62 22 L56 20 L62 18 Z" fill="#bae6fd" opacity="0.9"/>
+</svg>

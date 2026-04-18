@@ -143,6 +143,12 @@ pub struct Agent {
     pub id: String,
     /// Display name shown in the UI + at the start of Discord replies.
     pub name: String,
+    /// Visual identity — a short string (emoji, or 1–2 chars) that the
+    /// UI paints inside the 36×36 gradient tile on the agent card and
+    /// next to chat replies. Absent = the default wolf 🐺 so existing
+    /// installs look unchanged.
+    #[serde(default)]
+    pub avatar: Option<String>,
     /// The agent's personality / role. Fed as the `system` prompt on
     /// every turn. Keep it specific — "You are Spitfire, the incident
     /// commander. You answer in one sentence. If asked to do
@@ -567,6 +573,9 @@ pub fn new_default(name: String) -> Agent {
     Agent {
         id: generate_id(),
         name,
+        // Avatar unset — the frontend picks a built-in wolf deterministically
+        // from the agent id until the operator overrides it.
+        avatar: None,
         system_prompt: "You are a helpful operations assistant running inside WolfStack. \
                         Answer concisely. When you're unsure, say so rather than guessing."
             .to_string(),

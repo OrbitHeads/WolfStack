@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <radialGradient id="bgc" cx="50%" cy="30%" r="80%"><stop offset="0%" stop-color="#083344"/><stop offset="100%" stop-color="#020617"/></radialGradient>
+    <linearGradient id="furc" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#0891b2"/><stop offset="100%" stop-color="#083344"/></linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="18" fill="url(#bgc)"/>
+  <!-- faint grid -->
+  <g stroke="#06b6d4" stroke-width="0.4" opacity="0.25">
+    <line x1="0" y1="32" x2="128" y2="32"/><line x1="0" y1="64" x2="128" y2="64"/><line x1="0" y1="96" x2="128" y2="96"/>
+    <line x1="32" y1="0" x2="32" y2="128"/><line x1="64" y1="0" x2="64" y2="128"/><line x1="96" y1="0" x2="96" y2="128"/>
+  </g>
+  <path d="M24 48 L32 14 L56 38 Z" fill="#164e63"/>
+  <path d="M104 48 L96 14 L72 38 Z" fill="#164e63"/>
+  <path d="M33 42 L36 22 L48 36 Z" fill="#22d3ee"/>
+  <path d="M95 42 L92 22 L80 36 Z" fill="#22d3ee"/>
+  <path d="M28 70 Q28 36 64 34 Q100 36 100 70 Q100 102 64 106 Q28 102 28 70 Z" fill="url(#furc)"/>
+  <!-- circuit lines on fur -->
+  <g stroke="#22d3ee" stroke-width="1" fill="none" opacity="0.85">
+    <path d="M40 60 L40 50 L52 50"/>
+    <path d="M88 60 L88 50 L76 50"/>
+    <circle cx="40" cy="60" r="1.5" fill="#22d3ee"/>
+    <circle cx="88" cy="60" r="1.5" fill="#22d3ee"/>
+  </g>
+  <path d="M28 72 Q22 78 26 86 Q32 88 34 80 Z" fill="#164e63"/>
+  <path d="M100 72 Q106 78 102 86 Q96 88 94 80 Z" fill="#164e63"/>
+  <ellipse cx="64" cy="84" rx="24" ry="16" fill="#0e7490"/>
+  <!-- neon eyes -->
+  <circle cx="48" cy="63" r="11" fill="#10b981" opacity="0.3"/>
+  <circle cx="80" cy="63" r="11" fill="#10b981" opacity="0.3"/>
+  <ellipse cx="48" cy="62" rx="7" ry="8" fill="#ecfeff"/>
+  <ellipse cx="80" cy="62" rx="7" ry="8" fill="#ecfeff"/>
+  <circle cx="48" cy="64" r="4.2" fill="#10b981"/>
+  <circle cx="80" cy="64" r="4.2" fill="#10b981"/>
+  <rect x="46" y="62" width="4" height="4" fill="#022c22"/>
+  <rect x="78" y="62" width="4" height="4" fill="#022c22"/>
+  <path d="M58 78 Q64 74 70 78 Q72 86 64 89 Q56 86 58 78 Z" fill="#022c22"/>
+  <path d="M64 89 L64 95" stroke="#022c22" stroke-width="1.6" stroke-linecap="round"/>
+  <path d="M64 95 Q56 99 52 94" stroke="#022c22" stroke-width="1.6" fill="none" stroke-linecap="round"/>
+  <path d="M64 95 Q72 99 76 94" stroke="#022c22" stroke-width="1.6" fill="none" stroke-linecap="round"/>
+</svg>

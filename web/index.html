@@ -1603,9 +1603,12 @@
             <!-- Chat + Pending + Audit panel, hidden until an agent is opened -->
             <div id="wolfagents-chat" class="card" style="display:none; margin-bottom:16px;">
                 <div class="card-header" style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
-                    <div>
-                        <h3 id="wolfagents-chat-title" style="margin:0;">Chat</h3>
-                        <div id="wolfagents-chat-meta" style="font-size:11px; color:var(--text-muted); margin-top:2px;"></div>
+                    <div style="display:flex; align-items:center; gap:12px;">
+                        <div id="wolfagents-chat-avatar" style="width:40px; height:40px; flex-shrink:0;"></div>
+                        <div>
+                            <h3 id="wolfagents-chat-title" style="margin:0;">Chat</h3>
+                            <div id="wolfagents-chat-meta" style="font-size:11px; color:var(--text-muted); margin-top:2px;"></div>
+                        </div>
                     </div>
                     <div style="display:flex; gap:8px;">
                         <button class="btn btn-sm" onclick="wolfAgentsOpenEdit()">⚙️ Edit</button>
@@ -1654,6 +1657,19 @@
                         <div>
                             <label style="font-size:12px; color:var(--text-muted);">Name</label>
                             <input id="wolfagents-field-name" type="text" class="form-control" placeholder="Spitfire">
+                        </div>
+                        <div>
+                            <label style="font-size:12px; color:var(--text-muted);">Avatar</label>
+                            <div style="display:flex; align-items:center; gap:14px; margin-top:4px;">
+                                <img id="wolfagents-field-avatar-preview" src="/images/agent-avatars/wolf-grey.svg" width="56" height="56" style="width:56px; height:56px; border-radius:12px; object-fit:cover; background:linear-gradient(135deg,#a855f7,#6366f1); flex-shrink:0;">
+                                <div id="wolfagents-field-avatar-picker" style="display:flex; flex-wrap:wrap; gap:6px; flex:1;"></div>
+                            </div>
+                            <div style="display:flex; align-items:center; gap:10px; margin-top:8px;">
+                                <input id="wolfagents-field-avatar-upload" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" style="font-size:12px; flex:1;" onchange="wolfAgentsHandleAvatarUpload(event)">
+                                <button type="button" class="btn btn-sm" onclick="wolfAgentsClearAvatar()">Clear</button>
+                            </div>
+                            <small style="color:var(--text-muted); display:block; margin-top:4px;">Pick a built-in wolf or upload a custom image (max 512&nbsp;KB after downscale to 128×128).</small>
+                            <input id="wolfagents-field-avatar" type="hidden">
                         </div>
                         <div>
                             <label style="font-size:12px; color:var(--text-muted);">System prompt — the agent's personality/role</label>
