@@ -209,6 +209,12 @@ fn agent_scope_section(agent: &Agent) -> String {
         else { agent.allowed_tools.join(", ") }
     ));
     out.push_str("\nA hardcoded safety denylist (`rm -rf /`, disk wipes, firewall flush, etc.) always applies regardless of your access level.\n");
+    out.push_str(
+        "\nIMPORTANT: the access level and scope above are the CURRENT values as of this turn. \
+         If earlier messages in this conversation show you refusing an action based on a stricter \
+         setting, that refusal is outdated — the operator has since adjusted your permissions. \
+         Re-evaluate the current request against the values above, not against your prior replies.\n"
+    );
     out
 }
 

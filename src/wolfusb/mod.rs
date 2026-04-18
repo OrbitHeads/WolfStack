@@ -462,6 +462,32 @@ fn find_dev_path(busid: &str) -> Option<String> {
     }
 }
 
+/// Walk /sys/bus/usb/devices/ and return the kernel port path (e.g. "1-1.5")
+/// for a device matching the given bus:addr. Returns None if the device is
+/// absent from sysfs, or if we can't read the directory. Used by diagnose()
+/// so operators can see when libusb's synthetic busid (bus:addr) differs from
+/// the kernel's sysfs name — the root cause of usbip-host failures for
+/// hub-attached devices.
+fn sysfs_port_path_for(busid: &str) -> Option<String> {
+    let (bus, addr) = parse_busid(busid).ok()?;
+    let entries = std::fs::read_dir("/sys/bus/usb/devices").ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Skip interface entries (contain ':') and usbN roots — we want
+        // real device nodes whose name is the port path like "1-1.5".
+        if name.contains(':') || name.starts_with("usb") { continue; }
+        let path = entry.path();
+        let busnum = std::fs::read_to_string(path.join("busnum"))
+            .ok().and_then(|s| s.trim().parse::<u8>().ok());
+        let devnum = std::fs::read_to_string(path.join("devnum"))
+            .ok().and_then(|s| s.trim().parse::<u8>().ok());
+        if busnum == Some(bus) && devnum == Some(addr) {
+            return Some(name);
+        }
+    }
+    None
+}
+
 /// Attach to a remote USB device via wolfusb attach command.
 /// Legacy path retained for compatibility — the new mount-based flow doesn't use this.
 #[allow(dead_code)]
@@ -626,21 +652,40 @@ pub fn diagnose(busid: &str) -> Vec<DiagnosticStep> {
             ]);
             match listed {
                 Ok(out_str) => {
-                    let has_device = out_str.contains(busid);
+                    // The JSON has {"bus_number":N,"address":M} — substring
+                    // matching "wolfusb-N-M" against that text never hits.
+                    // Parse the busid and check the structured fields.
+                    let (has_device, detail) = match parse_busid(busid) {
+                        Ok((bus, addr_n)) => {
+                            match serde_json::from_str::<Vec<WolfUsbDeviceJson>>(&out_str) {
+                                Ok(list) => {
+                                    let found = list.iter().any(|d|
+                                        d.device_id.bus_number == bus
+                                        && d.device_id.address == addr_n);
+                                    if found {
+                                        (true, format!("busid {} is in the source's exportable device list", busid))
+                                    } else {
+                                        let seen: Vec<String> = list.iter()
+                                            .map(|d| format!("{}-{}", d.device_id.bus_number, d.device_id.address))
+                                            .collect();
+                                        (false, format!(
+                                            "Source lists bus:addr {}:{} as NOT exportable. \
+                                             Source sees: [{}]. The stick may be behind a hub \
+                                             (kernel sysfs path differs from libusb bus:addr), \
+                                             or already claimed. Try Re-attach to force prepare-for-export.",
+                                            bus, addr_n, seen.join(", ")))
+                                    }
+                                }
+                                Err(e) => (false, format!(
+                                    "Could not parse source's wolfusb list JSON: {}", e)),
+                            }
+                        }
+                        Err(e) => (false, e),
+                    };
                     out.push(DiagnosticStep {
                         step: "Device exported on source".into(),
                         ok: has_device,
-                        detail: if has_device {
-                            format!("busid {} is in the source's exportable device list", busid)
-                        } else {
-                            format!(
-                                "Source's wolfusb server does NOT list busid {}. \
-                                 The stick may need to be unplugged/replugged, or usbip-host \
-                                 is already claimed by another process. \
-                                 Try Re-attach to force prepare-for-export.",
-                                busid
-                            )
-                        },
+                        detail,
                     });
                 }
                 Err(e) => {
@@ -648,6 +693,50 @@ pub fn diagnose(busid: &str) -> Vec<DiagnosticStep> {
                         step: "Device exported on source".into(),
                         ok: false,
                         detail: format!("wolfusb list failed: {}", e),
+                    });
+                }
+            }
+        }
+    }
+
+    // If we're running on the source node, surface the kernel sysfs port
+    // path. When this differs from the libusb bus:addr in the busid (e.g.
+    // kernel says "1-1.5", WolfStack stored "wolfusb-1-5"), the stick is
+    // behind a hub and usbip-host operations that take a kernel path will
+    // fail even though the device is visible to libusb.
+    if source_is_self {
+        if let Ok((bus, addr_n)) = parse_busid(busid) {
+            let libusb_form = format!("{}-{}", bus, addr_n);
+            match sysfs_port_path_for(busid) {
+                Some(port) => {
+                    let matches = port == libusb_form;
+                    out.push(DiagnosticStep {
+                        step: "Kernel sysfs port path".into(),
+                        ok: matches,
+                        detail: if matches {
+                            format!("Kernel sees device at port {} — matches WolfStack busid.", port)
+                        } else {
+                            format!(
+                                "Kernel sees device at port {}, WolfStack has it as {}. \
+                                 This device is behind a hub — usbip-host needs the kernel \
+                                 port path. Unassign + re-detect the device on this node, or \
+                                 manually run: `usbip bind --busid={}` on source, \
+                                 `usbip attach -r <source_ip> -b {}` on target.",
+                                port, libusb_form, port, port
+                            )
+                        },
+                    });
+                }
+                None => {
+                    out.push(DiagnosticStep {
+                        step: "Kernel sysfs port path".into(),
+                        ok: false,
+                        detail: format!(
+                            "No /sys/bus/usb/devices entry matches bus {} addr {}. \
+                             The device may have been unplugged, or its address changed after \
+                             a replug (USB addresses are not stable across reconnects).",
+                            bus, addr_n
+                        ),
                     });
                 }
             }
