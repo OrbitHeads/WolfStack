@@ -74,6 +74,9 @@ pub enum ToolId {
     ListApiEndpoints,
     DescribeCluster,
     ListWorkflows,
+    WebFetch,
+    WebRender,
+    SemanticSearch,
 
     // ── Mutating ───────────────────────────────────────────────
     RestartContainer,
@@ -105,6 +108,9 @@ impl ToolId {
             ToolId::ListApiEndpoints => "list_api_endpoints",
             ToolId::DescribeCluster => "describe_cluster",
             ToolId::ListWorkflows => "list_workflows",
+            ToolId::WebFetch => "web_fetch",
+            ToolId::WebRender => "web_render",
+            ToolId::SemanticSearch => "semantic_search",
             ToolId::RestartContainer => "restart_container",
             ToolId::RunWorkflow => "run_workflow",
             ToolId::ScheduleWorkflow => "schedule_workflow",
@@ -129,6 +135,9 @@ impl ToolId {
             ToolId::ListApiEndpoints => "List available WolfStack API endpoints",
             ToolId::DescribeCluster => "Describe a cluster in detail",
             ToolId::ListWorkflows => "List WolfFlow workflows",
+            ToolId::WebFetch => "Fetch a public web URL (HTTP/HTTPS, no JS)",
+            ToolId::WebRender => "Fetch a web URL via headless Chromium (JS-heavy sites; requires chromium on the host)",
+            ToolId::SemanticSearch => "Search past agent memory, alerts, and audit logs (BM25)",
             ToolId::RestartContainer => "Restart container (Docker/LXC)",
             ToolId::RunWorkflow => "Run a WolfFlow workflow",
             ToolId::ScheduleWorkflow => "Schedule a WolfFlow workflow",
@@ -163,7 +172,9 @@ impl ToolId {
             ToolId::ListNodes | ToolId::ListContainers | ToolId::GetMetrics
             | ToolId::ListAlerts | ToolId::ReadLog | ToolId::CheckDiskUsage
             | ToolId::ReadFile | ToolId::ListApiEndpoints
-            | ToolId::DescribeCluster | ToolId::ListWorkflows => Danger::Safe,
+            | ToolId::DescribeCluster | ToolId::ListWorkflows
+            | ToolId::WebFetch | ToolId::WebRender
+            | ToolId::SemanticSearch => Danger::Safe,
 
             ToolId::RestartContainer | ToolId::RunWorkflow
             | ToolId::ScheduleWorkflow | ToolId::WriteFile
@@ -186,6 +197,9 @@ impl ToolId {
             "list_api_endpoints" => Some(ToolId::ListApiEndpoints),
             "describe_cluster" => Some(ToolId::DescribeCluster),
             "list_workflows" => Some(ToolId::ListWorkflows),
+            "web_fetch" => Some(ToolId::WebFetch),
+            "web_render" => Some(ToolId::WebRender),
+            "semantic_search" => Some(ToolId::SemanticSearch),
             "restart_container" => Some(ToolId::RestartContainer),
             "run_workflow" => Some(ToolId::RunWorkflow),
             "schedule_workflow" => Some(ToolId::ScheduleWorkflow),
@@ -212,6 +226,9 @@ impl ToolId {
         ToolId::ListApiEndpoints,
         ToolId::DescribeCluster,
         ToolId::ListWorkflows,
+        ToolId::WebFetch,
+        ToolId::WebRender,
+        ToolId::SemanticSearch,
         ToolId::RestartContainer,
         ToolId::RunWorkflow,
         ToolId::ScheduleWorkflow,

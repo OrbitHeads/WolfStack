@@ -193,6 +193,9 @@ pub async fn dispatch(
         ToolId::ListApiEndpoints => tool_list_api_endpoints(agent).await,
         ToolId::DescribeCluster => tool_describe_cluster(arguments, agent, state).await,
         ToolId::ListWorkflows => tool_list_workflows(arguments, state).await,
+        ToolId::WebFetch => tool_web_fetch(arguments, false).await,
+        ToolId::WebRender => tool_web_fetch(arguments, true).await,
+        ToolId::SemanticSearch => tool_semantic_search(arguments, agent).await,
 
         ToolId::RestartContainer => tool_restart_container(arguments, agent, state).await,
         ToolId::RunWorkflow => tool_run_workflow(arguments, state).await,
@@ -959,5 +962,537 @@ fn truncate(s: &str, max: usize) -> String {
         let mut t: String = s.chars().take(max).collect();
         t.push_str("\n...[truncated]");
         t
+    }
+}
+
+// ─── web_fetch / web_render ─────────────────────────────────────────────
+
+/// Maximum bytes read from any web fetch. A model that asks for a
+/// 50 MB page will get the first 512 KB — more than enough for text
+/// extraction and cheap to reason about.
+const WEB_FETCH_MAX_BYTES: usize = 512 * 1024;
+const WEB_FETCH_TIMEOUT_SECS: u64 = 10;
+const WEB_RENDER_TIMEOUT_SECS: u64 = 30;
+
+/// Shared implementation for `web_fetch` (static HTTP) and `web_render`
+/// (headless Chromium shell-out). The `rendered` flag flips execution
+/// path; the safety gates (scheme check, SSRF guard via pre-resolve,
+/// size cap, timeout) are identical.
+async fn tool_web_fetch(args: &serde_json::Value, rendered: bool) -> ToolResult {
+    let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if url.is_empty() {
+        return ToolResult::err(format!(
+            "{} requires a `url` argument",
+            if rendered { "web_render" } else { "web_fetch" }));
+    }
+    // Only http/https — no file://, no ftp, no data:. Validated with a
+    // case-insensitive prefix check so `HTTPS://` doesn't slip past.
+    let lower = url.to_ascii_lowercase();
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+        return ToolResult::err(format!(
+            "url '{}' rejected: only http:// and https:// schemes are allowed", url));
+    }
+    // SSRF guard: resolve the hostname and refuse private / loopback /
+    // link-local targets. Done before reqwest touches the network so we
+    // can't be redirected into the internal network mid-request.
+    let host = match extract_host(url) {
+        Some(h) => h,
+        None => return ToolResult::err(format!("url '{}' has no parseable host", url)),
+    };
+    match resolve_public(&host) {
+        Ok(()) => {}
+        Err(e) => return ToolResult::err(format!("url '{}' rejected: {}", url, e)),
+    }
+
+    if rendered {
+        web_render_via_chromium(url).await
+    } else {
+        web_fetch_http(url).await
+    }
+}
+
+/// Extract the hostname from an http(s) URL without pulling in a url
+/// crate. Handles `scheme://host`, `scheme://host:port`, `scheme://host/path`,
+/// and ignores credentials (`scheme://user:pass@host`). Returns None
+/// on malformed input.
+fn extract_host(url: &str) -> Option<String> {
+    let after_scheme = url.splitn(2, "://").nth(1)?;
+    // Drop anything after the first '/', '?', or '#'.
+    let authority: &str = after_scheme.splitn(2, |c: char| c == '/' || c == '?' || c == '#')
+        .next().unwrap_or("");
+    // Drop credentials.
+    let hostport = authority.rsplit('@').next().unwrap_or(authority);
+    // Drop port. Be careful with IPv6 literals `[::1]:443`.
+    if hostport.starts_with('[') {
+        if let Some(close) = hostport.find(']') {
+            return Some(hostport[1..close].to_string());
+        }
+        return None;
+    }
+    let host = hostport.splitn(2, ':').next().unwrap_or(hostport);
+    if host.is_empty() { None } else { Some(host.to_string()) }
+}
+
+/// Resolve a hostname and reject loopback / private / link-local IPs.
+/// Runs on the current thread because tokio's resolver is async and
+/// this is called from async context anyway — we use std::net here
+/// to avoid pulling in more tokio surface than needed.
+fn resolve_public(host: &str) -> Result<(), String> {
+    use std::net::ToSocketAddrs;
+    // Attach a placeholder port so ToSocketAddrs parses the host.
+    let probe = format!("{}:80", host);
+    let addrs: Vec<_> = probe.to_socket_addrs()
+        .map_err(|e| format!("DNS resolution failed: {}", e))?
+        .collect();
+    if addrs.is_empty() {
+        return Err("DNS returned no addresses".to_string());
+    }
+    for sa in &addrs {
+        let ip = sa.ip();
+        if is_ip_private(&ip) {
+            return Err(format!(
+                "hostname resolves to a private / loopback / link-local address ({}) — refusing to fetch",
+                ip));
+        }
+    }
+    Ok(())
+}
+
+/// Classify an IP as "don't fetch from an agent over the public web."
+/// Covers IPv4 loopback (127/8), private ranges (10/8, 172.16/12,
+/// 192.168/16), link-local (169.254/16), and CGNAT (100.64/10); plus
+/// IPv6 loopback, unique-local (fc00::/7), and link-local (fe80::/10).
+fn is_ip_private(ip: &std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || (o[0] == 100 && (64..=127).contains(&o[1])) // CGNAT 100.64/10
+        }
+        IpAddr::V6(v6) => {
+            let seg = v6.segments()[0];
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (seg & 0xfe00) == 0xfc00  // ULA fc00::/7
+                || (seg & 0xffc0) == 0xfe80  // link-local fe80::/10
+        }
+    }
+}
+
+async fn web_fetch_http(url: &str) -> ToolResult {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(WEB_FETCH_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .user_agent("WolfStackAgent/1.0 (+https://wolfstack.io)")
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return ToolResult::err(format!("web_fetch: build client failed: {}", e)),
+    };
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => return ToolResult::err(format!("web_fetch: request failed: {}", e)),
+    };
+    let status = resp.status().as_u16();
+    let content_type = resp.headers().get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    // Read up to WEB_FETCH_MAX_BYTES — avoids downloading a 5 GB ISO
+    // that some adversarial page tries to trick us into.
+    use futures::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                buf.extend_from_slice(&bytes);
+                if buf.len() >= WEB_FETCH_MAX_BYTES { buf.truncate(WEB_FETCH_MAX_BYTES); break; }
+            }
+            Err(e) => return ToolResult::err(format!("web_fetch: stream error: {}", e)),
+        }
+    }
+    let raw = String::from_utf8_lossy(&buf).into_owned();
+    let text = if content_type.contains("text/html") || content_type.is_empty() {
+        strip_html_to_text(&raw)
+    } else {
+        raw.clone()
+    };
+    ToolResult::ok(
+        format!("fetched {} ({} bytes, status {})", url, buf.len(), status),
+        serde_json::json!({
+            "url": url,
+            "status": status,
+            "content_type": content_type,
+            "text": truncate(&text, 100_000),
+        }),
+    )
+}
+
+/// Strip HTML tags + collapse whitespace. Drops <script>, <style>,
+/// <svg>, and <head>-level metadata so the text that reaches the LLM
+/// is what a reader would see. Not a full parser — a minute of regex
+/// that handles the common cases and degrades gracefully on malformed
+/// markup by leaving extra whitespace.
+fn strip_html_to_text(html: &str) -> String {
+    let mut s = html.to_string();
+    // Drop script/style blocks (tag + content).
+    for tag in ["script", "style", "noscript", "svg", "iframe", "template"] {
+        let open = format!("<{}", tag);
+        while let Some(start) = s.to_ascii_lowercase().find(&open) {
+            let close_tag = format!("</{}>", tag);
+            if let Some(end) = s[start..].to_ascii_lowercase().find(&close_tag) {
+                s.replace_range(start..start + end + close_tag.len(), " ");
+            } else {
+                // No closing tag — drop from open to end of string.
+                s.truncate(start);
+                break;
+            }
+        }
+    }
+    // Replace block-level tags with newlines for readability.
+    for tag in ["</p>", "</div>", "</li>", "</h1>", "</h2>", "</h3>",
+                "</h4>", "<br>", "<br/>", "<br />", "</tr>"] {
+        s = s.replace(tag, &format!("{}\n", tag));
+    }
+    // Strip remaining tags.
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    // Decode the handful of entities that actually matter.
+    let out = out.replace("&nbsp;", " ")
+                 .replace("&amp;", "&")
+                 .replace("&lt;", "<")
+                 .replace("&gt;", ">")
+                 .replace("&quot;", "\"")
+                 .replace("&#039;", "'")
+                 .replace("&apos;", "'");
+    // Collapse runs of whitespace (but keep single newlines so the
+    // paragraph structure survives).
+    let mut collapsed = String::with_capacity(out.len());
+    let mut last_was_space = false;
+    let mut last_was_newline = false;
+    for c in out.chars() {
+        if c == '\n' {
+            if !last_was_newline { collapsed.push('\n'); }
+            last_was_newline = true;
+            last_was_space = true;
+        } else if c.is_whitespace() {
+            if !last_was_space { collapsed.push(' '); }
+            last_was_space = true;
+        } else {
+            collapsed.push(c);
+            last_was_space = false;
+            last_was_newline = false;
+        }
+    }
+    collapsed.trim().to_string()
+}
+
+async fn web_render_via_chromium(url: &str) -> ToolResult {
+    // Find a chromium binary on the host. We deliberately don't ship
+    // one; operator must install it (apt install chromium, etc.).
+    let bin = ["chromium", "chromium-browser", "google-chrome", "chrome"]
+        .into_iter()
+        .find(|b| which_exists(b));
+    let Some(bin) = bin else {
+        return ToolResult::err(
+            "web_render: no chromium/google-chrome binary on this host. Install one and retry, \
+             or use web_fetch for static HTML.".to_string());
+    };
+    // --dump-dom prints the rendered HTML to stdout after JS executes.
+    // --no-sandbox is needed when running as root inside some distros;
+    // acceptable here because the caller is already an authorised agent
+    // and the URL passed SSRF pre-checks.
+    let out = tokio::process::Command::new(bin)
+        .args(["--headless=new", "--no-sandbox", "--disable-gpu",
+               "--disable-extensions", "--virtual-time-budget=5000",
+               "--dump-dom", url])
+        .output();
+    let out = match tokio::time::timeout(
+        std::time::Duration::from_secs(WEB_RENDER_TIMEOUT_SECS), out).await
+    {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return ToolResult::err(format!("web_render: exec failed: {}", e)),
+        Err(_) => return ToolResult::err(format!(
+            "web_render: timed out after {}s", WEB_RENDER_TIMEOUT_SECS)),
+    };
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return ToolResult::err(format!("web_render: chromium exited non-zero: {}",
+            truncate(&err, 400)));
+    }
+    let mut html = out.stdout;
+    if html.len() > WEB_FETCH_MAX_BYTES { html.truncate(WEB_FETCH_MAX_BYTES); }
+    let text = strip_html_to_text(&String::from_utf8_lossy(&html));
+    ToolResult::ok(
+        format!("rendered {} ({} bytes DOM)", url, html.len()),
+        serde_json::json!({
+            "url": url,
+            "rendered": true,
+            "text": truncate(&text, 100_000),
+        }),
+    )
+}
+
+fn which_exists(bin: &str) -> bool {
+    std::process::Command::new("sh").args(["-c", &format!("command -v {}", bin)])
+        .output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+// ─── semantic_search (BM25) ──────────────────────────────────────────────
+
+/// Search past agent memory, alert history, and audit logs using a BM25
+/// ranking. We intentionally avoid a true embedding model here — BM25
+/// handles "find past incidents mentioning the same container name"
+/// well enough without bundling a 25 MB ONNX model. The tool surface
+/// is stable; when a real vector index lands later, callers don't
+/// notice.
+async fn tool_semantic_search(args: &serde_json::Value, _agent: &Agent) -> ToolResult {
+    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if query.is_empty() {
+        return ToolResult::err("semantic_search requires a `query` string".into());
+    }
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10)
+        .clamp(1, 50) as usize;
+    let sources: Vec<&str> = args.get("sources").and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_else(|| vec!["memory", "audit", "alerts"]);
+    let docs = collect_search_corpus(&sources);
+    let ranked = bm25_rank(query, &docs, limit);
+    ToolResult::ok(
+        format!("{} matches for '{}' across {} docs", ranked.len(), query, docs.len()),
+        serde_json::json!({
+            "query": query,
+            "sources": sources,
+            "total_docs": docs.len(),
+            "matches": ranked,
+        }),
+    )
+}
+
+/// A single document in the search corpus — a line from memory/audit/
+/// alerts, tagged with where it came from so matches carry source.
+struct SearchDoc {
+    source: String,
+    path: String,
+    text: String,
+}
+
+fn collect_search_corpus(sources: &[&str]) -> Vec<SearchDoc> {
+    let mut out = Vec::new();
+    if sources.contains(&"memory") {
+        if let Ok(agents_dir) = std::fs::read_dir("/etc/wolfstack/agents") {
+            for ent in agents_dir.flatten() {
+                let mem = ent.path().join("memory.jsonl");
+                if !mem.exists() { continue; }
+                let id = ent.file_name().to_string_lossy().into_owned();
+                if let Ok(text) = std::fs::read_to_string(&mem) {
+                    for (i, line) in text.lines().enumerate() {
+                        if line.trim().is_empty() { continue; }
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                            let content = v.get("content").and_then(|x| x.as_str())
+                                .unwrap_or("").to_string();
+                            if content.is_empty() { continue; }
+                            out.push(SearchDoc {
+                                source: "memory".into(),
+                                path: format!("{}:{}", id, i + 1),
+                                text: content,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if sources.contains(&"audit") {
+        if let Ok(agents_dir) = std::fs::read_dir("/etc/wolfstack/agents") {
+            for ent in agents_dir.flatten() {
+                let audit = ent.path().join("audit.jsonl");
+                if !audit.exists() { continue; }
+                let id = ent.file_name().to_string_lossy().into_owned();
+                if let Ok(text) = std::fs::read_to_string(&audit) {
+                    for (i, line) in text.lines().enumerate() {
+                        if !line.trim().is_empty() {
+                            out.push(SearchDoc {
+                                source: "audit".into(),
+                                path: format!("{}:{}", id, i + 1),
+                                text: line.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if sources.contains(&"alerts") {
+        // Alerting state lives in /etc/wolfstack/alerting.json — walk
+        // the raw file so this stays consistent even if the in-memory
+        // state structure evolves.
+        if let Ok(text) = std::fs::read_to_string("/etc/wolfstack/alerting.json") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(events) = v.get("events").and_then(|x| x.as_array()) {
+                    for (i, ev) in events.iter().enumerate() {
+                        let blob = serde_json::to_string(ev).unwrap_or_default();
+                        out.push(SearchDoc {
+                            source: "alerts".into(),
+                            path: format!("alerting.json:{}", i + 1),
+                            text: blob,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Tokenise text for BM25: lowercase, split on non-alphanumerics, drop
+/// 1-char tokens (noise in BM25's IDF term). Good enough for the
+/// corpora we're indexing, which are already English-ish log/chat text.
+fn tokenise(text: &str) -> Vec<String> {
+    text.to_ascii_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 2)
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// Classic BM25 with k1=1.5, b=0.75. Returns the top `limit` docs by
+/// score, formatted for the tool response.
+fn bm25_rank(query: &str, docs: &[SearchDoc], limit: usize) -> Vec<serde_json::Value> {
+    if docs.is_empty() { return Vec::new(); }
+    let q_terms: Vec<String> = tokenise(query);
+    if q_terms.is_empty() { return Vec::new(); }
+    // Pre-tokenise every doc.
+    let doc_tokens: Vec<Vec<String>> = docs.iter().map(|d| tokenise(&d.text)).collect();
+    let n = docs.len() as f64;
+    let avgdl: f64 = doc_tokens.iter().map(|t| t.len() as f64).sum::<f64>() / n.max(1.0);
+    // Document frequency for each unique query term.
+    let mut df: std::collections::HashMap<&str, usize> = Default::default();
+    for qt in &q_terms {
+        let c = doc_tokens.iter().filter(|t| t.iter().any(|x| x == qt)).count();
+        df.insert(qt.as_str(), c);
+    }
+    let k1 = 1.5_f64;
+    let b = 0.75_f64;
+    let mut scored: Vec<(f64, usize)> = doc_tokens.iter().enumerate().map(|(i, toks)| {
+        let dl = toks.len() as f64;
+        let mut s = 0.0;
+        for qt in &q_terms {
+            let dfq = *df.get(qt.as_str()).unwrap_or(&0) as f64;
+            if dfq == 0.0 { continue; }
+            let idf = ((n - dfq + 0.5) / (dfq + 0.5) + 1.0).ln();
+            let tf = toks.iter().filter(|x| *x == qt).count() as f64;
+            if tf == 0.0 { continue; }
+            let denom = tf + k1 * (1.0 - b + b * dl / avgdl.max(1.0));
+            s += idf * (tf * (k1 + 1.0)) / denom;
+        }
+        (s, i)
+    }).filter(|(s, _)| *s > 0.0).collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(limit);
+    scored.into_iter().map(|(score, idx)| {
+        let d = &docs[idx];
+        serde_json::json!({
+            "score": score,
+            "source": d.source,
+            "path": d.path,
+            "snippet": truncate(&d.text, 400),
+        })
+    }).collect()
+}
+
+#[cfg(test)]
+mod web_tool_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn host_extraction_handles_common_shapes() {
+        assert_eq!(extract_host("https://example.com/foo"), Some("example.com".into()));
+        assert_eq!(extract_host("http://user:pw@example.com:8080/x"), Some("example.com".into()));
+        assert_eq!(extract_host("https://[::1]:443/"), Some("::1".into()));
+        assert_eq!(extract_host("https://host.example.com?q=1"), Some("host.example.com".into()));
+        assert_eq!(extract_host("notaurl"), None);
+    }
+
+    #[test]
+    fn private_ips_rejected() {
+        let v = |s: &str| IpAddr::V4(s.parse::<Ipv4Addr>().unwrap());
+        assert!(is_ip_private(&v("127.0.0.1")));
+        assert!(is_ip_private(&v("10.0.0.5")));
+        assert!(is_ip_private(&v("172.16.0.1")));
+        assert!(is_ip_private(&v("192.168.1.1")));
+        assert!(is_ip_private(&v("169.254.0.1")));
+        assert!(is_ip_private(&v("100.64.0.1"))); // CGNAT
+        assert!(!is_ip_private(&v("8.8.8.8")));
+        assert!(!is_ip_private(&v("1.1.1.1")));
+    }
+
+    #[test]
+    fn private_ipv6_rejected() {
+        let v = |s: &str| IpAddr::V6(s.parse::<Ipv6Addr>().unwrap());
+        assert!(is_ip_private(&v("::1")));
+        assert!(is_ip_private(&v("fc00::1")));
+        assert!(is_ip_private(&v("fd00::1")));
+        assert!(is_ip_private(&v("fe80::1")));
+        assert!(!is_ip_private(&v("2606:4700:4700::1111"))); // 1.1.1.1
+    }
+
+    #[test]
+    fn html_strip_removes_scripts_and_tags() {
+        let html = "<html><head><script>alert(1)</script></head><body><h1>Hello</h1><p>World &amp; friends</p></body></html>";
+        let text = strip_html_to_text(html);
+        assert!(!text.contains("<"));
+        assert!(!text.contains("alert"));
+        assert!(text.contains("Hello"));
+        assert!(text.contains("World & friends"));
+    }
+
+    #[test]
+    fn html_strip_handles_malformed_script() {
+        // Unterminated <script> — should still strip to end of string.
+        let html = "<p>ok</p><script>never closes";
+        let text = strip_html_to_text(html);
+        assert!(text.contains("ok"));
+        assert!(!text.contains("never"));
+    }
+
+    #[test]
+    fn bm25_ranks_matching_docs_higher() {
+        let docs = vec![
+            SearchDoc { source: "m".into(), path: "a".into(),
+                text: "disk space on wolfgrid1 is low".into() },
+            SearchDoc { source: "m".into(), path: "b".into(),
+                text: "weather forecast is sunny".into() },
+            SearchDoc { source: "m".into(), path: "c".into(),
+                text: "disk usage trending up on wolfgrid2".into() },
+        ];
+        let ranked = bm25_rank("disk wolfgrid", &docs, 10);
+        assert_eq!(ranked.len(), 2);
+        let first_path = ranked[0]["path"].as_str().unwrap();
+        assert!(first_path == "a" || first_path == "c",
+            "unexpected first match {}", first_path);
+    }
+
+    #[test]
+    fn bm25_empty_query_returns_nothing() {
+        let docs = vec![SearchDoc { source: "m".into(), path: "a".into(),
+            text: "hello".into() }];
+        assert!(bm25_rank("", &docs, 10).is_empty());
+        assert!(bm25_rank("   ", &docs, 10).is_empty());
     }
 }

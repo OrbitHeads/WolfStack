@@ -491,6 +491,33 @@ fn input_schema_for(tool: ToolId) -> serde_json::Value {
                 "cluster": { "type": "string", "description": "Optional cluster name filter" }
             }
         }),
+        ToolId::WebFetch => serde_json::json!({
+            "type": "object",
+            "required": ["url"],
+            "properties": {
+                "url": { "type": "string", "description": "http:// or https:// URL. Private/loopback/link-local addresses are refused." }
+            }
+        }),
+        ToolId::WebRender => serde_json::json!({
+            "type": "object",
+            "required": ["url"],
+            "properties": {
+                "url": { "type": "string", "description": "URL to render via headless Chromium. Use for JS-heavy sites when web_fetch returns empty text. Requires chromium on the host." }
+            }
+        }),
+        ToolId::SemanticSearch => serde_json::json!({
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": { "type": "string", "description": "Natural-language keywords. BM25 ranked." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 },
+                "sources": {
+                    "type": "array",
+                    "items": { "type": "string", "enum": ["memory", "audit", "alerts"] },
+                    "description": "Which corpora to search. Default: all three."
+                }
+            }
+        }),
         ToolId::RunWorkflow => serde_json::json!({
             "type": "object",
             "required": ["workflow_id"],
