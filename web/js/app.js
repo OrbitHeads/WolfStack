@@ -14507,6 +14507,13 @@ async function migrateVm(name) {
                 <div><label style="font-size:13px;color:var(--text-muted,#aaa);">Source Staging Directory <span style="color:var(--text-muted,#666);font-weight:normal;">(optional)</span></label>
                     <input id="vm-migrate-staging" type="text" placeholder="/tmp  (default — pick somewhere larger if VM disk &gt; /tmp size)" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;">
                     <span style="font-size:11px;color:var(--text-muted,#666);margin-top:2px;display:block;">Where the export tarball is staged on THIS node before upload. Needs ~2× the VM disk size free. Leave blank for /tmp / $TMPDIR.</span></div>
+                <div><label style="font-size:13px;color:var(--text-muted,#aaa);">Target Staging Directory <span style="color:var(--text-muted,#666);font-weight:normal;">(optional)</span></label>
+                    <input id="vm-migrate-target-staging" type="text" placeholder="/tmp on the target  (default)" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;">
+                    <span style="font-size:11px;color:var(--text-muted,#666);margin-top:2px;display:block;">Where the incoming archive is staged on the target node. Needs ~1× VM disk size free. Leave blank for the target's /tmp / $TMPDIR.</span></div>
+                <label id="vm-migrate-pve-row" style="font-size:13px;color:var(--text-muted,#aaa);display:none;align-items:center;gap:8px;cursor:pointer;">
+                    <input type="checkbox" id="vm-migrate-pve"/>
+                    <span>Import as <strong>Proxmox-managed VM</strong> on the target (uses <code>qm create</code> + <code>qm importdisk</code>; destination storage above must be a PVE storage ID like <code>local-lvm</code>)</span>
+                </label>
                 <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px;">
                     <button class="btn" onclick="document.getElementById('vm-migrate-modal')?.remove()">Cancel</button>
                     <button class="btn" style="background:#ef4444;color:#fff;" onclick="doMigrateVm('${name}')">Migrate</button>
@@ -14533,6 +14540,18 @@ async function migrateVm(name) {
     document.getElementById('vm-migrate-target').addEventListener('change', async (e) => {
         const val = e.target.value;
         document.getElementById('vm-migrate-external-fields').style.display = val === '__external__' ? 'block' : 'none';
+
+        // Reveal the "Import as Proxmox VM" checkbox only when the
+        // chosen target is actually a Proxmox node — for WolfStack-
+        // to-WolfStack moves the option is misleading.
+        const pveRow = document.getElementById('vm-migrate-pve-row');
+        const pveCb = document.getElementById('vm-migrate-pve');
+        if (pveRow && pveCb) {
+            const targetNode = (nodes || []).find(n => n.id === val);
+            const isPve = !!targetNode && targetNode.node_type === 'proxmox';
+            pveRow.style.display = isPve ? 'flex' : 'none';
+            if (!isPve) pveCb.checked = false;
+        }
 
         const sel = document.getElementById('vm-migrate-storage');
         const hint = document.getElementById('vm-migrate-storage-hint');
@@ -14577,6 +14596,8 @@ async function doMigrateVm(name) {
     const extToken = document.getElementById('vm-migrate-ext-token')?.value.trim() || '';
     const migrateStorage = document.getElementById('vm-migrate-storage')?.value || '';
     const stagingDir = (document.getElementById('vm-migrate-staging')?.value || '').trim();
+    const targetStagingDir = (document.getElementById('vm-migrate-target-staging')?.value || '').trim();
+    const importAsProxmox = !!document.getElementById('vm-migrate-pve')?.checked;
 
     const isExternal = target === '__external__';
     if (isExternal && (!rawExtUrl || !extToken)) { showToast('Enter URL and token', 'error'); return; }
@@ -14679,6 +14700,8 @@ async function doMigrateVm(name) {
             const extBody = { target_url: extUrl, target_token: extToken };
             if (migrateStorage) extBody.storage = migrateStorage;
             if (stagingDir) extBody.staging_dir = stagingDir;
+            if (targetStagingDir) extBody.target_staging_dir = targetStagingDir;
+            if (importAsProxmox) extBody.proxmox = true;
             resp = await fetch(`/api/vms/${name}/migrate-external`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -14690,6 +14713,8 @@ async function doMigrateVm(name) {
             if (targetNode) { migrateBody.target_address = targetNode.address; migrateBody.target_port = targetNode.port || 8553; }
             if (migrateStorage) migrateBody.storage = migrateStorage;
             if (stagingDir) migrateBody.staging_dir = stagingDir;
+            if (targetStagingDir) migrateBody.target_staging_dir = targetStagingDir;
+            if (importAsProxmox) migrateBody.proxmox = true;
             resp = await fetch(apiUrl(`/api/vms/${name}/migrate`), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },

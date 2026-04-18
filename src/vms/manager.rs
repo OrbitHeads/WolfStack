@@ -3281,16 +3281,11 @@ pub fn export_vm_with_staging(name: &str, staging_dir: Option<&str>) -> Result<P
     Ok(archive_path)
 }
 
-/// Import a VM from a tar.gz archive. Extracts to the VM base directory.
-/// Returns a success message with the VM name.
-pub fn import_vm(archive_path: &str, new_name: Option<&str>, storage: Option<&str>) -> Result<String, String> {
-    import_vm_with_staging(archive_path, new_name, storage, None)
-}
-
-/// Same as `import_vm` but respects a staging-dir override so an
-/// operator on the target side can point extraction at a big disk
-/// when `/tmp` is too small for a multi-GB VM archive. Falls back
-/// to `$TMPDIR` then `/tmp`.
+/// Import a VM from a tar.gz archive. Extracts to the VM base
+/// directory. Returns a success message with the VM name. The
+/// `staging_dir` argument points the extraction temp dir at a roomy
+/// filesystem when `/tmp` is too small — falls back to `$TMPDIR`
+/// then `/tmp` when None.
 pub fn import_vm_with_staging(
     archive_path: &str, new_name: Option<&str>, storage: Option<&str>,
     staging_dir: Option<&str>,
@@ -3501,6 +3496,315 @@ pub fn import_vm_with_staging(
 /// Clean up an export archive
 pub fn export_cleanup(archive_path: &str) {
     let _ = fs::remove_file(archive_path);
+}
+
+/// Import a WolfStack VM archive as a PVE-managed VM. Runs on a
+/// Proxmox host where `qm` is available. Does NOT create a
+/// WolfStack-style config in /var/lib/wolfstack/vms — the VM ends
+/// up owned by Proxmox (entry in /etc/pve/qemu-server/<vmid>.conf)
+/// and is manageable via the PVE UI, `qm`, and the WolfStack
+/// cluster view equally.
+///
+/// Sequence:
+///   1. Extract the tar.gz to staging (respects staging_dir / TMPDIR).
+///   2. Parse the bundled VmConfig for memory / cpus / disk size.
+///   3. Allocate a VMID via `pvesh get /cluster/nextid`.
+///   4. `qm create` with cpu / memory / basic net / ostype.
+///   5. `qm importdisk` to copy every qcow2 into the target PVE
+///      storage (PVE handles format conversion + storage-specific
+///      allocation — lvm-thin, zfs, dir, etc.).
+///   6. `qm set --scsi0 <storage>:vm-<vmid>-disk-0 --boot order=scsi0`
+///      to attach the primary disk and make it bootable.
+///   7. Additional disks attach as scsi1..N.
+///
+/// Network bridges may not match source-to-target; we default to
+/// `vmbr0`, which is the PVE default. Operator fixes via the PVE UI
+/// afterwards if they use a non-default bridge layout.
+pub fn import_vm_proxmox(
+    archive_path: &str, new_name: Option<&str>, storage: &str,
+    staging_dir: Option<&str>,
+) -> Result<String, String> {
+    if !containers::is_proxmox() {
+        return Err("import_vm_proxmox called on a non-Proxmox host".into());
+    }
+    let storage = storage.trim();
+    if storage.is_empty() {
+        return Err("PVE storage id is required for Proxmox import".into());
+    }
+
+    // Extract archive.
+    let tmp = migration_staging_root(staging_dir)
+        .join(format!("wolfstack-vm-import-pve-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&tmp)
+        .map_err(|e| format!("mkdir staging {}: {}", tmp.display(), e))?;
+    let out = Command::new("tar")
+        .args(["xzf", archive_path, "-C"])
+        .arg(tmp.to_string_lossy().as_ref())
+        .output()
+        .map_err(|e| format!("tar spawn: {}", e))?;
+    if !out.status.success() {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(format!("tar extract: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+
+    // Find + parse the VmConfig.
+    let cfg_file = match fs::read_dir(&tmp) {
+        Ok(d) => d.flatten().find(|e| e.path().extension().map(|x| x == "json").unwrap_or(false)),
+        Err(e) => { let _ = fs::remove_dir_all(&tmp); return Err(format!("read staging: {}", e)); }
+    };
+    let Some(cfg_file) = cfg_file else {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err("no .json config found in archive".into());
+    };
+    let cfg_content = match fs::read_to_string(cfg_file.path()) {
+        Ok(c) => c,
+        Err(e) => { let _ = fs::remove_dir_all(&tmp); return Err(format!("read config: {}", e)); }
+    };
+    let config: VmConfig = match serde_json::from_str(&cfg_content) {
+        Ok(c) => c,
+        Err(e) => { let _ = fs::remove_dir_all(&tmp); return Err(format!("parse config: {}", e)); }
+    };
+    let target_name = new_name.unwrap_or(&config.name).to_string();
+    // PVE VM names are length-limited and can't have slashes — same
+    // path-traversal guard as the native importer.
+    if target_name.contains('/') || target_name.contains("..") || target_name.contains('\0') || target_name.is_empty() {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err("Invalid VM name: must not contain path separators".into());
+    }
+
+    // Allocate a VMID.
+    let vmid = match next_pve_vmid() {
+        Ok(v) => v,
+        Err(e) => { let _ = fs::remove_dir_all(&tmp); return Err(e); }
+    };
+
+    // Create the VM config.
+    //
+    // Bridge: WolfStack's VmConfig doesn't carry a primary-NIC bridge
+    // field — the main NIC only knows model + MAC. We default to vmbr0
+    // (PVE's default bridge) and fall back to extra_nics[0].bridge if
+    // the operator uses the OPNsense-style "skip-default-nic, NICs
+    // live in extra_nics" pattern. This is a documented limitation:
+    // non-standard bridge layouts need a post-import fix via the PVE
+    // UI. MAC gets regenerated automatically so the destination and
+    // the still-running source can coexist.
+    let bridge = config.extra_nics.iter().next()
+        .and_then(|n| n.bridge.clone())
+        .unwrap_or_else(|| "vmbr0".to_string());
+    let net_model = match config.net_model.as_str() {
+        "e1000" | "e1000e" | "rtl8139" => config.net_model.clone(),
+        _ => "virtio".to_string(),
+    };
+    let net0 = format!("{},bridge={}", net_model, bridge);
+    let bios = if config.bios_type == "ovmf" { "ovmf" } else { "seabios" };
+    // OS type heuristic for PVE. WolfStack doesn't track OS family
+    // explicitly, but the existing new-VM flow uses:
+    //   - net_model = "e1000"/"e1000e"/"rtl8139" → Windows (virtio-net
+    //     drivers aren't in Win installer media)
+    //   - os_disk_bus = "ide"/"sata" → Windows (virtio-blk is in the
+    //     same boat on Win)
+    // Pick "win11" (most recent, backward-compatible with all Win10
+    // paravirt guest behaviour) when either signal fires; else "l26"
+    // (Linux 2.6+). Operator can fix post-import if wrong.
+    let looks_windows = matches!(config.net_model.as_str(), "e1000" | "e1000e" | "rtl8139")
+        || matches!(config.os_disk_bus.as_str(), "ide" | "sata");
+    let ostype = if looks_windows { "win11" } else { "l26" };
+    let mut create = Command::new("qm");
+    create.args([
+        "create", &vmid.to_string(),
+        "--name", &target_name,
+        "--memory", &config.memory_mb.to_string(),
+        "--cores", &config.cpus.to_string(),
+        "--sockets", "1",
+        "--net0", &net0,
+        "--ostype", ostype,
+        "--bios", bios,
+    ]);
+    // UEFI (OVMF) VMs require an EFI disk entry or PVE refuses to
+    // boot them ("no bootable device" regardless of the OS disk).
+    // Allocate a tiny 4m EFI disk on the same storage as the OS disk.
+    if bios == "ovmf" {
+        let efi = format!("{}:0,efitype=4m,pre-enrolled-keys=0", storage);
+        create.args(["--efidisk0", &efi]);
+    }
+    let out = create.output().map_err(|e| format!("qm create spawn: {}", e))?;
+    if !out.status.success() {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(format!(
+            "qm create {}: {}",
+            vmid,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+
+    // Import each disk. OS disk is named `<config.name>.qcow2` in the
+    // archive (portability rewrite in export_vm stripped the custom
+    // storage_path, so it's always at the archive root).
+    let os_disk_path = tmp.join(format!("{}.qcow2", config.name));
+    if !os_disk_path.exists() {
+        let _ = destroy_pve_vm(vmid);
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(format!("OS disk {} missing from archive — aborting", os_disk_path.display()));
+    }
+    if let Err(e) = pve_import_and_attach_disk(vmid, &os_disk_path, storage, "scsi0") {
+        let _ = destroy_pve_vm(vmid);
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(e);
+    }
+    // Mark boot order explicitly — PVE's default is to boot whatever
+    // disk happens to be first, but being explicit is friendlier. If
+    // this fails the VM is still valid but won't boot; surface the
+    // error as a warning so the operator knows to fix it in the PVE
+    // UI rather than silently failing later.
+    let boot_out = Command::new("qm")
+        .args(["set", &vmid.to_string(), "--boot", "order=scsi0"])
+        .output();
+    if let Ok(o) = boot_out {
+        if !o.status.success() {
+            warn!(
+                "import_vm_proxmox: vmid {} created but `qm set --boot order=scsi0` failed: {}. Fix via PVE UI → Hardware → Boot Order.",
+                vmid,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+        }
+    }
+
+    // Attach extras as scsi1..N.
+    for (i, extra) in config.extra_disks.iter().enumerate() {
+        let filename = format!("{}.{}", extra.name, extra.format);
+        let extra_path = tmp.join(&filename);
+        if !extra_path.exists() {
+            let _ = destroy_pve_vm(vmid);
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(format!(
+                "extra disk {} missing from archive",
+                filename
+            ));
+        }
+        let slot = format!("scsi{}", i + 1);
+        if let Err(e) = pve_import_and_attach_disk(vmid, &extra_path, storage, &slot) {
+            let _ = destroy_pve_vm(vmid);
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(e);
+        }
+    }
+
+    let _ = fs::remove_dir_all(&tmp);
+    Ok(format!(
+        "VM '{}' imported as PVE VMID {} on storage {} (stopped; start via `qm start {}` or the PVE UI)",
+        target_name, vmid, storage, vmid
+    ))
+}
+
+/// Ask PVE for the next free VMID. Uses pvesh because `qm` doesn't
+/// expose this directly on older releases.
+fn next_pve_vmid() -> Result<u32, String> {
+    let out = Command::new("pvesh")
+        .args(["get", "/cluster/nextid"])
+        .output()
+        .map_err(|e| format!("pvesh nextid spawn: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "pvesh nextid: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // pvesh may return raw integer, JSON-wrapped int, or quoted string
+    // depending on --output-format defaults. Strip whitespace + quotes.
+    let cleaned = text.trim().trim_matches('"').trim();
+    cleaned.parse::<u32>()
+        .map_err(|e| format!("cannot parse VMID from pvesh output '{}': {}", cleaned, e))
+}
+
+/// `qm importdisk` → `qm set --<slot> <storage>:vm-<vmid>-disk-N` in
+/// two steps. The disk index PVE assigns depends on what's already
+/// attached, so we parse the importdisk output for the disk id it
+/// picked and use that in the set step.
+fn pve_import_and_attach_disk(
+    vmid: u32, qcow2_path: &std::path::Path, storage: &str, slot: &str,
+) -> Result<(), String> {
+    // Intentionally no `--format`: PVE picks the right format for the
+    // target storage (qcow2 for `dir`-type, raw for LVM-thin, zvol for
+    // ZFS). Forcing qcow2 made importdisk error out on block-level
+    // storages, which are PVE's most common defaults.
+    let out = Command::new("qm")
+        .args(["importdisk", &vmid.to_string()])
+        .arg(qcow2_path)
+        .arg(storage)
+        .output()
+        .map_err(|e| format!("qm importdisk spawn: {}", e))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        return Err(format!(
+            "qm importdisk failed for slot {}: {}",
+            slot, stderr.trim()
+        ));
+    }
+    // Output varies by PVE version. Either of these shapes appears
+    // between single quotes on a success line:
+    //   old: "'unused0:<storage>:vm-<vmid>-disk-N'"
+    //   new: "'<storage>:vm-<vmid>-disk-N'"
+    // We want the `<storage>:vm-<vmid>-disk-N` form regardless, which
+    // is what `qm set --<slot>` accepts. Parse by extracting the
+    // quoted substring, then stripping a leading `unused\d+:` if
+    // present.
+    let mut disk_id: Option<String> = None;
+    for line in stdout.lines().chain(stderr.lines()) {
+        if let Some(start) = line.find('\'') {
+            if let Some(end) = line[start + 1..].find('\'') {
+                let inside = &line[start + 1..start + 1 + end];
+                // Must look like `<token>:vm-<digits>-disk-<digits>`
+                // — i.e. at least one colon AND the `vm-...-disk-`
+                // shape to avoid false-matching other quoted strings
+                // in the output (e.g. file paths).
+                if !inside.contains(":vm-") || !inside.contains("-disk-") { continue; }
+                let candidate = if let Some(rest) = inside.split_once(':')
+                    .and_then(|(head, rest)| {
+                        let is_unused = head.starts_with("unused")
+                            && head["unused".len()..].chars().all(|c| c.is_ascii_digit());
+                        if is_unused { Some(rest) } else { None }
+                    })
+                {
+                    rest.to_string()
+                } else {
+                    inside.to_string()
+                };
+                disk_id = Some(candidate);
+                break;
+            }
+        }
+    }
+    let disk_id = disk_id.ok_or_else(|| format!(
+        "qm importdisk succeeded but we could not parse the new disk id from output: {}",
+        stdout.trim()
+    ))?;
+
+    let set_out = Command::new("qm")
+        .args(["set", &vmid.to_string(), &format!("--{}", slot), &disk_id])
+        .output()
+        .map_err(|e| format!("qm set spawn: {}", e))?;
+    if !set_out.status.success() {
+        return Err(format!(
+            "qm set --{} {}: {}",
+            slot, disk_id,
+            String::from_utf8_lossy(&set_out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Best-effort destroy of a half-imported PVE VM. Called when a
+/// multi-step import fails partway — leaves no orphan qm config.
+fn destroy_pve_vm(vmid: u32) -> Result<(), String> {
+    // `--purge` is a boolean flag on current PVE — some older builds
+    // accept `--purge 1` but current docs say bare `--purge`. Best-
+    // effort: if this fails the caller already surfaced the real
+    // error; an orphan VM config is less bad than overwriting the
+    // original error message.
+    let _ = Command::new("qm").args(["destroy", &vmid.to_string(), "--purge"]).output();
+    Ok(())
 }
 
 /// Move a VM's disks to a new storage path on the SAME node. Companion
@@ -3882,6 +4186,62 @@ mod pve_slot_tests {
         let slots = parse_pve_disk_slots(cfg, "wolfpool");
         assert_eq!(slots.len(), 1);
         assert_eq!(slots[0].0, "scsi0");
+    }
+
+    /// Pure extract of the disk-id parser so we can unit-test both
+    /// old- and new-style `qm importdisk` output without spawning qm.
+    fn extract_disk_id(stdout: &str) -> Option<String> {
+        for line in stdout.lines() {
+            if let Some(start) = line.find('\'') {
+                if let Some(end) = line[start + 1..].find('\'') {
+                    let inside = &line[start + 1..start + 1 + end];
+                    if !inside.contains(":vm-") || !inside.contains("-disk-") { continue; }
+                    let candidate = if let Some(rest) = inside.split_once(':')
+                        .and_then(|(head, rest)| {
+                            let is_unused = head.starts_with("unused")
+                                && head["unused".len()..].chars().all(|c| c.is_ascii_digit());
+                            if is_unused { Some(rest) } else { None }
+                        })
+                    {
+                        rest.to_string()
+                    } else {
+                        inside.to_string()
+                    };
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn parse_importdisk_older_pve_format() {
+        // PVE 7.x emits: `unused0: successfully imported disk 'unused0:local-lvm:vm-101-disk-0'`
+        let out = "Formatting 'vm-101-disk-0.raw'\n\
+                   Successfully imported disk as 'unused0:local-lvm:vm-101-disk-0'\n";
+        assert_eq!(extract_disk_id(out).as_deref(), Some("local-lvm:vm-101-disk-0"));
+    }
+
+    #[test]
+    fn parse_importdisk_newer_pve_format() {
+        // Newer PVE drops the "unusedN:" prefix in the quoted form.
+        let out = "transferred 32.0 GiB of 32.0 GiB (100%)\n\
+                   Successfully imported disk as 'wolfpool:vm-500-disk-0'\n";
+        assert_eq!(extract_disk_id(out).as_deref(), Some("wolfpool:vm-500-disk-0"));
+    }
+
+    #[test]
+    fn parse_importdisk_skips_file_path_quotes() {
+        // Ignore quoted file paths that don't match the disk-id shape.
+        let out = "Formatting '/tmp/source.qcow2'\n\
+                   Successfully imported disk as 'local-lvm:vm-42-disk-0'\n";
+        assert_eq!(extract_disk_id(out).as_deref(), Some("local-lvm:vm-42-disk-0"));
+    }
+
+    #[test]
+    fn parse_importdisk_returns_none_on_error_output() {
+        let out = "Error: storage 'bogus' does not exist\n";
+        assert_eq!(extract_disk_id(out), None);
     }
 
     #[test]

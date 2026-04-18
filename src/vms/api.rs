@@ -580,16 +580,25 @@ async fn resize_volume(req: HttpRequest, state: web::Data<AppState>, path: web::
 struct VmMigrateRequest {
     target_node: String,
     new_name: Option<String>,
-    /// Destination storage path on the target node — where the final
-    /// qcow2(s) end up after import.
+    /// Destination storage path / PVE storage ID on the target node
+    /// — where the final qcow2(s) end up after import.
     storage: Option<String>,
     /// Staging root on the SOURCE node for the export tarball. The
     /// default `/tmp` is often a small tmpfs; operators whose VMs
     /// don't fit can point this at a big disk (e.g. /var/wolftmp).
-    /// Honoured on the source side only — the target node picks its
-    /// own staging root (TMPDIR env or its own setting).
     #[serde(default)]
     staging_dir: Option<String>,
+    /// Staging root on the TARGET node used by vm_import_external
+    /// to extract + stage the incoming archive. Sent to the target
+    /// as a `target_staging_dir` multipart field; fell back to
+    /// $TMPDIR / /tmp on the target when absent.
+    #[serde(default)]
+    target_staging_dir: Option<String>,
+    /// When true, the target node imports the VM as a PVE-managed VM
+    /// via `qm create` + `qm importdisk`. Requires the target to be
+    /// a Proxmox host and `storage` to be a PVE storage id.
+    #[serde(default)]
+    proxmox: bool,
     #[serde(default)]
     target_address: Option<String>,
     #[serde(default)]
@@ -618,6 +627,13 @@ struct VmMigrateExternalRequest {
     /// Staging root on the source node — same semantics as vm_migrate.
     #[serde(default)]
     staging_dir: Option<String>,
+    /// Staging root on the target — passed as target_staging_dir in the
+    /// multipart upload so the target honours it during extraction.
+    #[serde(default)]
+    target_staging_dir: Option<String>,
+    /// Request PVE-managed import on the target.
+    #[serde(default)]
+    proxmox: bool,
 }
 
 /// POST /api/vms/{name}/migrate — migrate VM to another cluster node
@@ -732,13 +748,23 @@ async fn vm_migrate(
     let mut last_err: Option<String> = None;
 
     let storage_val = body.storage.as_deref().unwrap_or("").to_string();
+    let tgt_staging_val = body.target_staging_dir.as_deref().unwrap_or("").to_string();
+    let proxmox_val = if body.proxmox { "1" } else { "" }.to_string();
 
     for import_url in &import_urls {
-        let form = reqwest::multipart::Form::new()
+        let mut form = reqwest::multipart::Form::new()
             .text("new_name", new_name.to_string())
             .text("storage", storage_val.clone())
             .part("archive", reqwest::multipart::Part::bytes(archive_bytes.clone())
                 .file_name(file_name.clone()));
+        // Send the optional fields only when set so old targets
+        // (pre-v18.7.18) silently ignore unknown multipart parts.
+        if !tgt_staging_val.is_empty() {
+            form = form.text("target_staging_dir", tgt_staging_val.clone());
+        }
+        if !proxmox_val.is_empty() {
+            form = form.text("proxmox", proxmox_val.clone());
+        }
 
         match client.post(import_url)
             .header("X-WolfStack-Secret", state.cluster_secret.clone())
@@ -874,14 +900,22 @@ async fn vm_migrate_external(
 
     let file_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
     let storage_val = body.storage.as_deref().unwrap_or("").to_string();
+    let tgt_staging_val = body.target_staging_dir.as_deref().unwrap_or("").to_string();
+    let proxmox_val = if body.proxmox { "1" } else { "" }.to_string();
     let mut last_err: Option<String> = None;
 
     for import_url in &import_urls {
-        let form = reqwest::multipart::Form::new()
+        let mut form = reqwest::multipart::Form::new()
             .text("new_name", new_name.to_string())
             .text("storage", storage_val.clone())
             .part("archive", reqwest::multipart::Part::bytes(archive_bytes.clone())
                 .file_name(file_name.clone()));
+        if !tgt_staging_val.is_empty() {
+            form = form.text("target_staging_dir", tgt_staging_val.clone());
+        }
+        if !proxmox_val.is_empty() {
+            form = form.text("proxmox", proxmox_val.clone());
+        }
 
         match client.post(import_url)
             .header("X-Transfer-Token", &body.target_token)
@@ -964,6 +998,9 @@ async fn vm_import_external(
     let mut new_name: Option<String> = None;
     let mut storage: Option<String> = None;
     let mut archive_path: Option<std::path::PathBuf> = None;
+    // New multipart fields — backward compatible (old clients don't send them).
+    let mut target_staging_dir: Option<String> = None;
+    let mut proxmox: bool = false;
 
     while let Some(item) = payload.next().await {
         let mut field = match item {
@@ -988,6 +1025,27 @@ async fn vm_import_external(
                 }
                 let val = String::from_utf8_lossy(&buf).trim().to_string();
                 if !val.is_empty() { storage = Some(val); }
+            }
+            "target_staging_dir" => {
+                // Source sends this so the target extracts the archive
+                // under the operator's chosen staging root instead of
+                // $TMPDIR / /tmp. Source staging is set separately on
+                // the source vm_migrate call — this is strictly the
+                // target side's extraction/upload directory.
+                let mut buf = Vec::new();
+                while let Some(chunk) = field.next().await {
+                    if let Ok(data) = chunk { buf.extend_from_slice(&data); }
+                }
+                let val = String::from_utf8_lossy(&buf).trim().to_string();
+                if !val.is_empty() { target_staging_dir = Some(val); }
+            }
+            "proxmox" => {
+                let mut buf = Vec::new();
+                while let Some(chunk) = field.next().await {
+                    if let Ok(data) = chunk { buf.extend_from_slice(&data); }
+                }
+                let val = String::from_utf8_lossy(&buf).trim().to_ascii_lowercase();
+                proxmox = matches!(val.as_str(), "1" | "true" | "yes" | "on");
             }
             "archive" => {
                 let fname = format!("vm-import-{}.tar.gz", uuid::Uuid::new_v4());
@@ -1015,11 +1073,37 @@ async fn vm_import_external(
         None => return HttpResponse::BadRequest().json(serde_json::json!({"error": "No archive uploaded"})),
     };
 
-    match super::manager::import_vm(
-        archive.to_str().unwrap_or(""),
-        new_name.as_deref(),
-        storage.as_deref(),
-    ) {
+    // Choose the import path. `proxmox=true` routes to import_vm_proxmox
+    // which creates a PVE-managed VM via qm create + qm importdisk.
+    // Fall back to native import if the operator asked for PVE but
+    // this host isn't Proxmox — surface the error instead of silently
+    // creating a WolfStack-style VM.
+    let result = if proxmox {
+        if !crate::containers::is_proxmox() {
+            Err("proxmox=true was requested but this host does not have Proxmox installed (`qm` not found)".to_string())
+        } else {
+            let sid = storage.as_deref().unwrap_or("").trim();
+            if sid.is_empty() {
+                Err("PVE storage id is required when proxmox=true (e.g. 'local-lvm')".to_string())
+            } else {
+                super::manager::import_vm_proxmox(
+                    archive.to_str().unwrap_or(""),
+                    new_name.as_deref(),
+                    sid,
+                    target_staging_dir.as_deref(),
+                )
+            }
+        }
+    } else {
+        super::manager::import_vm_with_staging(
+            archive.to_str().unwrap_or(""),
+            new_name.as_deref(),
+            storage.as_deref(),
+            target_staging_dir.as_deref(),
+        )
+    };
+
+    match result {
         Ok(msg) => {
             let _ = std::fs::remove_file(&archive);
             HttpResponse::Ok().json(serde_json::json!({"message": msg}))
