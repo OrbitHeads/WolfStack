@@ -37232,9 +37232,23 @@ function _wolfAgentsMarkdown(src) {
     // Italic (*text* or _text_) — avoid matching list bullets at BOL.
     s = s.replace(/(^|[^*\w])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
     s = s.replace(/(^|[^_\w])_([^_\n]+)_(?!_)/g, '$1<em>$2</em>');
-    // Links: [text](url). Restrict URL to http/https/mailto for safety.
+    // Links: [text](url). Restrict the scheme to http/https/mailto. The
+    // URL text was HTML-escaped up front, so any raw `<`, `>`, `"`, `'`,
+    // or `&` in the original URL now appears as an entity (`&lt;`, `&gt;`,
+    // `&quot;`, `&#039;`, `&amp;`). Browsers accept `&amp;` as an href
+    // literal, but `&quot;` would prematurely close the attribute. Decode
+    // the five entities we produced back to safe percent-encoded bytes
+    // (or, for `&amp;`, the literal `&` that URLs actually use).
     s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+|mailto:[^\s)]+)\)/g,
-        '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+        (_, text, url) => {
+            const href = url
+                .replace(/&amp;/g, '&')
+                .replace(/&lt;/g, '%3C')
+                .replace(/&gt;/g, '%3E')
+                .replace(/&quot;/g, '%22')
+                .replace(/&#039;/g, '%27');
+            return `<a href="${href}" target="_blank" rel="noopener noreferrer">${text}</a>`;
+        });
     // Headings — line starts with one to three #s.
     s = s.replace(/(^|\n)### (.+)/g, '$1<h5 style="margin:10px 0 4px;">$2</h5>');
     s = s.replace(/(^|\n)## (.+)/g, '$1<h4 style="margin:12px 0 4px;">$2</h4>');

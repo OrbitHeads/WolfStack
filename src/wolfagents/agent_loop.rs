@@ -30,7 +30,7 @@
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use super::{Agent, dispatch, tools::ToolId};
+use super::{Agent, dispatch, tools::{ToolId, Danger}};
 
 /// Summary of one completed agent turn. Returned to the caller (REST
 /// API handler or WolfFlow AgentChat) so they can render the final
@@ -176,19 +176,26 @@ async fn cluster_snapshot_section(agent: &Agent, state: &crate::api::AppState) -
 fn agent_scope_section(agent: &Agent) -> String {
     let scope = &agent.target_scope;
     let mut out = String::from("## Your Scope\n");
+    // Enumerate safe tools live from the tool registry so the hint stays
+    // correct when new tools are added — no risk of the prompt drifting
+    // from the authoriser's classification.
+    let safe_tools: Vec<&str> = ToolId::ALL.iter()
+        .filter(|t| t.danger() == Danger::Safe)
+        .map(|t| t.as_str())
+        .collect();
     let level_hint = match agent.access_level {
-        crate::wolfagents::AccessLevel::ReadOnly =>
-            "read_only — safe/read tools (list_nodes, get_metrics, check_disk_usage, \
-             read_log, list_workflows, etc.) run freely. Mutating and destructive \
+        crate::wolfagents::AccessLevel::ReadOnly => format!(
+            "read_only — safe/read tools run freely ({}). Mutating and destructive \
              tools are refused. This is NOT a chat-only agent — you SHOULD call \
              read tools to answer questions about the cluster.",
+            safe_tools.join(", ")),
         crate::wolfagents::AccessLevel::ReadWrite =>
             "read_write — safe and mutating tools run freely. Destructive tools \
-             queue for operator approval.",
+             queue for operator approval.".to_string(),
         crate::wolfagents::AccessLevel::ConfirmAll =>
-            "confirm_all — every non-read tool queues for operator approval.",
+            "confirm_all — every non-read tool queues for operator approval.".to_string(),
         crate::wolfagents::AccessLevel::Trusted =>
-            "trusted — all tools run freely, subject only to the hardcoded safety denylist.",
+            "trusted — all tools run freely, subject only to the hardcoded safety denylist.".to_string(),
     };
     out.push_str(&format!("- access_level: `{:?}` — {}\n", agent.access_level, level_hint));
     if scope.allowed_clusters.is_empty() {

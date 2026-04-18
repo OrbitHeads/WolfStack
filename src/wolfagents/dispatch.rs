@@ -557,7 +557,12 @@ async fn tool_run_workflow(args: &serde_json::Value, state: &crate::api::AppStat
     let wf_state = state.wolfflow.clone();
     let cluster = state.cluster.clone();
     let secret = state.cluster_secret.clone();
-    let ai_config = state.ai_agent.config.lock().unwrap().clone();
+    // Recover from a poisoned mutex instead of panicking — a previous
+    // panic in another code path under this lock would otherwise take
+    // the agent's tool call down with it. The inner value is fine to
+    // read; we only need a clone of the config to pass to the workflow.
+    let ai_config = state.ai_agent.config.lock()
+        .unwrap_or_else(|p| p.into_inner()).clone();
     let wf_name = workflow.name.clone();
     // Fire-and-forget exactly like the API trigger. The agent gets
     // back "enqueued" — if it needs the run's outcome, it can poll

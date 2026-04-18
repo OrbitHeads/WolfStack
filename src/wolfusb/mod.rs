@@ -25,11 +25,18 @@ fn config_path() -> String { format!("{}/wolfusb.json", crate::paths::get().conf
 static CLUSTER_SECRET: OnceLock<String> = OnceLock::new();
 
 /// Initialize the WolfUSB module with the cluster secret (call from main.rs)
+///
+/// This runs synchronously on the caller's thread because the migration
+/// MUST land before any other code path reads the config — attach/detach
+/// resolvers only understand canonical port-path busids, so leaving a
+/// legacy busid in the on-disk config through the boot window would let
+/// an early API request mis-resolve. The migration is O(assignments ×
+/// sysfs_devices), with sysfs entries being in-kernel reads — empirically
+/// a handful of ms for the largest homelab we've seen. If startup time
+/// ever becomes an issue, moving this to a spawned task that blocks the
+/// first config-mutating API call is the right refactor.
 pub fn init(cluster_secret: &str) {
     let _ = CLUSTER_SECRET.set(cluster_secret.to_string());
-    // One-shot on boot: migrate any legacy `wolfusb-bus-addr` busids to
-    // the canonical sysfs port-path form. Only rewrites assignments whose
-    // device is currently plugged in (we need a sysfs entry to migrate to).
     let mut config = WolfUsbConfig::load();
     if migrate_assignments_to_port_paths(&mut config) {
         if let Err(e) = config.save() {
@@ -477,6 +484,11 @@ pub fn list_local_devices_with_status(config: &WolfUsbConfig) -> (Vec<UsbDevice>
 /// Returns `true` if at least one assignment was rewritten.
 pub fn migrate_assignments_to_port_paths(config: &mut WolfUsbConfig) -> bool {
     let sysfs = sysfs_list_devices();
+    // Early-out when sysfs has no real USB devices plugged in — there's
+    // nothing stable to migrate TO. On a headless or embedded host with
+    // only root hubs visible this is the common case and is expected;
+    // legacy assignments stay as they are and will be migrated next
+    // boot when the device reappears.
     if sysfs.is_empty() { return false; }
     let mut rewrote = 0usize;
     for a in config.assignments.iter_mut() {
