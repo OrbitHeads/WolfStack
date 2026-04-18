@@ -1612,6 +1612,7 @@
                     </div>
                     <div style="display:flex; gap:8px;">
                         <button class="btn btn-sm" onclick="wolfAgentsOpenEdit()">⚙️ Edit</button>
+                        <button class="btn btn-sm" onclick="wolfAgentsToggleFullscreen()" id="wolfagents-chat-fs-btn" title="Toggle fullscreen (Esc)">⛶</button>
                         <button class="btn btn-sm" onclick="wolfAgentsDelete()" style="color:#ef4444;">Delete</button>
                         <button class="btn btn-sm" onclick="wolfAgentsCloseChat()">×</button>
                     </div>
@@ -7674,6 +7675,7 @@ region = us-east-1"></textarea>
                     '</div>' +
                     '<div style="display:flex;gap:6px;">' +
                     '<button onclick="openAiSettings()" style="background:rgba(255,255,255,0.2);border:none;color:#fff;border-radius:8px;padding:6px 10px;cursor:pointer;font-size:12px;" title="AI Settings">⚙️</button>' +
+                    '<button onclick="toggleAiChatFullscreen()" id="ai-chat-fs-btn" style="background:rgba(255,255,255,0.2);border:none;color:#fff;border-radius:8px;padding:6px 10px;cursor:pointer;font-size:14px;" title="Toggle fullscreen (Esc to exit)">⛶</button>' +
                     '<button onclick="toggleAiChat()" style="background:rgba(255,255,255,0.2);border:none;color:#fff;border-radius:8px;padding:6px 10px;cursor:pointer;font-size:16px;" title="Close">✕</button>' +
                     '</div>' +
                     '</div>' +

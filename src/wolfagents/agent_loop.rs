@@ -236,6 +236,21 @@ fn agent_scope_section(agent: &Agent) -> String {
          setting, that refusal is outdated — the operator has since adjusted your permissions. \
          Re-evaluate the current request against the values above, not against your prior replies.\n"
     );
+    out.push_str(
+        "\nCRITICAL: Your tools are your access. Before refusing any user request with a \
+         generic 'I'm an AI and can't do that' disclaimer, check the `allowed tools` list above. \
+         If a matching tool is listed, CALL IT — do not say you can't. Specifically:\n\
+         - User asks to email / notify / send a message → use `send_email` if present.\n\
+         - User asks to run / check / inspect something → use `exec_in_container`, `exec_on_node`, \
+           `check_disk_usage`, `read_log`, `get_metrics` as appropriate.\n\
+         - User asks to schedule / run daily / run every hour → use `schedule_workflow` or \
+           `run_workflow`.\n\
+         - User asks about past incidents or history → use `semantic_search`.\n\
+         - User asks about a website → use `web_fetch` or `web_render`.\n\
+         Only refuse if the required tool is NOT in your allowed_tools list, or if the access \
+         level forbids it. In that case, say exactly which tool would be needed so the operator \
+         can grant it.\n"
+    );
     out
 }
 

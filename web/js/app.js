@@ -18885,6 +18885,52 @@ function toggleAiChat() {
     }
 }
 
+// Fullscreen toggle for the main AI chat. The bubble panel is a fixed
+// 420×540 corner widget by default — long agent replies, code blocks,
+// and proposal previews all scroll a lot in that footprint. Fullscreen
+// stretches it to the full viewport for comfortable reading/editing.
+// Original dimensions are remembered so toggling back restores them.
+var _aiChatFsPrev = null;
+function toggleAiChatFullscreen() {
+    var panel = document.getElementById('ai-chat-panel');
+    var btn = document.getElementById('ai-chat-fs-btn');
+    if (!panel) return;
+    if (!_aiChatFsPrev) {
+        _aiChatFsPrev = {
+            width: panel.style.width,
+            height: panel.style.height,
+            top: panel.style.top,
+            left: panel.style.left,
+            right: panel.style.right,
+            bottom: panel.style.bottom,
+            borderRadius: panel.style.borderRadius,
+        };
+        panel.style.width = '100vw';
+        panel.style.height = '100vh';
+        panel.style.top = '0';
+        panel.style.left = '0';
+        panel.style.right = '0';
+        panel.style.bottom = '0';
+        panel.style.borderRadius = '0';
+        if (btn) { btn.textContent = '❐'; btn.title = 'Exit fullscreen (Esc)'; }
+    } else {
+        panel.style.width = _aiChatFsPrev.width;
+        panel.style.height = _aiChatFsPrev.height;
+        panel.style.top = _aiChatFsPrev.top;
+        panel.style.left = _aiChatFsPrev.left;
+        panel.style.right = _aiChatFsPrev.right;
+        panel.style.bottom = _aiChatFsPrev.bottom;
+        panel.style.borderRadius = _aiChatFsPrev.borderRadius;
+        _aiChatFsPrev = null;
+        if (btn) { btn.textContent = '⛶'; btn.title = 'Toggle fullscreen (Esc to exit)'; }
+    }
+}
+
+// Esc exits fullscreen when active — matches how most editors behave.
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && _aiChatFsPrev) toggleAiChatFullscreen();
+});
+
 // Visible infrastructure cache for AI action target picker
 var _aiVisibleInfra = null;
 
@@ -37221,6 +37267,19 @@ let _wolfAgentsActiveId = null;
 // rendering access the avatar without re-fetching per turn.
 let _wolfAgentsActiveAgent = null;
 
+// Built-in wolf avatars — hoisted via `var` so wolfAgentsLoad() can run
+// during initial render (the SPA may boot directly into the agents view
+// on /#wolfagents, firing this function before the script reaches the
+// body below) without a TDZ error.
+var WOLF_AVATARS = [
+    { file: 'wolf-grey.svg',   label: 'Grey' },
+    { file: 'wolf-red.svg',    label: 'Red' },
+    { file: 'wolf-arctic.svg', label: 'Arctic' },
+    { file: 'wolf-shadow.svg', label: 'Shadow' },
+    { file: 'wolf-cyber.svg',  label: 'Cyber' },
+    { file: 'wolf-sunset.svg', label: 'Sunset' },
+];
+
 async function wolfAgentsLoad() {
     const grid = document.getElementById('wolfagents-list');
     if (!grid) return;
@@ -37248,14 +37307,12 @@ async function wolfAgentsLoad() {
 // Order matters: used as the deterministic fallback when an agent has no
 // avatar set (hash the agent id into the list so each agent keeps a
 // consistent look across sessions without a config write).
-const WOLF_AVATARS = [
-    { file: 'wolf-grey.svg',   label: 'Grey' },
-    { file: 'wolf-red.svg',    label: 'Red' },
-    { file: 'wolf-arctic.svg', label: 'Arctic' },
-    { file: 'wolf-shadow.svg', label: 'Shadow' },
-    { file: 'wolf-cyber.svg',  label: 'Cyber' },
-    { file: 'wolf-sunset.svg', label: 'Sunset' },
-];
+// Defined with `var` so it's hoisted — previously `const` put it in a
+// temporal dead zone, and early callers (the initial wolfAgentsLoad()
+// that fires from selectView on page load) threw "Cannot access
+// 'WOLF_AVATARS' before initialization" when the SPA booted straight
+// into the agents view.
+// (see the definition moved higher up in this file)
 
 // Resolve an agent record's avatar to an <img> src. Three cases:
 //   - `data:` URL from an operator upload — use verbatim.
@@ -37354,10 +37411,64 @@ async function _wolfAgentsRefreshPendingBadge(id) {
 }
 
 function wolfAgentsCloseChat() {
+    if (_wolfAgentsChatFsPrev) wolfAgentsToggleFullscreen();
     _wolfAgentsActiveId = null;
     document.getElementById('wolfagents-chat').style.display = 'none';
     document.getElementById('wolfagents-chat-log').innerHTML = '';
 }
+
+// Fullscreen toggle for the WolfAgents chat panel. The card sits in the
+// normal page flow, so "fullscreen" means pinning it over the viewport.
+var _wolfAgentsChatFsPrev = null;
+function wolfAgentsToggleFullscreen() {
+    var card = document.getElementById('wolfagents-chat');
+    var log = document.getElementById('wolfagents-chat-log');
+    var btn = document.getElementById('wolfagents-chat-fs-btn');
+    if (!card) return;
+    if (!_wolfAgentsChatFsPrev) {
+        _wolfAgentsChatFsPrev = {
+            position: card.style.position,
+            top: card.style.top, left: card.style.left,
+            right: card.style.right, bottom: card.style.bottom,
+            width: card.style.width, height: card.style.height,
+            zIndex: card.style.zIndex, margin: card.style.margin,
+            borderRadius: card.style.borderRadius,
+            logMaxHeight: log && log.style.maxHeight,
+            logHeight: log && log.style.height,
+        };
+        card.style.position = 'fixed';
+        card.style.top = '0'; card.style.left = '0';
+        card.style.right = '0'; card.style.bottom = '0';
+        card.style.width = '100vw'; card.style.height = '100vh';
+        card.style.margin = '0';
+        card.style.borderRadius = '0';
+        card.style.zIndex = '10000';
+        if (log) {
+            log.style.maxHeight = 'calc(100vh - 260px)';
+            log.style.height = 'calc(100vh - 260px)';
+        }
+        if (btn) { btn.textContent = '❐'; btn.title = 'Exit fullscreen (Esc)'; }
+    } else {
+        var p = _wolfAgentsChatFsPrev;
+        card.style.position = p.position;
+        card.style.top = p.top; card.style.left = p.left;
+        card.style.right = p.right; card.style.bottom = p.bottom;
+        card.style.width = p.width; card.style.height = p.height;
+        card.style.margin = p.margin;
+        card.style.borderRadius = p.borderRadius;
+        card.style.zIndex = p.zIndex;
+        if (log) {
+            log.style.maxHeight = p.logMaxHeight || '';
+            log.style.height = p.logHeight || '';
+        }
+        _wolfAgentsChatFsPrev = null;
+        if (btn) { btn.textContent = '⛶'; btn.title = 'Toggle fullscreen (Esc)'; }
+    }
+}
+
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && _wolfAgentsChatFsPrev) wolfAgentsToggleFullscreen();
+});
 
 async function wolfAgentsLoadMemory(id) {
     const log = document.getElementById('wolfagents-chat-log');
@@ -37630,7 +37741,16 @@ function wolfAgentsOpenCreate() {
     const waNum = document.getElementById('wolfagents-field-whatsapp-number'); if (waNum) waNum.value = '';
     const waLabel = document.getElementById('wolfagents-field-whatsapp-label'); if (waLabel) waLabel.value = '';
     _wolfAgentsRenderInheritedAi(null);
-    _wolfAgentsRenderToolCheckboxes([]);
+    // Default new agents to ALL tools ticked. Combined with the default
+    // access_level=read_only this is still safe — mutating/destructive
+    // tools are refused by the authoriser until the operator raises the
+    // level. Starting empty forced a tedious tick-every-box ritual for
+    // every new agent; starting full lets the operator uncheck the few
+    // they don't want and be done.
+    _wolfAgentsFetchToolCatalogue().then(function(cat) {
+        var all = (cat || []).map(function(t) { return t.id; });
+        _wolfAgentsRenderToolCheckboxes(all);
+    });
     _wolfAgentsRenderAvatarPicker(null);
     document.getElementById('wolfagents-modal').style.display = 'flex';
 }
