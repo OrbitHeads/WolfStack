@@ -14894,6 +14894,26 @@ fn apply_access_fields(agent: &mut crate::wolfagents::Agent, v: &serde_json::Val
     if let Some(b) = v.get("include_cluster_context").and_then(|x| x.as_bool()) {
         agent.include_cluster_context = b;
     }
+    // Telegram binding: same convention as discord — null clears,
+    // missing leaves alone, object replaces. Historically only discord
+    // was processed here, which meant the frontend's telegram payload
+    // silently dropped on every save and the operator saw "chat_id
+    // set in the UI but nothing routes".
+    if let Some(t) = v.get("telegram") {
+        if t.is_null() {
+            agent.telegram = None;
+        } else if let Ok(parsed) = serde_json::from_value::<crate::wolfagents::TelegramBinding>(t.clone()) {
+            agent.telegram = Some(parsed);
+        }
+    }
+    // WhatsApp binding: same null/missing/object semantics.
+    if let Some(w) = v.get("whatsapp") {
+        if w.is_null() {
+            agent.whatsapp = None;
+        } else if let Ok(parsed) = serde_json::from_value::<crate::wolfagents::WhatsAppBinding>(w.clone()) {
+            agent.whatsapp = Some(parsed);
+        }
+    }
 }
 
 /// PUT /api/agents/{id} — update fields on an existing agent. Body
