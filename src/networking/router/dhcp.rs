@@ -101,6 +101,16 @@ pub fn render_config(lan: &LanSegment) -> Result<String, String> {
     for fwd in &lan.dns.forwarders {
         cfg.push_str(&format!("server={}\n", fwd));
     }
+    // EDNS Client Subnet (RFC 7871). When enabled, dnsmasq tags every
+    // outbound forwarded query with the client's /32 (IPv4) or /128
+    // (IPv6). Upstreams that honour ECS — AdGuard Home, NextDNS,
+    // Pi-hole with EDNS enabled — then attribute queries to the real
+    // LAN client instead of to the router. Matters most for AdGuard
+    // running in Docker bridge mode where every query otherwise
+    // appears to come from 172.17.0.1.
+    if lan.dns.forward_client_subnet {
+        cfg.push_str("add-subnet=32,128\n");
+    }
     for rec in &lan.dns.local_records {
         // address= gives an A record; host-record= gives A + PTR.
         cfg.push_str(&format!("host-record={},{}\n", rec.hostname, rec.ip));

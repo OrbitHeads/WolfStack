@@ -143,6 +143,14 @@ pub struct DnsServerConfig {
     /// not) in real time.
     #[serde(default)]
     pub query_log: bool,
+    /// Forward the original client IP to upstream forwarders via EDNS
+    /// Client Subnet (RFC 7871). Adds `add-subnet=32,128` to dnsmasq so
+    /// upstreams like AdGuard, Pi-hole, or NextDNS can attribute queries
+    /// to individual LAN clients instead of seeing them all come from
+    /// the router. Off by default because ECS leaks client subnets to
+    /// the upstream — enable only when you trust the upstream.
+    #[serde(default)]
+    pub forward_client_subnet: bool,
 }
 
 impl Default for DnsServerConfig {
@@ -153,6 +161,7 @@ impl Default for DnsServerConfig {
             cache_enabled: true,
             block_ads: false,
             query_log: false,
+            forward_client_subnet: false,
         }
     }
 }

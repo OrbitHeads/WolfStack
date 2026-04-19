@@ -1041,6 +1041,14 @@
                         <label style="grid-column:1/-1; display:flex; gap:8px; align-items:center;">
                             <input type="checkbox" id="wr-l-ads"/>Block ads/trackers via DNS (hosts-file block list)
                         </label>
+                        <div style="grid-column:1/-1; display:flex; flex-direction:column; gap:3px; padding:8px 10px; background:var(--bg-secondary,#161622); border:1px solid var(--border,#333); border-radius:6px;">
+                            <label style="display:flex; gap:8px; align-items:center; font-weight:500;">
+                                <input type="checkbox" id="wr-l-ecs"/>Forward client IP to upstream (EDNS Client Subnet)
+                            </label>
+                            <span style="font-size:11px; color:var(--text-muted); line-height:1.5;">
+                                Tags every forwarded query with the real LAN client's IP so upstream resolvers like <strong>AdGuard Home</strong>, <strong>Pi-hole</strong>, or <strong>NextDNS</strong> can attribute traffic to individual clients instead of seeing them all come from this router. Particularly useful for AdGuard running in a Docker bridge container, which otherwise sees every query as coming from <code>172.17.0.1</code>. The upstream must have ECS enabled too (AdGuard: Settings → DNS server → "Enable EDNS Client Subnet"). Leave off if you'd rather not leak client subnets to the upstream.
+                            </span>
+                        </div>
                     </div>
                 </div>
                 <div id="wr-l-status" style="padding:0 20px; font-size:12px;"></div>
@@ -1084,6 +1092,7 @@
         const presetId = wrDnsPresetFromServers(l.dns.forwarders);
         document.getElementById('wr-l-fwd-preset').value = presetId;
         document.getElementById('wr-l-ads').checked = !!l.dns.block_ads;
+        document.getElementById('wr-l-ecs').checked = !!l.dns.forward_client_subnet;
 
         // Populate the reservations editor from existing data. Each row
         // is a live DOM block the user can edit; wrSaveLan reads them
@@ -1244,6 +1253,7 @@
             local_records: lan.dns?.local_records || [],
             cache_enabled: true,
             block_ads: document.getElementById('wr-l-ads').checked,
+            forward_client_subnet: document.getElementById('wr-l-ecs').checked,
         });
 
         // Preflight — ensure dnsmasq exists BEFORE trying to create a segment
