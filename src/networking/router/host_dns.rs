@@ -425,7 +425,7 @@ fn detect_port_53_bindings() -> Vec<Port53Binding> {
     let Ok(out) = Command::new("ss").args(["-tulnp"]).output() else { return Vec::new(); };
     if !out.status.success() { return Vec::new(); }
     let text = String::from_utf8_lossy(&out.stdout);
-    let mut bindings = Vec::new();
+    let mut bindings: Vec<Port53Binding> = Vec::new();
     for line in text.lines() {
         // Skip header.
         if line.starts_with("Netid") { continue; }
@@ -442,7 +442,13 @@ fn detect_port_53_bindings() -> Vec<Port53Binding> {
         // looks like `users:(("systemd-resolve",pid=1234,fd=17))`.
         let process_col = parts.last().copied().unwrap_or("");
         if let Some(owner) = extract_process_name(process_col) {
-            bindings.push(Port53Binding { owner, local_addr: local.to_string() });
+            // Dedupe — dnsmasq and systemd-resolved each bind both
+            // TCP and UDP on the same local addr, which would
+            // otherwise produce two identical rows in the panel.
+            let already = bindings.iter().any(|b| b.owner == owner && b.local_addr == local);
+            if !already {
+                bindings.push(Port53Binding { owner, local_addr: local.to_string() });
+            }
         }
     }
     bindings

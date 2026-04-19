@@ -5560,7 +5560,7 @@
         }
         const confirmMsg = port === 53
             ? `Move this LAN's dnsmasq back to port 53? Any container currently bound to :53 on this LAN's interface will conflict.`
-            : `Move this LAN's dnsmasq from :53 to :${port} and advertise ${externalServer} via DHCP option 6? dnsmasq will restart.`;
+            : `Move this LAN's dnsmasq to :${port} and advertise ${externalServer} via DHCP option 6? dnsmasq will restart.`;
         if (!(await showConfirm(confirmMsg))) return;
         const nodeId = wrToolsSelectedNodeId();
         const url = await wrNodeUrl(nodeId, '/api/router/host-dns/lan-dns-port');

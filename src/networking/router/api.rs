@@ -2621,39 +2621,54 @@ async fn set_lan_dns_port(
             "error": "external_server is required when new_port isn't 53 — DHCP option 6 can only advertise a DNS server on the standard port, so clients need to be pointed at a resolver they can reach (typically the AdGuard/Pi-hole container IP).",
         }));
     }
-    // Update the LAN in place, validate it, save, restart dnsmasq if
-    // we own the LAN. Lock is dropped before the restart for the same
-    // reason as set_query_log above (don't stall readers on spawn).
-    let updated_lan = {
-        let mut cfg = state.router.config.write().unwrap();
-        let seg = match cfg.lans.iter_mut().find(|l| l.id == body.lan_id) {
-            Some(s) => s,
+    // Build the candidate LAN outside the write lock first, then
+    // validate it, then commit. Mutating in place before validating
+    // would leave RouterConfig in an invalid state on a validation
+    // failure (config saved + dnsmasq restarted are cheap to skip,
+    // but in-memory drift isn't).
+    let candidate = {
+        let cfg = state.router.config.read().unwrap();
+        let seg = match cfg.lans.iter().find(|l| l.id == body.lan_id) {
+            Some(s) => s.clone(),
             None => return actix_web::HttpResponse::NotFound().json(serde_json::json!({
                 "ok": false, "error": "LAN not found",
             })),
         };
-        seg.dns.listen_port = body.new_port;
-        if !external.is_empty() {
-            seg.dns.external_server = Some(external.clone());
-        } else if body.new_port == 53 {
-            // Reverting to :53 without an explicit external_server ==
-            // "back to defaults" — DHCP option 6 should advertise the
-            // router IP again, not the old container IP from when the
-            // LAN was temporarily moved to a non-standard port.
-            seg.dns.external_server = None;
-        }
-        let snapshot = seg.clone();
-        if let Err(e) = validate_segment(&snapshot) {
-            return actix_web::HttpResponse::BadRequest().json(serde_json::json!({
-                "ok": false, "error": e,
-            }));
-        }
+        seg
+    };
+    let mut candidate = candidate;
+    candidate.dns.listen_port = body.new_port;
+    if !external.is_empty() {
+        candidate.dns.external_server = Some(external.clone());
+    } else if body.new_port == 53 {
+        // Reverting to :53 without an explicit external_server ==
+        // "back to defaults" — DHCP option 6 should advertise the
+        // router IP again, not the old container IP from when the
+        // LAN was temporarily moved to a non-standard port.
+        candidate.dns.external_server = None;
+    }
+    if let Err(e) = validate_segment(&candidate) {
+        return actix_web::HttpResponse::BadRequest().json(serde_json::json!({
+            "ok": false, "error": e,
+        }));
+    }
+    // Validation passed — commit the change under the write lock. Lock
+    // is dropped before the dhcp::start restart for the same reason as
+    // set_query_log above (don't stall readers on spawn).
+    let updated_lan = {
+        let mut cfg = state.router.config.write().unwrap();
+        match cfg.lans.iter_mut().find(|l| l.id == body.lan_id) {
+            Some(seg) => { *seg = candidate.clone(); }
+            None => return actix_web::HttpResponse::NotFound().json(serde_json::json!({
+                "ok": false, "error": "LAN not found (it was deleted after we validated — retry)",
+            })),
+        };
         if let Err(e) = cfg.save() {
             return actix_web::HttpResponse::InternalServerError().json(serde_json::json!({
                 "ok": false, "error": format!("save: {}", e),
             }));
         }
-        snapshot
+        candidate
     };
     if updated_lan.node_id == crate::agent::self_node_id() {
         if let Err(e) = dhcp::start(&updated_lan) {
