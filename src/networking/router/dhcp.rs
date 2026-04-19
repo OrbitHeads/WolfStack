@@ -75,8 +75,15 @@ pub fn render_config(lan: &LanSegment) -> Result<String, String> {
         ));
         // Default gateway (option 3) = router_ip.
         cfg.push_str(&format!("dhcp-option=3,{}\n", lan.router_ip));
-        // DNS (option 6) = router_ip (we also serve DNS on this LAN).
-        cfg.push_str(&format!("dhcp-option=6,{}\n", lan.router_ip));
+        // DNS (option 6) — where clients should ask for DNS. When
+        // external_server is set (either because mode=External or the
+        // operator moved WolfRouter to a non-standard port), advertise
+        // that; otherwise fall back to router_ip. Save-time validation
+        // in the API stops the footgun where mode=External has no
+        // external_server at all.
+        let dns_opt6 = lan.dns.external_server.clone()
+            .unwrap_or_else(|| lan.router_ip.clone());
+        cfg.push_str(&format!("dhcp-option=6,{}\n", dns_opt6));
 
         // Static reservations.
         for r in &lan.dhcp.reservations {
@@ -94,41 +101,65 @@ pub fn render_config(lan: &LanSegment) -> Result<String, String> {
         }
     }
 
-    // DNS
-    // Cache size: 0 = disabled, otherwise a reasonable 1500.
-    let cache_size = if lan.dns.cache_enabled { 1500 } else { 0 };
-    cfg.push_str(&format!("cache-size={}\n", cache_size));
-    for fwd in &lan.dns.forwarders {
-        cfg.push_str(&format!("server={}\n", fwd));
-    }
-    // EDNS Client Subnet (RFC 7871). When enabled, dnsmasq tags every
-    // outbound forwarded query with the client's /32 (IPv4) or /128
-    // (IPv6). Upstreams that honour ECS — AdGuard Home, NextDNS,
-    // Pi-hole with EDNS enabled — then attribute queries to the real
-    // LAN client instead of to the router. Matters most for AdGuard
-    // running in Docker bridge mode where every query otherwise
-    // appears to come from 172.17.0.1.
-    if lan.dns.forward_client_subnet {
-        cfg.push_str("add-subnet=32,128\n");
-    }
-    for rec in &lan.dns.local_records {
-        // address= gives an A record; host-record= gives A + PTR.
-        cfg.push_str(&format!("host-record={},{}\n", rec.hostname, rec.ip));
-    }
-    // Ad-blocking: use a shared hosts file if available. The file is
-    // maintained separately (phase 4 feature) — for now it's optional.
-    if lan.dns.block_ads && Path::new(ADBLOCK_HOSTS).exists() {
-        cfg.push_str(&format!("addn-hosts={}\n", ADBLOCK_HOSTS));
-    }
-
-    // Query logging — drives the "LAN-side DNS health" diagnostic in
-    // the DNS Tools tab. When on, dnsmasq writes one line per query to
-    // a dedicated per-LAN file (NOT syslog — we don't want to pollute
-    // journald, and reading back is much simpler from a known path).
-    if lan.dns.query_log {
-        let log_path = format!("{}/lan-{}.log", LEASE_DIR, lan.id);
-        cfg.push_str("log-queries\n");
-        cfg.push_str(&format!("log-facility={}\n", log_path));
+    // DNS — behaviour depends on the LAN's DNS mode.
+    //
+    //   External → dnsmasq runs DHCP only. `port=0` tells dnsmasq not
+    //   to bind any DNS listener at all, freeing port 53 on the LAN
+    //   interface so the operator's own DNS server (AdGuard Home in a
+    //   container, Pi-hole on a separate box, etc.) can claim it. We
+    //   still render DHCP options above — option 6 already points at
+    //   external_server so clients resolve there.
+    //
+    //   WolfRouter → dnsmasq answers DNS itself. `port=N` sets the
+    //   listening port (default 53; 5353 is the common "move out of
+    //   the way for AdGuard" value). Forwarders, cache, local
+    //   records, EDNS client subnet, ad-block hosts and query logging
+    //   all apply in this mode only.
+    match lan.dns.mode {
+        DnsMode::External => {
+            cfg.push_str("# DNS disabled: WolfRouter DHCP-only, client DNS via external_server.\n");
+            cfg.push_str("port=0\n");
+        }
+        DnsMode::WolfRouter => {
+            // Explicit port directive so 5353 (or whatever the operator
+            // picked) actually takes effect. Emit the line even at 53 so
+            // the config is self-documenting.
+            cfg.push_str(&format!("port={}\n", lan.dns.listen_port));
+            // Cache size: 0 = disabled, otherwise a reasonable 1500.
+            let cache_size = if lan.dns.cache_enabled { 1500 } else { 0 };
+            cfg.push_str(&format!("cache-size={}\n", cache_size));
+            for fwd in &lan.dns.forwarders {
+                cfg.push_str(&format!("server={}\n", fwd));
+            }
+            // EDNS Client Subnet (RFC 7871). When enabled, dnsmasq tags every
+            // outbound forwarded query with the client's /32 (IPv4) or /128
+            // (IPv6). Upstreams that honour ECS — AdGuard Home, NextDNS,
+            // Pi-hole with EDNS enabled — then attribute queries to the real
+            // LAN client instead of to the router. Matters most for AdGuard
+            // running in Docker bridge mode where every query otherwise
+            // appears to come from 172.17.0.1.
+            if lan.dns.forward_client_subnet {
+                cfg.push_str("add-subnet=32,128\n");
+            }
+            for rec in &lan.dns.local_records {
+                // address= gives an A record; host-record= gives A + PTR.
+                cfg.push_str(&format!("host-record={},{}\n", rec.hostname, rec.ip));
+            }
+            // Ad-blocking: use a shared hosts file if available. The file is
+            // maintained separately (phase 4 feature) — for now it's optional.
+            if lan.dns.block_ads && Path::new(ADBLOCK_HOSTS).exists() {
+                cfg.push_str(&format!("addn-hosts={}\n", ADBLOCK_HOSTS));
+            }
+            // Query logging — drives the "LAN-side DNS health" diagnostic in
+            // the DNS Tools tab. When on, dnsmasq writes one line per query to
+            // a dedicated per-LAN file (NOT syslog — we don't want to pollute
+            // journald, and reading back is much simpler from a known path).
+            if lan.dns.query_log {
+                let log_path = format!("{}/lan-{}.log", LEASE_DIR, lan.id);
+                cfg.push_str("log-queries\n");
+                cfg.push_str(&format!("log-facility={}\n", log_path));
+            }
+        }
     }
 
     fs::write(&path, cfg)

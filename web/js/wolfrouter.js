@@ -1035,7 +1035,45 @@
                             </div>
                             <div id="wr-l-reservations" style="display:flex; flex-direction:column; gap:4px;"></div>
                         </div>
-                        <label style="grid-column:1/-1;">DNS provider
+                        <!-- DNS mode — primary choice. Two paths:
+                               • WolfRouter serves DNS (today's behaviour)
+                               • Use an external DNS server on this LAN
+                                 (AdGuard Home container, Pi-hole on a
+                                 separate box, etc.) — WolfRouter's
+                                 dnsmasq runs DHCP only.
+                             The "advanced" toggle underneath exposes the
+                             low-level listen_port/external_server fields
+                             for operators who want to run BOTH (e.g.
+                             WolfRouter on 5353, AdGuard on 53). -->
+                        <div style="grid-column:1/-1; display:flex; flex-direction:column; gap:4px; padding:10px 12px; background:rgba(59,130,246,0.08); border:1px solid rgba(59,130,246,0.3); border-radius:6px;">
+                            <strong style="font-size:12px; color:#3b82f6;">DNS mode</strong>
+                            <label style="display:flex; gap:8px; align-items:flex-start; font-size:12px;">
+                                <input type="radio" name="wr-l-dns-mode" value="wolf_router" id="wr-l-dns-mode-wolf" checked onchange="wrLanOnDnsModeChange()" style="margin-top:3px;"/>
+                                <div>
+                                    <strong>WolfRouter serves DNS on this LAN</strong>
+                                    <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">dnsmasq answers queries from LAN clients and forwards upstream. The normal case.</div>
+                                </div>
+                            </label>
+                            <label style="display:flex; gap:8px; align-items:flex-start; font-size:12px;">
+                                <input type="radio" name="wr-l-dns-mode" value="external" id="wr-l-dns-mode-ext" onchange="wrLanOnDnsModeChange()" style="margin-top:3px;"/>
+                                <div>
+                                    <strong>Use an external DNS server on this LAN</strong>
+                                    <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">WolfRouter's dnsmasq runs DHCP only (port 53 is freed). DHCP tells clients to use the IP you enter below — typically an AdGuard Home container on this node, or a Pi-hole on a separate box.</div>
+                                </div>
+                            </label>
+                            <label style="display:flex; gap:6px; align-items:center; font-size:12px; margin-top:4px;">
+                                <input type="checkbox" id="wr-l-dns-advanced" onchange="wrLanOnDnsModeChange()"/> Advanced — expose dnsmasq listen port and external DNS IP independently
+                            </label>
+                        </div>
+                        <label id="wr-l-dns-ext-wrap" style="grid-column:1/-1; display:none;">DNS server advertised to clients (DHCP option 6)
+                            <input id="wr-l-dns-ext" class="form-control" placeholder="e.g. 192.168.10.2 (the AdGuard container or Pi-hole IP)"/>
+                            <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">This is what LAN clients will be told to use for DNS. Must be reachable from the LAN.</div>
+                        </label>
+                        <label id="wr-l-dns-port-wrap" style="grid-column:1/-1; display:none;">WolfRouter DNS listen port
+                            <input id="wr-l-dns-port" class="form-control" type="number" min="1" max="65535" value="53" style="max-width:140px;"/>
+                            <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Leave at 53 for the normal case. Set to e.g. 5353 if you want to run a container on port 53 on the same interface while keeping WolfRouter's dnsmasq for DHCP and secondary DNS — then set the DNS server above to the container's IP so DHCP points clients there.</div>
+                        </label>
+                        <label id="wr-l-fwd-wrap" style="grid-column:1/-1;">DNS provider
                             <select id="wr-l-fwd-preset" class="form-control" onchange="wrLanApplyDnsPreset()">${wrDnsPresetOptionsHtml()}</select>
                             <input id="wr-l-fwd" class="form-control" value="1.1.1.1, 1.0.0.1" style="margin-top:4px;" placeholder="comma-separated IPs"/>
                         </label>
@@ -1095,6 +1133,23 @@
         document.getElementById('wr-l-ads').checked = !!l.dns.block_ads;
         document.getElementById('wr-l-ecs').checked = !!l.dns.forward_client_subnet;
 
+        // DNS mode seed. Older LAN records (pre-v18.7.25) have no
+        // `mode` field — default to WolfRouter so existing LANs keep
+        // behaving exactly as before.
+        const dnsMode = l.dns.mode === 'external' ? 'external' : 'wolf_router';
+        const modeRadio = document.querySelector(`input[name=wr-l-dns-mode][value=${dnsMode}]`);
+        if (modeRadio) modeRadio.checked = true;
+        document.getElementById('wr-l-dns-ext').value = l.dns.external_server || '';
+        document.getElementById('wr-l-dns-port').value = l.dns.listen_port || 53;
+        // Advanced toggle defaults on when the stored config diverges
+        // from the simple case (non-53 port, or external_server set in
+        // WolfRouter mode) — otherwise the operator would open the
+        // editor and see fields that don't match what's persisted.
+        const hasNonDefaults = (l.dns.listen_port && l.dns.listen_port !== 53)
+            || (!!l.dns.external_server && dnsMode === 'wolf_router');
+        document.getElementById('wr-l-dns-advanced').checked = hasNonDefaults;
+        wrLanOnDnsModeChange();
+
         // Populate the reservations editor from existing data. Each row
         // is a live DOM block the user can edit; wrSaveLan reads them
         // back when saving.
@@ -1125,6 +1180,34 @@
         container.appendChild(row);
     }
     window.wrLanAddReservationRow = wrLanAddReservationRow;
+
+    // Show/hide the advanced DNS fields based on mode + advanced toggle.
+    //   • mode=External      → external_server visible, port hidden (forced 0 on save)
+    //   • mode=WolfRouter    → port/forwarders visible; external_server hidden unless Advanced is on
+    //   • Advanced on        → both visible in WolfRouter mode (the dual-stack case)
+    function wrLanOnDnsModeChange() {
+        const mode = document.querySelector('input[name=wr-l-dns-mode]:checked')?.value || 'wolf_router';
+        const advanced = document.getElementById('wr-l-dns-advanced')?.checked;
+        const extWrap  = document.getElementById('wr-l-dns-ext-wrap');
+        const portWrap = document.getElementById('wr-l-dns-port-wrap');
+        const fwdWrap  = document.getElementById('wr-l-fwd-wrap');
+        if (!extWrap || !portWrap || !fwdWrap) return;
+        if (mode === 'external') {
+            // External DNS — clients need the IP; forwarders/port don't
+            // apply because WolfRouter's dnsmasq is DHCP-only here.
+            extWrap.style.display  = '';
+            portWrap.style.display = 'none';
+            fwdWrap.style.display  = 'none';
+        } else {
+            // WolfRouter serves DNS. Advanced toggle reveals the
+            // low-level knobs for the dual-stack (WolfRouter on 5353,
+            // external resolver on 53) case.
+            extWrap.style.display  = advanced ? '' : 'none';
+            portWrap.style.display = advanced ? '' : 'none';
+            fwdWrap.style.display  = '';
+        }
+    }
+    window.wrLanOnDnsModeChange = wrLanOnDnsModeChange;
 
     // Fill the forwarders text input from the selected preset. "custom"
     // leaves whatever the user has typed so they don't lose their work.
@@ -1249,7 +1332,24 @@
             reservations,
             extra_options: lan.dhcp?.extra_options || [],
         });
+        const dnsMode = document.querySelector('input[name=wr-l-dns-mode]:checked')?.value || 'wolf_router';
+        const listenPort = parseInt(document.getElementById('wr-l-dns-port')?.value || '53', 10) || 53;
+        const extServerRaw = (document.getElementById('wr-l-dns-ext')?.value || '').trim();
+        // External DNS mode needs an IP to advertise; catch it here so
+        // the user sees the error in the form instead of a 400 from the
+        // backend after they've clicked Save.
+        if (dnsMode === 'external' && !extServerRaw) {
+            say('❌', 'External DNS mode needs the DNS server IP (field just above). Save aborted.', '#ef4444');
+            unlock(); return;
+        }
+        if (dnsMode === 'wolf_router' && listenPort !== 53 && !extServerRaw) {
+            say('❌', 'Listen port isn\'t 53, so clients need another DNS IP to use — fill in the "DNS server advertised to clients" field (Advanced section). Save aborted.', '#ef4444');
+            unlock(); return;
+        }
         lan.dns = Object.assign(lan.dns || {}, {
+            mode: dnsMode,
+            listen_port: listenPort,
+            external_server: extServerRaw || null,
             forwarders: document.getElementById('wr-l-fwd').value.split(',').map(s => s.trim()).filter(Boolean),
             local_records: lan.dns?.local_records || [],
             cache_enabled: true,
@@ -5080,7 +5180,50 @@
         const lanOpts = (wrState.lans || []).map(l =>
             `<option value="${escHtml(l.id)}">${escHtml(l.name)} — ${escHtml(l.interface)} (${escHtml(l.subnet_cidr)})</option>`).join('');
 
+        // Node picker for the per-node panels (host-DNS + deps check).
+        // Build from the LANs that actually have a node_id, falling
+        // back to the cluster's topology nodes so even a fresh cluster
+        // with no LANs defined yet still gets a usable selector.
+        const _lanNodes = new Map();
+        for (const l of (wrState.lans || [])) {
+            if (l.node_id) _lanNodes.set(l.node_id, l.node_id);
+        }
+        for (const n of (wrState.topology?.nodes || [])) {
+            if (n.node_id && !_lanNodes.has(n.node_id)) {
+                _lanNodes.set(n.node_id, n.node_name || n.node_id);
+            }
+        }
+        // If a LAN contributed an ID but topology has the nicer name, prefer the name.
+        for (const n of (wrState.topology?.nodes || [])) {
+            if (n.node_id && _lanNodes.has(n.node_id)) _lanNodes.set(n.node_id, n.node_name || n.node_id);
+        }
+        const nodeOpts = Array.from(_lanNodes.entries())
+            .map(([id, name]) => `<option value="${escHtml(id)}">${escHtml(name)}</option>`).join('');
+
         root.innerHTML = `
+            <!-- PER-NODE scope picker. Host DNS / deps are node-local;
+                 we surface the choice explicitly so operators on a
+                 multi-node cluster know exactly which box they're
+                 inspecting. Defaults to the first LAN's node so the
+                 common "one LAN on one node" case needs zero clicks. -->
+            <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px; padding:8px 12px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:6px;">
+                <strong style="font-size:12px;">Node:</strong>
+                <select id="wr-tools-node" class="form-control" style="max-width:280px; font-size:12px;" onchange="wrToolsOnNodeChange()">${nodeOpts || '<option value="">(no nodes)</option>'}</select>
+                <span style="font-size:11px; color:var(--text-muted);">Host DNS + dependency checks below run against this node.</span>
+            </div>
+
+            <!-- DEPENDENCY CHECK — lists what's installed / missing on
+                 the selected node, shows the exact pkg-mgr command we
+                 would run, lets the operator click Install or copy it
+                 to run by hand. Distro-aware (apt/dnf/pacman/apk/zypper). -->
+            <div id="wr-deps-card" style="padding:14px; border:1px solid rgba(34,197,94,0.35); border-radius:8px; background:rgba(34,197,94,0.06); margin-bottom:16px;">
+                <div style="display:flex; align-items:baseline; gap:8px; margin-bottom:6px;">
+                    <strong style="font-size:14px; color:#22c55e;">📦 DNS tooling on this node</strong>
+                    <span style="font-size:11px; color:var(--text-muted);">— what's installed vs. what we need, with a one-click installer matched to your distro</span>
+                </div>
+                <div id="wr-deps-body" style="font-size:12px; color:var(--text-muted);">Checking…</div>
+            </div>
+
             <!-- HOST DNS RESOLVER — who owns port 53 on this node,
                  release it to a containerised resolver, restore when
                  done. One-click alternative to editing resolved.conf
@@ -5177,22 +5320,54 @@
             wrLSideStartAutoRefresh();
         }
 
-        // Load the host-DNS panel. Runs against the currently-selected
-        // node via wrUrl so operators can flip between nodes and see
-        // each one's local resolver state.
+        // Pre-select the first node (or whatever the operator had
+        // selected previously, preserved across re-renders).
+        const nodeSel = document.getElementById('wr-tools-node');
+        if (nodeSel) {
+            if (wrState.toolsNodeId && Array.from(nodeSel.options).some(o => o.value === wrState.toolsNodeId)) {
+                nodeSel.value = wrState.toolsNodeId;
+            } else if (nodeSel.options.length) {
+                wrState.toolsNodeId = nodeSel.value;
+            }
+        }
+
+        // Load host-DNS + deps for the selected node. Both are strictly
+        // node-local — we use wrNodeUrl so remote nodes go through the
+        // /api/nodes/{id}/proxy route instead of querying the dashboard
+        // node by mistake.
         wrHostDnsRefresh();
+        wrDepsRefresh();
     }
 
+    /// Selected node for the DNS Tools per-node panels. Memoised on
+    /// wrState so switching tabs and coming back preserves the choice.
+    function wrToolsSelectedNodeId() {
+        const sel = document.getElementById('wr-tools-node');
+        return sel?.value || wrState.toolsNodeId || '';
+    }
+
+    /// Handler on the node-picker — refresh both panels against the
+    /// newly-selected node.
+    function wrToolsOnNodeChange() {
+        wrState.toolsNodeId = wrToolsSelectedNodeId();
+        wrHostDnsRefresh();
+        wrDepsRefresh();
+    }
+    window.wrToolsOnNodeChange = wrToolsOnNodeChange;
+
     /// Fetch /api/router/host-dns and render the card. Called on DNS
-    /// Tools tab load and after each Release/Restore action so the
-    /// panel reflects reality instead of stale state.
+    /// Tools tab load, after each Release/Restore, and when the node
+    /// picker changes. Uses wrNodeUrl so the call lands on the node
+    /// the operator actually picked, not the dashboard host.
     async function wrHostDnsRefresh() {
         const body = document.getElementById('wr-host-dns-body');
         if (!body) return;
         body.innerHTML = 'Checking what owns port 53 on this node…';
+        const nodeId = wrToolsSelectedNodeId();
+        const url = await wrNodeUrl(nodeId, '/api/router/host-dns');
         let status;
         try {
-            const r = await fetch(wrUrl('/api/router/host-dns'));
+            const r = await fetch(url);
             if (!r.ok) {
                 body.innerHTML = `<span style="color:#ef4444;">Status check failed: HTTP ${r.status}</span>`;
                 return;
@@ -5243,15 +5418,18 @@
     window.wrHostDnsRefresh = wrHostDnsRefresh;
 
     /// Disable systemd-resolved's stub listener and redirect
-    /// /etc/resolv.conf at the chosen upstream, then re-poll status.
+    /// /etc/resolv.conf at the chosen upstream on the currently
+    /// selected node, then re-poll status.
     async function wrHostDnsRelease() {
         const input = document.getElementById('wr-host-dns-upstream');
         const upstream = (input?.value || '').trim() || '1.1.1.1';
         const out = document.getElementById('wr-host-dns-result');
+        const nodeId = wrToolsSelectedNodeId();
+        const url = await wrNodeUrl(nodeId, '/api/router/host-dns/release');
         if (!(await showConfirm(`Disable systemd-resolved's stub listener on this node and point host DNS at ${upstream}? This is undoable via Restore.`))) return;
         if (out) out.innerHTML = '<span style="color:var(--text-muted);">Applying…</span>';
         try {
-            const r = await fetch(wrUrl('/api/router/host-dns/release'), {
+            const r = await fetch(url, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ upstream }),
             });
@@ -5268,14 +5446,16 @@
     }
     window.wrHostDnsRelease = wrHostDnsRelease;
 
-    /// Undo a prior Release: delete the drop-in, restore the saved
-    /// /etc/resolv.conf, restart systemd-resolved.
+    /// Undo a prior Release on the selected node: delete the drop-in,
+    /// restore the saved /etc/resolv.conf, restart systemd-resolved.
     async function wrHostDnsRestore() {
         const out = document.getElementById('wr-host-dns-result');
+        const nodeId = wrToolsSelectedNodeId();
+        const url = await wrNodeUrl(nodeId, '/api/router/host-dns/restore');
         if (!(await showConfirm('Restore the host DNS resolver? systemd-resolved\'s stub listener will come back on 127.0.0.53:53 — any containerised resolver currently bound to port 53 on this host will need to be stopped first.'))) return;
         if (out) out.innerHTML = '<span style="color:var(--text-muted);">Restoring…</span>';
         try {
-            const r = await fetch(wrUrl('/api/router/host-dns/restore'), { method: 'POST' });
+            const r = await fetch(url, { method: 'POST' });
             const data = await r.json().catch(() => ({}));
             if (!r.ok || data.ok === false) {
                 if (out) out.innerHTML = `<span style="color:#ef4444;">Failed: ${escHtml(data.error || ('HTTP ' + r.status))}</span>`;
@@ -5288,6 +5468,137 @@
         setTimeout(wrHostDnsRefresh, 400);
     }
     window.wrHostDnsRestore = wrHostDnsRestore;
+
+    // ─── Dependency check / install (distro-aware, per-node) ────────
+    //
+    // `/api/system/deps/check?group=dns` tells us what's installed on
+    // the selected node, what's missing, and the exact command we'd
+    // run on its package manager. The operator always gets a choice:
+    // click Install to run it directly, or copy the command and run
+    // it by hand via their own sudo/terminal. We never silently run
+    // anything — install needs an explicit click.
+
+    async function wrDepsRefresh() {
+        const body = document.getElementById('wr-deps-body');
+        if (!body) return;
+        body.innerHTML = 'Checking installed tools on this node…';
+        const nodeId = wrToolsSelectedNodeId();
+        const url = await wrNodeUrl(nodeId, '/api/system/deps/check?group=dns');
+        let data;
+        try {
+            const r = await fetch(url);
+            if (!r.ok) {
+                body.innerHTML = `<span style="color:#ef4444;">Dependency check failed: HTTP ${r.status}</span>`;
+                return;
+            }
+            data = await r.json();
+        } catch (e) {
+            body.innerHTML = `<span style="color:#ef4444;">Dependency check errored: ${escHtml(e.message || String(e))}</span>`;
+            return;
+        }
+
+        const depRows = (data.deps || []).map(d => {
+            const mark = d.installed
+                ? '<span style="color:#22c55e;">✓ installed</span>'
+                : (d.package
+                    ? '<span style="color:#f59e0b;">◯ missing</span>'
+                    : '<span style="color:var(--text-muted);">— not packaged on this distro</span>');
+            const pkg = d.package ? `<code>${escHtml(d.package)}</code>` : '<span style="color:var(--text-muted);">n/a</span>';
+            const where = d.found_binaries?.length
+                ? `<span style="color:var(--text-muted);">at <code>${escHtml(d.found_binaries[0])}</code></span>`
+                : '';
+            return `
+                <tr>
+                    <td style="padding:4px 8px;">${escHtml(d.label)}</td>
+                    <td style="padding:4px 8px;">${pkg}</td>
+                    <td style="padding:4px 8px;">${mark} ${where}</td>
+                </tr>
+                <tr><td colspan="3" style="padding:0 8px 8px 8px; font-size:11px; color:var(--text-muted);">${escHtml(d.rationale || '')}</td></tr>
+            `;
+        }).join('');
+
+        const missingAny = (data.deps || []).some(d => !d.installed && !!d.package);
+        const cmd = data.install_cmd || '';
+        body.innerHTML = `
+            <div style="font-size:11px; color:var(--text-muted); margin-bottom:8px;">
+                Distro: <strong>${escHtml(data.distro)}</strong> · Package manager: <strong>${escHtml(data.pkg_mgr)}</strong> ${data.is_root ? '' : '<span style="color:#f59e0b;">· not running as root — install will refuse, copy the command and run it via sudo instead</span>'}
+            </div>
+            <table style="width:100%; border-collapse:collapse; font-size:12px; margin-bottom:8px;">
+                <thead><tr style="color:var(--text-muted); text-align:left;">
+                    <th style="padding:4px 8px; font-weight:500;">Tool</th>
+                    <th style="padding:4px 8px; font-weight:500;">Package</th>
+                    <th style="padding:4px 8px; font-weight:500;">Status</th>
+                </tr></thead>
+                <tbody>${depRows}</tbody>
+            </table>
+            ${missingAny ? `
+                <div style="font-size:11px; color:var(--text-muted); margin-bottom:4px;">Command we'd run on your behalf:</div>
+                <pre style="font-family:var(--font-mono); font-size:11px; background:var(--bg-secondary); padding:8px; border-radius:4px; margin:0 0 8px 0; white-space:pre-wrap; overflow-x:auto;">${escHtml(cmd)}</pre>
+                <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                    <button class="btn btn-sm btn-primary" onclick="wrDepsInstall()" ${data.is_root ? '' : 'disabled title="Install needs root — copy the command and run it manually."'}>Install on this node</button>
+                    <button class="btn btn-sm" onclick="wrDepsCopy()">📋 Copy command</button>
+                    <button class="btn btn-sm" onclick="wrDepsRefresh()">🔄 Refresh</button>
+                </div>
+                <div id="wr-deps-result" style="font-size:12px; margin-top:10px;"></div>
+            ` : `
+                <div style="color:#22c55e; font-size:12px;">All DNS-area tooling is already installed on this node.</div>
+                <div style="margin-top:6px;"><button class="btn btn-sm" onclick="wrDepsRefresh()">🔄 Refresh</button></div>
+            `}
+        `;
+        // Stash the command on the card so copy button can grab it
+        // without re-fetching / re-parsing.
+        const card = document.getElementById('wr-deps-card');
+        if (card) card.dataset.installCmd = cmd;
+    }
+    window.wrDepsRefresh = wrDepsRefresh;
+
+    async function wrDepsInstall() {
+        const out = document.getElementById('wr-deps-result');
+        const nodeId = wrToolsSelectedNodeId();
+        const url = await wrNodeUrl(nodeId, '/api/system/deps/install');
+        if (!(await showConfirm('Run the package-manager install on this node now? WolfStack will execute the command shown above as root.'))) return;
+        if (out) out.innerHTML = '<span style="color:var(--text-muted);">Installing… (first run can take 30-60 s while the package index refreshes)</span>';
+        try {
+            const r = await fetch(url, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ group: 'dns' }),
+            });
+            const data = await r.json().catch(() => ({}));
+            if (!r.ok) {
+                if (out) out.innerHTML = `<span style="color:#ef4444;">Install failed: ${escHtml(data.error || ('HTTP ' + r.status))}</span>`;
+                return;
+            }
+            const ok = (data.exit_code || 0) === 0;
+            if (out) {
+                out.innerHTML = `
+                    <div style="color:${ok ? '#22c55e' : '#ef4444'}; margin-bottom:4px;">
+                        ${ok ? '✅ Install finished (exit 0).' : `❌ Install exited with code ${escHtml(String(data.exit_code))}.`}
+                    </div>
+                    <details ${ok ? '' : 'open'}><summary style="cursor:pointer; font-size:11px; color:var(--text-muted);">package manager output</summary>
+                        <pre style="font-family:var(--font-mono); font-size:11px; background:var(--bg-secondary); padding:8px; border-radius:4px; max-height:280px; overflow:auto; white-space:pre-wrap; margin:6px 0 0 0;">${escHtml(data.output || '(no output)')}</pre>
+                    </details>
+                `;
+            }
+        } catch (e) {
+            if (out) out.innerHTML = `<span style="color:#ef4444;">Install errored: ${escHtml(e.message || String(e))}</span>`;
+        }
+        setTimeout(wrDepsRefresh, 400);
+    }
+    window.wrDepsInstall = wrDepsInstall;
+
+    function wrDepsCopy() {
+        const card = document.getElementById('wr-deps-card');
+        const cmd = card?.dataset?.installCmd || '';
+        if (!cmd) return;
+        navigator.clipboard?.writeText(cmd).then(() => {
+            const out = document.getElementById('wr-deps-result');
+            if (out) out.innerHTML = '<span style="color:#10b981;">Command copied. Paste into a terminal with sudo if needed.</span>';
+        }).catch(() => {
+            // Fallback for older browsers that don't grant clipboard access.
+            window.prompt('Copy this command:', cmd);
+        });
+    }
+    window.wrDepsCopy = wrDepsCopy;
 
     // ─── LAN-side diagnostics helpers ─────────────────────────────
 

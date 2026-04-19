@@ -18532,12 +18532,60 @@ pub async fn integrations_delete(
     }
 }
 
+// ─── System deps (check/install, distro-aware) ───────────────────────
+
+#[derive(serde::Deserialize)]
+struct DepsCheckQuery { group: Option<String> }
+
+/// GET /api/system/deps/check?group=dns — report which deps are
+/// missing on THIS node. Each node answers for its own OS; cross-node
+/// calls go via the existing /api/nodes/{id}/proxy/... route.
+async fn system_deps_check(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    q: web::Query<DepsCheckQuery>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let group = q.group.clone().unwrap_or_else(|| "dns".into());
+    let res = tokio::task::spawn_blocking(move || crate::deps::check(&group)).await;
+    match res {
+        Ok(Ok(r)) => HttpResponse::Ok().json(r),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct DepsInstallRequest { group: Option<String> }
+
+/// POST /api/system/deps/install — install everything missing for the
+/// requested group. Returns the exact command run and its combined
+/// stdout/stderr so the UI can show what happened.
+async fn system_deps_install(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<DepsInstallRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let group = body.group.clone().unwrap_or_else(|| "dns".into());
+    let res = tokio::task::spawn_blocking(move || crate::deps::install(&group)).await;
+    match res {
+        Ok(Ok(r)) => HttpResponse::Ok().json(r),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
 /// Configure all API routes
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg
         .configure(crate::vms::api::config)
         .configure(crate::tui::configure)
         .configure(crate::networking::router::api::configure)
+        // Distro-aware dep checks + installs. Cross-cutting — WolfRouter
+        // is the first consumer, more groups (VMs, WolfNet) added later.
+        .route("/api/system/deps/check",   web::get().to(system_deps_check))
+        .route("/api/system/deps/install", web::post().to(system_deps_install))
         // Auth (no auth required)
         .route("/api/auth/login", web::post().to(login))
         .route("/api/auth/logout", web::post().to(logout))

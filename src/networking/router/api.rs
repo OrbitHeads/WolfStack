@@ -280,6 +280,53 @@ fn validate_segment(seg: &LanSegment) -> Result<(), String> {
         check(&format!("local_records[{}].hostname", i), &rec.hostname)?;
         check(&format!("local_records[{}].ip", i), &rec.ip)?;
     }
+    // DNS mode / port / external_server sanity. The renderer falls back
+    // to router_ip for DHCP option 6 when external_server is missing,
+    // so "mode=External, no external_server" would silently advertise
+    // the router that's no longer answering DNS — a footgun worth
+    // blocking up-front.
+    if let Some(ext) = &seg.dns.external_server {
+        check("dns.external_server", ext)?;
+        if ext.contains(',') {
+            return Err("dns.external_server contains comma".into());
+        }
+    }
+    match seg.dns.mode {
+        DnsMode::External => {
+            if seg.dns.external_server.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                return Err(
+                    "DNS mode 'External' needs an external_server IP (the \
+                     DNS box clients should use — AdGuard Home, Pi-hole, etc.)"
+                        .into(),
+                );
+            }
+        }
+        DnsMode::WolfRouter => {
+            // Anything outside 1..=65535 would render as an invalid
+            // dnsmasq port= directive and crash startup.
+            if seg.dns.listen_port == 0 {
+                return Err(
+                    "DNS mode 'WolfRouter' needs a listen_port between 1 and 65535 \
+                     (use mode 'External' if you want DNS off entirely)"
+                        .into(),
+                );
+            }
+            // Non-53 port with no external_server means DHCP clients
+            // will be told "use router_ip on port 53" — which is not
+            // listening. Force the operator to pick a real DNS IP.
+            if seg.dns.listen_port != 53
+                && seg.dns.external_server.as_deref().map(str::trim).unwrap_or("").is_empty()
+            {
+                return Err(
+                    "When listen_port isn't 53, external_server must be set so \
+                     DHCP can advertise a DNS server clients can reach on the \
+                     standard port. (WolfRouter's own DNS would be on a \
+                     non-standard port that DHCP option 6 can't signal.)"
+                        .into(),
+                );
+            }
+        }
+    }
     // Interface name must be a syntactically plausible Linux iface name
     // (alnum, dash, dot, underscore — no shell metacharacters).
     if !seg.interface.chars().all(|c| c.is_ascii_alphanumeric() || "-._".contains(c)) {

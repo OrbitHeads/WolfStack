@@ -379,15 +379,27 @@ fn classify_resolver(owner: &Option<String>, stub: bool) -> String {
 
 /// Does WolfRouter itself serve a LAN on this node via dnsmasq? If
 /// yes, releasing port 53 would break our own DNS — the UI warns.
+///
+/// WolfRouter spawns dnsmasq as a plain process (see dhcp::start)
+/// with a per-LAN pid file under /run/wolfstack-router/. The
+/// presence of any live pid-file (with a matching running process)
+/// tells us WolfRouter is the one holding port 53 — more reliable
+/// than searching systemd units, which WolfRouter doesn't install.
 fn wolfrouter_dnsmasq_running() -> bool {
-    // The per-LAN units are named `wolfstack-dnsmasq-lan-<id>.service`
-    // (see dhcp::start_for_lan). If any is active, we own port 53 on
-    // at least one interface.
-    Command::new("systemctl")
-        .args(["list-units", "--type=service", "--state=active", "--no-legend", "wolfstack-dnsmasq-*"])
-        .output()
-        .map(|o| !o.stdout.is_empty())
-        .unwrap_or(false)
+    let dir = std::path::Path::new("/run/wolfstack-router");
+    let Ok(entries) = std::fs::read_dir(dir) else { return false; };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(s) = name.to_str() else { continue; };
+        if !(s.starts_with("lan-") && s.ends_with(".pid")) { continue; }
+        let Ok(pid_str) = std::fs::read_to_string(e.path()) else { continue; };
+        let Ok(pid) = pid_str.trim().parse::<i32>() else { continue; };
+        // /proc/<pid> existing is the cheapest "process alive?" probe.
+        if std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+            return true;
+        }
+    }
+    false
 }
 
 fn read_resolv_conf_servers() -> Vec<String> {

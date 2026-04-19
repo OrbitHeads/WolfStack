@@ -46,6 +46,7 @@ mod wolfnote;
 mod wolfusb;
 mod paths;
 mod ports;
+mod deps;
 mod systemcheck;
 mod security;
 mod services_discovery;

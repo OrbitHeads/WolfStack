@@ -118,10 +118,50 @@ pub struct DhcpReservation {
     pub hostname: Option<String>,
 }
 
+/// Who actually serves DNS on this LAN. Default is WolfRouter's own
+/// dnsmasq (the existing behaviour). `External` means the operator is
+/// running their own DNS box on the LAN (AdGuard Home in a container,
+/// Pi-hole on a Pi, etc.) and just wants WolfRouter's DHCP to point
+/// clients there.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsMode {
+    /// WolfRouter's dnsmasq binds port `listen_port` on the LAN
+    /// interface and DHCP option 6 advertises the router IP.
+    WolfRouter,
+    /// WolfRouter's dnsmasq runs DHCP only (port=0 = DNS off) and DHCP
+    /// option 6 advertises `external_server` to clients.
+    External,
+}
+
+impl Default for DnsMode {
+    fn default() -> Self { DnsMode::WolfRouter }
+}
+
 /// DNS resolver config for one LAN. dnsmasq handles both DHCP and DNS,
 /// so this is applied to the same per-LAN instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsServerConfig {
+    /// How DNS is served on this LAN. `WolfRouter` (default) = dnsmasq
+    /// answers on port 53; `External` = dnsmasq yields port 53 and
+    /// DHCP points clients at the operator's DNS server.
+    #[serde(default)]
+    pub mode: DnsMode,
+    /// Port dnsmasq binds for DNS on this LAN's interface when
+    /// `mode = WolfRouter`. Default 53. Moving this to 5353 lets a
+    /// containerised resolver (AdGuard Home, etc.) claim port 53 on
+    /// the same interface — in that case set `external_server` too so
+    /// DHCP option 6 still advertises a resolver clients can actually
+    /// reach on the standard port. Ignored when `mode = External`
+    /// (DNS is disabled there via `port=0`).
+    #[serde(default = "default_dns_port")]
+    pub listen_port: u16,
+    /// DNS server advertised to DHCP clients (option 6). Required when
+    /// `mode = External`. Optional when `mode = WolfRouter`: if set,
+    /// takes precedence over the router IP (useful when `listen_port`
+    /// isn't 53).
+    #[serde(default)]
+    pub external_server: Option<String>,
     /// Upstream forwarders. If empty, falls back to host's /etc/resolv.conf.
     #[serde(default)]
     pub forwarders: Vec<String>,
@@ -154,9 +194,14 @@ pub struct DnsServerConfig {
     pub forward_client_subnet: bool,
 }
 
+fn default_dns_port() -> u16 { 53 }
+
 impl Default for DnsServerConfig {
     fn default() -> Self {
         DnsServerConfig {
+            mode: DnsMode::WolfRouter,
+            listen_port: 53,
+            external_server: None,
             forwarders: vec!["1.1.1.1".into(), "9.9.9.9".into()],
             local_records: vec![],
             cache_enabled: true,
