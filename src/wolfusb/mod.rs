@@ -1033,7 +1033,7 @@ pub struct ReattachStep {
 ///
 /// Returns a vector of steps so the UI can show what succeeded and
 /// where the chain broke.
-pub fn reattach_local(busid: &str) -> Vec<ReattachStep> {
+pub fn reattach_local(busid: &str, source_bus_addr: Option<(u8, u8)>) -> Vec<ReattachStep> {
     let mut out = Vec::new();
     let config = WolfUsbConfig::load();
     let Some(a) = config.assignments.iter().find(|a| a.busid == busid).cloned() else {
@@ -1103,7 +1103,7 @@ pub fn reattach_local(busid: &str) -> Vec<ReattachStep> {
     // will silently fail. The API layer (not this function) is in
     // charge of calling source's prepare-for-export endpoint first
     // — we just assume that happened and try to attach.
-    match attach_and_passthrough(&a.source_address, busid, &a.target_type, &a.target_name) {
+    match attach_and_passthrough(&a.source_address, busid, &a.target_type, &a.target_name, source_bus_addr) {
         Ok(m) => out.push(ReattachStep {
             step: "Attach + passthrough".into(),
             ok: true,
@@ -1116,6 +1116,17 @@ pub fn reattach_local(busid: &str) -> Vec<ReattachStep> {
         }),
     }
     out
+}
+
+/// Look up (bus, addr) for a busid in the LOCAL sysfs. Used by the
+/// API layer on the SOURCE node when answering a prepare-for-export
+/// call from a cross-node target — the target needs these numbers to
+/// build a valid `wolfusb mount --bus N --addr M` command, but it
+/// can't look them up itself because the device only exists on the
+/// source's bus. Wrapper around the private busid_to_bus_addr so
+/// callers outside this module don't reach into sysfs directly.
+pub fn bus_addr_for(busid: &str) -> Option<(u8, u8)> {
+    busid_to_bus_addr(busid)
 }
 
 /// Prepare the LOCAL node to export a USB device via usbip. Called on
@@ -1421,14 +1432,18 @@ pub fn attach_and_passthrough(
     busid: &str,
     target_type: &str,
     target_name: &str,
+    source_bus_addr: Option<(u8, u8)>,
 ) -> Result<String, String> {
     // Snapshot existing USB devices so we can detect the new virtual one
     let before = lsusb_snapshot();
 
     // Start `wolfusb mount` as a long-lived systemd unit so it survives
-    // wolfstack restarts and gets auto-restart on failure.
+    // wolfstack restarts and gets auto-restart on failure. For cross-
+    // node attach the caller passes the SOURCE's bus+addr (looked up
+    // via the source's prepare-for-export API) — the target's sysfs
+    // doesn't have the device yet so a local lookup would fail.
     let unit_name = format!("wolfusb-mount@{}-{}.service", busid.replace('-', "_"), target_name);
-    install_mount_unit(&unit_name, source_address, busid)?;
+    install_mount_unit(&unit_name, source_address, busid, source_bus_addr)?;
 
     let _ = Command::new("systemctl").args(["daemon-reload"]).status();
     // `enable` so the mount auto-starts on reboot without needing wolfstack
@@ -1520,15 +1535,27 @@ fn find_new_device(before: &[String]) -> Option<String> {
     after.into_iter().find(|p| !before.contains(p))
 }
 
-/// Install a systemd unit for `wolfusb mount` so it runs as a supervised daemon
-fn install_mount_unit(unit_name: &str, source_address: &str, busid: &str) -> Result<(), String> {
-    // Resolve the busid to the device's current bus+addr via sysfs. NOTE:
-    // these are NOT stable across replugs; if the device is unplugged and
-    // reconnected, the mount unit will be stale and Re-attach should be run
-    // to regenerate it. Long-term fix is to teach wolfusb mount to take a
-    // port path directly so this hardcoded numeric pair goes away.
-    let (bus, addr) = busid_to_bus_addr(busid)
-        .ok_or_else(|| format!("busid {} is not currently attached on this host — replug and retry", busid))?;
+/// Install a systemd unit for `wolfusb mount` so it runs as a supervised daemon.
+/// `explicit_bus_addr`, when provided, bypasses the local sysfs lookup —
+/// callers use this for cross-node attach where the device only exists
+/// on the source's bus, not the target's. When None we fall back to a
+/// local sysfs lookup (same-node passthrough, or a re-attach the target
+/// has previously completed and still has a vhci entry for).
+fn install_mount_unit(
+    unit_name: &str, source_address: &str, busid: &str,
+    explicit_bus_addr: Option<(u8, u8)>,
+) -> Result<(), String> {
+    // Resolve the busid to the device's current bus+addr. NOTE: these
+    // are NOT stable across replugs; if the device is unplugged and
+    // reconnected, the mount unit will be stale and Re-attach should
+    // be run to regenerate it. Long-term fix is to teach wolfusb mount
+    // to take a port path directly so this hardcoded numeric pair goes
+    // away entirely.
+    let (bus, addr) = match explicit_bus_addr {
+        Some(pair) => pair,
+        None => busid_to_bus_addr(busid)
+            .ok_or_else(|| format!("busid {} is not currently attached on this host — replug and retry", busid))?,
+    };
     let secret = get_secret();
     let unit_path = format!("/etc/systemd/system/{}", unit_name);
     let key_arg = if secret.is_empty() {
@@ -2307,7 +2334,15 @@ pub fn restore_assignments(self_node_id: &str) {
     for a in &config.assignments {
         // Target side: re-attach remote devices for containers on this node
         if a.target_node_id == self_node_id && a.source_node_id != self_node_id {
-            match attach_and_passthrough(&a.source_address, &a.busid, &a.target_type, &a.target_name) {
+            // Boot-time restore runs from sync code and can't make an
+            // HTTP round-trip to the source for bus+addr. We rely on
+            // the existing mount unit (still installed on disk from
+            // the previous attach) — attach_and_passthrough with
+            // explicit=None falls back to local sysfs which works for
+            // a vhci device left over from the last boot. If the device
+            // was physically replugged between reboots the operator
+            // will see it appear in the Re-attach dialog.
+            match attach_and_passthrough(&a.source_address, &a.busid, &a.target_type, &a.target_name, None) {
                 Ok(msg) => info!("WolfUSB: restored {} — {}", a.busid, msg),
                 Err(e) => warn!("WolfUSB: failed to restore {}: {}", a.busid, e),
             }
@@ -2336,7 +2371,13 @@ pub fn on_container_started(container_name: &str, container_type: &str, self_nod
 
         if a.source_node_id != self_node_id {
             if !a.source_address.is_empty() {
-                match attach_and_passthrough(&a.source_address, &a.busid, &a.target_type, &a.target_name) {
+                // Container-restart restore — same constraint as the
+                // boot-time path: we can't easily do an async HTTP
+                // round-trip to the source from this sync event hook,
+                // so fall back to the local sysfs lookup. The operator
+                // can use Re-attach (which DOES query the source) if
+                // the local fallback comes up empty.
+                match attach_and_passthrough(&a.source_address, &a.busid, &a.target_type, &a.target_name, None) {
                     Ok(msg) => info!("WolfUSB: restored {} for {} — {}", a.busid, container_name, msg),
                     Err(e) => warn!("WolfUSB: failed to restore {} for {}: {}", a.busid, container_name, e),
                 }

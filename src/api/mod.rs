@@ -11031,17 +11031,29 @@ pub async fn wolfusb_assign(req: HttpRequest, state: web::Data<AppState>, body: 
                 // Case 3: we're the target and the source is elsewhere. Run
                 // attach_and_passthrough locally so the wolfusb-mount@ unit
                 // gets installed, enabled, started, and the device gets
-                // passed into the LXC/Docker/VM target.
+                // passed into the LXC/Docker/VM target. Query the source
+                // for its (bus, addr) first — the target doesn't have the
+                // physical device on its own sysfs, so a local lookup
+                // would return None and the install_mount_unit step would
+                // fail with "not currently attached on this host".
                 let src_addr = effective_address.clone();
                 let busid_s = busid.to_string();
                 let target_type_s = target_type.to_string();
                 let target_name_s = target_name.to_string();
-                tokio::task::spawn_blocking(move || {
-                    match crate::wolfusb::attach_and_passthrough(
-                        &src_addr, &busid_s, &target_type_s, &target_name_s,
-                    ) {
-                        Ok(m) => tracing::info!("WolfUSB: local attach done — {}", m),
-                        Err(e) => tracing::warn!("WolfUSB: local attach failed — {}", e),
+                let secret = state.cluster_secret.clone();
+                tokio::spawn(async move {
+                    let sba = query_source_bus_addr(&src_addr, &busid_s, &secret).await;
+                    let src_addr_c = src_addr.clone();
+                    let busid_c = busid_s.clone();
+                    let tt = target_type_s.clone();
+                    let tn = target_name_s.clone();
+                    let res = tokio::task::spawn_blocking(move || {
+                        crate::wolfusb::attach_and_passthrough(&src_addr_c, &busid_c, &tt, &tn, sba)
+                    }).await;
+                    match res {
+                        Ok(Ok(m)) => tracing::info!("WolfUSB: local attach done — {}", m),
+                        Ok(Err(e)) => tracing::warn!("WolfUSB: local attach failed — {}", e),
+                        Err(e) => tracing::warn!("WolfUSB: attach task join error — {}", e),
                     }
                 });
             } else if !is_local_target && !target_node_id.is_empty() {
@@ -11115,23 +11127,64 @@ pub async fn wolfusb_sync(req: HttpRequest, state: web::Data<AppState>, body: we
     HttpResponse::Ok().json(serde_json::json!({ "ok": true }))
 }
 
-/// POST /api/wolfusb/attach — attach a remote USB device and pass into container (called on target node)
+/// POST /api/wolfusb/attach — attach a remote USB device and pass into container (called on target node).
+/// Queries the SOURCE's `/api/wolfusb/prepare-for-export` first so it
+/// can learn the source-side (bus, addr) — the target's own sysfs
+/// doesn't have the device yet, so a local lookup would fail with
+/// "not currently attached" the way it does in the Re-attach dialog.
 pub async fn wolfusb_attach(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
 
-    let source_address = body.get("source_address").and_then(|v| v.as_str()).unwrap_or("");
-    let busid = body.get("busid").and_then(|v| v.as_str()).unwrap_or("");
-    let target_type = body.get("target_type").and_then(|v| v.as_str()).unwrap_or("");
-    let target_name = body.get("target_name").and_then(|v| v.as_str()).unwrap_or("");
+    let source_address = body.get("source_address").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let busid = body.get("busid").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let target_type = body.get("target_type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let target_name = body.get("target_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
     if source_address.is_empty() || busid.is_empty() {
         return HttpResponse::BadRequest().json(serde_json::json!({ "error": "source_address and busid required" }));
     }
 
-    match crate::wolfusb::attach_and_passthrough(source_address, busid, target_type, target_name) {
-        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "message": msg })),
+    // Ask source for bus+addr. Each attempted URL scheme in turn; any
+    // HTTP success with a parseable bus_addr wins.
+    let source_bus_addr = query_source_bus_addr(&source_address, &busid, &state.cluster_secret).await;
+
+    let busid_c = busid.clone();
+    match crate::wolfusb::attach_and_passthrough(&source_address, &busid_c, &target_type, &target_name, source_bus_addr) {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "message": msg, "bus_addr_resolved": source_bus_addr.is_some() })),
         Err(e) => HttpResponse::Ok().json(serde_json::json!({ "ok": false, "error": e })),
     }
+}
+
+/// Fetch the SOURCE node's (bus, addr) for a given busid via its
+/// prepare-for-export endpoint. Returns None if the source is
+/// unreachable, doesn't know about the busid, or is running an older
+/// version that doesn't include bus_addr in the response — callers
+/// then fall back to local sysfs lookup (which works for same-node
+/// attach and post-reboot vhci-survived attachments).
+async fn query_source_bus_addr(source_address: &str, busid: &str, secret: &str) -> Option<(u8, u8)> {
+    let urls = build_node_urls(source_address, 8553, "/api/wolfusb/prepare-for-export");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .danger_accept_invalid_certs(true)
+        .build().ok()?;
+    let body = serde_json::json!({ "busid": busid });
+    for url in &urls {
+        if let Ok(resp) = client.post(url)
+            .header("X-WolfStack-Secret", secret)
+            .json(&body)
+            .send().await
+        {
+            if !resp.status().is_success() { continue; }
+            let Ok(v) = resp.json::<serde_json::Value>().await else { continue; };
+            let Some(arr) = v.get("bus_addr").and_then(|x| x.as_array()) else { continue; };
+            if arr.len() != 2 { continue; }
+            let b = arr[0].as_u64().and_then(|n| u8::try_from(n).ok());
+            let a = arr[1].as_u64().and_then(|n| u8::try_from(n).ok());
+            if let (Some(b), Some(a)) = (b, a) { return Some((b, a)); }
+        }
+    }
+    None
 }
 
 /// GET /api/wolfusb/diagnose/{busid} — read-only walk of the
@@ -11168,17 +11221,26 @@ pub async fn wolfusb_prepare_for_export(
     if busid.is_empty() {
         return HttpResponse::BadRequest().json(serde_json::json!({ "error": "busid required" }));
     }
+    let busid_c = busid.clone();
     let steps = tokio::task::spawn_blocking(move || {
-        crate::wolfusb::prepare_for_export(&busid)
+        crate::wolfusb::prepare_for_export(&busid_c)
     }).await.unwrap_or_else(|e| vec![crate::wolfusb::ReattachStep {
         step: "prepare-for-export task".into(),
         ok: false,
         detail: format!("task panicked: {}", e),
     }]);
+    // Also return the SOURCE's current (bus, addr) so a cross-node
+    // target can build its `wolfusb mount --bus N --addr M` command
+    // without having to look the device up on its own sysfs (where
+    // it doesn't exist yet).
+    let bus_addr = tokio::task::spawn_blocking(move || {
+        crate::wolfusb::bus_addr_for(&busid)
+    }).await.ok().flatten();
     let overall_ok = steps.iter().all(|s| s.ok);
     HttpResponse::Ok().json(serde_json::json!({
         "ok": overall_ok,
         "steps": steps,
+        "bus_addr": bus_addr.map(|(b, a)| serde_json::json!([b, a])),
     }))
 }
 
@@ -11317,8 +11379,12 @@ pub async fn wolfusb_reattach(
     }
 
     // Step B: we ARE the target. If cross-node, ask source to prepare
-    // for export first. Accumulate the source's steps into the result.
+    // for export first. Accumulate the source's steps into the result
+    // AND extract its (bus, addr) so we can build a valid mount unit
+    // without trying to look the device up on our own sysfs (where it
+    // doesn't exist — it's on the source's bus).
     let mut all_steps: Vec<crate::wolfusb::ReattachStep> = Vec::new();
+    let mut source_bus_addr: Option<(u8, u8)> = None;
     if a.source_node_id != self_id {
         let nodes = state.cluster.get_all_nodes();
         let Some(source) = nodes.iter().find(|n| n.id == a.source_node_id) else {
@@ -11357,6 +11423,20 @@ pub async fn wolfusb_reattach(
                                     });
                                 }
                             }
+                            // [bus, addr] — optional; new in v18.7.21.
+                            // Older sources don't include the field, which
+                            // leaves source_bus_addr as None and the target
+                            // falls back to local sysfs (the old broken
+                            // behaviour, but no regression).
+                            if let Some(arr) = v.get("bus_addr").and_then(|x| x.as_array()) {
+                                if arr.len() == 2 {
+                                    let b = arr[0].as_u64().and_then(|n| u8::try_from(n).ok());
+                                    let a_ = arr[1].as_u64().and_then(|n| u8::try_from(n).ok());
+                                    if let (Some(b), Some(a_)) = (b, a_) {
+                                        source_bus_addr = Some((b, a_));
+                                    }
+                                }
+                            }
                         }
                         break;
                     }
@@ -11378,10 +11458,13 @@ pub async fn wolfusb_reattach(
 
     // Step C: run the local reattach — cleans stale mount unit and
     // reruns attach_and_passthrough. spawn_blocking because it shells
-    // systemctl + wolfusb.
+    // systemctl + wolfusb. source_bus_addr plumbs the source's real
+    // bus+addr through to install_mount_unit so the unit's ExecStart
+    // can correctly pass `--bus N --addr M` to wolfusb mount.
     let busid_c = busid.clone();
+    let source_bus_addr_c = source_bus_addr;
     let local_steps = tokio::task::spawn_blocking(move || {
-        crate::wolfusb::reattach_local(&busid_c)
+        crate::wolfusb::reattach_local(&busid_c, source_bus_addr_c)
     }).await.unwrap_or_else(|e| vec![crate::wolfusb::ReattachStep {
         step: "local reattach task".into(),
         ok: false,
