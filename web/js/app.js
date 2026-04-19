@@ -4661,6 +4661,163 @@ function browseContainerFiles(type, name, storagePath) {
     selectServerView(currentNodeId, 'files');
 }
 
+// Common config-file paths we suggest in the editor datalist. Covers
+// the containers people actually edit from WolfStack often — AdGuard,
+// Nginx, Traefik, Mosquitto, Home Assistant, Unbound, Pi-hole, and
+// the generic /etc/environment / /etc/hosts pair. Users can type
+// anything, this is just a hint list.
+const CONTAINER_CONFIG_HINTS = [
+    '/opt/adguardhome/conf/AdGuardHome.yaml',
+    '/etc/nginx/nginx.conf',
+    '/etc/nginx/conf.d/default.conf',
+    '/etc/traefik/traefik.yml',
+    '/etc/mosquitto/mosquitto.conf',
+    '/config/configuration.yaml',
+    '/etc/unbound/unbound.conf',
+    '/etc/pihole/setupVars.conf',
+    '/etc/environment',
+    '/etc/hosts',
+    '/etc/resolv.conf',
+];
+
+/// Open a modal that lets the operator read a file from inside a
+/// running container, edit it, and save it back. Reads use the
+/// existing /api/files/{docker,lxc}/download endpoint (which shells
+/// `docker exec cat` / `lxc-attach cat`); writes use /write which
+/// does the reverse via `docker cp` / `tee`. Optionally restarts the
+/// container after save so config changes take effect immediately.
+async function editContainerConfigFile(type, name) {
+    if (type !== 'docker' && type !== 'lxc') {
+        showToast('Unknown container type: ' + type, 'error'); return;
+    }
+    const modal = document.createElement('div');
+    modal.id = 'container-file-edit-modal';
+    modal.className = 'modal-overlay';
+    modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:10000;backdrop-filter:blur(4px);';
+    const typeIcon = type === 'docker' ? '🐳' : '📦';
+    modal.innerHTML = `
+        <div style="background:var(--card-bg,#1e1e2e);border:1px solid var(--border,#333);border-radius:12px;padding:24px;min-width:720px;max-width:90vw;max-height:90vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,0.5);">
+            <h3 style="margin:0 0 4px;color:var(--text,#fff);">${typeIcon} Edit config file — ${escapeHtml(name)}</h3>
+            <p style="margin:0 0 14px;color:var(--text-muted,#aaa);font-size:0.85em;">
+                Type the absolute path of a file inside the container, click <strong>Load</strong>, edit it, then <strong>Save</strong>. Changes usually need a container restart to take effect — tick the restart box if you want that done automatically.
+            </p>
+            <div style="display:flex;gap:8px;margin-bottom:8px;">
+                <input id="ccf-path" list="ccf-path-hints" placeholder="/opt/adguardhome/conf/AdGuardHome.yaml"
+                    style="flex:1;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);font-family:var(--font-mono,monospace);font-size:13px;"/>
+                <datalist id="ccf-path-hints">
+                    ${CONTAINER_CONFIG_HINTS.map(p => `<option value="${escapeAttr(p)}">`).join('')}
+                </datalist>
+                <button id="ccf-load" class="btn" style="background:#3b82f6;color:#fff;">Load</button>
+            </div>
+            <textarea id="ccf-content" placeholder="File contents will appear here after Load…"
+                style="flex:1;min-height:420px;padding:10px;background:#0b0b14;border:1px solid var(--border,#333);border-radius:6px;color:#e4e4e7;font-family:var(--font-mono,'JetBrains Mono',Consolas,monospace);font-size:13px;line-height:1.5;tab-size:2;resize:vertical;"></textarea>
+            <div id="ccf-status" style="min-height:18px;margin-top:8px;font-size:12px;color:var(--text-muted,#888);"></div>
+            <div style="display:flex;align-items:center;gap:14px;margin-top:8px;">
+                <label style="display:flex;gap:6px;align-items:center;font-size:13px;color:var(--text-muted,#aaa);cursor:pointer;">
+                    <input type="checkbox" id="ccf-restart"/>
+                    Restart container after save
+                </label>
+                <div style="flex:1;"></div>
+                <button class="btn" onclick="this.closest('#container-file-edit-modal').remove()">Cancel</button>
+                <button id="ccf-save" class="btn" style="background:#10b981;color:#fff;" disabled>Save</button>
+            </div>
+        </div>`;
+    document.body.appendChild(modal);
+
+    const pathEl = document.getElementById('ccf-path');
+    const contentEl = document.getElementById('ccf-content');
+    const statusEl = document.getElementById('ccf-status');
+    const loadBtn = document.getElementById('ccf-load');
+    const saveBtn = document.getElementById('ccf-save');
+    const restartEl = document.getElementById('ccf-restart');
+    let loadedPath = null;
+
+    const setStatus = (msg, colour) => {
+        statusEl.textContent = msg || '';
+        statusEl.style.color = colour || 'var(--text-muted,#888)';
+    };
+
+    loadBtn.onclick = async () => {
+        const path = (pathEl.value || '').trim();
+        if (!path.startsWith('/')) {
+            setStatus('Path must be absolute (start with /)', '#ef4444');
+            return;
+        }
+        setStatus('Loading…');
+        loadBtn.disabled = true;
+        try {
+            const url = apiUrl(`/api/files/${type}/download?container=${encodeURIComponent(name)}&path=${encodeURIComponent(path)}`);
+            const r = await fetch(url);
+            if (!r.ok) {
+                const err = await r.text().catch(() => '');
+                setStatus('Load failed: ' + (err || ('HTTP ' + r.status)), '#ef4444');
+                return;
+            }
+            const text = await r.text();
+            contentEl.value = text;
+            loadedPath = path;
+            saveBtn.disabled = false;
+            setStatus(`Loaded ${text.length.toLocaleString()} bytes from ${path}`, '#10b981');
+        } catch (e) {
+            setStatus('Load error: ' + e.message, '#ef4444');
+        } finally {
+            loadBtn.disabled = false;
+        }
+    };
+
+    saveBtn.onclick = async () => {
+        const path = (pathEl.value || '').trim();
+        if (!path || path !== loadedPath) {
+            setStatus('Path changed since load — click Load first to confirm the target', '#f59e0b');
+            return;
+        }
+        if (!(await showConfirm(`Write changes to ${path} inside ${name}? The file will be overwritten.`))) return;
+        setStatus('Saving…');
+        saveBtn.disabled = true;
+        try {
+            const r = await fetch(apiUrl(`/api/files/${type}/write`), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ container: name, path, content: contentEl.value }),
+            });
+            const data = await r.json().catch(() => ({}));
+            if (!r.ok) {
+                setStatus('Save failed: ' + (data.error || ('HTTP ' + r.status)), '#ef4444');
+                saveBtn.disabled = false;
+                return;
+            }
+            setStatus('Saved.', '#10b981');
+            if (restartEl.checked) {
+                setStatus('Saved — restarting container…', '#10b981');
+                const action = type === 'docker' ? 'restart' : 'reboot';
+                try {
+                    const actionUrl = type === 'docker'
+                        ? apiUrl(`/api/containers/docker/${encodeURIComponent(name)}/action`)
+                        : apiUrl(`/api/containers/lxc/${encodeURIComponent(name)}/action`);
+                    await fetch(actionUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ action }),
+                    });
+                    setStatus('Saved and restart triggered.', '#10b981');
+                } catch (e) {
+                    setStatus('Saved but restart failed: ' + e.message, '#f59e0b');
+                }
+            }
+            saveBtn.disabled = false;
+        } catch (e) {
+            setStatus('Save error: ' + e.message, '#ef4444');
+            saveBtn.disabled = false;
+        }
+    };
+
+    pathEl.addEventListener('input', () => {
+        // Any path change invalidates the Save button until re-loaded
+        if (pathEl.value.trim() !== loadedPath) saveBtn.disabled = true;
+    });
+    pathEl.focus();
+}
+
 async function loadFiles(path) {
     if (path !== undefined) currentFilePath = path;
     const table = document.getElementById('file-list-table');
@@ -11885,6 +12042,7 @@ function renderLxcCards(containers, stats) {
                 <button class="btn btn-sm" style="${isRunning ? bd : bs}" ${isRunning ? 'disabled' : ''} ${!isRunning ? `onclick="lxcAction('${c.name}','destroy',this)"` : ''} title="Destroy">🗑️</button>
                 <button class="btn btn-sm" style="${bs}" onclick="viewContainerLogs('lxc','${c.name}')" title="Logs">📜</button>
                 <button class="btn btn-sm" style="${bs}" onclick="browseContainerFiles('lxc','${c.name}','${(c.storage_path||'').replace(/'/g,"\\'")}')" title="Files">📂</button>
+                <button class="btn btn-sm" style="${bs}" onclick="editContainerConfigFile('lxc','${c.name}')" title="Edit Config File">📝</button>
                 <button class="btn btn-sm" style="${bs}" onclick="openLxcSettings('${c.name}')" title="Settings">⚙️</button>
                 <button class="btn btn-sm" style="${bs}" onclick="openContainerConfigurator('lxc','${c.name}')" title="Configure">🔧</button>
                 <button class="btn btn-sm" style="${bs}" onclick="openContainerUpdates('lxc','${c.name}')" title="Updates">📦</button>
@@ -12049,6 +12207,7 @@ function renderDockerContainers(containers) {
                 <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="viewContainerLogs('docker', '${c.name}')" title="Logs">📜</button>
                 <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="viewDockerVolumes('${c.name}')" title="Volumes">📁</button>
                 <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="browseContainerFiles('docker', '${c.name}')" title="Browse Files">📂</button>
+                <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="editContainerConfigFile('docker', '${c.name}')" title="Edit Config File">📝</button>
                 <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="openDockerSettings('${c.name}')" title="Settings">⚙️</button>
                 <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="openContainerConfigurator('docker', '${c.name}')" title="Configure">🔧</button>
                 <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="openContainerUpdates('docker', '${c.name}')" title="Check Updates">📦</button>
@@ -12718,6 +12877,7 @@ function renderLxcContainers(containers, stats) {
                 <button class="btn btn-sm" style="${isRunning ? disStyle : btnStyle}" ${isRunning ? 'disabled' : ''} ${!isRunning ? `onclick="lxcAction('${c.name}', 'destroy', this)"` : ''} title="Destroy">🗑️</button>
                 <button class="btn btn-sm" style="${btnStyle}" onclick="viewContainerLogs('lxc', '${c.name}')" title="Logs">📜</button>
                 <button class="btn btn-sm" style="${btnStyle}" onclick="browseContainerFiles('lxc', '${c.name}', '${(c.storage_path || '').replace(/'/g, "\\'")}')" title="Browse Files">📂</button>
+                <button class="btn btn-sm" style="${btnStyle}" onclick="editContainerConfigFile('lxc', '${c.name}')" title="Edit Config File">📝</button>
                 <button class="btn btn-sm" style="${btnStyle}" onclick="openLxcSettings('${c.name}')" title="Settings">⚙️</button>
                 <button class="btn btn-sm" style="${btnStyle}" onclick="openContainerConfigurator('lxc', '${c.name}')" title="Configure">🔧</button>
                 <button class="btn btn-sm" style="${btnStyle}" onclick="openContainerUpdates('lxc', '${c.name}')" title="Check Updates">📦</button>
