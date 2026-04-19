@@ -991,6 +991,7 @@
 
         const overlay = document.createElement('div');
         overlay.className = 'modal-overlay active';
+        overlay.id = 'wr-lan-editor-overlay';
         overlay.style.zIndex = '10000';
         overlay.innerHTML = `
             <div class="modal" style="max-width:640px;">
@@ -1326,9 +1327,17 @@
             return;
         }
         say('✅', 'Segment saved — dnsmasq running.', '#22c55e');
-        // Tiny pause so the user actually sees the green tick before the modal closes.
+        // Unlock the button as soon as the save returns — the setTimeout
+        // that removes the overlay can race against an unrelated modal
+        // being opened (confirm dialog, toast-as-modal) which would
+        // leave the LAN editor open with the button still stuck on
+        // "Working…". Also target the LAN editor overlay by id rather
+        // than querySelector('.modal-overlay'), which grabbed whichever
+        // overlay was first in the DOM — sometimes a leftover from a
+        // previous interaction, leaving the LAN editor behind.
+        unlock();
         setTimeout(() => {
-            document.querySelector('.modal-overlay')?.remove();
+            document.getElementById('wr-lan-editor-overlay')?.remove();
             wrLoadAll();
         }, 400);
     }

@@ -38234,17 +38234,26 @@ async function wolfAgentsSaveFromModal() {
     const avatarVal = (document.getElementById('wolfagents-field-avatar')?.value || '').trim();
     payload.avatar = avatarVal || null;
     if (!payload.name) { showToast('Name is required', 'warn'); return; }
-    const discordId = (document.getElementById('wolfagents-field-discord-id').value || '').trim();
+    let discordId = (document.getElementById('wolfagents-field-discord-id').value || '').trim();
     const discordLabel = (document.getElementById('wolfagents-field-discord-label').value || '').trim();
     const discordToken = (document.getElementById('wolfagents-field-discord-token')?.value || '').trim();
-    // Easy mistake: paste the bot token into the channel ID field
-    // because they sit next to each other. Discord snowflakes are
-    // 17–20 digits, nothing else; reject anything that contains
-    // characters no snowflake would ever have so the user corrects it
-    // instead of silently storing junk.
-    if (discordId && !/^\d{17,20}$/.test(discordId)) {
-        showToast('Discord channel ID must be a 17–20 digit snowflake (the number after /channels/ in the URL). Did you paste a bot token into the wrong field?', 'error');
-        return;
+    // Be lenient with paste: if the user pasted a full Discord URL
+    // (`https://discord.com/channels/<guild>/<channel>`), grab the
+    // last segment and use that. Also strip anything after a `#` or
+    // query string, and silently drop zero-width / non-breaking space
+    // characters that sometimes come along with copy-paste from the
+    // Discord web client. After all that, require a bare snowflake —
+    // a bot token in this field is still a user error we want to
+    // flag clearly.
+    if (discordId) {
+        discordId = discordId.replace(/[\u200B-\u200D\u2060\uFEFF\s]/g, '');
+        const urlMatch = discordId.match(/\/channels\/\d+\/(\d{17,20})/);
+        if (urlMatch) discordId = urlMatch[1];
+        if (!/^\d{17,20}$/.test(discordId)) {
+            const sample = JSON.stringify(discordId.slice(0, 32));
+            showToast('Discord channel ID must be a 17–20 digit snowflake (the number after /channels/ in the URL). Got ' + sample + '. Did you paste a bot token into the wrong field?', 'error');
+            return;
+        }
     }
     if (discordId) {
         payload.discord = { channel_id: discordId, channel_label: discordLabel };

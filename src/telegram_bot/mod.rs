@@ -182,15 +182,66 @@ async fn handle_telegram_chat(
         Ok(r) => r,
         Err(e) => format!("(agent error) {}", e),
     };
-    let out = if reply.len() > 4000 {
-        format!("{}\n…(truncated)", &reply[..4000])
-    } else {
-        reply
-    };
-    if let Err(e) = send_telegram_message(&http, bot_token, chat_id, &out).await {
-        warn!("telegram_bot: reply failed for agent {} chat {}: {}",
-            agent.id, chat_id, e);
+    // Telegram caps at 4096 chars per message; chunk instead of
+    // truncating so long agent outputs (log tails, diagnostic dumps)
+    // arrive intact. Paragraph-aware so markdown and code blocks
+    // survive the split.
+    for chunk in chunk_for_telegram(&reply) {
+        if let Err(e) = send_telegram_message(&http, bot_token, chat_id, &chunk).await {
+            warn!("telegram_bot: reply failed for agent {} chat {}: {}",
+                agent.id, chat_id, e);
+            break;
+        }
     }
+}
+
+/// Split `text` into Telegram-sized chunks (&lt;= 4000 chars each, a
+/// safety margin under the 4096 hard cap for variable-width chars).
+/// Same strategy as the Discord chunker: prefer paragraph boundaries,
+/// fall back to lines, then raw char-boundary cuts. Always returns at
+/// least one element.
+fn chunk_for_telegram(text: &str) -> Vec<String> {
+    const LIMIT: usize = 4000;
+    if text.is_empty() { return vec![String::new()]; }
+    if text.chars().count() <= LIMIT { return vec![text.to_string()]; }
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for para in text.split("\n\n") {
+        let needed = para.chars().count() + if current.is_empty() { 0 } else { 2 };
+        if !current.is_empty() && current.chars().count() + needed > LIMIT {
+            out.push(std::mem::take(&mut current));
+        }
+        if para.chars().count() <= LIMIT {
+            if !current.is_empty() { current.push_str("\n\n"); }
+            current.push_str(para);
+            continue;
+        }
+        if !current.is_empty() { out.push(std::mem::take(&mut current)); }
+        for line in para.split('\n') {
+            if current.chars().count() + line.chars().count() + 1 > LIMIT && !current.is_empty() {
+                out.push(std::mem::take(&mut current));
+            }
+            if line.chars().count() <= LIMIT {
+                if !current.is_empty() { current.push('\n'); }
+                current.push_str(line);
+                continue;
+            }
+            let mut remaining = line;
+            while remaining.chars().count() > LIMIT {
+                let cut = remaining.char_indices().nth(LIMIT).map(|(i, _)| i).unwrap_or(remaining.len());
+                if !current.is_empty() { out.push(std::mem::take(&mut current)); }
+                out.push(remaining[..cut].to_string());
+                remaining = &remaining[cut..];
+            }
+            if !remaining.is_empty() {
+                if !current.is_empty() { current.push('\n'); }
+                current.push_str(remaining);
+            }
+        }
+    }
+    if !current.is_empty() { out.push(current); }
+    if out.is_empty() { out.push(String::new()); }
+    out
 }
 
 pub async fn send_telegram_message(

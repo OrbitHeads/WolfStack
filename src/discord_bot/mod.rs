@@ -312,17 +312,73 @@ async fn handle_discord_chat(
         Ok(r) => r,
         Err(e) => format!("(agent error) {}", e),
     };
-    // Discord caps messages at 2000 chars; trim with a suffix so the
-    // operator can tell the reply was clipped rather than silently
-    // dropped.
-    let out = if reply.len() > 1900 {
-        format!("{}\n…(truncated)", &reply[..1900])
-    } else {
-        reply
-    };
-    if let Err(e) = send_discord_message(&http, bot_token, &msg.channel_id, &out).await {
-        warn!("discord_bot: reply failed for agent {} msg {}: {}", agent.id, msg.id, e);
+    // Discord caps messages at 2000 chars per message. Chunk the reply
+    // on paragraph / line boundaries so long agent outputs (logs, code
+    // blocks, diagnostic dumps) arrive in full instead of being clipped
+    // at 1900 chars with a "…(truncated)" suffix that loses data.
+    for chunk in chunk_for_discord(&reply) {
+        if let Err(e) = send_discord_message(&http, bot_token, &msg.channel_id, &chunk).await {
+            warn!("discord_bot: reply failed for agent {} msg {}: {}", agent.id, msg.id, e);
+            break;
+        }
     }
+}
+
+/// Split `text` into Discord-sized chunks (&lt;= 1900 chars each, leaving
+/// headroom under the 2000-char hard cap for the odd extra codepoint).
+/// Prefers splitting at paragraph breaks, then lines, then spaces,
+/// falling back to a raw char-boundary cut only when a single line is
+/// longer than the limit. Returns at least one element even for empty
+/// input so callers can iterate without a None-check.
+fn chunk_for_discord(text: &str) -> Vec<String> {
+    const LIMIT: usize = 1900;
+    if text.is_empty() { return vec![String::new()]; }
+    if text.chars().count() <= LIMIT { return vec![text.to_string()]; }
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    // Walk paragraph-by-paragraph so we keep markdown formatting intact.
+    // If a single paragraph exceeds the limit we break it at newlines,
+    // then spaces, then a hard cut. The inner helper is inlined for
+    // locality — this is the only caller.
+    for para in text.split("\n\n") {
+        let needed = para.chars().count() + if current.is_empty() { 0 } else { 2 };
+        if !current.is_empty() && current.chars().count() + needed > LIMIT {
+            out.push(std::mem::take(&mut current));
+        }
+        if para.chars().count() <= LIMIT {
+            if !current.is_empty() { current.push_str("\n\n"); }
+            current.push_str(para);
+            continue;
+        }
+        // Paragraph too long on its own — split on single newlines.
+        if !current.is_empty() { out.push(std::mem::take(&mut current)); }
+        for line in para.split('\n') {
+            if current.chars().count() + line.chars().count() + 1 > LIMIT && !current.is_empty() {
+                out.push(std::mem::take(&mut current));
+            }
+            if line.chars().count() <= LIMIT {
+                if !current.is_empty() { current.push('\n'); }
+                current.push_str(line);
+                continue;
+            }
+            // Single line still too long — break by char count, respecting
+            // codepoint boundaries so we don't split a multi-byte char.
+            let mut remaining = line;
+            while remaining.chars().count() > LIMIT {
+                let cut = remaining.char_indices().nth(LIMIT).map(|(i, _)| i).unwrap_or(remaining.len());
+                if !current.is_empty() { out.push(std::mem::take(&mut current)); }
+                out.push(remaining[..cut].to_string());
+                remaining = &remaining[cut..];
+            }
+            if !remaining.is_empty() {
+                if !current.is_empty() { current.push('\n'); }
+                current.push_str(remaining);
+            }
+        }
+    }
+    if !current.is_empty() { out.push(current); }
+    if out.is_empty() { out.push(String::new()); }
+    out
 }
 
 /// POST a message to a Discord channel. Thin wrapper around the HTTP
