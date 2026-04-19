@@ -2450,5 +2450,73 @@ pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
         .route("/api/router/wan/{id}",     web::put().to(update_wan))
         .route("/api/router/wan/{id}",     web::delete().to(delete_wan))
         .route("/api/router/wan-status",   web::get().to(wan_status))
-        .route("/api/router/interface-up", web::post().to(interface_up));
+        .route("/api/router/interface-up", web::post().to(interface_up))
+        .route("/api/router/host-dns",         web::get().to(get_host_dns))
+        .route("/api/router/host-dns/release", web::post().to(release_host_dns))
+        .route("/api/router/host-dns/restore", web::post().to(restore_host_dns));
+}
+
+/// GET /api/router/host-dns — detect what's holding port 53 on this
+/// node. Read-only. Returns the HostDnsStatus struct from host_dns::detect.
+async fn get_host_dns(
+    req: actix_web::HttpRequest,
+    state: actix_web::web::Data<crate::api::AppState>,
+) -> actix_web::HttpResponse {
+    if let Err(resp) = crate::api::require_auth(&req, &state) { return resp; }
+    let status = tokio::task::spawn_blocking(super::host_dns::detect)
+        .await.unwrap_or_else(|_| super::host_dns::HostDnsStatus {
+            resolver: "error".into(), port_53_owner: None, stub_listener: false,
+            release_applied: false, wolfrouter_owns_53: false,
+            resolv_conf_servers: Vec::new(),
+            distro: "unknown".into(), network_manager_active: false,
+            resolv_conf_immutable: false, tools_ok: false,
+            message: "Detection task panicked".into(),
+        });
+    actix_web::HttpResponse::Ok().json(status)
+}
+
+#[derive(serde::Deserialize)]
+struct HostDnsReleaseRequest {
+    /// Optional host DNS upstream to point /etc/resolv.conf at after
+    /// releasing port 53. Defaults to 1.1.1.1 when omitted so host
+    /// resolution keeps working without the stub.
+    #[serde(default)]
+    upstream: Option<String>,
+}
+
+/// POST /api/router/host-dns/release — disable systemd-resolved's stub
+/// listener so a containerised DNS server can claim port 53. Writes a
+/// drop-in at /etc/systemd/resolved.conf.d/99-wolfstack-release-53.conf
+/// and rewrites /etc/resolv.conf so host DNS still works. Undoable via
+/// /restore.
+async fn release_host_dns(
+    req: actix_web::HttpRequest,
+    state: actix_web::web::Data<crate::api::AppState>,
+    body: actix_web::web::Json<HostDnsReleaseRequest>,
+) -> actix_web::HttpResponse {
+    if let Err(resp) = crate::api::require_auth(&req, &state) { return resp; }
+    let upstream = body.upstream.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        super::host_dns::release_port_53(upstream.as_deref())
+    }).await.unwrap_or_else(|e| Err(format!("release task panicked: {}", e)));
+    match res {
+        Ok(msg) => actix_web::HttpResponse::Ok().json(serde_json::json!({ "ok": true, "message": msg })),
+        Err(e) => actix_web::HttpResponse::BadRequest().json(serde_json::json!({ "ok": false, "error": e })),
+    }
+}
+
+/// POST /api/router/host-dns/restore — undo the release: delete the
+/// drop-in, restore the backup of /etc/resolv.conf, restart the
+/// resolver so the stub listener comes back.
+async fn restore_host_dns(
+    req: actix_web::HttpRequest,
+    state: actix_web::web::Data<crate::api::AppState>,
+) -> actix_web::HttpResponse {
+    if let Err(resp) = crate::api::require_auth(&req, &state) { return resp; }
+    let res = tokio::task::spawn_blocking(super::host_dns::restore)
+        .await.unwrap_or_else(|e| Err(format!("restore task panicked: {}", e)));
+    match res {
+        Ok(msg) => actix_web::HttpResponse::Ok().json(serde_json::json!({ "ok": true, "message": msg })),
+        Err(e) => actix_web::HttpResponse::BadRequest().json(serde_json::json!({ "ok": false, "error": e })),
+    }
 }

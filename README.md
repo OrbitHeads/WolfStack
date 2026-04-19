@@ -1,4 +1,4 @@
-# 🐺 WolfStack — Server, VM & Container Management Platform
+# 🐺 WolfStack™ — Server, VM & Container Management Platform
 
 [![Fund Open Source](https://img.shields.io/badge/Fund_Open_Source-%E2%9D%A4-red?style=for-the-badge&logo=github)](https://github.com/sponsors/wolfsoftwaresystemsltd)
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/q9qMjHjUQY)
@@ -56,6 +56,10 @@ Backers get access to the private roadmap, early access builds, and direct devel
 [MIT License](LICENSE) — Free to use, modify, and distribute without restriction.
 
 © 2024-2026 [Wolf Software Systems Ltd](https://wolf.uk.com/)
+
+## Trademarks
+
+WolfStack™, WolfRouter™, WolfAgents™, WolfNet™, WolfFlow™, WolfRun™, WolfUSB™ and WolfDisk™ are trademarks of Wolf Software Systems Ltd. The MIT licence grants rights to the source code; it does not grant rights to the Wolf Software Systems Ltd trademarks. All rights reserved.
 
 ---
 

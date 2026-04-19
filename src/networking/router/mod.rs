@@ -29,6 +29,7 @@ pub mod dns;
 pub mod topology;
 pub mod api;
 pub mod wan;
+pub mod host_dns;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

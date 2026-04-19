@@ -5081,6 +5081,18 @@
             `<option value="${escHtml(l.id)}">${escHtml(l.name)} — ${escHtml(l.interface)} (${escHtml(l.subnet_cidr)})</option>`).join('');
 
         root.innerHTML = `
+            <!-- HOST DNS RESOLVER — who owns port 53 on this node,
+                 release it to a containerised resolver, restore when
+                 done. One-click alternative to editing resolved.conf
+                 by hand for the "AdGuard in Docker wants port 53"
+                 scenario. -->
+            <div id="wr-host-dns-card" style="padding:14px; border:1px solid rgba(59,130,246,0.35); border-radius:8px; background:rgba(59,130,246,0.06); margin-bottom:16px;">
+                <div style="display:flex; align-items:baseline; gap:8px; margin-bottom:6px;">
+                    <strong style="font-size:14px; color:#3b82f6;">🛡 Host DNS resolver — port 53</strong>
+                    <span style="font-size:11px; color:var(--text-muted);">— who owns port 53 on this node, and how to free it for a containerised DNS server</span>
+                </div>
+                <div id="wr-host-dns-body" style="font-size:12px; color:var(--text-muted);">Checking…</div>
+            </div>
             <!-- LAN-SIDE DIAGNOSTICS — the section that actually answers
                  "why can't my client resolve?" by watching real client
                  traffic, not by running dig from the host. -->
@@ -5164,7 +5176,118 @@
             wrLSideRefreshLog();
             wrLSideStartAutoRefresh();
         }
+
+        // Load the host-DNS panel. Runs against the currently-selected
+        // node via wrUrl so operators can flip between nodes and see
+        // each one's local resolver state.
+        wrHostDnsRefresh();
     }
+
+    /// Fetch /api/router/host-dns and render the card. Called on DNS
+    /// Tools tab load and after each Release/Restore action so the
+    /// panel reflects reality instead of stale state.
+    async function wrHostDnsRefresh() {
+        const body = document.getElementById('wr-host-dns-body');
+        if (!body) return;
+        body.innerHTML = 'Checking what owns port 53 on this node…';
+        let status;
+        try {
+            const r = await fetch(wrUrl('/api/router/host-dns'));
+            if (!r.ok) {
+                body.innerHTML = `<span style="color:#ef4444;">Status check failed: HTTP ${r.status}</span>`;
+                return;
+            }
+            status = await r.json();
+        } catch (e) {
+            body.innerHTML = `<span style="color:#ef4444;">Status check errored: ${escHtml(e.message || String(e))}</span>`;
+            return;
+        }
+        const servers = (status.resolv_conf_servers || []);
+        const canRelease = status.resolver === 'systemd-resolved'
+            && status.stub_listener
+            && !status.release_applied
+            && !status.wolfrouter_owns_53;
+        const canRestore = status.release_applied;
+        const ownerBadge = status.port_53_owner
+            ? `<code>${escHtml(status.port_53_owner)}</code>`
+            : '<span style="color:var(--text-muted);">nothing listening</span>';
+        body.innerHTML = `
+            <div style="display:grid; grid-template-columns:auto 1fr; gap:4px 14px; margin-bottom:10px; font-size:12px;">
+                <span style="color:var(--text-muted);">Resolver:</span>
+                <span><strong>${escHtml(status.resolver)}</strong></span>
+                <span style="color:var(--text-muted);">Port 53 owner:</span>
+                <span>${ownerBadge}</span>
+                <span style="color:var(--text-muted);">Stub listener:</span>
+                <span>${status.stub_listener ? '<span style="color:#f59e0b;">on (holding 127.0.0.53:53)</span>' : '<span style="color:var(--text-muted);">off</span>'}</span>
+                <span style="color:var(--text-muted);">Release applied:</span>
+                <span>${status.release_applied ? '<span style="color:#10b981;">yes (WolfStack drop-in present)</span>' : '<span style="color:var(--text-muted);">no</span>'}</span>
+                <span style="color:var(--text-muted);">/etc/resolv.conf:</span>
+                <span>${servers.length ? servers.map(s => `<code>${escHtml(s)}</code>`).join(', ') : '<span style="color:var(--text-muted);">(empty)</span>'}</span>
+            </div>
+            <div style="font-size:12px; color:var(--text,#fff); margin-bottom:10px;">${escHtml(status.message || '')}</div>
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                ${canRelease ? `
+                    <label style="font-size:12px; color:var(--text-muted); display:flex; gap:6px; align-items:center;">
+                        Host DNS upstream:
+                        <input id="wr-host-dns-upstream" placeholder="1.1.1.1" value="1.1.1.1"
+                            style="width:120px; padding:4px 8px; background:var(--bg-primary); border:1px solid var(--border); border-radius:4px; color:var(--text);"/>
+                    </label>
+                    <button class="btn btn-sm btn-primary" onclick="wrHostDnsRelease()">Release port 53</button>
+                ` : ''}
+                ${canRestore ? `<button class="btn btn-sm" onclick="wrHostDnsRestore()">Restore</button>` : ''}
+                <button class="btn btn-sm" onclick="wrHostDnsRefresh()">🔄 Refresh</button>
+            </div>
+            <div id="wr-host-dns-result" style="font-size:12px; margin-top:10px;"></div>
+        `;
+    }
+    window.wrHostDnsRefresh = wrHostDnsRefresh;
+
+    /// Disable systemd-resolved's stub listener and redirect
+    /// /etc/resolv.conf at the chosen upstream, then re-poll status.
+    async function wrHostDnsRelease() {
+        const input = document.getElementById('wr-host-dns-upstream');
+        const upstream = (input?.value || '').trim() || '1.1.1.1';
+        const out = document.getElementById('wr-host-dns-result');
+        if (!(await showConfirm(`Disable systemd-resolved's stub listener on this node and point host DNS at ${upstream}? This is undoable via Restore.`))) return;
+        if (out) out.innerHTML = '<span style="color:var(--text-muted);">Applying…</span>';
+        try {
+            const r = await fetch(wrUrl('/api/router/host-dns/release'), {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ upstream }),
+            });
+            const data = await r.json().catch(() => ({}));
+            if (!r.ok || data.ok === false) {
+                if (out) out.innerHTML = `<span style="color:#ef4444;">Failed: ${escHtml(data.error || ('HTTP ' + r.status))}</span>`;
+                return;
+            }
+            if (out) out.innerHTML = `<span style="color:#10b981;">${escHtml(data.message || 'Released')}</span>`;
+        } catch (e) {
+            if (out) out.innerHTML = `<span style="color:#ef4444;">Error: ${escHtml(e.message || String(e))}</span>`;
+        }
+        setTimeout(wrHostDnsRefresh, 400);
+    }
+    window.wrHostDnsRelease = wrHostDnsRelease;
+
+    /// Undo a prior Release: delete the drop-in, restore the saved
+    /// /etc/resolv.conf, restart systemd-resolved.
+    async function wrHostDnsRestore() {
+        const out = document.getElementById('wr-host-dns-result');
+        if (!(await showConfirm('Restore the host DNS resolver? systemd-resolved\'s stub listener will come back on 127.0.0.53:53 — any containerised resolver currently bound to port 53 on this host will need to be stopped first.'))) return;
+        if (out) out.innerHTML = '<span style="color:var(--text-muted);">Restoring…</span>';
+        try {
+            const r = await fetch(wrUrl('/api/router/host-dns/restore'), { method: 'POST' });
+            const data = await r.json().catch(() => ({}));
+            if (!r.ok || data.ok === false) {
+                if (out) out.innerHTML = `<span style="color:#ef4444;">Failed: ${escHtml(data.error || ('HTTP ' + r.status))}</span>`;
+                return;
+            }
+            if (out) out.innerHTML = `<span style="color:#10b981;">${escHtml(data.message || 'Restored')}</span>`;
+        } catch (e) {
+            if (out) out.innerHTML = `<span style="color:#ef4444;">Error: ${escHtml(e.message || String(e))}</span>`;
+        }
+        setTimeout(wrHostDnsRefresh, 400);
+    }
+    window.wrHostDnsRestore = wrHostDnsRestore;
 
     // ─── LAN-side diagnostics helpers ─────────────────────────────
 
