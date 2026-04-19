@@ -5378,20 +5378,33 @@
             return;
         }
         const servers = (status.resolv_conf_servers || []);
-        const canRelease = status.resolver === 'systemd-resolved'
-            && status.stub_listener
-            && !status.release_applied
-            && !status.wolfrouter_owns_53;
+        // Stub release is independent of WolfRouter dnsmasq — both can
+        // hold :53 at once (127.0.0.53 for the stub, LAN bridge IP for
+        // dnsmasq). The old guard that also required !wolfrouter_owns_53
+        // left mixed-state hosts with no way forward.
+        const canRelease = status.stub_listener && !status.release_applied;
         const canRestore = status.release_applied;
-        const ownerBadge = status.port_53_owner
-            ? `<code>${escHtml(status.port_53_owner)}</code>`
+
+        // Full bindings list — "first owner wins" before v18.7.26 hid
+        // stub behind dnsmasq (or vice versa) depending on `ss` output
+        // order. Show all of them.
+        const bindings = Array.isArray(status.port_53_bindings) ? status.port_53_bindings : [];
+        const bindingsHtml = bindings.length
+            ? bindings.map(b => `<code>${escHtml(b.owner)}</code> <span style="color:var(--text-muted);">@ ${escHtml(b.local_addr)}</span>`).join('<br>')
             : '<span style="color:var(--text-muted);">nothing listening</span>';
+
+        // Per-LAN WolfRouter DNS rows. Only LANs owned by this node
+        // come through (the backend filters) so operators don't see
+        // remote LANs they can't reach from this panel.
+        const lans = Array.isArray(status.wolfrouter_lans) ? status.wolfrouter_lans : [];
+        const lansHtml = wrHostDnsLansHtml(lans);
+
         body.innerHTML = `
             <div style="display:grid; grid-template-columns:auto 1fr; gap:4px 14px; margin-bottom:10px; font-size:12px;">
                 <span style="color:var(--text-muted);">Resolver:</span>
                 <span><strong>${escHtml(status.resolver)}</strong></span>
-                <span style="color:var(--text-muted);">Port 53 owner:</span>
-                <span>${ownerBadge}</span>
+                <span style="color:var(--text-muted);">:53 bindings:</span>
+                <span>${bindingsHtml}</span>
                 <span style="color:var(--text-muted);">Stub listener:</span>
                 <span>${status.stub_listener ? '<span style="color:#f59e0b;">on (holding 127.0.0.53:53)</span>' : '<span style="color:var(--text-muted);">off</span>'}</span>
                 <span style="color:var(--text-muted);">Release applied:</span>
@@ -5400,22 +5413,201 @@
                 <span>${servers.length ? servers.map(s => `<code>${escHtml(s)}</code>`).join(', ') : '<span style="color:var(--text-muted);">(empty)</span>'}</span>
             </div>
             <div style="font-size:12px; color:var(--text,#fff); margin-bottom:10px;">${escHtml(status.message || '')}</div>
-            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-                ${canRelease ? `
-                    <label style="font-size:12px; color:var(--text-muted); display:flex; gap:6px; align-items:center;">
-                        Host DNS upstream:
-                        <input id="wr-host-dns-upstream" placeholder="1.1.1.1" value="1.1.1.1"
-                            style="width:120px; padding:4px 8px; background:var(--bg-primary); border:1px solid var(--border); border-radius:4px; color:var(--text);"/>
-                    </label>
-                    <button class="btn btn-sm btn-primary" onclick="wrHostDnsRelease()">Release port 53</button>
-                ` : ''}
-                ${canRestore ? `<button class="btn btn-sm" onclick="wrHostDnsRestore()">Restore</button>` : ''}
+
+            <div style="border:1px solid var(--border); border-radius:6px; padding:10px; margin-bottom:10px;">
+                <div style="font-weight:600; font-size:12px; margin-bottom:6px;">systemd-resolved stub (127.0.0.53:53)</div>
+                <div style="font-size:12px; color:var(--text-muted); margin-bottom:8px;">
+                    Releasing disables the stub and points /etc/resolv.conf at an upstream you pick. Affects host DNS only; LAN DNS served by WolfRouter is untouched.
+                </div>
+                <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                    ${canRelease ? `
+                        <label style="font-size:12px; color:var(--text-muted); display:flex; gap:6px; align-items:center;">
+                            Host DNS upstream:
+                            <input id="wr-host-dns-upstream" placeholder="1.1.1.1" value="1.1.1.1"
+                                style="width:120px; padding:4px 8px; background:var(--bg-primary); border:1px solid var(--border); border-radius:4px; color:var(--text);"/>
+                        </label>
+                        <button class="btn btn-sm btn-primary" onclick="wrHostDnsRelease()">Release stub</button>
+                    ` : ''}
+                    ${canRestore ? `<button class="btn btn-sm" onclick="wrHostDnsRestore()">Restore stub</button>` : ''}
+                    ${!canRelease && !canRestore ? `<span style="font-size:12px; color:var(--text-muted);">Stub already off — no action needed.</span>` : ''}
+                </div>
+            </div>
+
+            ${lansHtml}
+
+            <div style="display:flex; gap:8px; align-items:center; margin-top:6px;">
                 <button class="btn btn-sm" onclick="wrHostDnsRefresh()">🔄 Refresh</button>
             </div>
             <div id="wr-host-dns-result" style="font-size:12px; margin-top:10px;"></div>
         `;
     }
     window.wrHostDnsRefresh = wrHostDnsRefresh;
+
+    /// Render the per-LAN WolfRouter DNS rows. Each row shows the
+    /// LAN's current dnsmasq DNS port and offers:
+    ///   • if mode=wolf_router && port==53 — "Move off :53" form
+    ///     (port input defaults to 5353, external_server required)
+    ///   • if mode=wolf_router && port!=53 — "Move back to :53" button
+    ///     plus an inline "Change port" editor
+    ///   • if mode=external — read-only note (DNS off entirely)
+    function wrHostDnsLansHtml(lans) {
+        if (!lans.length) {
+            return `<div style="font-size:12px; color:var(--text-muted); padding:6px 0;">
+                This node doesn't serve any WolfRouter LANs, so there's no per-LAN dnsmasq DNS to move.
+            </div>`;
+        }
+        const rows = lans.map(lan => wrHostDnsLanRowHtml(lan)).join('');
+        return `
+            <div style="border:1px solid var(--border); border-radius:6px; padding:10px; margin-bottom:10px;">
+                <div style="font-weight:600; font-size:12px; margin-bottom:6px;">WolfRouter LANs on this node</div>
+                <div style="font-size:12px; color:var(--text-muted); margin-bottom:8px;">
+                    Each LAN runs its own dnsmasq on its bridge interface. To let a containerised resolver (AdGuard Home, Pi-hole) bind :53 on a LAN, move that LAN's dnsmasq to a non-standard port and point DHCP option 6 at the container.
+                </div>
+                ${rows}
+            </div>
+        `;
+    }
+
+    function wrHostDnsLanRowHtml(lan) {
+        const safeId = escHtml(lan.id);
+        const head = `
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
+                <div>
+                    <strong>${escHtml(lan.name)}</strong>
+                    <span style="color:var(--text-muted); font-size:11px;"> — ${escHtml(lan.interface)} @ ${escHtml(lan.router_ip)}</span>
+                </div>
+                <div style="font-size:11px; color:var(--text-muted);">
+                    mode: <code>${escHtml(lan.mode)}</code> · dnsmasq port: <code>${lan.listen_port}</code>
+                </div>
+            </div>
+        `;
+
+        if (lan.mode === 'external') {
+            return `<div style="padding:8px; border-top:1px solid var(--border);">
+                ${head}
+                <div style="font-size:12px; color:var(--text-muted); margin-top:4px;">
+                    DNS mode is External — dnsmasq runs DHCP-only (port=0), so :53 on this LAN is already free. Change the mode on the LAN editor if you want WolfRouter to serve DNS again.
+                </div>
+            </div>`;
+        }
+
+        // WolfRouter mode: port is the axis of control.
+        if (lan.listen_port === 53) {
+            // On :53 — the common "standing in AdGuard's way" case.
+            return `<div style="padding:8px; border-top:1px solid var(--border);">
+                ${head}
+                <div style="font-size:12px; margin-top:6px;">
+                    dnsmasq is on :53 for this LAN. Move it off to let a container own :53 on <code>${escHtml(lan.interface)}</code>.
+                </div>
+                <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:6px;">
+                    <label style="font-size:12px; color:var(--text-muted); display:flex; gap:6px; align-items:center;">
+                        New port:
+                        <input id="wr-lan-port-${safeId}" type="number" min="1" max="65535" value="5353"
+                            style="width:90px; padding:4px 8px; background:var(--bg-primary); border:1px solid var(--border); border-radius:4px; color:var(--text);"/>
+                    </label>
+                    <label style="font-size:12px; color:var(--text-muted); display:flex; gap:6px; align-items:center;">
+                        Advertise DNS (DHCP opt 6):
+                        <input id="wr-lan-extdns-${safeId}" placeholder="e.g. ${escHtml(lan.router_ip)}"
+                            style="width:160px; padding:4px 8px; background:var(--bg-primary); border:1px solid var(--border); border-radius:4px; color:var(--text);"/>
+                    </label>
+                    <button class="btn btn-sm btn-primary" onclick="wrSetLanDnsPort('${safeId}')">Apply</button>
+                </div>
+            </div>`;
+        }
+
+        // WolfRouter mode on a non-53 port — offer "back to :53" plus
+        // an inline port editor so the operator can tune it without
+        // digging into the LAN editor.
+        return `<div style="padding:8px; border-top:1px solid var(--border);">
+            ${head}
+            <div style="font-size:12px; margin-top:6px;">
+                dnsmasq is on :${lan.listen_port} for this LAN — :53 on <code>${escHtml(lan.interface)}</code> is free for a container.
+            </div>
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:6px;">
+                <label style="font-size:12px; color:var(--text-muted); display:flex; gap:6px; align-items:center;">
+                    Change port:
+                    <input id="wr-lan-port-${safeId}" type="number" min="1" max="65535" value="${lan.listen_port}"
+                        style="width:90px; padding:4px 8px; background:var(--bg-primary); border:1px solid var(--border); border-radius:4px; color:var(--text);"/>
+                </label>
+                <label style="font-size:12px; color:var(--text-muted); display:flex; gap:6px; align-items:center;">
+                    Advertise DNS (DHCP opt 6):
+                    <input id="wr-lan-extdns-${safeId}" placeholder="required when port ≠ 53"
+                        style="width:160px; padding:4px 8px; background:var(--bg-primary); border:1px solid var(--border); border-radius:4px; color:var(--text);"/>
+                </label>
+                <button class="btn btn-sm" onclick="wrSetLanDnsPort('${safeId}')">Apply</button>
+                <button class="btn btn-sm" onclick="wrSetLanDnsPortTo53('${safeId}')">Back to :53</button>
+            </div>
+        </div>`;
+    }
+
+    /// Apply the new dnsmasq DNS port for one LAN. Reads the per-LAN
+    /// port + external_server inputs, posts to the new backend
+    /// endpoint, surfaces the result in the shared status line, then
+    /// re-polls to show the new state.
+    async function wrSetLanDnsPort(lanId) {
+        const portEl = document.getElementById(`wr-lan-port-${lanId}`);
+        const extEl = document.getElementById(`wr-lan-extdns-${lanId}`);
+        const out = document.getElementById('wr-host-dns-result');
+        const port = parseInt(portEl?.value || '0', 10);
+        const externalServer = (extEl?.value || '').trim();
+        if (!port || port < 1 || port > 65535) {
+            if (out) out.innerHTML = `<span style="color:#ef4444;">Port must be a number between 1 and 65535.</span>`;
+            return;
+        }
+        if (port !== 53 && !externalServer) {
+            if (out) out.innerHTML = `<span style="color:#ef4444;">When port isn't 53, a DHCP option-6 DNS server is required (typically your AdGuard/Pi-hole container IP).</span>`;
+            return;
+        }
+        const confirmMsg = port === 53
+            ? `Move this LAN's dnsmasq back to port 53? Any container currently bound to :53 on this LAN's interface will conflict.`
+            : `Move this LAN's dnsmasq from :53 to :${port} and advertise ${externalServer} via DHCP option 6? dnsmasq will restart.`;
+        if (!(await showConfirm(confirmMsg))) return;
+        const nodeId = wrToolsSelectedNodeId();
+        const url = await wrNodeUrl(nodeId, '/api/router/host-dns/lan-dns-port');
+        if (out) out.innerHTML = '<span style="color:var(--text-muted);">Applying…</span>';
+        try {
+            const r = await fetch(url, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ lan_id: lanId, new_port: port, external_server: externalServer || null }),
+            });
+            const data = await r.json().catch(() => ({}));
+            if (!r.ok || data.ok === false) {
+                if (out) out.innerHTML = `<span style="color:#ef4444;">Failed: ${escHtml(data.error || ('HTTP ' + r.status))}</span>`;
+                return;
+            }
+            if (out) out.innerHTML = `<span style="color:#10b981;">${escHtml(data.message || 'Applied')}</span>`;
+        } catch (e) {
+            if (out) out.innerHTML = `<span style="color:#ef4444;">Error: ${escHtml(e.message || String(e))}</span>`;
+        }
+        setTimeout(wrHostDnsRefresh, 400);
+    }
+    window.wrSetLanDnsPort = wrSetLanDnsPort;
+
+    /// Convenience helper: move a LAN's dnsmasq DNS back to :53. No
+    /// external_server needed (DHCP opt 6 on :53 is implicit).
+    async function wrSetLanDnsPortTo53(lanId) {
+        const out = document.getElementById('wr-host-dns-result');
+        if (!(await showConfirm(`Move this LAN's dnsmasq back to port 53? Any container currently bound to :53 on this LAN's interface will conflict.`))) return;
+        const nodeId = wrToolsSelectedNodeId();
+        const url = await wrNodeUrl(nodeId, '/api/router/host-dns/lan-dns-port');
+        if (out) out.innerHTML = '<span style="color:var(--text-muted);">Applying…</span>';
+        try {
+            const r = await fetch(url, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ lan_id: lanId, new_port: 53 }),
+            });
+            const data = await r.json().catch(() => ({}));
+            if (!r.ok || data.ok === false) {
+                if (out) out.innerHTML = `<span style="color:#ef4444;">Failed: ${escHtml(data.error || ('HTTP ' + r.status))}</span>`;
+                return;
+            }
+            if (out) out.innerHTML = `<span style="color:#10b981;">${escHtml(data.message || 'Applied')}</span>`;
+        } catch (e) {
+            if (out) out.innerHTML = `<span style="color:#ef4444;">Error: ${escHtml(e.message || String(e))}</span>`;
+        }
+        setTimeout(wrHostDnsRefresh, 400);
+    }
+    window.wrSetLanDnsPortTo53 = wrSetLanDnsPortTo53;
 
     /// Disable systemd-resolved's stub listener and redirect
     /// /etc/resolv.conf at the chosen upstream on the currently

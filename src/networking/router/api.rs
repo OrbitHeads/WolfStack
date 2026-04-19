@@ -2498,22 +2498,32 @@ pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
         .route("/api/router/wan/{id}",     web::delete().to(delete_wan))
         .route("/api/router/wan-status",   web::get().to(wan_status))
         .route("/api/router/interface-up", web::post().to(interface_up))
-        .route("/api/router/host-dns",         web::get().to(get_host_dns))
-        .route("/api/router/host-dns/release", web::post().to(release_host_dns))
-        .route("/api/router/host-dns/restore", web::post().to(restore_host_dns));
+        .route("/api/router/host-dns",              web::get().to(get_host_dns))
+        .route("/api/router/host-dns/release",      web::post().to(release_host_dns))
+        .route("/api/router/host-dns/restore",      web::post().to(restore_host_dns))
+        .route("/api/router/host-dns/lan-dns-port", web::post().to(set_lan_dns_port));
 }
 
 /// GET /api/router/host-dns — detect what's holding port 53 on this
 /// node. Read-only. Returns the HostDnsStatus struct from host_dns::detect.
+///
+/// Snapshots the LAN list before handing to a blocking task so the
+/// detect function can report per-LAN WolfRouter DNS mode/port without
+/// racing against concurrent config writes.
 async fn get_host_dns(
     req: actix_web::HttpRequest,
     state: actix_web::web::Data<crate::api::AppState>,
 ) -> actix_web::HttpResponse {
     if let Err(resp) = crate::api::require_auth(&req, &state) { return resp; }
-    let status = tokio::task::spawn_blocking(super::host_dns::detect)
+    let lans = state.router.config.read().unwrap().lans.clone();
+    let self_id = crate::agent::self_node_id();
+    let status = tokio::task::spawn_blocking(move || super::host_dns::detect(&lans, &self_id))
         .await.unwrap_or_else(|_| super::host_dns::HostDnsStatus {
-            resolver: "error".into(), port_53_owner: None, stub_listener: false,
+            resolver: "error".into(), port_53_owner: None,
+            port_53_bindings: Vec::new(),
+            stub_listener: false,
             release_applied: false, wolfrouter_owns_53: false,
+            wolfrouter_lans: Vec::new(),
             resolv_conf_servers: Vec::new(),
             distro: "unknown".into(), network_manager_active: false,
             resolv_conf_immutable: false, tools_ok: false,
@@ -2566,4 +2576,102 @@ async fn restore_host_dns(
         Ok(msg) => actix_web::HttpResponse::Ok().json(serde_json::json!({ "ok": true, "message": msg })),
         Err(e) => actix_web::HttpResponse::BadRequest().json(serde_json::json!({ "ok": false, "error": e })),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct SetLanDnsPortRequest {
+    lan_id: String,
+    /// New dnsmasq port for this LAN. 5353 is the common "move out of
+    /// AdGuard's way" value; anything 1..=65535 is accepted. Hitting
+    /// 53 here is effectively a no-op unless the LAN was previously
+    /// moved.
+    new_port: u16,
+    /// DNS server to advertise via DHCP option 6 once dnsmasq is off
+    /// :53. Required when new_port != 53 because DHCP can't signal a
+    /// non-standard port — clients would try router_ip:53 and get
+    /// nothing. Typically the AdGuard/Pi-hole container IP.
+    #[serde(default)]
+    external_server: Option<String>,
+}
+
+/// POST /api/router/host-dns/lan-dns-port — move one WolfRouter LAN's
+/// dnsmasq DNS listener off :53 (or back onto it) so a containerised
+/// resolver can claim :53 on that LAN's interface. Restarts that
+/// LAN's dnsmasq to apply.
+///
+/// This is the per-LAN counterpart to the systemd-resolved stub
+/// release: both may be needed to fully vacate :53 on a host that
+/// runs both WolfRouter's dnsmasq and systemd-resolved's stub.
+async fn set_lan_dns_port(
+    req: actix_web::HttpRequest,
+    state: actix_web::web::Data<crate::api::AppState>,
+    body: actix_web::web::Json<SetLanDnsPortRequest>,
+) -> actix_web::HttpResponse {
+    if let Err(resp) = crate::api::require_auth(&req, &state) { return resp; }
+    if body.new_port == 0 {
+        return actix_web::HttpResponse::BadRequest().json(serde_json::json!({
+            "ok": false,
+            "error": "new_port must be between 1 and 65535 (use DNS mode 'External' to disable dnsmasq DNS entirely)",
+        }));
+    }
+    let external = body.external_server.as_deref().map(str::trim).unwrap_or("").to_string();
+    if body.new_port != 53 && external.is_empty() {
+        return actix_web::HttpResponse::BadRequest().json(serde_json::json!({
+            "ok": false,
+            "error": "external_server is required when new_port isn't 53 — DHCP option 6 can only advertise a DNS server on the standard port, so clients need to be pointed at a resolver they can reach (typically the AdGuard/Pi-hole container IP).",
+        }));
+    }
+    // Update the LAN in place, validate it, save, restart dnsmasq if
+    // we own the LAN. Lock is dropped before the restart for the same
+    // reason as set_query_log above (don't stall readers on spawn).
+    let updated_lan = {
+        let mut cfg = state.router.config.write().unwrap();
+        let seg = match cfg.lans.iter_mut().find(|l| l.id == body.lan_id) {
+            Some(s) => s,
+            None => return actix_web::HttpResponse::NotFound().json(serde_json::json!({
+                "ok": false, "error": "LAN not found",
+            })),
+        };
+        seg.dns.listen_port = body.new_port;
+        if !external.is_empty() {
+            seg.dns.external_server = Some(external.clone());
+        } else if body.new_port == 53 {
+            // Reverting to :53 without an explicit external_server ==
+            // "back to defaults" — DHCP option 6 should advertise the
+            // router IP again, not the old container IP from when the
+            // LAN was temporarily moved to a non-standard port.
+            seg.dns.external_server = None;
+        }
+        let snapshot = seg.clone();
+        if let Err(e) = validate_segment(&snapshot) {
+            return actix_web::HttpResponse::BadRequest().json(serde_json::json!({
+                "ok": false, "error": e,
+            }));
+        }
+        if let Err(e) = cfg.save() {
+            return actix_web::HttpResponse::InternalServerError().json(serde_json::json!({
+                "ok": false, "error": format!("save: {}", e),
+            }));
+        }
+        snapshot
+    };
+    if updated_lan.node_id == crate::agent::self_node_id() {
+        if let Err(e) = dhcp::start(&updated_lan) {
+            return actix_web::HttpResponse::InternalServerError().json(serde_json::json!({
+                "ok": false, "error": format!("restart dnsmasq: {}", e),
+            }));
+        }
+    }
+    replicate_config_to_cluster(state.clone());
+    let msg = if body.new_port == 53 {
+        format!("LAN '{}' dnsmasq DNS is back on port 53. Clients will resolve via WolfRouter directly again.", updated_lan.name)
+    } else {
+        format!(
+            "LAN '{}' dnsmasq moved to port {}. Port 53 on {} is now free for a containerised resolver. DHCP option 6 points clients at {}.",
+            updated_lan.name, body.new_port, updated_lan.interface, external,
+        )
+    };
+    actix_web::HttpResponse::Ok().json(serde_json::json!({
+        "ok": true, "message": msg,
+    }))
 }
