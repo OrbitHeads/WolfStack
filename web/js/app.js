@@ -39204,18 +39204,80 @@ async function cpReload() {
     if (_cpLoading) return;
     _cpLoading = true;
     const status = document.getElementById('cp-status-line');
-    if (status) status.textContent = 'Loading inventory…';
+    if (status) status.textContent = 'Loading inventory across clusters…';
     try {
-        const [invResp, grpResp] = await Promise.all([
+        // Step 1 — local cluster aggregate (our own backend fans out
+        // across our WolfStack cluster's nodes + their PVE guests).
+        const [localInvResp, grpResp] = await Promise.all([
             fetch('/api/control-panel/inventory'),
             fetch('/api/control-panel/groups'),
         ]);
-        if (!invResp.ok) throw new Error('inventory HTTP ' + invResp.status);
+        if (!localInvResp.ok) throw new Error('inventory HTTP ' + localInvResp.status);
         if (!grpResp.ok) throw new Error('groups HTTP ' + grpResp.status);
-        const inv = await invResp.json();
+        const localInv = await localInvResp.json();
         const grp = await grpResp.json();
-        _cpInventory = inv.items || [];
-        _cpErrors = inv.errors || [];
+
+        // Step 2 — identify every OTHER cluster we know about. For each
+        // remote cluster, route through one online node of that cluster
+        // via the existing /api/nodes/{id}/proxy/... proxy; that remote
+        // aggregator handles its own cluster's fan-out, including PVE
+        // guests on nodes we've never authed against directly.
+        const selfNode = (typeof allNodes !== 'undefined' ? allNodes : []).find(n => n.is_self);
+        const selfCluster = selfNode?.cluster_name || 'WolfStack';
+        const clustersSeen = new Set([selfCluster]);
+        const remoteGateways = [];  // one chosen node per remote cluster
+        for (const n of (typeof allNodes !== 'undefined' ? allNodes : [])) {
+            const c = n.cluster_name || 'WolfStack';
+            if (clustersSeen.has(c)) continue;
+            if (n.online) {
+                clustersSeen.add(c);
+                remoteGateways.push({ cluster: c, node: n });
+            }
+        }
+
+        if (status) {
+            status.textContent = remoteGateways.length > 0
+                ? `Fanning out across ${remoteGateways.length + 1} clusters…`
+                : 'Loading inventory…';
+        }
+
+        // Step 3 — parallel per-cluster inventory fetches.
+        const remoteResults = await Promise.all(remoteGateways.map(async g => {
+            try {
+                const url = `/api/nodes/${encodeURIComponent(g.node.id)}/proxy/api/control-panel/inventory`;
+                const resp = await fetch(url);
+                if (!resp.ok) return { cluster: g.cluster, error: 'HTTP ' + resp.status, items: [], errors: [] };
+                const j = await resp.json();
+                return { cluster: g.cluster, items: j.items || [], errors: j.errors || [] };
+            } catch (e) {
+                return { cluster: g.cluster, error: e.message, items: [], errors: [] };
+            }
+        }));
+
+        // Step 4 — merge, deduping on the item's stable key. Each
+        // cluster's aggregator only reports its own nodes, so duplicates
+        // shouldn't happen in practice, but a stale cluster_name somewhere
+        // could leak an item into two aggregators. Better safe.
+        const merged = [];
+        const seen = new Set();
+        const pushUnique = (items) => {
+            for (const it of items) {
+                const k = `${it.node_id}|${it.kind}|${it.name}`;
+                if (seen.has(k)) continue;
+                seen.add(k);
+                merged.push(it);
+            }
+        };
+        pushUnique(localInv.items || []);
+        _cpErrors = (localInv.errors || []).slice();
+        for (const r of remoteResults) {
+            pushUnique(r.items);
+            _cpErrors.push(...r.errors);
+            if (r.error) {
+                _cpErrors.push({ node_hostname: r.cluster, kind: 'cluster', error: r.error });
+            }
+        }
+        _cpInventory = merged;
         _cpGroups = (grp.groups || []).slice().sort((a, b) => (a.order || 0) - (b.order || 0));
         cpRender();
     } catch (e) {

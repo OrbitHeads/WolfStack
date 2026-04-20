@@ -3804,9 +3804,28 @@ pub async fn control_panel_inventory(req: HttpRequest, state: web::Data<AppState
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+
+    // Determine this node's cluster so we only aggregate our own — the
+    // caller (frontend) federates across clusters by calling each
+    // cluster's aggregator in parallel via the proxy route. Without
+    // this filter, a cross-cluster proxy call would re-aggregate every
+    // known node (from every cluster) and duplicate items.
+    let self_cluster: String = state.cluster.get_all_nodes()
+        .iter()
+        .find(|n| n.is_self)
+        .and_then(|n| n.cluster_name.clone().or(n.pve_cluster_name.clone()))
+        .unwrap_or_else(|| "WolfStack".to_string());
+
     let nodes: Vec<_> = state.cluster.get_all_nodes()
         .into_iter()
-        .filter(|n| n.is_self || (n.online && now.saturating_sub(n.last_seen) < 300))
+        .filter(|n| {
+            let reachable = n.is_self || (n.online && now.saturating_sub(n.last_seen) < 300);
+            if !reachable { return false; }
+            let node_cluster = n.cluster_name.clone()
+                .or(n.pve_cluster_name.clone())
+                .unwrap_or_else(|| "WolfStack".to_string());
+            node_cluster == self_cluster
+        })
         .collect();
     let secret = state.cluster_secret.clone();
     let client = reqwest::Client::builder()
