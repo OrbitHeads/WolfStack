@@ -436,6 +436,25 @@ fi
 mkdir -p /etc/wolfstack/s3 /etc/wolfstack/pbs /mnt/wolfstack /var/cache/wolfstack/s3
 echo "✓ Storage directories configured"
 
+# Lock down /etc/wolfstack — it holds the cluster secret, PVE API
+# tokens inside nodes.json, the join-token, and license.key. Before
+# v18.7.27 these files were world-readable (inherited process umask),
+# which let any unprivileged local user impersonate a cluster member
+# or siphon PVE credentials. The running binary also enforces this
+# on startup (paths::harden_existing); tightening here too closes
+# the window on very first install before wolfstack has started.
+chmod 700 /etc/wolfstack 2>/dev/null || true
+for f in /etc/wolfstack/custom-cluster-secret \
+         /etc/wolfstack/cluster-secret \
+         /etc/wolfstack/nodes.json \
+         /etc/wolfstack/join-token \
+         /etc/wolfstack/license.key \
+         /etc/wolfstack/key.pem; do
+    if [ -e "$f" ]; then
+        chmod 600 "$f" 2>/dev/null || true
+    fi
+done
+
 # ─── Install Docker if missing ──────────────────────────────────────────────
 if ! command -v docker >/dev/null 2>&1; then
     echo ""

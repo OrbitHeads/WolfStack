@@ -69,13 +69,14 @@ pub fn generate_cluster_secret() -> String {
     secret
 }
 
-/// Save a cluster secret to the custom secret file
+/// Save a cluster secret to the custom secret file. Written with mode
+/// 0600 — the secret is the cluster's inter-node auth token, so any
+/// non-root reader can impersonate a cluster member. Pre-v18.7.27 this
+/// used `std::fs::write` which inherited the process umask (usually
+/// 022 → 0644) and made the secret world-readable.
 pub fn save_cluster_secret(secret: &str) -> Result<(), String> {
     let path = custom_secret_path();
-    if let Some(parent) = std::path::Path::new(&path).parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    std::fs::write(&path, secret)
+    crate::paths::write_secure(&path, secret)
         .map_err(|e| format!("Cannot write custom-cluster-secret: {}", e))
 }
 

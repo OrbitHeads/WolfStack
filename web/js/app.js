@@ -7930,7 +7930,12 @@ async function upgradeNode(nodeId) {
     if (!node) return;
 
     const machine = node.is_self ? 'this machine (local)' : (node.hostname + ' (' + node.address + ')');
-    if (!(await showConfirm('⚡ Upgrade WolfStack on ' + machine + '?\n\nThis will run the upgrade script in the background.\n\nProgress will be tracked in the task log.\n\nProceed?'))) return;
+    if (!(await showConfirm('⚡ Upgrade WolfStack on ' + machine + '?\n\n'
+        + 'The upgrade runs in the background and may take several minutes '
+        + '(up to ~50 minutes on slow hardware like a Raspberry Pi). '
+        + 'The server will restart automatically once the new binary is built. '
+        + 'You can safely close this modal — progress is tracked in the task log '
+        + 'and survives a browser refresh.\n\nProceed?'))) return;
 
     // Record current version for comparison
     const oldVersion = node.metrics?.hostname ? (allNodes.find(n => n.id === nodeId)?.metrics?.hostname || '') : '';
@@ -17487,42 +17492,96 @@ function copyInstallCmd(component) {
 }
 
 async function toggleDockerAutostart(id, enabled) {
+    // The bug this guard fixes: previously this function awaited the
+    // fetch and unconditionally showed a green "enabled/disabled" toast,
+    // even when the backend returned 4xx/5xx. The user saw "enabled",
+    // refreshed the page, and the checkbox was empty because Docker had
+    // never actually had its restart policy changed. Now we check
+    // response.ok, surface the backend's error verbatim on failure,
+    // and re-fetch the list so the checkbox always shows the *actual*
+    // committed state — never the user's intent.
+    let r;
     try {
-        await fetch(apiUrl(`/api/containers/docker/${encodeURIComponent(id)}/config`), {
+        r = await fetch(apiUrl(`/api/containers/docker/${encodeURIComponent(id)}/config`), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ autostart: enabled })
         });
-        showToast(`Docker autostart ${enabled ? 'enabled' : 'disabled'}`, 'success');
     } catch (e) {
-        showToast('Error: ' + e.message, 'error');
+        showToast('Autostart change failed: ' + e.message, 'error');
+        if (typeof loadDockerContainers === 'function') loadDockerContainers();
+        return;
     }
+    if (!r.ok) {
+        let detail = `HTTP ${r.status}`;
+        try {
+            const errBody = await r.json();
+            if (errBody?.error) detail = errBody.error;
+        } catch (_) { /* not JSON, keep status */ }
+        showToast(`Autostart change rejected: ${detail}`, 'error');
+        if (typeof loadDockerContainers === 'function') loadDockerContainers();
+        return;
+    }
+    showToast(`Docker autostart ${enabled ? 'enabled' : 'disabled'}`, 'success');
+    if (typeof loadDockerContainers === 'function') loadDockerContainers();
 }
 
 async function toggleLxcAutostart(name, enabled) {
+    // Same honesty fix as toggleDockerAutostart — check response.ok,
+    // surface backend errors, refresh so the checkbox reflects the
+    // actual committed state.
+    let r;
     try {
-        await fetch(apiUrl(`/api/containers/lxc/${encodeURIComponent(name)}/autostart`), {
+        r = await fetch(apiUrl(`/api/containers/lxc/${encodeURIComponent(name)}/autostart`), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ enabled: enabled })
         });
-        showToast(`LXC autostart ${enabled ? 'enabled' : 'disabled'}`, 'success');
     } catch (e) {
-        showToast('Error: ' + e.message, 'error');
+        showToast('Autostart change failed: ' + e.message, 'error');
+        if (typeof loadLxcContainers === 'function') loadLxcContainers();
+        return;
     }
+    if (!r.ok) {
+        let detail = `HTTP ${r.status}`;
+        try {
+            const errBody = await r.json();
+            if (errBody?.error) detail = errBody.error;
+        } catch (_) { /* not JSON */ }
+        showToast(`Autostart change rejected: ${detail}`, 'error');
+        if (typeof loadLxcContainers === 'function') loadLxcContainers();
+        return;
+    }
+    showToast(`LXC autostart ${enabled ? 'enabled' : 'disabled'}`, 'success');
+    if (typeof loadLxcContainers === 'function') loadLxcContainers();
 }
 
 async function toggleVmAutostart(name, enabled) {
+    // Same honesty fix as toggleDockerAutostart.
+    let r;
     try {
-        await fetch(apiUrl(`/api/vms/${encodeURIComponent(name)}`), {
+        r = await fetch(apiUrl(`/api/vms/${encodeURIComponent(name)}`), {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ auto_start: enabled })
         });
-        showToast(`VM autostart ${enabled ? 'enabled' : 'disabled'}`, 'success');
     } catch (e) {
-        showToast('Error: ' + e.message, 'error');
+        showToast('Autostart change failed: ' + e.message, 'error');
+        if (typeof loadVms === 'function') loadVms();
+        return;
     }
+    if (!r.ok) {
+        let detail = `HTTP ${r.status}`;
+        try {
+            const errBody = await r.json();
+            if (errBody?.error) detail = errBody.error;
+        } catch (_) { /* not JSON */ }
+        showToast(`Autostart change rejected: ${detail}`, 'error');
+        if (typeof loadVms === 'function') loadVms();
+        return;
+    }
+    showToast(`VM autostart ${enabled ? 'enabled' : 'disabled'}`, 'success');
+    if (typeof loadVms === 'function') loadVms();
 }
 
 // ─── Backup Management ───
@@ -22213,7 +22272,10 @@ async function issuesUpgradeNode(nodeId) {
 
     try {
         await showIssuesConfirm('\u26A1', 'Upgrade WolfStack on ' + escapeHtml(name) + '?',
-            'This will run the upgrade script in the background. The server will restart automatically when complete.',
+            'The upgrade runs in the background and may take several minutes '
+            + '(up to ~50 minutes on slow hardware like a Raspberry Pi). '
+            + 'The server will restart automatically once the new binary is built. '
+            + 'Progress is tracked in the task log and survives a browser refresh.',
             [], '\u26A1 Upgrade', '#f59e0b');
     } catch (e) { return; }
 
@@ -22256,7 +22318,11 @@ async function issuesUpgradeAll() {
     var nodeList = targets.map(function (r) { return '\uD83D\uDDA5\uFE0F ' + escapeHtml(r.hostname || r.node_id) + ' (v' + (r.version || '?') + ')'; });
     try {
         await showIssuesConfirm('\u26A1', 'Upgrade ' + targets.length + ' Server' + (targets.length !== 1 ? 's' : '') + '?',
-            'This will trigger a background upgrade on <strong>all</strong> nodes.', nodeList, '\u26A1 Upgrade All', '#f59e0b');
+            'Each node runs its upgrade independently in the background — <strong>fan-out, not sequential</strong>. '
+            + 'Typical completion is a few minutes per node; slow hardware (Raspberry Pi, low-core VPS) can take up to ~50 minutes. '
+            + 'Each server restarts automatically once its new binary is built. '
+            + 'Progress is tracked in the task log and persists across browser refresh.',
+            nodeList, '\u26A1 Upgrade All', '#f59e0b');
     } catch (e) { return; }
 
     var modal = showProgressModal('\u26A1', 'Upgrading ' + targets.length + ' Server' + (targets.length !== 1 ? 's' : ''));

@@ -199,12 +199,12 @@ pub fn load_join_token() -> String {
     for b in &random_bytes {
         let _ = write!(token, "{:02x}", b);
     }
-    // Save it
-    let _ = std::fs::create_dir_all("/etc/wolfstack");
-    if let Err(e) = std::fs::write(path, &token) {
+    // Save it with mode 0600. Pre-v18.7.27 the token was world-readable;
+    // a local user could read it and forge a rogue cluster join request
+    // against any other node. write_secure enforces 0600 even if the
+    // file already exists with looser perms.
+    if let Err(e) = crate::paths::write_secure(path.to_str().unwrap_or("/etc/wolfstack/join-token"), &token) {
         warn!("Could not save join token to {}: {}", path.display(), e);
-    } else {
-
     }
     token
 }
@@ -4393,6 +4393,7 @@ async fn lxc_remote_clone(
                     login_disabled: false,
                     tls: false,
                     update_script: None,
+                    self_id: None,
                 }
             } else {
                 return HttpResponse::NotFound().json(serde_json::json!({"error": "Target node not found"}));
@@ -12216,7 +12217,12 @@ pub async fn k8s_create_cluster(req: HttpRequest, state: web::Data<AppState>, bo
         let dir = "/etc/wolfstack/kubernetes";
         let _ = std::fs::create_dir_all(dir);
         let path = format!("{}/{}.yaml", dir, id);
-        if let Err(e) = std::fs::write(&path, &body.kubeconfig) {
+        // Kubeconfig carries the cluster CA cert and a bearer token
+        // with (typically) full cluster-admin rights. Even though
+        // /etc/wolfstack is now 0700, belt-and-braces: write the file
+        // itself as 0600 so a later accidental dir-perm loosening
+        // doesn't leak admin credentials to local users.
+        if let Err(e) = crate::paths::write_secure(&path, &body.kubeconfig) {
             return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Failed to save kubeconfig: {}", e) }));
         }
         (path, body.kubeconfig.clone())

@@ -5680,12 +5680,41 @@
         try {
             const r = await fetch(url);
             if (!r.ok) {
-                body.innerHTML = `<span style="color:#ef4444;">Dependency check failed: HTTP ${r.status}</span>`;
+                // Degrade gracefully — the dep check is a nice-to-have, not
+                // a blocker. The Host DNS panel above this one is fully
+                // independent and still works. Two common 404 causes worth
+                // calling out explicitly so the operator knows what to do:
+                //   - 404 with `{"error":"Node not found"}`: the proxy
+                //     couldn't resolve the picked node's id (cluster state
+                //     out of sync).
+                //   - 404 from the remote with no body: the remote is on
+                //     an older WolfStack that lacks /api/system/deps/check
+                //     (added v18.7.25). Tell the operator to upgrade.
+                let detail = `HTTP ${r.status}`;
+                try {
+                    const errBody = await r.clone().json();
+                    if (errBody?.error) detail += ` — ${errBody.error}`;
+                } catch (_) { /* not JSON, leave the status alone */ }
+                let hint = '';
+                if (r.status === 404) {
+                    hint = ' This usually means the selected node is on a WolfStack version older than v18.7.25 (which added the dep check), or its id is no longer in the cluster state. The Host DNS panel above still works regardless.';
+                }
+                body.innerHTML = `
+                    <div style="color:#f59e0b; font-size:12px;">
+                        Dependency check unavailable on this node (${escHtml(detail)}).${escHtml(hint)}
+                    </div>`;
                 return;
             }
             data = await r.json();
         } catch (e) {
-            body.innerHTML = `<span style="color:#ef4444;">Dependency check errored: ${escHtml(e.message || String(e))}</span>`;
+            // Network-level failure (proxy died, TLS handshake failed,
+            // etc.). Same graceful-degradation principle — the dep check
+            // is independent from the Host DNS panel and should never
+            // hide it behind a red error.
+            body.innerHTML = `
+                <div style="color:#f59e0b; font-size:12px;">
+                    Dependency check unreachable: ${escHtml(e.message || String(e))}. The Host DNS panel above still works.
+                </div>`;
             return;
         }
 

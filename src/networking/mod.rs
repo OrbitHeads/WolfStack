@@ -2613,16 +2613,23 @@ pub fn apply_wireguard_bridge(bridge: &WireGuardBridge) -> Result<(), String> {
         .args(["device", "set", &iface, "managed", "no"])
         .output();
 
-    // Write private key to temp file for wg setconf
+    // Write private key to a temp file for `wg set` — wg refuses to read
+    // the key from stdin or an argument, so we MUST stage it on disk
+    // briefly. /tmp is world-readable, so the file is created with
+    // mode 0600 via write_secure and removed immediately after wg
+    // consumes it. Pre-v18.7.27 this used plain fs::write which
+    // inherited umask 022 → the private key was world-readable for the
+    // duration of the wg call.
     let key_path = format!("/tmp/wg-{}-key", iface);
-    std::fs::write(&key_path, &bridge.private_key)
+    crate::paths::write_secure(&key_path, &bridge.private_key)
         .map_err(|e| format!("Failed to write key: {}", e))?;
 
     // Set private key and listen port
-    run_cmd("wg", &["set", &iface, "private-key", &key_path, "listen-port", &bridge.listen_port.to_string()])?;
+    let set_result = run_cmd("wg", &["set", &iface, "private-key", &key_path, "listen-port", &bridge.listen_port.to_string()]);
 
-    // Clean up key file
+    // Clean up key file even on error — don't leave a private key in /tmp.
     let _ = std::fs::remove_file(&key_path);
+    set_result?;
 
     // Set IP address (flush first to avoid duplicates)
     let _ = Command::new("ip").args(["addr", "flush", "dev", &iface]).output();

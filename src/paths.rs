@@ -244,3 +244,92 @@ pub fn update(locs: FileLocations) -> Result<(), String> {
     *LOCATIONS.write().unwrap() = locs;
     Ok(())
 }
+
+// ── Secure-write helpers ─────────────────────────────────────────────
+//
+// Prior to v18.7.27 every `std::fs::write` in the codebase inherited
+// the process umask (typically 022), so secrets like the cluster
+// secret, PVE tokens in nodes.json, and the join-token were created
+// world-readable (0644). Any unprivileged local user could read them.
+// These helpers plug that hole for NEW writes; `harden_existing()`
+// fixes installs that already have the bad permissions.
+
+/// Write a file with mode 0600 (owner-only). Used for anything
+/// carrying credentials or auth tokens — cluster secret, join-token,
+/// nodes.json (which contains pve_token fields), license.key.
+///
+/// Creates parent directories with mode 0700 as needed. On non-Unix
+/// platforms mode is ignored (WolfStack is Linux-only in practice
+/// but the code stays portable).
+pub fn write_secure(path: &str, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    use std::io::Write;
+    // Ensure parent exists. We don't chmod the parent here — that's
+    // harden_existing()'s job, done once at startup, so we don't race
+    // with other writers mid-operation.
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true).create(true).truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(contents.as_ref())?;
+        // If the file existed before with looser perms, the mode
+        // argument above is ignored — explicitly enforce 0600 now.
+        let _ = std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600));
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true).create(true).truncate(true)
+            .open(path)?;
+        f.write_all(contents.as_ref())
+    }
+}
+
+/// One-shot: tighten permissions on `/etc/wolfstack` and any known
+/// sensitive file that might already exist with 0644 from a pre-v18.7.27
+/// install. Called once from main at startup. Silent on failure
+/// (best-effort — not every install runs as root all the time, and a
+/// failed chmod shouldn't block boot).
+pub fn harden_existing() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let locs = get();
+        // Directory: 0700 on /etc/wolfstack so the directory listing is
+        // owner-only. Files inside inherit nothing from dir mode, but
+        // a readable dir makes targeted secret-file reads easier for
+        // an attacker even when the files themselves are locked down.
+        if let Ok(meta) = std::fs::metadata(&locs.config_dir) {
+            let _ = std::fs::set_permissions(
+                &locs.config_dir,
+                std::fs::Permissions::from_mode(0o700),
+            );
+            let _ = meta; // silence unused on some toolchains
+        }
+        // Files known to hold credentials or cluster auth state.
+        // Legacy paths are included because old installs may still
+        // carry `/etc/wolfstack/cluster-secret` from v11.26.3 even
+        // though current code writes `custom-cluster-secret`.
+        let sensitive = [
+            locs.cluster_secret.clone(),
+            "/etc/wolfstack/cluster-secret".to_string(),
+            locs.nodes_config.clone(),
+            "/etc/wolfstack/join-token".to_string(),
+            "/etc/wolfstack/license.key".to_string(),
+            locs.tls_key.clone(),
+        ];
+        for path in &sensitive {
+            if std::path::Path::new(path).exists() {
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+}

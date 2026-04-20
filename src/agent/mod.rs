@@ -90,6 +90,15 @@ pub struct Node {
     pub tls: bool,                        // Whether this node serves HTTPS on its main port
     #[serde(default)]
     pub update_script: Option<String>,    // Custom install/update script command
+    /// The peer's own self_id (from its `/etc/wolfstack/node_id`). Captured
+    /// on first successful poll. Cluster.nodes is keyed by a locally-assigned
+    /// `node-{uuid}` ID, but topology / router config / WolfNet endpoints
+    /// stamp responses with the peer's self_id — so cross-node proxy lookups
+    /// must accept either form. `get_node` falls back to a self_id scan when
+    /// the direct key lookup misses; this field is what that scan reads.
+    /// `None` until the first poll succeeds (and forever for self).
+    #[serde(default)]
+    pub self_id: Option<String>,
 }
 
 fn default_node_type() -> String { "wolfstack".to_string() }
@@ -215,10 +224,11 @@ impl ClusterState {
             .collect();
         if let Ok(json) = serde_json::to_string_pretty(&remote_nodes) {
             let path = Self::nodes_file();
-            if let Some(dir) = std::path::Path::new(&path).parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if let Err(e) = std::fs::write(&path, json) {
+            // Written with mode 0600 because each Node row embeds the
+            // peer's pve_token (if any) and pve_fingerprint. Pre-v18.7.27
+            // nodes.json was world-readable — any unprivileged local user
+            // could siphon every PVE API token on the cluster.
+            if let Err(e) = crate::paths::write_secure(&path, json) {
                 warn!("Failed to save nodes: {}", e);
             }
         }
@@ -264,6 +274,10 @@ impl ClusterState {
             login_disabled: prev_login_disabled.or_else(|| Self::load_self_login_disabled()).unwrap_or(false),
             tls: tls_enabled,
             update_script: prev_update_script,
+            // Self's id IS the self_id by construction; the field is for
+            // OTHER nodes' self_ids as observed via polling. Self has no
+            // need to record one.
+            self_id: None,
         });
     }
 
@@ -296,10 +310,17 @@ impl ClusterState {
         }).collect()
     }
 
-    /// Get a single node
+    /// Get a single node by either its locally-assigned cluster key
+    /// (`node-{uuid}`) or its self-reported self_id (from
+    /// `/etc/wolfstack/node_id` on the peer). The direct key lookup
+    /// is the hot path; the self_id scan handles cross-node calls
+    /// where the caller (WolfRouter topology, LAN records, WolfNet
+    /// peer tables) only knows the peer's self_id. Linear scan is
+    /// fine — clusters are tens of nodes, not thousands.
     pub fn get_node(&self, id: &str) -> Option<Node> {
         let nodes = self.nodes.read().unwrap();
-        nodes.get(id).cloned()
+        if let Some(n) = nodes.get(id) { return Some(n.clone()); }
+        nodes.values().find(|n| n.self_id.as_deref() == Some(id)).cloned()
     }
 
     /// Get this node's cluster name
@@ -378,6 +399,8 @@ impl ClusterState {
             login_disabled: false,
             tls: false,
             update_script: None,
+            // Filled in on first successful poll from the peer's status report.
+            self_id: None,
         });
         drop(nodes);
         self.save_nodes();
@@ -699,6 +722,10 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                         login_disabled: node.login_disabled,
                         tls: true, // Proxmox always serves HTTPS
                         update_script: node.update_script.clone(),
+                        // Proxmox nodes don't expose a WolfStack-style self_id;
+                        // their canonical identifier is the locally-assigned
+                        // cluster key, which is what gets used everywhere.
+                        self_id: None,
                     });
 
                     // Reset fail count on success
@@ -753,7 +780,7 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
             {
                 Ok(resp) => {
                     if let Ok(msg) = resp.json::<AgentMessage>().await {
-                        if let AgentMessage::StatusReport { node_id: _, hostname, metrics, components, docker_count, lxc_count, vm_count, public_ip, known_nodes, deleted_ids, wolfnet_ips, has_docker, has_lxc, has_kvm, license_key } = msg {
+                        if let AgentMessage::StatusReport { node_id: peer_self_id, hostname, metrics, components, docker_count, lxc_count, vm_count, public_ip, known_nodes, deleted_ids, wolfnet_ips, has_docker, has_lxc, has_kvm, license_key } = msg {
                             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                             // Detect TLS: HTTP on port+1 means TLS is on the main port,
                             // HTTPS on main port also means TLS. Only plain HTTP on the
@@ -786,6 +813,23 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                                 login_disabled: node.login_disabled,
                                 tls: node_tls,
                                 update_script: node.update_script.clone(),
+                                // Capture the peer's own self_id from its
+                                // status report so cross-node proxy calls
+                                // that arrive with the self_id (topology,
+                                // LAN records) resolve via the get_node
+                                // self_id fallback.
+                                //
+                                // If the peer's report is anomalously empty
+                                // (transient bug, partial config), preserve
+                                // the previously-captured self_id rather
+                                // than wiping it — otherwise a single bad
+                                // poll re-opens the 404 window until the
+                                // next good poll.
+                                self_id: if peer_self_id.is_empty() {
+                                    node.self_id.clone()
+                                } else {
+                                    Some(peer_self_id)
+                                },
                             });
 
                             // Reset fail count on success

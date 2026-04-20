@@ -169,6 +169,13 @@ async fn main() -> std::io::Result<()> {
     // Persists the chosen port back to ports.json so restarts are stable.
     let status_port: u16 = ports::reserve_status_port(&cli.bind, port_cfg.status, 8550..=8599);
 
+    // Lock down /etc/wolfstack and known sensitive files. Pre-v18.7.27
+    // installs left cluster-secret, nodes.json (containing PVE tokens),
+    // join-token, license.key world-readable (0644). This is a no-op on
+    // already-locked-down installs; on upgraded installs it migrates
+    // the permissions in place. See paths::harden_existing for scope.
+    paths::harden_existing();
+
     // Load or generate node ID
     let node_id_file = paths::get().node_id_file;
     let node_id = if let Ok(content) = std::fs::read_to_string(&node_id_file) {

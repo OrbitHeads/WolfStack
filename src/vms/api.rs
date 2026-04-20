@@ -769,6 +769,7 @@ async fn vm_migrate(
                     login_disabled: false,
                     tls: false,
                     update_script: None,
+                    self_id: None,
                 }
             } else {
                 return HttpResponse::NotFound().json(serde_json::json!({"error": "Target node not found"}));
