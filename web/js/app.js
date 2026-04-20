@@ -39225,14 +39225,19 @@ async function cpReload() {
         const selfNode = (typeof allNodes !== 'undefined' ? allNodes : []).find(n => n.is_self);
         const selfCluster = selfNode?.cluster_name || 'WolfStack';
         const clustersSeen = new Set([selfCluster]);
-        const remoteGateways = [];  // one chosen node per remote cluster
+        const remoteGateways = [];  // one WolfStack gateway per remote cluster
+        // Only federate to clusters that have an online WolfStack node
+        // we can proxy through. Proxmox-only clusters don't host the
+        // WolfStack API — our local aggregator reaches their PVE API
+        // directly via the stored token, so they don't need a gateway.
         for (const n of (typeof allNodes !== 'undefined' ? allNodes : [])) {
             const c = n.cluster_name || 'WolfStack';
             if (clustersSeen.has(c)) continue;
-            if (n.online) {
-                clustersSeen.add(c);
-                remoteGateways.push({ cluster: c, node: n });
-            }
+            if (!n.online) continue;
+            const isWolfStack = !n.node_type || n.node_type === 'wolfstack';
+            if (!isWolfStack) continue;
+            clustersSeen.add(c);
+            remoteGateways.push({ cluster: c, node: n });
         }
 
         if (status) {
@@ -40173,110 +40178,93 @@ function cp3dRebuild() {
         : _cpInventory.slice();
     const groupings = mode === 'custom' ? cpBuildCustomRows(filtered) : cpBuildDerivedRows(filtered, mode);
 
-    const ringSpacing = 3.4;
-    const topY = (groupings.length - 1) * ringSpacing / 2;
-    const innerR = 1.1;   // central pillar radius
-    const outerR = 5.0;   // plate outer radius
-    const plateDepth = 0.15;
-    const totalHeight = Math.max(6, groupings.length * ringSpacing + 1.5);
+    // Solid cylinder made of coloured bands, one per group. No gaps —
+    // the bands stacked form a continuous vertical drum. Each band is
+    // a separate object so it can spin independently on its Y axis.
+    const radius = 3.8;
+    const bandHeight = 2.2;
+    const totalHeight = groupings.length * bandHeight;
+    const topY = (groupings.length - 1) * bandHeight / 2;
 
-    // Central pillar — a semi-transparent glass cylinder that all
-    // plates thread onto. Stationary (doesn't spin with any ring).
-    const pillarGeo = new THREE.CylinderGeometry(innerR, innerR, totalHeight, 48, 1, false);
-    const pillarMat = new THREE.MeshStandardMaterial({
-        color: 0x1e293b,
-        roughness: 0.25,
-        metalness: 0.4,
-        transparent: true,
-        opacity: 0.28,
-    });
-    _cp3d.pillar = new THREE.Mesh(pillarGeo, pillarMat);
-    _cp3d.pillar.position.y = 0;
-    _cp3d.scene.add(_cp3d.pillar);
-
-    // Subtle caps at top and bottom to make the pillar feel grounded.
-    const capGeo = new THREE.CylinderGeometry(innerR + 0.2, innerR + 0.2, 0.25, 48);
+    // Thin end-caps so the top/bottom of the drum look finished, not
+    // hollow. Stationary (not parented to any spinning band).
+    const capGeo = new THREE.CylinderGeometry(radius + 0.02, radius + 0.02, 0.08, 64);
     const capMat = new THREE.MeshStandardMaterial({
-        color: 0x334155,
-        roughness: 0.45,
+        color: 0x0f172a,
+        roughness: 0.4,
         metalness: 0.3,
-        transparent: true,
-        opacity: 0.5,
     });
     _cp3d.capTop = new THREE.Mesh(capGeo, capMat);
-    _cp3d.capTop.position.y = totalHeight / 2;
+    _cp3d.capTop.position.y = totalHeight / 2 + 0.04;
     _cp3d.scene.add(_cp3d.capTop);
     _cp3d.capBot = new THREE.Mesh(capGeo, capMat.clone());
-    _cp3d.capBot.position.y = -totalHeight / 2;
+    _cp3d.capBot.position.y = -totalHeight / 2 - 0.04;
     _cp3d.scene.add(_cp3d.capBot);
 
     groupings.forEach((g, idx) => {
-        const y = topY - idx * ringSpacing;
+        const y = topY - idx * bandHeight;
         const shade = cpRowShade(idx);
-        const ring = cp3dMakeRing(g, y, shade, idx, mode, innerR, outerR, plateDepth);
+        const ring = cp3dMakeRing(g, y, shade, idx, mode, radius, bandHeight);
         _cp3d.rings.push(ring);
         _cp3d.scene.add(ring.mesh);
     });
 
-    // Camera — pull back enough to frame the whole column.
-    const frameDist = Math.max(14, 8 + totalHeight * 0.9);
-    _cp3d.camera.position.set(0, 0, frameDist);
+    // Camera — close enough that tiles read clearly; slight up-angle.
+    const frameDist = Math.max(9, 5.5 + totalHeight * 0.55);
+    _cp3d.camera.position.set(0, 0.5, frameDist);
     _cp3d.camera.lookAt(0, 0, 0);
 }
 
-function cp3dMakeRing(rowData, y, shade, idx, mode, innerR, outerR, depth) {
+function cp3dMakeRing(rowData, y, shade, idx, mode, radius, bandHeight) {
     const colour = rowData.colour || cp3dShadeToHex(shade);
 
     const ringGroup = new THREE.Group();
     ringGroup.position.y = y;
     ringGroup.userData = { kind: 'ring', rowId: rowData.id, rowName: rowData.name, mode };
 
-    // Flat annular plate — a proper washer shape extruded from an
-    // outer circle with an inner hole, so it's a solid disc around the
-    // central pillar rather than a floating torus.
-    const shape = new THREE.Shape();
-    shape.absarc(0, 0, outerR, 0, Math.PI * 2, false);
-    const hole = new THREE.Path();
-    hole.absarc(0, 0, innerR, 0, Math.PI * 2, true);
-    shape.holes.push(hole);
-    const plateGeo = new THREE.ExtrudeGeometry(shape, { depth, bevelEnabled: false, curveSegments: 64 });
-    plateGeo.rotateX(-Math.PI / 2);
-    plateGeo.translate(0, -depth / 2, 0);
-
-    const plateMat = new THREE.MeshStandardMaterial({
+    // The band IS the cylinder at this group's height. Solid, opaque,
+    // coloured per group. Stacking the bands forms the drum; each one
+    // spins on its own Y axis when the user drags.
+    const bandGeo = new THREE.CylinderGeometry(radius, radius, bandHeight, 96, 1, false);
+    const bandMat = new THREE.MeshStandardMaterial({
         color: new THREE.Color(colour),
-        roughness: 0.35,
-        metalness: 0.45,
+        roughness: 0.55,
+        metalness: 0.15,
         transparent: true,
-        opacity: 0.38,
+        opacity: 0.92,
     });
-    const plate = new THREE.Mesh(plateGeo, plateMat);
-    ringGroup.add(plate);
+    const band = new THREE.Mesh(bandGeo, bandMat);
+    ringGroup.add(band);
 
-    // Subtle edge accent — a thin ring of brighter colour on the
-    // outer perimeter so the plate reads as a distinct band.
-    const rimGeo = new THREE.TorusGeometry(outerR, 0.04, 8, 96);
-    const rimMat = new THREE.MeshBasicMaterial({
-        color: new THREE.Color(colour),
-        transparent: true,
-        opacity: 0.6,
+    // Thin highlight at the top and bottom edges so band boundaries
+    // read clearly against their neighbours.
+    const edgeGeo = new THREE.TorusGeometry(radius + 0.005, 0.03, 6, 96);
+    const edgeMat = new THREE.MeshBasicMaterial({
+        color: 0x000000, transparent: true, opacity: 0.55,
     });
-    const rim = new THREE.Mesh(rimGeo, rimMat);
-    rim.rotation.x = Math.PI / 2;
-    ringGroup.add(rim);
+    const edgeTop = new THREE.Mesh(edgeGeo, edgeMat);
+    edgeTop.rotation.x = Math.PI / 2;
+    edgeTop.position.y = bandHeight / 2;
+    ringGroup.add(edgeTop);
+    const edgeBot = new THREE.Mesh(edgeGeo, edgeMat.clone());
+    edgeBot.rotation.x = Math.PI / 2;
+    edgeBot.position.y = -bandHeight / 2;
+    ringGroup.add(edgeBot);
 
     const label = cp3dMakeLabelSprite(`${rowData.name}  (${rowData.items.length})`);
-    label.position.set(0, 1.0, 0);
+    label.position.set(0, bandHeight / 2 + 0.6, 0);
     ringGroup.add(label);
 
-    // Tiles around the perimeter — standing upright, facing outward.
+    // Tiles ON the cylinder's outer surface at the band's middle Y.
+    // Offset slightly outward so they don't z-fight with the band.
     const items = [];
     const count = Math.min(rowData.items.length, 60);
+    const tileOffset = 0.02;
     for (let i = 0; i < count; i++) {
         const angle = (i / Math.max(count, 1)) * Math.PI * 2;
         const it = rowData.items[i];
         const plane = cp3dMakeTileSprite(it);
-        plane.position.set(Math.cos(angle) * outerR, 0.05, Math.sin(angle) * outerR);
+        plane.position.set(Math.cos(angle) * (radius + tileOffset), 0, Math.sin(angle) * (radius + tileOffset));
         plane.rotation.y = Math.PI / 2 - angle;
         plane.userData = { kind: 'tile', item: it };
         ringGroup.add(plane);
@@ -40395,7 +40383,10 @@ function cp3dMakeTileSprite(item) {
     const tex = new THREE.CanvasTexture(canvas);
     tex.needsUpdate = true;
     const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide, depthWrite: false });
-    const geo = new THREE.PlaneGeometry(1.1, 1.1);
+    // Large enough to read at typical camera distance (~10 world units
+    // from the camera to the front of the drum). Below this, the 256px
+    // canvas texture starts to alias.
+    const geo = new THREE.PlaneGeometry(1.6, 1.6);
     return new THREE.Mesh(geo, mat);
 }
 

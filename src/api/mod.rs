@@ -3805,15 +3805,23 @@ pub async fn control_panel_inventory(req: HttpRequest, state: web::Data<AppState
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    // Determine this node's cluster so we only aggregate our own — the
-    // caller (frontend) federates across clusters by calling each
-    // cluster's aggregator in parallel via the proxy route. Without
-    // this filter, a cross-cluster proxy call would re-aggregate every
-    // known node (from every cluster) and duplicate items.
+    // Cluster filtering rules:
+    //
+    // * WolfStack nodes (node_type == "wolfstack" or empty): only
+    //   aggregate members of OUR own cluster. Other WolfStack clusters
+    //   are reached by the frontend via proxy; without this filter, a
+    //   cross-cluster proxy call would re-aggregate everything and
+    //   duplicate items.
+    //
+    // * Proxmox nodes (node_type == "proxmox"): the local WolfStack
+    //   holds the PVE token and queries them directly — they aren't
+    //   reachable as a WolfStack proxy gateway (they don't run the
+    //   WolfStack API). So aggregate ALL registered PVE nodes
+    //   regardless of their pve_cluster_name.
     let self_cluster: String = state.cluster.get_all_nodes()
         .iter()
         .find(|n| n.is_self)
-        .and_then(|n| n.cluster_name.clone().or(n.pve_cluster_name.clone()))
+        .and_then(|n| n.cluster_name.clone())
         .unwrap_or_else(|| "WolfStack".to_string());
 
     let nodes: Vec<_> = state.cluster.get_all_nodes()
@@ -3821,8 +3829,13 @@ pub async fn control_panel_inventory(req: HttpRequest, state: web::Data<AppState
         .filter(|n| {
             let reachable = n.is_self || (n.online && now.saturating_sub(n.last_seen) < 300);
             if !reachable { return false; }
+            if n.node_type == "proxmox" {
+                // Always include PVE nodes — only THIS WolfStack can
+                // talk to them.
+                return true;
+            }
+            // WolfStack (or untyped legacy) nodes: own cluster only.
             let node_cluster = n.cluster_name.clone()
-                .or(n.pve_cluster_name.clone())
                 .unwrap_or_else(|| "WolfStack".to_string());
             node_cluster == self_cluster
         })
