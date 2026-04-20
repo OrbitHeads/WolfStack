@@ -6700,9 +6700,21 @@ pub fn docker_pull(image: &str) -> Result<String, String> {
 /// Create a Docker container from an image
 /// If wolfnet_ip is provided, the container will be connected to the WolfNet overlay network
 /// volumes: list of volume mount specs, e.g. ["/host/path:/container/path", "myvolume:/data"]
-pub fn docker_create(name: &str, image: &str, ports: &[String], env: &[String], wolfnet_ip: Option<&str>, 
+pub fn docker_create(name: &str, image: &str, ports: &[String], env: &[String], wolfnet_ip: Option<&str>,
                      memory: Option<&str>, cpus: Option<&str>, _storage: Option<&str>,
                      volumes: &[String]) -> Result<String, String> {
+    docker_create_with_cmd(name, image, ports, env, wolfnet_ip, memory, cpus, _storage, volumes, &[])
+}
+
+/// Like `docker_create` but also passes `cmd` as positional args
+/// after the image name — used by the app store for images whose
+/// ENTRYPOINT needs a subcommand (cloudflared `tunnel run`, etc.)
+/// to actually do anything. Passing an empty slice is equivalent to
+/// calling `docker_create`.
+#[allow(clippy::too_many_arguments)]
+pub fn docker_create_with_cmd(name: &str, image: &str, ports: &[String], env: &[String], wolfnet_ip: Option<&str>,
+                     memory: Option<&str>, cpus: Option<&str>, _storage: Option<&str>,
+                     volumes: &[String], cmd: &[String]) -> Result<String, String> {
 
 
     let mut args = vec![
@@ -6767,6 +6779,15 @@ pub fn docker_create(name: &str, image: &str, ports: &[String], env: &[String], 
 
     args.push(image.to_string());
 
+    // CMD arguments — positional args after the image name. Each one
+    // becomes its own argv entry (no shell quoting), so `docker create
+    // <image> tunnel --no-autoupdate run` is exactly `docker create`
+    // + args `[..., image, "tunnel", "--no-autoupdate", "run"]`. The
+    // appstore uses this for images whose ENTRYPOINT needs a subcommand
+    // (cloudflared, traefik config-file overrides, etc).
+    for c in cmd {
+        if !c.is_empty() { args.push(c.clone()); }
+    }
 
     let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let output = Command::new("docker")
