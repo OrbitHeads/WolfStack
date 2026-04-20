@@ -596,7 +596,14 @@
                             </div>
                         </div>
                         <div style="display: flex; gap: 12px;">
-                            <button class="btn btn-primary" onclick="selectView('terminal')">
+                            <!-- Must preserve the dashboard's currentNodeId
+                                 via selectServerView — selectView('terminal')
+                                 wipes currentNodeId on entry, so the inline
+                                 terminal handler downstream has no node to
+                                 target and silently does nothing. Use the
+                                 same path the sidebar's Terminal menu item
+                                 uses so both routes are equivalent. -->
+                            <button class="btn btn-primary" onclick="selectServerView(currentNodeId, 'terminal')">
                                 <span class="icon">💻</span> Terminal
                             </button>
                             <button class="btn" onclick="location.reload()">

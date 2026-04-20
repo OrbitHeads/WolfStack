@@ -2429,22 +2429,71 @@ fn docker_list(all: bool) -> Vec<ContainerInfo> {
                     let name = parts.get(1).unwrap_or(&"").to_string();
                     let state = parts.get(4).unwrap_or(&"").to_string();
 
-                    // Get network IPs, gateway, MAC, restart policy, and rootfs in ONE inspect call
-                    // (previously 3 separate docker inspect calls per container)
-                    let inspect_fmt = "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}|{{range .NetworkSettings.Networks}}{{.Gateway}} {{end}}|{{range .NetworkSettings.Networks}}{{.MacAddress}} {{end}}|{{.HostConfig.RestartPolicy.Name}}|{{.GraphDriver.Data.MergedDir}}";
+                    // Combined inspect for network info + rootfs. We
+                    // keep restart-policy and autostart OUT of this
+                    // combined call because the template above has
+                    // proven fragile (range over empty networks, missing
+                    // GraphDriver.Data fields on non-overlay2 drivers
+                    // like zfs/btrfs/devicemapper, or newer Docker
+                    // versions subtly changing output) and when it
+                    // breaks, every container silently gets autostart=
+                    // false on the UI even though its actual policy is
+                    // unless-stopped. Dedicated inspect for RestartPolicy
+                    // lives below and is known-good for every Docker
+                    // version + storage driver combo.
+                    //
+                    // Inspect targets the container ID (parts[0]) not
+                    // the name — names can have aliases/prefixes that
+                    // confuse lookups; IDs never do.
+                    let cid = parts.first().copied().unwrap_or("");
+                    let inspect_target = if !cid.is_empty() { cid } else { name.as_str() };
+                    let inspect_fmt = "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}|{{range .NetworkSettings.Networks}}{{.Gateway}} {{end}}|{{range .NetworkSettings.Networks}}{{.MacAddress}} {{end}}|{{.GraphDriver.Data.MergedDir}}";
                     let inspect_out = Command::new("docker")
-                        .args(["inspect", "-f", inspect_fmt, &name])
+                        .args(["inspect", "-f", inspect_fmt, inspect_target])
                         .output()
                         .ok()
                         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                         .unwrap_or_default();
 
-                    let inspect_parts: Vec<&str> = inspect_out.splitn(5, '|').collect();
+                    let inspect_parts: Vec<&str> = inspect_out.splitn(4, '|').collect();
                     let raw_net_ips = inspect_parts.first().unwrap_or(&"").trim();
                     let raw_gateways = inspect_parts.get(1).unwrap_or(&"").trim();
                     let raw_macs = inspect_parts.get(2).unwrap_or(&"").trim();
-                    let restart_policy = inspect_parts.get(3).unwrap_or(&"").trim().to_string();
-                    let rootfs_raw = inspect_parts.get(4).unwrap_or(&"").trim().to_string();
+                    let rootfs_raw = inspect_parts.get(3).unwrap_or(&"").trim().to_string();
+
+                    // Dedicated inspect for the restart policy. If this
+                    // fails (container gone, daemon blip) we fall back
+                    // to "no" — but we LOG a warning so the operator
+                    // can diagnose a systemic parse failure instead of
+                    // quietly seeing every autostart checkbox unticked.
+                    let restart_policy = {
+                        let out = Command::new("docker")
+                            .args(["inspect", "-f", "{{.HostConfig.RestartPolicy.Name}}", inspect_target])
+                            .output();
+                        match out {
+                            Ok(o) if o.status.success() => {
+                                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                                // `<no value>` only appears if the
+                                // template path itself was wrong —
+                                // shouldn't happen for the canonical
+                                // HostConfig.RestartPolicy.Name path,
+                                // but guard anyway.
+                                if s == "<no value>" { String::new() } else { s }
+                            }
+                            Ok(o) => {
+                                warn!(
+                                    "docker inspect for restart policy of '{}' exited {}: {}",
+                                    inspect_target, o.status.code().unwrap_or(-1),
+                                    String::from_utf8_lossy(&o.stderr).trim()
+                                );
+                                String::new()
+                            }
+                            Err(e) => {
+                                warn!("docker inspect (restart policy) failed for '{}': {}", inspect_target, e);
+                                String::new()
+                            }
+                        }
+                    };
 
                     // Parse WolfNet IP — override file takes priority, then Docker label
                     let wolfnet_ip = docker_effective_wolfnet_ip(&name);
