@@ -55,11 +55,10 @@ impl AuthConfig {
 
     pub fn save(&self) -> Result<(), String> {
         let path = auth_config_path();
-        if let Some(dir) = std::path::Path::new(&path).parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&path, json).map_err(|e| format!("Failed to write auth config: {}", e))
+        // 0600 — config tunes auth behaviour and can carry secrets.
+        crate::paths::write_secure(&path, json)
+            .map_err(|e| format!("Failed to write auth config: {}", e))
     }
 }
 
@@ -130,11 +129,12 @@ impl UserStore {
 
     pub fn save(&self) -> Result<(), String> {
         let path = users_config_path();
-        if let Some(dir) = std::path::Path::new(&path).parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&path, json).map_err(|e| format!("Failed to write users config: {}", e))
+        // 0600 — this file contains password hashes. Pre-v18.7.30 it
+        // was world-readable, giving any local user the hashes to
+        // offline-crack.
+        crate::paths::write_secure(&path, json)
+            .map_err(|e| format!("Failed to write users config: {}", e))
     }
 
     pub fn find(&self, username: &str) -> Option<&WolfUser> {

@@ -207,6 +207,13 @@ pub fn start(lan: &LanSegment) -> Result<(), String> {
 
 /// Stop the dnsmasq instance for a LAN (if any). Safe to call even when
 /// nothing is running.
+///
+/// Waits for the process to actually exit (up to ~2 seconds) before
+/// returning. Pre-v18.7.30 we sent SIGTERM and immediately deleted
+/// the PID file — the next `start()` would then race with the still-
+/// dying dnsmasq and the new instance would fail to bind :53 / :67
+/// on the same interface. That manifested as "dnsmasq failed to start"
+/// errors on rapid save cycles (the LAN editor save-and-apply path).
 pub fn stop(lan: &LanSegment) -> Result<(), String> {
     let pid_file = format!("{}/lan-{}.pid", PID_DIR, lan.id);
     let pid_str = match fs::read_to_string(&pid_file) {
@@ -214,8 +221,50 @@ pub fn stop(lan: &LanSegment) -> Result<(), String> {
         Err(_) => return Ok(()),
     };
     if pid_str.is_empty() { return Ok(()); }
-    let _ = Command::new("kill").arg(&pid_str).status();
-    // Also remove the pid file so we don't churn on stale entries.
+    // Validate the PID is numeric before shelling out to kill. A
+    // corrupted or manually-edited pid file can otherwise contain
+    // arbitrary text; `kill "garbage"` silently fails and we proceed
+    // to remove the pid file, at which point the next start() spawns
+    // a new dnsmasq while the old one still holds the port. The
+    // numeric check also rejects negative numbers (which `kill -N`
+    // interprets as a process group — not what we want here).
+    let pid: u32 = match pid_str.parse() {
+        Ok(p) => p,
+        Err(_) => {
+            // Unreadable pid file — remove it and move on. A subsequent
+            // start() will spawn cleanly; if the old dnsmasq is still
+            // running on the bridge, the new one will fail to bind and
+            // surface a clear error to the operator.
+            let _ = fs::remove_file(&pid_file);
+            return Ok(());
+        }
+    };
+    let pid_s = pid.to_string();
+
+    // SIGTERM (dnsmasq handles it cleanly and releases sockets fast).
+    let _ = Command::new("kill").arg(&pid_s).status();
+
+    // Poll /proc/<pid> for up to 2 seconds. dnsmasq typically exits
+    // in < 50ms on SIGTERM; we cap at 2s to avoid blocking a router
+    // reconfigure indefinitely on a stuck process.
+    let proc_path = format!("/proc/{}", pid_s);
+    for _ in 0..40 {
+        if !std::path::Path::new(&proc_path).exists() { break; }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // If still alive after 2s, escalate to SIGKILL. Better to force-
+    // kill a stuck dnsmasq than leave it holding the port forever.
+    if std::path::Path::new(&proc_path).exists() {
+        let _ = Command::new("kill").args(["-KILL", &pid_s]).status();
+        // Give SIGKILL a beat to propagate — the kernel is synchronous
+        // here, so this is mostly paranoia.
+        for _ in 0..20 {
+            if !std::path::Path::new(&proc_path).exists() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    // Remove the pid file now that the process is confirmed gone.
     let _ = fs::remove_file(&pid_file);
     Ok(())
 }

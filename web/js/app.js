@@ -1037,8 +1037,18 @@ function showDangerConfirm(opts) {
         confirmBtn.style.cssText = 'background:#7f1d1d;color:#fca5a5;border:1px solid #7f1d1d;border-radius:6px;padding:9px 22px;cursor:not-allowed;font-size:13px;font-weight:500;opacity:0.7;';
         confirmBtn.textContent = confirmLabel + ' (' + remaining + 's)';
 
+        // escHandler is installed at document level so Escape works
+        // regardless of focus. Pre-v18.7.30 the listener was only
+        // removed inside the Escape branch — clicking Cancel, clicking
+        // the overlay, or clicking Confirm all left the listener
+        // permanently attached, leaking one listener per dialog call.
+        // Now finish() removes it unconditionally.
+        function escHandler(e) {
+            if (e.key === 'Escape') { finish(false); }
+        }
         function finish(val) {
             if (timerHandle) clearInterval(timerHandle);
+            document.removeEventListener('keydown', escHandler);
             overlay.remove();
             resolve(val);
         }
@@ -1046,9 +1056,7 @@ function showDangerConfirm(opts) {
         cancelBtn.onclick = function () { finish(false); };
         confirmBtn.onclick = function () { if (!confirmBtn.disabled) finish(true); };
         overlay.onclick = function (e) { if (e.target === overlay) finish(false); };
-        document.addEventListener('keydown', function escHandler(e) {
-            if (e.key === 'Escape') { finish(false); document.removeEventListener('keydown', escHandler); }
-        });
+        document.addEventListener('keydown', escHandler);
 
         btnWrap.appendChild(cancelBtn);
         btnWrap.appendChild(confirmBtn);
@@ -1069,6 +1077,11 @@ function showDangerConfirm(opts) {
             confirmBtn.disabled = false;
             confirmBtn.style.cssText = 'background:#ef4444;color:#fff;border:none;border-radius:6px;padding:9px 22px;cursor:pointer;font-size:13px;font-weight:600;';
             confirmBtn.textContent = confirmLabel;
+            // Don't steal focus from Cancel — a user who's been reading
+            // the warning keeps their default "Cancel-is-safer" posture.
+            // But DO make confirm tab-focusable so a keyboard user can
+            // reach it with one Tab press.
+            confirmBtn.tabIndex = 0;
         }, 1000);
     });
 }

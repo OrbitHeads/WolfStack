@@ -80,15 +80,32 @@ pub fn save_cluster_secret(secret: &str) -> Result<(), String> {
         .map_err(|e| format!("Cannot write custom-cluster-secret: {}", e))
 }
 
-/// Validate a cluster secret from a request header
+/// Validate a cluster secret from a request header.
+///
+/// True constant-time comparison: the pre-v18.7.30 implementation had
+/// an early-exit on length mismatch which leaked the secret's length
+/// via timing. Now we fold the length difference into the accumulator
+/// so the running time depends only on the longer of the two inputs.
 pub fn validate_cluster_secret(provided: &str, expected: &str) -> bool {
     if provided.is_empty() || expected.is_empty() {
         return false;
     }
-    // Constant-time comparison to prevent timing attacks
-    provided.len() == expected.len()
-        && provided.as_bytes().iter().zip(expected.as_bytes().iter())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+    let a = provided.as_bytes();
+    let b = expected.as_bytes();
+    // Mix the length difference into the accumulator by OR-ing every
+    // byte of the XOR — this folds len-mismatch into the result
+    // without a narrow u8 cast (which would alias 256-byte-apart
+    // lengths to "equal"). Then walk both inputs in full by reading
+    // zero for out-of-bounds indices.
+    let len_diff_bytes = ((a.len() as u64) ^ (b.len() as u64)).to_le_bytes();
+    let mut acc: u8 = len_diff_bytes.iter().fold(0u8, |x, b| x | *b);
+    let max = a.len().max(b.len());
+    for i in 0..max {
+        let x = *a.get(i).unwrap_or(&0);
+        let y = *b.get(i).unwrap_or(&0);
+        acc |= x ^ y;
+    }
+    acc == 0
 }
 
 // Pure-Rust password hashing (replaces C libcrypt dependency)
@@ -373,4 +390,50 @@ pub fn is_safe_name(name: &str) -> bool {
         && name.len() <= 253
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
         && !name.contains("..")
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+
+    #[test]
+    fn equal_content_equal_length_is_true() {
+        assert!(validate_cluster_secret("wsk_abc123", "wsk_abc123"));
+        assert!(validate_cluster_secret("x", "x"));
+    }
+
+    #[test]
+    fn equal_length_different_content_is_false() {
+        assert!(!validate_cluster_secret("wsk_abc123", "wsk_xyz999"));
+        assert!(!validate_cluster_secret("aaaaa", "aaaab"));  // one byte off
+    }
+
+    #[test]
+    fn different_length_is_false() {
+        // The bug this test prevents: pre-v18.7.30 the function did an
+        // early return on length mismatch, leaking expected length via
+        // timing. Now len-mismatch is folded into the accumulator
+        // alongside content bytes — still returns false, still const
+        // time relative to the longer input.
+        assert!(!validate_cluster_secret("short", "muchlongersecret"));
+        assert!(!validate_cluster_secret("longerthanexpected", "short"));
+        assert!(!validate_cluster_secret("a", "ab"));
+        assert!(!validate_cluster_secret("", ""));  // both empty — explicit early exit
+    }
+
+    #[test]
+    fn empty_inputs_rejected() {
+        assert!(!validate_cluster_secret("", "real_secret"));
+        assert!(!validate_cluster_secret("real_secret", ""));
+    }
+
+    #[test]
+    fn long_secret_equality() {
+        let s = "wsk_".to_string() + &"a".repeat(64);
+        assert!(validate_cluster_secret(&s, &s));
+        let mut tampered = s.clone();
+        tampered.pop();
+        tampered.push('b');  // flip last byte
+        assert!(!validate_cluster_secret(&s, &tampered));
+    }
 }

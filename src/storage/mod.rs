@@ -509,11 +509,13 @@ fn mount_s3_via_s3fs(mount: &StorageMount, s3: &S3Config) -> Result<String, Stri
         .map_err(|e| format!("Failed to create credentials dir: {}", e))?;
     
     let creds_path = format!("{}/{}.passwd", creds_dir, mount.id);
-    fs::write(&creds_path, format!("{}:{}", s3.access_key_id, s3.secret_access_key))
+    // write_secure opens with O_CREAT|mode=0600 AND explicitly re-chmods
+    // after write — no TOCTOU window where credentials exist on disk
+    // at 0644. Pre-v18.7.30 this used fs::write+Command("chmod") which
+    // left a ~milliseconds window of world-readable creds on disk.
+    crate::paths::write_secure(&creds_path,
+        format!("{}:{}", s3.access_key_id, s3.secret_access_key))
         .map_err(|e| format!("Failed to write credentials: {}", e))?;
-    
-    // Set restrictive permissions (s3fs requires 600)
-    Command::new("chmod").args(["600", &creds_path]).output().ok();
     
     // Build s3fs arguments
     let mut args = vec![

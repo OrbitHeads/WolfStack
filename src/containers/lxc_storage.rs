@@ -275,15 +275,25 @@ pub fn migrate(name: &str, target_storage: &str, remove_source: bool) -> Result<
     }
 
     // Rewrite lxc.rootfs.path in the new copy of the config so it
-    // points at the new location.
+    // points at the new location. Propagating a write failure here is
+    // critical — pre-v18.7.30 we swallowed the Err with `let _ =`,
+    // which meant a failed rewrite left the moved container's config
+    // pointing at the OLD (now-missing) rootfs path. Container would
+    // refuse to start on next boot with a cryptic "rootfs doesn't
+    // exist" error and no hint about the silent write failure.
     let new_cfg_path = format!("{}/config", dst_dir);
     if let Ok(cfg) = fs::read_to_string(&new_cfg_path) {
         let new_rootfs = info.rootfs.replace(&info.storage, target_storage);
         let updated = rewrite_rootfs_path(&cfg, &new_rootfs);
-        let _ = fs::write(&new_cfg_path, updated);
+        fs::write(&new_cfg_path, updated)
+            .map_err(|e| format!("rewrite {} after storage migrate: {}", new_cfg_path, e))?;
     }
 
     if remove_source {
+        // Source removal IS fine to swallow — we've already moved the
+        // data to dst and rewritten the config. A failure here leaves
+        // stale bits in the old storage but doesn't break the
+        // migrated container.
         let _ = fs::remove_dir_all(&src_dir);
     }
     Ok(format!("migrated {} → {} ({} → {})", name, target_storage, info.storage, target_storage))

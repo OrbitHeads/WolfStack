@@ -51,11 +51,12 @@ impl OidcConfig {
 
     pub fn save(&self) -> Result<(), String> {
         let path = oidc_config_path();
-        if let Some(dir) = std::path::Path::new(&path).parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&path, json).map_err(|e| format!("Failed to write OIDC config: {}", e))
+        // 0600 — this file embeds the OIDC client_secret (encrypted,
+        // but still the encrypted blob — and other provider metadata
+        // operators may not want world-readable).
+        crate::paths::write_secure(&path, json)
+            .map_err(|e| format!("Failed to write OIDC config: {}", e))
     }
 }
 

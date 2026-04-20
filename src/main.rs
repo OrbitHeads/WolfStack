@@ -630,16 +630,31 @@ async fn main() -> std::io::Result<()> {
             crate::telegram_bot::supervise_forever(telegram_state).await;
         });
 
-        // Background: session + login rate limiter + reset token cleanup
+        // Background: session + login rate limiter + reset token cleanup.
+        // Also sweeps expired OIDC pending-flow state tokens — pre-v18.7.30
+        // that map grew without bound because the TTL was only checked
+        // on successful callback lookup, so an attacker (or a buggy IdP)
+        // that initiated flows without ever completing them could
+        // exhaust memory.
         let sessions_cleanup = sessions.clone();
         let login_limiter_cleanup = app_state.login_limiter.clone();
         let reset_tokens_cleanup = app_state.password_reset_tokens.clone();
+        let oidc_flows_cleanup = app_state.oidc_pending_flows.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(300)).await;
                 sessions_cleanup.cleanup();
                 login_limiter_cleanup.cleanup();
                 reset_tokens_cleanup.cleanup();
+                // OIDC flows: 5 minute TTL. Walk the map and drop any
+                // entry whose creation timestamp is older than that.
+                {
+                    let mut flows = oidc_flows_cleanup.write().unwrap();
+                    let now = std::time::Instant::now();
+                    flows.retain(|_state, flow| {
+                        now.duration_since(flow.created_at).as_secs() < 300
+                    });
+                }
             }
         });
 

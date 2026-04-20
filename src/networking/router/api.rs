@@ -587,7 +587,13 @@ pub struct ZoneAssignRequest {
 
 pub async fn assign_zone(req: HttpRequest, state: S, body: web::Json<ZoneAssignRequest>) -> HttpResponse {
     auth_or_return!(req, state);
-    let zones_snapshot = {
+    // Apply the config change under the write lock, then release the
+    // lock BEFORE shelling out to iptables-restore. Pre-v18.7.30 the
+    // whole firewall apply ran with the write lock held — a slow
+    // iptables-restore (hundreds of ms on busy boxes) stalled every
+    // concurrent config.read() caller: topology polls, lease reads,
+    // all the read paths. Now the lock is short-lived.
+    let (ruleset_opt, zones_snapshot) = {
         let mut cfg = state.router.config.write().unwrap();
         let r = body.into_inner();
         match r.zone {
@@ -597,12 +603,16 @@ pub async fn assign_zone(req: HttpRequest, state: S, body: web::Json<ZoneAssignR
         if let Err(e) = cfg.save() {
             return HttpResponse::InternalServerError().body(e);
         }
-        if cfg.auto_apply {
-            let ruleset = firewall::build_ruleset(&cfg, &crate::agent::self_node_id());
-            let _ = firewall::apply(&ruleset, false);
-        }
-        cfg.zones.clone()
-    }; // write lock dropped here — safe to replicate
+        let ruleset_to_apply = if cfg.auto_apply {
+            Some(firewall::build_ruleset(&cfg, &crate::agent::self_node_id()))
+        } else {
+            None
+        };
+        (ruleset_to_apply, cfg.zones.clone())
+    }; // write lock dropped here
+    if let Some(ruleset) = ruleset_opt {
+        let _ = firewall::apply(&ruleset, false);
+    }
     replicate_config_to_cluster(state);
     HttpResponse::Ok().json(&zones_snapshot)
 }
@@ -865,7 +875,11 @@ pub async fn create_rule(req: HttpRequest, state: S, body: web::Json<FirewallRul
     let mut rule = body.into_inner();
     if rule.id.is_empty() { rule.id = gen_id("rule"); }
 
-    {
+    // Build ruleset under the write lock, apply OUTSIDE. See assign_zone
+    // for the rationale — iptables-restore can take hundreds of ms
+    // and should not starve config.read() callers (topology polls,
+    // lease reads) that whole time.
+    let ruleset_opt = {
         let mut cfg = state.router.config.write().unwrap();
         let next_order = cfg.rules.iter().map(|r| r.order).max().unwrap_or(-1) + 1;
         if rule.order == 0 { rule.order = next_order; }
@@ -875,10 +889,12 @@ pub async fn create_rule(req: HttpRequest, state: S, body: web::Json<FirewallRul
             return HttpResponse::InternalServerError().body(e);
         }
         if cfg.auto_apply {
-            let ruleset = firewall::build_ruleset(&cfg, &crate::agent::self_node_id());
-            if let Err(e) = firewall::apply(&ruleset, false) {
-                return HttpResponse::InternalServerError().body(format!("firewall apply failed: {}", e));
-            }
+            Some(firewall::build_ruleset(&cfg, &crate::agent::self_node_id()))
+        } else { None }
+    };
+    if let Some(ruleset) = ruleset_opt {
+        if let Err(e) = firewall::apply(&ruleset, false) {
+            return HttpResponse::InternalServerError().body(format!("firewall apply failed: {}", e));
         }
     }
     replicate_config_to_cluster(state);
@@ -897,7 +913,7 @@ pub async fn update_rule(
     if updated.id != id {
         return HttpResponse::BadRequest().body("id mismatch");
     }
-    {
+    let ruleset_opt = {
         let mut cfg = state.router.config.write().unwrap();
         let idx = match cfg.rules.iter().position(|r| r.id == id) {
             Some(i) => i,
@@ -908,9 +924,11 @@ pub async fn update_rule(
             return HttpResponse::InternalServerError().body(e);
         }
         if cfg.auto_apply {
-            let ruleset = firewall::build_ruleset(&cfg, &crate::agent::self_node_id());
-            let _ = firewall::apply(&ruleset, false);
-        }
+            Some(firewall::build_ruleset(&cfg, &crate::agent::self_node_id()))
+        } else { None }
+    };
+    if let Some(ruleset) = ruleset_opt {
+        let _ = firewall::apply(&ruleset, false);
     }
     replicate_config_to_cluster(state);
     HttpResponse::Ok().json(&updated)
@@ -919,16 +937,18 @@ pub async fn update_rule(
 pub async fn delete_rule(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
-    {
+    let ruleset_opt = {
         let mut cfg = state.router.config.write().unwrap();
         cfg.rules.retain(|r| r.id != id);
         if let Err(e) = cfg.save() {
             return HttpResponse::InternalServerError().body(e);
         }
         if cfg.auto_apply {
-            let ruleset = firewall::build_ruleset(&cfg, &crate::agent::self_node_id());
-            let _ = firewall::apply(&ruleset, false);
-        }
+            Some(firewall::build_ruleset(&cfg, &crate::agent::self_node_id()))
+        } else { None }
+    };
+    if let Some(ruleset) = ruleset_opt {
+        let _ = firewall::apply(&ruleset, false);
     }
     replicate_config_to_cluster(state);
     HttpResponse::Ok().body("deleted")
@@ -940,7 +960,7 @@ pub struct ReorderRequest { pub order: Vec<String> }
 pub async fn reorder_rules(req: HttpRequest, state: S, body: web::Json<ReorderRequest>) -> HttpResponse {
     auth_or_return!(req, state);
     let r = body.into_inner();
-    {
+    let ruleset_opt = {
         let mut cfg = state.router.config.write().unwrap();
         let mut order_map: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
         for (i, id) in r.order.iter().enumerate() {
@@ -955,9 +975,11 @@ pub async fn reorder_rules(req: HttpRequest, state: S, body: web::Json<ReorderRe
             return HttpResponse::InternalServerError().body(e);
         }
         if cfg.auto_apply {
-            let ruleset = firewall::build_ruleset(&cfg, &crate::agent::self_node_id());
-            let _ = firewall::apply(&ruleset, false);
-        }
+            Some(firewall::build_ruleset(&cfg, &crate::agent::self_node_id()))
+        } else { None }
+    };
+    if let Some(ruleset) = ruleset_opt {
+        let _ = firewall::apply(&ruleset, false);
     }
     replicate_config_to_cluster(state);
     HttpResponse::Ok().body("reordered")

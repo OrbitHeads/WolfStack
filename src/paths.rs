@@ -236,10 +236,13 @@ pub fn get() -> FileLocations {
 
 /// Update file locations and persist to disk.
 pub fn update(locs: FileLocations) -> Result<(), String> {
-    let _ = std::fs::create_dir_all("/etc/wolfstack");
     let json = serde_json::to_string_pretty(&locs)
         .map_err(|e| format!("Failed to serialize paths config: {}", e))?;
-    std::fs::write(PATHS_CONFIG_FILE, json)
+    // 0600 — this file decides where secrets get written. An attacker
+    // who can edit paths.json can redirect write_secure targets to
+    // attacker-controlled locations. harden_existing covers the old
+    // file on upgrade; write_secure covers fresh writes.
+    write_secure(PATHS_CONFIG_FILE, json)
         .map_err(|e| format!("Failed to write paths config: {}", e))?;
     *LOCATIONS.write().unwrap() = locs;
     Ok(())
@@ -318,6 +321,10 @@ pub fn harden_existing() {
         // Legacy paths are included because old installs may still
         // carry `/etc/wolfstack/cluster-secret` from v11.26.3 even
         // though current code writes `custom-cluster-secret`.
+        //
+        // Extended list (v18.7.30) covers every writer migrated to
+        // write_secure — existing installs get permissions tightened
+        // on the next restart without needing the file to be rewritten.
         let sensitive = [
             locs.cluster_secret.clone(),
             "/etc/wolfstack/cluster-secret".to_string(),
@@ -325,10 +332,38 @@ pub fn harden_existing() {
             "/etc/wolfstack/join-token".to_string(),
             "/etc/wolfstack/license.key".to_string(),
             locs.tls_key.clone(),
+            "/etc/wolfstack/users.json".to_string(),         // password hashes
+            "/etc/wolfstack/auth-config.json".to_string(),   // auth tuning
+            "/etc/wolfstack/oidc.json".to_string(),          // OIDC client secrets
+            "/etc/wolfstack/ai-config.json".to_string(),     // LLM API keys + SMTP pass
+            "/etc/wolfstack/pbs/config.json".to_string(),    // PBS tokens
+            "/etc/wolfstack/paths.json".to_string(),         // path remap — if attacker-controlled, can redirect secret writers
+            "/etc/ppp/chap-secrets".to_string(),             // PPPoE passwords (WAN)
+            "/etc/ppp/pap-secrets".to_string(),
         ];
         for path in &sensitive {
             if std::path::Path::new(path).exists() {
                 let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+        // Sensitive directories — /etc/wolfstack/s3 contains per-mount
+        // credentials files; lock the directory itself AND every
+        // passwd file inside it.
+        let sensitive_dirs = [
+            "/etc/wolfstack/s3",
+        ];
+        for dir in &sensitive_dirs {
+            let p = std::path::Path::new(dir);
+            if p.exists() {
+                let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700));
+                if let Ok(entries) = std::fs::read_dir(p) {
+                    for entry in entries.flatten() {
+                        let _ = std::fs::set_permissions(
+                            entry.path(),
+                            std::fs::Permissions::from_mode(0o600),
+                        );
+                    }
+                }
             }
         }
     }

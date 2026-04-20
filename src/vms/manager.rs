@@ -727,11 +727,17 @@ impl VmManager {
             }
         }
 
-        // Save a WolfStack config for tracking
+        // Save a WolfStack config for tracking. Propagate errors —
+        // pre-v18.7.30 we used `let _ =` which meant a failed write
+        // silently lost the VM's tracked storage_path. Next restart
+        // would see a VM with storage_path=None and mis-route disk
+        // operations (or forget where the qcow2 actually lives).
         let mut tracked = config.clone();
         tracked.storage_path = Some(storage.to_string());
         let json = serde_json::to_string_pretty(&tracked).map_err(|e| e.to_string())?;
-        let _ = fs::write(self.vm_config_path(&config.name), json);
+        let cfg_path = self.vm_config_path(&config.name);
+        fs::write(&cfg_path, json)
+            .map_err(|e| format!("write VM tracking config {}: {}", cfg_path.display(), e))?;
 
         Ok(())
     }

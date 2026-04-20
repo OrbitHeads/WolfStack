@@ -614,18 +614,21 @@ fn write_secret(path: &str, user: &str, password: &str) -> Result<(), String> {
         }
         out.push_str(line); out.push('\n');
     }
+    // The replace-pass above skipped any existing line for this user
+    // via `continue`, so the new line is always needed — either as
+    // the replacement for the skipped old line (replaced=true) or as
+    // the very first entry for this user (replaced=false). Either
+    // way, one push. Pre-v18.7.30 this was also unconditional but
+    // the loop did NOT `continue` on a match, so duplicate lines
+    // accumulated; that's now fixed by the continue at line 613.
     out.push_str(&format!("{} * \"{}\" *\n", user_q, password));
-    let _ = replaced;  // currently unused; kept for clarity
+    let _ = replaced;  // kept for log/debug hooks; no behaviour branch
 
-    fs::write(path, out)
+    // write_secure sets 0600 atomically at open — no TOCTOU window
+    // where the ISP password was world-readable before the explicit
+    // chmod. Replaces the fs::write + metadata+set_permissions dance.
+    crate::paths::write_secure(path, out)
         .map_err(|e| format!("write {}: {}", path, e))?;
-    // Lock down to root-only.
-    if let Ok(meta) = fs::metadata(path) {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = meta.permissions();
-        perms.set_mode(0o600);
-        let _ = fs::set_permissions(path, perms);
-    }
     Ok(())
 }
 
