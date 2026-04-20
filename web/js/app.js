@@ -980,6 +980,99 @@ function showConfirm(message, title) {
     });
 }
 
+/// Dangerous-operation confirm dialog. For actions that could brick the
+/// management interface (firewall apply, host DNS release, LAN bridge
+/// down, TLS cert swap, etc.). Three differences from showConfirm:
+///
+///   1. An explicit danger banner (red) at the top naming the risk.
+///   2. Cancel is pre-focused and styled as the primary button — the
+///      common "hit Enter by accident" case doesn't apply the change.
+///   3. The confirm button is disabled for `countdown` seconds AND
+///      shows the remaining countdown. Gives the operator time to
+///      actually read the warning instead of muscle-memory'ing through.
+///
+/// Usage:
+///   if (!(await showDangerConfirm({
+///       title: 'Apply firewall rules?',
+///       danger: 'New rules could block the WolfStack management port (8553).',
+///       detail: 'If the rules drop your session, you will need console access.',
+///       countdown: 8,
+///       confirmLabel: 'Apply anyway',
+///   }))) return;
+///
+/// Returns Promise<boolean> — true = confirm, false = cancel/escape/click-outside.
+function showDangerConfirm(opts) {
+    const title = opts.title || 'Confirm dangerous action';
+    const danger = opts.danger || 'This action could affect connectivity to this node.';
+    const detail = opts.detail || '';
+    let remaining = Math.max(1, Math.min(60, parseInt(opts.countdown || 5, 10) || 5));
+    const confirmLabel = opts.confirmLabel || 'Proceed anyway';
+    return new Promise(function (resolve) {
+        const overlay = document.createElement('div');
+        overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:100000;display:flex;align-items:center;justify-content:center;animation:fadeIn 0.15s ease';
+        const modal = document.createElement('div');
+        modal.style.cssText = 'background:var(--bg-card,#1e2028);border:2px solid #ef4444;border-radius:12px;padding:22px 26px;max-width:520px;width:92%;max-height:90vh;overflow-y:auto;box-shadow:0 20px 60px rgba(239,68,68,0.25);color:var(--text-primary,#e4e4e7);font-family:inherit';
+
+        const dangerBanner = document.createElement('div');
+        dangerBanner.style.cssText = 'display:flex;gap:10px;align-items:flex-start;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.35);border-radius:8px;padding:10px 12px;margin-bottom:14px;';
+        dangerBanner.innerHTML = '<div style="font-size:20px;line-height:1;">\u26A0\uFE0F</div>'
+            + '<div><div style="font-weight:600;color:#fca5a5;margin-bottom:2px;font-size:13px;">' + escapeHtml(title) + '</div>'
+            + '<div style="font-size:12px;color:#fecaca;line-height:1.5;">' + escapeHtml(danger) + '</div></div>';
+
+        const detailEl = document.createElement('div');
+        if (detail) {
+            detailEl.style.cssText = 'font-size:12px;color:var(--text-secondary,#a1a1aa);line-height:1.5;margin-bottom:16px;';
+            detailEl.textContent = detail;
+        }
+
+        const btnWrap = document.createElement('div');
+        btnWrap.style.cssText = 'margin-top:4px;display:flex;justify-content:flex-end;gap:8px;align-items:center;';
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.style.cssText = 'background:var(--accent,#3b82f6);color:#fff;border:none;border-radius:6px;padding:9px 22px;cursor:pointer;font-size:13px;font-weight:600;';
+
+        const confirmBtn = document.createElement('button');
+        confirmBtn.disabled = true;
+        confirmBtn.style.cssText = 'background:#7f1d1d;color:#fca5a5;border:1px solid #7f1d1d;border-radius:6px;padding:9px 22px;cursor:not-allowed;font-size:13px;font-weight:500;opacity:0.7;';
+        confirmBtn.textContent = confirmLabel + ' (' + remaining + 's)';
+
+        function finish(val) {
+            if (timerHandle) clearInterval(timerHandle);
+            overlay.remove();
+            resolve(val);
+        }
+
+        cancelBtn.onclick = function () { finish(false); };
+        confirmBtn.onclick = function () { if (!confirmBtn.disabled) finish(true); };
+        overlay.onclick = function (e) { if (e.target === overlay) finish(false); };
+        document.addEventListener('keydown', function escHandler(e) {
+            if (e.key === 'Escape') { finish(false); document.removeEventListener('keydown', escHandler); }
+        });
+
+        btnWrap.appendChild(cancelBtn);
+        btnWrap.appendChild(confirmBtn);
+        modal.appendChild(dangerBanner);
+        if (detail) modal.appendChild(detailEl);
+        modal.appendChild(btnWrap);
+        overlay.appendChild(modal);
+        document.body.appendChild(overlay);
+        cancelBtn.focus();
+
+        const timerHandle = setInterval(function () {
+            remaining -= 1;
+            if (remaining > 0) {
+                confirmBtn.textContent = confirmLabel + ' (' + remaining + 's)';
+                return;
+            }
+            clearInterval(timerHandle);
+            confirmBtn.disabled = false;
+            confirmBtn.style.cssText = 'background:#ef4444;color:#fff;border:none;border-radius:6px;padding:9px 22px;cursor:pointer;font-size:13px;font-weight:600;';
+            confirmBtn.textContent = confirmLabel;
+        }, 1000);
+    });
+}
+
 /// Styled prompt dialog — returns a Promise<string|null>
 function showPrompt(message, title, defaultValue) {
     title = title || 'Input';
@@ -25191,7 +25284,116 @@ function addPluginNavItem(manifest) {
 // Load plugins on startup
 document.addEventListener('DOMContentLoaded', function() {
     setTimeout(loadPluginAssets, 1000);
+    startDangerPolling();
 });
+
+// ─── Danger-op banner (deadman-switch confirmations) ───
+//
+// Polls /api/danger/pending every 2 seconds. Any pending op renders a
+// persistent top-of-viewport banner with a countdown, "Keep" button
+// (calls /api/danger/confirm/{id}), and "Rollback now" button. If the
+// user's connection to the node dies after applying a dangerous op,
+// no heartbeat reaches /confirm and the backend auto-rolls back at the
+// TTL. Operator gets their UI back without manual recovery.
+
+let _dangerBannerEl = null;
+let _dangerPollTimer = null;
+
+function startDangerPolling() {
+    if (_dangerPollTimer) clearInterval(_dangerPollTimer);
+    const poll = async () => {
+        try {
+            const r = await fetch(apiUrl('/api/danger/pending'));
+            if (!r.ok) {
+                // 401/403 on session expiry — leave the existing banner
+                // in place rather than clearing it. The pending op is
+                // still counting down on the backend; if we wipe the
+                // banner now the operator loses their Keep button.
+                // Same philosophy as the catch branch below.
+                return;
+            }
+            const ops = await r.json();
+            renderDangerBanner(Array.isArray(ops) ? ops : []);
+        } catch (_) {
+            // Network error polling — leave last-rendered banner alone,
+            // try again on next tick. Don't hide the banner just because
+            // we lost network, because the banner IS the "you might be
+            // about to lose more network" warning.
+        }
+    };
+    poll();
+    _dangerPollTimer = setInterval(poll, 2000);
+}
+
+function renderDangerBanner(ops) {
+    const pending = ops.filter(o => o.status === 'pending');
+    if (!pending.length) {
+        if (_dangerBannerEl) { _dangerBannerEl.remove(); _dangerBannerEl = null; }
+        return;
+    }
+    if (!_dangerBannerEl) {
+        _dangerBannerEl = document.createElement('div');
+        _dangerBannerEl.id = 'wolfstack-danger-banner';
+        _dangerBannerEl.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:linear-gradient(90deg,#7f1d1d,#991b1b);border-bottom:2px solid #ef4444;color:#fff;padding:10px 16px;display:flex;flex-direction:column;gap:6px;box-shadow:0 4px 20px rgba(239,68,68,0.35);font-family:inherit;';
+        document.body.appendChild(_dangerBannerEl);
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const rows = pending.map(op => {
+        const elapsed = now - (op.applied_at_unix || now);
+        const remaining = Math.max(0, (op.ttl_secs || 0) - elapsed);
+        const mins = Math.floor(remaining / 60);
+        const secs = remaining % 60;
+        const timeStr = mins > 0 ? mins + 'm ' + secs + 's' : secs + 's';
+        return `<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+            <div style="display:flex;align-items:center;gap:10px;min-width:0;">
+                <span style="font-size:18px;line-height:1;">\u26A0\uFE0F</span>
+                <div style="min-width:0;">
+                    <div style="font-weight:600;font-size:13px;">${escapeHtml(op.description || op.op_type || 'Dangerous op in flight')}</div>
+                    <div style="font-size:11px;color:#fecaca;">
+                        Auto-rollback in <strong style="color:#fff;">${timeStr}</strong> unless you click Keep.
+                        If this browser loses connection to the node, the change undoes itself automatically.
+                    </div>
+                </div>
+            </div>
+            <div style="display:flex;gap:6px;flex-shrink:0;">
+                <button class="btn btn-sm" style="background:#10b981;color:#fff;font-weight:600;" onclick="dangerConfirm('${escapeHtml(op.id)}')">\u2705 Keep</button>
+                <button class="btn btn-sm" style="background:#1f2937;color:#fca5a5;border:1px solid #7f1d1d;" onclick="dangerRollback('${escapeHtml(op.id)}')">\u21A9\uFE0F Rollback now</button>
+            </div>
+        </div>`;
+    }).join('');
+    _dangerBannerEl.innerHTML = rows;
+}
+
+async function dangerConfirm(id) {
+    try {
+        const r = await fetch(apiUrl('/api/danger/confirm/' + encodeURIComponent(id)), { method: 'POST' });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok || data.ok === false) {
+            showToast('Confirm failed: ' + (data.error || 'HTTP ' + r.status), 'error');
+            return;
+        }
+        showToast(data.message || 'Change committed', 'success');
+    } catch (e) {
+        showToast('Confirm error: ' + e.message, 'error');
+    }
+}
+window.dangerConfirm = dangerConfirm;
+
+async function dangerRollback(id) {
+    if (!(await showConfirm('Roll back this change now?\n\nThe undo action runs immediately. Any work that depended on the change will break.'))) return;
+    try {
+        const r = await fetch(apiUrl('/api/danger/rollback/' + encodeURIComponent(id)), { method: 'POST' });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok || data.ok === false) {
+            showToast('Rollback failed: ' + (data.error || 'HTTP ' + r.status), 'error');
+            return;
+        }
+        showToast(data.message || 'Rolled back', 'success');
+    } catch (e) {
+        showToast('Rollback error: ' + e.message, 'error');
+    }
+}
+window.dangerRollback = dangerRollback;
 
 // ─── Enterprise API Keys ───
 

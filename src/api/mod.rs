@@ -18582,12 +18582,54 @@ async fn system_deps_install(
     }
 }
 
+/// GET /api/danger/pending — list dangerous ops awaiting confirmation
+/// or auto-rollback. Polled by the frontend to render the countdown
+/// banner. No auth required beyond standard — cluster-secret callers
+/// see the same list (needed for inter-node status displays).
+async fn danger_list(
+    req: HttpRequest, state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    HttpResponse::Ok().json(crate::danger::list())
+}
+
+/// POST /api/danger/confirm/{id} — commit a pending op, cancelling
+/// its auto-rollback timer. Returns the final status message.
+async fn danger_confirm(
+    req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    match crate::danger::confirm(&id) {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "message": msg })),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "ok": false, "error": e })),
+    }
+}
+
+/// POST /api/danger/rollback/{id} — manually roll back a pending op
+/// right now instead of waiting for the TTL.
+async fn danger_rollback(
+    req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    match tokio::task::spawn_blocking(move || crate::danger::rollback_now(&id)).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "message": msg })),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "ok": false, "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+    }
+}
+
 /// Configure all API routes
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg
         .configure(crate::vms::api::config)
         .configure(crate::tui::configure)
         .configure(crate::networking::router::api::configure)
+        // Dangerous-op deadman switch endpoints. See src/danger.rs.
+        .route("/api/danger/pending",        web::get().to(danger_list))
+        .route("/api/danger/confirm/{id}",   web::post().to(danger_confirm))
+        .route("/api/danger/rollback/{id}",  web::post().to(danger_rollback))
         // Distro-aware dep checks + installs. Cross-cutting — WolfRouter
         // is the first consumer, more groups (VMs, WolfNet) added later.
         .route("/api/system/deps/check",   web::get().to(system_deps_check))

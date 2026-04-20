@@ -5618,7 +5618,16 @@
         const out = document.getElementById('wr-host-dns-result');
         const nodeId = wrToolsSelectedNodeId();
         const url = await wrNodeUrl(nodeId, '/api/router/host-dns/release');
-        if (!(await showConfirm(`Disable systemd-resolved's stub listener on this node and point host DNS at ${upstream}? This is undoable via Restore.`))) return;
+        const confirmed = (typeof showDangerConfirm === 'function')
+            ? await showDangerConfirm({
+                title: 'Release systemd-resolved stub listener?',
+                danger: 'This rewrites /etc/resolv.conf and restarts systemd-resolved. If the new upstream (' + upstream + ') is unreachable from this node, host DNS will stop resolving until you click Restore.',
+                detail: 'Browser sessions already open stay usable; new lookups on the host may fail until the resolver comes back. Do not do this if you are SSHed in via hostname rather than IP.',
+                countdown: 6,
+                confirmLabel: 'Release stub',
+            })
+            : await showConfirm(`Disable systemd-resolved's stub listener on this node and point host DNS at ${upstream}? This is undoable via Restore.`);
+        if (!confirmed) return;
         if (out) out.innerHTML = '<span style="color:var(--text-muted);">Applying…</span>';
         try {
             const r = await fetch(url, {
@@ -5644,7 +5653,16 @@
         const out = document.getElementById('wr-host-dns-result');
         const nodeId = wrToolsSelectedNodeId();
         const url = await wrNodeUrl(nodeId, '/api/router/host-dns/restore');
-        if (!(await showConfirm('Restore the host DNS resolver? systemd-resolved\'s stub listener will come back on 127.0.0.53:53 — any containerised resolver currently bound to port 53 on this host will need to be stopped first.'))) return;
+        const confirmed = (typeof showDangerConfirm === 'function')
+            ? await showDangerConfirm({
+                title: 'Restore systemd-resolved stub?',
+                danger: 'Any container currently bound to :53 on 127.0.0.53 will conflict with the returning stub listener and fail.',
+                detail: 'Stop your containerised resolver (AdGuard Home, Pi-hole) BEFORE clicking Restore, or docker/systemd will bind the stub into an error loop.',
+                countdown: 5,
+                confirmLabel: 'Restore stub',
+            })
+            : await showConfirm('Restore the host DNS resolver? systemd-resolved\'s stub listener will come back on 127.0.0.53:53 — any containerised resolver currently bound to port 53 on this host will need to be stopped first.');
+        if (!confirmed) return;
         if (out) out.innerHTML = '<span style="color:var(--text-muted);">Restoring…</span>';
         try {
             const r = await fetch(url, { method: 'POST' });

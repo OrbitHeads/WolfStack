@@ -2557,7 +2557,32 @@ async fn release_host_dns(
         super::host_dns::release_port_53(upstream.as_deref())
     }).await.unwrap_or_else(|e| Err(format!("release task panicked: {}", e)));
     match res {
-        Ok(msg) => actix_web::HttpResponse::Ok().json(serde_json::json!({ "ok": true, "message": msg })),
+        Ok(msg) => {
+            // Schedule an automatic rollback after 120s unless the
+            // operator hits Confirm in the UI. If the release broke
+            // host DNS (upstream unreachable, NM clobbered resolv.conf,
+            // whatever), the operator's browser will fail to reach the
+            // node, no Confirm call arrives, and danger::tick fires
+            // host_dns::restore() to put the stub back. This is the
+            // PapaSchlumpf-incident preventer — they released, DNS
+            // broke, they had no UI to hit Restore from.
+            let upstream_for_desc = body.upstream.clone().unwrap_or_else(|| "1.1.1.1".to_string());
+            let danger_id = crate::danger::schedule(
+                "host_dns_release",
+                &format!("systemd-resolved stub released; host DNS pointed at {}", upstream_for_desc),
+                120,
+                Box::new(|| {
+                    super::host_dns::restore()
+                }),
+            );
+            actix_web::HttpResponse::Ok().json(serde_json::json!({
+                "ok": true,
+                "message": msg,
+                "danger_id": danger_id,
+                "ttl_secs": 120,
+                "confirm_required": true,
+            }))
+        }
         Err(e) => actix_web::HttpResponse::BadRequest().json(serde_json::json!({ "ok": false, "error": e })),
     }
 }

@@ -257,12 +257,19 @@ impl AiAgent {
 
             last_response = response.clone();
 
-            // Check for [EXEC], [EXEC_ALL], or [WOLFNOTE] tags
-            let has_exec = response.contains("[EXEC]") && response.contains("[/EXEC]");
-            let has_exec_all = response.contains("[EXEC_ALL]") && response.contains("[/EXEC_ALL]");
-            let has_wolfnote = response.contains("[WOLFNOTE") && response.contains("[/WOLFNOTE]");
+            // Check for tool-use tags. The multi-turn loop continues
+            // while any of these are present so the AI can stitch
+            // together research, execution, and audit calls before
+            // giving a final answer. [WOLFNOTE] is fire-and-forget
+            // (no tool-use loop needed).
+            let has_exec        = response.contains("[EXEC]")          && response.contains("[/EXEC]");
+            let has_exec_all    = response.contains("[EXEC_ALL]")      && response.contains("[/EXEC_ALL]");
+            let has_wolfnote    = response.contains("[WOLFNOTE")       && response.contains("[/WOLFNOTE]");
+            let has_websearch   = response.contains("[WEBSEARCH")      && response.contains("[/WEBSEARCH]");
+            let has_fetch       = response.contains("[FETCH")          && response.contains("[/FETCH]");
+            let has_audit       = response.contains("[SECURITY_AUDIT]") && response.contains("[/SECURITY_AUDIT]");
 
-            if !has_exec && !has_exec_all {
+            if !has_exec && !has_exec_all && !has_websearch && !has_fetch && !has_audit {
                 // Handle [WOLFNOTE] tags if present (fire-and-forget, no multi-turn needed)
                 if has_wolfnote {
                     final_response = execute_wolfnote_tags(&response).await;
@@ -363,6 +370,82 @@ impl AiAgent {
                     }
 
                     search_from = abs_start + end + 11;
+                } else {
+                    break;
+                }
+            }
+
+            // Handle [WEBSEARCH query="..."][/WEBSEARCH] — DuckDuckGo HTML
+            // search, top N results. The AI uses this to look up package
+            // names, distro-specific quirks, Docker/Proxmox docs —
+            // anything outside the WolfStack codebase that users
+            // routinely ask about.
+            search_from = 0;
+            while let Some(start) = response[search_from..].find("[WEBSEARCH") {
+                let abs_open = search_from + start;
+                let Some(close_open) = response[abs_open..].find(']') else { break; };
+                let tag_start = abs_open + close_open + 1;
+                let Some(close) = response[tag_start..].find("[/WEBSEARCH]") else { break; };
+                let tag_header = &response[abs_open..abs_open + close_open + 1];
+                let body_text = response[tag_start..tag_start + close].trim();
+                let query = extract_tag_attr(tag_header, "query")
+                    .unwrap_or_else(|| body_text.to_string());
+                let query = query.trim();
+                let results = if query.is_empty() {
+                    "(no query)".to_string()
+                } else {
+                    match web_search(&self.client, query).await {
+                        Ok(r) => r,
+                        Err(e) => format!("WEBSEARCH ERROR: {}", e),
+                    }
+                };
+                command_results.push_str(&format!(
+                    "\n=== WEBSEARCH: {} ===\n{}\n",
+                    query, results
+                ));
+                search_from = tag_start + close + 12;
+            }
+
+            // Handle [FETCH url="..."][/FETCH] — fetch a URL, strip HTML,
+            // cap at ~8k chars. Paired with WEBSEARCH: the AI picks a
+            // result URL and pulls the full content for closer reading.
+            search_from = 0;
+            while let Some(start) = response[search_from..].find("[FETCH") {
+                let abs_open = search_from + start;
+                let Some(close_open) = response[abs_open..].find(']') else { break; };
+                let tag_start = abs_open + close_open + 1;
+                let Some(close) = response[tag_start..].find("[/FETCH]") else { break; };
+                let tag_header = &response[abs_open..abs_open + close_open + 1];
+                let body_text = response[tag_start..tag_start + close].trim();
+                let url = extract_tag_attr(tag_header, "url")
+                    .unwrap_or_else(|| body_text.to_string());
+                let url = url.trim();
+                let fetched = if url.is_empty() {
+                    "(no url)".to_string()
+                } else {
+                    match web_fetch(&self.client, url).await {
+                        Ok(r) => r,
+                        Err(e) => format!("FETCH ERROR: {}", e),
+                    }
+                };
+                command_results.push_str(&format!(
+                    "\n=== FETCH: {} ===\n{}\n",
+                    url, fetched
+                ));
+                search_from = tag_start + close + 8;
+            }
+
+            // Handle [SECURITY_AUDIT][/SECURITY_AUDIT] — run the built-in
+            // audit script (file perms, default secrets, stale versions,
+            // container restart-policy mismatches). Returns a structured
+            // report the AI can summarise and propose ACTIONs against.
+            search_from = 0;
+            while let Some(start) = response[search_from..].find("[SECURITY_AUDIT]") {
+                let abs_start = search_from + start + 16;
+                if let Some(end) = response[abs_start..].find("[/SECURITY_AUDIT]") {
+                    let report = run_security_audit();
+                    command_results.push_str(&format!("\n=== SECURITY AUDIT ===\n{}\n", report));
+                    search_from = abs_start + end + 17;
                 } else {
                     break;
                 }
@@ -1258,6 +1341,15 @@ fn build_system_prompt(knowledge: &str, server_context: &str) -> String {
          You can run commands on the server by using these special tags:\n\
          - `[EXEC]command[/EXEC]` — runs the command on the LOCAL WolfStack node only (the machine running this dashboard)\n\
          - `[EXEC_ALL]command[/EXEC_ALL]` — runs the command on ALL WolfStack nodes in the cluster. Results come back labelled by hostname.\n\n\
+         ## Research Tools\n\
+         Beyond shell execution, you have tools for external research and built-in audits. Use them BEFORE guessing:\n\
+         - `[WEBSEARCH query=\"search terms here\"][/WEBSEARCH]` — search the web (DuckDuckGo). Returns the top 5 results as title + URL + snippet. Use for questions about package names, distro quirks, Docker/Proxmox docs, anything outside the WolfStack codebase.\n\
+         - `[FETCH url=\"https://example.com/docs\"][/FETCH]` — fetch a URL's content. Returns up to 8000 chars of extracted text. Loopback and private-range addresses are refused (SSRF guard). Typical workflow: WEBSEARCH → pick a result → FETCH that URL → summarise for the user.\n\
+         - `[SECURITY_AUDIT][/SECURITY_AUDIT]` — run the built-in security audit. Checks /etc/wolfstack file permissions, default cluster secret, Docker container restart policies (so you can spot the \"autostart checkbox doesn't stick\" bug), and more. Returns a plain-text report. When the report flags a fixable issue, propose an ACTION to resolve it.\n\
+         Rules:\n\
+         - Use WEBSEARCH when you need external documentation, package names, or distro-specific facts — NOT for questions answerable from the server state below, your embedded knowledge base, or your training data. Each WEBSEARCH adds latency the user will feel.\n\
+         - Prefer WEBSEARCH + FETCH over saying \"check the docs\" — you CAN check the docs. But answer from system context first when possible.\n\
+         - Chain tools freely in one turn — a SECURITY_AUDIT finding can be followed by WEBSEARCH for the fix, then a proposed ACTION.\n\n\
          **CRITICAL RULES:**\n\
          - [EXEC] ALWAYS runs on the LOCAL node — even if the user is viewing a different node in the dashboard\n\
          - When the user asks about a SPECIFIC REMOTE node (e.g. 'what is using CPU on pbs?'), you MUST use [EXEC_ALL] and then look at the results for that specific hostname in the output\n\
@@ -1800,4 +1892,468 @@ pub fn build_metrics_summary(
     }
 
     summary
+}
+
+// ─── Tool-use helpers (WEBSEARCH / FETCH / SECURITY_AUDIT) ──────────
+
+/// Pull a named attribute value out of an opening tag like
+/// `[WEBSEARCH query="docker restart policy"]`. Returns None if the
+/// attribute isn't present or the value isn't quoted. Used by the
+/// websearch/fetch tag parsers so the AI can pass arguments as
+/// `key="value"` attributes rather than stuffing them in the body.
+fn extract_tag_attr(header: &str, attr: &str) -> Option<String> {
+    // Match `attr="..."` — a simple scan avoids pulling in a regex crate.
+    let needle = format!("{}=\"", attr);
+    let start = header.find(&needle)? + needle.len();
+    let rest = &header[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Scrape DuckDuckGo's HTML result page (no API key needed). Returns
+/// the top ~5 results as plain text, one per line, in the format
+/// "N. Title — URL\n   snippet". Errors on network failure or
+/// unexpected HTML structure.
+///
+/// DDG's HTML endpoint is stable-ish but not an official API. If this
+/// ever stops parsing cleanly we'd swap in Brave Search API or Kagi
+/// (both paid / API-keyed). Keeping this behind a feature flag is a
+/// deliberate deferred decision — for now the AI just gets whatever
+/// DDG returns, and if the scrape fails the AI sees an error string
+/// and can try `[FETCH]` on a known-good URL instead.
+async fn web_search(client: &reqwest::Client, query: &str) -> Result<String, String> {
+    let url = format!(
+        "https://html.duckduckgo.com/html/?q={}",
+        urlencoding_encode(query)
+    );
+    let resp = client.get(&url)
+        .header("User-Agent", "Mozilla/5.0 (compatible; WolfStack-AI/1.0)")
+        .timeout(std::time::Duration::from_secs(10))
+        .send().await
+        .map_err(|e| format!("network: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status().as_u16()));
+    }
+    let html = resp.text().await
+        .map_err(|e| format!("read body: {}", e))?;
+    // Cheap, no-dep HTML parsing — DDG's result rows always have the
+    // classes `result__title` (a link) followed by `result__snippet`.
+    // We scan linearly, pluck up to 5 pairs. If the structure ever
+    // changes this returns "(no results)" — the AI sees that and
+    // can try a different query or FETCH directly.
+    let mut results = Vec::new();
+    let mut cursor = 0usize;
+    while results.len() < 5 {
+        let title_start = match html[cursor..].find("class=\"result__a\"") {
+            Some(i) => cursor + i,
+            None => break,
+        };
+        let href_anchor = "href=\"";
+        let href_pos = match html[..title_start].rfind(href_anchor) {
+            Some(p) => p + href_anchor.len(),
+            None => { cursor = title_start + 1; continue; }
+        };
+        let href_end = match html[href_pos..].find('"') {
+            Some(i) => href_pos + i,
+            None => break,
+        };
+        let raw_href = &html[href_pos..href_end];
+        let url_str = ddg_decode_url(raw_href);
+        let title_text_start = match html[title_start..].find('>') {
+            Some(i) => title_start + i + 1,
+            None => break,
+        };
+        let title_text_end = match html[title_text_start..].find("</a>") {
+            Some(i) => title_text_start + i,
+            None => break,
+        };
+        let title = strip_html(&html[title_text_start..title_text_end]);
+        // Snippet: next `result__snippet` chunk after this title.
+        let snippet_marker = "result__snippet";
+        let snippet = match html[title_text_end..].find(snippet_marker) {
+            Some(s) => {
+                let snippet_pos = title_text_end + s;
+                let body_start = html[snippet_pos..].find('>')
+                    .map(|i| snippet_pos + i + 1).unwrap_or(snippet_pos);
+                let body_end = html[body_start..].find("</a>")
+                    .or_else(|| html[body_start..].find("</div>"))
+                    .map(|i| body_start + i).unwrap_or(body_start);
+                strip_html(&html[body_start..body_end])
+            }
+            None => String::new(),
+        };
+        results.push(format!(
+            "{}. {} — {}\n   {}",
+            results.len() + 1, title, url_str, snippet
+        ));
+        cursor = title_text_end;
+    }
+    if results.is_empty() {
+        Ok("(no results)".into())
+    } else {
+        Ok(results.join("\n"))
+    }
+}
+
+/// Fetch a URL, extract the visible text, cap at ~8000 chars so the
+/// AI doesn't blow its context on a huge page. Refuses non-HTTP(S)
+/// schemes and loopback/private-range addresses to avoid being
+/// turned into a SSRF cannon.
+async fn web_fetch(client: &reqwest::Client, url: &str) -> Result<String, String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("only http(s) URLs allowed".into());
+    }
+    if fetch_url_is_internal(url) {
+        return Err("fetching loopback/link-local/private addresses is disabled (SSRF guard)".into());
+    }
+    let resp = client.get(url)
+        .header("User-Agent", "Mozilla/5.0 (compatible; WolfStack-AI/1.0)")
+        .timeout(std::time::Duration::from_secs(15))
+        .send().await
+        .map_err(|e| format!("network: {}", e))?;
+    let status = resp.status();
+    let ct = resp.headers().get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let body = resp.text().await
+        .map_err(|e| format!("read body: {}", e))?;
+    let text = if ct.contains("html") {
+        strip_html(&body)
+    } else {
+        body
+    };
+    let cap = 8000;
+    let trimmed: String = text.chars().take(cap).collect();
+    let suffix = if text.chars().count() > cap {
+        format!("\n\n[… content truncated at {} chars …]", cap)
+    } else { String::new() };
+    Ok(format!("HTTP {} ({})\n\n{}{}", status.as_u16(), ct, trimmed, suffix))
+}
+
+/// SSRF guard — reject obvious internal targets. Not exhaustive, but
+/// catches the common "AI asked to fetch http://127.0.0.1/admin" case
+/// plus the less-obvious hex and decimal IPv4 literal forms which
+/// bypass a naïve dotted-quad check. Extra care because `reqwest`
+/// happily resolves `0x7f000001` or `2130706433` to 127.0.0.1.
+fn fetch_url_is_internal(url: &str) -> bool {
+    // Strip scheme, pull host portion.
+    let no_scheme = url.splitn(2, "://").nth(1).unwrap_or("");
+    let host_with_port = no_scheme.split('/').next().unwrap_or("");
+    // Handle bracketed IPv6: [::1]:8080 → host = "[::1]", port drop keeps "[::1]"
+    let host = if host_with_port.starts_with('[') {
+        host_with_port.rsplitn(2, ']').last().unwrap_or("")
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string()
+    } else {
+        host_with_port.split(':').next().unwrap_or("").to_string()
+    };
+    // Normalise — trailing dot (fully-qualified form), uppercase, URL
+    // encoding on host is unusual but not impossible.
+    let host_l = host.trim_end_matches('.').to_lowercase();
+    if host_l.is_empty() { return true; } // missing host = refuse
+    if host_l == "localhost" || host_l.ends_with(".localhost") { return true; }
+    if host_l.ends_with(".local") { return true; } // mDNS
+
+    // IPv4 dotted-quad form.
+    let quad_octets: Vec<u8> = host_l.split('.').filter_map(|s| s.parse().ok()).collect();
+    if quad_octets.len() == 4 {
+        if ipv4_is_private(quad_octets[0], quad_octets[1]) { return true; }
+    }
+    // IPv4 decimal form: a single integer like `2130706433` = 127.0.0.1.
+    // All-digits, fits in u32.
+    if host_l.chars().all(|c| c.is_ascii_digit()) {
+        if let Ok(n) = host_l.parse::<u32>() {
+            let a = ((n >> 24) & 0xFF) as u8;
+            let b = ((n >> 16) & 0xFF) as u8;
+            if ipv4_is_private(a, b) { return true; }
+        }
+    }
+    // IPv4 hex form: `0x7f000001` = 127.0.0.1. Curl supports this;
+    // reqwest relays to the OS resolver which also resolves it on
+    // Linux, so we must block it explicitly.
+    if let Some(hex) = host_l.strip_prefix("0x") {
+        if hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            if let Ok(n) = u32::from_str_radix(hex, 16) {
+                let a = ((n >> 24) & 0xFF) as u8;
+                let b = ((n >> 16) & 0xFF) as u8;
+                if ipv4_is_private(a, b) { return true; }
+            }
+        }
+    }
+    // IPv4 octal form: `0177.0.0.1` = 127.0.0.1. Each octet can be
+    // 0-prefixed octal. Rust's u8::parse doesn't do octal, so if all
+    // octets have a leading zero we convert manually.
+    if host_l.contains('.') {
+        let parsed_octal: Option<Vec<u8>> = host_l.split('.').map(|s| {
+            if let Some(rest) = s.strip_prefix('0') {
+                if rest.is_empty() { return Some(0u8); }
+                u8::from_str_radix(rest, 8).ok()
+            } else {
+                s.parse::<u8>().ok()
+            }
+        }).collect();
+        if let Some(oct) = parsed_octal {
+            if oct.len() == 4 && ipv4_is_private(oct[0], oct[1]) { return true; }
+        }
+    }
+
+    // IPv6 forms — loopback (::1), link-local (fe80::/10), unique-local (fc00::/7).
+    // Only apply these checks when the host actually looks like an IPv6
+    // literal (contains at least one colon) — otherwise a legitimate
+    // domain like "fcdn.example.com" gets blocked.
+    if host_l.contains(':') {
+        if host_l == "::1" || host_l == "0:0:0:0:0:0:0:1" { return true; }
+        if host_l.starts_with("fe80:") || host_l.starts_with("fe80::") { return true; }
+        // fc00::/7 (fc** and fd** prefixes). The hextet is a 4-char
+        // hex group so we match "fc..:" or "fd..:" where the ".." is
+        // 0-2 hex digits. Safer than blanket fc/fd prefix matching.
+        let first_hextet = host_l.split(':').next().unwrap_or("");
+        if (first_hextet.starts_with("fc") || first_hextet.starts_with("fd"))
+            && first_hextet.len() <= 4
+            && first_hextet.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return true;
+        }
+        // IPv4-mapped IPv6 (::ffff:127.0.0.1).
+        if host_l.starts_with("::ffff:") {
+            let mapped = &host_l[7..];
+            let oct: Vec<u8> = mapped.split('.').filter_map(|s| s.parse().ok()).collect();
+            if oct.len() == 4 && ipv4_is_private(oct[0], oct[1]) { return true; }
+        }
+    }
+
+    false
+}
+
+/// Shared classifier for IPv4 octets — 127/8, 10/8, 192.168/16, 172.16/12,
+/// 169.254/16 link-local, 0/8. Extracted so every IPv4-looking form
+/// (dotted quad, decimal, hex, octal, IPv4-mapped IPv6) hits the same
+/// check and we can't forget to update one branch.
+fn ipv4_is_private(a: u8, b: u8) -> bool {
+    a == 127                            // loopback
+        || a == 10                       // private
+        || (a == 192 && b == 168)        // private
+        || (a == 172 && (16..=31).contains(&b)) // private
+        || (a == 169 && b == 254)        // link-local
+        || a == 0                        // this-network
+}
+
+/// Very small URL-encoder — pulls in nothing, handles the chars DDG
+/// actually sees in a natural-language query (space, quote, etc).
+fn urlencoding_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else if b == b' ' {
+            out.push('+');
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
+/// DuckDuckGo's HTML endpoint wraps every result href in
+/// `/l/?kh=-1&uddg=<encoded real URL>`. Strip that wrapper so the AI
+/// gets the actual target URL to FETCH. Best-effort — if the format
+/// changes we fall back to returning the raw href.
+fn ddg_decode_url(href: &str) -> String {
+    let marker = "uddg=";
+    if let Some(pos) = href.find(marker) {
+        let tail = &href[pos + marker.len()..];
+        let end = tail.find('&').unwrap_or(tail.len());
+        let encoded = &tail[..end];
+        return urldecode(encoded);
+    }
+    href.to_string()
+}
+
+fn urldecode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        if bytes[i] == b'+' { out.push(b' '); } else { out.push(bytes[i]); }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Strip HTML tags + collapse whitespace. Not a real parser — just
+/// enough to turn a result page into something readable for the LLM.
+/// Deliberately no dep on html5ever; adds a megabyte for no benefit.
+fn strip_html(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    let mut in_script = false;
+    let chars: Vec<char> = html.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        // Detect <script> and <style> blocks — skip until matching close.
+        if !in_tag && chars[i] == '<' {
+            let rest: String = chars[i..(i + 8).min(chars.len())].iter().collect();
+            let rest_l = rest.to_lowercase();
+            if rest_l.starts_with("<script") || rest_l.starts_with("<style") {
+                in_script = true;
+                i += 1;
+                continue;
+            }
+        }
+        if in_script {
+            if chars[i] == '>' {
+                let recent: String = chars[i.saturating_sub(9)..=i].iter().collect();
+                let recent_l = recent.to_lowercase();
+                if recent_l.contains("/script") || recent_l.contains("/style") {
+                    in_script = false;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if chars[i] == '<' { in_tag = true; i += 1; continue; }
+        if chars[i] == '>' { in_tag = false; out.push(' '); i += 1; continue; }
+        if !in_tag { out.push(chars[i]); }
+        i += 1;
+    }
+    // Collapse runs of whitespace (incl. newlines) to single spaces,
+    // then decode the handful of HTML entities that matter.
+    let collapsed = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+}
+
+/// Built-in security audit. Shell out to `stat` / `find` / `systemctl`
+/// and look for the known-bad states:
+///   - /etc/wolfstack sensitive files with loose perms (pre-v18.7.27 leftovers)
+///   - Default cluster secret still active (custom-cluster-secret missing or empty)
+///   - Stale WolfStack binary (compares CARGO_PKG_VERSION to `wolfstack --version`)
+///   - Default join-token file present (not a bug per se, but operators should
+///     know it exists — it's a trust delegation)
+///   - NetworkManager actively managing a LAN bridge (clobber risk)
+///
+/// Returns a plain-text multi-line report. The AI wraps it in
+/// `[ACTION]` proposals for the fixes it knows how to apply.
+fn run_security_audit() -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("WolfStack v{} — security audit", env!("CARGO_PKG_VERSION")));
+    lines.push("".into());
+
+    // ── File permission checks ──
+    let sensitive = [
+        ("/etc/wolfstack/custom-cluster-secret", "cluster secret (inter-node auth)"),
+        ("/etc/wolfstack/cluster-secret", "legacy cluster secret (pre-v11.26.3 leftovers)"),
+        ("/etc/wolfstack/nodes.json", "cluster node list with embedded PVE API tokens"),
+        ("/etc/wolfstack/join-token", "cluster join token"),
+        ("/etc/wolfstack/license.key", "enterprise license key"),
+        ("/etc/wolfstack/key.pem", "TLS private key"),
+    ];
+    let mut file_issues = 0;
+    for (path, label) in &sensitive {
+        if !std::path::Path::new(path).exists() { continue; }
+        match std::process::Command::new("stat")
+            .args(["-c", "%a", path])
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                let mode = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                // Any group/world bits on a sensitive file = finding.
+                let owner_only = mode == "600" || mode == "400";
+                if !owner_only {
+                    file_issues += 1;
+                    lines.push(format!(
+                        "[!] {} has mode {} (should be 600) — {}",
+                        path, mode, label
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    // Directory itself.
+    if let Ok(out) = std::process::Command::new("stat")
+        .args(["-c", "%a", "/etc/wolfstack"])
+        .output()
+    {
+        if out.status.success() {
+            let mode = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !mode.starts_with("700") && !mode.starts_with("750") {
+                file_issues += 1;
+                lines.push(format!(
+                    "[!] /etc/wolfstack has mode {} (should be 700 or 750)",
+                    mode
+                ));
+            }
+        }
+    }
+    if file_issues == 0 {
+        lines.push("[OK] Sensitive file/directory permissions look right.".into());
+    }
+
+    // ── Default cluster secret still in use? ──
+    let secret_path = "/etc/wolfstack/custom-cluster-secret";
+    match std::fs::read_to_string(secret_path) {
+        Ok(s) if !s.trim().is_empty() => {
+            lines.push("[OK] Custom cluster secret is set (not using built-in default).".into());
+        }
+        _ => {
+            lines.push("[!] No custom cluster secret — all nodes are using the built-in default. \
+                        Any attacker who downloads WolfStack can talk to your cluster's inter-node \
+                        API. Generate one from Settings → Security.".into());
+        }
+    }
+
+    // ── Container autostart mismatch check ──
+    // Docker reports HostConfig.RestartPolicy.Name per container. We
+    // list all containers and their policies so the AI can spot the
+    // "ran docker update --restart but it didn't stick" case the user
+    // reported against the autostart checkbox.
+    if let Ok(out) = std::process::Command::new("docker")
+        .args(["ps", "-a", "--format", "{{.Names}}\t{{.ID}}"])
+        .output()
+    {
+        if out.status.success() {
+            let names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                .lines().map(|l| l.to_string()).collect();
+            if !names.is_empty() {
+                lines.push("".into());
+                lines.push("Docker restart policies (what docker inspect actually reports):".into());
+                for line in names.iter().take(50) {
+                    let parts: Vec<&str> = line.split('\t').collect();
+                    if parts.len() < 2 { continue; }
+                    let name = parts[0];
+                    if let Ok(pol) = std::process::Command::new("docker")
+                        .args(["inspect", "-f", "{{.HostConfig.RestartPolicy.Name}}", name])
+                        .output()
+                    {
+                        let p = String::from_utf8_lossy(&pol.stdout).trim().to_string();
+                        lines.push(format!("    {} : {}", name, if p.is_empty() { "(empty)".into() } else { p }));
+                    }
+                }
+            }
+        }
+    }
+
+    lines.join("\n")
 }

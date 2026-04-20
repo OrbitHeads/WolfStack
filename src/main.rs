@@ -52,6 +52,7 @@ mod security;
 mod services_discovery;
 mod cluster_browser;
 mod compat;
+mod danger;
 mod plugins;
 #[allow(dead_code)]
 mod integrations;
@@ -491,6 +492,18 @@ async fn main() -> std::io::Result<()> {
         let state_clone = app_state.clone();
         let cluster_clone = cluster.clone();
         // Clone public_ip for the background task
+        // Deadman-switch tick — every second, check pending dangerous
+        // ops and auto-rollback any whose TTL has expired. See
+        // src/danger.rs for the design. Cheap (HashMap scan + Instant
+        // elapsed check); runs unconditionally so every node enforces
+        // its own rollback window even if the orchestrator's dead.
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::task::spawn_blocking(danger::tick).await.ok();
+            }
+        });
+
         let public_ip = public_ip.clone();
         let cached_status_bg = cached_status.clone();
         tokio::spawn(async move {
