@@ -5041,7 +5041,29 @@ pub async fn docker_update_config(
     let id = path.into_inner();
 
     match containers::docker_update_config(&id, body.autostart, body.memory_mb, body.cpus, body.wolfnet_ip.clone()) {
-         Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+         Ok(msg) => {
+            // Re-inspect AFTER the update (and after any compose-file
+            // edit + docker-update retry) and return the authoritative
+            // autostart state. Frontend uses this value directly to
+            // set the checkbox — it does NOT trust the user's intent.
+            // That closes the class of bugs where `docker update`
+            // succeeded, the verify passed, but the subsequent list
+            // fetch somehow returned a stale/different value (cache,
+            // combined-inspect parse edge case, multi-writer race,
+            // whatever). The checkbox now renders exactly what
+            // `docker inspect` says right now.
+            let verified_autostart: Option<bool> = std::process::Command::new("docker")
+                .args(["inspect", "-f", "{{.HostConfig.RestartPolicy.Name}}", &id])
+                .output().ok()
+                .and_then(|o| if o.status.success() {
+                    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                } else { None })
+                .map(|p| !p.is_empty() && p != "no");
+            HttpResponse::Ok().json(serde_json::json!({
+                "message": msg,
+                "autostart": verified_autostart,
+            }))
+         }
          Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
     }
 }

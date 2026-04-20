@@ -17598,14 +17598,13 @@ function copyInstallCmd(component) {
 }
 
 async function toggleDockerAutostart(id, enabled) {
-    // The bug this guard fixes: previously this function awaited the
-    // fetch and unconditionally showed a green "enabled/disabled" toast,
-    // even when the backend returned 4xx/5xx. The user saw "enabled",
-    // refreshed the page, and the checkbox was empty because Docker had
-    // never actually had its restart policy changed. Now we check
-    // response.ok, surface the backend's error verbatim on failure,
-    // and re-fetch the list so the checkbox always shows the *actual*
-    // committed state — never the user's intent.
+    // On success, the backend returns { autostart: <bool> } — the
+    // authoritative value from `docker inspect` immediately after the
+    // update was verified. We flip the checkbox to THAT, not to the
+    // user's intent. Avoids the old race where we also fired a
+    // /api/containers/docker re-fetch that sometimes came back with
+    // a stale / re-inspect-parsed autostart=false and stomped the
+    // just-applied state, causing the checkbox to flip back ~3s later.
     let r;
     try {
         r = await fetch(apiUrl(`/api/containers/docker/${encodeURIComponent(id)}/config`), {
@@ -17628,8 +17627,22 @@ async function toggleDockerAutostart(id, enabled) {
         if (typeof loadDockerContainers === 'function') loadDockerContainers();
         return;
     }
-    showToast(`Docker autostart ${enabled ? 'enabled' : 'disabled'}`, 'success');
-    if (typeof loadDockerContainers === 'function') loadDockerContainers();
+    // Success — trust the server's verified autostart value.
+    let verified = null;
+    try {
+        const data = await r.json();
+        if (typeof data?.autostart === 'boolean') verified = data.autostart;
+    } catch (_) { /* legacy server, body was just { message } */ }
+    const effective = verified !== null ? verified : enabled;
+    // Sync the DOM checkbox to the verified state, in case the user's
+    // click diverged from what actually stuck (e.g. compose override,
+    // policy change rejected). Find the specific row's checkbox.
+    const row = document.querySelector(`tr[data-name] input[type=checkbox][onchange*="toggleDockerAutostart('${id}'"]`);
+    if (row) row.checked = effective;
+    showToast(`Docker autostart ${effective ? 'enabled' : 'disabled'}`, 'success');
+    // No full-list re-fetch on success — the verified value is already
+    // applied above, and a re-fetch has been observed to occasionally
+    // stomp it back on some setups (root cause still under investigation).
 }
 
 async function toggleLxcAutostart(name, enabled) {
