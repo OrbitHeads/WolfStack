@@ -39371,16 +39371,16 @@ function cpBuildCustomRows(filteredItems) {
 }
 
 // Per-row background shading — "each row slightly different shaded"
-// (user spec). Alternates hue across rows in a fixed, readable palette
-// that works in both light and dark themes.
+// (user spec). Low-alpha tints that sit behind the glass tiles and give
+// each row a quiet hue without fighting the dark theme.
 const _CP_ROW_SHADES = [
-    'rgba(59,130,246,0.06)',   // blue
-    'rgba(168,85,247,0.06)',   // purple
-    'rgba(16,185,129,0.06)',   // emerald
-    'rgba(234,179,8,0.07)',    // amber
-    'rgba(239,68,68,0.06)',    // red
-    'rgba(14,165,233,0.06)',   // sky
-    'rgba(236,72,153,0.06)',   // pink
+    'rgba(59,130,246,0.04)',   // blue
+    'rgba(168,85,247,0.04)',   // purple
+    'rgba(16,185,129,0.04)',   // emerald
+    'rgba(234,179,8,0.05)',    // amber
+    'rgba(239,68,68,0.04)',    // red
+    'rgba(14,165,233,0.04)',   // sky
+    'rgba(236,72,153,0.04)',   // pink
 ];
 function cpRowShade(idx) { return _CP_ROW_SHADES[idx % _CP_ROW_SHADES.length]; }
 
@@ -39440,51 +39440,151 @@ function cpRenderRow(row, idx, mode) {
 
 function cpRenderTile(it, rowId, mode) {
     const kindBadge = { docker: '🐳', lxc: '📦', vm: '💻' }[it.kind] || '•';
-    const statusColour = {
-        running: '#10b981',
-        stopped: '#6b7280',
-        paused: '#f59e0b',
-        unknown: '#ef4444',
-        stale:   '#eab308',
-    }[it.status] || '#6b7280';
+    const statusColour = cpStatusColour(it.status);
     const draggable = mode === 'custom' && !it._stale;
     const dragAttrs = draggable
         ? `draggable="true" ondragstart="cpDragStart(event, '${cpKey(it)}', '${rowId}')"`
         : '';
-    const staleNote = it._stale ? `<div style="font-size:10px;color:#eab308;margin-top:2px;">gone — not in inventory</div>` : '';
-    const memMb = it.memory_bytes ? (it.memory_bytes / 1048576).toFixed(0) + ' MB' : '';
-    const cpuPct = (it.cpu_percent && it.cpu_percent > 0) ? it.cpu_percent.toFixed(1) + '%' : '';
-    const metrics = [cpuPct, memMb].filter(Boolean).join(' · ');
+
+    // Icon with text underneath. Background picks up a faint status
+    // tint so "is this thing running?" reads at a glance — green for
+    // running, grey for stopped, amber for paused, red for unknown,
+    // yellow for stale. The glass blur still keeps it subtle.
+    const tintBg = cpStatusTintBg(it.status);
+    const tintBorder = cpStatusTintBorder(it.status);
 
     return `
         <div class="cp-tile" ${dragAttrs} data-key="${escapeHtml(cpKey(it))}"
-             style="flex:0 0 200px;background:var(--bg-input);border:1px solid var(--border);border-radius:8px;padding:9px 10px;font-size:12px;${draggable ? 'cursor:grab;' : ''}">
-            <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
-                <span style="width:8px;height:8px;border-radius:50%;background:${statusColour};flex-shrink:0;"></span>
-                <span style="font-size:14px;">${kindBadge}</span>
-                <span style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(it.name)}">${escapeHtml(it.name)}</span>
+             title="${escapeHtml(it.name)}${it.node_hostname ? ' · ' + escapeHtml(it.node_hostname) : ''} — ${escapeHtml(it.status)}"
+             oncontextmenu="cpContextMenu(event, '${cpKey(it)}'); return false;"
+             style="position:relative;flex:0 0 100px;display:flex;flex-direction:column;align-items:center;gap:4px;padding:12px 6px 10px;border-radius:10px;
+                    background:${tintBg};backdrop-filter:blur(6px);
+                    border:1px solid ${tintBorder};
+                    ${draggable ? 'cursor:grab;' : ''}">
+            <div style="position:relative;font-size:34px;line-height:1;">
+                ${kindBadge}
+                <span style="position:absolute;right:-6px;top:-3px;width:10px;height:10px;border-radius:50%;background:${statusColour};box-shadow:0 0 6px ${statusColour};border:1.5px solid rgba(15,23,42,0.8);"></span>
             </div>
-            <div style="color:var(--text-muted);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(it.node_hostname || '')}">
-                ${escapeHtml(it.node_hostname || '')} ${it.cluster ? '· ' + escapeHtml(it.cluster) : ''}
-            </div>
-            ${metrics ? `<div style="color:var(--text-muted);font-size:11px;margin-top:2px;">${escapeHtml(metrics)}</div>` : ''}
-            ${staleNote}
-            ${it._stale ? '' : cpRenderTileActions(it)}
+            <div style="font-size:12px;font-weight:600;max-width:88px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center;">${escapeHtml(it.name)}</div>
+            <div style="font-size:10px;color:var(--text-muted);max-width:88px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center;">${escapeHtml(it.node_hostname || '')}</div>
+            <div style="font-size:10px;font-weight:600;color:${statusColour};text-transform:uppercase;letter-spacing:0.5px;">${escapeHtml(it.status || '')}</div>
         </div>`;
 }
 
-function cpRenderTileActions(it) {
-    if (it._stale) return '';
-    const k = cpKey(it);
+function cpStatusColour(s) {
+    return { running: '#10b981', stopped: '#6b7280', paused: '#f59e0b', unknown: '#ef4444', stale: '#eab308' }[s] || '#6b7280';
+}
+function cpStatusTintBg(s) {
+    const m = {
+        running: 'rgba(16,185,129,0.08)',
+        stopped: 'rgba(100,116,139,0.06)',
+        paused:  'rgba(245,158,11,0.08)',
+        unknown: 'rgba(239,68,68,0.10)',
+        stale:   'rgba(234,179,8,0.10)',
+    };
+    return m[s] || 'rgba(255,255,255,0.03)';
+}
+function cpStatusTintBorder(s) {
+    const m = {
+        running: 'rgba(16,185,129,0.25)',
+        stopped: 'rgba(100,116,139,0.18)',
+        paused:  'rgba(245,158,11,0.25)',
+        unknown: 'rgba(239,68,68,0.35)',
+        stale:   'rgba(234,179,8,0.35)',
+    };
+    return m[s] || 'rgba(255,255,255,0.06)';
+}
+
+// Action functions used by hover/menus — kept for back-compat.
+function cpRenderTileActions(_it) { return ''; }
+
+// ─── Right-click context menu ───
+
+let _cpMenuEl = null;
+function cpContextMenu(ev, key) {
+    ev.preventDefault();
+    const it = _cpInventory.find(x => cpKey(x) === key);
+    if (!it) return;
+    cpDismissContextMenu();
+
+    const items = [];
     const running = it.status === 'running';
-    return `
-        <div style="display:flex;gap:4px;margin-top:6px;">
-            ${running
-                ? `<button class="btn btn-sm" style="flex:1;padding:3px 6px;font-size:11px;" onclick="cpAction('${k}','stop')">■ Stop</button>
-                   <button class="btn btn-sm" style="flex:1;padding:3px 6px;font-size:11px;" onclick="cpAction('${k}','restart')">↻ Restart</button>`
-                : `<button class="btn btn-sm btn-primary" style="flex:1;padding:3px 6px;font-size:11px;" onclick="cpAction('${k}','start')">▶ Start</button>`
-            }
-        </div>`;
+    if (!it._stale) {
+        if (!running) items.push({ label: '▶ Start', fn: () => cpAction(key, 'start') });
+        if (running)  items.push({ label: '■ Stop', fn: () => cpAction(key, 'stop') });
+        if (running)  items.push({ label: '↻ Restart', fn: () => cpAction(key, 'restart') });
+        items.push({ separator: true });
+        items.push({ label: '🖥 Open console', fn: () => cpOpenConsole(it) });
+        items.push({ label: '↗ Go to node view', fn: () => cpGoToNode(it) });
+    }
+    items.push({ separator: true });
+    items.push({ label: 'ℹ Copy name', fn: () => cpCopyName(it) });
+
+    const menu = document.createElement('div');
+    menu.className = 'cp-context-menu';
+    menu.style.cssText = `position:fixed;z-index:10000;min-width:190px;background:rgba(15,23,42,0.97);border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:4px 0;box-shadow:0 10px 30px rgba(0,0,0,0.55);backdrop-filter:blur(8px);font-size:13px;color:#f1f5f9;`;
+    const header = document.createElement('div');
+    header.style.cssText = 'padding:6px 14px 6px;font-size:11px;color:#94a3b8;border-bottom:1px solid rgba(255,255,255,0.08);margin-bottom:4px;';
+    header.textContent = `${it.kind} · ${it.name}`;
+    menu.appendChild(header);
+
+    for (const row of items) {
+        if (row.separator) {
+            const sep = document.createElement('div');
+            sep.style.cssText = 'height:1px;background:rgba(255,255,255,0.08);margin:4px 0;';
+            menu.appendChild(sep);
+            continue;
+        }
+        const btn = document.createElement('div');
+        btn.textContent = row.label;
+        btn.style.cssText = 'padding:7px 14px;cursor:pointer;';
+        btn.addEventListener('mouseenter', () => btn.style.background = 'rgba(255,255,255,0.06)');
+        btn.addEventListener('mouseleave', () => btn.style.background = 'transparent');
+        btn.addEventListener('click', () => {
+            cpDismissContextMenu();
+            try { row.fn(); } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+        });
+        menu.appendChild(btn);
+    }
+
+    // Position — keep inside viewport.
+    const maxX = window.innerWidth - 200;
+    const maxY = window.innerHeight - Math.min(menu.offsetHeight || 250, 300);
+    menu.style.left = Math.min(ev.clientX, maxX) + 'px';
+    menu.style.top  = Math.min(ev.clientY, maxY) + 'px';
+    document.body.appendChild(menu);
+    _cpMenuEl = menu;
+
+    // Dismiss on click outside / escape / scroll.
+    setTimeout(() => {
+        document.addEventListener('click', cpDismissContextMenu, { once: true });
+        document.addEventListener('keydown', cpMenuKeyHandler);
+        window.addEventListener('scroll', cpDismissContextMenu, { once: true, capture: true });
+    }, 0);
+}
+function cpDismissContextMenu() {
+    if (_cpMenuEl && _cpMenuEl.parentNode) _cpMenuEl.parentNode.removeChild(_cpMenuEl);
+    _cpMenuEl = null;
+    document.removeEventListener('keydown', cpMenuKeyHandler);
+}
+function cpMenuKeyHandler(ev) {
+    if (ev.key === 'Escape') cpDismissContextMenu();
+}
+function cpCopyName(it) {
+    if (navigator.clipboard) navigator.clipboard.writeText(it.name).then(() => showToast('Name copied', 'success'));
+}
+function cpOpenConsole(it) {
+    // Route via the existing per-kind console pages. Docker/LXC consoles
+    // live at /console.html?type=...&name=...; VMs use their own URL.
+    if (it.kind === 'docker' || it.kind === 'lxc') {
+        window.open(`/console.html?type=${encodeURIComponent(it.kind)}&name=${encodeURIComponent(it.name)}&node=${encodeURIComponent(it.node_id)}`, '_blank');
+    } else if (it.kind === 'vm') {
+        window.open(`/vnc.html?vm=${encodeURIComponent(it.name)}&node=${encodeURIComponent(it.node_id)}`, '_blank');
+    }
+}
+function cpGoToNode(it) {
+    // Jump to the item's node's dashboard. Uses existing selectServerView.
+    if (typeof selectServerView === 'function') selectServerView(it.node_id, it.kind === 'vm' ? 'vms' : 'containers');
 }
 
 // ─── Drag & drop (Custom mode only) ───
@@ -39841,8 +39941,11 @@ function cp3dInit() {
 
     const W = container.clientWidth, H = container.clientHeight;
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x080810);
-    scene.fog = new THREE.Fog(0x080810, 25, 70);
+    // Transparent so the CSS gradient on the container shows through —
+    // the 3D scene blends with the rest of the dashboard instead of
+    // feeling like a separate dark window.
+    scene.background = null;
+    scene.fog = new THREE.Fog(0x0f172a, 20, 60);
 
     const camera = new THREE.PerspectiveCamera(55, W / H, 0.1, 200);
     camera.position.set(0, 3, 17);
@@ -39884,12 +39987,22 @@ function cp3dInit() {
             const hit = hits[0].object;
             const tileHit = cp3dFindTile(hit);
             const ringHit = cp3dFindRing(hit);
+            // Right-click on a tile → context menu, same as flat view.
+            if (ev.button === 2 && tileHit) {
+                ev.preventDefault();
+                cpContextMenu(ev, cpKey(tileHit));
+                return;
+            }
             if (tileHit) {
                 cp3dHandleTileClick(tileHit);
             } else if (ringHit) {
-                // Start drag-to-spin if user holds down and moves
                 _cp3d.dragging = { ring: ringHit, startX: ev.clientX, startRotation: ringHit.rotation.y };
             }
+        },
+        onContextMenu(ev) {
+            // Block the browser's native menu on the 3D canvas — our
+            // custom one opens from pointerdown instead.
+            ev.preventDefault();
         },
         onPointerMove(ev) {
             if (!_cp3d.dragging) return;
@@ -39907,6 +40020,7 @@ function cp3dInit() {
     };
 
     canvas.addEventListener('pointerdown', _cp3d.onPointerDown);
+    canvas.addEventListener('contextmenu', _cp3d.onContextMenu);
     window.addEventListener('pointermove', _cp3d.onPointerMove);
     window.addEventListener('pointerup', _cp3d.onPointerUp);
     window.addEventListener('resize', _cp3d.onResize);
@@ -39928,7 +40042,10 @@ function cp3dDispose() {
     try { _cp3d.renderer.dispose(); } catch (e) {}
     try {
         const canvas = document.getElementById('cp-3d-canvas');
-        if (canvas) canvas.removeEventListener('pointerdown', _cp3d.onPointerDown);
+        if (canvas) {
+            canvas.removeEventListener('pointerdown', _cp3d.onPointerDown);
+            canvas.removeEventListener('contextmenu', _cp3d.onContextMenu);
+        }
     } catch (e) {}
     window.removeEventListener('pointermove', _cp3d.onPointerMove);
     window.removeEventListener('pointerup', _cp3d.onPointerUp);
@@ -39990,49 +40107,51 @@ function cp3dRebuild() {
 
 function cp3dMakeRing(rowData, y, shade, idx, mode) {
     const radius = 5;
-    const tubeR = 0.25;
+    const tubeR = 0.15;  // thinner, less dominant
     const colour = rowData.colour || cp3dShadeToHex(shade);
 
-    // Everything for this ring sits in a single Group so the ring and
-    // its tiles all spin together via `ringGroup.rotation.y`. The group
-    // is translated to the ring's Y; everything inside is local.
     const ringGroup = new THREE.Group();
     ringGroup.position.y = y;
     ringGroup.userData = { kind: 'ring', rowId: rowData.id, rowName: rowData.name, mode };
 
-    const torusGeo = new THREE.TorusGeometry(radius, tubeR, 16, 64);
+    // Flat ring, glassy — sits quietly in the scene instead of glowing.
+    // Low opacity, subtle tint from the row colour, matte roughness.
+    const torusGeo = new THREE.TorusGeometry(radius, tubeR, 12, 72);
     const torusMat = new THREE.MeshStandardMaterial({
         color: new THREE.Color(colour),
-        emissive: new THREE.Color(colour),
-        emissiveIntensity: 0.25,
-        roughness: 0.5,
-        metalness: 0.2,
+        roughness: 0.35,
+        metalness: 0.5,
+        transparent: true,
+        opacity: 0.35,
     });
     const torus = new THREE.Mesh(torusGeo, torusMat);
-    // Default TorusGeometry lies in the XY plane; rotate so it lies
-    // flat in XZ (a ring around the Y axis).
     torus.rotation.x = Math.PI / 2;
     ringGroup.add(torus);
 
-    // Label above the ring — a sprite always faces the camera, so no
-    // rotation bookkeeping needed.
+    // Faint disk underneath the ring for depth.
+    const diskGeo = new THREE.RingGeometry(radius - 0.4, radius + 0.4, 72);
+    const diskMat = new THREE.MeshBasicMaterial({
+        color: new THREE.Color(colour),
+        transparent: true,
+        opacity: 0.06,
+        side: THREE.DoubleSide,
+    });
+    const disk = new THREE.Mesh(diskGeo, diskMat);
+    disk.rotation.x = -Math.PI / 2;
+    disk.position.y = -0.05;
+    ringGroup.add(disk);
+
     const label = cp3dMakeLabelSprite(`${rowData.name}  (${rowData.items.length})`);
-    label.position.set(0, 1.1, 0);
+    label.position.set(0, 1.0, 0);
     ringGroup.add(label);
 
     const items = [];
-    const count = Math.min(rowData.items.length, 60);  // cap per ring for performance
+    const count = Math.min(rowData.items.length, 60);
     for (let i = 0; i < count; i++) {
         const angle = (i / Math.max(count, 1)) * Math.PI * 2;
         const it = rowData.items[i];
         const plane = cp3dMakeTileSprite(it);
-        // Position in the ring's local XZ plane so all tiles lie flat
-        // at the same height. ringGroup.rotation.y spins them together.
-        plane.position.set(Math.cos(angle) * (radius + 0.05), 0, Math.sin(angle) * (radius + 0.05));
-        // Orient the plane's +Z normal outward from the ring centre.
-        // Default plane normal is +Z; rotating by (π/2 - angle) around
-        // Y turns that into the outward-radial direction (derivation:
-        // (sin θ, 0, cos θ) = (cos a, 0, sin a) → θ = π/2 - a).
+        plane.position.set(Math.cos(angle) * radius, 0, Math.sin(angle) * radius);
         plane.rotation.y = Math.PI / 2 - angle;
         plane.userData = { kind: 'tile', item: it };
         ringGroup.add(plane);
@@ -40096,46 +40215,72 @@ async function cp3dHandleRingClick(ringMesh) {
     await cpReload();
 }
 
-// Build a CanvasTexture with the tile's label + status dot. Returns a
-// Sprite-like Mesh (PlaneGeometry) ready to drop into the scene.
+// Draw each item as: large kind-emoji up top, name underneath, host in
+// a quieter tint below. Background is a soft vertical gradient rather
+// than a hard rectangle so the tile reads as an icon on the ring rather
+// than a framed card.
 function cp3dMakeTileSprite(item) {
     const canvas = document.createElement('canvas');
-    canvas.width = 256; canvas.height = 128;
+    canvas.width = 256; canvas.height = 256;
     const ctx = canvas.getContext('2d');
-    ctx.fillStyle = 'rgba(20,24,36,0.94)';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.strokeStyle = 'rgba(100,120,160,0.45)';
-    ctx.lineWidth = 3;
-    ctx.strokeRect(1.5, 1.5, canvas.width - 3, canvas.height - 3);
-    // Status dot
+    // Soft radial backdrop — mostly transparent, just enough to anchor
+    // the icon against the dark scene. No hard border.
+    const grad = ctx.createRadialGradient(128, 128, 20, 128, 128, 130);
+    grad.addColorStop(0, 'rgba(30,41,59,0.8)');
+    grad.addColorStop(0.7, 'rgba(30,41,59,0.25)');
+    grad.addColorStop(1, 'rgba(30,41,59,0.0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 256, 256);
+
     const statusColour = { running: '#10b981', stopped: '#6b7280', paused: '#f59e0b', unknown: '#ef4444', stale: '#eab308' }[item.status] || '#6b7280';
-    ctx.fillStyle = statusColour;
-    ctx.beginPath(); ctx.arc(20, 20, 9, 0, Math.PI * 2); ctx.fill();
-    // Kind emoji
-    ctx.font = '30px system-ui, -apple-system, sans-serif';
-    ctx.fillStyle = '#e8eaf0';
+
+    // Kind emoji — big, centered horizontally, top half of the canvas.
+    ctx.font = '120px system-ui, -apple-system, "Apple Color Emoji", "Segoe UI Emoji", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
     const emoji = { docker: '🐳', lxc: '📦', vm: '💻' }[item.kind] || '•';
-    ctx.fillText(emoji, 40, 32);
-    // Name
-    ctx.font = 'bold 22px system-ui, sans-serif';
+    ctx.fillText(emoji, 128, 95);
+
+    // Status dot badge nestled against the emoji.
+    ctx.beginPath();
+    ctx.arc(178, 62, 12, 0, Math.PI * 2);
+    ctx.fillStyle = statusColour;
+    ctx.fill();
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(15,23,42,0.9)';
+    ctx.stroke();
+
+    // Name — bold, single line, centered below icon.
+    ctx.font = 'bold 26px system-ui, sans-serif';
     ctx.fillStyle = '#f1f5f9';
-    const name = (item.name || '').slice(0, 18);
-    ctx.fillText(name, 16, 68);
-    // Host
-    ctx.font = '16px system-ui, sans-serif';
+    const name = cp3dTruncate(ctx, item.name || '', 220);
+    ctx.fillText(name, 128, 180);
+
+    // Host line — smaller, dimmer.
+    ctx.font = '18px system-ui, sans-serif';
     ctx.fillStyle = '#94a3b8';
-    const host = (item.node_hostname || '').slice(0, 22);
-    ctx.fillText(host, 16, 94);
-    // Status word
+    const host = cp3dTruncate(ctx, item.node_hostname || '', 220);
+    ctx.fillText(host, 128, 208);
+
+    // Status word — small, matches badge colour.
     ctx.font = '14px system-ui, sans-serif';
     ctx.fillStyle = statusColour;
-    ctx.fillText(item.status || '', 16, 114);
+    ctx.fillText(item.status || '', 128, 232);
 
     const tex = new THREE.CanvasTexture(canvas);
     tex.needsUpdate = true;
-    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide });
-    const geo = new THREE.PlaneGeometry(1.3, 0.7);
+    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide, depthWrite: false });
+    const geo = new THREE.PlaneGeometry(1.1, 1.1);
     return new THREE.Mesh(geo, mat);
+}
+
+// Trim a string with an ellipsis until it fits maxWidth in the current
+// ctx font. Used for the 3D tile labels.
+function cp3dTruncate(ctx, text, maxWidth) {
+    if (ctx.measureText(text).width <= maxWidth) return text;
+    let s = text;
+    while (s.length > 0 && ctx.measureText(s + '…').width > maxWidth) s = s.slice(0, -1);
+    return s + '…';
 }
 
 // Label above a ring (simple CanvasTexture sprite).

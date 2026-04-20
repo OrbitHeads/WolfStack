@@ -3898,10 +3898,13 @@ pub async fn control_panel_inventory(req: HttpRequest, state: web::Data<AppState
 }
 
 async fn fetch_local_json(state: &web::Data<AppState>, path: &str) -> Option<serde_json::Value> {
-    // For "local" we still go over HTTP so we hit the same auth path
-    // and shape the same JSON the remote fetch returns. Using localhost
-    // on the inter-node port avoids TLS cert issues.
-    let port = crate::ports::PortConfig::load().inter_node;
+    // Local fan-out hits the node over HTTP on whichever plain port is
+    // actually listening — inter_node when TLS is on (the main port is
+    // HTTPS then), or api when TLS is off (the api port IS the plain
+    // HTTP listener). Using the wrong one silently fails because no
+    // listener is bound.
+    let ports = crate::ports::PortConfig::load();
+    let port = if state.tls_enabled { ports.inter_node } else { ports.api };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
