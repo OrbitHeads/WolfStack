@@ -4704,20 +4704,83 @@ fn pct_update_settings(container: &str, settings: &LxcSettingsUpdate) -> Result<
         }
     }
 
+    // Drop the cached LXC list so the next GET shows the updated
+    // settings immediately. Pre-v18.7.33 the cache stuck for 5s after
+    // a pct set, so the UI would re-render the OLD memory/cores/etc
+    // and the operator would think the save silently reverted.
+    invalidate_list_caches();
+
     Ok(format!("Settings updated for '{}' via pct", container))
 }
 
 /// Parse memory string (e.g. "512M", "1G", "1024") to MB
 fn parse_mem_to_mb(mem: &str) -> u64 {
     let mem = mem.trim();
-    if mem.ends_with('G') || mem.ends_with('g') {
-        mem[..mem.len()-1].parse::<u64>().unwrap_or(0) * 1024
-    } else if mem.ends_with('M') || mem.ends_with('m') {
-        mem[..mem.len()-1].parse::<u64>().unwrap_or(0)
-    } else {
-        // Assume bytes or MB depending on magnitude
-        let val = mem.parse::<u64>().unwrap_or(0);
-        if val > 10000 { val / (1024 * 1024) } else { val }
+    if mem.is_empty() { return 0; }
+    // Normalise: strip trailing "B" so both "MB" and "M" work, "GB"
+    // and "G" work, etc. Also accept lowercase.
+    let low = mem.to_lowercase();
+    let stripped = low.strip_suffix('b').unwrap_or(&low);
+    if let Some(v) = stripped.strip_suffix('g') {
+        return v.trim().parse::<u64>().unwrap_or(0) * 1024;
+    }
+    if let Some(v) = stripped.strip_suffix('m') {
+        return v.trim().parse::<u64>().unwrap_or(0);
+    }
+    if let Some(v) = stripped.strip_suffix('k') {
+        // kB → MB (rounded up — 1 kB still counts as 1 MB of allowance).
+        let kb = v.trim().parse::<u64>().unwrap_or(0);
+        return (kb + 1023) / 1024;
+    }
+    // Plain number. This field is always MB in the WolfStack UI —
+    // previous code had a "if val > 10000 treat as bytes" heuristic
+    // that silently divided any value ≥ 10000 down to ~0, so any LXC
+    // memory limit of 10 GB or more (10000+ MB) was being discarded
+    // entirely. Every UI field that feeds this function is labelled
+    // "MB" — trust the user.
+    mem.parse::<u64>().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod mem_parse_tests {
+    use super::*;
+
+    #[test]
+    fn plain_numbers_are_mb() {
+        assert_eq!(parse_mem_to_mb("2048"), 2048);
+        // The bug — v18.7.32 and earlier returned 0 here because
+        // 16384 > 10000 triggered the "treat as bytes" heuristic
+        // and then divided by 1 MiB, which floors to 0.
+        assert_eq!(parse_mem_to_mb("16384"), 16384);
+        assert_eq!(parse_mem_to_mb("32768"), 32768);
+    }
+
+    #[test]
+    fn suffixes_work() {
+        assert_eq!(parse_mem_to_mb("2G"), 2048);
+        assert_eq!(parse_mem_to_mb("2g"), 2048);
+        assert_eq!(parse_mem_to_mb("2GB"), 2048);
+        assert_eq!(parse_mem_to_mb("2gb"), 2048);
+        assert_eq!(parse_mem_to_mb("2048M"), 2048);
+        assert_eq!(parse_mem_to_mb("2048m"), 2048);
+        assert_eq!(parse_mem_to_mb("2048MB"), 2048);
+        assert_eq!(parse_mem_to_mb("2048mb"), 2048);
+        assert_eq!(parse_mem_to_mb("1024K"), 1);
+        assert_eq!(parse_mem_to_mb("1024KB"), 1);
+    }
+
+    #[test]
+    fn empty_and_garbage() {
+        assert_eq!(parse_mem_to_mb(""), 0);
+        assert_eq!(parse_mem_to_mb("   "), 0);
+        assert_eq!(parse_mem_to_mb("not a number"), 0);
+        assert_eq!(parse_mem_to_mb("12X"), 0);
+    }
+
+    #[test]
+    fn whitespace_tolerated() {
+        assert_eq!(parse_mem_to_mb(" 2048 "), 2048);
+        assert_eq!(parse_mem_to_mb("2 G"), 2048);
     }
 }
 
@@ -4985,6 +5048,11 @@ pub fn lxc_update_settings(container: &str, settings: &LxcSettingsUpdate) -> Res
             }
         }
     }
+
+    // Drop the cached LXC list so the UI re-render picks up the new
+    // settings immediately (see the equivalent invalidate in
+    // pct_update_settings for the full rationale).
+    invalidate_list_caches();
 
     Ok(format!("Settings updated for '{}'", container))
 }
