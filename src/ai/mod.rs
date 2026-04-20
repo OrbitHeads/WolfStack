@@ -268,8 +268,9 @@ impl AiAgent {
             let has_websearch   = response.contains("[WEBSEARCH")      && response.contains("[/WEBSEARCH]");
             let has_fetch       = response.contains("[FETCH")          && response.contains("[/FETCH]");
             let has_audit       = response.contains("[SECURITY_AUDIT]") && response.contains("[/SECURITY_AUDIT]");
+            let has_read        = response.contains("[READ")           && response.contains("[/READ]");
 
-            if !has_exec && !has_exec_all && !has_websearch && !has_fetch && !has_audit {
+            if !has_exec && !has_exec_all && !has_websearch && !has_fetch && !has_audit && !has_read {
                 // Handle [WOLFNOTE] tags if present (fire-and-forget, no multi-turn needed)
                 if has_wolfnote {
                     final_response = execute_wolfnote_tags(&response).await;
@@ -449,6 +450,37 @@ impl AiAgent {
                 } else {
                     break;
                 }
+            }
+
+            // Handle [READ path="..."][/READ] — read a file from a
+            // curated allow-list of WolfStack runtime paths. Useful
+            // for answering "what's in my config" without making the
+            // AI shell out to `cat`. Credentials / private keys are
+            // blocked unconditionally regardless of path pattern.
+            search_from = 0;
+            while let Some(start) = response[search_from..].find("[READ") {
+                let abs_open = search_from + start;
+                let Some(close_open) = response[abs_open..].find(']') else { break; };
+                let tag_start = abs_open + close_open + 1;
+                let Some(close) = response[tag_start..].find("[/READ]") else { break; };
+                let tag_header = &response[abs_open..abs_open + close_open + 1];
+                let body_text = response[tag_start..tag_start + close].trim();
+                let path = extract_tag_attr(tag_header, "path")
+                    .unwrap_or_else(|| body_text.to_string());
+                let path = path.trim();
+                let output = if path.is_empty() {
+                    "(no path)".to_string()
+                } else {
+                    match read_sandboxed(path) {
+                        Ok(s) => s,
+                        Err(e) => format!("READ ERROR: {}", e),
+                    }
+                };
+                command_results.push_str(&format!(
+                    "\n=== READ: {} ===\n{}\n",
+                    path, output
+                ));
+                search_from = tag_start + close + 7;
             }
 
             // Add the AI's response and command results to history for next round
@@ -905,10 +937,23 @@ impl AiAgent {
 // ─── Knowledge Base ───
 
 fn load_knowledge_base() -> String {
-    // Knowledge base is compiled into the binary — always available, no file I/O needed
-    let knowledge = include_str!("wolfstack-kb.md").to_string();
-    tracing::info!("Loaded embedded knowledge base ({} bytes)", knowledge.len());
-    knowledge
+    // The KB is assembled from two pieces, both compiled into the binary:
+    //   1. Hand-written KB (src/ai/wolfstack-kb.md) — architecture, gotchas,
+    //      principles. The "why" that isn't derivable from the code.
+    //   2. Auto-generated KB (built by build.rs at compile time, stored in
+    //      OUT_DIR) — exhaustive endpoint list, version/git metadata.
+    //      Regenerates every build so it's never stale.
+    let handwritten = include_str!("wolfstack-kb.md");
+    let generated = include_str!(concat!(env!("OUT_DIR"), "/wolfstack-kb-generated.md"));
+    let mut combined = String::with_capacity(handwritten.len() + generated.len() + 2);
+    combined.push_str(handwritten);
+    combined.push_str("\n\n");
+    combined.push_str(generated);
+    tracing::info!(
+        "Loaded embedded knowledge base ({} bytes hand-written + {} bytes generated)",
+        handwritten.len(), generated.len()
+    );
+    combined
 }
 
 
@@ -1345,6 +1390,7 @@ fn build_system_prompt(knowledge: &str, server_context: &str) -> String {
          Beyond shell execution, you have tools for external research and built-in audits. Use them BEFORE guessing:\n\
          - `[WEBSEARCH query=\"search terms here\"][/WEBSEARCH]` — search the web (DuckDuckGo). Returns the top 5 results as title + URL + snippet. Use for questions about package names, distro quirks, Docker/Proxmox docs, anything outside the WolfStack codebase.\n\
          - `[FETCH url=\"https://example.com/docs\"][/FETCH]` — fetch a URL's content. Returns up to 8000 chars of extracted text. Loopback and private-range addresses are refused (SSRF guard). Typical workflow: WEBSEARCH → pick a result → FETCH that URL → summarise for the user.\n\
+         - `[READ path=\"/etc/wolfstack/router.json\"][/READ]` — read a WolfStack config/log file from a curated allow-list. Safer than [EXEC] cat because credentials (cluster-secret, TLS private keys, join-token, license.key) are unconditionally denied and symlink escape is blocked. 64 KB cap — use [EXEC] tail for larger files.\n\
          - `[SECURITY_AUDIT][/SECURITY_AUDIT]` — run the built-in security audit. Checks /etc/wolfstack file permissions, default cluster secret, Docker container restart policies (so you can spot the \"autostart checkbox doesn't stick\" bug), and more. Returns a plain-text report. When the report flags a fixable issue, propose an ACTION to resolve it.\n\
          Rules:\n\
          - Use WEBSEARCH when you need external documentation, package names, or distro-specific facts — NOT for questions answerable from the server state below, your embedded knowledge base, or your training data. Each WEBSEARCH adds latency the user will feel.\n\
@@ -2123,6 +2169,133 @@ fn fetch_url_is_internal(url: &str) -> bool {
     }
 
     false
+}
+
+/// Read a file from a curated allow-list of WolfStack runtime paths.
+/// Returns `Err` for paths outside the allow-list, paths on the deny
+/// list (credential files), symlinks that escape the allow-list after
+/// canonicalisation, and files larger than 64 KB (the AI doesn't need
+/// megabytes of log to reason about a problem).
+///
+/// This is the `[READ]` tool the AI uses to inspect config without
+/// shelling out to `cat`. Much tighter than `[EXEC]` — no shell
+/// interpretation, no path traversal, no credential leakage.
+fn read_sandboxed(raw_path: &str) -> Result<String, String> {
+    // Deny-list checked before allow-list — these win regardless of
+    // how the allow-list expands in future.
+    const DENY: &[&str] = &[
+        "custom-cluster-secret",
+        "cluster-secret",
+        "join-token",
+        "license.key",
+        "key.pem",                 // TLS private key
+        "/etc/shadow", "/etc/gshadow",
+        "/root/.ssh", "/home",     // user-private data
+        "id_rsa", "id_ed25519", "id_ecdsa",
+    ];
+    // Allow-list of exact paths or prefixes. Must survive canonicalisation
+    // — we accept both the literal path and, if it resolves, the
+    // canonicalised form so symlinks don't bypass the list.
+    let allow_prefixes: &[&str] = &[
+        "/etc/wolfstack/",                 // config (minus deny list)
+        "/etc/wolfstack/router/",
+        "/etc/wolfstack/wolfrun/",
+        "/etc/wolfstack/wolfflow/",
+        "/var/log/wolfstack/",             // wolfstack logs
+        "/var/lib/wolfstack-router/",      // DNS query logs per LAN
+        "/run/wolfstack-router/",          // dnsmasq pid files
+        "/etc/dnsmasq.d/",
+        "/etc/systemd/resolved.conf.d/",
+        "/etc/NetworkManager/conf.d/",
+    ];
+    let allow_exact: &[&str] = &[
+        "/etc/resolv.conf",
+        "/etc/hosts",
+        "/etc/hostname",
+        "/etc/os-release",
+        "/etc/systemd/system/wolfstack.service",
+        "/proc/version",
+        "/proc/meminfo",
+        "/proc/loadavg",
+        "/proc/uptime",
+        "/proc/cpuinfo",
+        "/proc/mounts",
+    ];
+
+    // Deny pass — a token that starts with `/` is treated as a path
+    // prefix (with trailing `/` or exact match) so `/home` doesn't
+    // reject a hypothetical /etc/wolfstack/homepage.conf. Tokens
+    // without a leading `/` are filename fragments and match anywhere
+    // in the path — that's what we want for `custom-cluster-secret`,
+    // `license.key`, `id_rsa`, etc.
+    let lowered = raw_path.to_lowercase();
+    for bad in DENY {
+        let bad_l = bad.to_lowercase();
+        let hit = if bad_l.starts_with('/') {
+            lowered == bad_l
+                || lowered.starts_with(&format!("{}/", bad_l))
+        } else {
+            lowered.contains(&bad_l)
+        };
+        if hit {
+            return Err(format!("path {} is on the READ deny-list (credential/private file)", raw_path));
+        }
+    }
+
+    // Allow pass against the raw path.
+    let on_allow_raw = allow_exact.iter().any(|p| *p == raw_path)
+        || allow_prefixes.iter().any(|p| raw_path.starts_with(p));
+    if !on_allow_raw {
+        return Err(format!(
+            "path {} isn't in the READ allow-list — add it explicitly if you need it, \
+             or use [EXEC] for one-off reads.",
+            raw_path
+        ));
+    }
+
+    // Canonicalise and re-check — blocks symlink escape (e.g. an
+    // attacker-controlled symlink inside /etc/wolfstack/ pointing at
+    // /etc/shadow).
+    let canonical = std::fs::canonicalize(raw_path)
+        .map_err(|e| format!("cannot resolve {}: {}", raw_path, e))?;
+    let canonical_str = canonical.to_string_lossy().to_string();
+    let lowered_canon = canonical_str.to_lowercase();
+    for bad in DENY {
+        let bad_l = bad.to_lowercase();
+        let hit = if bad_l.starts_with('/') {
+            lowered_canon == bad_l
+                || lowered_canon.starts_with(&format!("{}/", bad_l))
+        } else {
+            lowered_canon.contains(&bad_l)
+        };
+        if hit {
+            return Err(format!(
+                "path resolves to a denied target ({}) — refusing",
+                canonical_str
+            ));
+        }
+    }
+    let on_allow_canon = allow_exact.iter().any(|p| *p == canonical_str)
+        || allow_prefixes.iter().any(|p| canonical_str.starts_with(p));
+    if !on_allow_canon {
+        return Err(format!(
+            "path resolves outside the READ allow-list ({} → {}) — refusing",
+            raw_path, canonical_str
+        ));
+    }
+
+    // Size cap: if the AI really needs more than 64 KB of a log it
+    // should use `[EXEC] tail -c 65535 <path>` — we're not its grep.
+    let meta = std::fs::metadata(&canonical)
+        .map_err(|e| format!("stat: {}", e))?;
+    if meta.len() > 64 * 1024 {
+        return Err(format!(
+            "{} is {} bytes — too large for READ (64KB cap). Use [EXEC] tail instead.",
+            canonical_str, meta.len()
+        ));
+    }
+    std::fs::read_to_string(&canonical)
+        .map_err(|e| format!("read: {}", e))
 }
 
 /// Shared classifier for IPv4 octets — 127/8, 10/8, 192.168/16, 172.16/12,

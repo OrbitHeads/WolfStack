@@ -979,19 +979,103 @@ pub async fn apply_rules_now(req: HttpRequest, state: S) -> HttpResponse {
     auth_or_return!(req, state);
     let cfg = state.router.config.read().unwrap();
     let ruleset = firewall::build_ruleset(&cfg, &crate::agent::self_node_id());
+
+    // Pre-flight (Level 3) — parse the proposed ruleset and refuse
+    // anything that would block the current session from reaching the
+    // WolfStack management ports. Stops the operator-shoots-own-foot
+    // case where an INPUT DROP rule matches the session's peer IP on
+    // :8553 and the first real symptom is the browser going silent.
+    //
+    // Peer-IP resolution: we take the TCP peer by default. If that's
+    // loopback (dashboard is behind an nginx/Caddy reverse proxy), we
+    // fall back to the left-most X-Forwarded-For entry. Trusting XFF
+    // for auth would be wrong, but this is a SAFETY check — the only
+    // way a forged XFF hurts is if an attacker can forge the header
+    // AND has already been authenticated AND is trying to apply rules
+    // that lock out a *different* admin, in which case the analyser
+    // would flag spurious concerns (the attacker's claimed IP) instead
+    // of the real one. False positive, not an exploit path.
+    let peer_ip = {
+        let raw = req.peer_addr().map(|a| a.ip().to_string());
+        let is_loopback = matches!(raw.as_deref(), Some("127.0.0.1") | Some("::1"));
+        if is_loopback {
+            req.headers().get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.split(',').next())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .or(raw)
+        } else {
+            raw
+        }
+    };
+    let mgmt_ports: Vec<u16> = {
+        let pc = crate::ports::PortConfig::load();
+        vec![pc.api, pc.inter_node]
+    };
+    let mut concerns = firewall::analyse_ruleset_against_session(
+        &ruleset,
+        peer_ip.as_deref(),
+        &mgmt_ports,
+    );
+    // Note in the concerns if the source IP came from XFF (proxied
+    // deployment) so operators can verify the check was against the
+    // right identity. Harmless to add even when there are no other
+    // concerns: if the list is empty we don't emit this.
+    if !concerns.is_empty() {
+        if let Some("127.0.0.1") | Some("::1") = req.peer_addr().map(|a| a.ip().to_string()).as_deref() {
+            concerns.push(format!(
+                "(note: your TCP peer is loopback — evaluated against X-Forwarded-For = {}. \
+                 If you run a reverse proxy, verify the right admin IP was checked.)",
+                peer_ip.as_deref().unwrap_or("<unknown>"),
+            ));
+        }
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "applied": false,
+            "error": "Pre-flight refused the ruleset — it would lock your current session out of this node.",
+            "concerns": concerns,
+            "hint": "Edit the offending rules (add a narrower -s scope that excludes your admin subnet, \
+                     or remove the rule entirely) and re-apply. You can bypass the check only by editing \
+                     rules from a node whose session source isn't affected.",
+        }));
+    }
+    let safe_mode_seconds = cfg.safe_mode_seconds;
+    drop(cfg);
     match firewall::apply(&ruleset, false) {
         Ok(prev) => {
-            *state.router.last_applied_rules.write().unwrap() = Some(prev);
-            // Safe-mode: set a rollback deadline.
-            if cfg.safe_mode_seconds > 0 {
+            *state.router.last_applied_rules.write().unwrap() = Some(prev.clone());
+            // Register with the Level-2 danger framework so the UI
+            // gets a unified "Keep / Rollback now" banner across all
+            // dangerous ops. TTL defaults to the existing safe_mode_seconds
+            // value (30s) if set, else 120s — same envelope whether
+            // the old safe-mode is on or off.
+            let ttl = if safe_mode_seconds > 0 { safe_mode_seconds as u64 } else { 120 };
+            let prev_for_rollback = prev.clone();
+            let danger_id = crate::danger::schedule(
+                "firewall_apply",
+                "WolfRouter firewall rules applied",
+                ttl,
+                Box::new(move || {
+                    super::firewall::revert(&prev_for_rollback)
+                        .map(|_| "Firewall reverted to previous ruleset.".to_string())
+                }),
+            );
+            // Keep the legacy safe_mode deadline in step — when the
+            // danger framework rolls back, the legacy path sees a
+            // re-applied ruleset and no-ops. If the operator confirms
+            // via the danger banner, we also clear the legacy deadline
+            // so the old watcher doesn't double-revert.
+            if safe_mode_seconds > 0 {
                 let deadline = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
-                    + cfg.safe_mode_seconds as u64;
+                    + safe_mode_seconds as u64;
                 *state.router.rollback_deadline.write().unwrap() = Some(deadline);
             }
             HttpResponse::Ok().json(serde_json::json!({
                 "applied": true,
-                "rollback_in_seconds": cfg.safe_mode_seconds,
+                "rollback_in_seconds": ttl,
+                "danger_id": danger_id,
+                "confirm_required": true,
             }))
         }
         Err(e) => HttpResponse::InternalServerError().body(e),

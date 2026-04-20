@@ -31,7 +31,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// A closure that undoes a dangerous op. Returns Ok(msg) on successful
 /// rollback, Err(msg) when rollback fails — in which case we log the
@@ -174,7 +174,11 @@ pub fn rollback_now(id: &str) -> Result<String, String> {
             Err(e) => {
                 entry.meta.status = "rollback_failed".to_string();
                 entry.meta.rollback_message = e.clone();
-                warn!("danger: rollback FAILED for op {} ({}): {}", id, entry.meta.op_type, e);
+                // error! not warn! — this is a genuine alert path.
+                // Operators routinely grep journalctl for ERROR; a
+                // failed rollback means something they explicitly
+                // expected to be undoable is now stuck in a bad state.
+                error!("danger: rollback FAILED for op {} ({}): {}", id, entry.meta.op_type, e);
             }
         }
     }

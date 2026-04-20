@@ -262,6 +262,140 @@ fn expand_endpoint(
     }
 }
 
+/// Pre-flight check — scan a proposed iptables-save-format ruleset for
+/// rules that would lock the caller out of the management interface.
+/// Returns a list of concerns (empty = ruleset looks safe).
+///
+/// Heuristic, not a simulator: we parse `-A INPUT … --dport <mgmt_port>
+/// … -j DROP|REJECT` lines and check whether the caller's peer IP
+/// matches the rule's `-s` clause (or whether the rule has no `-s`,
+/// matching everyone). False positives are possible (layered rules
+/// where a later ACCEPT supersedes the DROP) but false negatives are
+/// bounded — we catch the common "DROP tcp/8553 from 0.0.0.0/0" bullet
+/// the operator would otherwise take to the face.
+///
+/// `mgmt_ports` is typically `[8553, 8554]` (primary + inter-node). If
+/// a rule would block any of these for the caller, it's a concern.
+pub fn analyse_ruleset_against_session(
+    ruleset: &str,
+    peer_ip: Option<&str>,
+    mgmt_ports: &[u16],
+) -> Vec<String> {
+    let mut concerns = Vec::new();
+    let peer = match peer_ip { Some(p) if !p.is_empty() => p, _ => return concerns };
+    // Only look at INPUT-chain rules — FORWARD/OUTPUT can't block our
+    // session from reaching this box.
+    for line in ruleset.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("-A INPUT ") && !trimmed.starts_with("-I INPUT ") {
+            continue;
+        }
+        // Target must be a drop/reject variant.
+        let drops = trimmed.contains("-j DROP") || trimmed.contains("-j REJECT");
+        if !drops { continue; }
+        // Must mention at least one of the mgmt ports on --dport or
+        // --dports. Check all the forms iptables actually emits:
+        //   --dport 8553
+        //   --dport 8000:9000        (port range — port falls inside)
+        //   -m multiport --dports 22,8553,8554   (any slot matches)
+        //   -m multiport --dports 8000:9000      (range inside multiport)
+        // The range handling is what upgrades this from "lazy substring
+        // match" to something an attacker can't slip a multiport or
+        // range rule past. See the firewall-apply test plan.
+        let matches_port = rule_matches_any_port(trimmed, mgmt_ports);
+        if !matches_port { continue; }
+        // Would this rule match the session's peer? If the rule has a
+        // -s clause we compare it to peer_ip; if it has no -s clause
+        // it matches every source (which definitely includes peer_ip).
+        let source_matches = if let Some(idx) = trimmed.find("-s ") {
+            let after = &trimmed[idx + 3..];
+            let src = after.split_whitespace().next().unwrap_or("");
+            cidr_matches_ip(src, peer)
+        } else {
+            true
+        };
+        if source_matches {
+            concerns.push(format!(
+                "rule `{}` would DROP/REJECT traffic from your current session source ({}) to a WolfStack management port. \
+                 Applying this would lock your browser out of this node.",
+                trimmed, peer
+            ));
+        }
+    }
+    concerns
+}
+
+/// Does an iptables rule line cover any of the given management
+/// ports? Handles every form iptables-save emits that we've actually
+/// seen: single port, colon range, `-m multiport --dports` with a
+/// comma-separated list which can itself contain ranges. Anything
+/// else (e.g. `--match-set`, `ipset`) returns false — those would
+/// need the ipset content to evaluate and the pre-flight can't
+/// simulate that. iptables-save uses `--source` rarely but `-s`
+/// always; we anchor on `-s`.
+fn rule_matches_any_port(rule: &str, mgmt_ports: &[u16]) -> bool {
+    // --dport <X> (single port or single range).
+    if let Some(v) = find_flag_value(rule, "--dport") {
+        if port_spec_covers_any(v, mgmt_ports) { return true; }
+    }
+    // -m multiport --dports <comma-separated, each can be a range>
+    if let Some(v) = find_flag_value(rule, "--dports") {
+        for chunk in v.split(',') {
+            if port_spec_covers_any(chunk.trim(), mgmt_ports) { return true; }
+        }
+    }
+    false
+}
+
+/// Pull the single whitespace-delimited value after a named flag.
+/// Returns None if the flag isn't present. Flags in iptables-save
+/// never take quoted values, so whitespace split is sufficient.
+fn find_flag_value<'a>(rule: &'a str, flag: &str) -> Option<&'a str> {
+    let tokens: Vec<&str> = rule.split_whitespace().collect();
+    for (i, t) in tokens.iter().enumerate() {
+        if *t == flag {
+            return tokens.get(i + 1).copied();
+        }
+    }
+    None
+}
+
+/// Does the port-spec `spec` (e.g. "8553", "8000:9000") cover any of
+/// `wanted`? Used to test both the `--dport` argument and each slot
+/// of a `--dports` comma-separated list.
+fn port_spec_covers_any(spec: &str, wanted: &[u16]) -> bool {
+    if let Some((lo_s, hi_s)) = spec.split_once(':') {
+        let (Ok(lo), Ok(hi)) = (lo_s.parse::<u16>(), hi_s.parse::<u16>()) else { return false; };
+        if lo > hi { return false; }
+        return wanted.iter().any(|p| *p >= lo && *p <= hi);
+    }
+    let Ok(p) = spec.parse::<u16>() else { return false; };
+    wanted.contains(&p)
+}
+
+/// Cheap best-effort "does this CIDR-ish string cover this IP?" for
+/// the pre-flight analyser. Handles `a.b.c.d`, `a.b.c.d/32`, and
+/// `a.b.c.d/24`. Anything weirder (IPv6, range syntax) returns true
+/// so we err on the side of flagging a concern rather than hiding it.
+fn cidr_matches_ip(cidr: &str, ip: &str) -> bool {
+    let ip_octets: Vec<u8> = ip.split('.').filter_map(|s| s.parse().ok()).collect();
+    if ip_octets.len() != 4 { return true; }
+    let (addr_part, mask_str) = match cidr.split_once('/') {
+        Some((a, m)) => (a, m),
+        None => (cidr, "32"),
+    };
+    let mask: u8 = mask_str.parse().unwrap_or(32);
+    if mask > 32 { return true; }
+    let addr_octets: Vec<u8> = addr_part.split('.').filter_map(|s| s.parse().ok()).collect();
+    if addr_octets.len() != 4 { return true; }
+    let ip_u32 = ((ip_octets[0] as u32) << 24) | ((ip_octets[1] as u32) << 16)
+        | ((ip_octets[2] as u32) << 8) | (ip_octets[3] as u32);
+    let addr_u32 = ((addr_octets[0] as u32) << 24) | ((addr_octets[1] as u32) << 16)
+        | ((addr_octets[2] as u32) << 8) | (addr_octets[3] as u32);
+    let mask_u32: u32 = if mask == 0 { 0 } else { u32::MAX << (32 - mask) };
+    (ip_u32 & mask_u32) == (addr_u32 & mask_u32)
+}
+
 /// Apply a ruleset. `test_only = true` runs `iptables-restore --test`
 /// without swapping. Returns the previous ruleset (as iptables-save
 /// text) on success so callers can stash it for rollback.
@@ -362,4 +496,79 @@ pub fn validate(config: &RouterConfig, self_node_id: &str) -> Vec<(String, Strin
         issues.push(("_ruleset_".into(), e));
     }
     issues
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::*;
+
+    fn flag(rule: &str, ports: &[u16]) -> bool {
+        rule_matches_any_port(rule, ports)
+    }
+
+    #[test]
+    fn single_port_matches() {
+        assert!(flag("-A INPUT -p tcp --dport 8553 -j DROP", &[8553, 8554]));
+        assert!(!flag("-A INPUT -p tcp --dport 22 -j DROP", &[8553, 8554]));
+    }
+
+    #[test]
+    fn port_range_matches_if_target_inside() {
+        // The bug the reviewer found — 8553 inside 8000:9000.
+        assert!(flag("-A INPUT -p tcp --dport 8000:9000 -j DROP", &[8553]));
+        // Outside the range.
+        assert!(!flag("-A INPUT -p tcp --dport 1000:2000 -j DROP", &[8553]));
+        // Reversed range (malformed) — don't flag, iptables would reject anyway.
+        assert!(!flag("-A INPUT -p tcp --dport 9000:8000 -j DROP", &[8553]));
+    }
+
+    #[test]
+    fn multiport_dports_any_slot_matches() {
+        // The second reviewer bug — 8553 isn't the first port.
+        assert!(flag(
+            "-A INPUT -p tcp -m multiport --dports 22,8553,8554 -j DROP",
+            &[8553, 8554],
+        ));
+        // Also works when combined with ranges in a slot.
+        assert!(flag(
+            "-A INPUT -p tcp -m multiport --dports 22,8000:9000,443 -j DROP",
+            &[8553],
+        ));
+        // No slot matches.
+        assert!(!flag(
+            "-A INPUT -p tcp -m multiport --dports 22,443,80 -j DROP",
+            &[8553, 8554],
+        ));
+    }
+
+    #[test]
+    fn cidr_match() {
+        assert!(cidr_matches_ip("10.0.0.0/8", "10.1.2.3"));
+        assert!(cidr_matches_ip("192.168.1.0/24", "192.168.1.100"));
+        assert!(!cidr_matches_ip("192.168.1.0/24", "192.168.2.100"));
+        assert!(cidr_matches_ip("0.0.0.0/0", "203.0.113.1")); // match all
+        assert!(cidr_matches_ip("203.0.113.7", "203.0.113.7")); // bare address = /32
+        assert!(!cidr_matches_ip("203.0.113.7", "203.0.113.8"));
+    }
+
+    #[test]
+    fn analyser_end_to_end() {
+        let rule = "*filter\n:INPUT ACCEPT [0:0]\n\
+                    -A INPUT -p tcp -m multiport --dports 22,8553,8554 -j DROP\n\
+                    COMMIT\n";
+        let concerns = analyse_ruleset_against_session(
+            rule, Some("192.168.1.50"), &[8553, 8554]
+        );
+        assert_eq!(concerns.len(), 1, "should flag the multiport DROP");
+    }
+
+    #[test]
+    fn analyser_narrow_source_misses_session() {
+        // Rule only affects 10.0.0.0/24 — session is elsewhere.
+        let rule = "-A INPUT -s 10.0.0.0/24 -p tcp --dport 8553 -j DROP\n";
+        let concerns = analyse_ruleset_against_session(
+            rule, Some("192.168.1.50"), &[8553]
+        );
+        assert!(concerns.is_empty(), "source scope excludes session — shouldn't flag");
+    }
 }

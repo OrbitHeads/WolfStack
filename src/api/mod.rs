@@ -6486,7 +6486,31 @@ pub async fn net_set_state(
     if let Err(e) = require_auth(&req, &state) { return e; }
     let iface = path.into_inner();
     match networking::set_interface_state(&iface, body.up) {
-        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+        Ok(msg) => {
+            // Bringing an interface DOWN can strand the admin LAN or
+            // the WAN. Register with the danger framework so the
+            // operator has a countdown-to-auto-up in the UI banner.
+            // Bringing UP is safe — no rollback needed.
+            if !body.up {
+                let iface_for_undo = iface.clone();
+                let danger_id = crate::danger::schedule(
+                    "interface_down",
+                    &format!("Interface {} was brought DOWN", iface),
+                    90,
+                    Box::new(move || {
+                        crate::networking::set_interface_state(&iface_for_undo, true)
+                            .map(|_| format!("Interface {} brought back UP.", iface_for_undo))
+                    }),
+                );
+                return HttpResponse::Ok().json(serde_json::json!({
+                    "message": msg,
+                    "danger_id": danger_id,
+                    "ttl_secs": 90,
+                    "confirm_required": true,
+                }));
+            }
+            HttpResponse::Ok().json(serde_json::json!({ "message": msg }))
+        }
         Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
     }
 }
