@@ -259,3 +259,169 @@ cifs-utils (or nfs-common/nfs-utils/nfs-client) not installed on the host. WolfS
 3. Add a bridge NIC for LAN access (Physical NIC passthrough)
 4. Pass through Zigbee/Z-Wave USB dongle via Passthrough tab
 5. If no IP: set static IP from HA CLI: `ha network update enp0s3 --ipv4-method static --ipv4-address 192.168.1.x/24 --ipv4-gateway 192.168.1.1`
+
+## WireGuard Bridge (VPN access INTO the cluster from outside)
+
+This is the answer to "how do I connect from my office / phone / laptop to my WolfStack cluster or WolfNet?". WireGuard bridges bolt a standard WireGuard VPN on the side of WolfNet so external clients can join the mesh from any network.
+
+- Each cluster gets a unique /24 in 10.20.0.0/16 (e.g. 10.20.5.0/24) for its WireGuard bridge
+- Config is stored in /etc/wolfstack/wireguard-bridge.json (per-cluster entries)
+- UI: Settings → WireGuard Bridge → Create bridge for cluster → add clients
+- Each client gets a download button for their .conf file (import into WireGuard app on phone/laptop)
+- Endpoint = cluster node's public IP + listen port (default 51820, configurable)
+- Client traffic enters the bridge, is routed into WolfNet, reaches every node + container/VM on the mesh
+- Requires `wireguard-tools` on the host (install via the distro-aware deps page)
+- Supports multiple bridges per host (different clusters = different subnets)
+- **Wolfnet is NOT WireGuard**: WolfNet is the internal mesh overlay between cluster nodes; WireGuard bridge is the external-client door into that mesh
+- WireGuard private keys are written to /tmp/wg-<iface>-key with mode 0600 (locked down since v18.7.27), consumed by `wg set`, then removed
+
+## WolfRouter (native firewall / DHCP / DNS / WAN router on any node)
+
+Turn any WolfStack node into a full router — no pfSense/OPNsense box needed.
+
+- **Zones**: WAN / LAN / DMZ / WolfNet / Trusted / custom, assigned per interface
+- **LAN segments**: each LAN = subnet + DHCP range + DNS. dnsmasq runs per-LAN, one process per bridge, pidfiles in /run/wolfstack-router/
+- **DNS modes per LAN**: "WolfRouter" (dnsmasq serves :53) or "External" (dnsmasq DHCP-only, DHCP option 6 points clients at their chosen resolver — AdGuard/Pi-hole)
+- **Firewall**: iptables filter table via iptables-restore, atomic swap, pre-flight refuses rules that would lock the admin out of :8553 / :8554 (handles --dport, port ranges `8000:9000`, `-m multiport --dports`)
+- **Safe-mode rollback**: firewall apply registers a deadman-switch (default 120s) — if operator doesn't click Keep in the banner, the previous ruleset is restored automatically
+- **WAN types**: DHCP, static, PPPoE (writes /etc/ppp/chap-secrets with mode 0600)
+- **Host DNS panel**: when a container wants :53 on a node, use the Host DNS panel to release systemd-resolved's stub listener AND/OR move WolfRouter's own dnsmasq to a different port (e.g. 5353). Both actions are deadman-switched.
+- UI: WolfRouter module in the datacenter view — Topology, Zones, Rules, LANs, WANs, DNS Tools
+- Replicates config across cluster nodes automatically
+- /etc/wolfstack/router.json is the source of truth
+
+## WolfRun (container orchestration across the cluster)
+
+n8n-like service manager that spreads Docker/LXC instances across nodes.
+
+- Services = (image, replicas, placement, restart policy). Reconciler loop every 15s makes the live state match declared state
+- Placement options: any node, specific node, all nodes (DaemonSet-like), per-zone
+- Restart policy: `Always` means WolfRun auto-restarts exited containers on the next tick
+- Failover events logged to /etc/wolfstack/wolfrun/failover-events.json
+- Only the cluster LEADER runs the reconciler (Raft-free leader election via lowest node_id heuristic)
+- Config: /etc/wolfstack/wolfrun/services.json
+- UI: Datacenter → WolfRun
+
+## WolfUSB (network USB device passthrough)
+
+Expose host-plugged USB devices to containers/VMs on any node via USB/IP.
+
+- Each node runs a wolfusb server on :3240 (key in /etc/wolfusb/wolfusb.env, same cluster secret)
+- Requires kernel modules vhci-hcd (client) + usbip-host (server) — auto-modprobed on install, auto-installed for distros that ship them in kernel-modules-extra
+- Assign a USB device to a container/VM via the WolfUSB panel; WolfStack auto-attaches on container start
+- Cross-node: a USB device plugged into node A can be attached to a VM on node B. Re-attach on container restart is automatic (wolfusb::on_container_started hook).
+- Common use: Zigbee/Z-Wave dongles for Home Assistant VMs, license dongles, webcams
+
+## WolfKube (Kubernetes lifecycle + management on the cluster)
+
+- Cluster modes: self-hosted (k3s/kubeadm installed by WolfStack), or attach to an existing kubeconfig
+- Kubeconfig uploaded via UI is stored at /etc/wolfstack/kubernetes/<id>.yaml with mode 0600 (since v18.7.27)
+- Pod terminal: WebSocket console to any container in any pod (`kubectl exec` under the hood)
+- Scale/delete workloads from the UI; see resource usage per pod
+- Stores JOIN tokens for node expansion — token endpoint is cluster-secret-auth'd
+
+## Cluster Browser (unified web UI for every cluster-internal service)
+
+- Scans all nodes for running web services (by common ports 80/443/3000/8080/...)
+- Presents them as one pane: "Jellyfin on node-A", "AdGuard on node-B", "Grafana on node-C"
+- Click through to the service's UI — WolfStack reverse-proxies it so browser credentials aren't needed per-service
+- Discovery runs every 60 seconds via a reconciliation loop (main.rs background task)
+- Config: /etc/wolfstack/cluster-services-discovered.json
+
+## Ceph integration
+
+- Attach an existing Ceph cluster (MON + keys) via Settings → Ceph → Add cluster
+- WolfStack renders Ceph health, OSD status, pool usage; can create/delete pools and RBD volumes
+- RBD volumes become a first-class storage target (alongside local, S3, NFS, SSHFS, WolfDisk)
+
+## Discord / Telegram / WhatsApp bots (AI access from chat)
+
+- Each bot runs as a supervised background task; credentials in /etc/wolfstack/ai-config.json (mode 0600)
+- Bots relay user messages to the AI agent (same [EXEC]/[EXEC_ALL]/[WEBSEARCH]/[FETCH]/[READ]/[SECURITY_AUDIT] tool loop as the dashboard chat)
+- Discord: set DISCORD_BOT_TOKEN in the AI settings; bot joins the configured channel, replies in-thread
+- Telegram: paste bot token; /start to begin; long replies get chunked into 4096-char messages
+- WhatsApp: relays via the Baileys gateway (Node.js subprocess) — requires pairing a phone once
+
+## MCP server (Model Context Protocol)
+
+- Exposes the WolfStack AI toolbox as an MCP server so Claude Desktop / Cursor / other MCP clients can reach it
+- Endpoint: /api/mcp (WebSocket, session-auth)
+- Same tool set as the built-in agent: run cluster commands, propose ACTIONs, read files
+- Config: /etc/wolfstack/ai-config.json → mcp_enabled
+
+## MySQL / MariaDB editor
+
+- Attach credentials via the Database Manager panel — stored encrypted in /etc/wolfstack/
+- Browse schemas/tables, run ad-hoc queries, edit rows
+- Supports both MariaDB and MySQL protocol
+
+## Deadman-switch framework (Level 2 safety)
+
+Any operation that can brick the node's UI registers a rollback closure with a TTL. If the operator doesn't hit "Keep" in the banner before the TTL expires, the rollback fires automatically.
+
+- Host DNS release: 120s TTL → restore systemd-resolved stub
+- WolfRouter firewall apply: 120s TTL → revert to previous ruleset
+- Interface down: 90s TTL → bring interface back up
+- Endpoint: GET /api/danger/pending, POST /api/danger/confirm/{id}, POST /api/danger/rollback/{id}
+- Frontend banner polls every 2s, survives session expiry and network blips
+- See src/danger.rs for the registry internals
+
+## Plugin system
+
+- Plugins live in /etc/wolfstack/plugins/<plugin>/
+- Each plugin has a manifest.json declaring name, icon, backend command (if any), frontend HTML
+- Backend plugins run as child processes of WolfStack, expose HTTP endpoints under /api/plugins/<plugin>/...
+- Frontend plugins inject their HTML + JS into a dedicated tab
+- Install: drop the directory, reload WolfStack; or use the plugin install UI (fetches from a URL)
+- Plugins are sandboxed only by Unix permissions — they run as root, so trust matters
+
+## System Check (distro-aware diagnostics)
+
+- UI: Settings → System Check
+- Runs a battery of tests: kernel modules present, iptables/nftables choice, services enabled, ports open, disk space, memory, package manager health
+- Each failing check is paired with a one-click "Fix" that knows the distro (apt/dnf/pacman/apk/zypper)
+- Used by the installer too — `setup.sh` runs a subset on fresh install
+
+## Services Discovery
+
+- Background reconciler scans each node for well-known services (Docker registries, media servers, dashboards)
+- Populates the Cluster Browser + drives the app-update-summary badge
+- Service definitions at /etc/wolfstack/cluster-services.json
+- Tombstoning prevents re-discovering deleted services
+
+## Security posture summary (v18.7.27+)
+
+- All sensitive files under /etc/wolfstack/ are mode 0600 (custom-cluster-secret, nodes.json with PVE tokens, join-token, license.key, users.json, oidc.json, auth-config.json, ai-config.json, s3/*.passwd, chap-secrets)
+- /etc/wolfstack/ directory itself is mode 0700
+- `paths::harden_existing` runs on startup to migrate pre-v18.7.27 installs
+- `paths::write_secure(path, content)` is the canonical secure writer
+- Cluster secret validation is constant-time including length
+- Pre-flight firewall analyser refuses rules that would lock the admin out
+- AI's [READ] tool has a hard-coded deny-list covering every credential file
+- AI's [EXEC] pipe allowlist applies to EVERY pipe segment (no more exfil via `ls | wget`)
+- AI's approved-action [ACTION] path blocks `;`, `&&`, `||`, newlines (no shell-chain injection)
+
+## AI tool tags reference (for the agent itself)
+
+- `[EXEC]cmd[/EXEC]` — local read-only shell, allowlist of safe commands only
+- `[EXEC_ALL]cmd[/EXEC_ALL]` — same command on every cluster node, results labelled by hostname
+- `[ACTION id=".." title=".." risk="low|medium|high" explain=".." target="local|all"]cmd[/ACTION]` — proposes a fix the operator approves with one click
+- `[WOLFNOTE title="..."]body[/WOLFNOTE]` — save a note for the user
+- `[WEBSEARCH query="..."][/WEBSEARCH]` — DuckDuckGo top 5 results
+- `[FETCH url="..."][/FETCH]` — fetch a URL, strip HTML, 8 KB cap, SSRF-guarded
+- `[READ path="..."][/READ]` — read a WolfStack runtime file from a sandboxed allow-list
+- `[SECURITY_AUDIT][/SECURITY_AUDIT]` — run the built-in security audit (file perms, default secret, docker restart policies)
+
+## Common user questions → where to point them
+
+- **"Connect from outside to my cluster/containers"** → WireGuard Bridge (Settings → WireGuard Bridge → create bridge + add client → download .conf)
+- **"How do I get two nodes to talk securely?"** → WolfNet (wolfnet invite on existing node → token → wolfnet join on new node)
+- **"Make this node a router / firewall / DHCP server"** → WolfRouter module
+- **"Plug a USB device into my Home Assistant VM on another node"** → WolfUSB panel
+- **"Run a container on whichever node is free"** → WolfRun service
+- **"Public status page for my apps"** → Status Pages (cluster-scoped, served on :8550)
+- **"Manage Kubernetes from WolfStack"** → WolfKube (attach kubeconfig or let WolfStack install k3s)
+- **"See all my web services in one place"** → Cluster Browser
+- **"Use WolfStack from Claude Desktop / Cursor"** → MCP server (Settings → AI → Enable MCP)
+- **"Chat with my cluster from my phone"** → Discord / Telegram / WhatsApp bots (Settings → AI → Bots)
+- **"Back up my containers / VMs"** → Backups (scheduled, destinations: local / NFS / SMB / S3 / Proxmox Backup Server / SSHFS / WolfDisk)
