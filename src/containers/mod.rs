@@ -2727,6 +2727,56 @@ pub fn docker_update_config(container: &str, autostart: Option<bool>, memory_mb:
     // 5-second cache and the user's change appears to revert on refresh).
     invalidate_docker_list_cache();
 
+    // Post-verify the autostart change actually stuck. `docker update` can
+    // exit 0 but leave the restart policy unchanged in surprising edge
+    // cases — e.g. the container was just removed / renamed / handed off
+    // to docker-compose which immediately rewrote the policy from its
+    // compose file. If we claim success here and the inspect still shows
+    // the old value, the UI re-fetch on the operator's next breath will
+    // untick their checkbox and they'll rightly call the whole feature
+    // broken (exactly what users reported against pre-v18.7.31). Verify
+    // and surface a real error instead of silently lying.
+    if let Some(requested) = autostart {
+        let expected = if requested { "unless-stopped" } else { "no" };
+        match Command::new("docker")
+            .args(["inspect", "-f", "{{.HostConfig.RestartPolicy.Name}}", container])
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                let actual = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                // Equality check tolerates the other valid "on" policies
+                // (always, on-failure) — if the operator previously set
+                // one of those via CLI and we're enabling autostart, we
+                // don't want to flap it to unless-stopped.
+                let actual_means_on = !actual.is_empty() && actual != "no";
+                let matches = if requested { actual_means_on } else { !actual_means_on };
+                if !matches {
+                    return Err(format!(
+                        "docker update returned exit 0 but the restart policy \
+                         for container '{}' is still '{}' (expected '{}'). \
+                         This usually means the container is managed by \
+                         docker-compose (whose policy takes priority on the \
+                         next `up`), or the container was recreated between \
+                         the update and the verify. Run \
+                         `docker inspect -f '{{{{.HostConfig.RestartPolicy.Name}}}}' {}` \
+                         to see the current state.",
+                        container, actual, expected, container
+                    ));
+                }
+            }
+            Ok(o) => {
+                // inspect failed — container probably gone. Don't claim success.
+                return Err(format!(
+                    "update applied but verification inspect failed: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ));
+            }
+            Err(e) => {
+                return Err(format!("update applied but verification inspect errored: {}", e));
+            }
+        }
+    }
+
     Ok(messages.join("; "))
 }
 
