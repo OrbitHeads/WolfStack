@@ -3975,11 +3975,27 @@ fn shape_inventory_item(base: &serde_json::Value, kind: &str, entry: &serde_json
     let name = entry.get("name").and_then(|v| v.as_str())
         .or_else(|| entry.get("id").and_then(|v| v.as_str()))
         .unwrap_or("").to_string();
-    let status = match kind {
+    let raw_status = match kind {
         "vm" => if entry.get("running").and_then(|v| v.as_bool()).unwrap_or(false) { "running" } else { "stopped" }.to_string(),
         _ => entry.get("status").and_then(|v| v.as_str())
                 .or_else(|| entry.get("state").and_then(|v| v.as_str()))
                 .unwrap_or("unknown").to_string(),
+    };
+    // Docker returns human-friendly strings like "Up 2 hours" or
+    // "Exited (0) 5 minutes ago" in the `status` field, and terse ones
+    // like "running" in `state`. Normalise both forms to the five
+    // buckets the UI knows how to colour: running / stopped / paused
+    // / unknown. Anything that looks alive → running; anything that
+    // looks dead → stopped.
+    let lc = raw_status.to_lowercase();
+    let status = if lc.contains("pause") {
+        "paused"
+    } else if lc.starts_with("up ") || lc == "up" || lc.contains("running") || lc.contains("restart") {
+        "running"
+    } else if lc.contains("exit") || lc.contains("stop") || lc.contains("dead") || lc.contains("created") {
+        "stopped"
+    } else {
+        "unknown"
     };
     let image = entry.get("image").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let cpu = entry.get("cpu_percent").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;

@@ -39514,11 +39514,12 @@ function cpRenderTile(it, rowId, mode) {
         : '';
 
     // Icon with text underneath. Background picks up a faint status
-    // tint so "is this thing running?" reads at a glance — green for
-    // running, grey for stopped, amber for paused, red for unknown,
-    // yellow for stale. The glass blur still keeps it subtle.
+    // tint, and a coloured glow sits behind the tile so "running vs
+    // not" reads from across the room: green halo = running, red =
+    // not, amber = paused, yellow = stale.
     const tintBg = cpStatusTintBg(it.status);
     const tintBorder = cpStatusTintBorder(it.status);
+    const glow = cpStatusGlow(it.status);
 
     return `
         <div class="cp-tile" ${dragAttrs} data-key="${escapeHtml(cpKey(it))}"
@@ -39527,6 +39528,7 @@ function cpRenderTile(it, rowId, mode) {
              style="position:relative;flex:0 0 100px;display:flex;flex-direction:column;align-items:center;gap:4px;padding:12px 6px 10px;border-radius:10px;
                     background:${tintBg};backdrop-filter:blur(6px);
                     border:1px solid ${tintBorder};
+                    box-shadow:${glow};
                     ${draggable ? 'cursor:grab;' : ''}">
             <div style="position:relative;font-size:34px;line-height:1;">
                 ${kindBadge}
@@ -39536,6 +39538,17 @@ function cpRenderTile(it, rowId, mode) {
             <div style="font-size:10px;color:var(--text-muted);max-width:88px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center;">${escapeHtml(it.node_hostname || '')}</div>
             <div style="font-size:10px;font-weight:600;color:${statusColour};text-transform:uppercase;letter-spacing:0.5px;">${escapeHtml(it.status || '')}</div>
         </div>`;
+}
+
+function cpStatusGlow(s) {
+    const m = {
+        running: '0 0 14px rgba(16,185,129,0.55), inset 0 0 0 1px rgba(16,185,129,0.25)',
+        stopped: '0 0 12px rgba(239,68,68,0.45), inset 0 0 0 1px rgba(239,68,68,0.22)',
+        paused:  '0 0 12px rgba(245,158,11,0.55), inset 0 0 0 1px rgba(245,158,11,0.25)',
+        unknown: '0 0 12px rgba(239,68,68,0.45), inset 0 0 0 1px rgba(239,68,68,0.22)',
+        stale:   '0 0 10px rgba(234,179,8,0.45), inset 0 0 0 1px rgba(234,179,8,0.22)',
+    };
+    return m[s] || 'none';
 }
 
 function cpStatusColour(s) {
@@ -40256,12 +40269,17 @@ function cp3dMakeRing(rowData, y, shade, idx, mode, radius, bandHeight) {
     ringGroup.add(label);
 
     // Tiles ON the cylinder's outer surface at the band's middle Y.
-    // Offset slightly outward so they don't z-fight with the band.
+    // Bunched at a fixed angular step (~14°) rather than spread around
+    // the whole circumference — fewer tiles cluster on the front face
+    // so you can see them all at once; lots of tiles wrap right around.
     const items = [];
-    const count = Math.min(rowData.items.length, 60);
+    const cap = 60;
+    const count = Math.min(rowData.items.length, cap);
+    const step = (14 * Math.PI) / 180;          // ~14° between tiles
+    const halfSpan = (count - 1) * step / 2;    // centre the cluster on the +Z face
     const tileOffset = 0.02;
     for (let i = 0; i < count; i++) {
-        const angle = (i / Math.max(count, 1)) * Math.PI * 2;
+        const angle = -halfSpan + i * step + Math.PI / 2;   // centre on +Z
         const it = rowData.items[i];
         const plane = cp3dMakeTileSprite(it);
         plane.position.set(Math.cos(angle) * (radius + tileOffset), 0, Math.sin(angle) * (radius + tileOffset));
@@ -40328,24 +40346,46 @@ async function cp3dHandleRingClick(ringMesh) {
     await cpReload();
 }
 
-// Draw each item as: large kind-emoji up top, name underneath, host in
-// a quieter tint below. Background is a soft vertical gradient rather
-// than a hard rectangle so the tile reads as an icon on the ring rather
-// than a framed card.
+// Draw each item as: status-coloured halo behind, big kind emoji on
+// top, name + host + status word below. Green halo = running, red =
+// not, amber = paused, yellow = stale. Reads at a glance from far
+// enough away that you can't make out the name.
 function cp3dMakeTileSprite(item) {
     const canvas = document.createElement('canvas');
     canvas.width = 256; canvas.height = 256;
     const ctx = canvas.getContext('2d');
-    // Soft radial backdrop — mostly transparent, just enough to anchor
-    // the icon against the dark scene. No hard border.
-    const grad = ctx.createRadialGradient(128, 128, 20, 128, 128, 130);
-    grad.addColorStop(0, 'rgba(30,41,59,0.8)');
-    grad.addColorStop(0.7, 'rgba(30,41,59,0.25)');
-    grad.addColorStop(1, 'rgba(30,41,59,0.0)');
-    ctx.fillStyle = grad;
+
+    // Match the flat view's running/stopped/paused/unknown/stale
+    // colouring so 2D and 3D feel like the same language.
+    const glowColour = {
+        running: 'rgba(16,185,129,',
+        stopped: 'rgba(239,68,68,',
+        paused:  'rgba(245,158,11,',
+        unknown: 'rgba(239,68,68,',
+        stale:   'rgba(234,179,8,',
+    }[item.status] || 'rgba(100,116,139,';
+
+    // Status halo — a big, soft, radial glow in the status colour.
+    // This is the "green behind if running, red behind if not" the
+    // user wants to read from across the room.
+    const glow = ctx.createRadialGradient(128, 128, 10, 128, 128, 140);
+    glow.addColorStop(0.0, glowColour + '0.85)');
+    glow.addColorStop(0.4, glowColour + '0.35)');
+    glow.addColorStop(0.8, glowColour + '0.05)');
+    glow.addColorStop(1.0, glowColour + '0.0)');
+    ctx.fillStyle = glow;
     ctx.fillRect(0, 0, 256, 256);
 
-    const statusColour = { running: '#10b981', stopped: '#6b7280', paused: '#f59e0b', unknown: '#ef4444', stale: '#eab308' }[item.status] || '#6b7280';
+    // Darker inner disc so the icon and text contrast against the
+    // glow, rather than the glow bleaching them out.
+    const disc = ctx.createRadialGradient(128, 128, 20, 128, 128, 95);
+    disc.addColorStop(0.0, 'rgba(15,23,42,0.85)');
+    disc.addColorStop(0.85, 'rgba(15,23,42,0.55)');
+    disc.addColorStop(1.0, 'rgba(15,23,42,0.0)');
+    ctx.fillStyle = disc;
+    ctx.fillRect(0, 0, 256, 256);
+
+    const statusColour = { running: '#10b981', stopped: '#ef4444', paused: '#f59e0b', unknown: '#ef4444', stale: '#eab308' }[item.status] || '#94a3b8';
 
     // Kind emoji — big, centered horizontally, top half of the canvas.
     ctx.font = '120px system-ui, -apple-system, "Apple Color Emoji", "Segoe UI Emoji", sans-serif';
