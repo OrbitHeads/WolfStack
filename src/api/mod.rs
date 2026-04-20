@@ -3790,6 +3790,322 @@ pub async fn reverse_proxy_config_save(
     HttpResponse::Ok().json(serde_json::json!({"saved": true, "config": cfg}))
 }
 
+// ─── Control Panel (cluster-wide apps view) ─────────────────────────────
+
+/// GET /api/control-panel/inventory — every VM, LXC and Docker container
+/// across every reachable cluster node, flattened into a single list.
+/// Fans out in parallel to each node's per-kind listing endpoints using
+/// the cluster secret; unreachable nodes are skipped with a diagnostic
+/// entry in the response so the UI can surface per-node failures.
+pub async fn control_panel_inventory(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let nodes: Vec<_> = state.cluster.get_all_nodes()
+        .into_iter()
+        .filter(|n| n.is_self || (n.online && now.saturating_sub(n.last_seen) < 300))
+        .collect();
+    let secret = state.cluster_secret.clone();
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    let mut node_errors: Vec<serde_json::Value> = Vec::new();
+
+    for node in &nodes {
+        let cluster_name = node.cluster_name.clone()
+            .or(node.pve_cluster_name.clone())
+            .unwrap_or_else(|| "WolfStack".to_string());
+        let base_entry = serde_json::json!({
+            "node_id": node.id,
+            "node_hostname": node.hostname,
+            "cluster": cluster_name,
+        });
+
+        // Three fetches per node: Docker, LXC, native VMs. PVE guests
+        // are handled separately below for nodes registered as Proxmox.
+        let endpoints = [
+            ("docker", "/api/containers/docker"),
+            ("lxc", "/api/containers/lxc"),
+            ("vm", "/api/vms"),
+        ];
+
+        // Skip non-WolfStack (e.g. Proxmox-only registered) nodes for
+        // the docker/lxc/native-vm endpoints — they won't serve them.
+        let is_wolfstack_node = node.node_type == "wolfstack" || node.node_type.is_empty();
+
+        for (kind, path) in &endpoints {
+            if !is_wolfstack_node { continue; }
+            let raw: Option<serde_json::Value> = if node.is_self {
+                fetch_local_json(&state, path).await
+            } else {
+                fetch_remote_json(&client, &node.address, node.port, path, &secret).await
+            };
+            let Some(raw) = raw else {
+                node_errors.push(serde_json::json!({
+                    "node_id": node.id,
+                    "node_hostname": node.hostname,
+                    "kind": kind,
+                    "error": "unreachable or endpoint failed",
+                }));
+                continue;
+            };
+            let arr = raw.as_array().cloned().unwrap_or_default();
+            for entry in arr {
+                items.push(shape_inventory_item(&base_entry, kind, &entry));
+            }
+        }
+
+        // Proxmox guests — only for nodes registered as node_type "proxmox".
+        if node.node_type == "proxmox" {
+            let token = node.pve_token.clone().unwrap_or_default();
+            let pve_name = node.pve_node_name.clone().unwrap_or_default();
+            let fp = node.pve_fingerprint.as_deref();
+            if !token.is_empty() && !pve_name.is_empty() {
+                let pve_client = crate::proxmox::PveClient::new(&node.address, node.port, &token, fp, &pve_name);
+                match pve_client.list_all_guests().await {
+                    Ok(guests) => {
+                        if let Ok(val) = serde_json::to_value(&guests) {
+                            if let Some(arr) = val.as_array() {
+                                for g in arr {
+                                    items.push(shape_pve_item(&base_entry, g));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => node_errors.push(serde_json::json!({
+                        "node_id": node.id,
+                        "node_hostname": node.hostname,
+                        "kind": "pve",
+                        "error": e,
+                    })),
+                }
+            }
+        }
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "items": items,
+        "errors": node_errors,
+        "generated_at": now,
+    }))
+}
+
+async fn fetch_local_json(state: &web::Data<AppState>, path: &str) -> Option<serde_json::Value> {
+    // For "local" we still go over HTTP so we hit the same auth path
+    // and shape the same JSON the remote fetch returns. Using localhost
+    // on the inter-node port avoids TLS cert issues.
+    let port = crate::ports::PortConfig::load().inter_node;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let url = format!("http://127.0.0.1:{}{}", port, path);
+    let resp = client.get(&url)
+        .header("X-WolfStack-Secret", state.cluster_secret.clone())
+        .send().await.ok()?;
+    if !resp.status().is_success() { return None; }
+    resp.json::<serde_json::Value>().await.ok()
+}
+
+async fn fetch_remote_json(
+    client: &reqwest::Client,
+    address: &str,
+    port: u16,
+    path: &str,
+    secret: &str,
+) -> Option<serde_json::Value> {
+    let urls = build_node_urls(address, port, path);
+    for url in &urls {
+        if let Ok(resp) = client.get(url)
+            .header("X-WolfStack-Secret", secret)
+            .send().await
+        {
+            if resp.status().is_success() {
+                if let Ok(j) = resp.json::<serde_json::Value>().await { return Some(j); }
+            }
+        }
+    }
+    None
+}
+
+/// Normalise a per-node Docker/LXC/VM entry into the flat InventoryItem shape.
+fn shape_inventory_item(base: &serde_json::Value, kind: &str, entry: &serde_json::Value) -> serde_json::Value {
+    let name = entry.get("name").and_then(|v| v.as_str())
+        .or_else(|| entry.get("id").and_then(|v| v.as_str()))
+        .unwrap_or("").to_string();
+    let status = match kind {
+        "vm" => if entry.get("running").and_then(|v| v.as_bool()).unwrap_or(false) { "running" } else { "stopped" }.to_string(),
+        _ => entry.get("status").and_then(|v| v.as_str())
+                .or_else(|| entry.get("state").and_then(|v| v.as_str()))
+                .unwrap_or("unknown").to_string(),
+    };
+    let image = entry.get("image").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let cpu = entry.get("cpu_percent").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+    let mem = entry.get("memory_usage").and_then(|v| v.as_u64())
+        .or_else(|| entry.get("memory_mb").and_then(|v| v.as_u64()).map(|mb| mb * 1024 * 1024))
+        .unwrap_or(0);
+    let mem_limit = entry.get("memory_limit").and_then(|v| v.as_u64()).unwrap_or(0);
+    serde_json::json!({
+        "node_id": base.get("node_id"),
+        "node_hostname": base.get("node_hostname"),
+        "cluster": base.get("cluster"),
+        "kind": kind,
+        "name": name,
+        "status": status.to_lowercase(),
+        "image": image,
+        "cpu_percent": cpu,
+        "memory_bytes": mem,
+        "memory_limit_bytes": mem_limit,
+    })
+}
+
+/// Normalise a Proxmox PveGuest into the flat InventoryItem shape.
+/// `pve: true` + `vmid` are carried through so the frontend can route
+/// actions to the Proxmox-specific endpoint (`/api/nodes/{id}/pve/{vmid}/{action}`)
+/// instead of the WolfStack Docker/LXC ones which don't exist on a
+/// Proxmox node.
+fn shape_pve_item(base: &serde_json::Value, g: &serde_json::Value) -> serde_json::Value {
+    let name = g.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let status = g.get("status").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+    let guest_type = g.get("guest_type").and_then(|v| v.as_str()).unwrap_or("vm");
+    let kind = if guest_type.eq_ignore_ascii_case("lxc") { "lxc" } else { "vm" };
+    let vmid = g.get("vmid").and_then(|v| v.as_u64()).unwrap_or(0);
+    let cpu = g.get("cpu").and_then(|v| v.as_f64()).map(|f| (f * 100.0) as f32).unwrap_or(0.0);
+    let mem = g.get("mem").and_then(|v| v.as_u64()).unwrap_or(0);
+    let mem_limit = g.get("maxmem").and_then(|v| v.as_u64()).unwrap_or(0);
+    serde_json::json!({
+        "node_id": base.get("node_id"),
+        "node_hostname": base.get("node_hostname"),
+        "cluster": base.get("cluster"),
+        "kind": kind,
+        "name": name,
+        "status": status.to_lowercase(),
+        "image": "",
+        "cpu_percent": cpu,
+        "memory_bytes": mem,
+        "memory_limit_bytes": mem_limit,
+        "pve": true,
+        "vmid": vmid,
+    })
+}
+
+/// GET /api/control-panel/groups — user-defined Custom groups.
+pub async fn control_panel_groups_get(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    HttpResponse::Ok().json(crate::control_panel::ControlPanelConfig::load())
+}
+
+/// POST /api/control-panel/groups — create a new group. Body: { name, colour? }.
+pub async fn control_panel_groups_create(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<serde_json::Value>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if name.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "name required"}));
+    }
+    let colour = body.get("colour").and_then(|v| v.as_str()).unwrap_or("#3b82f6").to_string();
+    let _guard = crate::control_panel::CONFIG_LOCK.lock().unwrap();
+    let mut cfg = crate::control_panel::ControlPanelConfig::load();
+    let id = format!("grp-{}", uuid::Uuid::new_v4().simple());
+    let order = cfg.groups.iter().map(|g| g.order).max().unwrap_or(0) + 1;
+    let group = crate::control_panel::Group { id, name, colour, order, members: Vec::new() };
+    cfg.groups.push(group.clone());
+    if let Err(e) = cfg.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e}));
+    }
+    HttpResponse::Ok().json(group)
+}
+
+/// PUT /api/control-panel/groups/{id} — rename, recolour, or reorder a group.
+pub async fn control_panel_groups_update(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<serde_json::Value>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let _guard = crate::control_panel::CONFIG_LOCK.lock().unwrap();
+    let mut cfg = crate::control_panel::ControlPanelConfig::load();
+    let Some(group) = cfg.groups.iter_mut().find(|g| g.id == id) else {
+        return HttpResponse::NotFound().json(serde_json::json!({"error": "group not found"}));
+    };
+    if let Some(n) = body.get("name").and_then(|v| v.as_str()) {
+        let trimmed = n.trim();
+        if !trimmed.is_empty() { group.name = trimmed.to_string(); }
+    }
+    if let Some(c) = body.get("colour").and_then(|v| v.as_str()) {
+        group.colour = c.to_string();
+    }
+    if let Some(o) = body.get("order").and_then(|v| v.as_i64()) {
+        group.order = o as i32;
+    }
+    let updated = group.clone();
+    if let Err(e) = cfg.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e}));
+    }
+    HttpResponse::Ok().json(updated)
+}
+
+/// DELETE /api/control-panel/groups/{id}
+pub async fn control_panel_groups_delete(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let _guard = crate::control_panel::CONFIG_LOCK.lock().unwrap();
+    let mut cfg = crate::control_panel::ControlPanelConfig::load();
+    let before = cfg.groups.len();
+    cfg.groups.retain(|g| g.id != id);
+    if cfg.groups.len() == before {
+        return HttpResponse::NotFound().json(serde_json::json!({"error": "group not found"}));
+    }
+    if let Err(e) = cfg.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e}));
+    }
+    HttpResponse::Ok().json(serde_json::json!({"deleted": true}))
+}
+
+/// POST /api/control-panel/groups/{id}/members — replace the member
+/// list for a group. Body: `{ members: [{ node_id, kind, name }, ...] }`.
+/// Replaces the whole set atomically; simpler than incremental add/remove
+/// endpoints and matches the UI pattern of persisting after each drag.
+pub async fn control_panel_groups_set_members(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<serde_json::Value>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let members_val = body.get("members").cloned().unwrap_or(serde_json::Value::Null);
+    let members: Vec<crate::control_panel::MemberRef> = serde_json::from_value(members_val)
+        .unwrap_or_default();
+    let _guard = crate::control_panel::CONFIG_LOCK.lock().unwrap();
+    let mut cfg = crate::control_panel::ControlPanelConfig::load();
+    let Some(group) = cfg.groups.iter_mut().find(|g| g.id == id) else {
+        return HttpResponse::NotFound().json(serde_json::json!({"error": "group not found"}));
+    };
+    group.members = members;
+    let updated = group.clone();
+    if let Err(e) = cfg.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e}));
+    }
+    HttpResponse::Ok().json(updated)
+}
+
 // ─── Cluster Services Discovery ─────────────────────────────────────────
 
 /// GET /api/cluster-services — every web service this user can see:
@@ -19132,6 +19448,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/ports", web::post().to(set_ports))
         .route("/api/reverse-proxy/config", web::get().to(reverse_proxy_config_get))
         .route("/api/reverse-proxy/config", web::post().to(reverse_proxy_config_save))
+        .route("/api/control-panel/inventory", web::get().to(control_panel_inventory))
+        .route("/api/control-panel/groups", web::get().to(control_panel_groups_get))
+        .route("/api/control-panel/groups", web::post().to(control_panel_groups_create))
+        .route("/api/control-panel/groups/{id}", web::put().to(control_panel_groups_update))
+        .route("/api/control-panel/groups/{id}", web::delete().to(control_panel_groups_delete))
+        .route("/api/control-panel/groups/{id}/members", web::post().to(control_panel_groups_set_members))
         .route("/api/cluster-services", web::get().to(cluster_services_list))
         .route("/api/cluster-services/sweep", web::post().to(cluster_services_sweep))
         .route("/api/cluster-services/manual", web::post().to(cluster_services_add_manual))

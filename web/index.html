@@ -248,6 +248,11 @@
                     style="display:flex;align-items:center;justify-content:center;width:40px;height:40px;padding:0;border-radius:10px;">
                     <span class="icon" style="margin:0;font-size:20px;">🔗</span>
                 </a>
+                <a class="nav-item" data-page="control-panel" onclick="selectView('control-panel')"
+                    title="Control Panel — every VM, LXC and Docker across the cluster, one view"
+                    style="display:flex;align-items:center;justify-content:center;width:40px;height:40px;padding:0;border-radius:10px;">
+                    <span class="icon" style="margin:0;font-size:20px;">🎛️</span>
+                </a>
             </div>
             <div class="nav-section">
                 <div class="nav-section-title">Servers</div>
@@ -1922,6 +1927,47 @@
                     <p style="color:var(--text-muted);font-size:12px;margin:0 0 12px;">Auto-detected from a periodic scan of WolfNet IPs. These also appear on the homepage of every Cluster Browser session.</p>
                     <div id="cluster-services-grid"><div style="color:var(--text-muted);font-size:13px;">Loading…</div></div>
                 </div>
+            </div>
+        </div>
+
+        <!-- ═══ Control Panel Page ═══ -->
+        <div id="page-control-panel" class="page-view" style="display:none;">
+            <div class="card" style="margin-bottom:16px;">
+                <div class="card-body" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
+                    <div>
+                        <h2 style="margin:0;display:flex;align-items:center;gap:10px;"><span style="font-size:28px;">🎛️</span>Control Panel</h2>
+                        <p style="margin:6px 0 0;color:var(--text-muted);font-size:13px;">Every VM, LXC and Docker container across the cluster in one place. Switch how they're grouped, drag items between custom groups, and act on anything from one view.</p>
+                    </div>
+                    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                        <label style="font-size:12px;color:var(--text-muted);">Group by</label>
+                        <select id="cp-group-by" onchange="cpRender()" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text);font-size:13px;">
+                            <option value="node">Node</option>
+                            <option value="type">Type</option>
+                            <option value="status">Status</option>
+                            <option value="cluster">Cluster</option>
+                            <option value="custom">Custom groups</option>
+                        </select>
+                        <input type="text" id="cp-search" placeholder="🔍 search…" oninput="cpRender()"
+                            style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text);font-size:13px;min-width:180px;">
+                        <div style="display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;">
+                            <button class="btn btn-sm" id="cp-view-flat" onclick="cpSetViewMode('flat')" style="border:none;border-radius:0;padding:6px 10px;font-size:12px;">▤ Flat</button>
+                            <button class="btn btn-sm" id="cp-view-3d"   onclick="cpSetViewMode('3d')"   style="border:none;border-radius:0;padding:6px 10px;font-size:12px;">🎛 3D</button>
+                        </div>
+                        <button class="btn" onclick="cpReload()" title="Refresh inventory">↻</button>
+                        <button class="btn btn-primary" id="cp-new-group-btn" onclick="cpCreateGroup()" style="display:none;">+ New group</button>
+                    </div>
+                </div>
+            </div>
+            <div id="cp-status-line" style="font-size:12px;color:var(--text-muted);margin:0 4px 10px;"></div>
+            <div id="cp-rows" style="display:flex;flex-direction:column;gap:10px;">
+                <div style="color:var(--text-muted);text-align:center;padding:30px;">Loading inventory…</div>
+            </div>
+            <div id="cp-3d-container" style="display:none;position:relative;height:620px;background:#080810;border:1px solid var(--border);border-radius:10px;overflow:hidden;">
+                <canvas id="cp-3d-canvas" style="display:block;width:100%;height:100%;"></canvas>
+                <div id="cp-3d-hud" style="position:absolute;top:10px;left:12px;color:#cbd5e1;font-size:12px;background:rgba(15,23,42,0.6);padding:6px 10px;border-radius:6px;pointer-events:none;">
+                    Drag a ring horizontally to spin · click a tile to pick it up · click a ring to drop it in
+                </div>
+                <div id="cp-3d-selected" style="position:absolute;top:10px;right:12px;color:#fbbf24;font-size:12px;background:rgba(15,23,42,0.6);padding:6px 10px;border-radius:6px;pointer-events:none;display:none;"></div>
             </div>
         </div>
 
