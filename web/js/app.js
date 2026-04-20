@@ -39636,17 +39636,38 @@ function cpCopyName(it) {
     if (navigator.clipboard) navigator.clipboard.writeText(it.name).then(() => showToast('Name copied', 'success'));
 }
 function cpOpenConsole(it) {
-    // Route via the existing per-kind console pages. Docker/LXC consoles
-    // live at /console.html?type=...&name=...; VMs use their own URL.
-    if (it.kind === 'docker' || it.kind === 'lxc') {
-        window.open(`/console.html?type=${encodeURIComponent(it.kind)}&name=${encodeURIComponent(it.name)}&node=${encodeURIComponent(it.node_id)}`, '_blank');
-    } else if (it.kind === 'vm') {
-        window.open(`/vnc.html?vm=${encodeURIComponent(it.name)}&node=${encodeURIComponent(it.node_id)}`, '_blank');
+    // Delegate to the same helpers the per-node pages use so
+    // pre-flight (serial-console checks, PVE routing, etc.) happens.
+    // Those helpers read `currentNodeId` from the global for remote-
+    // node routing, so swap it in and out around the call.
+    const saved = (typeof currentNodeId !== 'undefined') ? currentNodeId : null;
+    try {
+        currentNodeId = it.node_id;
+        if (it.pve && it.kind === 'vm' && typeof openPveVmVnc === 'function') {
+            openPveVmVnc(it.node_id, it.vmid, it.name);
+        } else if (it.pve && typeof openPveConsole === 'function') {
+            openPveConsole(it.node_id, it.vmid, it.name);
+        } else if (it.kind === 'docker' && typeof openConsole === 'function') {
+            openConsole('docker', it.name);
+        } else if (it.kind === 'lxc' && typeof openLxcConsole === 'function') {
+            openLxcConsole(it.name, it.name);
+        } else if (it.kind === 'vm' && typeof openVmConsole === 'function') {
+            openVmConsole(it.name);
+        } else {
+            showToast('No console helper for this item type', 'warn');
+        }
+    } finally {
+        currentNodeId = saved;
     }
 }
 function cpGoToNode(it) {
-    // Jump to the item's node's dashboard. Uses existing selectServerView.
-    if (typeof selectServerView === 'function') selectServerView(it.node_id, it.kind === 'vm' ? 'vms' : 'containers');
+    // Map item kind → the sidebar view name used on per-node pages.
+    // Docker containers live under the "containers" view; LXC has its
+    // own "lxc" view; native and PVE VMs both live under "vms".
+    const view = it.kind === 'docker' ? 'containers'
+               : it.kind === 'lxc'    ? 'lxc'
+               : 'vms';
+    if (typeof selectServerView === 'function') selectServerView(it.node_id, view);
 }
 
 // ─── Drag & drop (Custom mode only) ───
@@ -40119,10 +40140,9 @@ function cp3dDispose() {
 
 function cp3dRebuild() {
     if (!_cp3d) return;
-    // Rings own their tiles as children, so removing the group removes
-    // everything. Also dispose the per-tile canvas textures so we don't
-    // leak GPU memory across rebuilds (texture material has a map we
-    // created from a CanvasTexture — three.js won't GC it otherwise).
+    // Tear down previous rings (tiles are children of the ring group;
+    // removing the group removes them). Also dispose canvas textures
+    // and materials so repeated rebuilds don't leak GPU memory.
     for (const ring of _cp3d.rings) {
         for (const t of ring.items) {
             if (t.mesh.material && t.mesh.material.map) {
@@ -40134,6 +40154,10 @@ function cp3dRebuild() {
         _cp3d.scene.remove(ring.mesh);
     }
     _cp3d.rings = [];
+    // Remove any previous central pillar + end caps.
+    if (_cp3d.pillar) { _cp3d.scene.remove(_cp3d.pillar); _cp3d.pillar = null; }
+    if (_cp3d.capTop) { _cp3d.scene.remove(_cp3d.capTop); _cp3d.capTop = null; }
+    if (_cp3d.capBot) { _cp3d.scene.remove(_cp3d.capBot); _cp3d.capBot = null; }
 
     // Use the same groupings logic as the flat view.
     const sel = document.getElementById('cp-group-by');
@@ -40149,71 +40173,110 @@ function cp3dRebuild() {
         : _cpInventory.slice();
     const groupings = mode === 'custom' ? cpBuildCustomRows(filtered) : cpBuildDerivedRows(filtered, mode);
 
-    const ringSpacing = 3.2;
+    const ringSpacing = 3.4;
     const topY = (groupings.length - 1) * ringSpacing / 2;
+    const innerR = 1.1;   // central pillar radius
+    const outerR = 5.0;   // plate outer radius
+    const plateDepth = 0.15;
+    const totalHeight = Math.max(6, groupings.length * ringSpacing + 1.5);
+
+    // Central pillar — a semi-transparent glass cylinder that all
+    // plates thread onto. Stationary (doesn't spin with any ring).
+    const pillarGeo = new THREE.CylinderGeometry(innerR, innerR, totalHeight, 48, 1, false);
+    const pillarMat = new THREE.MeshStandardMaterial({
+        color: 0x1e293b,
+        roughness: 0.25,
+        metalness: 0.4,
+        transparent: true,
+        opacity: 0.28,
+    });
+    _cp3d.pillar = new THREE.Mesh(pillarGeo, pillarMat);
+    _cp3d.pillar.position.y = 0;
+    _cp3d.scene.add(_cp3d.pillar);
+
+    // Subtle caps at top and bottom to make the pillar feel grounded.
+    const capGeo = new THREE.CylinderGeometry(innerR + 0.2, innerR + 0.2, 0.25, 48);
+    const capMat = new THREE.MeshStandardMaterial({
+        color: 0x334155,
+        roughness: 0.45,
+        metalness: 0.3,
+        transparent: true,
+        opacity: 0.5,
+    });
+    _cp3d.capTop = new THREE.Mesh(capGeo, capMat);
+    _cp3d.capTop.position.y = totalHeight / 2;
+    _cp3d.scene.add(_cp3d.capTop);
+    _cp3d.capBot = new THREE.Mesh(capGeo, capMat.clone());
+    _cp3d.capBot.position.y = -totalHeight / 2;
+    _cp3d.scene.add(_cp3d.capBot);
+
     groupings.forEach((g, idx) => {
         const y = topY - idx * ringSpacing;
         const shade = cpRowShade(idx);
-        const ring = cp3dMakeRing(g, y, shade, idx, mode);
+        const ring = cp3dMakeRing(g, y, shade, idx, mode, innerR, outerR, plateDepth);
         _cp3d.rings.push(ring);
-        // Tiles are children of ring.mesh (the Group), so adding the
-        // group adds them all.
         _cp3d.scene.add(ring.mesh);
     });
 
-    // Position camera so all rings are visible.
-    const totalHeight = Math.max(6, groupings.length * ringSpacing);
-    _cp3d.camera.position.set(0, totalHeight * 0.2, 8 + totalHeight * 0.8);
+    // Camera — pull back enough to frame the whole column.
+    const frameDist = Math.max(14, 8 + totalHeight * 0.9);
+    _cp3d.camera.position.set(0, 0, frameDist);
     _cp3d.camera.lookAt(0, 0, 0);
 }
 
-function cp3dMakeRing(rowData, y, shade, idx, mode) {
-    const radius = 5;
-    const tubeR = 0.15;  // thinner, less dominant
+function cp3dMakeRing(rowData, y, shade, idx, mode, innerR, outerR, depth) {
     const colour = rowData.colour || cp3dShadeToHex(shade);
 
     const ringGroup = new THREE.Group();
     ringGroup.position.y = y;
     ringGroup.userData = { kind: 'ring', rowId: rowData.id, rowName: rowData.name, mode };
 
-    // Flat ring, glassy — sits quietly in the scene instead of glowing.
-    // Low opacity, subtle tint from the row colour, matte roughness.
-    const torusGeo = new THREE.TorusGeometry(radius, tubeR, 12, 72);
-    const torusMat = new THREE.MeshStandardMaterial({
+    // Flat annular plate — a proper washer shape extruded from an
+    // outer circle with an inner hole, so it's a solid disc around the
+    // central pillar rather than a floating torus.
+    const shape = new THREE.Shape();
+    shape.absarc(0, 0, outerR, 0, Math.PI * 2, false);
+    const hole = new THREE.Path();
+    hole.absarc(0, 0, innerR, 0, Math.PI * 2, true);
+    shape.holes.push(hole);
+    const plateGeo = new THREE.ExtrudeGeometry(shape, { depth, bevelEnabled: false, curveSegments: 64 });
+    plateGeo.rotateX(-Math.PI / 2);
+    plateGeo.translate(0, -depth / 2, 0);
+
+    const plateMat = new THREE.MeshStandardMaterial({
         color: new THREE.Color(colour),
         roughness: 0.35,
-        metalness: 0.5,
+        metalness: 0.45,
         transparent: true,
-        opacity: 0.35,
+        opacity: 0.38,
     });
-    const torus = new THREE.Mesh(torusGeo, torusMat);
-    torus.rotation.x = Math.PI / 2;
-    ringGroup.add(torus);
+    const plate = new THREE.Mesh(plateGeo, plateMat);
+    ringGroup.add(plate);
 
-    // Faint disk underneath the ring for depth.
-    const diskGeo = new THREE.RingGeometry(radius - 0.4, radius + 0.4, 72);
-    const diskMat = new THREE.MeshBasicMaterial({
+    // Subtle edge accent — a thin ring of brighter colour on the
+    // outer perimeter so the plate reads as a distinct band.
+    const rimGeo = new THREE.TorusGeometry(outerR, 0.04, 8, 96);
+    const rimMat = new THREE.MeshBasicMaterial({
         color: new THREE.Color(colour),
         transparent: true,
-        opacity: 0.06,
-        side: THREE.DoubleSide,
+        opacity: 0.6,
     });
-    const disk = new THREE.Mesh(diskGeo, diskMat);
-    disk.rotation.x = -Math.PI / 2;
-    disk.position.y = -0.05;
-    ringGroup.add(disk);
+    const rim = new THREE.Mesh(rimGeo, rimMat);
+    rim.rotation.x = Math.PI / 2;
+    ringGroup.add(rim);
 
     const label = cp3dMakeLabelSprite(`${rowData.name}  (${rowData.items.length})`);
     label.position.set(0, 1.0, 0);
     ringGroup.add(label);
 
+    // Tiles around the perimeter — standing upright, facing outward.
     const items = [];
     const count = Math.min(rowData.items.length, 60);
     for (let i = 0; i < count; i++) {
         const angle = (i / Math.max(count, 1)) * Math.PI * 2;
         const it = rowData.items[i];
         const plane = cp3dMakeTileSprite(it);
-        plane.position.set(Math.cos(angle) * radius, 0, Math.sin(angle) * radius);
+        plane.position.set(Math.cos(angle) * outerR, 0.05, Math.sin(angle) * outerR);
         plane.rotation.y = Math.PI / 2 - angle;
         plane.userData = { kind: 'tile', item: it };
         ringGroup.add(plane);
