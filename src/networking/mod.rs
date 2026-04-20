@@ -1284,23 +1284,33 @@ pub fn list_ip_mappings() -> Vec<IpMapping> {
     load_ip_mapping_config().mappings
 }
 
-/// Ports that must NEVER be mapped — doing so can lock users out of critical services.
-const BLOCKED_PORTS: &[(u16, &str)] = &[
-    (22,   "SSH"),
-    (111,  "NFS portmapper"),
-    (2049, "NFS"),
-    (3128, "Proxmox CONNECT proxy"),
-    (5900, "Proxmox VNC console"),
-    (5901, "Proxmox VNC console"),
-    (5902, "Proxmox VNC console"),
-    (5903, "Proxmox VNC console"),
-    (5999, "Proxmox SPICE console"),
-    (8006, "Proxmox Web UI"),
-    (8007, "Proxmox Spiceproxy"),
-    (8443, "Proxmox API"),
-    (8552, "WolfStack API"),
-    (8553, "WolfStack cluster"),
-    (9600, "WolfNet"),
+/// Ports whose SOURCE mapping could lock the operator out of critical
+/// services on this host. The block is context-sensitive: each entry
+/// is only refused when that port is actually listening on this host
+/// (verified live via `get_listening_ports`). On a plain Linux box
+/// with no PVE installed, 8006/8007/8443 are free and mappable — you
+/// can land PBS on those. On a PVE host, they're refused because the
+/// DNAT would collide with pveproxy/spiceproxy.
+///
+/// WolfStack's own ports (8552/8553) and the SSH guard (22) are
+/// always blocked — those are bedrock, never let anyone override.
+const BLOCKED_PORTS: &[(u16, &str, bool)] = &[
+    // (port, label, ALWAYS_BLOCK)
+    (22,   "SSH", true),
+    (111,  "NFS portmapper", false),
+    (2049, "NFS", false),
+    (3128, "Proxmox CONNECT proxy", false),
+    (5900, "Proxmox VNC console", false),
+    (5901, "Proxmox VNC console", false),
+    (5902, "Proxmox VNC console", false),
+    (5903, "Proxmox VNC console", false),
+    (5999, "Proxmox SPICE console", false),
+    (8006, "Proxmox Web UI", false),
+    (8007, "Proxmox Spiceproxy / PBS Web UI", false),
+    (8443, "Proxmox API", false),
+    (8552, "WolfStack API",    true),
+    (8553, "WolfStack cluster", true),
+    (9600, "WolfNet", true),
 ];
 
 /// Parse a port specification string into individual port numbers.
@@ -1376,27 +1386,44 @@ pub fn add_ip_mapping(
             }
 
             let port_list = parse_port_list(trimmed)?;
+            // Live listening-ports scan once, reuse for both checks.
+            let listening = get_listening_ports();
+            let is_listening = |p: u16| -> Option<String> {
+                listening.iter()
+                    .find(|e| e["port"].as_u64() == Some(p as u64))
+                    .and_then(|e| e["process"].as_str().map(str::to_string))
+            };
 
-            // Check against blocked ports (hardcoded safety list)
+            // Check against blocked ports. Entries flagged ALWAYS_BLOCK
+            // (WolfStack's own ports, SSH) are refused unconditionally;
+            // everything else is only refused when that port is ACTUALLY
+            // listening on this host — so e.g. PBS-as-VM can land its
+            // 8007 mapping on a plain Linux host where 8007 is free,
+            // but still gets blocked on a PVE host where pveproxy/
+            // spiceproxy is listening.
             for &port in &port_list {
-                for &(blocked, service) in BLOCKED_PORTS {
-                    if port == blocked {
+                for &(blocked, service, always) in BLOCKED_PORTS {
+                    if port != blocked { continue; }
+                    let live = is_listening(port);
+                    if always || live.is_some() {
+                        let extra = if let Some(proc) = live {
+                            format!(" (currently in use by '{}')", proc)
+                        } else { String::new() };
                         return Err(format!(
-                            "Port {} is used by {} and cannot be mapped. \
-                             Redirecting this port would break critical system access.",
-                            port, service
+                            "Port {} is reserved for {}{}. Map a different source port \
+                             (e.g. {}→{}) if you need this service exposed externally.",
+                            port, service, extra, port.saturating_add(1000), port
                         ));
                     }
                 }
             }
 
-            // Live scan: warn (but don't block) if ports are in use on this server
-            // DNAT rules are IP-specific so they won't necessarily conflict
-            let listening = get_listening_ports();
+            // Live scan: warn (not block) for any OTHER port in use
+            // on this host. DNAT rules are IP-specific so they won't
+            // necessarily conflict; operator may know what they're doing.
             for &port in &port_list {
-                if let Some(entry) = listening.iter().find(|e| e["port"].as_u64() == Some(port as u64)) {
-                    let proc_name = entry["process"].as_str().unwrap_or("unknown");
-                    if BLOCKED_PORTS.iter().any(|&(bp, _)| bp == port) { continue; }
+                if BLOCKED_PORTS.iter().any(|&(bp, _, _)| bp == port) { continue; }
+                if let Some(proc_name) = is_listening(port) {
                     warn!("Source port {} is in use by '{}' — mapping will use DNAT on public IP only", port, proc_name);
                 }
             }
@@ -1521,10 +1548,14 @@ pub fn get_listening_ports() -> Vec<serde_json::Value> {
     ports
 }
 
-/// Get the list of blocked ports (for frontend display)
+/// Get the list of blocked ports (for frontend display). `always` is
+/// included so the UI can distinguish the bedrock blocks (WolfStack's
+/// own ports, SSH — refused regardless of what's running) from the
+/// context-sensitive ones (refused only when that port is listening
+/// on this host).
 pub fn get_blocked_ports() -> Vec<serde_json::Value> {
-    BLOCKED_PORTS.iter().map(|&(port, service)| {
-        serde_json::json!({ "port": port, "service": service })
+    BLOCKED_PORTS.iter().map(|&(port, service, always)| {
+        serde_json::json!({ "port": port, "service": service, "always": always })
     }).collect()
 }
 

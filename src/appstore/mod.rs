@@ -1382,7 +1382,9 @@ fn install_vm(
     // menu entry, which needs an answer file we don't ship and drops to
     // a debug shell when DHCP doesn't find one.
     let installer_tip = if app.id == "pbs" {
-        " Open VNC to finish setup: at the PBS installer menu pick **Install Proxmox Backup Server (Graphical)** — NOT 'Automatic installation' (that one needs an answer file)."
+        " Open VNC to finish setup: at the PBS installer menu pick **Install Proxmox Backup Server (Graphical)** — NOT 'Automatic installation' (that one needs an answer file). \
+         After install completes and PBS reboots, its web UI is on https://<WolfNet-IP>:8007. \
+         To expose externally, add an IP mapping in Networking → IP Mappings — use a SOURCE port other than 8007 (e.g. 8107 → 8007) if this host also runs Proxmox VE (8007 is spiceproxy there)."
     } else {
         " Open VNC to complete the installer."
     };
