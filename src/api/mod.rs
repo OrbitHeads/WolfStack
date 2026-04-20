@@ -5092,6 +5092,54 @@ pub async fn docker_update_env(
     }
 }
 
+/// POST /api/containers/docker/{id}/raw-config — rebuild the container
+/// from an edited `docker inspect` JSON. This lets operators add binds,
+/// change ports, tweak labels, adjust any config field without having
+/// to `docker rm` and re-run by hand. Recreation is rename-based: the
+/// old container is kept renamed until the new one is successfully
+/// created, then removed; on failure we rename back so nothing is
+/// lost.
+///
+/// The request body is the inspect JSON the UI fetched from
+/// `GET /inspect`, with the operator's edits applied. We don't diff
+/// against the current state — we just treat the JSON as the new
+/// spec. Fields that aren't part of a container spec (State,
+/// NetworkSettings.IPAddress, Created timestamps, etc.) are ignored,
+/// so the operator can't break things by leaving those stale.
+pub async fn docker_update_raw_config(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<serde_json::Value>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+
+    // Docker's inspect output is always a single-element array. The
+    // UI may send it either way (bare object OR 1-element array),
+    // accommodate both.
+    let spec = match &*body {
+        serde_json::Value::Array(arr) if arr.len() == 1 => arr[0].clone(),
+        serde_json::Value::Object(_) => body.clone(),
+        _ => return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "Body must be a docker-inspect JSON object (or a 1-element array of one)",
+        })),
+    };
+
+    let spec_for_task = spec.clone();
+    let id_for_task = id.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        containers::docker_recreate_from_inspect(&id_for_task, &spec_for_task)
+    }).await;
+    match res {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("recreate task panicked: {}", e)
+        })),
+    }
+}
+
 /// GET /api/containers/docker/{id}/inspect — inspect raw docker config
 pub async fn docker_inspect(
     req: HttpRequest,
@@ -18780,6 +18828,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/containers/docker/import", web::post().to(docker_import))
         .route("/api/containers/docker/{id}/config", web::post().to(docker_update_config))
         .route("/api/containers/docker/{id}/env", web::post().to(docker_update_env))
+        .route("/api/containers/docker/{id}/raw-config", web::post().to(docker_update_raw_config))
         .route("/api/containers/docker/{id}/inspect", web::get().to(docker_inspect))
         // LXC
         .route("/api/containers/lxc", web::get().to(lxc_list))

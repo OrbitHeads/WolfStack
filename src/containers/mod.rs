@@ -2846,9 +2846,53 @@ pub fn docker_recreate_with_env(container: &str, new_env: &[String]) -> Result<S
             return Err(format!("Invalid env var key '{}' — must match [A-Za-z_][A-Za-z0-9_]*", key));
         }
     }
+    // Fetch current inspect, override /Config/Env with the new env,
+    // and delegate to the generalised recreate path — single
+    // implementation for both "change env" and "edit raw inspect".
+    let mut inspect = docker_inspect(container)?;
+    if let Some(cfg) = inspect.pointer_mut("/Config") {
+        if let Some(obj) = cfg.as_object_mut() {
+            let env_arr: Vec<serde_json::Value> = new_env.iter()
+                .map(|e| serde_json::Value::String(e.clone()))
+                .collect();
+            obj.insert("Env".to_string(), serde_json::Value::Array(env_arr));
+        }
+    }
+    docker_recreate_from_inspect(container, &inspect)
+}
 
-    // 1. Inspect the current container to capture its full config
-    let inspect = docker_inspect(container)?;
+/// Rebuild a Docker container from an edited inspect-JSON spec. Used
+/// by the "Edit Raw Config" UI and by docker_recreate_with_env above.
+/// Rename-based: old container is renamed to `<name>_wolfstack_old`,
+/// a new container is created from the new spec, old is removed on
+/// success OR renamed back on failure. Invalidates the list cache on
+/// completion so the UI re-renders from the new state.
+///
+/// The set of inspect fields we actually honour — operator-editable:
+///   /Config/Image               — target image (full name:tag)
+///   /Config/Env                 — environment variables (the common
+///                                 edit driver)
+///   /Config/Cmd                 — command args after entrypoint
+///   /Config/Entrypoint          — entrypoint override
+///   /Config/User, WorkingDir    — user + workdir
+///   /Config/Labels              — docker labels (dict)
+///   /Config/Tty, OpenStdin      — tty / stdin flags
+///   /HostConfig/Binds           — host-path bind mounts (this is what
+///                                 users have been asking for — add a
+///                                 new bind without recreating by hand)
+///   /HostConfig/PortBindings    — published ports
+///   /HostConfig/RestartPolicy   — restart policy
+///   /HostConfig/Memory, NanoCpus— resource limits
+///   /HostConfig/NetworkMode     — bridge / host / container: / custom
+///   /HostConfig/CapAdd, CapDrop — capabilities
+///   /HostConfig/Devices         — /dev pass-through
+///   /HostConfig/ShmSize         — /dev/shm size
+///   /Mounts                     — named volumes (type=volume)
+///
+/// Read-only inspect fields (State, NetworkSettings.IPAddress, Created
+/// timestamps) are ignored — they aren't a container spec, they're a
+/// container STATE, and editing them has no effect.
+pub fn docker_recreate_from_inspect(container: &str, inspect: &serde_json::Value) -> Result<String, String> {
 
     let image = inspect.pointer("/Config/Image")
         .and_then(|v| v.as_str())
@@ -3089,7 +3133,14 @@ pub fn docker_recreate_with_env(container: &str, new_env: &[String]) -> Result<S
         args.push(port.clone());
     }
 
-    for e in new_env {
+    // Env comes from /Config/Env on the provided inspect — either the
+    // live container's (plain recreate) or the operator's edited spec
+    // (Edit Raw Config path).
+    let env_list: Vec<String> = inspect.pointer("/Config/Env")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    for e in &env_list {
         if !e.is_empty() {
             args.push("-e".to_string());
             args.push(e.clone());
@@ -3138,7 +3189,7 @@ pub fn docker_recreate_with_env(container: &str, new_env: &[String]) -> Result<S
     }
 
     invalidate_docker_list_cache();
-    Ok(format!("Container '{}' recreated with updated environment variables{}", name,
+    Ok(format!("Container '{}' recreated from edited spec{}", name,
         if was_running { " and started" } else { "" }))
 }
 

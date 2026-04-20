@@ -12629,6 +12629,10 @@ async function openDockerSettings(name) {
                     style="${tabBtnStyle}border-bottom:2px solid transparent;color:var(--text-muted);">
                     💻 Resources
                 </button>
+                <button class="docker-tab-btn" data-dtab="4" onclick="switchDockerTab(4)"
+                    style="${tabBtnStyle}border-bottom:2px solid transparent;color:var(--text-muted);">
+                    🧾 Raw Config
+                </button>
             </div>
 
             <!-- ═══ Tab 1: General ═══ -->
@@ -12743,16 +12747,123 @@ async function openDockerSettings(name) {
                 </div>
             </div>
 
+            <!-- ═══ Tab 4: Raw Config (editable) ═══ -->
+            <div class="docker-tab-page" id="docker-tab-4" style="display:none;">
+                <div style="display:flex; align-items:flex-start; gap:10px; padding:10px 12px; margin-bottom:12px;
+                            background:rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.3); border-radius:8px;">
+                    <span style="font-size:18px;line-height:1;">⚠️</span>
+                    <div style="font-size:12px; line-height:1.5;">
+                        <strong style="color:#fca5a5;">Danger zone.</strong> Saving this tab RECREATES the container — old one is stopped, renamed to <code>${escapeHtml(name)}_wolfstack_old</code>, replaced with a fresh container matching the JSON below, then the old one is removed on success.
+                        The JSON's read-only fields (State, NetworkSettings, Created timestamps, etc.) are ignored — we only honour fields that are part of a container spec.
+                        Use this to add a bind mount, tweak port bindings, change labels — anything <code>docker update</code> can't do live. Env vars have their own tab on the Network page.
+                    </div>
+                </div>
+                <label style="font-size:12px; color:var(--text-muted); display:block; margin-bottom:6px;">
+                    <code>docker inspect</code> JSON — edit any field, press <strong>Save Raw Config</strong> to apply.
+                </label>
+                <textarea id="docker-raw-config" class="form-control"
+                    style="font-family:'JetBrains Mono',monospace;font-size:11px;height:520px;white-space:pre;
+                           overflow:auto; background:var(--bg-primary); color:var(--text-primary);
+                           border:1px solid var(--border); border-radius:8px; padding:12px;"
+                    spellcheck="false"
+                >${escapeHtml(JSON.stringify(cfg, null, 2))}</textarea>
+                <div style="display:flex; gap:8px; margin-top:10px; align-items:center;">
+                    <button class="btn btn-sm btn-primary" onclick="saveDockerRawConfig('${name}')" style="background:#ef4444; border-color:#ef4444;">
+                        💾 Save Raw Config (recreates container)
+                    </button>
+                    <button class="btn btn-sm" onclick="resetDockerRawConfig()">Reset</button>
+                    <span id="docker-raw-config-status" style="font-size:12px; color:var(--text-muted);"></span>
+                </div>
+            </div>
+
             <!-- Save/Cancel Bar -->
             <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px;padding-top:12px;border-top:1px solid var(--border);">
                 <button class="btn btn-sm" onclick="closeContainerDetail()">Cancel</button>
                 <button class="btn btn-sm btn-primary" onclick="saveDockerSettings('${name}')">💾 Save Settings</button>
             </div>
         `;
+        // Stash the as-loaded JSON so the Reset button can restore it.
+        window._dockerRawConfigOriginal = JSON.stringify(cfg, null, 2);
     } catch (e) {
         body.innerHTML = `<p style="color:#ef4444;">Failed to load config: ${e.message}</p>`;
     }
 }
+
+/// Restore the raw-config textarea to the JSON captured at modal-open
+/// time. Discards any edits the operator has been poking at.
+function resetDockerRawConfig() {
+    const ta = document.getElementById('docker-raw-config');
+    if (!ta) return;
+    ta.value = window._dockerRawConfigOriginal || '';
+    const status = document.getElementById('docker-raw-config-status');
+    if (status) status.textContent = 'Restored the as-loaded JSON.';
+}
+window.resetDockerRawConfig = resetDockerRawConfig;
+
+/// Save the edited docker-inspect JSON — recreates the container
+/// from the new spec. Parses the JSON client-side before submitting
+/// so we surface syntax errors immediately; backend then walks the
+/// parsed object and rebuilds the container.
+async function saveDockerRawConfig(name) {
+    const ta = document.getElementById('docker-raw-config');
+    const status = document.getElementById('docker-raw-config-status');
+    if (!ta) return;
+    const text = ta.value;
+    let parsed;
+    try {
+        parsed = JSON.parse(text);
+    } catch (e) {
+        if (status) {
+            status.style.color = '#ef4444';
+            status.textContent = 'Invalid JSON: ' + e.message;
+        }
+        return;
+    }
+    // Sanity prompt — this is destructive enough to deserve explicit
+    // confirmation with a countdown, same UX as host-DNS release.
+    const confirmed = (typeof showDangerConfirm === 'function')
+        ? await showDangerConfirm({
+            title: 'Recreate container from edited JSON?',
+            danger: 'The running container "' + name + '" will be stopped and renamed; a fresh one is created from the JSON below, then the old one is removed on success.',
+            detail: 'Data in named volumes and bind mounts survives (those are OUTSIDE the container layer). Logs and /var/log inside the container do NOT — they are in the layer and get discarded with the old container.',
+            countdown: 6,
+            confirmLabel: 'Recreate',
+        })
+        : await showConfirm('Recreate container "' + name + '" from the edited JSON?');
+    if (!confirmed) return;
+    if (status) {
+        status.style.color = 'var(--text-muted)';
+        status.textContent = 'Applying…';
+    }
+    try {
+        const r = await fetch(apiUrl('/api/containers/docker/' + encodeURIComponent(name) + '/raw-config'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(parsed),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            if (status) {
+                status.style.color = '#ef4444';
+                status.textContent = 'Failed: ' + (data.error || ('HTTP ' + r.status));
+            }
+            return;
+        }
+        if (status) {
+            status.style.color = '#10b981';
+            status.textContent = data.message || 'Recreated.';
+        }
+        showToast(data.message || 'Container recreated', 'success');
+        // Refresh the list so the new container's state is visible.
+        if (typeof loadDockerContainers === 'function') loadDockerContainers();
+    } catch (e) {
+        if (status) {
+            status.style.color = '#ef4444';
+            status.textContent = 'Error: ' + e.message;
+        }
+    }
+}
+window.saveDockerRawConfig = saveDockerRawConfig;
 
 async function saveDockerSettings(name) {
     var restartPolicy = (document.getElementById('docker-restart-policy') || {}).value || 'no';
