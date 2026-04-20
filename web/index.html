@@ -4228,6 +4228,7 @@
                         <button class="settings-tab-btn" onclick="switchSettingsTab('security')">🔐 Security</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('systemcheck')">🩺 System Check</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('paths')">📂 File Locations</button>
+                        <button class="settings-tab-btn" onclick="switchSettingsTab('reverseproxy')">🌐 Reverse Proxy</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('wolfnote')">📝 WolfNote</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('plugins')">🔌 Plugins</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('apikeys')">🔑 API Keys / Enterprise</button>
@@ -5143,6 +5144,38 @@
                         </p>
                         <div id="paths-form" style="max-width:700px;">
                             <div style="color:var(--text-muted);text-align:center;padding:20px;">Loading...</div>
+                        </div>
+                    </div>
+
+                    <!-- ─── Reverse Proxy Tab ─── -->
+                    <div id="settings-tab-reverseproxy" class="settings-tab-panel">
+                        <h4 style="margin:0 0 8px 0;font-size:16px;font-weight:600;">Reverse Proxy</h4>
+                        <p style="font-size:13px;color:var(--text-muted);margin:0 0 16px 0;">
+                            If WolfStack sits behind a reverse proxy (Cloudflare Tunnel, nginx, Traefik, Caddy, …), status page links and other shareable URLs default to the current browser origin. That works out of the box for most setups — including custom domains on the main API port. Use the override below only if the auto-detection doesn't match the URL your users actually reach WolfStack on (e.g. subpath proxying, or admin-vs-public split domains).
+                        </p>
+                        <div style="max-width:720px;">
+                            <div style="background:var(--bg-input);border:1px solid var(--border);border-radius:8px;padding:14px 16px;margin-bottom:18px;">
+                                <div style="font-weight:600;margin-bottom:6px;font-size:14px;">Proxy checklist</div>
+                                <ul style="margin:0;padding-left:20px;font-size:13px;color:var(--text-muted);line-height:1.6;">
+                                    <li>Forward the proxy to the main API port (default <code>8553</code>) — status pages, cluster browser, consoles and the SPA all share this port.</li>
+                                    <li>Pass through these headers: <code>Host</code>, <code>X-Forwarded-Proto</code>, <code>X-Forwarded-For</code>.</li>
+                                    <li>Enable WebSocket upgrades (<code>Upgrade</code> and <code>Connection</code> headers) — consoles, VNC, cluster browser all use WS.</li>
+                                    <li>Port <code>8550</code> (dedicated no-auth status listener) does <b>not</b> need forwarding — <code>/status/{slug}</code> is also served on the main port.</li>
+                                </ul>
+                            </div>
+                            <label style="display:block;font-size:13px;font-weight:600;margin-bottom:6px;">Public base URL <span style="color:var(--text-muted);font-weight:400;">(optional)</span></label>
+                            <input type="text" id="reverse-proxy-public-base" placeholder="https://status.example.com"
+                                   style="width:100%;padding:9px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text);font-family:monospace;font-size:13px;">
+                            <p style="font-size:12px;color:var(--text-muted);margin:6px 0 0;">
+                                Absolute URL, no trailing slash. Leave empty to use the current browser origin (the default, works for most setups).
+                                Examples: <code>https://status.example.com</code>, <code>https://example.com/wolfstack</code>.
+                            </p>
+                            <div id="reverse-proxy-preview" style="margin-top:14px;font-size:12px;color:var(--text-muted);"></div>
+                            <div style="display:flex;gap:8px;margin-top:16px;">
+                                <button class="btn btn-primary" onclick="saveReverseProxyConfig()">💾 Save</button>
+                                <button class="btn" onclick="loadReverseProxyConfig()">↻ Reload</button>
+                            </div>
+                            <div id="reverse-proxy-status" style="margin-top:12px;font-size:13px;"></div>
                         </div>
                     </div>
 

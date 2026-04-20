@@ -46,6 +46,7 @@ mod wolfnote;
 mod wolfusb;
 mod paths;
 mod ports;
+mod reverse_proxy;
 mod deps;
 mod systemcheck;
 mod security;

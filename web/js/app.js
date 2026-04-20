@@ -24769,6 +24769,8 @@ function switchSettingsTab(tabName) {
         loadClusterSecretStatus();
     } else if (tabName === 'paths') {
         loadFileLocations();
+    } else if (tabName === 'reverseproxy') {
+        loadReverseProxyConfig();
     } else if (tabName === 'users') {
         loadAuthConfig();
         loadUsers();
@@ -26525,6 +26527,100 @@ async function saveFileLocations() {
         showToast('Failed to save file locations: ' + e.message, 'error');
     }
 }
+
+// ─── Reverse Proxy config (Settings → 🌐 Reverse Proxy) ───
+
+// Cached public-base override. Read by spPublicUrl() and anywhere else
+// that builds shareable links. Populated eagerly on app bootstrap so
+// the first render of status pages already has it, and refreshed
+// whenever the user saves from the settings tab.
+let _reverseProxyBase = '';
+
+async function fetchReverseProxyConfigSilent() {
+    try {
+        const resp = await fetch('/api/reverse-proxy/config');
+        if (!resp.ok) return;
+        const cfg = await resp.json();
+        _reverseProxyBase = (cfg.public_base_url || '').replace(/\/+$/, '');
+    } catch (e) { /* non-fatal — fall back to origin */ }
+}
+
+async function loadReverseProxyConfig() {
+    const input = document.getElementById('reverse-proxy-public-base');
+    const statusEl = document.getElementById('reverse-proxy-status');
+    if (!input) return;
+    if (statusEl) statusEl.textContent = '';
+    try {
+        const resp = await fetch('/api/reverse-proxy/config');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const cfg = await resp.json();
+        input.value = cfg.public_base_url || '';
+        _reverseProxyBase = (cfg.public_base_url || '').replace(/\/+$/, '');
+        updateReverseProxyPreview();
+    } catch (e) {
+        if (statusEl) {
+            statusEl.textContent = 'Failed to load: ' + e.message;
+            statusEl.style.color = 'var(--danger, #ef4444)';
+        }
+    }
+}
+
+async function saveReverseProxyConfig() {
+    const input = document.getElementById('reverse-proxy-public-base');
+    const statusEl = document.getElementById('reverse-proxy-status');
+    if (!input) return;
+    const raw = (input.value || '').trim().replace(/\/+$/, '');
+    if (raw && !/^https?:\/\//i.test(raw)) {
+        if (statusEl) {
+            statusEl.textContent = 'Must start with http:// or https://';
+            statusEl.style.color = 'var(--danger, #ef4444)';
+        }
+        return;
+    }
+    try {
+        const resp = await fetch('/api/reverse-proxy/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ public_base_url: raw }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || 'HTTP ' + resp.status);
+        _reverseProxyBase = (data.config?.public_base_url || '').replace(/\/+$/, '');
+        input.value = _reverseProxyBase;
+        updateReverseProxyPreview();
+        if (statusEl) {
+            statusEl.textContent = 'Saved.';
+            statusEl.style.color = 'var(--success, #10b981)';
+        }
+        if (typeof showToast === 'function') showToast('Reverse-proxy config saved', 'success');
+    } catch (e) {
+        if (statusEl) {
+            statusEl.textContent = 'Failed to save: ' + e.message;
+            statusEl.style.color = 'var(--danger, #ef4444)';
+        }
+    }
+}
+
+function updateReverseProxyPreview() {
+    const previewEl = document.getElementById('reverse-proxy-preview');
+    const input = document.getElementById('reverse-proxy-public-base');
+    if (!previewEl) return;
+    const raw = ((input?.value) || '').trim().replace(/\/+$/, '');
+    const base = raw || window.location.origin;
+    const example = `${base}/status/example-slug`;
+    previewEl.innerHTML = `Public status-page links will be built as: <code style="color:var(--text);">${escapeHtml(example)}</code>` +
+        (raw ? '' : ' <span style="opacity:0.7;">(using current browser origin — no override configured)</span>');
+}
+
+// Live preview as the user types
+document.addEventListener('DOMContentLoaded', function() {
+    const input = document.getElementById('reverse-proxy-public-base');
+    if (input) input.addEventListener('input', updateReverseProxyPreview);
+});
+
+// Eagerly populate the cache so spPublicUrl() has the override on first
+// render of the status-page list.
+document.addEventListener('DOMContentLoaded', fetchReverseProxyConfigSilent);
 
 // ─── Sponsor Header Badge ───
 
@@ -29218,21 +29314,30 @@ function spUrl(path) {
     return base ? `${base}/${path}` : `/api/${path}`;
 }
 
-// Build the public URL for a status page.
-// Uses port 8550 (dedicated status page HTTP listener) on the node's address.
+// Build the public URL for a status page. Same-cluster uses the page's
+// current origin so it inherits whatever scheme/host/port the admin is
+// already using — including a reverse-proxy domain (Cloudflare tunnel,
+// nginx, etc.), since /status/{slug} is also served on the main port.
+// Remote clusters fall back to the node's IP on the dedicated 8550
+// listener because we don't know the remote cluster's public URL.
 function spPublicUrl(slug, cluster) {
     const selfNode = allNodes.find(n => n.is_self);
     const selfCluster = selfNode?.cluster_name || 'WolfStack';
     const resolvedCluster = cluster || spCurrentCluster || selfCluster;
+    // Admin-configured override (Settings → 🌐 Reverse Proxy) wins over
+    // the auto-detected origin for the local cluster. Needed when the
+    // admin UI and public status pages live on different URLs, or when
+    // the proxy is mounted on a subpath.
+    const localBase = (_reverseProxyBase || window.location.origin).replace(/\/+$/, '');
     if (resolvedCluster === selfCluster) {
-        return `http://${window.location.hostname}:8550/status/${slug}`;
+        return `${localBase}/status/${slug}`;
     }
     const remoteNode = spFindRemoteNode(resolvedCluster);
     if (remoteNode) {
         const host = remoteNode.address || remoteNode.hostname;
         return `http://${host}:8550/status/${slug}`;
     }
-    return `http://${window.location.hostname}:8550/status/${slug}`;
+    return `${localBase}/status/${slug}`;
 }
 
 function showStatusPagesForCluster(clusterName) {

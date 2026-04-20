@@ -3752,6 +3752,44 @@ pub async fn set_ports(req: HttpRequest, state: web::Data<AppState>, body: web::
     HttpResponse::Ok().json(serde_json::json!({"saved": true, "restart_required": true}))
 }
 
+// ─── Reverse proxy configuration ────────────────────────────────────────
+
+/// GET /api/reverse-proxy/config — public base URL override for building
+/// shareable links (status pages, cluster browser) when WolfStack is
+/// served through a reverse proxy on a domain that differs from the
+/// node's internal address.
+pub async fn reverse_proxy_config_get(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    HttpResponse::Ok().json(crate::reverse_proxy::ReverseProxyConfig::load())
+}
+
+/// POST /api/reverse-proxy/config — validate and persist the override.
+pub async fn reverse_proxy_config_save(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<crate::reverse_proxy::ReverseProxyConfig>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let cfg = body.into_inner().normalised();
+    if !cfg.public_base_url.is_empty() {
+        let u = &cfg.public_base_url;
+        if !(u.starts_with("http://") || u.starts_with("https://")) {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": "public_base_url must start with http:// or https://"
+            }));
+        }
+        if u.contains(' ') || u.contains('\n') {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": "public_base_url must not contain whitespace"
+            }));
+        }
+    }
+    if let Err(e) = cfg.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e}));
+    }
+    HttpResponse::Ok().json(serde_json::json!({"saved": true, "config": cfg}))
+}
+
 // ─── Cluster Services Discovery ─────────────────────────────────────────
 
 /// GET /api/cluster-services — every web service this user can see:
@@ -19092,6 +19130,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/agent/storage/apply", web::post().to(agent_storage_apply))
         .route("/api/ports", web::get().to(get_ports))
         .route("/api/ports", web::post().to(set_ports))
+        .route("/api/reverse-proxy/config", web::get().to(reverse_proxy_config_get))
+        .route("/api/reverse-proxy/config", web::post().to(reverse_proxy_config_save))
         .route("/api/cluster-services", web::get().to(cluster_services_list))
         .route("/api/cluster-services/sweep", web::post().to(cluster_services_sweep))
         .route("/api/cluster-services/manual", web::post().to(cluster_services_add_manual))

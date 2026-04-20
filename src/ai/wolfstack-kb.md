@@ -122,6 +122,15 @@
 - HTTP/HTTPS/TCP/ICMP/DNS monitors
 - Incident tracking with updates
 - Cluster-scoped: monitors, pages, incidents all have a cluster field
+- Served on BOTH the main API port (auth not required for /status/*) AND a dedicated no-auth listener on port 8550 — the main-port route is what makes reverse-proxy deployments work
+- Admin UI "public URL" link uses `window.location.origin` for the local cluster, so it automatically matches whatever domain the admin is on (Cloudflare tunnel, nginx, direct IP — all work without config)
+
+## Running behind a reverse proxy (Cloudflare Tunnel, nginx, Traefik, etc.)
+- Point the proxy at the main API port (default 8553, or whatever `--port` sets). Status pages, cluster browser sessions, consoles and the SPA all ride that one port.
+- Required proxy headers: `Host` (preserve original), `X-Forwarded-Proto`, `X-Forwarded-For`. actix-web's `connection_info()` reads these for URL generation (cluster browser `connect_url`, etc.).
+- Enable WebSocket upgrades — consoles, VNC, k8s provisioning, and cluster browser all use WS on the same port.
+- Status pages work out of the box at `https://your-domain/status/{slug}` with no extra routing.
+- Port 8550 (dedicated status listener) is NOT needed behind a proxy and can be left un-forwarded; it's only there for admins who want no-auth public pages on a separate port without a proxy.
 
 ## Backups
 - Scheduled backups with multiple destination types
