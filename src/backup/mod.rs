@@ -2544,12 +2544,18 @@ pub fn check_schedules() {
 
         // Time to run this schedule!
 
-        
+        // Scheduler form may have saved storage as `{type:"pbs"}` only.
+        // Fill in server/user/credentials from the saved PBS config so
+        // proxmox-backup-client gets PBS_PASSWORD instead of failing with
+        // "no password input mechanism".
+        let mut storage = schedule.storage.clone();
+        merge_pbs_secrets(&mut storage);
+
         let new_entries = if schedule.backup_all {
-            backup_all(&schedule.storage)
+            backup_all(&storage)
         } else {
             schedule.targets.iter()
-                .map(|t| create_backup_entry(t.clone(), &schedule.storage))
+                .map(|t| create_backup_entry(t.clone(), &storage))
                 .collect()
         };
 
@@ -3334,6 +3340,24 @@ pub fn check_pbs_status(storage: &BackupStorage) -> serde_json::Value {
             "error": e
         })
     }
+}
+
+/// Fill any empty PBS connection/credential fields on `storage` from the
+/// saved PBS config. The cluster-wide scheduler form only sends
+/// `{type:"pbs"}` — without this merge, scheduled runs invoke
+/// proxmox-backup-client with no PBS_PASSWORD and fail with
+/// "no password input mechanism".
+pub fn merge_pbs_secrets(storage: &mut BackupStorage) {
+    if storage.storage_type != StorageType::Pbs { return; }
+    let saved = load_pbs_config();
+    if storage.pbs_server.is_empty()      { storage.pbs_server      = saved.pbs_server; }
+    if storage.pbs_datastore.is_empty()   { storage.pbs_datastore   = saved.pbs_datastore; }
+    if storage.pbs_user.is_empty()        { storage.pbs_user        = saved.pbs_user; }
+    if storage.pbs_token_name.is_empty()  { storage.pbs_token_name  = saved.pbs_token_name; }
+    if storage.pbs_token_secret.is_empty(){ storage.pbs_token_secret= saved.pbs_token_secret; }
+    if storage.pbs_password.is_empty()    { storage.pbs_password    = saved.pbs_password; }
+    if storage.pbs_fingerprint.is_empty() { storage.pbs_fingerprint = saved.pbs_fingerprint; }
+    if storage.pbs_namespace.is_empty()   { storage.pbs_namespace   = saved.pbs_namespace; }
 }
 
 /// PBS configuration — stored in /etc/wolfstack/pbs/config.json

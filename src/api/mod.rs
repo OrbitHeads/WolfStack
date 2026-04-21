@@ -7412,24 +7412,8 @@ pub async fn backup_create(
     body: web::Json<CreateBackupRequest>,
 ) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
-    // If PBS storage selected, merge in saved secrets (frontend doesn't send them)
     let mut storage = body.storage.clone();
-    if storage.storage_type == backup::StorageType::Pbs {
-        let saved = backup::load_pbs_config();
-        if storage.pbs_password.is_empty() && !saved.pbs_password.is_empty() {
-            storage.pbs_password = saved.pbs_password;
-        }
-        if storage.pbs_token_secret.is_empty() && !saved.pbs_token_secret.is_empty() {
-            storage.pbs_token_secret = saved.pbs_token_secret;
-        }
-        // Also fill in any missing connection details from saved config
-        if storage.pbs_server.is_empty() { storage.pbs_server = saved.pbs_server; }
-        if storage.pbs_datastore.is_empty() { storage.pbs_datastore = saved.pbs_datastore; }
-        if storage.pbs_user.is_empty() { storage.pbs_user = saved.pbs_user; }
-        if storage.pbs_token_name.is_empty() { storage.pbs_token_name = saved.pbs_token_name; }
-        if storage.pbs_fingerprint.is_empty() { storage.pbs_fingerprint = saved.pbs_fingerprint; }
-        if storage.pbs_namespace.is_empty() { storage.pbs_namespace = saved.pbs_namespace; }
-    }
+    backup::merge_pbs_secrets(&mut storage);
     let entries = backup::create_backup(body.target.clone(), storage);
     let success_count = entries.iter().filter(|e| e.status == backup::BackupStatus::Completed).count();
     let fail_count = entries.iter().filter(|e| e.status == backup::BackupStatus::Failed).count();
@@ -7447,21 +7431,7 @@ pub async fn backup_stream(
     if let Err(e) = require_auth(&req, &state) { return e; }
 
     let mut storage = body.storage.clone();
-    if storage.storage_type == backup::StorageType::Pbs {
-        let saved = backup::load_pbs_config();
-        if storage.pbs_password.is_empty() && !saved.pbs_password.is_empty() {
-            storage.pbs_password = saved.pbs_password;
-        }
-        if storage.pbs_token_secret.is_empty() && !saved.pbs_token_secret.is_empty() {
-            storage.pbs_token_secret = saved.pbs_token_secret;
-        }
-        if storage.pbs_server.is_empty() { storage.pbs_server = saved.pbs_server; }
-        if storage.pbs_datastore.is_empty() { storage.pbs_datastore = saved.pbs_datastore; }
-        if storage.pbs_user.is_empty() { storage.pbs_user = saved.pbs_user; }
-        if storage.pbs_token_name.is_empty() { storage.pbs_token_name = saved.pbs_token_name; }
-        if storage.pbs_fingerprint.is_empty() { storage.pbs_fingerprint = saved.pbs_fingerprint; }
-        if storage.pbs_namespace.is_empty() { storage.pbs_namespace = saved.pbs_namespace; }
-    }
+    backup::merge_pbs_secrets(&mut storage);
 
     let target = body.target.clone();
     let cluster_name = Some(body.cluster_name.clone()
@@ -7639,6 +7609,10 @@ pub async fn backup_schedule_create(
     body: web::Json<CreateScheduleRequest>,
 ) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
+    // Cluster-wide scheduler UI sends only `{type:"pbs"}`; fill in saved
+    // server/credentials so the schedule is runnable without a second round-trip.
+    let mut storage = body.storage.clone();
+    backup::merge_pbs_secrets(&mut storage);
     let schedule = backup::BackupSchedule {
         id: uuid::Uuid::new_v4().to_string(),
         name: body.name.clone(),
@@ -7647,7 +7621,7 @@ pub async fn backup_schedule_create(
         retention: body.retention,
         backup_all: body.backup_all,
         targets: body.targets.clone(),
-        storage: body.storage.clone(),
+        storage,
         enabled: body.enabled,
         last_run: String::new(),
     };
