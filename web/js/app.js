@@ -11490,7 +11490,14 @@ async function createIpMapping() {
         const data = await resp.json();
         if (!resp.ok) throw new Error(data.error || 'Failed to create mapping');
         closeCreateMappingModal();
-        showToast(data.message, 'success');
+        // Surface reachability warning (e.g. remote WolfNet target not pingable).
+        // iptables rules got written regardless, but the operator needs to know
+        // packets will be black-holed until WolfNet routing to the target comes up.
+        if (data.warning) {
+            showModal(data.warning, '⚠️ Mapping saved but target unreachable');
+        } else {
+            showToast(data.message, 'success');
+        }
         loadNetworking();
     } catch (e) {
         showModal('Error: ' + e.message);

@@ -1657,9 +1657,110 @@ fn build_port_args(ports: &str) -> Vec<String> {
     }
 }
 
+/// Delete every iptables rule in `table`/`chain` whose listing line contains
+/// ALL of the given substring markers. Loops until no match remains. Returns
+/// the number of rules removed (capped at 1024 as a safety stop).
+///
+/// Used to flush duplicate/stale mapping rules before re-applying. Matches
+/// on text rather than exact rule spec so it catches rules whose DNAT target
+/// or SNAT source differs from the current mapping (i.e. stale rules left
+/// from a previous WolfNet IP or a different translated destination port).
+fn purge_matching_lines(table: &str, chain: &str, markers: &[&str]) -> usize {
+    let mut removed = 0;
+    loop {
+        let text = match Command::new("iptables")
+            .args(["-t", table, "-L", chain, "--line-numbers", "-n"])
+            .output()
+        {
+            Ok(ref o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+            _ => break,
+        };
+        let mut found = None;
+        // Walk bottom-up: deleting by line number shifts everything below
+        // the deleted line. Picking the highest-numbered match keeps the
+        // numbers we haven't touched valid.
+        for line in text.lines().rev() {
+            if markers.iter().all(|m| line.contains(m)) {
+                if let Some(num) = line.split_whitespace().next().and_then(|n| n.parse::<u32>().ok()) {
+                    found = Some(num);
+                    break;
+                }
+            }
+        }
+        match found {
+            Some(num) => {
+                let _ = Command::new("iptables")
+                    .args(["-t", table, "-D", chain, &num.to_string()])
+                    .output();
+                removed += 1;
+                if removed >= 1024 { break; }
+            }
+            None => break,
+        }
+    }
+    removed
+}
+
+/// Sweep iptables for any existing rule belonging to this mapping —
+/// duplicates accumulated across WolfStack restarts, plus stale rules
+/// whose DNAT target or SNAT source no longer matches the current
+/// mapping (left over when the WolfNet IP was edited).
+///
+/// This is called at the top of apply_mapping_rules so a subsequent
+/// append always produces exactly one rule per chain, regardless of
+/// how many stale copies were there before.
+fn purge_mapping_rules(m: &IpMapping) {
+    let src_ports: Vec<u16> = m.ports.as_deref()
+        .and_then(|s| parse_port_list(s).ok())
+        .unwrap_or_default();
+    let dest_ports: Vec<u16> = m.dest_ports.as_deref()
+        .or(m.ports.as_deref())
+        .and_then(|s| parse_port_list(s).ok())
+        .unwrap_or_default();
+
+    // Source side (PREROUTING + OUTPUT): match any DNAT rule for this
+    // public_ip + src_port. Catches duplicates AND stale rules whose
+    // --to-destination points at an old WolfNet IP.
+    if src_ports.is_empty() {
+        purge_matching_lines("nat", "PREROUTING", &[&m.public_ip, "DNAT"]);
+        purge_matching_lines("nat", "OUTPUT", &[&m.public_ip, "DNAT"]);
+    } else {
+        for p in &src_ports {
+            let port_marker = format!("dpt:{}", p);
+            purge_matching_lines("nat", "PREROUTING", &[&m.public_ip, "DNAT", &port_marker]);
+            purge_matching_lines("nat", "OUTPUT", &[&m.public_ip, "DNAT", &port_marker]);
+        }
+    }
+
+    // Dest side (POSTROUTING SNAT + FORWARD conntrack-DNAT ACCEPT): match
+    // on the current wolfnet_ip + dest_port. Won't catch rules from a
+    // previous WolfNet IP, but those are benign (wrong-target SNAT/ACCEPT
+    // just dead-routes traffic to a defunct IP, it doesn't mis-route).
+    if dest_ports.is_empty() {
+        purge_matching_lines("nat", "POSTROUTING", &[&m.wolfnet_ip, "SNAT"]);
+        purge_matching_lines("filter", "FORWARD", &[&m.wolfnet_ip, "ctstate DNAT"]);
+    } else {
+        for p in &dest_ports {
+            let port_marker = format!("dpt:{}", p);
+            purge_matching_lines("nat", "POSTROUTING", &[&m.wolfnet_ip, "SNAT", &port_marker]);
+            purge_matching_lines("filter", "FORWARD", &[&m.wolfnet_ip, "ctstate DNAT", &port_marker]);
+        }
+    }
+}
+
 /// Apply iptables rules for a single mapping
 fn apply_mapping_rules(m: &IpMapping) -> Result<(), String> {
     if !m.enabled { return Ok(()); }
+
+    // Flush any existing rules for this mapping first — makes the whole
+    // function idempotent. Without this, every WolfStack startup calls
+    // apply_ip_mappings → apply_mapping_rules → -A, piling duplicate DNAT
+    // rules into PREROUTING. Since iptables DNAT is terminating and the
+    // first match wins, once a stale rule with a wrong target accumulates
+    // (e.g. from before an edit changed the WolfNet IP), all traffic gets
+    // black-holed to the dead target. Purging first guarantees exactly one
+    // rule per chain after this function returns.
+    purge_mapping_rules(m);
 
     // Detect gateway WolfNet IP for SNAT
     let gateway_ip = detect_wolfnet_gateway_ip()
@@ -2112,6 +2213,33 @@ fn detect_wolfnet_gateway_ip() -> Option<String> {
         }
     }
     None
+}
+
+/// Check whether a WolfNet IP is reachable from this host — used by the
+/// IP-mapping create/update flow to catch the case where someone maps to
+/// a VM on a remote cluster node that isn't actually reachable over
+/// WolfNet (stale route cache, WireGuard peer down, VM not yet booted,
+/// etc.). Without this probe, `add_ip_mapping` silently writes DNAT
+/// rules that black-hole traffic and the operator has no idea why the
+/// mapping doesn't work.
+///
+/// Returns one of:
+///   - "local"       — target IS this host's own WolfNet IP
+///   - "reachable"   — ping over WolfNet succeeded
+///   - "unreachable" — ping failed (WolfNet routing broken, or target down)
+///   - "no_wolfnet"  — this host has no WolfNet interface at all
+pub fn check_wolfnet_reachability(ip: &str) -> &'static str {
+    let gw = detect_wolfnet_gateway_ip();
+    if gw.is_none() { return "no_wolfnet"; }
+    if gw.as_deref() == Some(ip) { return "local"; }
+
+    match Command::new("ping")
+        .args(["-c", "1", "-W", "1", ip])
+        .output()
+    {
+        Ok(o) if o.status.success() => "reachable",
+        _ => "unreachable",
+    }
 }
 
 /// Detect the best reachable LAN IP for this node.

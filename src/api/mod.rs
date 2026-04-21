@@ -7450,10 +7450,29 @@ pub async fn net_add_ip_mapping(
         protocol,
         label,
     ) {
-        Ok(mapping) => HttpResponse::Ok().json(serde_json::json!({
-            "message": format!("Mapped {} → {}", mapping.public_ip, mapping.wolfnet_ip),
-            "mapping": mapping,
-        })),
+        Ok(mapping) => {
+            let reachability = networking::check_wolfnet_reachability(&mapping.wolfnet_ip);
+            let warning = match reachability {
+                "unreachable" => Some(format!(
+                    "Mapping saved, but {} is not reachable over WolfNet from this node. \
+                     iptables rules are in place but packets to this target will be black-holed \
+                     until WolfNet routing to it comes up. Check: WireGuard peer status, the \
+                     target VM/container is running, and the node hosting it is online.",
+                    mapping.wolfnet_ip
+                )),
+                "no_wolfnet" => Some(
+                    "Mapping saved, but this node has no WolfNet interface — packets cannot \
+                     leave this host via WolfNet. Start WolfNet on this node.".to_string()
+                ),
+                _ => None,
+            };
+            HttpResponse::Ok().json(serde_json::json!({
+                "message": format!("Mapped {} → {}", mapping.public_ip, mapping.wolfnet_ip),
+                "mapping": mapping,
+                "reachability": reachability,
+                "warning": warning,
+            }))
+        }
         Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
     }
 }
@@ -7490,7 +7509,28 @@ pub async fn net_update_ip_mapping(
         protocol,
         label,
     ) {
-        Ok(mapping) => HttpResponse::Ok().json(mapping),
+        Ok(mapping) => {
+            let reachability = networking::check_wolfnet_reachability(&mapping.wolfnet_ip);
+            let warning = match reachability {
+                "unreachable" => Some(format!(
+                    "Mapping saved, but {} is not reachable over WolfNet from this node. \
+                     iptables rules are in place but packets to this target will be black-holed \
+                     until WolfNet routing to it comes up. Check: WireGuard peer status, the \
+                     target VM/container is running, and the node hosting it is online.",
+                    mapping.wolfnet_ip
+                )),
+                "no_wolfnet" => Some(
+                    "Mapping saved, but this node has no WolfNet interface — packets cannot \
+                     leave this host via WolfNet. Start WolfNet on this node.".to_string()
+                ),
+                _ => None,
+            };
+            HttpResponse::Ok().json(serde_json::json!({
+                "mapping": mapping,
+                "reachability": reachability,
+                "warning": warning,
+            }))
+        }
         Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
     }
 }
