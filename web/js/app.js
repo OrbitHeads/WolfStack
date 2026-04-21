@@ -3581,34 +3581,33 @@ function escapeHtml(str) {
     return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
-// Feature-flag cache backed by /api/platform/status. Populated on first
-// call and reused until page reload — the license doesn't change on the
-// fly and saving a round-trip per feature check keeps the UI snappy.
-// Enterprise-only UI uses `hasFeature('per_user_clusters')` to hide
-// gated controls completely on non-enterprise installs; the call
-// resolves to false before the fetch completes, which means the UI
-// renders non-enterprise first and may enable controls a moment later
-// once the real license data arrives. That's acceptable — there's no
-// security impact (the backend re-enforces the gate), and hiding first
-// then showing is the right default.
-let _platformFeaturesCache = null;
-let _platformFeaturesInflight = null;
-async function loadPlatformFeatures() {
-    if (_platformFeaturesCache) return _platformFeaturesCache;
-    if (_platformFeaturesInflight) return _platformFeaturesInflight;
-    _platformFeaturesInflight = (async () => {
+// License cache backed by /api/platform/status. Any valid license =
+// enterprise = all enterprise features on (no per-feature toggle).
+// Cached across the session because the license doesn't change on the
+// fly and saving a round-trip per check keeps the UI snappy.
+//
+// `isEnterprise()` resolves to false before the fetch completes, which
+// means the UI renders as non-enterprise first and may enable controls
+// a moment later once the real license status arrives. That's fine —
+// the backend re-enforces the gate, and hiding then showing is safer
+// than showing then hiding.
+let _platformLicenseCache = null;
+let _platformLicenseInflight = null;
+async function loadPlatformLicense() {
+    if (_platformLicenseCache !== null) return _platformLicenseCache;
+    if (_platformLicenseInflight) return _platformLicenseInflight;
+    _platformLicenseInflight = (async () => {
         try {
             const r = await fetch('/api/platform/status');
-            if (!r.ok) return [];
-            const d = await r.json();
-            return Array.isArray(d.features) ? d.features : [];
-        } catch (e) { return []; }
+            if (!r.ok) return { valid: false };
+            return await r.json();
+        } catch (e) { return { valid: false }; }
     })();
-    _platformFeaturesCache = await _platformFeaturesInflight;
-    return _platformFeaturesCache;
+    _platformLicenseCache = await _platformLicenseInflight;
+    return _platformLicenseCache;
 }
-function hasFeature(name) {
-    return Array.isArray(_platformFeaturesCache) && _platformFeaturesCache.includes(name);
+function isEnterprise() {
+    return !!(_platformLicenseCache && _platformLicenseCache.valid);
 }
 
 async function discoverLibvirtVms() {
@@ -26872,11 +26871,11 @@ async function setAuthMode(mode) {
 async function loadUsers() {
     const container = document.getElementById('users-list');
     if (!container) return;
-    // Pull the feature list once so per-user cluster controls are
-    // hidden on non-enterprise installs. `await` here delays the render
-    // slightly on the first visit; subsequent visits are cached.
-    await loadPlatformFeatures();
-    const perUserClusters = hasFeature('per_user_clusters');
+    // Pull the license status once so per-user cluster controls are
+    // hidden on non-enterprise installs. Any valid license unlocks it
+    // — no per-feature toggle.
+    await loadPlatformLicense();
+    const perUserClusters = isEnterprise();
     try {
         const resp = await fetch('/api/auth/users');
         if (!resp.ok) throw new Error('HTTP ' + resp.status);

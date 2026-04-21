@@ -642,8 +642,8 @@ pub async fn create_user(req: HttpRequest, state: web::Data<AppState>, body: web
     // field is enterprise-only; on non-enterprise installs the UI
     // doesn't render it and we discard any value posted anyway so a
     // bad-actor admin can't pre-seed restrictions that then get
-    // enforced.
-    let allowed_clusters: Vec<String> = if crate::compat::has_feature("per_user_clusters") {
+    // enforced. "Enterprise" = any valid license.
+    let allowed_clusters: Vec<String> = if crate::compat::platform_ready() {
         body.get("allowed_clusters")
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
@@ -769,11 +769,10 @@ pub async fn update_user_clusters(
     path: web::Path<String>, body: web::Json<serde_json::Value>,
 ) -> HttpResponse {
     let caller = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
-    // Per-user cluster assignment is an enterprise feature. On a
-    // non-enterprise install the route looks as if it doesn't exist,
-    // matching what the UI tells the admin — 404, not 403, so no
-    // "upgrade for this" leakage.
-    if !crate::compat::has_feature("per_user_clusters") {
+    // Enterprise-only — any valid license unlocks it, no per-feature
+    // toggle. On a non-enterprise install the route returns 404 (route
+    // invisible, matching the hidden UI — no upgrade leakage).
+    if !crate::compat::platform_ready() {
         return HttpResponse::NotFound().finish();
     }
     let store = crate::auth::users::UserStore::load();
