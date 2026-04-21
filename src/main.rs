@@ -1489,7 +1489,36 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                         if guest_stats_refs.is_empty() { None } else { Some(&guest_stats_refs) },
                         k8s_health.as_deref(),
                     );
-                    let _ = ai_agent_bg.health_check(&summary).await;
+                    let sample = ai::baseline::Sample {
+                        ts: chrono::Utc::now().timestamp(),
+                        cpu_pct,
+                        mem_used_gb, mem_total_gb,
+                        disk_used_gb, disk_total_gb,
+                        docker_count, lxc_count, vm_count,
+                    };
+                    let cluster_name = ai_state.cluster.get_self_cluster_name();
+                    let open_incidents = ai_state.statuspage.open_ai_incidents_summary(&cluster_name);
+                    let outcome = ai_agent_bg.health_check(sample, &summary, &open_incidents).await;
+                    // Drive status-page incidents off the outcome. Ok
+                    // auto-resolves any open AI incident for this host;
+                    // Alert opens (or appends to) one. Error leaves
+                    // existing incidents alone — a transient LLM API
+                    // failure must not silently resolve real issues.
+                    match outcome {
+                        ai::HealthOutcome::Alert { severity, message } => {
+                            ai_state.statuspage.open_or_update_ai_incident(
+                                &cluster_name, &hostname, &severity, &message,
+                            );
+                        }
+                        ai::HealthOutcome::Ok => {
+                            ai_state.statuspage.resolve_ai_incidents_for_host(&cluster_name, &hostname);
+                            // Fire "cleared" notifications on the alert→OK
+                            // transition (self-gated: no-op if this host
+                            // wasn't previously alerting).
+                            ai_agent_bg.notify_resolved(&hostname).await;
+                        }
+                        ai::HealthOutcome::NotConfigured | ai::HealthOutcome::Error => {}
+                    }
                 }
 
                 tokio::time::sleep(Duration::from_secs(interval)).await;

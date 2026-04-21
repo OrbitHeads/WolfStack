@@ -59,6 +59,8 @@ pub struct FileLocations {
     // ── AI Agent ──────────────────────────────────
     #[serde(default = "default_ai_config")]
     pub ai_config: String,
+    #[serde(default = "default_ai_baseline")]
+    pub ai_baseline: String,
 
     // ── WolfRun ───────────────────────────────────
     #[serde(default = "default_wolfrun_dir")]
@@ -167,6 +169,7 @@ fn default_statuspage_config() -> String { "/etc/wolfstack/statuspage.json".into
 fn default_statuspage_uptime() -> String { "/etc/wolfstack/statuspage-uptime.json".into() }
 
 fn default_ai_config() -> String { "/etc/wolfstack/ai-config.json".into() }
+fn default_ai_baseline() -> String { "/var/lib/wolfstack/ai-baseline.json".into() }
 
 fn default_wolfrun_dir() -> String { "/etc/wolfstack/wolfrun".into() }
 fn default_wolfrun_services() -> String { "/etc/wolfstack/wolfrun/services.json".into() }

@@ -429,6 +429,151 @@ impl StatusPageState {
         drop(config);
         self.config.read().unwrap().save().ok();
     }
+
+    // ─── AI Agent Integration ───
+    //
+    // The AI health-check agent uses these helpers to open/resolve
+    // incidents automatically. Incidents it creates are tagged with
+    // auto_created=true AND a "[AI] ..." title prefix so we can match
+    // only our own when the next health check comes back. Hand-created
+    // incidents (auto_created=true set by other means) are left alone.
+
+    /// True if this cluster has at least one enabled status page — the
+    /// condition for publishing AI incidents. Without a page the AI has
+    /// no public voice, so we skip silently rather than bloat
+    /// statuspage.json with records nobody can see.
+    fn cluster_has_enabled_page(&self, cluster: &str) -> bool {
+        let config = self.config.read().unwrap();
+        config.pages.iter().any(|p| p.cluster == cluster && p.enabled)
+    }
+
+    /// Open a new AI incident or append an update to an existing open one.
+    /// Returns the incident id on success, or None if the cluster has no
+    /// enabled status page (nothing to publish to).
+    pub fn open_or_update_ai_incident(
+        &self,
+        cluster: &str,
+        hostname: &str,
+        severity: &str,
+        message: &str,
+    ) -> Option<String> {
+        if !self.cluster_has_enabled_page(cluster) { return None; }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut config = self.config.write().unwrap();
+
+        let tag = format!("[{}]", hostname);
+        let existing_idx = config.incidents.iter().position(|i| i.auto_created
+            && i.cluster == cluster
+            && i.status != IncidentStatus::Resolved
+            && i.title.starts_with("[AI] ")
+            && i.title.contains(&tag));
+
+        // Map AI severity → incident impact for the public status page.
+        let impact = match severity {
+            "critical" => Some("major".to_string()),
+            "warning" => Some("minor".to_string()),
+            _ => Some("none".to_string()),
+        };
+
+        if let Some(idx) = existing_idx {
+            let inc = &mut config.incidents[idx];
+            inc.updates.push(IncidentUpdate {
+                timestamp: now,
+                status: inc.status.clone(),
+                message: message.to_string(),
+            });
+            if inc.impact != impact { inc.impact = impact; }
+            let id = inc.id.clone();
+            drop(config);
+            let _ = self.config.read().unwrap().save();
+            return Some(id);
+        }
+
+        let id = format!("ai-{}", &uuid::Uuid::new_v4().to_string()[..16]);
+        let title = format!("[AI] {} alert on {}", severity.to_uppercase(), hostname);
+        let incident = Incident {
+            id: id.clone(),
+            title,
+            status: IncidentStatus::Investigating,
+            cluster: cluster.to_string(),
+            impact,
+            service_ids: Vec::new(),
+            updates: vec![IncidentUpdate {
+                timestamp: now.clone(),
+                status: IncidentStatus::Investigating,
+                message: message.to_string(),
+            }],
+            created_at: now,
+            resolved_at: None,
+            auto_created: true,
+        };
+        config.incidents.push(incident);
+        // Attach the new incident to every enabled page for this cluster
+        // so it renders on the public status page instead of sitting in
+        // the global pool, orphaned.
+        for page in config.pages.iter_mut() {
+            if page.cluster == cluster && page.enabled && !page.incident_ids.contains(&id) {
+                page.incident_ids.push(id.clone());
+            }
+        }
+        drop(config);
+        let _ = self.config.read().unwrap().save();
+        Some(id)
+    }
+
+    /// Resolve any open AI-created incidents for this host. Returns count.
+    pub fn resolve_ai_incidents_for_host(&self, cluster: &str, hostname: &str) -> usize {
+        if !self.cluster_has_enabled_page(cluster) { return 0; }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let tag = format!("[{}]", hostname);
+        let mut resolved = 0;
+        {
+            let mut config = self.config.write().unwrap();
+            for inc in config.incidents.iter_mut() {
+                if inc.auto_created
+                    && inc.cluster == cluster
+                    && inc.status != IncidentStatus::Resolved
+                    && inc.title.starts_with("[AI] ")
+                    && inc.title.contains(&tag)
+                {
+                    inc.status = IncidentStatus::Resolved;
+                    inc.resolved_at = Some(now.clone());
+                    inc.updates.push(IncidentUpdate {
+                        timestamp: now.clone(),
+                        status: IncidentStatus::Resolved,
+                        message: "AI health check returned ALL_OK — auto-resolved.".to_string(),
+                    });
+                    resolved += 1;
+                }
+            }
+        }
+        if resolved > 0 {
+            let _ = self.config.read().unwrap().save();
+        }
+        resolved
+    }
+
+    /// Short prompt-friendly summary of open AI incidents in this cluster.
+    /// The agent sees this so it doesn't re-alert on issues already flagged.
+    pub fn open_ai_incidents_summary(&self, cluster: &str) -> String {
+        let config = self.config.read().unwrap();
+        let open: Vec<&Incident> = config.incidents.iter()
+            .filter(|i| i.auto_created
+                && i.cluster == cluster
+                && i.status != IncidentStatus::Resolved
+                && i.title.starts_with("[AI] "))
+            .collect();
+        if open.is_empty() { return String::new(); }
+        let mut out = String::from("\nCurrently open AI incidents (do NOT re-open — append only):\n");
+        for inc in open {
+            let latest = inc.updates.last().map(|u| u.message.as_str()).unwrap_or("");
+            let first_line = latest.lines().next().unwrap_or("").chars().take(120).collect::<String>();
+            out.push_str(&format!("  - {} ({}): {}\n", inc.title, inc.id, first_line));
+        }
+        out
+    }
 }
 
 // ═══════════════════════════════════════════════

@@ -17,6 +17,20 @@ use tracing::warn;
 use std::process::Command as StdCommand;
 use std::time::Duration;
 
+pub mod baseline;
+
+/// Outcome of a single health check. Callers use this to drive
+/// status-page incident open/close: Alert opens (or appends), Ok
+/// resolves, Error leaves existing incidents alone (a transient
+/// LLM API failure must not auto-resolve a real incident).
+#[derive(Debug, Clone)]
+pub enum HealthOutcome {
+    Ok,
+    Alert { severity: String, message: String },
+    NotConfigured,
+    Error,
+}
+
 fn ai_config_path() -> String { crate::paths::get().ai_config }
 
 // ─── Configuration ───
@@ -191,6 +205,10 @@ pub struct AiAgent {
     pub alerts: Mutex<Vec<AiAlert>>,
     pub pending_actions: Mutex<Vec<AiAction>>,
     pub last_health_check: Mutex<Option<String>>,
+    /// Hosts currently in "alerting" state from this agent's view.
+    /// Lets us fire a "cleared" notification on the ALL_OK transition
+    /// even when no status page exists to track incidents.
+    pub alerting_hosts: Mutex<std::collections::HashSet<String>>,
     pub knowledge_base: String,
     client: reqwest::Client,
 }
@@ -207,6 +225,7 @@ impl AiAgent {
             alerts: Mutex::new(Vec::new()),
             pending_actions: Mutex::new(Vec::new()),
             last_health_check: Mutex::new(None),
+            alerting_hosts: Mutex::new(std::collections::HashSet::new()),
             knowledge_base,
             client: reqwest::Client::new(),
         }
@@ -733,10 +752,28 @@ impl AiAgent {
         }
     }
 
-    /// Run a health check — analyze system metrics and return findings  
-    pub async fn health_check(&self, metrics_summary: &str) -> Option<String> {
+    /// Run a health check — analyze system metrics and return findings.
+    /// `sample` is recorded into the rolling 7-day baseline; the delta
+    /// summary (now vs 24h/7d ago) is appended to the LLM prompt so it
+    /// can flag slow drift the static thresholds miss.
+    /// `open_incidents_summary` lists status-page incidents the AI has
+    /// previously opened (still unresolved) so it can append context
+    /// rather than re-raising the same alarm.
+    pub async fn health_check(&self, sample: baseline::Sample, metrics_summary: &str, open_incidents_summary: &str) -> HealthOutcome {
         let config = self.config.lock().unwrap().clone();
-        if !config.is_configured() { return None; }
+        if !config.is_configured() { return HealthOutcome::NotConfigured; }
+
+        // Update rolling baseline first (off-executor — does blocking
+        // JSON read/write). Fail soft: a baseline write error must not
+        // stop the health check itself.
+        let baseline_summary = tokio::task::spawn_blocking(move || {
+            let mut bl = baseline::Baseline::load();
+            bl.push(sample);
+            if let Err(e) = bl.save() {
+                warn!("Failed to persist AI baseline: {}", e);
+            }
+            bl.deltas_summary()
+        }).await.unwrap_or_default();
 
         // Pull in live security findings so the AI sees active attacks
         // (SSH brute-force, crypto miners, exposed services) alongside
@@ -776,8 +813,14 @@ impl AiAgent {
              IMPORTANT: If you identify a fixable issue, propose the fix using ACTION tags:\n\
              [ACTION id=\"unique-id\" title=\"Short Title\" risk=\"low|medium|high\" explain=\"Why this fixes it\" target=\"local\"]command[/ACTION]\n\
              The admin will see these actions in the WolfStack dashboard AND in the alert email, and can approve them with one click.\n\n\
-             Current server metrics:\n{}{}",
-            metrics_summary, security_summary
+             The rolling baseline below shows how current metrics compare to 24h and 7d ago. Use it to flag drift that \
+             static thresholds miss — e.g. disk usage creeping up 1 GB/day, CPU trending higher over the week, container \
+             count unexpectedly growing. A stable trend at a high absolute value is different from a rising trend.\n\
+             Open AI incidents from previous health checks are listed below. If a current issue matches an open incident, \
+             just acknowledge it — do NOT restate the full alert. The status page will auto-resolve incidents when you \
+             return ALL_OK, so only report net-new problems.\n\n\
+             Current server metrics:\n{}{}{}{}",
+            metrics_summary, baseline_summary, security_summary, open_incidents_summary
         );
 
         let system = "You are a WolfStack server health monitoring agent. Be concise and technical. Only flag genuine issues. Propose fixes with [ACTION] tags when possible.";
@@ -838,6 +881,10 @@ impl AiAgent {
                         if alerts.len() > 200 { let drain = alerts.len() - 200; alerts.drain(..drain); }
                     }
 
+                    // Record that this host is in the alerting state so
+                    // the next ALL_OK can send a "cleared" notification.
+                    self.alerting_hosts.lock().unwrap().insert(hostname.clone());
+
                     // Send email if configured — include proposed actions
                     if config.email_enabled && !config.email_to.is_empty() {
                         let subject = format!("[WolfStack {}] {} Alert on {}", severity.to_uppercase(), severity.to_uppercase(), hostname);
@@ -880,16 +927,52 @@ impl AiAgent {
                         });
                     }
 
-                    Some(clean_response)
+                    HealthOutcome::Alert { severity: severity.to_string(), message: clean_response }
                 } else {
-
-                    None
+                    HealthOutcome::Ok
                 }
             }
             Err(e) => {
                 warn!("AI health check failed: {}", e);
-                None
+                HealthOutcome::Error
             }
+        }
+    }
+
+    /// Send a "resolved" notification when a previously-alerting host
+    /// comes back healthy. No-op unless this host was actually in the
+    /// alerting set — avoids firing a "cleared" email on every ALL_OK
+    /// from a host that was never in alarm. Called on every Ok outcome
+    /// from the health-check loop; the method self-gates.
+    pub async fn notify_resolved(&self, hostname: &str) {
+        // Transition gate: only notify if we were tracking this host as
+        // alerting. Remove from the set in the same step so repeated
+        // ALL_OKs don't re-send.
+        let was_alerting = self.alerting_hosts.lock().unwrap().remove(hostname);
+        if !was_alerting { return; }
+
+        let config = self.config.lock().unwrap().clone();
+        if !config.is_configured() { return; }
+
+        let subject = format!("[WolfStack OK] Health alert cleared on {}", hostname);
+        let body = format!(
+            "The AI health check for {} returned ALL_OK — the previous alert has been resolved.\n\
+             Any auto-created status-page incidents for this host have been marked resolved.",
+            hostname
+        );
+
+        if config.email_enabled && !config.email_to.is_empty() {
+            if let Err(e) = send_alert_email(&config, &subject, &body) {
+                warn!("Failed to send resolved email: {}", e);
+            }
+        }
+
+        let alert_config = crate::alerting::AlertConfig::load();
+        if alert_config.enabled && alert_config.has_channels() {
+            let title = format!("[WolfStack AI OK] Health alert cleared on {}", hostname);
+            tokio::spawn(async move {
+                crate::alerting::send_alert(&alert_config, &title, &body).await;
+            });
         }
     }
 
@@ -975,6 +1058,8 @@ const ALLOWED_COMMANDS: &[&str] = &[
     "ip addr", "ip route", "ip link", "ip neigh", "ss", "netstat",
     "ping -c", "dig", "nslookup", "host ", "traceroute", "tracepath",
     "curl -s", "curl --silent", "wget -qO-",
+    // Bounded packet capture — validated below (requires -c N, forbids -w/-W/-z/-G)
+    "tcpdump",
     // Containers
     "docker ps", "docker stats --no-stream", "docker inspect", "docker logs",
     "docker images", "docker info", "docker version", "docker network",
@@ -1050,6 +1135,22 @@ pub fn execute_safe_command(cmd: &str) -> Result<String, String> {
                 return Err(format!("Command '{}' is blocked (read-only mode — no destructive operations)", blocked.trim()));
             }
         }
+        // tcpdump needs extra validation beyond prefix matching: prefix
+        // alone would let `tcpdump -w /etc/shadow` through. Require a
+        // bounded packet count (-c N) and forbid any flag that writes
+        // to disk or runs a post-rotate command.
+        if seg.starts_with("tcpdump") {
+            let tokens: Vec<&str> = seg.split_whitespace().collect();
+            let has_count = tokens.windows(2).any(|w| w[0] == "-c" && w[1].parse::<u32>().is_ok());
+            if !has_count {
+                return Err("tcpdump requires -c N to bound packet count".to_string());
+            }
+            for bad in &["-w", "-W", "-z", "-G", "--print-file", "--postrotate-command"] {
+                if tokens.iter().any(|t| t == bad) {
+                    return Err(format!("tcpdump flag '{}' is not allowed (read-only mode)", bad));
+                }
+            }
+        }
         // Allowlist check on EVERY segment.
         let allowed = ALLOWED_COMMANDS.iter().any(|prefix| seg.starts_with(prefix));
         if !allowed {
@@ -1060,10 +1161,19 @@ pub fn execute_safe_command(cmd: &str) -> Result<String, String> {
         }
     }
 
+    // tcpdump with -c N still blocks until N packets arrive; on a quiet
+    // link that's forever. Wrap in `timeout 30` so the request can't
+    // hang the caller.
+    let wrapped = if segments.iter().any(|s| s.trim().starts_with("tcpdump")) {
+        format!("timeout 30 {}", cmd)
+    } else {
+        cmd.to_string()
+    };
+
     // Execute with timeout
     let output = StdCommand::new("bash")
         .arg("-c")
-        .arg(cmd)
+        .arg(&wrapped)
         .output();
 
     match output {
@@ -1427,6 +1537,7 @@ fn build_system_prompt(knowledge: &str, server_context: &str) -> String {
          - When the user asks about a SPECIFIC REMOTE node (e.g. 'what is using CPU on pbs?'), you MUST use [EXEC_ALL] and then look at the results for that specific hostname in the output\n\
          - Do NOT use [EXEC] when the user asks about a remote node — [EXEC] cannot reach remote nodes\n\
          - Only read-only commands are allowed (ls, cat, lscpu, df, ps, docker ps, systemctl status, etc.)\n\
+         - Bounded packet capture is available: `tcpdump -c N -i IFACE [filter]` (requires -c N; -w/-W/-z/-G are blocked; wrapped in a 30-second timeout). Use it for network diagnosis, e.g. `tcpdump -c 50 -i any port 53` to inspect DNS traffic.\n\
          - Destructive commands (rm, kill, reboot, etc.) are blocked and will fail\n\
          - You MUST use these tags when the user asks a question that requires live data\n\
          - Do NOT just tell the user how to run a command — run it yourself and present the results\n\
