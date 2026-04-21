@@ -3805,40 +3805,20 @@ pub async fn control_panel_inventory(req: HttpRequest, state: web::Data<AppState
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    // Cluster filtering rules:
+    // Aggregate every reachable node this WolfStack knows about —
+    // across every `cluster_name` label in the dashboard. All nodes
+    // in `state.cluster` are peers that share the cluster_secret, so
+    // authentication to any of them works with our local secret.
+    // The only filter is reachability (either self or recently
+    // heartbeat-ed online within 5 minutes).
     //
-    // * WolfStack nodes (node_type == "wolfstack" or empty): only
-    //   aggregate members of OUR own cluster. Other WolfStack clusters
-    //   are reached by the frontend via proxy; without this filter, a
-    //   cross-cluster proxy call would re-aggregate everything and
-    //   duplicate items.
-    //
-    // * Proxmox nodes (node_type == "proxmox"): the local WolfStack
-    //   holds the PVE token and queries them directly — they aren't
-    //   reachable as a WolfStack proxy gateway (they don't run the
-    //   WolfStack API). So aggregate ALL registered PVE nodes
-    //   regardless of their pve_cluster_name.
-    let self_cluster: String = state.cluster.get_all_nodes()
-        .iter()
-        .find(|n| n.is_self)
-        .and_then(|n| n.cluster_name.clone())
-        .unwrap_or_else(|| "WolfStack".to_string());
-
+    // No cluster-name filter: the `cluster_name` field is a user
+    // label for sidebar grouping, not a security boundary. Filtering
+    // by it was dropping peer nodes that happened to live under a
+    // different display label.
     let nodes: Vec<_> = state.cluster.get_all_nodes()
         .into_iter()
-        .filter(|n| {
-            let reachable = n.is_self || (n.online && now.saturating_sub(n.last_seen) < 300);
-            if !reachable { return false; }
-            if n.node_type == "proxmox" {
-                // Always include PVE nodes — only THIS WolfStack can
-                // talk to them.
-                return true;
-            }
-            // WolfStack (or untyped legacy) nodes: own cluster only.
-            let node_cluster = n.cluster_name.clone()
-                .unwrap_or_else(|| "WolfStack".to_string());
-            node_cluster == self_cluster
-        })
+        .filter(|n| n.is_self || (n.online && now.saturating_sub(n.last_seen) < 300))
         .collect();
     let secret = state.cluster_secret.clone();
     let client = reqwest::Client::builder()
@@ -12341,10 +12321,24 @@ pub async fn appstore_list(
     let q = query.get("q").map(|s| s.as_str());
     let cat = query.get("category").map(|s| s.as_str());
     let apps = appstore::list_apps(q, cat);
-    HttpResponse::Ok().json(serde_json::json!({ "apps": apps }))
+    // Annotate each app with `compose_available` so the install modal
+    // can show the Docker Compose option without a second lookup.
+    let annotated: Vec<serde_json::Value> = apps.iter().map(|app| {
+        let mut obj = match serde_json::to_value(app) {
+            Ok(serde_json::Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        obj.insert("compose_available".to_string(),
+                   serde_json::Value::Bool(appstore::has_compose_template(&app.id)));
+        serde_json::Value::Object(obj)
+    }).collect();
+    HttpResponse::Ok().json(serde_json::json!({ "apps": annotated }))
 }
 
-/// GET /api/appstore/apps/{id} — get app details
+/// GET /api/appstore/apps/{id} — get app details. The response body
+/// is the manifest plus a computed `compose_available` flag so the
+/// install wizard can show or hide the Docker Compose option without
+/// a second round-trip.
 pub async fn appstore_get(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -12353,7 +12347,15 @@ pub async fn appstore_get(
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let id = path.into_inner();
     match appstore::get_app(&id) {
-        Some(app) => HttpResponse::Ok().json(app),
+        Some(app) => {
+            let compose_available = appstore::has_compose_template(&app.id);
+            let mut obj = match serde_json::to_value(&app) {
+                Ok(serde_json::Value::Object(m)) => m,
+                _ => return HttpResponse::InternalServerError().json(serde_json::json!({ "error": "manifest serialisation" })),
+            };
+            obj.insert("compose_available".to_string(), serde_json::Value::Bool(compose_available));
+            HttpResponse::Ok().json(serde_json::Value::Object(obj))
+        }
         None => HttpResponse::NotFound().json(serde_json::json!({ "error": format!("App '{}' not found", id) })),
     }
 }
@@ -12376,6 +12378,12 @@ pub struct AppInstallRequest {
     pub memory_limit: Option<String>,                // e.g. "512m", "2g"
     #[serde(default)]
     pub cpu_limit: Option<String>,                   // e.g. "0.5", "2"
+    /// Deployment mode for Docker target. "docker-run" (default,
+    /// existing behaviour) or "docker-compose" (opt-in, requires the
+    /// manifest to ship a compose template). Missing from older
+    /// clients ⇒ docker-run, so nothing breaks.
+    #[serde(default)]
+    pub deployment_type: Option<String>,
 }
 
 /// POST /api/appstore/apps/{id}/install — install an app
@@ -12401,9 +12409,57 @@ pub async fn appstore_install(
     inputs.insert("CONTAINER_NAME".to_string(), body.container_name.clone());
 
     let custom_ports = body.ports.clone();
-    match appstore::install_app(&id, &body.target, &body.container_name, &inputs, custom_ports.as_deref()) {
+    match appstore::install_app(
+        &id,
+        &body.target,
+        &body.container_name,
+        &inputs,
+        custom_ports.as_deref(),
+        body.deployment_type.as_deref(),
+    ) {
         Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// GET /api/appstore/installed/{install_id}/compose.yaml — read the
+/// rendered compose file for a compose-backed install. Returns
+/// text/yaml so the frontend can drop the body straight into an editor.
+pub async fn appstore_compose_get(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let install_id = path.into_inner();
+    match appstore::read_compose_file(&install_id) {
+        Ok(yaml) => HttpResponse::Ok()
+            .content_type("text/yaml; charset=utf-8")
+            .body(yaml),
+        Err(e) => HttpResponse::NotFound().json(serde_json::json!({ "error": e })),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct AppComposeWriteRequest {
+    pub content: String,
+}
+
+/// PUT /api/appstore/installed/{install_id}/compose.yaml — overwrite
+/// the compose file and run `docker compose up -d` to apply the new
+/// definition. The stack's containers are recreated by compose as
+/// needed.
+pub async fn appstore_compose_put(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<AppComposeWriteRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let install_id = path.into_inner();
+    match appstore::write_compose_file(&install_id, &body.content) {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
     }
 }
 
@@ -19584,6 +19640,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/system/prepare-install-package", web::post().to(prepare_install_package))
         .route("/api/appstore/installed", web::get().to(appstore_installed))
         .route("/api/appstore/installed/{id}", web::delete().to(appstore_uninstall))
+        .route("/api/appstore/installed/{id}/compose.yaml", web::get().to(appstore_compose_get))
+        .route("/api/appstore/installed/{id}/compose.yaml", web::put().to(appstore_compose_put))
         // System
         .route("/api/config/export", web::get().to(config_export))
         .route("/api/config/import", web::post().to(config_import))

@@ -3520,9 +3520,14 @@ function renderVms(vms) {
             if (node && !node.is_self) vncHost = node.address;
         }
 
+        // Browser-console link works for any VM the backend can
+        // bridge — native QEMU (vnc_ws_port) and libvirt (vnc_port
+        // via the raw-TCP bridge). If neither is set there's nothing
+        // to connect to. The port displayed is the VNC port itself.
+        const vncBridgePort = vm.vnc_ws_port || vm.vnc_port;
         const vncText = (vm.running && vm.vnc_port)
-            ? (vm.vnc_ws_port
-                ? `<a href="/vnc.html?name=${encodeURIComponent(vm.name)}&port=${vm.vnc_ws_port}&host=${encodeURIComponent(vncHost)}" target="_blank" 
+            ? (vncBridgePort
+                ? `<a href="/vnc.html?name=${encodeURIComponent(vm.name)}&port=${vncBridgePort}&host=${encodeURIComponent(vncHost)}" target="_blank"
                     class="badge" style="cursor:pointer; text-decoration:none; background:rgba(234,179,8,0.15); color:#eab308;" title="Open console in browser">🖥️ :${vm.vnc_port}</a>`
                 : `<span class="badge" style="background:rgba(234,179,8,0.15); color:#eab308;" title="Connect with VNC client to port ${vm.vnc_port}">:${vm.vnc_port}</span>`)
             : '—';
@@ -3554,7 +3559,7 @@ function renderVms(vms) {
                     ${vm.running ?
                 `${vm.vmid
                     ? `<button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="openPveVmConsole('${vm.vmid}', '${vm.name}')" title="VNC Console">🖥️</button>`
-                    : (vm.vnc_ws_port ? `<button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="openVmVnc('${vm.name}', ${vm.vnc_ws_port})" title="VNC Console">🖥️</button>` : '')}
+                    : ((vm.vnc_ws_port || vm.vnc_port) ? `<button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="openVmVnc('${vm.name}', ${vm.vnc_ws_port || vm.vnc_port})" title="VNC Console">🖥️</button>` : '')}
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="openVmConsole('${vm.name}')" title="Serial terminal (guest must have serial console enabled)">💻</button>
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#ef4444;" onclick="vmAction('${vm.name}', 'stop', this)" title="Stop (graceful ACPI shutdown)">⏹️</button>
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#b91c1c;" onclick="if (confirm('Force-stop ${vm.name}? The guest will not shut down cleanly — unsaved data may be lost.')) vmAction('${vm.name}', 'force-stop', this)" title="Force Stop (power off immediately)">⛔</button>` :
@@ -12204,7 +12209,10 @@ function renderVmCards(vms) {
             const node = allNodes.find(n => n.id === currentNodeId);
             if (node && !node.is_self) vncHost = node.address;
         }
-        const vncLink = (vm.running && vm.vnc_ws_port) ? `/vnc.html?name=${encodeURIComponent(vm.name)}&port=${vm.vnc_ws_port}&host=${encodeURIComponent(vncHost)}` : '';
+        // Bridge works with either port — native QEMU's ws port or
+        // libvirt's raw-TCP vnc port (bridged server-side).
+        const vncBridgePort2 = vm.vnc_ws_port || vm.vnc_port;
+        const vncLink = (vm.running && vncBridgePort2) ? `/vnc.html?name=${encodeURIComponent(vm.name)}&port=${vncBridgePort2}&host=${encodeURIComponent(vncHost)}` : '';
 
         return `<div style="background:var(--bg-card);border:1px solid var(--border);border-left:4px solid ${borderColor};border-radius:10px;overflow:hidden;">
             <div style="display:flex;flex-wrap:wrap;padding:6px 8px;background:var(--bg-secondary);border-bottom:1px solid var(--border);gap:1px;">
@@ -21448,6 +21456,56 @@ function mysqlConfirmDestructive(message, detail) {
     });
 }
 
+// Generic "type YES to confirm" modal for destructive operations
+// outside the MySQL editor (app-store compose uninstalls, future
+// Control Panel bulk wipes, etc.). Returns a Promise<boolean>.
+// Defaults to "YES" as the required word but any case-insensitive
+// string works.
+function confirmTypedYes(options) {
+    const opts = options || {};
+    const title = opts.title || 'Confirm Destructive Operation';
+    const message = opts.message || 'This action cannot be undone.';
+    const detail = opts.detail || '';
+    const requiredWord = (opts.requiredWord || 'YES').toString();
+    const confirmLabel = opts.confirmLabel || 'Confirm';
+    const cancelLabel = opts.cancelLabel || 'Cancel';
+    return new Promise((resolve) => {
+        const modal = document.createElement('div');
+        modal.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.6); display:flex; align-items:center; justify-content:center; z-index:10001;';
+        modal.innerHTML = `<div style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:12px; padding:24px; width:460px; max-width:92vw;">
+            <div style="display:flex; align-items:center; gap:10px; margin-bottom:16px;">
+                <span style="font-size:28px;">⚠️</span>
+                <h3 style="margin:0; font-size:16px; color:#e74c3c;">${escapeHtml(title)}</h3>
+            </div>
+            <p style="color:var(--text-primary); font-size:13px; margin:0 0 8px; line-height:1.5;">${message}</p>
+            ${detail ? `<div style="background:var(--bg-primary); border:1px solid var(--border); border-radius:6px; padding:10px 12px; margin:12px 0; font-family:var(--font-mono); font-size:12px; color:#e67e22; word-break:break-word; max-height:110px; overflow-y:auto;">${escapeHtml(detail)}</div>` : ''}
+            <p style="color:var(--text-muted); font-size:12px; margin:12px 0 8px;">Type <strong style="color:#e74c3c;">${escapeHtml(requiredWord)}</strong> to confirm:</p>
+            <input id="cty-input" style="width:100%; padding:10px; background:var(--bg-primary); border:2px solid var(--border); border-radius:6px; color:var(--text-primary); font-size:14px; font-weight:600; text-align:center; box-sizing:border-box; letter-spacing:2px;" placeholder="${escapeHtml(requiredWord)}" autocomplete="off">
+            <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:16px;">
+                <button id="cty-cancel" style="background:var(--bg-tertiary); border:1px solid var(--border); color:var(--text-primary); padding:8px 20px; border-radius:6px; cursor:pointer; font-size:13px;">${escapeHtml(cancelLabel)}</button>
+                <button id="cty-ok" style="background:#e74c3c; color:#fff; border:none; padding:8px 20px; border-radius:6px; cursor:pointer; font-size:13px; font-weight:500; opacity:0.4;" disabled>${escapeHtml(confirmLabel)}</button>
+            </div>
+        </div>`;
+        document.body.appendChild(modal);
+
+        const input = modal.querySelector('#cty-input');
+        const okBtn = modal.querySelector('#cty-ok');
+        const match = () => input.value.trim().toUpperCase() === requiredWord.toUpperCase();
+        input.focus();
+        input.addEventListener('input', () => {
+            const m = match();
+            okBtn.disabled = !m;
+            okBtn.style.opacity = m ? '1' : '0.4';
+        });
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && match()) { modal.remove(); resolve(true); }
+            if (e.key === 'Escape') { modal.remove(); resolve(false); }
+        });
+        okBtn.addEventListener('click', () => { modal.remove(); resolve(true); });
+        modal.querySelector('#cty-cancel').addEventListener('click', () => { modal.remove(); resolve(false); });
+    });
+}
+
 // Check if a SQL query is destructive
 function isMysqlDestructiveQuery(sql) {
     const upper = sql.trim().toUpperCase();
@@ -23173,8 +23231,9 @@ async function loadFleetContainers() {
         if (vm.running) {
             h += '<button class="btn btn-sm" style="' + DS + '" disabled title="Start">▶️</button>';
             h += '<button class="btn btn-sm" style="' + BS + 'color:#ef4444;" onclick="fleetAction(\'' + nid + '\',\'vm\',\'' + eName + '\',\'stop\',this)" title="Stop">⏹️</button>';
-            if (vm.vnc_ws_port) {
-                h += '<button class="btn btn-sm" style="' + BS + '" onclick="fleetOpenVnc(\'' + nid + '\',\'' + eName + '\',' + vm.vnc_ws_port + ')" title="VNC Console">🖥️</button>';
+            var fleetVncPort = vm.vnc_ws_port || vm.vnc_port;
+            if (fleetVncPort) {
+                h += '<button class="btn btn-sm" style="' + BS + '" onclick="fleetOpenVnc(\'' + nid + '\',\'' + eName + '\',' + fleetVncPort + ')" title="VNC Console">🖥️</button>';
             }
         } else {
             h += '<button class="btn btn-sm" style="' + BS + 'color:#22c55e;" onclick="fleetAction(\'' + nid + '\',\'vm\',\'' + eName + '\',\'start\',this)" title="Start">▶️</button>';
@@ -23524,6 +23583,12 @@ function openAppStoreInstallModal(appId) {
     // Populate port mappings from Docker manifest
     populateAppStorePorts(app);
 
+    // Deployment-mode selector (docker run vs docker compose).
+    // Only shown when (a) target is Docker and (b) the backend advertised
+    // a compose template for this app. Everything else keeps the classic
+    // single-container docker-run behaviour untouched.
+    renderAppStoreDeploymentMode(app);
+
     // Build user input fields
     const inputsEl = document.getElementById('appstore-install-inputs');
     if (app.user_inputs && app.user_inputs.length > 0) {
@@ -23649,6 +23714,10 @@ function selectInstallTarget(target) {
     // Show/hide advanced settings (only for Docker)
     const advSettings = document.getElementById('appstore-advanced-settings');
     if (advSettings) advSettings.style.display = target === 'docker' ? '' : 'none';
+    // Compose option only makes sense for Docker — re-render when the
+    // target flips.
+    const currentApp = appStoreApps.find(a => a.id === appStoreInstallAppId);
+    renderAppStoreDeploymentMode(currentApp);
 }
 
 function populateAppStorePorts(app) {
@@ -23764,6 +23833,48 @@ function closeAppStoreInstallModal() {
     const modal = document.getElementById('appstore-install-modal');
     modal.classList.remove('active');
     setTimeout(() => modal.style.display = 'none', 200);
+}
+
+// Current deployment-mode choice inside the install modal. Reset
+// every time the modal opens. "docker-run" matches the existing
+// behaviour bit-for-bit; "docker-compose" is the opt-in path.
+let appStoreDeploymentMode = 'docker-run';
+
+// Render (or hide) the deployment-mode radio group. Called on modal
+// open and whenever the target changes — compose only makes sense
+// when the user picked the Docker target AND the app has a compose
+// template in the backend.
+function renderAppStoreDeploymentMode(app) {
+    // Reset to the safe default every time so users don't carry a
+    // previous "compose" choice into an app that doesn't support it.
+    appStoreDeploymentMode = 'docker-run';
+    const host = document.getElementById('appstore-install-deployment');
+    if (!host) return;   // modal HTML hasn't been rebuilt yet — no-op
+    const show = (appStoreInstallTarget === 'docker') && !!(app && app.compose_available);
+    if (!show) {
+        host.style.display = 'none';
+        host.innerHTML = '';
+        return;
+    }
+    host.style.display = '';
+    host.innerHTML = `
+        <label style="font-size:13px; font-weight:500; display:block; margin-bottom:6px; color:var(--text-secondary);">Deploy with</label>
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <label style="flex:1; min-width:180px; display:flex; gap:8px; padding:10px 12px; border:1px solid var(--border); border-radius:8px; cursor:pointer; background:var(--bg-input);">
+                <input type="radio" name="appstore-deploy-mode" value="docker-run" checked onchange="appStoreDeploymentMode='docker-run'">
+                <span>
+                    <div style="font-weight:600; font-size:13px;">Standard (docker run)</div>
+                    <div style="font-size:11px; color:var(--text-muted);">Single container, the classic path. Default.</div>
+                </span>
+            </label>
+            <label style="flex:1; min-width:180px; display:flex; gap:8px; padding:10px 12px; border:1px solid var(--border); border-radius:8px; cursor:pointer; background:var(--bg-input);">
+                <input type="radio" name="appstore-deploy-mode" value="docker-compose" onchange="appStoreDeploymentMode='docker-compose'">
+                <span>
+                    <div style="font-weight:600; font-size:13px;">Docker Compose <span style="font-size:10px;background:rgba(59,130,246,0.18);color:#60a5fa;padding:1px 6px;border-radius:8px;margin-left:4px;">Beta</span></div>
+                    <div style="font-size:11px; color:var(--text-muted);">Multi-service stack; edit the YAML later from the installed list.</div>
+                </span>
+            </label>
+        </div>`;
 }
 
 async function executeAppStoreInstall() {
@@ -23909,6 +24020,43 @@ async function executeAppStoreInstall() {
         return;
     }
 
+    // Handle Docker-Compose installs separately. Compose is
+    // non-interactive (just `up -d`) so we skip the install-script
+    // terminal flow and call the direct /install endpoint.
+    if (appStoreInstallTarget === 'docker' && appStoreDeploymentMode === 'docker-compose') {
+        closeAppStoreInstallModal();
+        try {
+            const installUrl = (!selectedNode || selectedNode.is_self)
+                ? `/api/appstore/apps/${appStoreInstallAppId}/install`
+                : `/api/nodes/${selectedNodeId}/proxy/appstore/apps/${appStoreInstallAppId}/install`;
+            const resp = await fetch(installUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    container_name: name,
+                    target: 'docker',
+                    deployment_type: 'docker-compose',
+                    inputs: userInputs,
+                    storage_path: storagePath,
+                    ports: customPorts.length > 0 ? customPorts : undefined,
+                    extra_env: extraEnv.length > 0 ? extraEnv : undefined,
+                    extra_volumes: extraVolumes.length > 0 ? extraVolumes : undefined,
+                    memory_limit: memoryLimit || undefined,
+                    cpu_limit: cpuLimit || undefined,
+                }),
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+            showToast(data.message || `${appName} deployed via Docker Compose`, 'success', 8000);
+            taskLog('App install (Compose): ' + appName);
+            if (typeof loadInstalledApps === 'function') loadInstalledApps();
+        } catch (e) {
+            showToast('Compose install failed: ' + e.message, 'error');
+            taskLog('App install (Compose): ' + appName, 'failed');
+        }
+        return;
+    }
+
     // Handle Kubernetes deploy separately
     if (appStoreInstallTarget === 'kubernetes') {
         const k8sClusterId = document.getElementById('appstore-k8s-cluster')?.value;
@@ -23989,15 +24137,52 @@ async function executeAppStoreInstall() {
 }
 
 // ─── Installed Apps ───
+//
+// Lists installs from every WolfStack node in the cluster — not just
+// this node — so Docker Compose view/edit/uninstall all work on apps
+// installed via the host picker in the install modal. Each install
+// gets annotated with the node_id it lives on so the row action
+// handlers can route via /api/nodes/{id}/proxy/... when the install
+// isn't local.
 async function loadInstalledApps() {
     const listEl = document.getElementById('appstore-installed-list');
     if (!listEl) return;
 
     try {
-        const res = await fetch('/api/appstore/installed');
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        const installed = data.installed || [];
+        // Local installs first.
+        const selfNode = (typeof allNodes !== 'undefined' ? allNodes : []).find(n => n.is_self);
+        const selfId = selfNode?.id || null;
+        const [localResp, ...remoteResps] = await Promise.all([
+            fetch('/api/appstore/installed'),
+            // Remote WolfStack nodes only — PVE nodes don't run the
+            // appstore endpoint. Offline nodes are skipped; a user
+            // refresh picks them up when they come back online.
+            ...((typeof allNodes !== 'undefined' ? allNodes : [])
+                .filter(n => !n.is_self && n.online && (!n.node_type || n.node_type === 'wolfstack'))
+                .map(async n => {
+                    try {
+                        const r = await fetch(`/api/nodes/${encodeURIComponent(n.id)}/proxy/appstore/installed`);
+                        if (!r.ok) return { node: n, items: [] };
+                        const j = await r.json();
+                        return { node: n, items: j.installed || [] };
+                    } catch (_) {
+                        return { node: n, items: [] };
+                    }
+                })),
+        ]);
+        if (!localResp.ok) throw new Error(`HTTP ${localResp.status}`);
+        const localJson = await localResp.json();
+        const installed = [];
+        for (const it of (localJson.installed || [])) {
+            installed.push({ ...it, __node_id: selfId, __node_hostname: selfNode?.hostname || '' });
+        }
+        for (const r of remoteResps) {
+            for (const it of r.items) {
+                installed.push({ ...it, __node_id: r.node.id, __node_hostname: r.node.hostname });
+            }
+        }
+        // Sort newest-first so the just-installed app is easy to find.
+        installed.sort((a, b) => (b.installed_at || '').localeCompare(a.installed_at || ''));
 
         if (installed.length === 0) {
             listEl.innerHTML = '<div style="padding:40px; text-align:center; color:var(--text-muted);">No apps installed yet. Browse the store and install your first app!</div>';
@@ -24007,15 +24192,43 @@ async function loadInstalledApps() {
         listEl.innerHTML = installed.map(app => {
             const icon = APP_ICONS[app.app_id] || '📦';
             const date = new Date(app.installed_at).toLocaleString();
+            // InstalledApp uses `install_id` and `app_name` in the
+            // backend JSON. Older code read `app.id` / `app.name` and
+            // quietly got `undefined` — keep a fallback so existing
+            // records still work even if anything in the pipeline
+            // renames the field.
+            const installId = app.install_id || app.id || '';
+            const displayName = app.app_name || app.name || app.app_id;
+            const isCompose = app.deployment_type === 'docker-compose';
+            const nodeId = app.__node_id || '';
+            const nodeHost = app.__node_hostname || '';
+            // Serialise nodeId/installId as safe JSON strings for the
+            // onclick attribute values so weird characters can't break
+            // out. These are always safe in practice (alphanumeric +
+            // dash + underscore) but the defensive encoding is cheap.
+            const jId = JSON.stringify(installId);
+            const jNm = JSON.stringify(displayName);
+            const jNode = JSON.stringify(nodeId);
+            const composeBadge = isCompose
+                ? `<span title="Deployed with Docker Compose" style="font-size:10px;font-weight:600;letter-spacing:0.4px;text-transform:uppercase;padding:2px 7px;border-radius:999px;background:rgba(59,130,246,0.18);color:#60a5fa;margin-left:6px;">🐙 compose</span>`
+                : '';
+            const composeButtons = isCompose
+                ? `<button class="btn btn-sm" onclick='appstoreViewCompose(${jId}, ${jNm}, ${jNode})' title="View compose file">📄 View</button>
+                   <button class="btn btn-sm" onclick='appstoreEditCompose(${jId}, ${jNm}, ${jNode})' title="Edit compose file">✏️ Edit</button>`
+                : '';
+            const nodeLabel = nodeHost ? ` · ${escapeHtml(nodeHost)}` : '';
             return `<div class="appstore-installed-card">
                 <div style="font-size:28px;">${icon}</div>
                 <div style="flex:1;">
-                    <div style="font-weight:600; font-size:14px;">${escapeHtml(app.name)}</div>
+                    <div style="font-weight:600; font-size:14px;">${escapeHtml(displayName)}${composeBadge}</div>
                     <div style="font-size:12px; color:var(--text-muted);">
-                        ${escapeHtml(app.app_id)} · ${escapeHtml(app.target)} · Installed ${date}
+                        ${escapeHtml(app.app_id)} · ${escapeHtml(app.target)}${nodeLabel} · Installed ${date}
                     </div>
                 </div>
-                <button class="btn btn-danger btn-sm" onclick="uninstallApp('${escapeHtml(app.id)}', '${escapeHtml(app.name)}')">🗑️ Uninstall</button>
+                <div style="display:flex;gap:6px;">
+                    ${composeButtons}
+                    <button class="btn btn-danger btn-sm" onclick='uninstallApp(${jId}, ${jNm}, ${isCompose}, ${jNode})'>🗑️ Uninstall</button>
+                </div>
             </div>`;
         }).join('');
     } catch (e) {
@@ -24023,10 +24236,25 @@ async function loadInstalledApps() {
     }
 }
 
-async function uninstallApp(installId, name) {
-    if (!(await showConfirm(`Uninstall ${name}? This will remove the container or service.`))) return;
+async function uninstallApp(installId, name, isCompose, nodeId) {
+    // Compose uninstalls run `docker compose down -v` which wipes
+    // named volumes — gate this behind the typed-YES modal so the
+    // user explicitly acknowledges the data loss. Standard docker-run
+    // uninstalls keep the existing single-click confirm.
+    if (isCompose) {
+        const ok = await confirmTypedYes({
+            title: `Uninstall ${name}?`,
+            message: 'This will tear down the Compose stack and <strong style="color:#e74c3c;">delete the named volumes</strong> it created. Bind-mounted host paths are not touched.',
+            detail: `docker compose down -v  (stack: appstore-${installId})`,
+            requiredWord: 'YES',
+            confirmLabel: 'Uninstall & delete volumes',
+        });
+        if (!ok) return;
+    } else {
+        if (!(await showConfirm(`Uninstall ${name}? This will remove the container or service.`))) return;
+    }
     try {
-        const res = await fetch(`/api/appstore/installed/${installId}`, { method: 'DELETE' });
+        const res = await fetch(appstoreInstalledUrl(installId, nodeId), { method: 'DELETE' });
         const data = await res.json();
         if (res.ok) {
             showToast(data.message || `${name} uninstalled`, 'success');
@@ -24039,6 +24267,101 @@ async function uninstallApp(installId, name) {
     } catch (e) {
         showToast('Uninstall failed: ' + e.message, 'error');
         taskLog('Uninstall app: ' + name, 'failed');
+    }
+}
+
+// Build the path to an installed-app endpoint, routing through the
+// cluster proxy when the install lives on a remote node. Local or
+// empty nodeId falls back to the direct path so older callers
+// without node awareness keep working.
+function appstoreInstalledUrl(installId, nodeId) {
+    const selfNode = (typeof allNodes !== 'undefined' ? allNodes : []).find(n => n.is_self);
+    const isRemote = nodeId && selfNode && nodeId !== selfNode.id;
+    if (isRemote) {
+        return `/api/nodes/${encodeURIComponent(nodeId)}/proxy/appstore/installed/${encodeURIComponent(installId)}`;
+    }
+    return `/api/appstore/installed/${encodeURIComponent(installId)}`;
+}
+
+// ─── Compose view / edit for app-store installs ───
+
+async function appstoreViewCompose(installId, name, nodeId) {
+    try {
+        const res = await fetch(appstoreComposeUrl(installId, nodeId));
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.error || `HTTP ${res.status}`);
+        }
+        const yaml = await res.text();
+        appstoreShowComposeModal(installId, name, yaml, /*readOnly=*/true, nodeId);
+    } catch (e) {
+        showToast('Failed to load compose file: ' + e.message, 'error');
+    }
+}
+
+async function appstoreEditCompose(installId, name, nodeId) {
+    try {
+        const res = await fetch(appstoreComposeUrl(installId, nodeId));
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.error || `HTTP ${res.status}`);
+        }
+        const yaml = await res.text();
+        appstoreShowComposeModal(installId, name, yaml, /*readOnly=*/false, nodeId);
+    } catch (e) {
+        showToast('Failed to load compose file: ' + e.message, 'error');
+    }
+}
+
+// Build the URL for the compose.yaml endpoint — direct when the
+// install is local, cluster-proxied when it's on a remote node.
+function appstoreComposeUrl(installId, nodeId) {
+    const selfNode = (typeof allNodes !== 'undefined' ? allNodes : []).find(n => n.is_self);
+    const isRemote = nodeId && selfNode && nodeId !== selfNode.id;
+    if (isRemote) {
+        return `/api/nodes/${encodeURIComponent(nodeId)}/proxy/appstore/installed/${encodeURIComponent(installId)}/compose.yaml`;
+    }
+    return `/api/appstore/installed/${encodeURIComponent(installId)}/compose.yaml`;
+}
+
+function appstoreShowComposeModal(installId, name, yaml, readOnly, nodeId) {
+    const modal = document.createElement('div');
+    modal.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.65); display:flex; align-items:center; justify-content:center; z-index:10001;';
+    modal.innerHTML = `<div style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:12px; padding:20px; width:780px; max-width:94vw; max-height:88vh; display:flex; flex-direction:column;">
+        <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;">
+            <span style="font-size:24px;">📄</span>
+            <h3 style="margin:0; font-size:15px;">${escapeHtml(readOnly ? 'View' : 'Edit')} compose — ${escapeHtml(name)}</h3>
+            <span style="font-size:10px;font-weight:600;letter-spacing:0.4px;text-transform:uppercase;padding:2px 7px;border-radius:999px;background:rgba(59,130,246,0.18);color:#60a5fa;">Beta</span>
+        </div>
+        <textarea id="appstore-compose-textarea" ${readOnly ? 'readonly' : ''}
+            style="flex:1; min-height:380px; width:100%; padding:12px; background:var(--bg-primary); border:1px solid var(--border); border-radius:8px; color:var(--text-primary); font-family:var(--font-mono, monospace); font-size:12px; line-height:1.5; resize:vertical; box-sizing:border-box; white-space:pre;"></textarea>
+        ${!readOnly ? `<p style="font-size:11px; color:var(--text-muted); margin:8px 0 0;">Save re-runs <code>docker compose up -d</code> — services with changed definitions are recreated. Named volumes are preserved.</p>` : ''}
+        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:14px;">
+            <button id="appstore-compose-cancel" class="btn">Close</button>
+            ${!readOnly ? `<button id="appstore-compose-save" class="btn btn-primary">Save &amp; apply</button>` : ''}
+        </div>
+    </div>`;
+    document.body.appendChild(modal);
+    const ta = modal.querySelector('#appstore-compose-textarea');
+    ta.value = yaml;
+    const close = () => modal.remove();
+    modal.querySelector('#appstore-compose-cancel').addEventListener('click', close);
+    if (!readOnly) {
+        modal.querySelector('#appstore-compose-save').addEventListener('click', async () => {
+            try {
+                const resp = await fetch(appstoreComposeUrl(installId, nodeId), {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ content: ta.value }),
+                });
+                const data = await resp.json().catch(() => ({}));
+                if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+                showToast(data.message || 'Compose file saved', 'success');
+                close();
+            } catch (e) {
+                showToast('Save failed: ' + e.message, 'error');
+            }
+        });
     }
 }
 
@@ -39204,85 +39527,35 @@ async function cpReload() {
     if (_cpLoading) return;
     _cpLoading = true;
     const status = document.getElementById('cp-status-line');
-    if (status) status.textContent = 'Loading inventory across clusters…';
+    if (status) status.textContent = 'Loading inventory across the datacenter…';
     try {
-        // Step 1 — local cluster aggregate (our own backend fans out
-        // across our WolfStack cluster's nodes + their PVE guests).
-        const [localInvResp, grpResp] = await Promise.all([
+        // The backend aggregator now fans out to every peer node this
+        // WolfStack knows about (across every cluster_name label in
+        // the sidebar) plus every registered Proxmox node. No
+        // frontend federation needed — one call returns the whole
+        // datacenter's inventory.
+        const [invResp, grpResp] = await Promise.all([
             fetch('/api/control-panel/inventory'),
             fetch('/api/control-panel/groups'),
         ]);
-        if (!localInvResp.ok) throw new Error('inventory HTTP ' + localInvResp.status);
+        if (!invResp.ok) throw new Error('inventory HTTP ' + invResp.status);
         if (!grpResp.ok) throw new Error('groups HTTP ' + grpResp.status);
-        const localInv = await localInvResp.json();
+        const inv = await invResp.json();
         const grp = await grpResp.json();
 
-        // Step 2 — identify every OTHER cluster we know about. For each
-        // remote cluster, route through one online node of that cluster
-        // via the existing /api/nodes/{id}/proxy/... proxy; that remote
-        // aggregator handles its own cluster's fan-out, including PVE
-        // guests on nodes we've never authed against directly.
-        const selfNode = (typeof allNodes !== 'undefined' ? allNodes : []).find(n => n.is_self);
-        const selfCluster = selfNode?.cluster_name || 'WolfStack';
-        const clustersSeen = new Set([selfCluster]);
-        const remoteGateways = [];  // one WolfStack gateway per remote cluster
-        // Only federate to clusters that have an online WolfStack node
-        // we can proxy through. Proxmox-only clusters don't host the
-        // WolfStack API — our local aggregator reaches their PVE API
-        // directly via the stored token, so they don't need a gateway.
-        for (const n of (typeof allNodes !== 'undefined' ? allNodes : [])) {
-            const c = n.cluster_name || 'WolfStack';
-            if (clustersSeen.has(c)) continue;
-            if (!n.online) continue;
-            const isWolfStack = !n.node_type || n.node_type === 'wolfstack';
-            if (!isWolfStack) continue;
-            clustersSeen.add(c);
-            remoteGateways.push({ cluster: c, node: n });
-        }
-
-        if (status) {
-            status.textContent = remoteGateways.length > 0
-                ? `Fanning out across ${remoteGateways.length + 1} clusters…`
-                : 'Loading inventory…';
-        }
-
-        // Step 3 — parallel per-cluster inventory fetches.
-        const remoteResults = await Promise.all(remoteGateways.map(async g => {
-            try {
-                const url = `/api/nodes/${encodeURIComponent(g.node.id)}/proxy/api/control-panel/inventory`;
-                const resp = await fetch(url);
-                if (!resp.ok) return { cluster: g.cluster, error: 'HTTP ' + resp.status, items: [], errors: [] };
-                const j = await resp.json();
-                return { cluster: g.cluster, items: j.items || [], errors: j.errors || [] };
-            } catch (e) {
-                return { cluster: g.cluster, error: e.message, items: [], errors: [] };
-            }
-        }));
-
-        // Step 4 — merge, deduping on the item's stable key. Each
-        // cluster's aggregator only reports its own nodes, so duplicates
-        // shouldn't happen in practice, but a stale cluster_name somewhere
-        // could leak an item into two aggregators. Better safe.
+        // Dedupe defensively on (node_id, kind, name). Shouldn't
+        // happen since the backend iterates a deduped node list, but
+        // cheap insurance.
         const merged = [];
         const seen = new Set();
-        const pushUnique = (items) => {
-            for (const it of items) {
-                const k = `${it.node_id}|${it.kind}|${it.name}`;
-                if (seen.has(k)) continue;
-                seen.add(k);
-                merged.push(it);
-            }
-        };
-        pushUnique(localInv.items || []);
-        _cpErrors = (localInv.errors || []).slice();
-        for (const r of remoteResults) {
-            pushUnique(r.items);
-            _cpErrors.push(...r.errors);
-            if (r.error) {
-                _cpErrors.push({ node_hostname: r.cluster, kind: 'cluster', error: r.error });
-            }
+        for (const it of (inv.items || [])) {
+            const k = `${it.node_id}|${it.kind}|${it.name}`;
+            if (seen.has(k)) continue;
+            seen.add(k);
+            merged.push(it);
         }
         _cpInventory = merged;
+        _cpErrors = inv.errors || [];
         _cpGroups = (grp.groups || []).slice().sort((a, b) => (a.order || 0) - (b.order || 0));
         cpRender();
     } catch (e) {

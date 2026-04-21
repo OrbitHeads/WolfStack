@@ -171,6 +171,20 @@
 - Install modal detects which targets the manifest supports and shows matching pills
 - Ports/env/memory sections auto-hide for non-Docker targets
 
+### Docker deployment modes (v19.0.6+)
+- Docker-target apps can be installed two ways: **Standard (`docker run`)** or **Docker Compose**. The radio appears in the install modal only when target is Docker AND the backend advertises `compose_available: true` on the app manifest response
+- **Standard** is the default and the legacy path — completely unchanged behaviour (`install_docker` → `docker_create_with_cmd`). Every existing installed app keeps working as before
+- **Compose** is opt-in per install. Writes `/etc/wolfstack/compose/appstore-{install_id}/docker-compose.yml`, runs `docker compose -f … up -d`, and records `deployment_type: "docker-compose"` + `compose_stack_name` on the `InstalledApp`
+- Compose-backed installs appear on the existing Compose Stacks page automatically because they live in the same directory as user-created stacks — look for the `appstore-` prefix
+- Compose template resolution (`resolve_compose_template`): hand-crafted override in `handcrafted_compose_template` takes priority; otherwise synthesised from the `DockerTarget` (image, ports, env, volumes, sidecars → one compose service each; named volumes declared at the top level)
+- View / edit the compose file via `GET`/`PUT /api/appstore/installed/{install_id}/compose.yaml`. Save re-runs `docker compose up -d`
+- Uninstall of a compose app runs `docker compose down -v` (wipes named volumes). Frontend gates this behind the typed-YES modal (`confirmTypedYes`)
+- Existing `installed.json` records without the new fields default to `deployment_type: "docker-run"` via `#[serde(default)]` — zero migration
+- Legacy `prepare-install` terminal flow is bypassed for compose installs; the call goes straight to `/api/appstore/apps/{id}/install` because `docker compose up` is non-interactive
+- **Installed-apps list is cluster-wide**: fetches local installs plus every online WolfStack node via `/api/nodes/{id}/proxy/appstore/installed`, annotates each row with `__node_id`, and routes View / Edit / Uninstall through the cluster proxy when the install is remote
+- **YAML escaping**: `yaml_double_quoted()` handles backslashes, quotes, newlines, tabs and control chars per the YAML spec. User inputs containing any of these no longer break the synthesised compose file
+- **Install failure rollback**: if `docker compose up -d` fails on a fresh install, `install_compose` runs `down -v --remove-orphans` and deletes the stack directory before returning the error — no orphaned `/etc/wolfstack/compose/appstore-*` dirs
+
 ### VM Target (ISO-Based Apps)
 - For apps that want a whole OS (PBS, pfSense, OPNsense, Home Assistant OS, etc.)
 - VmTarget fields: iso_url, memory_mb, cores, disk_gb, optional data_disk_gb + data_disk_label, vga

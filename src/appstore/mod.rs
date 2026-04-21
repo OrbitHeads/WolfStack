@@ -162,7 +162,21 @@ pub struct InstalledApp {
     /// Any sidecar container names
     #[serde(default)]
     pub sidecar_names: Vec<String>,
+    /// How this app was deployed: "docker-run" (default, single
+    /// container via `docker create/start`, the original behaviour) or
+    /// "docker-compose" (rendered YAML under
+    /// ~/wolfstack/compose/stacks/{compose_stack_name} and lifecycled
+    /// via `docker compose …`). Missing in older records ⇒ docker-run.
+    #[serde(default = "default_deployment_type")]
+    pub deployment_type: String,
+    /// The compose project name used for `docker compose -p …`.
+    /// Format: `appstore-{install_id}`. `None` for non-compose
+    /// deployments.
+    #[serde(default)]
+    pub compose_stack_name: Option<String>,
 }
+
+fn default_deployment_type() -> String { "docker-run".to_string() }
 
 // ─── Installed apps persistence ───
 
@@ -221,6 +235,7 @@ pub fn install_app(
     container_name: &str,
     user_inputs: &HashMap<String, String>,
     custom_ports: Option<&[String]>,
+    deployment_type: Option<&str>,
 ) -> Result<String, String> {
     let mut app = get_app(app_id).ok_or_else(|| format!("App '{}' not found", app_id))?;
 
@@ -231,27 +246,55 @@ pub fn install_app(
         }
     }
 
+    // Generate the install_id up-front — compose uses it as the stack
+    // name so the dir and project name are known before we write the
+    // YAML.
+    let install_id = format!("{}_{}", app_id, chrono_timestamp());
+    let chosen_deployment = deployment_type.unwrap_or("docker-run");
     let mut sidecar_names: Vec<String> = Vec::new();
+    let mut resolved_deployment = "docker-run".to_string();
+    let mut compose_stack_name: Option<String> = None;
+    let mut persisted_container_name: Option<String> = Some(container_name.to_string());
 
     let result = match target {
-        "docker" => install_docker(&app, container_name, user_inputs, &mut sidecar_names),
-        "lxc" => install_lxc(&app, container_name, user_inputs),
-        "bare" => install_bare_metal(&app, user_inputs),
-        "vm" => install_vm(&app, container_name, user_inputs),
-        _ => Err(format!("Unknown install target: {}", target)),
-    }?;
+        "docker" if chosen_deployment == "docker-compose" => {
+            // Opt-in Compose path. Resolve the template — either
+            // hand-crafted in the override map or synthesised from
+            // the DockerTarget. Only fails when the app has no
+            // Docker target at all (LXC-only / VM-only), which the
+            // frontend already refuses to offer but the backend
+            // checks defensively.
+            if !has_compose_template(&app.id) {
+                return Err("This app can't be installed via Docker Compose".to_string());
+            }
+            let stack_name = format!("appstore-{}", install_id);
+            let msg = install_compose(&app, &stack_name, user_inputs)?;
+            resolved_deployment = "docker-compose".to_string();
+            compose_stack_name = Some(stack_name);
+            // Compose installs don't own a single container name; the
+            // compose project owns many containers named by service.
+            persisted_container_name = None;
+            msg
+        }
+        "docker" => install_docker(&app, container_name, user_inputs, &mut sidecar_names)?,
+        "lxc" => install_lxc(&app, container_name, user_inputs)?,
+        "bare" => install_bare_metal(&app, user_inputs)?,
+        "vm" => install_vm(&app, container_name, user_inputs)?,
+        _ => return Err(format!("Unknown install target: {}", target)),
+    };
 
     // Track the installation
-    let install_id = format!("{}_{}", app_id, chrono_timestamp());
     let mut installed = load_installed();
     installed.push(InstalledApp {
         install_id: install_id.clone(),
         app_id: app_id.to_string(),
         app_name: app.name.clone(),
         target: target.to_string(),
-        container_name: Some(container_name.to_string()),
+        container_name: persisted_container_name,
         installed_at: chrono_timestamp(),
         sidecar_names,
+        deployment_type: resolved_deployment,
+        compose_stack_name,
     });
     save_installed(&installed);
 
@@ -259,7 +302,10 @@ pub fn install_app(
     Ok(result)
 }
 
-/// Uninstall an app by its install ID
+/// Uninstall an app by its install ID. For compose-deployed apps the
+/// caller is expected to have obtained user confirmation to wipe
+/// volumes (the UI enforces the typed-YES modal); this function just
+/// executes `docker compose down -v` when invoked.
 pub fn uninstall_app(install_id: &str) -> Result<String, String> {
     let mut installed = load_installed();
     let idx = installed.iter().position(|a| a.install_id == install_id)
@@ -267,6 +313,15 @@ pub fn uninstall_app(install_id: &str) -> Result<String, String> {
 
     let app = installed.remove(idx);
 
+    // Compose-backed apps don't have a single container to remove — we
+    // tear down the whole project.
+    if app.deployment_type == "docker-compose" {
+        if let Some(ref stack) = app.compose_stack_name {
+            uninstall_compose(stack)?;
+        }
+        save_installed(&installed);
+        return Ok(format!("{} has been uninstalled", app.app_name));
+    }
 
     // Remove the container/packages
     match app.target.as_str() {
@@ -374,6 +429,304 @@ fn install_docker(
         msg.push_str(&format!(" (with sidecars: {})", sidecar_names.join(", ")));
     }
     Ok(msg)
+}
+
+// ─── Compose deployment (opt-in) ────────────────────────────────────────
+//
+// Compose-backed appstore installs live under the same directory as
+// user-created compose stacks (/etc/wolfstack/compose/{name}) so they
+// appear on the existing Compose Stacks page with an `appstore-`
+// prefix in the name. This means the generic compose lifecycle
+// endpoints (start, stop, logs, etc.) already manage them for free —
+// we only need to own create and delete.
+//
+// Compose templates are kept in a separate lookup rather than as a
+// field on DockerTarget. That lets authors add compose support to
+// any app incrementally without touching the hundreds of existing
+// catalog literals (Rust struct literals need every field set; the
+// separate lookup keeps compose opt-in with zero ripple).
+
+/// Hand-crafted compose YAML for apps that want a richer stack than
+/// synthesis can produce (custom healthchecks, depends_on, multiple
+/// named networks, etc.). Returns None for apps without a crafted
+/// template — the install path then falls back to synthesising one
+/// from the DockerTarget manifest. Template syntax is
+/// `${user_input_id}` substitution, same rules as env / cmd.
+pub fn handcrafted_compose_template(app_id: &str) -> Option<&'static str> {
+    match app_id {
+        // Add overrides here, e.g.:
+        // "nextcloud" => Some(include_str!("compose_templates/nextcloud.yml")),
+        _ => None,
+    }
+}
+
+/// Resolve the compose template for an app. Preference order:
+///
+/// 1. A hand-crafted template in `handcrafted_compose_template`.
+/// 2. A template synthesised from `DockerTarget` — image, ports,
+///    env, volumes and sidecars — covering the common case
+///    automatically.
+///
+/// `None` is returned only when the app has no Docker target at all
+/// (LXC / bare-metal / VM installs, which can't go through compose).
+pub fn resolve_compose_template(app_id: &str) -> Option<String> {
+    if let Some(s) = handcrafted_compose_template(app_id) {
+        return Some(s.to_string());
+    }
+    let app = get_app(app_id)?;
+    let docker = app.docker.as_ref()?;
+    Some(synthesise_compose_template(app_id, docker))
+}
+
+/// True when the given app has compose available (hand-crafted or
+/// synthesisable). Used by the frontend-facing manifest to surface a
+/// "Deploy with Compose" option.
+pub fn has_compose_template(app_id: &str) -> bool {
+    resolve_compose_template(app_id).is_some()
+}
+
+/// Generate a minimal docker-compose.yml from a DockerTarget. Covers
+/// image / ports / env / volumes for the main service, plus one
+/// service per sidecar. Named volumes referenced by a service are
+/// declared at the top level so `docker compose up` creates them.
+///
+/// This is a starting point the user can edit via the "Edit compose"
+/// button — anything fancier (healthchecks, depends_on chains,
+/// custom networks) lives in the hand-crafted override map above.
+fn synthesise_compose_template(app_id: &str, d: &DockerTarget) -> String {
+    let main_name = "${CONTAINER_NAME}";
+    let mut out = String::new();
+    out.push_str("# Auto-generated docker-compose.yml for ");
+    out.push_str(app_id);
+    out.push_str(".\n");
+    out.push_str("# Edit freely — saving re-runs `docker compose up -d`.\n");
+    out.push_str("services:\n");
+
+    // Main service.
+    out.push_str(&render_compose_service(main_name, &d.image, &d.ports, &d.env, &d.volumes, &d.cmd));
+
+    // Sidecars.
+    for s in &d.sidecars {
+        let svc_name = format!("${{CONTAINER_NAME}}-{}", s.name_suffix);
+        out.push_str(&render_compose_service(&svc_name, &s.image, &s.ports, &s.env, &s.volumes, &[]));
+    }
+
+    // Collect named volumes referenced by any service. A named volume
+    // is a volume whose host side doesn't start with "/" or "./" —
+    // i.e. a Docker-managed named volume rather than a bind mount.
+    let mut named: std::collections::BTreeSet<String> = Default::default();
+    let mut collect = |vols: &[String]| {
+        for v in vols {
+            if let Some(host) = v.split(':').next() {
+                let h = host.trim();
+                if !h.is_empty() && !h.starts_with('/') && !h.starts_with('.') {
+                    named.insert(h.to_string());
+                }
+            }
+        }
+    };
+    collect(&d.volumes);
+    for s in &d.sidecars { collect(&s.volumes); }
+    if !named.is_empty() {
+        out.push_str("volumes:\n");
+        for v in &named {
+            out.push_str(&format!("  {}: {{}}\n", v));
+        }
+    }
+    out
+}
+
+fn render_compose_service(
+    name: &str,
+    image: &str,
+    ports: &[String],
+    env: &[String],
+    volumes: &[String],
+    cmd: &[String],
+) -> String {
+    let mut s = String::new();
+    s.push_str(&format!("  {}:\n", name));
+    s.push_str(&format!("    image: {}\n", image));
+    s.push_str(&format!("    container_name: {}\n", name));
+    s.push_str("    restart: unless-stopped\n");
+    if !ports.is_empty() {
+        s.push_str("    ports:\n");
+        for p in ports {
+            s.push_str(&format!("      - \"{}\"\n", yaml_double_quoted(p)));
+        }
+    }
+    if !env.is_empty() {
+        s.push_str("    environment:\n");
+        for e in env {
+            // KEY=VALUE → - "KEY=VALUE" (fully escaped so newlines,
+            // quotes, backslashes and control chars in the value can't
+            // break out of the quoted string).
+            s.push_str(&format!("      - \"{}\"\n", yaml_double_quoted(e)));
+        }
+    }
+    if !volumes.is_empty() {
+        s.push_str("    volumes:\n");
+        for v in volumes {
+            s.push_str(&format!("      - \"{}\"\n", yaml_double_quoted(v)));
+        }
+    }
+    if !cmd.is_empty() {
+        s.push_str("    command:\n");
+        for c in cmd {
+            s.push_str(&format!("      - \"{}\"\n", yaml_double_quoted(c)));
+        }
+    }
+    s
+}
+
+/// Escape a string so it can be safely embedded inside a YAML
+/// double-quoted scalar. Follows the YAML 1.2 spec for double-quoted
+/// escape sequences: `\\`, `\"`, `\n`, `\r`, `\t`, plus `\xNN` for
+/// any other control character. Keeps everything else literal so
+/// unicode passes through untouched.
+fn yaml_double_quoted(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"'  => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+const APPSTORE_COMPOSE_DIR: &str = "/etc/wolfstack/compose";
+
+fn appstore_compose_dir(stack: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(APPSTORE_COMPOSE_DIR).join(stack)
+}
+
+fn appstore_compose_file(stack: &str) -> std::path::PathBuf {
+    appstore_compose_dir(stack).join("docker-compose.yml")
+}
+
+fn install_compose(
+    app: &AppManifest,
+    stack_name: &str,
+    user_inputs: &HashMap<String, String>,
+) -> Result<String, String> {
+    app.docker.as_ref()
+        .ok_or("This app doesn't support Docker installation")?;
+    let template = resolve_compose_template(&app.id)
+        .ok_or("This app doesn't provide a Docker Compose template")?;
+
+    // Render ${...} placeholders using the same substitution rules as
+    // env/cmd so users see consistent behaviour between run and
+    // compose modes.
+    let rendered = substitute_inputs(&[template], user_inputs)
+        .into_iter().next().unwrap_or_default();
+
+    let dir = appstore_compose_dir(stack_name);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("create compose dir: {}", e))?;
+    std::fs::write(appstore_compose_file(stack_name), &rendered)
+        .map_err(|e| format!("write compose file: {}", e))?;
+
+    // Bring the stack up. If compose fails (bad image, port
+    // conflict, invalid YAML…), roll back: tear down anything that
+    // did start and remove the stack directory so the next install
+    // attempt gets a clean slate. Without this the user is left with
+    // an orphaned directory under /etc/wolfstack/compose that they'd
+    // have to clean up manually.
+    if let Err(e) = compose_up(stack_name) {
+        let file = appstore_compose_file(stack_name);
+        let _ = std::process::Command::new("docker")
+            .args(["compose", "-f", &file.to_string_lossy(), "down", "-v", "--remove-orphans"])
+            .current_dir(&dir)
+            .output();
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(e);
+    }
+
+    Ok(format!("{} deployed via Docker Compose (stack {})", app.name, stack_name))
+}
+
+fn uninstall_compose(stack_name: &str) -> Result<String, String> {
+    let file = appstore_compose_file(stack_name);
+    if file.exists() {
+        // `down -v` removes the containers *and* the named volumes
+        // the compose file declared. UI guards this behind a typed-YES
+        // modal so the user has acknowledged the data loss.
+        let out = std::process::Command::new("docker")
+            .args(["compose", "-f", &file.to_string_lossy(), "down", "-v", "--remove-orphans"])
+            .current_dir(appstore_compose_dir(stack_name))
+            .output()
+            .map_err(|e| format!("docker compose down failed to start: {}", e))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // Don't abort uninstall — we still want the stack dir
+            // cleaned up and the InstalledApp record removed. Log to
+            // the caller so the message reaches the operator.
+            eprintln!("[appstore] compose down warning for {}: {}", stack_name, stderr);
+        }
+    }
+    // Remove the stack directory so a re-install of the same app gets
+    // a clean slate. If this fails we return the error — the install
+    // record has already been cleared from the list by the caller.
+    let _ = std::fs::remove_dir_all(appstore_compose_dir(stack_name));
+    Ok(format!("Compose stack {} removed", stack_name))
+}
+
+fn compose_up(stack_name: &str) -> Result<(), String> {
+    let file = appstore_compose_file(stack_name);
+    let out = std::process::Command::new("docker")
+        .args(["compose", "-f", &file.to_string_lossy(), "up", "-d", "--remove-orphans"])
+        .current_dir(appstore_compose_dir(stack_name))
+        .output()
+        .map_err(|e| format!("docker compose up failed to start: {}", e))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("docker compose up failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
+/// Read the on-disk compose file for a compose-backed install. Looks
+/// up the install by id, resolves the stack name, and returns the
+/// YAML. Returns an error if the install doesn't exist or wasn't a
+/// compose install.
+pub fn read_compose_file(install_id: &str) -> Result<String, String> {
+    let installed = load_installed();
+    let app = installed.iter().find(|a| a.install_id == install_id)
+        .ok_or_else(|| format!("Install ID '{}' not found", install_id))?;
+    if app.deployment_type != "docker-compose" {
+        return Err("This app was not deployed via Docker Compose".to_string());
+    }
+    let stack = app.compose_stack_name.as_ref()
+        .ok_or("Compose stack name missing from install record")?;
+    std::fs::read_to_string(appstore_compose_file(stack))
+        .map_err(|e| format!("read compose file: {}", e))
+}
+
+/// Overwrite the compose file and re-run `docker compose up -d`.
+pub fn write_compose_file(install_id: &str, new_yaml: &str) -> Result<String, String> {
+    let installed = load_installed();
+    let app = installed.iter().find(|a| a.install_id == install_id)
+        .ok_or_else(|| format!("Install ID '{}' not found", install_id))?;
+    if app.deployment_type != "docker-compose" {
+        return Err("This app was not deployed via Docker Compose".to_string());
+    }
+    let stack = app.compose_stack_name.clone()
+        .ok_or("Compose stack name missing from install record")?;
+    let dir = appstore_compose_dir(&stack);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("create compose dir: {}", e))?;
+    std::fs::write(appstore_compose_file(&stack), new_yaml)
+        .map_err(|e| format!("write compose file: {}", e))?;
+    compose_up(&stack)?;
+    Ok(format!("{} compose file saved and stack reloaded", app.app_name))
 }
 
 fn install_lxc(
@@ -2018,6 +2371,8 @@ pub fn prepare_install(
         container_name: Some(container_name.to_string()),
         installed_at: chrono_timestamp(),
         sidecar_names,
+        deployment_type: "docker-run".to_string(),
+        compose_stack_name: None,
     };
     let pending_json = serde_json::to_string_pretty(&installed_app).unwrap_or_default();
 

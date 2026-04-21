@@ -224,9 +224,15 @@ async fn vnc_tcp_bridge(
 
 
 /// WebSocket endpoint: /ws/vm-vnc/{name}
-/// Bridges browser noVNC ↔ native QEMU VM's built-in WebSocket VNC.
-/// QEMU's websocket= port speaks WebSocket (not raw TCP), so we connect
-/// as a WebSocket client to QEMU and bridge to the browser's WebSocket.
+/// Bridges browser noVNC ↔ a VM's VNC endpoint. Two flavours supported:
+///
+/// * **Native QEMU** — VmConfig has `vnc_ws_port` set (QEMU was started
+///   with `-vnc … ,websocket=N`). We connect as a WebSocket client and
+///   shuttle frames.
+/// * **Libvirt** — VmConfig has only `vnc_port` set (virsh doesn't
+///   expose a WebSocket VNC port by default). We connect a raw TCP
+///   socket to 127.0.0.1:vnc_port and bridge browser WS frames ↔
+///   TCP bytes. noVNC handles the RFB protocol in-frame either way.
 pub async fn vm_vnc_ws(
     req: HttpRequest,
     stream: web::Payload,
@@ -236,40 +242,56 @@ pub async fn vm_vnc_ws(
     if let Err(resp) = super::require_auth(&req, &state) { return Ok(resp); }
     let vm_name = path.into_inner();
 
-    // Look up the VM's WebSocket port
-    let ws_port = {
+    // Pick the connection strategy from the VmConfig. Prefer ws_port
+    // when present (native QEMU), fall back to raw TCP vnc_port
+    // (libvirt).
+    let (ws_port_opt, vnc_port_opt) = {
         let manager = state.vms.lock().unwrap();
-        manager.get_vm(&vm_name)
-            .and_then(|vm| vm.vnc_ws_port)
+        let vm = manager.get_vm(&vm_name);
+        (vm.as_ref().and_then(|v| v.vnc_ws_port),
+         vm.as_ref().and_then(|v| v.vnc_port))
     };
 
-    let ws_port = match ws_port {
-        Some(p) => p,
-        None => return Ok(HttpResponse::NotFound().json(serde_json::json!({
-            "error": format!("VM '{}' not found or not running", vm_name)
-        }))),
-    };
+    if let Some(ws_port) = ws_port_opt {
+        // Native-QEMU path — WebSocket ↔ WebSocket.
+        let qemu_url = format!("ws://127.0.0.1:{}", ws_port);
+        let (qemu_ws, _) = match tokio_tungstenite::connect_async(&qemu_url).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                error!("Failed to connect to QEMU VNC WebSocket port {} for VM '{}': {}", ws_port, vm_name, e);
+                return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+                    "error": format!("Failed to connect to VM console: {}", e)
+                })));
+            }
+        };
+        let (res, session, msg_stream) = actix_ws::handle(&req, stream)?;
+        actix_rt::spawn(vnc_ws_bridge(session, msg_stream, qemu_ws));
+        return Ok(res);
+    }
 
-    // Connect WebSocket to QEMU's built-in WebSocket VNC port
-    let qemu_url = format!("ws://127.0.0.1:{}", ws_port);
-    let (qemu_ws, _) = match tokio_tungstenite::connect_async(&qemu_url).await {
-        Ok(pair) => pair,
-        Err(e) => {
-            error!("Failed to connect to QEMU VNC WebSocket port {} for VM '{}': {}", ws_port, vm_name, e);
-            return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": format!("Failed to connect to VM console: {}", e)
-            })));
-        }
-    };
+    if let Some(vnc_port) = vnc_port_opt {
+        // Libvirt path — WebSocket ↔ raw TCP.
+        let tcp = match TcpStream::connect(("127.0.0.1", vnc_port)).await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to connect to libvirt VNC TCP port {} for VM '{}': {}", vnc_port, vm_name, e);
+                return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+                    "error": format!("Failed to connect to VM console: {}", e)
+                })));
+            }
+        };
+        let (res, session, msg_stream) = actix_ws::handle(&req, stream)?;
+        actix_rt::spawn(vnc_tcp_bridge(session, msg_stream, tcp));
+        return Ok(res);
+    }
 
-    // Upgrade browser connection to WebSocket
-    let (res, session, msg_stream) = actix_ws::handle(&req, stream)?;
-
-    // Bridge browser WebSocket ↔ QEMU WebSocket
-    actix_rt::spawn(vnc_ws_bridge(session, msg_stream, qemu_ws));
-
-    Ok(res)
+    Ok(HttpResponse::NotFound().json(serde_json::json!({
+        "error": format!("VM '{}' not found or has no VNC configured", vm_name)
+    })))
 }
+
+// Libvirt path reuses the existing `vnc_tcp_bridge` helper defined
+// above — same passthrough shape (raw TCP ↔ binary WS frames).
 
 /// Bridge browser noVNC WebSocket ↔ QEMU's WebSocket VNC.
 /// Both sides are WebSocket — we just shuttle binary frames between them.
