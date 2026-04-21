@@ -65,6 +65,20 @@ pub struct DockerSidecar {
     pub ports: Vec<String>,
     pub env: Vec<String>,
     pub volumes: Vec<String>,
+    /// Command override — equivalent to the main container's `cmd`.
+    /// Lets a sidecar run the same base image as the primary with a
+    /// different entrypoint (e.g. Mastodon's `sidekiq` worker, or
+    /// Authentik's `worker` command) without needing a second image.
+    /// Also covers databases that need flags — Mongo for Rocket.Chat
+    /// needs `--replSet rs0 --oplogSize 128`.
+    #[serde(default)]
+    pub cmd: Vec<String>,
+    /// Post-install exec — commands run via `docker exec` against
+    /// this sidecar once after install completes. The typical use
+    /// is initialising a database: Mongo `rs.initiate()`, Postgres
+    /// `CREATE DATABASE`, etc. Runs once at install time only.
+    #[serde(default)]
+    pub post_install_exec: Vec<Vec<String>>,
 }
 
 /// How to install an app in an LXC container
@@ -368,16 +382,18 @@ fn install_docker(
     let wolfnet_ip = crate::containers::next_available_wolfnet_ip();
 
 
-    // Install sidecars first (e.g. database)
+    // Install sidecars first (e.g. database). Sidecars can now carry
+    // a `cmd` override (needed for Mongo --replSet, Authentik worker,
+    // Mastodon sidekiq, etc.) and a `post_install_exec` list (one-shot
+    // `docker exec` commands like `mongosh --eval rs.initiate()`).
     for sidecar in &docker.sidecars {
         let sidecar_name = format!("{}-{}", container_name, sidecar.name_suffix);
         let env = substitute_inputs(&sidecar.env, user_inputs);
-
+        let cmd = substitute_inputs(&sidecar.cmd, user_inputs);
 
         crate::containers::docker_pull(&sidecar.image)?;
 
-
-        crate::containers::docker_create(
+        crate::containers::docker_create_with_cmd(
             &sidecar_name,
             &sidecar.image,
             &sidecar.ports,
@@ -387,22 +403,81 @@ fn install_docker(
             None,  // no CPU limit
             None,  // no storage limit
             &sidecar.volumes,
+            &cmd,
         )?;
-        // Don't start sidecars — user will start everything manually
-        sidecar_names.push(sidecar_name);
+        sidecar_names.push(sidecar_name.clone());
+
+        // Run post-install exec commands, if any. These need the
+        // sidecar up, so start it first, give it a moment to settle,
+        // then exec the commands and leave it running. The main app
+        // starts after all sidecars and their inits are finished.
+        if !sidecar.post_install_exec.is_empty() {
+            crate::containers::docker_start(&sidecar_name)?;
+            // Poll briefly for the container to accept exec — avoids
+            // racing databases that take a second or two to bind.
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            for raw_argv in &sidecar.post_install_exec {
+                let argv = substitute_inputs(raw_argv, user_inputs);
+                let mut cmd = std::process::Command::new("docker");
+                cmd.arg("exec").arg(&sidecar_name);
+                for a in &argv { cmd.arg(a); }
+                // Best-effort: failure here (e.g. replSet already
+                // initiated on a retry) shouldn't roll the install back.
+                let _ = cmd.output();
+            }
+        }
     }
 
     // Pull the main image
 
     crate::containers::docker_pull(&docker.image)?;
 
+    // Seed dummy config files BEFORE creating the main container.
+    // Some images (Misskey, Frigate, Home Assistant) crash-loop on
+    // a missing /config file; writing it up-front unbricks first-run.
+    // The content is put through substitute_inputs so placeholders
+    // like ${DB_PASSWORD} or ${CONTAINER_NAME} resolve the same way
+    // env / cmd do.
+    for seed in &docker.seed_files {
+        // Match the seed's container_path against a volume whose
+        // target is a prefix, e.g. `/misskey/.config/default.yml`
+        // under `misskey_files:/misskey`. Named volumes need to
+        // exist before a throwaway alpine writer can mount them.
+        let matched = docker.volumes.iter().find_map(|spec| {
+            let (host, target) = spec.split_once(':')?;
+            if seed.container_path == target
+                || seed.container_path.starts_with(&format!("{}/", target))
+            {
+                Some((host.to_string(), target.to_string()))
+            } else { None }
+        });
+        let Some((source, mount)) = matched else { continue };
+        let Some(rel) = seed.container_path.strip_prefix(&format!("{}/", mount)) else { continue };
+        if rel.is_empty() || source.is_empty() { continue; }
+        let content = substitute_inputs(
+            &[seed.content.clone()], user_inputs,
+        ).into_iter().next().unwrap_or_default();
+        // Create the named volume (no-op if exists) then write via
+        // a throwaway alpine container. `[ -f … ] ||` preserves an
+        // existing user edit on reinstall.
+        if !source.starts_with('/') {
+            let _ = std::process::Command::new("docker")
+                .args(["volume", "create", &source])
+                .output();
+        }
+        let sh = format!(
+            "mkdir -p \"$(dirname /seed/{rel})\" && [ -f /seed/{rel} ] || printf %s \"$SEED_CONTENT\" > /seed/{rel}",
+            rel = rel,
+        );
+        let _ = std::process::Command::new("docker")
+            .args(["run", "--rm", "-v", &format!("{}:/seed", source),
+                   "-e", &format!("SEED_CONTENT={}", content),
+                   "alpine", "sh", "-c", &sh])
+            .output();
+    }
+
     // Substitute user inputs into env vars AND the cmd — same
-    // ${PLACEHOLDER} syntax, same user_inputs map. This is what
-    // lets a cloudflared manifest say `cmd = ["tunnel", "run",
-    // "--token", "${TUNNEL_TOKEN}"]` (although env-var TUNNEL_TOKEN
-    // works too; cloudflared reads either). Keeping tokens as env
-    // vars is preferred — argv is visible to anyone with `ps` on
-    // the host — but some images only accept the value via argv.
+    // ${PLACEHOLDER} syntax, same user_inputs map.
     let env = substitute_inputs(&docker.env, user_inputs);
     let cmd = substitute_inputs(&docker.cmd, user_inputs);
 
@@ -505,10 +580,11 @@ fn synthesise_compose_template(app_id: &str, d: &DockerTarget) -> String {
     // Main service.
     out.push_str(&render_compose_service(main_name, &d.image, &d.ports, &d.env, &d.volumes, &d.cmd));
 
-    // Sidecars.
+    // Sidecars. `cmd` is honoured so Mongo replSet flags, Mastodon
+    // sidekiq, Authentik worker, etc. render correctly.
     for s in &d.sidecars {
         let svc_name = format!("${{CONTAINER_NAME}}-{}", s.name_suffix);
-        out.push_str(&render_compose_service(&svc_name, &s.image, &s.ports, &s.env, &s.volumes, &[]));
+        out.push_str(&render_compose_service(&svc_name, &s.image, &s.ports, &s.env, &s.volumes, &s.cmd));
     }
 
     // Collect named volumes referenced by any service. A named volume
@@ -2063,7 +2139,27 @@ pub fn prepare_install(
                     create_args.push_str(&format!(" -v {}", shell_escape(&vol)));
                 }
                 create_args.push_str(&format!(" {}", shell_escape(&sidecar.image)));
+                // Sidecar cmd (after image). Same substitution rules as
+                // the main container — ${USER_INPUT_ID} placeholders.
+                let sidecar_cmd = substitute_inputs(&sidecar.cmd, user_inputs);
+                for a in &sidecar_cmd {
+                    create_args.push_str(&format!(" {}", shell_escape(a)));
+                }
                 script.push_str(&format!("{}\n\n", create_args));
+
+                // Post-install exec (one-shot docker exec commands, eg
+                // Mongo rs.initiate()). Wrapped in a start + sleep so
+                // the sidecar is actually up before the exec.
+                if !sidecar.post_install_exec.is_empty() {
+                    script.push_str(&format!("docker start {}\nsleep 3\n", shell_escape(&sidecar_name)));
+                    for raw_argv in &sidecar.post_install_exec {
+                        let argv = substitute_inputs(raw_argv, user_inputs);
+                        let mut line = format!("docker exec {}", shell_escape(&sidecar_name));
+                        for a in &argv { line.push_str(&format!(" {}", shell_escape(a))); }
+                        script.push_str(&format!("{} || true\n", line));
+                    }
+                    script.push('\n');
+                }
 
                 sidecar_names.push(sidecar_name);
             }
@@ -2150,13 +2246,18 @@ pub fn prepare_install(
                     // Write the file via a throwaway alpine container
                     // that mounts the volume. The `[ -f … ]` test skips
                     // the write when the file already exists so user
-                    // edits survive a reinstall.
+                    // edits survive a reinstall. Content goes through
+                    // substitute_inputs so `${VAR}` placeholders resolve
+                    // (Misskey seeds ${DB_PASSWORD} into its config.yml).
+                    let seeded_content = substitute_inputs(
+                        &[seed.content.clone()], user_inputs,
+                    ).into_iter().next().unwrap_or_default();
                     script.push_str(&format!(
                         "docker run --rm -v {}:/seed -e SEED_CONTENT={} alpine sh -c '\
                          mkdir -p \"$(dirname /seed/{})\" && \
                          [ -f /seed/{} ] || printf %s \"$SEED_CONTENT\" > /seed/{}'\n",
                         shell_escape(&source),
-                        shell_escape(&seed.content),
+                        shell_escape(&seeded_content),
                         rel, rel, rel,
                     ));
                 }
@@ -2936,13 +3037,82 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         },
 
 
-        // Authentik removed — needs a Postgres DB, a Redis broker AND
-        // a separate `worker` container running the same image with a
-        // different command. A single-container DockerTarget can't
-        // spawn the worker, so the server container starts but every
-        // login stalls waiting on background tasks that never run.
-        // Add a Compose template (postgres + redis + server + worker)
-        // if we bring it back.
+        // Authentik — server + worker (same image, different cmd) +
+        // Postgres + Redis. The server handles HTTP; the worker runs
+        // Celery migrations and background tasks. Without the worker
+        // logins stall forever.
+        AppManifest {
+            id: "authentik".into(),
+            name: "Authentik".into(),
+            icon: "🛡️".into(),
+            category: "Security".into(),
+            description: "Identity provider with SSO, MFA, and user management".into(),
+            website: Some("https://goauthentik.io".into()),
+            docker: Some(DockerTarget {
+                image: "ghcr.io/goauthentik/server:latest".into(),
+                ports: vec!["9003:9000".into(), "9444:9443".into()],
+                env: vec![
+                    "AUTHENTIK_SECRET_KEY=${SECRET_KEY}".into(),
+                    "AUTHENTIK_POSTGRESQL__HOST=${CONTAINER_NAME}-db".into(),
+                    "AUTHENTIK_POSTGRESQL__USER=authentik".into(),
+                    "AUTHENTIK_POSTGRESQL__PASSWORD=${DB_PASSWORD}".into(),
+                    "AUTHENTIK_POSTGRESQL__NAME=authentik".into(),
+                    "AUTHENTIK_REDIS__HOST=${CONTAINER_NAME}-redis".into(),
+                ],
+                volumes: vec![
+                    "authentik_media:/media".into(),
+                    "authentik_templates:/templates".into(),
+                ],
+                sidecars: vec![
+                    DockerSidecar {
+                        name_suffix: "db".into(),
+                        image: "postgres:16-alpine".into(),
+                        ports: vec![],
+                        env: vec![
+                            "POSTGRES_USER=authentik".into(),
+                            "POSTGRES_PASSWORD=${DB_PASSWORD}".into(),
+                            "POSTGRES_DB=authentik".into(),
+                        ],
+                        volumes: vec!["authentik_db:/var/lib/postgresql/data".into()],
+                        cmd: vec![], post_install_exec: vec![],
+                    },
+                    DockerSidecar {
+                        name_suffix: "redis".into(),
+                        image: "redis:7-alpine".into(),
+                        ports: vec![],
+                        env: vec![],
+                        volumes: vec!["authentik_redis:/data".into()],
+                        cmd: vec![], post_install_exec: vec![],
+                    },
+                    DockerSidecar {
+                        name_suffix: "worker".into(),
+                        image: "ghcr.io/goauthentik/server:latest".into(),
+                        ports: vec![],
+                        env: vec![
+                            "AUTHENTIK_SECRET_KEY=${SECRET_KEY}".into(),
+                            "AUTHENTIK_POSTGRESQL__HOST=${CONTAINER_NAME}-db".into(),
+                            "AUTHENTIK_POSTGRESQL__USER=authentik".into(),
+                            "AUTHENTIK_POSTGRESQL__PASSWORD=${DB_PASSWORD}".into(),
+                            "AUTHENTIK_POSTGRESQL__NAME=authentik".into(),
+                            "AUTHENTIK_REDIS__HOST=${CONTAINER_NAME}-redis".into(),
+                        ],
+                        volumes: vec![
+                            "authentik_media:/media".into(),
+                            "authentik_templates:/templates".into(),
+                        ],
+                        cmd: vec!["worker".into()],
+                        post_install_exec: vec![],
+                    },
+                ],
+                seed_files: vec![], cmd: vec!["server".into()],
+            }),
+            lxc: None,
+            bare_metal: None,
+            vm: None, user_inputs: vec![
+                UserInput { id: "SECRET_KEY".into(), label: "Secret Key".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Long random string (50+ chars)".into()), options: vec![] },
+                UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Postgres password".into()), options: vec![] },
+            ],
+        },
 
 
         AppManifest {
@@ -3464,7 +3634,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
                         "POSTGRES_PASSWORD=${DB_PASSWORD}".into(),
                     ],
                     volumes: vec!["immich_db:/var/lib/postgresql/data".into()],
-                }], seed_files: vec![], cmd: vec![],
+                 cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![],
             }),
             lxc: None,
             bare_metal: None,
@@ -3687,7 +3857,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
                         "POSTGRES_PASSWORD=${DB_PASSWORD}".into(),
                     ],
                     volumes: vec!["mattermost_db:/var/lib/postgresql/data".into()],
-                }], seed_files: vec![], cmd: vec![],
+                 cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![],
             }),
             lxc: None,
             bare_metal: None,
@@ -3922,7 +4092,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
                         "MYSQL_PASSWORD=${DB_PASSWORD}".into(),
                     ],
                     volumes: vec!["nextcloud_db:/var/lib/mysql".into()],
-                }], seed_files: vec![], cmd: vec![],
+                 cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![],
             }),
             lxc: None,
             bare_metal: None,
@@ -4258,12 +4428,48 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         },
 
 
-        // Rocket.Chat removed — requires MongoDB running with a
-        // replica set (`mongod --replSet rs0`) AND a one-off
-        // `rs.initiate()` before the app will talk to it. A bare
-        // `mongo:6` sidecar with no command override and no post-
-        // start hook can't provide either, so the app logged
-        // "not master" and looped forever. Needs a Compose template.
+        // Rocket.Chat — Mongo must be started with `--replSet rs0`
+        // and then have `rs.initiate()` run once before the app will
+        // accept traffic. Sidecar `cmd` handles the flag; sidecar
+        // `post_install_exec` runs the one-shot `rs.initiate()` via
+        // `mongosh`.
+        AppManifest {
+            id: "rocketchat".into(),
+            name: "Rocket.Chat".into(),
+            icon: "💬".into(),
+            category: "Communication".into(),
+            description: "Team communication platform — open-source Slack alternative".into(),
+            website: Some("https://rocket.chat".into()),
+            docker: Some(DockerTarget {
+                image: "rocketchat/rocket.chat:latest".into(),
+                ports: vec!["3009:3000".into()],
+                env: vec![
+                    "MONGO_URL=mongodb://${CONTAINER_NAME}-db:27017/rocketchat?replicaSet=rs0".into(),
+                    "MONGO_OPLOG_URL=mongodb://${CONTAINER_NAME}-db:27017/local?replicaSet=rs0".into(),
+                    "ROOT_URL=${ROOT_URL}".into(),
+                ],
+                volumes: vec!["rocketchat_uploads:/app/uploads".into()],
+                sidecars: vec![DockerSidecar {
+                    name_suffix: "db".into(),
+                    image: "mongo:6".into(),
+                    ports: vec![],
+                    env: vec![],
+                    volumes: vec!["rocketchat_db:/data/db".into()],
+                    cmd: vec!["--replSet".into(), "rs0".into(), "--oplogSize".into(), "128".into()],
+                    // Member hostname must be what the app container
+                    // uses to connect — localhost won't resolve from
+                    // inside rocketchat's network namespace.
+                    post_install_exec: vec![
+                        vec!["mongosh".into(), "--eval".into(), "rs.initiate({_id:'rs0',members:[{_id:0,host:'${CONTAINER_NAME}-db:27017'}]})".into()],
+                    ],
+                }], seed_files: vec![], cmd: vec![],
+            }),
+            lxc: None,
+            bare_metal: None,
+            vm: None, user_inputs: vec![
+                UserInput { id: "ROOT_URL".into(), label: "Root URL".into(), input_type: "text".into(), default: Some("http://localhost:3009".into()), required: true, placeholder: Some("e.g. https://chat.example.com".into()), options: vec![] },
+            ],
+        },
 
 
         AppManifest {
@@ -4414,7 +4620,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
                         "POSTGRES_PASSWORD=${DB_PASSWORD}".into(),
                     ],
                     volumes: vec!["umami_db:/var/lib/postgresql/data".into()],
-                }], seed_files: vec![], cmd: vec![],
+                 cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![],
             }),
             lxc: None,
             bare_metal: None,
@@ -4615,7 +4821,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
                         "MYSQL_PASSWORD=${DB_PASSWORD}".into(),
                     ],
                     volumes: vec!["wordpress_db:/var/lib/mysql".into()],
-                }], seed_files: vec![], cmd: vec![],
+                 cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![],
             }),
             lxc: Some(LxcTarget {
                 distribution: "debian".into(),
@@ -4741,7 +4947,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
                     ports: vec![],
                     env: vec![],
                     volumes: vec!["paperless_redis:/data".into()],
-                }],
+                 cmd: vec![], post_install_exec: vec![] }],
                 seed_files: vec![], cmd: vec![],
             }),
             lxc: Some(LxcTarget {
@@ -4803,14 +5009,47 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
             name: "Outline".into(),
             icon: "📝".into(),
             category: "Productivity".into(),
-            description: "Beautiful wiki and knowledge base for growing teams — Notion alternative. LXC install only; Docker mode requires Compose (postgres + redis + app).".into(),
+            description: "Beautiful wiki and knowledge base for growing teams — Notion alternative".into(),
             website: Some("https://getoutline.com".into()),
-            // Docker mode was previously pointing at undeclared
-            // `${CONTAINER_NAME}-db` and `${CONTAINER_NAME}-redis`
-            // sidecars, so every install was dead on arrival. The
-            // LXC path below bootstraps Postgres + Redis + Outline
-            // on a single host and actually works.
-            docker: None,
+            // Docker mode: the Postgres and Redis sidecars it depends
+            // on are now properly declared. Outline runs its own DB
+            // migration on first boot so no post-install step needed.
+            docker: Some(DockerTarget {
+                image: "outlinewiki/outline:latest".into(),
+                ports: vec!["3003:3000".into()],
+                env: vec![
+                    "SECRET_KEY=${SECRET_KEY}".into(),
+                    "UTILS_SECRET=${UTILS_SECRET}".into(),
+                    "DATABASE_URL=postgres://outline:${DB_PASSWORD}@${CONTAINER_NAME}-db:5432/outline".into(),
+                    "REDIS_URL=redis://${CONTAINER_NAME}-redis:6379".into(),
+                    "URL=${URL}".into(),
+                    "PGSSLMODE=disable".into(),
+                ],
+                volumes: vec!["outline_data:/var/lib/outline/data".into()],
+                sidecars: vec![
+                    DockerSidecar {
+                        name_suffix: "db".into(),
+                        image: "postgres:15-alpine".into(),
+                        ports: vec![],
+                        env: vec![
+                            "POSTGRES_USER=outline".into(),
+                            "POSTGRES_PASSWORD=${DB_PASSWORD}".into(),
+                            "POSTGRES_DB=outline".into(),
+                        ],
+                        volumes: vec!["outline_db:/var/lib/postgresql/data".into()],
+                        cmd: vec![], post_install_exec: vec![],
+                    },
+                    DockerSidecar {
+                        name_suffix: "redis".into(),
+                        image: "redis:7-alpine".into(),
+                        ports: vec![],
+                        env: vec![],
+                        volumes: vec!["outline_redis:/data".into()],
+                        cmd: vec![], post_install_exec: vec![],
+                    },
+                ],
+                seed_files: vec![], cmd: vec![],
+            }),
             lxc: Some(LxcTarget {
                 distribution: "debian".into(),
                 release: "bookworm".into(),
@@ -4828,9 +5067,10 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
             }),
             bare_metal: None,
             vm: None, user_inputs: vec![
-                UserInput { id: "SECRET_KEY".into(), label: "Secret Key".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Long random hex string".into()), options: vec![] },
+                UserInput { id: "SECRET_KEY".into(), label: "Secret Key".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Long random hex string (openssl rand -hex 32)".into()), options: vec![] },
                 UserInput { id: "UTILS_SECRET".into(), label: "Utils Secret".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Another random hex string".into()), options: vec![] },
                 UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("PostgreSQL password".into()), options: vec![] },
+                UserInput { id: "URL".into(), label: "Public URL".into(), input_type: "text".into(), default: Some("http://localhost:3003".into()), required: true, placeholder: Some("e.g. https://wiki.example.com".into()), options: vec![] },
             ],
         },
 
@@ -6162,7 +6402,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
                     ports: vec![],
                     env: vec!["MYSQL_ROOT_PASSWORD=${DB_PASSWORD}".into(), "MYSQL_DATABASE=bookstack".into(), "MYSQL_USER=bookstack".into(), "MYSQL_PASSWORD=${DB_PASSWORD}".into()],
                     volumes: vec!["bookstack_db:/var/lib/mysql".into()],
-                }], seed_files: vec![], cmd: vec![],
+                 cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![],
             }),
             lxc: None, bare_metal: None,
             vm: None, user_inputs: vec![
@@ -6927,7 +7167,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
                     ports: vec![],
                     env: vec!["POSTGRES_DB=listmonk".into(), "POSTGRES_USER=listmonk".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()],
                     volumes: vec!["listmonk_db:/var/lib/postgresql/data".into()],
-                }], seed_files: vec![], cmd: vec![],
+                 cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![],
             }),
             lxc: None, bare_metal: None,
             vm: None, user_inputs: vec![
@@ -6993,7 +7233,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
                     ports: vec![],
                     env: vec!["POSTGRES_DB=invidious".into(), "POSTGRES_USER=kemal".into(), "POSTGRES_PASSWORD=kemal".into()],
                     volumes: vec!["invidious_db:/var/lib/postgresql/data".into()],
-                }], seed_files: vec![], cmd: vec![],
+                 cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![],
             }),
             lxc: None, bare_metal: None,
             vm: None, user_inputs: vec![],
@@ -7061,7 +7301,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
                     ports: vec![],
                     env: vec!["MYSQL_ROOT_PASSWORD=${DB_PASSWORD}".into()],
                     volumes: vec!["seafile_db:/var/lib/mysql".into()],
-                }], seed_files: vec![], cmd: vec![],
+                 cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![],
             }),
             lxc: None, bare_metal: None,
             vm: None, user_inputs: vec![
@@ -7091,7 +7331,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
                     ports: vec![],
                     env: vec!["MYSQL_ROOT_PASSWORD=${DB_PASSWORD}".into(), "MYSQL_DATABASE=matomo".into(), "MYSQL_USER=matomo".into(), "MYSQL_PASSWORD=${DB_PASSWORD}".into()],
                     volumes: vec!["matomo_db:/var/lib/mysql".into()],
-                }], seed_files: vec![], cmd: vec![],
+                 cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![],
             }),
             lxc: None, bare_metal: None,
             vm: None, user_inputs: vec![
@@ -7159,7 +7399,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
                     ports: vec![],
                     env: vec![],
                     volumes: vec!["wekan_db:/data/db".into()],
-                }], seed_files: vec![], cmd: vec![],
+                 cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![],
             }),
             lxc: None, bare_metal: None,
             vm: None, user_inputs: vec![],
@@ -7183,7 +7423,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
                     ports: vec![],
                     env: vec!["MYSQL_ROOT_PASSWORD=${DB_PASSWORD}".into(), "MYSQL_DATABASE=leantime".into(), "MYSQL_USER=lean".into(), "MYSQL_PASSWORD=${DB_PASSWORD}".into()],
                     volumes: vec!["leantime_db:/var/lib/mysql".into()],
-                }], seed_files: vec![], cmd: vec![],
+                 cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![],
             }),
             lxc: None, bare_metal: None,
             vm: None, user_inputs: vec![
@@ -7383,7 +7623,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         AppManifest { id: "miniflux".into(), name: "Miniflux".into(), icon: "📰".into(), category: "Media".into(),
             description: "Minimalist and opinionated RSS/Atom feed reader".into(),
             website: Some("https://miniflux.app".into()),
-            docker: Some(DockerTarget { image: "miniflux/miniflux:latest".into(), ports: vec!["8080:8080".into()], env: vec!["DATABASE_URL=postgres://miniflux:${DB_PASSWORD}@miniflux-db/miniflux?sslmode=disable".into(), "CREATE_ADMIN=1".into(), "ADMIN_USERNAME=admin".into(), "ADMIN_PASSWORD=${ADMIN_PASSWORD}".into()], volumes: vec![], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_DB=miniflux".into(), "POSTGRES_USER=miniflux".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["miniflux_db:/var/lib/postgresql/data".into()] }], seed_files: vec![], cmd: vec![] }),
+            docker: Some(DockerTarget { image: "miniflux/miniflux:latest".into(), ports: vec!["8080:8080".into()], env: vec!["DATABASE_URL=postgres://miniflux:${DB_PASSWORD}@miniflux-db/miniflux?sslmode=disable".into(), "CREATE_ADMIN=1".into(), "ADMIN_USERNAME=admin".into(), "ADMIN_PASSWORD=${ADMIN_PASSWORD}".into()], volumes: vec![], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_DB=miniflux".into(), "POSTGRES_USER=miniflux".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["miniflux_db:/var/lib/postgresql/data".into()] , cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![] }),
             lxc: None, bare_metal: None, vm: None, user_inputs: vec![
                 UserInput { id: "ADMIN_PASSWORD".into(), label: "Admin Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Admin password".into()), options: vec![] },
                 UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("PostgreSQL password".into()), options: vec![] },
@@ -7437,7 +7677,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         AppManifest { id: "linkwarden".into(), name: "Linkwarden".into(), icon: "🔖".into(), category: "Productivity".into(),
             description: "Bookmark manager with collaboration and archiving".into(),
             website: Some("https://linkwarden.app".into()),
-            docker: Some(DockerTarget { image: "ghcr.io/linkwarden/linkwarden:latest".into(), ports: vec!["3000:3000".into()], env: vec!["DATABASE_URL=postgresql://postgres:${DB_PASSWORD}@linkwarden-db:5432/linkwarden".into(), "NEXTAUTH_SECRET=${SECRET_KEY}".into(), "NEXTAUTH_URL=http://localhost:3000".into()], volumes: vec!["linkwarden_data:/data".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_DB=linkwarden".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["linkwarden_db:/var/lib/postgresql/data".into()] }], seed_files: vec![], cmd: vec![] }),
+            docker: Some(DockerTarget { image: "ghcr.io/linkwarden/linkwarden:latest".into(), ports: vec!["3000:3000".into()], env: vec!["DATABASE_URL=postgresql://postgres:${DB_PASSWORD}@linkwarden-db:5432/linkwarden".into(), "NEXTAUTH_SECRET=${SECRET_KEY}".into(), "NEXTAUTH_URL=http://localhost:3000".into()], volumes: vec!["linkwarden_data:/data".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_DB=linkwarden".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["linkwarden_db:/var/lib/postgresql/data".into()] , cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![] }),
             lxc: None, bare_metal: None, vm: None, user_inputs: vec![
                 UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("PostgreSQL password".into()), options: vec![] },
                 UserInput { id: "SECRET_KEY".into(), label: "Secret Key".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Random secret".into()), options: vec![] },
@@ -7458,7 +7698,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         AppManifest { id: "invoice-ninja".into(), name: "Invoice Ninja".into(), icon: "💰".into(), category: "Productivity".into(),
             description: "Invoicing, payments, and time tracking for freelancers".into(),
             website: Some("https://invoiceninja.com".into()),
-            docker: Some(DockerTarget { image: "invoiceninja/invoiceninja:latest".into(), ports: vec!["8080:80".into()], env: vec!["APP_KEY=${APP_KEY}".into(), "DB_HOST=invoiceninja-db".into(), "DB_DATABASE=ninja".into(), "DB_USERNAME=ninja".into(), "DB_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["invoiceninja_public:/var/www/app/public".into(), "invoiceninja_storage:/var/www/app/storage".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "mariadb:10".into(), ports: vec![], env: vec!["MYSQL_ROOT_PASSWORD=${DB_PASSWORD}".into(), "MYSQL_DATABASE=ninja".into(), "MYSQL_USER=ninja".into(), "MYSQL_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["invoiceninja_db:/var/lib/mysql".into()] }], seed_files: vec![], cmd: vec![] }),
+            docker: Some(DockerTarget { image: "invoiceninja/invoiceninja:latest".into(), ports: vec!["8080:80".into()], env: vec!["APP_KEY=${APP_KEY}".into(), "DB_HOST=invoiceninja-db".into(), "DB_DATABASE=ninja".into(), "DB_USERNAME=ninja".into(), "DB_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["invoiceninja_public:/var/www/app/public".into(), "invoiceninja_storage:/var/www/app/storage".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "mariadb:10".into(), ports: vec![], env: vec!["MYSQL_ROOT_PASSWORD=${DB_PASSWORD}".into(), "MYSQL_DATABASE=ninja".into(), "MYSQL_USER=ninja".into(), "MYSQL_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["invoiceninja_db:/var/lib/mysql".into()] , cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![] }),
             lxc: None, bare_metal: None, vm: None, user_inputs: vec![
                 UserInput { id: "APP_KEY".into(), label: "App Key".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("base64:... (32-char random)".into()), options: vec![] },
                 UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("MariaDB password".into()), options: vec![] },
@@ -7736,7 +7976,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         AppManifest { id: "windmill".into(), name: "Windmill".into(), icon: "🌀".into(), category: "Automation".into(),
             description: "Developer-first workflow engine — scripts, flows, and apps".into(),
             website: Some("https://windmill.dev".into()),
-            docker: Some(DockerTarget { image: "ghcr.io/windmill-labs/windmill:main".into(), ports: vec!["8000:8000".into()], env: vec!["DATABASE_URL=postgres://postgres:${DB_PASSWORD}@windmill-db/windmill".into()], volumes: vec![], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_DB=windmill".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["windmill_db:/var/lib/postgresql/data".into()] }], seed_files: vec![], cmd: vec![] }),
+            docker: Some(DockerTarget { image: "ghcr.io/windmill-labs/windmill:main".into(), ports: vec!["8000:8000".into()], env: vec!["DATABASE_URL=postgres://postgres:${DB_PASSWORD}@windmill-db/windmill".into()], volumes: vec![], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_DB=windmill".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["windmill_db:/var/lib/postgresql/data".into()] , cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![] }),
             lxc: None, bare_metal: None, vm: None, user_inputs: vec![
                 UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("PostgreSQL password".into()), options: vec![] },
             ],
@@ -8134,7 +8374,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         AppManifest { id: "yourls".into(), name: "YOURLS".into(), icon: "🔗".into(), category: "Other".into(),
             description: "Your Own URL Shortener — track clicks and analytics".into(),
             website: Some("https://yourls.org".into()),
-            docker: Some(DockerTarget { image: "yourls:latest".into(), ports: vec!["8080:80".into()], env: vec!["YOURLS_DB_HOST=yourls-db".into(), "YOURLS_DB_PASS=${DB_PASSWORD}".into(), "YOURLS_SITE=http://localhost:8080".into(), "YOURLS_USER=admin".into(), "YOURLS_PASS=${ADMIN_PASSWORD}".into()], volumes: vec![], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "mariadb:10".into(), ports: vec![], env: vec!["MYSQL_ROOT_PASSWORD=${DB_PASSWORD}".into(), "MYSQL_DATABASE=yourls".into()], volumes: vec!["yourls_db:/var/lib/mysql".into()] }], seed_files: vec![], cmd: vec![] }),
+            docker: Some(DockerTarget { image: "yourls:latest".into(), ports: vec!["8080:80".into()], env: vec!["YOURLS_DB_HOST=yourls-db".into(), "YOURLS_DB_PASS=${DB_PASSWORD}".into(), "YOURLS_SITE=http://localhost:8080".into(), "YOURLS_USER=admin".into(), "YOURLS_PASS=${ADMIN_PASSWORD}".into()], volumes: vec![], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "mariadb:10".into(), ports: vec![], env: vec!["MYSQL_ROOT_PASSWORD=${DB_PASSWORD}".into(), "MYSQL_DATABASE=yourls".into()], volumes: vec!["yourls_db:/var/lib/mysql".into()] , cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![] }),
             lxc: None, bare_metal: None, vm: None, user_inputs: vec![
                 UserInput { id: "ADMIN_PASSWORD".into(), label: "Admin Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("YOURLS admin password".into()), options: vec![] },
                 UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("MariaDB password".into()), options: vec![] },
@@ -8185,7 +8425,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         AppManifest { id: "peertube".into(), name: "PeerTube".into(), icon: "▶️".into(), category: "Media".into(),
             description: "Decentralised video hosting — YouTube alternative".into(),
             website: Some("https://joinpeertube.org".into()),
-            docker: Some(DockerTarget { image: "chocobozzz/peertube:production-bookworm".into(), ports: vec!["9000:9000".into()], env: vec!["PEERTUBE_DB_HOSTNAME=peertube-db".into(), "PEERTUBE_DB_USERNAME=peertube".into(), "PEERTUBE_DB_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["peertube_data:/data".into(), "peertube_config:/config".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_DB=peertube".into(), "POSTGRES_USER=peertube".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["peertube_db:/var/lib/postgresql/data".into()] }], seed_files: vec![], cmd: vec![] }),
+            docker: Some(DockerTarget { image: "chocobozzz/peertube:production-bookworm".into(), ports: vec!["9000:9000".into()], env: vec!["PEERTUBE_DB_HOSTNAME=peertube-db".into(), "PEERTUBE_DB_USERNAME=peertube".into(), "PEERTUBE_DB_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["peertube_data:/data".into(), "peertube_config:/config".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_DB=peertube".into(), "POSTGRES_USER=peertube".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["peertube_db:/var/lib/postgresql/data".into()] , cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![] }),
             lxc: None, bare_metal: None, vm: None, user_inputs: vec![
                 UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("PostgreSQL password".into()), options: vec![] },
             ],
@@ -8265,7 +8505,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         AppManifest { id: "weblate".into(), name: "Weblate".into(), icon: "🌍".into(), category: "Productivity".into(),
             description: "Web-based translation management with version control".into(),
             website: Some("https://weblate.org".into()),
-            docker: Some(DockerTarget { image: "weblate/weblate:latest".into(), ports: vec!["8080:8080".into()], env: vec!["WEBLATE_ADMIN_PASSWORD=${ADMIN_PASSWORD}".into(), "POSTGRES_HOST=weblate-db".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["weblate_data:/app/data".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["weblate_db:/var/lib/postgresql/data".into()] }], seed_files: vec![], cmd: vec![] }),
+            docker: Some(DockerTarget { image: "weblate/weblate:latest".into(), ports: vec!["8080:8080".into()], env: vec!["WEBLATE_ADMIN_PASSWORD=${ADMIN_PASSWORD}".into(), "POSTGRES_HOST=weblate-db".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["weblate_data:/app/data".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["weblate_db:/var/lib/postgresql/data".into()] , cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![] }),
             lxc: None, bare_metal: None, vm: None, user_inputs: vec![
                 UserInput { id: "ADMIN_PASSWORD".into(), label: "Admin Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Weblate admin password".into()), options: vec![] },
                 UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("PostgreSQL password".into()), options: vec![] },
@@ -8324,7 +8564,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         AppManifest { id: "netbox".into(), name: "NetBox".into(), icon: "🗺️".into(), category: "Networking".into(),
             description: "IP address management and data centre infrastructure modelling".into(),
             website: Some("https://netbox.dev".into()),
-            docker: Some(DockerTarget { image: "netboxcommunity/netbox:latest".into(), ports: vec!["8080:8080".into()], env: vec!["SUPERUSER_NAME=admin".into(), "SUPERUSER_PASSWORD=${ADMIN_PASSWORD}".into(), "SUPERUSER_EMAIL=admin@example.com".into()], volumes: vec!["netbox_media:/opt/netbox/netbox/media".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_DB=netbox".into(), "POSTGRES_USER=netbox".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["netbox_db:/var/lib/postgresql/data".into()] }], seed_files: vec![], cmd: vec![] }),
+            docker: Some(DockerTarget { image: "netboxcommunity/netbox:latest".into(), ports: vec!["8080:8080".into()], env: vec!["SUPERUSER_NAME=admin".into(), "SUPERUSER_PASSWORD=${ADMIN_PASSWORD}".into(), "SUPERUSER_EMAIL=admin@example.com".into()], volumes: vec!["netbox_media:/opt/netbox/netbox/media".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_DB=netbox".into(), "POSTGRES_USER=netbox".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["netbox_db:/var/lib/postgresql/data".into()] , cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![] }),
             lxc: None, bare_metal: None, vm: None, user_inputs: vec![
                 UserInput { id: "ADMIN_PASSWORD".into(), label: "Admin Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("NetBox admin password".into()), options: vec![] },
                 UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("PostgreSQL password".into()), options: vec![] },
@@ -8348,7 +8588,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         AppManifest { id: "passbolt".into(), name: "Passbolt".into(), icon: "🔐".into(), category: "Security".into(),
             description: "Team password manager with sharing and auditing".into(),
             website: Some("https://www.passbolt.com".into()),
-            docker: Some(DockerTarget { image: "passbolt/passbolt:latest-ce".into(), ports: vec!["8080:80".into(), "8443:443".into()], env: vec!["DATASOURCES_DEFAULT_HOST=passbolt-db".into(), "DATASOURCES_DEFAULT_PASSWORD=${DB_PASSWORD}".into(), "DATASOURCES_DEFAULT_DATABASE=passbolt".into(), "DATASOURCES_DEFAULT_USERNAME=passbolt".into(), "APP_FULL_BASE_URL=http://localhost:8080".into()], volumes: vec!["passbolt_gpg:/etc/passbolt/gpg".into(), "passbolt_jwt:/etc/passbolt/jwt".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "mariadb:10".into(), ports: vec![], env: vec!["MYSQL_ROOT_PASSWORD=${DB_PASSWORD}".into(), "MYSQL_DATABASE=passbolt".into(), "MYSQL_USER=passbolt".into(), "MYSQL_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["passbolt_db:/var/lib/mysql".into()] }], seed_files: vec![], cmd: vec![] }),
+            docker: Some(DockerTarget { image: "passbolt/passbolt:latest-ce".into(), ports: vec!["8080:80".into(), "8443:443".into()], env: vec!["DATASOURCES_DEFAULT_HOST=passbolt-db".into(), "DATASOURCES_DEFAULT_PASSWORD=${DB_PASSWORD}".into(), "DATASOURCES_DEFAULT_DATABASE=passbolt".into(), "DATASOURCES_DEFAULT_USERNAME=passbolt".into(), "APP_FULL_BASE_URL=http://localhost:8080".into()], volumes: vec!["passbolt_gpg:/etc/passbolt/gpg".into(), "passbolt_jwt:/etc/passbolt/jwt".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "mariadb:10".into(), ports: vec![], env: vec!["MYSQL_ROOT_PASSWORD=${DB_PASSWORD}".into(), "MYSQL_DATABASE=passbolt".into(), "MYSQL_USER=passbolt".into(), "MYSQL_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["passbolt_db:/var/lib/mysql".into()] , cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![] }),
             lxc: None, bare_metal: None, vm: None, user_inputs: vec![
                 UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("MariaDB password".into()), options: vec![] },
             ],
@@ -8406,12 +8646,149 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
 
         // ─── Communication (batch 3) ───
 
-        // Discourse / Flarum / Chatwoot removed — all three need an
-        // external database (and Redis, for Chatwoot) plus an initial
-        // migration step. Discourse in particular isn't even packaged
-        // as a single container upstream (launcher + base image), so
-        // pulling `discourse/discourse:latest` fails outright. Add
-        // Compose templates if wanted back.
+        // Flarum — crazymax/flarum bundles nginx + php-fpm + SQLite
+        // in one image, so it's a true single-container install.
+        AppManifest { id: "flarum".into(), name: "Flarum".into(), icon: "💬".into(), category: "Communication".into(),
+            description: "Lightweight, modern community forum — all-in-one image with bundled SQLite".into(),
+            website: Some("https://flarum.org".into()),
+            docker: Some(DockerTarget { image: "crazymax/flarum:latest".into(), ports: vec!["8000:8000".into()], env: vec!["FLARUM_BASE_URL=${BASE_URL}".into()], volumes: vec!["flarum_data:/data".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }),
+            lxc: None, bare_metal: None, vm: None, user_inputs: vec![
+                UserInput { id: "BASE_URL".into(), label: "Base URL".into(), input_type: "text".into(), default: Some("http://localhost:8000".into()), required: true, placeholder: Some("e.g. https://forum.example.com".into()), options: vec![] },
+            ],
+        },
+
+        // Discourse — upstream only ships a `base` image that their
+        // `launcher` script rebuilds into a custom per-host image.
+        // Bitnami packages a runnable app + separate Postgres + Redis
+        // which is the closest we can get to one-click.
+        AppManifest { id: "discourse".into(), name: "Discourse".into(), icon: "💬".into(), category: "Communication".into(),
+            description: "Modern community forum and discussion platform".into(),
+            website: Some("https://www.discourse.org".into()),
+            docker: Some(DockerTarget {
+                image: "bitnami/discourse:latest".into(),
+                ports: vec!["8480:3000".into()],
+                env: vec![
+                    "DISCOURSE_DATABASE_HOST=${CONTAINER_NAME}-db".into(),
+                    "DISCOURSE_DATABASE_NAME=discourse".into(),
+                    "DISCOURSE_DATABASE_USER=discourse".into(),
+                    "DISCOURSE_DATABASE_PASSWORD=${DB_PASSWORD}".into(),
+                    "DISCOURSE_REDIS_HOST=${CONTAINER_NAME}-redis".into(),
+                    "DISCOURSE_HOST=${HOST}".into(),
+                    "DISCOURSE_USERNAME=${ADMIN_USER}".into(),
+                    "DISCOURSE_PASSWORD=${ADMIN_PASSWORD}".into(),
+                    "DISCOURSE_EMAIL=admin@localhost".into(),
+                ],
+                volumes: vec!["discourse_data:/bitnami/discourse".into()],
+                sidecars: vec![
+                    DockerSidecar {
+                        name_suffix: "db".into(),
+                        image: "bitnami/postgresql:15".into(),
+                        ports: vec![],
+                        env: vec![
+                            "POSTGRESQL_USERNAME=discourse".into(),
+                            "POSTGRESQL_PASSWORD=${DB_PASSWORD}".into(),
+                            "POSTGRESQL_DATABASE=discourse".into(),
+                            "POSTGRESQL_POSTGRES_PASSWORD=${DB_PASSWORD}".into(),
+                        ],
+                        volumes: vec!["discourse_db:/bitnami/postgresql".into()],
+                        cmd: vec![], post_install_exec: vec![],
+                    },
+                    DockerSidecar {
+                        name_suffix: "redis".into(),
+                        image: "bitnami/redis:7".into(),
+                        ports: vec![],
+                        env: vec!["ALLOW_EMPTY_PASSWORD=yes".into()],
+                        volumes: vec!["discourse_redis:/bitnami/redis/data".into()],
+                        cmd: vec![], post_install_exec: vec![],
+                    },
+                ],
+                seed_files: vec![], cmd: vec![],
+            }),
+            lxc: None, bare_metal: None, vm: None, user_inputs: vec![
+                UserInput { id: "HOST".into(), label: "Hostname".into(), input_type: "text".into(), default: Some("localhost".into()), required: true, placeholder: Some("e.g. forum.example.com".into()), options: vec![] },
+                UserInput { id: "ADMIN_USER".into(), label: "Admin Username".into(), input_type: "text".into(), default: Some("admin".into()), required: true, placeholder: None, options: vec![] },
+                UserInput { id: "ADMIN_PASSWORD".into(), label: "Admin Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Min 10 characters".into()), options: vec![] },
+                UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Postgres password".into()), options: vec![] },
+            ],
+        },
+
+        // Chatwoot — Rails app + Postgres + Redis + Sidekiq worker
+        // (same image, different cmd). The app runs migrations on
+        // first boot via its bundled docker-entrypoint.
+        AppManifest { id: "chatwoot".into(), name: "Chatwoot".into(), icon: "💬".into(), category: "Communication".into(),
+            description: "Customer engagement platform — live chat, email, social".into(),
+            website: Some("https://www.chatwoot.com".into()),
+            docker: Some(DockerTarget {
+                image: "chatwoot/chatwoot:latest".into(),
+                ports: vec!["3030:3000".into()],
+                env: vec![
+                    "SECRET_KEY_BASE=${SECRET_KEY}".into(),
+                    "FRONTEND_URL=${FRONTEND_URL}".into(),
+                    "POSTGRES_HOST=${CONTAINER_NAME}-db".into(),
+                    "POSTGRES_USERNAME=chatwoot".into(),
+                    "POSTGRES_PASSWORD=${DB_PASSWORD}".into(),
+                    "POSTGRES_DATABASE=chatwoot".into(),
+                    "REDIS_URL=redis://${CONTAINER_NAME}-redis:6379".into(),
+                    "RAILS_ENV=production".into(),
+                    "NODE_ENV=production".into(),
+                    "INSTALLATION_ENV=docker".into(),
+                ],
+                volumes: vec!["chatwoot_storage:/app/storage".into()],
+                sidecars: vec![
+                    DockerSidecar {
+                        name_suffix: "db".into(),
+                        image: "postgres:15-alpine".into(),
+                        ports: vec![],
+                        env: vec![
+                            "POSTGRES_USER=chatwoot".into(),
+                            "POSTGRES_PASSWORD=${DB_PASSWORD}".into(),
+                            "POSTGRES_DB=chatwoot".into(),
+                        ],
+                        volumes: vec!["chatwoot_db:/var/lib/postgresql/data".into()],
+                        cmd: vec![], post_install_exec: vec![],
+                    },
+                    DockerSidecar {
+                        name_suffix: "redis".into(),
+                        image: "redis:7-alpine".into(),
+                        ports: vec![],
+                        env: vec![],
+                        volumes: vec!["chatwoot_redis:/data".into()],
+                        cmd: vec![], post_install_exec: vec![],
+                    },
+                    DockerSidecar {
+                        name_suffix: "sidekiq".into(),
+                        image: "chatwoot/chatwoot:latest".into(),
+                        ports: vec![],
+                        env: vec![
+                            "SECRET_KEY_BASE=${SECRET_KEY}".into(),
+                            "FRONTEND_URL=${FRONTEND_URL}".into(),
+                            "POSTGRES_HOST=${CONTAINER_NAME}-db".into(),
+                            "POSTGRES_USERNAME=chatwoot".into(),
+                            "POSTGRES_PASSWORD=${DB_PASSWORD}".into(),
+                            "POSTGRES_DATABASE=chatwoot".into(),
+                            "REDIS_URL=redis://${CONTAINER_NAME}-redis:6379".into(),
+                            "RAILS_ENV=production".into(),
+                            "NODE_ENV=production".into(),
+                            "INSTALLATION_ENV=docker".into(),
+                        ],
+                        volumes: vec!["chatwoot_storage:/app/storage".into()],
+                        cmd: vec!["bundle".into(), "exec".into(), "sidekiq".into(), "-C".into(), "config/sidekiq.yml".into()],
+                        post_install_exec: vec![],
+                    },
+                ],
+                seed_files: vec![],
+                // `db:chatwoot_prepare` is idempotent — creates schema
+                // on first install, runs any pending migrations on
+                // subsequent starts. Without this the web container
+                // starts but every request 500s on missing tables.
+                cmd: vec!["sh".into(), "-c".into(), "bundle exec rails db:chatwoot_prepare && bundle exec rails server -b 0.0.0.0 -p 3000".into()],
+            }),
+            lxc: None, bare_metal: None, vm: None, user_inputs: vec![
+                UserInput { id: "SECRET_KEY".into(), label: "Secret Key Base".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Long random hex (64 chars)".into()), options: vec![] },
+                UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Postgres password".into()), options: vec![] },
+                UserInput { id: "FRONTEND_URL".into(), label: "Frontend URL".into(), input_type: "text".into(), default: Some("http://localhost:3030".into()), required: true, placeholder: Some("e.g. https://chat.example.com".into()), options: vec![] },
+            ],
+        },
 
         // ─── CMS (batch 3) ───
 
@@ -8584,7 +8961,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         AppManifest { id: "ackee".into(), name: "Ackee".into(), icon: "📈".into(), category: "Analytics".into(),
             description: "Privacy-focused analytics without cookies — Node.js based".into(),
             website: Some("https://ackee.electerious.com".into()),
-            docker: Some(DockerTarget { image: "electerious/ackee:latest".into(), ports: vec!["3000:3000".into()], env: vec!["ACKEE_MONGODB=mongodb://ackee-db:27017/ackee".into(), "ACKEE_USERNAME=admin".into(), "ACKEE_PASSWORD=${ADMIN_PASSWORD}".into()], volumes: vec![], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "mongo:6".into(), ports: vec![], env: vec![], volumes: vec!["ackee_db:/data/db".into()] }], seed_files: vec![], cmd: vec![] }),
+            docker: Some(DockerTarget { image: "electerious/ackee:latest".into(), ports: vec!["3000:3000".into()], env: vec!["ACKEE_MONGODB=mongodb://ackee-db:27017/ackee".into(), "ACKEE_USERNAME=admin".into(), "ACKEE_PASSWORD=${ADMIN_PASSWORD}".into()], volumes: vec![], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "mongo:6".into(), ports: vec![], env: vec![], volumes: vec!["ackee_db:/data/db".into()] , cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![] }),
             lxc: None, bare_metal: None, vm: None, user_inputs: vec![
                 UserInput { id: "ADMIN_PASSWORD".into(), label: "Admin Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Ackee admin password".into()), options: vec![] },
             ],
@@ -8601,7 +8978,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         AppManifest { id: "concourse".into(), name: "Concourse CI".into(), icon: "✈️".into(), category: "CI/CD".into(),
             description: "Pipeline-based CI/CD system with reproducible builds".into(),
             website: Some("https://concourse-ci.org".into()),
-            docker: Some(DockerTarget { image: "concourse/concourse:latest".into(), ports: vec!["8080:8080".into()], env: vec!["CONCOURSE_ADD_LOCAL_USER=admin:${ADMIN_PASSWORD}".into(), "CONCOURSE_MAIN_TEAM_LOCAL_USER=admin".into(), "CONCOURSE_EXTERNAL_URL=http://localhost:8080".into(), "CONCOURSE_POSTGRES_HOST=concourse-db".into(), "CONCOURSE_POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec![], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_DB=concourse".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["concourse_db:/var/lib/postgresql/data".into()] }], seed_files: vec![], cmd: vec![] }),
+            docker: Some(DockerTarget { image: "concourse/concourse:latest".into(), ports: vec!["8080:8080".into()], env: vec!["CONCOURSE_ADD_LOCAL_USER=admin:${ADMIN_PASSWORD}".into(), "CONCOURSE_MAIN_TEAM_LOCAL_USER=admin".into(), "CONCOURSE_EXTERNAL_URL=http://localhost:8080".into(), "CONCOURSE_POSTGRES_HOST=concourse-db".into(), "CONCOURSE_POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec![], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_DB=concourse".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["concourse_db:/var/lib/postgresql/data".into()] , cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![] }),
             lxc: None, bare_metal: None, vm: None, user_inputs: vec![
                 UserInput { id: "ADMIN_PASSWORD".into(), label: "Admin Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Concourse admin password".into()), options: vec![] },
                 UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("PostgreSQL password".into()), options: vec![] },
@@ -8657,7 +9034,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         AppManifest { id: "sshwifty".into(), name: "Sshwifty".into(), icon: "🔌".into(), category: "Dev Tools".into(), description: "SSH and Telnet client in the browser".into(), website: Some("https://github.com/nirui/sshwifty".into()), docker: Some(DockerTarget { image: "niruix/sshwifty:latest".into(), ports: vec!["8182:8182".into()], env: vec![], volumes: vec![], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
         AppManifest { id: "webssh".into(), name: "WebSSH".into(), icon: "💻".into(), category: "Dev Tools".into(), description: "Web-based SSH terminal".into(), website: Some("https://github.com/huashengdun/webssh".into()), docker: Some(DockerTarget { image: "snsyzb/webssh:latest".into(), ports: vec!["8888:8888".into()], env: vec![], volumes: vec![], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
 
-        AppManifest { id: "ferretdb".into(), name: "FerretDB".into(), icon: "🐾".into(), category: "Database".into(), description: "Open-source MongoDB alternative built on PostgreSQL".into(), website: Some("https://www.ferretdb.com".into()), docker: Some(DockerTarget { image: "ghcr.io/ferretdb/ferretdb:latest".into(), ports: vec!["27017:27017".into()], env: vec!["FERRETDB_POSTGRESQL_URL=postgres://postgres:${DB_PASSWORD}@ferretdb-db:5432/ferretdb".into()], volumes: vec![], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_DB=ferretdb".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["ferretdb_db:/var/lib/postgresql/data".into()] }], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("PostgreSQL password".into()), options: vec![] }] },
+        AppManifest { id: "ferretdb".into(), name: "FerretDB".into(), icon: "🐾".into(), category: "Database".into(), description: "Open-source MongoDB alternative built on PostgreSQL".into(), website: Some("https://www.ferretdb.com".into()), docker: Some(DockerTarget { image: "ghcr.io/ferretdb/ferretdb:latest".into(), ports: vec!["27017:27017".into()], env: vec!["FERRETDB_POSTGRESQL_URL=postgres://postgres:${DB_PASSWORD}@ferretdb-db:5432/ferretdb".into()], volumes: vec![], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_DB=ferretdb".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["ferretdb_db:/var/lib/postgresql/data".into()] , cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("PostgreSQL password".into()), options: vec![] }] },
         AppManifest { id: "edgedb".into(), name: "EdgeDB".into(), icon: "🔺".into(), category: "Database".into(), description: "Next-gen database with a graph-relational model and EdgeQL".into(), website: Some("https://www.edgedb.com".into()), docker: Some(DockerTarget { image: "edgedb/edgedb:latest".into(), ports: vec!["5656:5656".into()], env: vec!["EDGEDB_SERVER_SECURITY=insecure_dev_mode".into()], volumes: vec!["edgedb_data:/var/lib/edgedb/data".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
         AppManifest { id: "rethinkdb".into(), name: "RethinkDB".into(), icon: "🔄".into(), category: "Database".into(), description: "Real-time database with change feeds for push architectures".into(), website: Some("https://rethinkdb.com".into()), docker: Some(DockerTarget { image: "rethinkdb:latest".into(), ports: vec!["8080:8080".into(), "28015:28015".into()], env: vec![], volumes: vec!["rethinkdb_data:/data".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
         AppManifest { id: "couchdb".into(), name: "Apache CouchDB".into(), icon: "🛋️".into(), category: "Database".into(), description: "Document-oriented database with HTTP API and replication".into(), website: Some("https://couchdb.apache.org".into()), docker: Some(DockerTarget { image: "couchdb:latest".into(), ports: vec!["5984:5984".into()], env: vec!["COUCHDB_USER=admin".into(), "COUCHDB_PASSWORD=${ADMIN_PASSWORD}".into()], volumes: vec!["couchdb_data:/opt/couchdb/data".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "ADMIN_PASSWORD".into(), label: "Admin Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("CouchDB admin password".into()), options: vec![] }] },
@@ -8690,7 +9067,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         AppManifest { id: "kasm".into(), name: "Kasm Workspaces".into(), icon: "🖥️".into(), category: "Other".into(), description: "Streaming containerised apps and desktops to the browser".into(), website: Some("https://kasmweb.com".into()), docker: Some(DockerTarget { image: "kasmweb/core:latest".into(), ports: vec!["443:443".into()], env: vec![], volumes: vec!["kasm_data:/opt/kasm".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
         AppManifest { id: "reactive-resume".into(), name: "Reactive Resume".into(), icon: "📄".into(), category: "Other".into(), description: "Beautiful resume builder with real-time preview".into(), website: Some("https://rxresu.me".into()), docker: Some(DockerTarget { image: "amruthpillai/reactive-resume:latest".into(), ports: vec!["3000:3000".into()], env: vec![], volumes: vec![], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
         AppManifest { id: "inventree".into(), name: "InvenTree".into(), icon: "📦".into(), category: "Other".into(), description: "Inventory management for electronics and parts".into(), website: Some("https://inventree.org".into()), docker: Some(DockerTarget { image: "inventree/inventree:stable".into(), ports: vec!["1337:8000".into()], env: vec!["INVENTREE_DB_ENGINE=sqlite3".into()], volumes: vec!["inventree_data:/home/inventree/data".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
-        AppManifest { id: "snipe-it".into(), name: "Snipe-IT".into(), icon: "🏷️".into(), category: "Other".into(), description: "IT asset management — track hardware, software, licenses".into(), website: Some("https://snipeitapp.com".into()), docker: Some(DockerTarget { image: "snipe/snipe-it:latest".into(), ports: vec!["8080:80".into()], env: vec!["APP_KEY=${APP_KEY}".into(), "DB_HOST=snipeit-db".into(), "DB_DATABASE=snipeit".into(), "DB_USERNAME=snipeit".into(), "DB_PASSWORD=${DB_PASSWORD}".into(), "APP_URL=http://localhost:8080".into()], volumes: vec!["snipeit_data:/var/lib/snipeit".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "mariadb:10".into(), ports: vec![], env: vec!["MYSQL_ROOT_PASSWORD=${DB_PASSWORD}".into(), "MYSQL_DATABASE=snipeit".into(), "MYSQL_USER=snipeit".into(), "MYSQL_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["snipeit_db:/var/lib/mysql".into()] }], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "APP_KEY".into(), label: "App Key".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("base64:... (32-char random)".into()), options: vec![] }, UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("MariaDB password".into()), options: vec![] }] },
+        AppManifest { id: "snipe-it".into(), name: "Snipe-IT".into(), icon: "🏷️".into(), category: "Other".into(), description: "IT asset management — track hardware, software, licenses".into(), website: Some("https://snipeitapp.com".into()), docker: Some(DockerTarget { image: "snipe/snipe-it:latest".into(), ports: vec!["8080:80".into()], env: vec!["APP_KEY=${APP_KEY}".into(), "DB_HOST=snipeit-db".into(), "DB_DATABASE=snipeit".into(), "DB_USERNAME=snipeit".into(), "DB_PASSWORD=${DB_PASSWORD}".into(), "APP_URL=http://localhost:8080".into()], volumes: vec!["snipeit_data:/var/lib/snipeit".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "mariadb:10".into(), ports: vec![], env: vec!["MYSQL_ROOT_PASSWORD=${DB_PASSWORD}".into(), "MYSQL_DATABASE=snipeit".into(), "MYSQL_USER=snipeit".into(), "MYSQL_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["snipeit_db:/var/lib/mysql".into()] , cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "APP_KEY".into(), label: "App Key".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("base64:... (32-char random)".into()), options: vec![] }, UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("MariaDB password".into()), options: vec![] }] },
         AppManifest { id: "grocy".into(), name: "Grocy".into(), icon: "🛒".into(), category: "Other".into(), description: "Groceries and household management — shopping lists, recipes, stock".into(), website: Some("https://grocy.info".into()), docker: Some(DockerTarget { image: "linuxserver/grocy:latest".into(), ports: vec!["9283:80".into()], env: vec!["PUID=1000".into(), "PGID=1000".into()], volumes: vec!["grocy_config:/config".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
         AppManifest { id: "mealie".into(), name: "Mealie".into(), icon: "🍽️".into(), category: "Other".into(), description: "Recipe management with meal planning and shopping lists".into(), website: Some("https://mealie.io".into()), docker: Some(DockerTarget { image: "ghcr.io/mealie-recipes/mealie:latest".into(), ports: vec!["9925:9000".into()], env: vec![], volumes: vec!["mealie_data:/app/data".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
         AppManifest { id: "homebox".into(), name: "Homebox".into(), icon: "📦".into(), category: "Other".into(), description: "Home inventory management with labels and locations".into(), website: Some("https://hay-kot.github.io/homebox/".into()), docker: Some(DockerTarget { image: "ghcr.io/hay-kot/homebox:latest".into(), ports: vec!["7745:7745".into()], env: vec![], volumes: vec!["homebox_data:/data".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
@@ -8702,12 +9079,245 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         // standalone.
         AppManifest { id: "rundeck".into(), name: "Rundeck".into(), icon: "⚙️".into(), category: "Automation".into(), description: "Runbook automation — schedule and run operational tasks".into(), website: Some("https://www.rundeck.com".into()), docker: Some(DockerTarget { image: "rundeck/rundeck:latest".into(), ports: vec!["4440:4440".into()], env: vec![], volumes: vec!["rundeck_data:/home/rundeck/server/data".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
 
-        // Mastodon / Pixelfed / Lemmy / Misskey removed — all four are
-        // multi-container stacks (Postgres + Redis + worker + streaming
-        // for Mastodon, Pictrs + lemmy-ui for Lemmy, etc.) that need
-        // initial migrations and secret generation. A one-container
-        // DockerTarget can't express any of that, so every install was
-        // DOA. Add proper Compose templates if these are wanted back.
+        // Mastodon — web + sidekiq worker + streaming + Postgres +
+        // Redis. All three Mastodon containers run the same image with
+        // different commands. Secrets (SECRET_KEY_BASE, OTP_SECRET,
+        // VAPID keys) are collected up-front as user inputs.
+        AppManifest { id: "mastodon".into(), name: "Mastodon".into(), icon: "🐘".into(), category: "Communication".into(),
+            description: "Decentralised social network — Twitter/X alternative".into(),
+            website: Some("https://joinmastodon.org".into()),
+            docker: Some(DockerTarget {
+                image: "ghcr.io/mastodon/mastodon:latest".into(),
+                ports: vec!["3030:3000".into()],
+                env: vec![
+                    "LOCAL_DOMAIN=${LOCAL_DOMAIN}".into(),
+                    "SINGLE_USER_MODE=false".into(),
+                    "SECRET_KEY_BASE=${SECRET_KEY_BASE}".into(),
+                    "OTP_SECRET=${OTP_SECRET}".into(),
+                    "VAPID_PRIVATE_KEY=${VAPID_PRIVATE_KEY}".into(),
+                    "VAPID_PUBLIC_KEY=${VAPID_PUBLIC_KEY}".into(),
+                    "DB_HOST=${CONTAINER_NAME}-db".into(),
+                    "DB_USER=mastodon".into(),
+                    "DB_NAME=mastodon".into(),
+                    "DB_PASS=${DB_PASSWORD}".into(),
+                    "REDIS_HOST=${CONTAINER_NAME}-redis".into(),
+                    "RAILS_ENV=production".into(),
+                ],
+                volumes: vec!["mastodon_public:/mastodon/public/system".into()],
+                sidecars: vec![
+                    DockerSidecar {
+                        name_suffix: "db".into(), image: "postgres:15-alpine".into(),
+                        ports: vec![],
+                        env: vec![
+                            "POSTGRES_USER=mastodon".into(),
+                            "POSTGRES_PASSWORD=${DB_PASSWORD}".into(),
+                            "POSTGRES_DB=mastodon".into(),
+                        ],
+                        volumes: vec!["mastodon_db:/var/lib/postgresql/data".into()],
+                        cmd: vec![], post_install_exec: vec![],
+                    },
+                    DockerSidecar {
+                        name_suffix: "redis".into(), image: "redis:7-alpine".into(),
+                        ports: vec![], env: vec![],
+                        volumes: vec!["mastodon_redis:/data".into()],
+                        cmd: vec![], post_install_exec: vec![],
+                    },
+                    DockerSidecar {
+                        name_suffix: "sidekiq".into(), image: "ghcr.io/mastodon/mastodon:latest".into(),
+                        ports: vec![],
+                        env: vec![
+                            "LOCAL_DOMAIN=${LOCAL_DOMAIN}".into(),
+                            "SECRET_KEY_BASE=${SECRET_KEY_BASE}".into(),
+                            "OTP_SECRET=${OTP_SECRET}".into(),
+                            "VAPID_PRIVATE_KEY=${VAPID_PRIVATE_KEY}".into(),
+                            "VAPID_PUBLIC_KEY=${VAPID_PUBLIC_KEY}".into(),
+                            "DB_HOST=${CONTAINER_NAME}-db".into(),
+                            "DB_USER=mastodon".into(),
+                            "DB_NAME=mastodon".into(),
+                            "DB_PASS=${DB_PASSWORD}".into(),
+                            "REDIS_HOST=${CONTAINER_NAME}-redis".into(),
+                            "RAILS_ENV=production".into(),
+                        ],
+                        volumes: vec!["mastodon_public:/mastodon/public/system".into()],
+                        cmd: vec!["bundle".into(), "exec".into(), "sidekiq".into()],
+                        post_install_exec: vec![],
+                    },
+                    DockerSidecar {
+                        name_suffix: "streaming".into(), image: "ghcr.io/mastodon/mastodon-streaming:latest".into(),
+                        ports: vec!["4040:4000".into()],
+                        env: vec![
+                            "LOCAL_DOMAIN=${LOCAL_DOMAIN}".into(),
+                            "DB_HOST=${CONTAINER_NAME}-db".into(),
+                            "DB_USER=mastodon".into(),
+                            "DB_NAME=mastodon".into(),
+                            "DB_PASS=${DB_PASSWORD}".into(),
+                            "REDIS_HOST=${CONTAINER_NAME}-redis".into(),
+                        ],
+                        volumes: vec![],
+                        cmd: vec![], post_install_exec: vec![],
+                    },
+                ],
+                seed_files: vec![],
+                // `db:prepare` is idempotent: creates the database on
+                // first install, then only runs pending migrations on
+                // subsequent starts. `db:migrate` alone would fail on
+                // first boot because the DB doesn't exist yet.
+                cmd: vec!["bash".into(), "-c".into(), "bundle exec rake db:prepare && bundle exec rails s -p 3000".into()],
+            }),
+            lxc: None, bare_metal: None, vm: None, user_inputs: vec![
+                UserInput { id: "LOCAL_DOMAIN".into(), label: "Instance Domain".into(), input_type: "text".into(), default: None, required: true, placeholder: Some("e.g. social.example.com".into()), options: vec![] },
+                UserInput { id: "SECRET_KEY_BASE".into(), label: "Secret Key Base".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("128-char hex (bundle exec rails secret)".into()), options: vec![] },
+                UserInput { id: "OTP_SECRET".into(), label: "OTP Secret".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("128-char hex (rails secret)".into()), options: vec![] },
+                UserInput { id: "VAPID_PRIVATE_KEY".into(), label: "VAPID Private Key".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("rake mastodon:webpush:generate_vapid_key".into()), options: vec![] },
+                UserInput { id: "VAPID_PUBLIC_KEY".into(), label: "VAPID Public Key".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("from same rake task".into()), options: vec![] },
+                UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Postgres password".into()), options: vec![] },
+            ],
+        },
+
+        // Pixelfed — Laravel app + Postgres + Redis + horizon worker.
+        AppManifest { id: "pixelfed".into(), name: "Pixelfed".into(), icon: "📸".into(), category: "Communication".into(),
+            description: "Decentralised photo sharing — Instagram alternative".into(),
+            website: Some("https://pixelfed.org".into()),
+            docker: Some(DockerTarget {
+                image: "zknt/pixelfed:latest".into(),
+                ports: vec!["8088:80".into()],
+                env: vec![
+                    "APP_NAME=Pixelfed".into(),
+                    "APP_URL=${APP_URL}".into(),
+                    "APP_DOMAIN=${APP_DOMAIN}".into(),
+                    "APP_KEY=${APP_KEY}".into(),
+                    "DB_CONNECTION=pgsql".into(),
+                    "DB_HOST=${CONTAINER_NAME}-db".into(),
+                    "DB_PORT=5432".into(),
+                    "DB_DATABASE=pixelfed".into(),
+                    "DB_USERNAME=pixelfed".into(),
+                    "DB_PASSWORD=${DB_PASSWORD}".into(),
+                    "REDIS_HOST=${CONTAINER_NAME}-redis".into(),
+                    "CACHE_DRIVER=redis".into(),
+                    "QUEUE_DRIVER=redis".into(),
+                    "SESSION_DRIVER=redis".into(),
+                ],
+                volumes: vec!["pixelfed_storage:/var/www/storage".into()],
+                sidecars: vec![
+                    DockerSidecar {
+                        name_suffix: "db".into(), image: "postgres:15-alpine".into(),
+                        ports: vec![],
+                        env: vec!["POSTGRES_USER=pixelfed".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into(), "POSTGRES_DB=pixelfed".into()],
+                        volumes: vec!["pixelfed_db:/var/lib/postgresql/data".into()],
+                        cmd: vec![], post_install_exec: vec![],
+                    },
+                    DockerSidecar {
+                        name_suffix: "redis".into(), image: "redis:7-alpine".into(),
+                        ports: vec![], env: vec![],
+                        volumes: vec!["pixelfed_redis:/data".into()],
+                        cmd: vec![], post_install_exec: vec![],
+                    },
+                ],
+                seed_files: vec![], cmd: vec![],
+            }),
+            lxc: None, bare_metal: None, vm: None, user_inputs: vec![
+                UserInput { id: "APP_URL".into(), label: "App URL".into(), input_type: "text".into(), default: Some("http://localhost:8088".into()), required: true, placeholder: Some("e.g. https://pixel.example.com".into()), options: vec![] },
+                UserInput { id: "APP_DOMAIN".into(), label: "Domain".into(), input_type: "text".into(), default: Some("localhost:8088".into()), required: true, placeholder: Some("e.g. pixel.example.com".into()), options: vec![] },
+                UserInput { id: "APP_KEY".into(), label: "App Key".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("base64:… (32-byte random, `php artisan key:generate`)".into()), options: vec![] },
+                UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Postgres password".into()), options: vec![] },
+            ],
+        },
+
+        // Lemmy — backend + lemmy-ui (separate image) + Postgres + pictrs.
+        // The backend reads /config/config.hjson on startup and exits
+        // if it's missing, so we seed a minimal file via seed_files.
+        AppManifest { id: "lemmy".into(), name: "Lemmy".into(), icon: "🐭".into(), category: "Communication".into(),
+            description: "Federated link aggregator — Reddit alternative".into(),
+            website: Some("https://join-lemmy.org".into()),
+            docker: Some(DockerTarget {
+                image: "dessalines/lemmy:latest".into(),
+                ports: vec!["8536:8536".into()],
+                env: vec![
+                    "LEMMY_CONFIG_LOCATION=/config/config.hjson".into(),
+                    "RUST_LOG=warn".into(),
+                ],
+                volumes: vec!["lemmy_data:/config".into()],
+                sidecars: vec![
+                    DockerSidecar {
+                        name_suffix: "db".into(), image: "postgres:15-alpine".into(),
+                        ports: vec![],
+                        env: vec!["POSTGRES_USER=lemmy".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into(), "POSTGRES_DB=lemmy".into()],
+                        volumes: vec!["lemmy_db:/var/lib/postgresql/data".into()],
+                        cmd: vec![], post_install_exec: vec![],
+                    },
+                    DockerSidecar {
+                        name_suffix: "ui".into(), image: "dessalines/lemmy-ui:latest".into(),
+                        ports: vec!["1235:1234".into()],
+                        env: vec![
+                            "LEMMY_UI_LEMMY_INTERNAL_HOST=${CONTAINER_NAME}:8536".into(),
+                            "LEMMY_UI_LEMMY_EXTERNAL_HOST=${EXTERNAL_HOST}".into(),
+                            "LEMMY_UI_HTTPS=false".into(),
+                        ],
+                        volumes: vec![],
+                        cmd: vec![], post_install_exec: vec![],
+                    },
+                    DockerSidecar {
+                        name_suffix: "pictrs".into(), image: "asonix/pictrs:0.5".into(),
+                        ports: vec![],
+                        env: vec!["PICTRS__SERVER__API_KEY=${PICTRS_API_KEY}".into()],
+                        volumes: vec!["lemmy_pictrs:/mnt".into()],
+                        cmd: vec![], post_install_exec: vec![],
+                    },
+                ],
+                seed_files: vec![SeedFile {
+                    container_path: "/config/config.hjson".into(),
+                    content: "{\n  database: {\n    host: \"${CONTAINER_NAME}-db\"\n    port: 5432\n    user: \"lemmy\"\n    password: \"${DB_PASSWORD}\"\n    database: \"lemmy\"\n  }\n  hostname: \"${EXTERNAL_HOST}\"\n  bind: \"0.0.0.0\"\n  port: 8536\n  tls_enabled: false\n  pictrs: {\n    url: \"http://${CONTAINER_NAME}-pictrs:8080/\"\n    api_key: \"${PICTRS_API_KEY}\"\n  }\n}\n".into(),
+                }],
+                cmd: vec![],
+            }),
+            lxc: None, bare_metal: None, vm: None, user_inputs: vec![
+                UserInput { id: "EXTERNAL_HOST".into(), label: "External Hostname".into(), input_type: "text".into(), default: Some("localhost:1235".into()), required: true, placeholder: Some("e.g. lemmy.example.com".into()), options: vec![] },
+                UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Postgres password".into()), options: vec![] },
+                UserInput { id: "PICTRS_API_KEY".into(), label: "Pictrs API Key".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Random string for pictrs auth".into()), options: vec![] },
+            ],
+        },
+
+        // Misskey — app + Postgres + Redis. The Misskey image does
+        // NOT honour MISSKEY_* env vars for DB / URL; it reads its
+        // config from /misskey/.config/default.yml. We seed that file
+        // at install time so the single-container install actually
+        // boots. Image lives at ghcr.io/misskey-dev, not docker.io.
+        AppManifest { id: "misskey".into(), name: "Misskey".into(), icon: "🌟".into(), category: "Communication".into(),
+            description: "Decentralised social media with customisable UI".into(),
+            website: Some("https://misskey-hub.net".into()),
+            docker: Some(DockerTarget {
+                image: "ghcr.io/misskey-dev/misskey:latest".into(),
+                ports: vec!["3033:3000".into()],
+                env: vec![
+                    "NODE_ENV=production".into(),
+                ],
+                volumes: vec!["misskey_files:/misskey/files".into()],
+                sidecars: vec![
+                    DockerSidecar {
+                        name_suffix: "db".into(), image: "postgres:15-alpine".into(),
+                        ports: vec![],
+                        env: vec!["POSTGRES_USER=misskey".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into(), "POSTGRES_DB=misskey".into()],
+                        volumes: vec!["misskey_db:/var/lib/postgresql/data".into()],
+                        cmd: vec![], post_install_exec: vec![],
+                    },
+                    DockerSidecar {
+                        name_suffix: "redis".into(), image: "redis:7-alpine".into(),
+                        ports: vec![], env: vec![],
+                        volumes: vec!["misskey_redis:/data".into()],
+                        cmd: vec![], post_install_exec: vec![],
+                    },
+                ],
+                seed_files: vec![SeedFile {
+                    container_path: "/misskey/.config/default.yml".into(),
+                    content: "url: ${MISSKEY_URL}\nport: 3000\ndb:\n  host: ${CONTAINER_NAME}-db\n  port: 5432\n  db: misskey\n  user: misskey\n  pass: ${DB_PASSWORD}\nredis:\n  host: ${CONTAINER_NAME}-redis\n  port: 6379\nid: 'aidx'\n".into(),
+                }],
+                cmd: vec![],
+            }),
+            lxc: None, bare_metal: None, vm: None, user_inputs: vec![
+                UserInput { id: "MISSKEY_URL".into(), label: "Instance URL".into(), input_type: "text".into(), default: Some("http://localhost:3033".into()), required: true, placeholder: Some("e.g. https://misskey.example.com".into()), options: vec![] },
+                UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Postgres password".into()), options: vec![] },
+            ],
+        },
 
         AppManifest { id: "supavisor".into(), name: "Supavisor".into(), icon: "🐘".into(), category: "Database".into(), description: "Scalable PostgreSQL connection pooler by Supabase".into(), website: Some("https://github.com/supabase/supavisor".into()), docker: Some(DockerTarget { image: "supabase/supavisor:latest".into(), ports: vec!["4000:4000".into()], env: vec![], volumes: vec![], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
         AppManifest { id: "pgbouncer".into(), name: "PgBouncer".into(), icon: "🏀".into(), category: "Database".into(), description: "Lightweight PostgreSQL connection pooler".into(), website: Some("https://www.pgbouncer.org".into()), docker: Some(DockerTarget { image: "edoburu/pgbouncer:latest".into(), ports: vec!["5432:5432".into()], env: vec!["DATABASE_URL=postgres://postgres:${DB_PASSWORD}@db:5432/postgres".into()], volumes: vec![], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("PostgreSQL password".into()), options: vec![] }] },
@@ -8723,10 +9333,90 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         AppManifest { id: "traggo-v2".into(), name: "Wakapi (coding stats)".into(), icon: "📊".into(), category: "Productivity".into(), description: "WakaTime-compatible coding activity dashboard".into(), website: Some("https://wakapi.dev".into()), docker: Some(DockerTarget { image: "ghcr.io/muety/wakapi:latest".into(), ports: vec!["3000:3000".into()], env: vec![], volumes: vec!["wakapi_v2_data:/data".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
 
         AppManifest { id: "mirotalk".into(), name: "MiroTalk".into(), icon: "📹".into(), category: "Communication".into(), description: "WebRTC video calls — Zoom alternative, no account required".into(), website: Some("https://mirotalk.com".into()), docker: Some(DockerTarget { image: "mirotalk/p2p:latest".into(), ports: vec!["3000:3000".into()], env: vec![], volumes: vec![], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
-        // Jitsi Meet removed — `jitsi/web` is only the front-end
-        // Nginx; a working install also needs prosody, jicofo and jvb
-        // containers plus UDP ports for the video bridge. Add a
-        // Compose template when we bring it back.
+        // Jitsi Meet — 4 containers (web, prosody XMPP, jicofo focus,
+        // jvb video bridge). Shared XMPP auth secrets make env setup
+        // verbose; 10000/udp on jvb is what actually carries video.
+        AppManifest { id: "jitsi".into(), name: "Jitsi Meet".into(), icon: "📞".into(), category: "Communication".into(),
+            description: "Secure video conferencing — no account needed to join".into(),
+            website: Some("https://jitsi.org".into()),
+            docker: Some(DockerTarget {
+                image: "jitsi/web:latest".into(),
+                ports: vec!["8010:80".into(), "8453:443".into()],
+                env: vec![
+                    "ENABLE_AUTH=0".into(),
+                    "ENABLE_GUESTS=1".into(),
+                    "PUBLIC_URL=${PUBLIC_URL}".into(),
+                    "XMPP_DOMAIN=meet.jitsi".into(),
+                    "XMPP_AUTH_DOMAIN=auth.meet.jitsi".into(),
+                    "XMPP_BOSH_URL_BASE=http://${CONTAINER_NAME}-prosody:5280".into(),
+                    "XMPP_GUEST_DOMAIN=guest.meet.jitsi".into(),
+                    "XMPP_MUC_DOMAIN=muc.meet.jitsi".into(),
+                    "JICOFO_AUTH_USER=focus".into(),
+                    "JVB_AUTH_USER=jvb".into(),
+                    "TZ=UTC".into(),
+                ],
+                volumes: vec!["jitsi_web:/config".into()],
+                sidecars: vec![
+                    DockerSidecar {
+                        name_suffix: "prosody".into(), image: "jitsi/prosody:latest".into(),
+                        ports: vec![],
+                        env: vec![
+                            "XMPP_DOMAIN=meet.jitsi".into(),
+                            "XMPP_AUTH_DOMAIN=auth.meet.jitsi".into(),
+                            "XMPP_GUEST_DOMAIN=guest.meet.jitsi".into(),
+                            "XMPP_MUC_DOMAIN=muc.meet.jitsi".into(),
+                            "XMPP_INTERNAL_MUC_DOMAIN=internal-muc.meet.jitsi".into(),
+                            "JICOFO_COMPONENT_SECRET=${JICOFO_COMPONENT_SECRET}".into(),
+                            "JICOFO_AUTH_USER=focus".into(),
+                            "JICOFO_AUTH_PASSWORD=${JICOFO_AUTH_PASSWORD}".into(),
+                            "JVB_AUTH_USER=jvb".into(),
+                            "JVB_AUTH_PASSWORD=${JVB_AUTH_PASSWORD}".into(),
+                            "TZ=UTC".into(),
+                        ],
+                        volumes: vec!["jitsi_prosody_config:/config".into()],
+                        cmd: vec![], post_install_exec: vec![],
+                    },
+                    DockerSidecar {
+                        name_suffix: "jicofo".into(), image: "jitsi/jicofo:latest".into(),
+                        ports: vec![],
+                        env: vec![
+                            "XMPP_DOMAIN=meet.jitsi".into(),
+                            "XMPP_AUTH_DOMAIN=auth.meet.jitsi".into(),
+                            "XMPP_INTERNAL_MUC_DOMAIN=internal-muc.meet.jitsi".into(),
+                            "XMPP_SERVER=${CONTAINER_NAME}-prosody".into(),
+                            "JICOFO_COMPONENT_SECRET=${JICOFO_COMPONENT_SECRET}".into(),
+                            "JICOFO_AUTH_USER=focus".into(),
+                            "JICOFO_AUTH_PASSWORD=${JICOFO_AUTH_PASSWORD}".into(),
+                            "TZ=UTC".into(),
+                        ],
+                        volumes: vec!["jitsi_jicofo_config:/config".into()],
+                        cmd: vec![], post_install_exec: vec![],
+                    },
+                    DockerSidecar {
+                        name_suffix: "jvb".into(), image: "jitsi/jvb:latest".into(),
+                        ports: vec!["10000:10000/udp".into()],
+                        env: vec![
+                            "XMPP_AUTH_DOMAIN=auth.meet.jitsi".into(),
+                            "XMPP_INTERNAL_MUC_DOMAIN=internal-muc.meet.jitsi".into(),
+                            "XMPP_SERVER=${CONTAINER_NAME}-prosody".into(),
+                            "JVB_AUTH_USER=jvb".into(),
+                            "JVB_AUTH_PASSWORD=${JVB_AUTH_PASSWORD}".into(),
+                            "JVB_PORT=10000".into(),
+                            "TZ=UTC".into(),
+                        ],
+                        volumes: vec!["jitsi_jvb_config:/config".into()],
+                        cmd: vec![], post_install_exec: vec![],
+                    },
+                ],
+                seed_files: vec![], cmd: vec![],
+            }),
+            lxc: None, bare_metal: None, vm: None, user_inputs: vec![
+                UserInput { id: "PUBLIC_URL".into(), label: "Public URL".into(), input_type: "text".into(), default: Some("http://localhost:8010".into()), required: true, placeholder: Some("e.g. https://meet.example.com".into()), options: vec![] },
+                UserInput { id: "JICOFO_COMPONENT_SECRET".into(), label: "Jicofo Component Secret".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Random string (openssl rand -hex 16)".into()), options: vec![] },
+                UserInput { id: "JICOFO_AUTH_PASSWORD".into(), label: "Jicofo Auth Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Random string".into()), options: vec![] },
+                UserInput { id: "JVB_AUTH_PASSWORD".into(), label: "JVB Auth Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Random string".into()), options: vec![] },
+            ],
+        },
 
         AppManifest { id: "livebook".into(), name: "Livebook".into(), icon: "📓".into(), category: "AI / ML".into(), description: "Interactive Elixir notebooks for data exploration and ML".into(), website: Some("https://livebook.dev".into()), docker: Some(DockerTarget { image: "ghcr.io/livebook-dev/livebook:latest".into(), ports: vec!["8080:8080".into(), "8081:8081".into()], env: vec!["LIVEBOOK_PASSWORD=${PASSWORD}".into()], volumes: vec!["livebook_data:/data".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "PASSWORD".into(), label: "Access Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Min 12 characters".into()), options: vec![] }] },
         AppManifest { id: "comfyui".into(), name: "ComfyUI".into(), icon: "🎨".into(), category: "AI / ML".into(), description: "Node-based Stable Diffusion UI for advanced workflows".into(), website: Some("https://github.com/comfyanonymous/ComfyUI".into()), docker: Some(DockerTarget { image: "ghcr.io/ai-dock/comfyui:latest-cpu".into(), ports: vec!["8188:8188".into()], env: vec![], volumes: vec!["comfyui_models:/opt/ComfyUI/models".into(), "comfyui_output:/opt/ComfyUI/output".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
@@ -8751,7 +9441,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
 
         AppManifest { id: "lobe-chat".into(), name: "Lobe Chat".into(), icon: "💬".into(), category: "AI / ML".into(), description: "Modern AI chat framework — multi-model, plugins, knowledge base".into(), website: Some("https://lobehub.com".into()), docker: Some(DockerTarget { image: "lobehub/lobe-chat:latest".into(), ports: vec!["3210:3210".into()], env: vec![], volumes: vec![], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
 
-        AppManifest { id: "rallly-v2".into(), name: "Cal.com".into(), icon: "📅".into(), category: "Productivity".into(), description: "Scheduling infrastructure — Calendly alternative".into(), website: Some("https://cal.com".into()), docker: Some(DockerTarget { image: "calcom/cal.com:latest".into(), ports: vec!["3000:3000".into()], env: vec!["NEXTAUTH_SECRET=${SECRET_KEY}".into(), "CALENDSO_ENCRYPTION_KEY=${ENC_KEY}".into(), "DATABASE_URL=postgresql://postgres:${DB_PASSWORD}@calcom-db:5432/calcom".into()], volumes: vec![], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_DB=calcom".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["calcom_db:/var/lib/postgresql/data".into()] }], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "SECRET_KEY".into(), label: "NextAuth Secret".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Random secret".into()), options: vec![] }, UserInput { id: "ENC_KEY".into(), label: "Encryption Key".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("32-char random key".into()), options: vec![] }, UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("PostgreSQL password".into()), options: vec![] }] },
+        AppManifest { id: "rallly-v2".into(), name: "Cal.com".into(), icon: "📅".into(), category: "Productivity".into(), description: "Scheduling infrastructure — Calendly alternative".into(), website: Some("https://cal.com".into()), docker: Some(DockerTarget { image: "calcom/cal.com:latest".into(), ports: vec!["3000:3000".into()], env: vec!["NEXTAUTH_SECRET=${SECRET_KEY}".into(), "CALENDSO_ENCRYPTION_KEY=${ENC_KEY}".into(), "DATABASE_URL=postgresql://postgres:${DB_PASSWORD}@calcom-db:5432/calcom".into()], volumes: vec![], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_DB=calcom".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["calcom_db:/var/lib/postgresql/data".into()] , cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "SECRET_KEY".into(), label: "NextAuth Secret".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Random secret".into()), options: vec![] }, UserInput { id: "ENC_KEY".into(), label: "Encryption Key".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("32-char random key".into()), options: vec![] }, UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("PostgreSQL password".into()), options: vec![] }] },
 
 
         // ═══════════════════════════════════════════════════════════════
@@ -8771,15 +9461,15 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
 
         AppManifest { id: "redmine".into(), name: "Redmine".into(), icon: "🔴".into(), category: "Project Management".into(), description: "Flexible project management with issue tracking and Gantt charts".into(), website: Some("https://www.redmine.org".into()), docker: Some(DockerTarget { image: "redmine:latest".into(), ports: vec!["3000:3000".into()], env: vec![], volumes: vec!["redmine_data:/usr/src/redmine/files".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
         AppManifest { id: "zentao".into(), name: "ZenTao".into(), icon: "📊".into(), category: "Project Management".into(), description: "Agile project management with Scrum and Kanban support".into(), website: Some("https://www.zentao.pm".into()), docker: Some(DockerTarget { image: "easysoft/zentao:latest".into(), ports: vec!["8080:80".into()], env: vec![], volumes: vec!["zentao_data:/data".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
-        AppManifest { id: "planka".into(), name: "Planka".into(), icon: "📋".into(), category: "Project Management".into(), description: "Real-time kanban board for workgroups — Trello alternative".into(), website: Some("https://planka.app".into()), docker: Some(DockerTarget { image: "ghcr.io/plankanban/planka:latest".into(), ports: vec!["1337:1337".into()], env: vec!["SECRET_KEY=${SECRET_KEY}".into(), "BASE_URL=http://localhost:1337".into(), "DATABASE_URL=postgresql://postgres:${DB_PASSWORD}@planka-db/planka".into()], volumes: vec!["planka_avatars:/app/public/user-avatars".into(), "planka_bg:/app/public/project-background-images".into(), "planka_attachments:/app/private/attachments".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_DB=planka".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["planka_db:/var/lib/postgresql/data".into()] }], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "SECRET_KEY".into(), label: "Secret Key".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Random secret string".into()), options: vec![] }, UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("PostgreSQL password".into()), options: vec![] }] },
+        AppManifest { id: "planka".into(), name: "Planka".into(), icon: "📋".into(), category: "Project Management".into(), description: "Real-time kanban board for workgroups — Trello alternative".into(), website: Some("https://planka.app".into()), docker: Some(DockerTarget { image: "ghcr.io/plankanban/planka:latest".into(), ports: vec!["1337:1337".into()], env: vec!["SECRET_KEY=${SECRET_KEY}".into(), "BASE_URL=http://localhost:1337".into(), "DATABASE_URL=postgresql://postgres:${DB_PASSWORD}@planka-db/planka".into()], volumes: vec!["planka_avatars:/app/public/user-avatars".into(), "planka_bg:/app/public/project-background-images".into(), "planka_attachments:/app/private/attachments".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_DB=planka".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["planka_db:/var/lib/postgresql/data".into()] , cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "SECRET_KEY".into(), label: "Secret Key".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Random secret string".into()), options: vec![] }, UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("PostgreSQL password".into()), options: vec![] }] },
 
-        AppManifest { id: "monica".into(), name: "Monica".into(), icon: "👤".into(), category: "Productivity".into(), description: "Personal CRM — remember everything about your contacts".into(), website: Some("https://www.monicahq.com".into()), docker: Some(DockerTarget { image: "monica:latest".into(), ports: vec!["8080:80".into()], env: vec!["APP_KEY=${APP_KEY}".into(), "DB_HOST=monica-db".into(), "DB_DATABASE=monica".into(), "DB_USERNAME=monica".into(), "DB_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["monica_data:/var/www/html/storage".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "mariadb:10".into(), ports: vec![], env: vec!["MYSQL_ROOT_PASSWORD=${DB_PASSWORD}".into(), "MYSQL_DATABASE=monica".into(), "MYSQL_USER=monica".into(), "MYSQL_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["monica_db:/var/lib/mysql".into()] }], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "APP_KEY".into(), label: "App Key".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("base64:... (32-char random)".into()), options: vec![] }, UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("MariaDB password".into()), options: vec![] }] },
+        AppManifest { id: "monica".into(), name: "Monica".into(), icon: "👤".into(), category: "Productivity".into(), description: "Personal CRM — remember everything about your contacts".into(), website: Some("https://www.monicahq.com".into()), docker: Some(DockerTarget { image: "monica:latest".into(), ports: vec!["8080:80".into()], env: vec!["APP_KEY=${APP_KEY}".into(), "DB_HOST=monica-db".into(), "DB_DATABASE=monica".into(), "DB_USERNAME=monica".into(), "DB_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["monica_data:/var/www/html/storage".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "mariadb:10".into(), ports: vec![], env: vec!["MYSQL_ROOT_PASSWORD=${DB_PASSWORD}".into(), "MYSQL_DATABASE=monica".into(), "MYSQL_USER=monica".into(), "MYSQL_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["monica_db:/var/lib/mysql".into()] , cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "APP_KEY".into(), label: "App Key".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("base64:... (32-char random)".into()), options: vec![] }, UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("MariaDB password".into()), options: vec![] }] },
 
         AppManifest { id: "traccar".into(), name: "Traccar".into(), icon: "📍".into(), category: "Other".into(), description: "GPS tracking server for vehicles, people, and assets".into(), website: Some("https://www.traccar.org".into()), docker: Some(DockerTarget { image: "traccar/traccar:latest".into(), ports: vec!["8082:8082".into(), "5055:5055".into()], env: vec![], volumes: vec!["traccar_data:/opt/traccar/data/database".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
         AppManifest { id: "haos".into(), name: "Home Assistant OS".into(), icon: "🏠".into(), category: "Automation".into(), description: "Home automation platform — 2000+ integrations".into(), website: Some("https://www.home-assistant.io".into()), docker: Some(DockerTarget { image: "ghcr.io/home-assistant/home-assistant:stable".into(), ports: vec!["8123:8123".into()], env: vec![], volumes: vec!["homeassistant_v2_config:/config".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
 
         AppManifest { id: "miniflux-v2".into(), name: "Tiny Tiny RSS".into(), icon: "📰".into(), category: "Media".into(), description: "Web-based news feed reader and aggregator".into(), website: Some("https://tt-rss.org".into()), docker: Some(DockerTarget { image: "cthulhoo/ttrss-fpm-pgsql-static:latest".into(), ports: vec!["8280:80".into()], env: vec![], volumes: vec!["ttrss_data:/var/www/html".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
-        AppManifest { id: "linkace".into(), name: "LinkAce".into(), icon: "🔗".into(), category: "Other".into(), description: "Bookmark archive with tags, lists, and monitoring".into(), website: Some("https://www.linkace.org".into()), docker: Some(DockerTarget { image: "linkace/linkace:latest".into(), ports: vec!["8080:80".into()], env: vec!["APP_KEY=${APP_KEY}".into(), "DB_HOST=linkace-db".into(), "DB_DATABASE=linkace".into(), "DB_USERNAME=linkace".into(), "DB_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["linkace_data:/app/storage".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "mariadb:10".into(), ports: vec![], env: vec!["MYSQL_ROOT_PASSWORD=${DB_PASSWORD}".into(), "MYSQL_DATABASE=linkace".into(), "MYSQL_USER=linkace".into(), "MYSQL_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["linkace_db:/var/lib/mysql".into()] }], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "APP_KEY".into(), label: "App Key".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("base64:... (32-char random)".into()), options: vec![] }, UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("MariaDB password".into()), options: vec![] }] },
+        AppManifest { id: "linkace".into(), name: "LinkAce".into(), icon: "🔗".into(), category: "Other".into(), description: "Bookmark archive with tags, lists, and monitoring".into(), website: Some("https://www.linkace.org".into()), docker: Some(DockerTarget { image: "linkace/linkace:latest".into(), ports: vec!["8080:80".into()], env: vec!["APP_KEY=${APP_KEY}".into(), "DB_HOST=linkace-db".into(), "DB_DATABASE=linkace".into(), "DB_USERNAME=linkace".into(), "DB_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["linkace_data:/app/storage".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "mariadb:10".into(), ports: vec![], env: vec!["MYSQL_ROOT_PASSWORD=${DB_PASSWORD}".into(), "MYSQL_DATABASE=linkace".into(), "MYSQL_USER=linkace".into(), "MYSQL_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["linkace_db:/var/lib/mysql".into()] , cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "APP_KEY".into(), label: "App Key".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("base64:... (32-char random)".into()), options: vec![] }, UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("MariaDB password".into()), options: vec![] }] },
 
         AppManifest { id: "budibase".into(), name: "Budibase".into(), icon: "🏗️".into(), category: "Dev Tools".into(), description: "Low-code platform for building internal tools and admin panels".into(), website: Some("https://budibase.com".into()), docker: Some(DockerTarget { image: "budibase/budibase:latest".into(), ports: vec!["10000:80".into()], env: vec![], volumes: vec!["budibase_data:/data".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
         AppManifest { id: "tooljet".into(), name: "ToolJet".into(), icon: "🔧".into(), category: "Dev Tools".into(), description: "Low-code platform for building internal tools with drag and drop".into(), website: Some("https://www.tooljet.com".into()), docker: Some(DockerTarget { image: "tooljet/tooljet:latest".into(), ports: vec!["3000:3000".into()], env: vec!["TOOLJET_HOST=http://localhost:3000".into(), "SECRET_KEY_BASE=${SECRET_KEY}".into()], volumes: vec![], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "SECRET_KEY".into(), label: "Secret Key".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Random secret string".into()), options: vec![] }] },
@@ -8798,7 +9488,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
 
         AppManifest { id: "mayan-edms".into(), name: "Mayan EDMS".into(), icon: "📁".into(), category: "Productivity".into(), description: "Electronic document management with OCR and workflows".into(), website: Some("https://www.mayan-edms.com".into()), docker: Some(DockerTarget { image: "mayanedms/mayanedms:latest".into(), ports: vec!["8000:8000".into()], env: vec![], volumes: vec!["mayan_media:/var/lib/mayan".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
 
-        AppManifest { id: "rallly-v3".into(), name: "Doodle Alternative (Rallly)".into(), icon: "📅".into(), category: "Productivity".into(), description: "Schedule group meetings — Doodle alternative".into(), website: Some("https://rallly.co".into()), docker: Some(DockerTarget { image: "lukevella/rallly:latest".into(), ports: vec!["3000:3000".into()], env: vec!["SECRET_PASSWORD=${SECRET_KEY}".into(), "DATABASE_URL=postgresql://postgres:${DB_PASSWORD}@rallly-v3-db:5432/rallly".into()], volumes: vec![], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_DB=rallly".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["rallly_v3_db:/var/lib/postgresql/data".into()] }], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "SECRET_KEY".into(), label: "Secret".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Random secret".into()), options: vec![] }, UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("PostgreSQL password".into()), options: vec![] }] },
+        AppManifest { id: "rallly-v3".into(), name: "Doodle Alternative (Rallly)".into(), icon: "📅".into(), category: "Productivity".into(), description: "Schedule group meetings — Doodle alternative".into(), website: Some("https://rallly.co".into()), docker: Some(DockerTarget { image: "lukevella/rallly:latest".into(), ports: vec!["3000:3000".into()], env: vec!["SECRET_PASSWORD=${SECRET_KEY}".into(), "DATABASE_URL=postgresql://postgres:${DB_PASSWORD}@rallly-v3-db:5432/rallly".into()], volumes: vec![], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_DB=rallly".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["rallly_v3_db:/var/lib/postgresql/data".into()] , cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "SECRET_KEY".into(), label: "Secret".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Random secret".into()), options: vec![] }, UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("PostgreSQL password".into()), options: vec![] }] },
 
         AppManifest { id: "squid".into(), name: "Squid Proxy".into(), icon: "🦑".into(), category: "Networking".into(), description: "Caching forward proxy for web content".into(), website: Some("https://www.squid-cache.org".into()), docker: Some(DockerTarget { image: "ubuntu/squid:latest".into(), ports: vec!["3128:3128".into()], env: vec![], volumes: vec!["squid_cache:/var/spool/squid".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
         AppManifest { id: "privoxy".into(), name: "Privoxy".into(), icon: "🛡️".into(), category: "Privacy".into(), description: "Non-caching web proxy with ad and tracker filtering".into(), website: Some("https://www.privoxy.org".into()), docker: Some(DockerTarget { image: "vimagick/privoxy:latest".into(), ports: vec!["8118:8118".into()], env: vec![], volumes: vec!["privoxy_config:/etc/privoxy".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
@@ -8837,7 +9527,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         AppManifest { id: "rstudio".into(), name: "RStudio Server".into(), icon: "📊".into(), category: "AI / ML".into(), description: "IDE for R statistical computing in the browser".into(), website: Some("https://posit.co/products/open-source/rstudio-server/".into()), docker: Some(DockerTarget { image: "rocker/rstudio:latest".into(), ports: vec!["8787:8787".into()], env: vec!["PASSWORD=${PASSWORD}".into()], volumes: vec!["rstudio_home:/home/rstudio".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "PASSWORD".into(), label: "Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("RStudio login password".into()), options: vec![] }] },
         AppManifest { id: "zeppelin".into(), name: "Apache Zeppelin".into(), icon: "📓".into(), category: "AI / ML".into(), description: "Web-based notebook for data analytics and visualisation".into(), website: Some("https://zeppelin.apache.org".into()), docker: Some(DockerTarget { image: "apache/zeppelin:latest".into(), ports: vec!["8080:8080".into()], env: vec![], volumes: vec!["zeppelin_notebook:/opt/zeppelin/notebook".into(), "zeppelin_logs:/opt/zeppelin/logs".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
         AppManifest { id: "openblocks".into(), name: "Lowcoder".into(), icon: "🏗️".into(), category: "Dev Tools".into(), description: "Low-code platform for building internal apps — Retool alternative".into(), website: Some("https://lowcoder.cloud".into()), docker: Some(DockerTarget { image: "lowcoderorg/lowcoder-ce:latest".into(), ports: vec!["3000:3000".into()], env: vec![], volumes: vec!["lowcoder_data:/lowcoder-stacks".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
-        AppManifest { id: "unleash".into(), name: "Unleash".into(), icon: "🏴".into(), category: "Dev Tools".into(), description: "Feature flag management for progressive releases".into(), website: Some("https://www.getunleash.io".into()), docker: Some(DockerTarget { image: "unleashorg/unleash-server:latest".into(), ports: vec!["4242:4242".into()], env: vec!["DATABASE_URL=postgres://postgres:${DB_PASSWORD}@unleash-db/unleash".into()], volumes: vec![], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_DB=unleash".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["unleash_db:/var/lib/postgresql/data".into()] }], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("PostgreSQL password".into()), options: vec![] }] },
+        AppManifest { id: "unleash".into(), name: "Unleash".into(), icon: "🏴".into(), category: "Dev Tools".into(), description: "Feature flag management for progressive releases".into(), website: Some("https://www.getunleash.io".into()), docker: Some(DockerTarget { image: "unleashorg/unleash-server:latest".into(), ports: vec!["4242:4242".into()], env: vec!["DATABASE_URL=postgres://postgres:${DB_PASSWORD}@unleash-db/unleash".into()], volumes: vec![], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:15-alpine".into(), ports: vec![], env: vec!["POSTGRES_DB=unleash".into(), "POSTGRES_PASSWORD=${DB_PASSWORD}".into()], volumes: vec!["unleash_db:/var/lib/postgresql/data".into()] , cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("PostgreSQL password".into()), options: vec![] }] },
         AppManifest { id: "lago".into(), name: "Lago".into(), icon: "💰".into(), category: "Other".into(), description: "Open-source billing and usage-based pricing engine".into(), website: Some("https://www.getlago.com".into()), docker: Some(DockerTarget { image: "getlago/lago-api:latest".into(), ports: vec!["3000:3000".into()], env: vec![], volumes: vec!["lago_data:/app/storage".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
         AppManifest { id: "cal-dav".into(), name: "DAViCal".into(), icon: "📅".into(), category: "Productivity".into(), description: "CalDAV server for shared calendars and scheduling".into(), website: Some("https://www.davical.org".into()), docker: Some(DockerTarget { image: "jsmitsnl/davical-docker:latest".into(), ports: vec!["8080:80".into()], env: vec![], volumes: vec!["davical_data:/var/lib/postgresql".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
         AppManifest { id: "uptime-status".into(), name: "Upptime".into(), icon: "⬆️".into(), category: "Monitoring".into(), description: "GitHub-powered uptime monitor and status page".into(), website: Some("https://upptime.js.org".into()), docker: Some(DockerTarget { image: "upptime/upptime:latest".into(), ports: vec!["3000:3000".into()], env: vec![], volumes: vec![], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
@@ -8871,11 +9561,11 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         AppManifest { id: "cosmos".into(), name: "Cosmos".into(), icon: "🌌".into(), category: "Other".into(), description: "Self-hosted platform manager with automatic HTTPS, SSO, and container management".into(), website: Some("https://cosmos-cloud.io".into()), docker: Some(DockerTarget { image: "azukaar/cosmos-server:latest".into(), ports: vec!["80:80".into(), "443:443".into()], env: vec![], volumes: vec!["/var/run/docker.sock:/var/run/docker.sock".into(), "cosmos_config:/config".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
 
         // Business / Productivity
-        AppManifest { id: "twenty".into(), name: "Twenty CRM".into(), icon: "📇".into(), category: "Project Management".into(), description: "Open-source CRM — modern Salesforce alternative with clean UI".into(), website: Some("https://twenty.com".into()), docker: Some(DockerTarget { image: "twentycrm/twenty:latest".into(), ports: vec!["3000:3000".into()], env: vec!["SERVER_URL=http://localhost:3000".into()], volumes: vec!["twenty_data:/app/.local-storage".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "twentycrm/twenty-postgres:latest".into(), ports: vec![], env: vec!["POSTGRES_USER=twenty".into(), "POSTGRES_PASSWORD=twenty".into(), "POSTGRES_DB=default".into()], volumes: vec!["twenty_db:/bitnami/postgresql".into()] }], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
+        AppManifest { id: "twenty".into(), name: "Twenty CRM".into(), icon: "📇".into(), category: "Project Management".into(), description: "Open-source CRM — modern Salesforce alternative with clean UI".into(), website: Some("https://twenty.com".into()), docker: Some(DockerTarget { image: "twentycrm/twenty:latest".into(), ports: vec!["3000:3000".into()], env: vec!["SERVER_URL=http://localhost:3000".into()], volumes: vec!["twenty_data:/app/.local-storage".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "twentycrm/twenty-postgres:latest".into(), ports: vec![], env: vec!["POSTGRES_USER=twenty".into(), "POSTGRES_PASSWORD=twenty".into(), "POSTGRES_DB=default".into()], volumes: vec!["twenty_db:/bitnami/postgresql".into()] , cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
         AppManifest { id: "appflowy".into(), name: "AppFlowy".into(), icon: "📝".into(), category: "Other".into(), description: "Open-source Notion alternative — notes, wikis, and project management".into(), website: Some("https://appflowy.io".into()), docker: Some(DockerTarget { image: "appflowyio/appflowy-cloud:latest".into(), ports: vec!["9025:9025".into()], env: vec![], volumes: vec!["appflowy_data:/data".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
         AppManifest { id: "firefly-iii".into(), name: "Firefly III".into(), icon: "💰".into(), category: "Other".into(), description: "Personal finance manager — budgets, transactions, reports and charts".into(), website: Some("https://firefly-iii.org".into()), docker: Some(DockerTarget { image: "fireflyiii/core:latest".into(), ports: vec!["8084:8080".into()], env: vec!["APP_KEY=SomeRandomStringOf32CharsExactly".into(), "DB_CONNECTION=sqlite".into(), "TRUSTED_PROXIES=**".into()], volumes: vec!["firefly_upload:/var/www/html/storage/upload".into(), "firefly_db:/var/www/html/storage/database".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
         AppManifest { id: "erpnext".into(), name: "ERPNext".into(), icon: "🏢".into(), category: "Other".into(), description: "Full open-source ERP — accounting, inventory, HR, CRM, manufacturing".into(), website: Some("https://erpnext.com".into()), docker: Some(DockerTarget { image: "frappe/erpnext:latest".into(), ports: vec!["8082:8080".into()], env: vec![], volumes: vec!["erpnext_sites:/home/frappe/frappe-bench/sites".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
-        AppManifest { id: "odoo".into(), name: "Odoo".into(), icon: "🏭".into(), category: "Other".into(), description: "Business suite — CRM, eCommerce, accounting, inventory, project management".into(), website: Some("https://www.odoo.com".into()), docker: Some(DockerTarget { image: "odoo:17".into(), ports: vec!["8069:8069".into()], env: vec![], volumes: vec!["odoo_data:/var/lib/odoo".into(), "odoo_config:/etc/odoo".into(), "odoo_addons:/mnt/extra-addons".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:16".into(), ports: vec![], env: vec!["POSTGRES_USER=odoo".into(), "POSTGRES_PASSWORD=odoo".into(), "POSTGRES_DB=postgres".into(), "PGDATA=/var/lib/postgresql/data/pgdata".into()], volumes: vec!["odoo_db:/var/lib/postgresql/data/pgdata".into()] }], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
+        AppManifest { id: "odoo".into(), name: "Odoo".into(), icon: "🏭".into(), category: "Other".into(), description: "Business suite — CRM, eCommerce, accounting, inventory, project management".into(), website: Some("https://www.odoo.com".into()), docker: Some(DockerTarget { image: "odoo:17".into(), ports: vec!["8069:8069".into()], env: vec![], volumes: vec!["odoo_data:/var/lib/odoo".into(), "odoo_config:/etc/odoo".into(), "odoo_addons:/mnt/extra-addons".into()], sidecars: vec![DockerSidecar { name_suffix: "db".into(), image: "postgres:16".into(), ports: vec![], env: vec!["POSTGRES_USER=odoo".into(), "POSTGRES_PASSWORD=odoo".into(), "POSTGRES_DB=postgres".into(), "PGDATA=/var/lib/postgresql/data/pgdata".into()], volumes: vec!["odoo_db:/var/lib/postgresql/data/pgdata".into()] , cmd: vec![], post_install_exec: vec![] }], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
 
         // Media / Home
         AppManifest { id: "notifiarr".into(), name: "Notifiarr".into(), icon: "🔔".into(), category: "Media".into(), description: "Notification aggregator for Sonarr, Radarr, Lidarr, Readarr and other *arr apps".into(), website: Some("https://notifiarr.com".into()), docker: Some(DockerTarget { image: "golift/notifiarr:latest".into(), ports: vec!["5454:5454".into()], env: vec![], volumes: vec!["notifiarr_config:/config".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
@@ -8889,4 +9579,80 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         AppManifest { id: "fasten-health".into(), name: "Fasten Health".into(), icon: "🏥".into(), category: "Other".into(), description: "Personal health record aggregator — pull medical records from hospitals and insurers".into(), website: Some("https://fastenhealth.com".into()), docker: Some(DockerTarget { image: "ghcr.io/fastenhealth/fasten-onprem:latest".into(), ports: vec!["9090:8080".into()], env: vec![], volumes: vec!["fasten_db:/opt/fasten/db".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
 
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every app with a Docker target must resolve to a valid compose
+    /// template — either hand-crafted or auto-synthesised. This
+    /// catches a future manifest edit that breaks the compose path
+    /// for even one app. LXC-only / bare-metal / VM-only apps are
+    /// expected to return None.
+    #[test]
+    fn every_docker_app_has_compose_template() {
+        let mut missing: Vec<String> = Vec::new();
+        for app in built_in_catalogue() {
+            if app.docker.is_some() {
+                if resolve_compose_template(&app.id).is_none() {
+                    missing.push(app.id.clone());
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "Apps with Docker target but no resolvable compose template: {:?}",
+            missing,
+        );
+    }
+
+    /// Every env / cmd ${VAR} placeholder must either be CONTAINER_NAME
+    /// (injected by the API layer) or declared in the app's user_inputs
+    /// list. A dangling ${FOO} leaves a literal "${FOO}" in the running
+    /// container's env — the class of bug that made Outline and early
+    /// Guacamole dead on arrival.
+    #[test]
+    fn every_placeholder_is_declared() {
+        let mut dangling: Vec<(String, String)> = Vec::new();
+        for app in built_in_catalogue() {
+            let Some(docker) = &app.docker else { continue };
+            let declared: std::collections::HashSet<String> = std::iter::once("CONTAINER_NAME".to_string())
+                .chain(app.user_inputs.iter().map(|u| u.id.clone()))
+                .collect();
+
+            let mut strings: Vec<String> = Vec::new();
+            strings.extend(docker.env.iter().cloned());
+            strings.extend(docker.cmd.iter().cloned());
+            for s in &docker.sidecars {
+                strings.extend(s.env.iter().cloned());
+                strings.extend(s.cmd.iter().cloned());
+                for argv in &s.post_install_exec { strings.extend(argv.iter().cloned()); }
+            }
+            // Seed file contents — a stray ${FOO} in a YAML config
+            // lands literally in the file if FOO isn't declared.
+            for seed in &docker.seed_files {
+                strings.push(seed.content.clone());
+            }
+
+            for s in &strings {
+                let mut i = 0;
+                while let Some(start) = s[i..].find("${") {
+                    let abs = i + start + 2;
+                    if let Some(end) = s[abs..].find('}') {
+                        let name = &s[abs..abs + end];
+                        if !declared.contains(name) {
+                            dangling.push((app.id.clone(), name.to_string()));
+                        }
+                        i = abs + end + 1;
+                    } else { break; }
+                }
+            }
+        }
+        assert!(
+            dangling.is_empty(),
+            "Apps referencing undeclared ${{VAR}} placeholders: {:?}",
+            dangling,
+        );
+    }
 }
