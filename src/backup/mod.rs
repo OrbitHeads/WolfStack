@@ -1221,9 +1221,36 @@ fn store_pbs_with_notes_and_log(local_path: &Path, storage: &BackupStorage, file
         "host"
     };
 
+    // Isolate this one backup file in its own subdirectory before
+    // handing the directory to `proxmox-backup-client backup …pxar:DIR`.
+    // The shared staging dir (`/tmp/wolfstack-backups/`) can contain
+    // stale files from previous runs (e.g. from a backup that failed
+    // before cleanup), and backup_all() runs many targets in sequence
+    // — without isolation each snapshot's pxar archive pulls in every
+    // file currently sitting in staging, which wastes PBS space and
+    // makes per-snapshot restore nonsensical.
+    let parent = local_path.parent().unwrap_or(Path::new("/tmp"));
+    let isolate = parent.join(format!(".pbs-stage-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&isolate)
+        .map_err(|e| format!("PBS stage dir: {}", e))?;
+    let file_name = local_path.file_name()
+        .ok_or_else(|| "local_path has no filename".to_string())?;
+    let isolate_file = isolate.join(file_name);
+    // Hardlink when possible so a 5 GB vzdump archive doesn't
+    // double its disk footprint just for the PBS upload.
+    if std::fs::hard_link(local_path, &isolate_file).is_err() {
+        std::fs::copy(local_path, &isolate_file)
+            .map_err(|e| {
+                let _ = std::fs::remove_dir_all(&isolate);
+                format!("PBS stage copy: {}", e)
+            })?;
+    }
+
     let mut cmd = Command::new("proxmox-backup-client");
     cmd.arg("backup")
-       .arg(format!("backup.pxar:{}", local_path.parent().unwrap_or(Path::new("/tmp")).display()))
+       .arg(format!("backup.pxar:{}", isolate.display()))
        .arg("--repository").arg(&repo)
        .arg("--backup-id").arg(&backup_id)
        .arg("--backup-type").arg(backup_type);
@@ -1275,19 +1302,30 @@ fn store_pbs_with_notes_and_log(local_path: &Path, storage: &BackupStorage, file
         }
 
         let status = child.wait()
-            .map_err(|e| format!("PBS backup wait failed: {}", e))?;
+            .map_err(|e| {
+                let _ = std::fs::remove_dir_all(&isolate);
+                format!("PBS backup wait failed: {}", e)
+            })?;
         if !status.success() {
+            let _ = std::fs::remove_dir_all(&isolate);
             return Err("PBS backup failed (see log above)".to_string());
         }
     } else {
         let output = cmd.output()
-            .map_err(|e| format!("Failed to run proxmox-backup-client: {}", e))?;
+            .map_err(|e| {
+                let _ = std::fs::remove_dir_all(&isolate);
+                format!("Failed to run proxmox-backup-client: {}", e)
+            })?;
 
         if !output.status.success() {
-            return Err(format!("PBS backup failed: {}",
-                String::from_utf8_lossy(&output.stderr)));
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let _ = std::fs::remove_dir_all(&isolate);
+            return Err(format!("PBS backup failed: {}", stderr.trim()));
         }
     }
+    // Drop the per-backup isolation dir now that the upload succeeded.
+    // The snapshot-notes API call below only needs repo+snapshot info.
+    let _ = std::fs::remove_dir_all(&isolate);
 
     // Set snapshot notes with cluster/node/container metadata for identification
     if let Some(notes_text) = notes {

@@ -18016,16 +18016,30 @@ function renderBackupHistory(backups) {
         const storageLabel = formatStorageLabel(b.storage);
         const size = formatBytes(b.size_bytes || 0);
         const date = b.created_at ? new Date(b.created_at).toLocaleString() : '—';
+        const errText = (b.error || '').trim();
+        const errTitle = errText ? ` title="${escapeHtml(errText)}"` : '';
         const statusBadge = b.status === 'completed'
             ? '<span class="badge" style="background:#22c55e; color:#fff;">✓ Completed</span>'
             : b.status === 'failed'
-                ? `<span class="badge" style="background:#ef4444; color:#fff;">✗ Failed</span>`
+                ? `<span class="badge" style="background:#ef4444; color:#fff; cursor:help;"${errTitle}>✗ Failed</span>`
                 : '<span class="badge" style="background:#f59e0b; color:#000;">⏳ In Progress</span>';
         const comments = b.comments ? `<div style="font-size:11px; color:var(--text-muted); margin-top:2px;">${escapeHtml(b.comments)}</div>` : '';
         const nodeLabel = b.node_hostname ? `<span style="font-size:11px; color:var(--text-muted);">${escapeHtml(b.node_hostname)}</span>` : '';
+        // Failed rows expose the error inline so operators don't have
+        // to read backups.json to know what went wrong. Long errors
+        // are truncated in the cell but the full text is on the
+        // tooltip and in the "Show full" expander.
+        const errCell = (b.status === 'failed' && errText)
+            ? `<div style="margin-top:4px; font-size:11px; color:#fca5a5; max-width:520px;">
+                    <details>
+                        <summary style="cursor:pointer; list-style:none;">⚠ ${escapeHtml(errText.length > 140 ? errText.slice(0, 140) + '…' : errText)}</summary>
+                        <pre style="margin:4px 0 0; padding:6px 8px; background:rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.25); border-radius:4px; color:#fecaca; font-size:11px; white-space:pre-wrap; word-break:break-word; max-height:180px; overflow:auto;">${escapeHtml(errText)}</pre>
+                    </details>
+               </div>`
+            : '';
 
         return `<tr>
-            <td>${typeEmoji} ${escapeHtml(targetName)}${specsNote}${comments}</td>
+            <td>${typeEmoji} ${escapeHtml(targetName)}${specsNote}${comments}${errCell}</td>
             <td>${typeName}</td>
             <td>${nodeLabel}</td>
             <td>${escapeHtml(storageLabel)}</td>
