@@ -61,6 +61,8 @@ pub struct FileLocations {
     pub ai_config: String,
     #[serde(default = "default_ai_baseline")]
     pub ai_baseline: String,
+    #[serde(default = "default_ai_suppress_secret")]
+    pub ai_suppress_secret: String,
 
     // ── WolfRun ───────────────────────────────────
     #[serde(default = "default_wolfrun_dir")]
@@ -170,6 +172,7 @@ fn default_statuspage_uptime() -> String { "/etc/wolfstack/statuspage-uptime.jso
 
 fn default_ai_config() -> String { "/etc/wolfstack/ai-config.json".into() }
 fn default_ai_baseline() -> String { "/var/lib/wolfstack/ai-baseline.json".into() }
+fn default_ai_suppress_secret() -> String { "/etc/wolfstack/ai-suppress-secret".into() }
 
 fn default_wolfrun_dir() -> String { "/etc/wolfstack/wolfrun".into() }
 fn default_wolfrun_services() -> String { "/etc/wolfstack/wolfrun/services.json".into() }

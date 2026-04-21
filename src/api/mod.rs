@@ -6387,6 +6387,12 @@ pub async fn ai_save_config(
         if let Some(v) = body.get("scan_schedule").and_then(|v| v.as_str()) {
             config.scan_schedule = v.to_string();
         }
+        if let Some(arr) = body.get("accepted_risks").and_then(|v| v.as_array()) {
+            config.accepted_risks = arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty() && s.len() <= 200)
+                .collect();
+        }
 
         if let Err(e) = config.save() {
             return HttpResponse::InternalServerError().json(serde_json::json!({"error": e}));
@@ -6479,6 +6485,137 @@ pub async fn ai_test_email(
             "error": format!("Failed to send: {}", e)
         })),
     }
+}
+
+/// GET /api/ai/suppress?p=<phrase>&t=<token> — one-click suppress
+/// from an alert email. Session-free: the HMAC token is the auth.
+/// Adds the phrase to accepted_risks and returns a minimal HTML page
+/// confirming what was suppressed.
+#[derive(Deserialize)]
+pub struct AiSuppressQuery {
+    pub p: String,
+    pub t: String,
+}
+
+pub async fn ai_suppress_link(
+    state: web::Data<AppState>,
+    query: web::Query<AiSuppressQuery>,
+) -> HttpResponse {
+    let phrase = query.p.trim().to_string();
+    if phrase.is_empty() || phrase.len() > 200 {
+        return HttpResponse::BadRequest().body("Invalid phrase");
+    }
+    if !crate::ai::verify_suppress_token(&phrase, &query.t) {
+        return HttpResponse::Forbidden().body(
+            "Invalid or expired suppress token. \
+             This link can only be used with a valid HMAC from an alert email sent by this node."
+        );
+    }
+
+    // Add to accepted_risks if not already there.
+    let added = {
+        let mut config = state.ai_agent.config.lock().unwrap();
+        if config.accepted_risks.iter().any(|r| r.eq_ignore_ascii_case(&phrase)) {
+            false
+        } else {
+            config.accepted_risks.push(phrase.clone());
+            if let Err(e) = config.save() {
+                warn!("Failed to save accepted_risks: {}", e);
+            }
+            true
+        }
+    };
+
+    // Minimal inline HTML — no frontend dependency. Explicitly does
+    // NOT include operator session tokens or return to the dashboard
+    // by default; a user who clicked a stale link from a shared inbox
+    // should just see a confirmation, nothing privileged.
+    let escaped: String = phrase.chars()
+        .map(|c| match c {
+            '<' => "&lt;".to_string(),
+            '>' => "&gt;".to_string(),
+            '&' => "&amp;".to_string(),
+            '"' => "&quot;".to_string(),
+            _ => c.to_string(),
+        })
+        .collect();
+    let body = format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Alert suppressed</title>\
+         <style>body{{font-family:system-ui,sans-serif;max-width:640px;margin:4em auto;padding:1em;color:#222;}}\
+         code{{background:#f2f2f2;padding:2px 6px;border-radius:4px;}}</style></head><body>\
+         <h2>{}</h2>\
+         <p>The AI agent will no longer flag this condition in future health checks on this node:</p>\
+         <p><code>{}</code></p>\
+         <p>You can review or remove suppressed items under <strong>AI settings → Accepted risks</strong> in the WolfStack dashboard.</p>\
+         </body></html>",
+        if added { "✓ Alert suppressed" } else { "Already suppressed" },
+        escaped,
+    );
+    HttpResponse::Ok().content_type("text/html; charset=utf-8").body(body)
+}
+
+/// GET /api/ai/accepted-risks — list suppressed phrases
+pub async fn ai_accepted_risks_get(
+    req: HttpRequest, state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let risks = state.ai_agent.config.lock().unwrap().accepted_risks.clone();
+    HttpResponse::Ok().json(serde_json::json!({ "accepted_risks": risks }))
+}
+
+/// POST /api/ai/accepted-risks — replace the list wholesale
+#[derive(Deserialize)]
+pub struct AiAcceptedRisksSave {
+    pub accepted_risks: Vec<String>,
+}
+
+pub async fn ai_accepted_risks_save(
+    req: HttpRequest, state: web::Data<AppState>,
+    body: web::Json<AiAcceptedRisksSave>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let cleaned: Vec<String> = body.accepted_risks.iter()
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty() && r.len() <= 200)
+        .collect();
+    {
+        let mut config = state.ai_agent.config.lock().unwrap();
+        config.accepted_risks = cleaned.clone();
+        if let Err(e) = config.save() {
+            return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+        }
+    }
+    HttpResponse::Ok().json(serde_json::json!({ "accepted_risks": cleaned }))
+}
+
+/// POST /api/ai/accepted-risks/remove — remove one entry by value
+#[derive(Deserialize)]
+pub struct AiAcceptedRisksRemove {
+    pub phrase: String,
+}
+
+pub async fn ai_accepted_risks_remove(
+    req: HttpRequest, state: web::Data<AppState>,
+    body: web::Json<AiAcceptedRisksRemove>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let phrase = body.phrase.trim();
+    let removed;
+    {
+        let mut config = state.ai_agent.config.lock().unwrap();
+        let before = config.accepted_risks.len();
+        config.accepted_risks.retain(|r| !r.eq_ignore_ascii_case(phrase));
+        removed = before - config.accepted_risks.len();
+        if removed > 0 {
+            if let Err(e) = config.save() {
+                return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+            }
+        }
+    }
+    HttpResponse::Ok().json(serde_json::json!({
+        "removed": removed,
+        "accepted_risks": state.ai_agent.config.lock().unwrap().accepted_risks.clone(),
+    }))
 }
 
 /// POST /api/ai/chat — send a message to the AI agent
@@ -19570,6 +19707,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/ai/action/exec", web::post().to(ai_action_exec))
         .route("/api/ai/config/sync", web::post().to(ai_sync_config))
         .route("/api/ai/test-email", web::post().to(ai_test_email))
+        .route("/api/ai/suppress", web::get().to(ai_suppress_link))
+        .route("/api/ai/accepted-risks", web::get().to(ai_accepted_risks_get))
+        .route("/api/ai/accepted-risks", web::post().to(ai_accepted_risks_save))
+        .route("/api/ai/accepted-risks/remove", web::post().to(ai_accepted_risks_remove))
         // System dependency audit
         .route("/api/system-check", web::get().to(system_check_run))
         .route("/api/system-check/ask-ai", web::post().to(system_check_ask_ai))

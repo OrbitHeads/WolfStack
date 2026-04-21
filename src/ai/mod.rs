@@ -64,6 +64,12 @@ pub struct AiConfig {
     pub check_interval_minutes: u32,
     #[serde(default = "default_scan_schedule")]
     pub scan_schedule: String,    // "off", "hourly", "6h", "12h", "daily"
+    /// Findings the operator has explicitly accepted (e.g. "SSH password
+    /// login enabled"). Injected into the health-check prompt so the
+    /// LLM stops flagging them. Populated either via the settings UI or
+    /// the one-click suppress link in alert emails.
+    #[serde(default)]
+    pub accepted_risks: Vec<String>,
 }
 
 fn default_scan_schedule() -> String { "off".to_string() }
@@ -87,6 +93,7 @@ impl Default for AiConfig {
             smtp_tls: "starttls".to_string(),
             check_interval_minutes: 60,
             scan_schedule: "off".to_string(),
+            accepted_risks: Vec::new(),
         }
     }
 }
@@ -127,6 +134,7 @@ impl AiConfig {
             "smtp_pass": mask_key(&self.smtp_pass),
             "check_interval_minutes": self.check_interval_minutes,
             "scan_schedule": self.scan_schedule,
+            "accepted_risks": self.accepted_risks,
             "has_claude_key": !self.claude_api_key.is_empty(),
             "has_gemini_key": !self.gemini_api_key.is_empty(),
             "has_openrouter_key": !self.openrouter_api_key.is_empty(),
@@ -158,6 +166,121 @@ fn mask_key(key: &str) -> String {
         return if key.is_empty() { String::new() } else { "••••••••".to_string() };
     }
     format!("{}••••{}", &key[..4], &key[key.len()-4..])
+}
+
+// ─── Alert suppression (one-click "don't flag this again") ───
+//
+// Alert emails include a per-finding link back to this node's
+// /api/ai/suppress?p=<urlenc phrase>&t=<hmac>. Clicking the link adds
+// the phrase to AiConfig.accepted_risks; the next health check's
+// system prompt lists these and the LLM stops flagging them.
+//
+// The HMAC key lives in its own 0600 file — not in AiConfig — because
+// AiConfig is cluster-synced and we want suppress links to only work
+// on the node that sent the email. Lazy-init: first call generates and
+// persists the key; subsequent calls re-use it.
+
+static SUPPRESS_SECRET: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+fn suppress_secret() -> &'static [u8] {
+    SUPPRESS_SECRET.get_or_init(|| {
+        let path = crate::paths::get().ai_suppress_secret;
+        if let Ok(existing) = std::fs::read(&path) {
+            if existing.len() >= 32 { return existing; }
+        }
+        use rand::RngCore;
+        let mut bytes = vec![0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        if let Err(e) = crate::paths::write_secure(&path, &bytes) {
+            warn!("Failed to persist ai-suppress-secret ({}): generated in-memory key will reset on restart", e);
+        }
+        bytes
+    }).as_slice()
+}
+
+/// HMAC-SHA256 of the phrase, truncated to 12 bytes and URL-base64'd.
+/// Short enough for email URLs; long enough to be unforgeable.
+pub fn suppress_token(phrase: &str) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    use base64::Engine;
+    let mut mac = Hmac::<Sha256>::new_from_slice(suppress_secret())
+        .expect("hmac can take any key length");
+    mac.update(phrase.as_bytes());
+    let tag = mac.finalize().into_bytes();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&tag[..12])
+}
+
+/// Constant-time verify of a suppress token against a phrase.
+pub fn verify_suppress_token(phrase: &str, token: &str) -> bool {
+    use base64::Engine;
+    let expected = suppress_token(phrase);
+    // Decode both to bytes so subtle::ConstantTimeEq works on fixed
+    // lengths. Base64 strings compared as &str are timing-safe via
+    // constant_time_eq but we already normalise via the encoder.
+    let a = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&expected).unwrap_or_default();
+    let b = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token).unwrap_or_default();
+    if a.len() != b.len() || a.is_empty() { return false; }
+    // Manual constant-time compare — avoids a new dep for one check.
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) { diff |= x ^ y; }
+    diff == 0
+}
+
+/// Extract per-finding phrases from an LLM health-check response so we
+/// can build a suppress link for each one. Trims the severity prefix,
+/// caps length for URL safety, drops empty / too-short noise.
+pub fn extract_findings(response: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in response.lines() {
+        let trimmed = line.trim().trim_start_matches(['-', '*', '•', ' ']);
+        // Strip a leading severity tag so "CRITICAL: Foo" → "Foo".
+        let cleaned = ["CRITICAL:", "CRITICAL", "WARNING:", "WARNING", "INFO:", "INFO"]
+            .iter()
+            .fold(trimmed, |acc, tag| acc.trim_start_matches(tag).trim_start());
+        let cleaned = cleaned.trim();
+        if cleaned.len() < 10 || cleaned.len() > 200 { continue; }
+        // Skip prose / action-tag leftovers.
+        if cleaned.starts_with('[') || cleaned.starts_with("You ") { continue; }
+        out.push(cleaned.to_string());
+    }
+    out
+}
+
+#[cfg(test)]
+mod suppress_tests {
+    use super::*;
+
+    #[test]
+    fn token_round_trip() {
+        let phrase = "SSH password login enabled";
+        let token = suppress_token(phrase);
+        assert!(verify_suppress_token(phrase, &token));
+    }
+
+    #[test]
+    fn token_rejects_wrong_phrase() {
+        let token = suppress_token("SSH password login enabled");
+        assert!(!verify_suppress_token("Docker daemon running", &token));
+    }
+
+    #[test]
+    fn token_rejects_forged() {
+        assert!(!verify_suppress_token("SSH password login enabled", "AAAAAAAAAAAAAAAA"));
+    }
+
+    #[test]
+    fn extract_findings_strips_severity_prefixes() {
+        let response = "CRITICAL: SSH password login is enabled\n\
+                        WARNING: Docker daemon running on default port\n\
+                        - INFO: /var disk usage climbing\n\
+                        \n\
+                        Consider fixing these.";
+        let findings = extract_findings(response);
+        assert!(findings.iter().any(|f| f.starts_with("SSH password")));
+        assert!(findings.iter().any(|f| f.starts_with("Docker daemon")));
+        assert!(findings.iter().any(|f| f.starts_with("/var disk")));
+    }
 }
 
 // ─── Chat Messages ───
@@ -802,6 +925,20 @@ impl AiAgent {
             }
         }).await.unwrap_or_default();
 
+        // Accepted-risks preamble — the operator has said "don't flag
+        // these". The LLM is instructed to treat them as known and not
+        // re-report, so hourly emails don't repeat the same findings
+        // the operator has already decided not to fix.
+        let accepted_risks_block = if config.accepted_risks.is_empty() {
+            String::new()
+        } else {
+            let mut b = String::from("\n\nThe operator has explicitly ACCEPTED the following conditions. Do NOT flag them in this report, do NOT mention them, do NOT recommend fixes for them. They are known and intentional:\n");
+            for r in &config.accepted_risks {
+                b.push_str(&format!("  - {}\n", r));
+            }
+            b
+        };
+
         let prompt = format!(
             "You are a server monitoring AI for WolfStack. Analyze these metrics and report ONLY if there are concerns. \
              If everything looks healthy, respond with exactly 'ALL_OK'. \
@@ -821,8 +958,8 @@ impl AiAgent {
              The rolling baseline below shows how current metrics compare to 24h and 7d ago. Use it to flag drift that \
              static thresholds miss — e.g. disk usage creeping up 1 GB/day, CPU trending higher over the week, container \
              count unexpectedly growing. A stable trend at a high absolute value is different from a rising trend.\n\n\
-             Current server metrics:\n{}{}{}",
-            metrics_summary, baseline_summary, security_summary
+             Current server metrics:\n{}{}{}{}",
+            metrics_summary, baseline_summary, security_summary, accepted_risks_block
         );
 
         let system = "You are a WolfStack server health monitoring agent. Be concise and technical. Only flag genuine issues. Propose fixes with [ACTION] tags when possible.";
@@ -887,30 +1024,59 @@ impl AiAgent {
                     // the next ALL_OK can send a "cleared" notification.
                     self.alerting_hosts.lock().unwrap().insert(hostname.clone());
 
+                    // Build a per-finding suppress-link block so the
+                    // operator can click "don't alert me about this
+                    // again" directly from the email. URL points back
+                    // to THIS node because the HMAC secret is per-node.
+                    let suppress_block = {
+                        let findings = extract_findings(&clean_response);
+                        if findings.is_empty() {
+                            String::new()
+                        } else {
+                            let port = crate::ports::PortConfig::load().api;
+                            let mut b = String::from("\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+                            b.push_str("SUPPRESS FUTURE ALERTS (\"I know, not going to fix\")\n");
+                            b.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n");
+                            for phrase in &findings {
+                                let token = suppress_token(phrase);
+                                let url_phrase: String = phrase.chars()
+                                    .map(|c| if c.is_ascii_alphanumeric() || "-_.~".contains(c) {
+                                        c.to_string()
+                                    } else {
+                                        format!("%{:02X}", c as u32)
+                                    })
+                                    .collect();
+                                b.push_str(&format!(
+                                    "• {}\n  Click to suppress: https://{}:{}/api/ai/suppress?p={}&t={}\n\n",
+                                    phrase, hostname, port, url_phrase, token,
+                                ));
+                            }
+                            b
+                        }
+                    };
+
                     // Send email if configured — include proposed actions
                     if config.email_enabled && !config.email_to.is_empty() {
                         let subject = format!("[WolfStack {}] {} Alert on {}", severity.to_uppercase(), severity.to_uppercase(), hostname);
-                        let email_body = if actions.is_empty() {
-                            clean_response.clone()
-                        } else {
-                            let mut body = clean_response.clone();
-                            body.push_str("\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-                            body.push_str("PROPOSED FIXES (approve in WolfStack dashboard)\n");
-                            body.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n");
+                        let mut email_body = clean_response.clone();
+                        if !actions.is_empty() {
+                            email_body.push_str("\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+                            email_body.push_str("PROPOSED FIXES (approve in WolfStack dashboard)\n");
+                            email_body.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n");
                             for a in &actions {
                                 let risk_label = match a.risk.as_str() {
                                     "low" => "LOW RISK",
                                     "high" => "HIGH RISK",
                                     _ => "MEDIUM RISK",
                                 };
-                                body.push_str(&format!(
+                                email_body.push_str(&format!(
                                     "[{}] {}\n  Command: {}\n  {}\n  → Open WolfStack dashboard to approve this action\n\n",
                                     risk_label, a.title, a.command,
                                     if a.explanation.is_empty() { String::new() } else { format!("Reason: {}", a.explanation) }
                                 ));
                             }
-                            body
-                        };
+                        }
+                        email_body.push_str(&suppress_block);
                         if let Err(e) = send_alert_email(&config, &subject, &email_body) {
                             warn!("Failed to send alert email: {}", e);
                         }
