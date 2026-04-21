@@ -57,6 +57,7 @@ mod cluster_browser;
 mod compat;
 mod danger;
 mod plugins;
+mod certbot;
 #[allow(dead_code)]
 mod integrations;
 
@@ -504,6 +505,22 @@ async fn main() -> std::io::Result<()> {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 tokio::task::spawn_blocking(danger::tick).await.ok();
+            }
+        });
+
+        // Daily certbot renewal. Runs certbot's own `renew --quiet`
+        // which is a no-op for any cert with >30 days left, so it's
+        // cheap to fire every 24h. Skipped by config flag and when
+        // certbot isn't installed — both checked inside renew_due.
+        // First run after 60s so we don't race the service into a
+        // fresh LE hit at every restart.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            loop {
+                tokio::task::spawn_blocking(|| {
+                    let _ = certbot::renew_due();
+                }).await.ok();
+                tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
             }
         });
 

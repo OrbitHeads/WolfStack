@@ -638,12 +638,20 @@ pub async fn create_user(req: HttpRequest, state: web::Data<AppState>, body: web
 
     // Allowed clusters — comma-free list from the create form. Empty =
     // see-everything (matches the existing default for legacy users);
-    // for restricted team members the operator fills this in.
-    let allowed_clusters: Vec<String> = body.get("allowed_clusters")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
-            .filter(|s| !s.is_empty()).collect())
-        .unwrap_or_default();
+    // for restricted team members the operator fills this in. The
+    // field is enterprise-only; on non-enterprise installs the UI
+    // doesn't render it and we discard any value posted anyway so a
+    // bad-actor admin can't pre-seed restrictions that then get
+    // enforced.
+    let allowed_clusters: Vec<String> = if crate::compat::has_feature("per_user_clusters") {
+        body.get("allowed_clusters")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     let user = crate::auth::users::WolfUser {
         username: username.clone(),
@@ -761,6 +769,13 @@ pub async fn update_user_clusters(
     path: web::Path<String>, body: web::Json<serde_json::Value>,
 ) -> HttpResponse {
     let caller = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
+    // Per-user cluster assignment is an enterprise feature. On a
+    // non-enterprise install the route looks as if it doesn't exist,
+    // matching what the UI tells the admin — 404, not 403, so no
+    // "upgrade for this" leakage.
+    if !crate::compat::has_feature("per_user_clusters") {
+        return HttpResponse::NotFound().finish();
+    }
     let store = crate::auth::users::UserStore::load();
     let caller_is_admin = store.find(&caller)
         .map(|u| u.role == "admin").unwrap_or(false);
@@ -3788,6 +3803,105 @@ pub async fn reverse_proxy_config_save(
         return HttpResponse::InternalServerError().json(serde_json::json!({"error": e}));
     }
     HttpResponse::Ok().json(serde_json::json!({"saved": true, "config": cfg}))
+}
+
+// ─── Certbot / SSL certificates ─────────────────────────────────────────
+
+/// GET /api/certs — list every Let's Encrypt cert on disk, with expiry.
+pub async fn certs_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    HttpResponse::Ok().json(serde_json::json!({
+        "installed": crate::certbot::is_installed(),
+        "config": crate::certbot::CertbotConfig::load(),
+        "certs": crate::certbot::list_certs(),
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct CertIssueRequest {
+    pub domains: Vec<String>,
+    #[serde(default)]
+    pub email: String,
+    /// "webroot" (default) or "dns-<provider>".
+    #[serde(default)]
+    pub challenge: String,
+    /// Path to an uploaded DNS provider credentials INI, if using DNS-01.
+    #[serde(default)]
+    pub dns_credentials_path: String,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// POST /api/certs — issue a new cert. Runs certbot in-process and
+/// returns its stdout so the UI can surface ACME errors verbatim
+/// (they're usually self-explanatory — rate limits, DNS mismatch, etc.)
+pub async fn certs_issue(
+    req: HttpRequest, state: web::Data<AppState>,
+    body: web::Json<CertIssueRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let b = body.into_inner();
+    let challenge = if b.challenge.is_empty() { "webroot".to_string() } else { b.challenge };
+    let creds: Option<String> = if b.dns_credentials_path.is_empty() { None } else { Some(b.dns_credentials_path.clone()) };
+    let domains = b.domains.clone();
+    let email = b.email.clone();
+    let dry_run = b.dry_run;
+    let result = web::block(move || {
+        crate::certbot::issue(&domains, &email, &challenge, creds.as_deref(), dry_run)
+    }).await;
+    match result {
+        Ok(Ok(out)) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "log": out })),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+/// POST /api/certs/{name}/renew — force renew.
+pub async fn certs_renew(
+    req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let name = path.into_inner();
+    match web::block(move || crate::certbot::renew(&name)).await {
+        Ok(Ok(out)) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "log": out })),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+/// DELETE /api/certs/{name} — delete a cert.
+pub async fn certs_delete(
+    req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let name = path.into_inner();
+    match web::block(move || crate::certbot::delete(&name)).await {
+        Ok(Ok(out)) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "log": out })),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+/// POST /api/certs/config — save certbot config (email, webroot,
+/// auto-renew toggle, reload_cmd override). Also regenerates the
+/// WolfProxy include snippet so the webroot path in nginx matches
+/// whatever certbot is about to write into.
+pub async fn certs_config_save(
+    req: HttpRequest, state: web::Data<AppState>,
+    body: web::Json<crate::certbot::CertbotConfig>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let cfg = body.into_inner();
+    if let Err(e) = cfg.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+    // Best-effort — writing the snippet isn't fatal if /etc/wolfproxy
+    // doesn't exist (WolfProxy may not be installed on this node).
+    let _ = crate::certbot::write_nginx_snippet(&cfg);
+    HttpResponse::Ok().json(serde_json::json!({
+        "saved": true,
+        "nginx_snippet": crate::certbot::nginx_snippet_path().display().to_string(),
+    }))
 }
 
 // ─── GitHub Backup ──────────────────────────────────────────────────────
@@ -19673,6 +19787,11 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/ports", web::post().to(set_ports))
         .route("/api/reverse-proxy/config", web::get().to(reverse_proxy_config_get))
         .route("/api/reverse-proxy/config", web::post().to(reverse_proxy_config_save))
+        .route("/api/certs", web::get().to(certs_list))
+        .route("/api/certs", web::post().to(certs_issue))
+        .route("/api/certs/config", web::post().to(certs_config_save))
+        .route("/api/certs/{name}/renew", web::post().to(certs_renew))
+        .route("/api/certs/{name}", web::delete().to(certs_delete))
         .route("/api/github-backup/config", web::get().to(github_backup_config_get))
         .route("/api/github-backup/config", web::post().to(github_backup_config_save))
         .route("/api/github-backup/push", web::post().to(github_backup_push_now))

@@ -110,6 +110,18 @@ pub fn probe_runtime() -> bool {
     dm.expires >= ts_ymd()
 }
 
+/// True when the loaded platform manifest grants the named feature.
+/// Used to gate paid features (e.g. `per_user_clusters`). Non-enterprise
+/// installs — or any install without a valid manifest — return false, so
+/// callers can branch cleanly and hide gated UI without leaking its
+/// existence.
+pub fn has_feature(name: &str) -> bool {
+    match load_dm() {
+        Some(dm) => dm.features.iter().any(|f| f == name),
+        None => false,
+    }
+}
+
 pub fn runtime_status() -> serde_json::Value {
     match load_dm() {
         Some(dm) => serde_json::json!({

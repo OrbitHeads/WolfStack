@@ -3581,6 +3581,36 @@ function escapeHtml(str) {
     return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
+// Feature-flag cache backed by /api/platform/status. Populated on first
+// call and reused until page reload — the license doesn't change on the
+// fly and saving a round-trip per feature check keeps the UI snappy.
+// Enterprise-only UI uses `hasFeature('per_user_clusters')` to hide
+// gated controls completely on non-enterprise installs; the call
+// resolves to false before the fetch completes, which means the UI
+// renders non-enterprise first and may enable controls a moment later
+// once the real license data arrives. That's acceptable — there's no
+// security impact (the backend re-enforces the gate), and hiding first
+// then showing is the right default.
+let _platformFeaturesCache = null;
+let _platformFeaturesInflight = null;
+async function loadPlatformFeatures() {
+    if (_platformFeaturesCache) return _platformFeaturesCache;
+    if (_platformFeaturesInflight) return _platformFeaturesInflight;
+    _platformFeaturesInflight = (async () => {
+        try {
+            const r = await fetch('/api/platform/status');
+            if (!r.ok) return [];
+            const d = await r.json();
+            return Array.isArray(d.features) ? d.features : [];
+        } catch (e) { return []; }
+    })();
+    _platformFeaturesCache = await _platformFeaturesInflight;
+    return _platformFeaturesCache;
+}
+function hasFeature(name) {
+    return Array.isArray(_platformFeaturesCache) && _platformFeaturesCache.includes(name);
+}
+
 async function discoverLibvirtVms() {
     try {
         showToast('Scanning for libvirt VMs...', 'info');
@@ -9351,6 +9381,7 @@ async function loadNginxConfigurator() {
         <button class="btn btn-primary btn-sm" onclick="nginxNewSiteForm()">+ New Site</button>
         <button class="btn btn-sm" onclick="nginxTestConfig()">Test Config</button>
         <button class="btn btn-success btn-sm" onclick="nginxReloadService()">Reload</button>
+        <button class="btn btn-sm" onclick="loadCertManager()">🔒 SSL Certificates</button>
         <button class="btn btn-sm" onclick="loadTomlConfigurator('wolfproxy', 'WolfProxy')">WolfProxy Settings</button>
     `;
 
@@ -9662,6 +9693,224 @@ async function nginxReloadService() {
     } catch (e) {
         showToast('Failed: ' + e.message, 'error');
     }
+}
+
+// ── SSL Certificate Manager (certbot) ──
+//
+// Used by both the WolfProxy/Nginx configurator and — in future — the
+// app-store nginx settings page. Lists the certs currently on disk,
+// their days-remaining, and offers issue/renew/delete actions. The
+// issuance modal defaults to webroot challenges (zero-downtime — no
+// need to stop WolfProxy) with DNS-01 as an advanced toggle for
+// wildcards.
+
+async function loadCertManager() {
+    document.getElementById('configurator-title').textContent = 'SSL Certificates';
+    document.getElementById('configurator-header-actions').innerHTML = `
+        <button class="btn btn-primary btn-sm" onclick="certIssueDialog()">+ Issue new cert</button>
+        <button class="btn btn-sm" onclick="certConfigDialog()">⚙ Settings</button>
+        <button class="btn btn-sm" onclick="loadNginxConfigurator()">← Back to sites</button>
+    `;
+    const body = document.getElementById('configurator-body');
+    body.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">Loading certificates…</div>';
+    try {
+        const resp = await fetch('/api/certs');
+        if (handleAuthError(resp)) return;
+        const data = await resp.json();
+        if (!data.installed) {
+            body.innerHTML = `<div style="padding:18px; border:1px solid var(--border); border-radius:8px; background:var(--bg-panel);">
+                <h3 style="margin-top:0;">certbot not installed</h3>
+                <p style="color:var(--text-secondary);">Install certbot on this node to manage Let's Encrypt certificates from here.</p>
+                <pre style="background:var(--bg-input); padding:10px; border-radius:6px; font-size:12px;">apt install certbot         # Debian / Ubuntu
+dnf install certbot         # RHEL / Fedora / Alma
+pacman -S certbot           # Arch</pre>
+            </div>`;
+            return;
+        }
+        renderCertList(data);
+    } catch (e) {
+        body.innerHTML = `<div style="color:var(--danger);">Failed to load certs: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function renderCertList(data) {
+    const body = document.getElementById('configurator-body');
+    const certs = data.certs || [];
+    if (certs.length === 0) {
+        body.innerHTML = `<div style="text-align:center;padding:28px;color:var(--text-muted);">
+            No certificates yet.<br>
+            <button class="btn btn-primary btn-sm" style="margin-top:10px;" onclick="certIssueDialog()">Issue the first one</button>
+        </div>`;
+        return;
+    }
+    const rows = certs.map(c => {
+        const d = c.days_remaining;
+        const colour = d < 7 ? 'var(--danger)' : d < 30 ? '#f59e0b' : '#10b981';
+        const status = d < 0 ? `Expired ${-d}d ago` : `${d} day${d === 1 ? '' : 's'}`;
+        return `<tr>
+            <td><code>${escapeHtml(c.name)}</code></td>
+            <td style="font-size:12px;">${(c.domains || []).map(escapeHtml).join('<br>')}</td>
+            <td><span style="color:${colour};font-weight:600;">${status}</span><br>
+                <span style="font-size:11px;color:var(--text-muted);">${escapeHtml(c.expires)}</span></td>
+            <td style="text-align:right;">
+                <button class="btn btn-sm" onclick="certRenew('${escapeHtml(c.name)}')">Renew</button>
+                <button class="btn btn-sm btn-danger" onclick="certDelete('${escapeHtml(c.name)}')">Delete</button>
+            </td>
+        </tr>`;
+    }).join('');
+    body.innerHTML = `
+        <div style="margin-bottom:10px; font-size:12px; color:var(--text-muted);">
+            Auto-renewal runs daily via certbot renew. Certs are reloaded into WolfProxy automatically.
+        </div>
+        <table class="data-table" style="width:100%;">
+            <thead><tr><th>Name</th><th>Domains</th><th>Expiry</th><th style="text-align:right;">Actions</th></tr></thead>
+            <tbody>${rows}</tbody>
+        </table>`;
+}
+
+function certIssueDialog() {
+    const existing = document.getElementById('cert-issue-modal');
+    if (existing) existing.remove();
+    const overlay = document.createElement('div');
+    overlay.id = 'cert-issue-modal';
+    overlay.className = 'modal-overlay active';
+    overlay.innerHTML = `
+        <div class="modal" style="max-width:520px;">
+            <div class="modal-header"><h3>Issue SSL Certificate</h3>
+                <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">&times;</button></div>
+            <div class="modal-body" style="display:flex;flex-direction:column;gap:10px;">
+                <label>Domains <span style="color:var(--text-muted);font-weight:400;">(one per line)</span>
+                    <textarea id="cert-domains" style="width:100%;height:80px;font-family:var(--font-mono);" placeholder="example.com&#10;www.example.com"></textarea></label>
+                <label>Contact email
+                    <input id="cert-email" style="width:100%;" placeholder="admin@example.com"></label>
+                <label>Challenge type
+                    <select id="cert-challenge">
+                        <option value="webroot" selected>Webroot (zero-downtime, recommended)</option>
+                        <option value="dns-cloudflare">DNS-01 — Cloudflare</option>
+                        <option value="dns-route53">DNS-01 — AWS Route 53</option>
+                        <option value="dns-digitalocean">DNS-01 — DigitalOcean</option>
+                        <option value="dns-gandi">DNS-01 — Gandi</option>
+                    </select></label>
+                <label id="cert-dns-creds-label" style="display:none;">DNS credentials file path
+                    <input id="cert-dns-creds" style="width:100%;font-family:var(--font-mono);" placeholder="/etc/wolfstack/dns-credentials.ini"></label>
+                <label style="display:flex;align-items:center;gap:6px;">
+                    <input type="checkbox" id="cert-dry-run"> Dry run (test without actually requesting)
+                </label>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+                <button class="btn btn-primary" onclick="certIssueSubmit()">Issue</button>
+            </div>
+        </div>`;
+    document.body.appendChild(overlay);
+    const sel = document.getElementById('cert-challenge');
+    const lbl = document.getElementById('cert-dns-creds-label');
+    const sync = () => { lbl.style.display = sel.value.startsWith('dns-') ? '' : 'none'; };
+    sel.addEventListener('change', sync);
+    sync();
+}
+
+async function certIssueSubmit() {
+    const domains = (document.getElementById('cert-domains')?.value || '').split(/\s+/).filter(Boolean);
+    if (domains.length === 0) { showToast('Enter at least one domain', 'error'); return; }
+    const email = (document.getElementById('cert-email')?.value || '').trim();
+    const challenge = (document.getElementById('cert-challenge')?.value || 'webroot');
+    const dnsCreds = (document.getElementById('cert-dns-creds')?.value || '').trim();
+    const dryRun = document.getElementById('cert-dry-run')?.checked || false;
+    document.getElementById('cert-issue-modal')?.remove();
+    showToast('Requesting certificate… this can take up to a minute', 'info');
+    try {
+        const resp = await fetch('/api/certs', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ domains, email, challenge, dns_credentials_path: dnsCreds, dry_run: dryRun }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+            showModal(`<pre style="white-space:pre-wrap;font-family:var(--font-mono);font-size:12px;color:var(--danger);">${escapeHtml(data.error || 'Issue failed')}</pre>`, 'Certbot error');
+            return;
+        }
+        showToast(dryRun ? 'Dry-run succeeded' : 'Certificate issued', 'success');
+        loadCertManager();
+    } catch (e) {
+        showToast('Failed: ' + e.message, 'error');
+    }
+}
+
+async function certRenew(name) {
+    if (!(await wolfConfirm(`Force-renew ${name}? This bypasses certbot's 30-day freshness window.`, 'Renew'))) return;
+    try {
+        const resp = await fetch(`/api/certs/${encodeURIComponent(name)}/renew`, { method: 'POST' });
+        const data = await resp.json();
+        if (!resp.ok) {
+            showModal(`<pre style="white-space:pre-wrap;color:var(--danger);">${escapeHtml(data.error || 'Renew failed')}</pre>`, 'Renew failed');
+            return;
+        }
+        showToast('Renewed', 'success');
+        loadCertManager();
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+}
+
+async function certDelete(name) {
+    if (!(await wolfConfirm(`Delete ${name}? This revokes the cert and removes it from /etc/letsencrypt.`, 'Delete'))) return;
+    try {
+        const resp = await fetch(`/api/certs/${encodeURIComponent(name)}`, { method: 'DELETE' });
+        const data = await resp.json();
+        if (!resp.ok) {
+            showModal(`<pre style="white-space:pre-wrap;color:var(--danger);">${escapeHtml(data.error || 'Delete failed')}</pre>`, 'Delete failed');
+            return;
+        }
+        showToast('Deleted', 'success');
+        loadCertManager();
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+}
+
+async function certConfigDialog() {
+    const resp = await fetch('/api/certs');
+    const data = await resp.json();
+    const cfg = data.config || {};
+    const existing = document.getElementById('cert-cfg-modal');
+    if (existing) existing.remove();
+    const overlay = document.createElement('div');
+    overlay.id = 'cert-cfg-modal';
+    overlay.className = 'modal-overlay active';
+    overlay.innerHTML = `
+        <div class="modal" style="max-width:520px;">
+            <div class="modal-header"><h3>Certbot settings</h3>
+                <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">&times;</button></div>
+            <div class="modal-body" style="display:flex;flex-direction:column;gap:10px;">
+                <label>Default contact email
+                    <input id="cert-cfg-email" value="${escapeHtml(cfg.email || '')}" style="width:100%;"></label>
+                <label>Webroot path (where certbot writes ACME challenges)
+                    <input id="cert-cfg-webroot" value="${escapeHtml(cfg.webroot || '/var/lib/wolfstack/acme-webroot')}" style="width:100%;font-family:var(--font-mono);"></label>
+                <label>Reload command override <span style="color:var(--text-muted);font-weight:400;">(empty = auto-detect wolfproxy / nginx)</span>
+                    <input id="cert-cfg-reload" value="${escapeHtml(cfg.reload_cmd || '')}" style="width:100%;font-family:var(--font-mono);" placeholder="e.g. systemctl reload wolfproxy"></label>
+                <label style="display:flex;align-items:center;gap:6px;">
+                    <input type="checkbox" id="cert-cfg-auto" ${cfg.auto_renew !== false ? 'checked' : ''}> Auto-renew daily
+                </label>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+                <button class="btn btn-primary" onclick="certConfigSubmit()">Save</button>
+            </div>
+        </div>`;
+    document.body.appendChild(overlay);
+}
+
+async function certConfigSubmit() {
+    const payload = {
+        email: document.getElementById('cert-cfg-email').value.trim(),
+        webroot: document.getElementById('cert-cfg-webroot').value.trim(),
+        reload_cmd: document.getElementById('cert-cfg-reload').value.trim(),
+        auto_renew: document.getElementById('cert-cfg-auto').checked,
+    };
+    const r = await fetch('/api/certs/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+    document.getElementById('cert-cfg-modal')?.remove();
+    if (r.ok) { showToast('Settings saved', 'success'); }
+    else { showToast('Save failed', 'error'); }
 }
 
 // ── Apache Configurator (WolfServe) ──
@@ -26623,6 +26872,11 @@ async function setAuthMode(mode) {
 async function loadUsers() {
     const container = document.getElementById('users-list');
     if (!container) return;
+    // Pull the feature list once so per-user cluster controls are
+    // hidden on non-enterprise installs. `await` here delays the render
+    // slightly on the first visit; subsequent visits are cached.
+    await loadPlatformFeatures();
+    const perUserClusters = hasFeature('per_user_clusters');
     try {
         const resp = await fetch('/api/auth/users');
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
@@ -26639,9 +26893,12 @@ async function loadUsers() {
             html += '<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">';
             html += '<span style="padding:2px 6px;border-radius:4px;background:var(--bg-tertiary);border:1px solid var(--border);font-size:10px;text-transform:uppercase;font-weight:600;">' + escapeHtml(user.role) + '</span>';
             if (user.totp_enabled) html += ' <span style="padding:2px 6px;border-radius:4px;background:rgba(34,197,94,0.1);color:var(--success);border:1px solid rgba(34,197,94,0.3);font-size:10px;font-weight:600;">2FA ENABLED</span>';
-            // Cluster access badge — admins have implicit all-access, so only
-            // surface the allowlist for non-admin users to avoid visual noise.
-            if (user.role !== 'admin') {
+            // Cluster access badge — only rendered on Enterprise
+            // installs (feature flag `per_user_clusters`). On non-
+            // enterprise installs the feature is invisible: no badge,
+            // no button, no hint it exists. Admins always see all
+            // clusters regardless, so we skip the badge for them too.
+            if (perUserClusters && user.role !== 'admin') {
                 const ac = Array.isArray(user.allowed_clusters) ? user.allowed_clusters : [];
                 const label = ac.length === 0 ? 'ALL CLUSTERS' : ac.join(', ');
                 const tone = ac.length === 0 ? 'rgba(234,179,8,0.12);color:#eab308;border:1px solid rgba(234,179,8,0.35)'
@@ -26652,7 +26909,9 @@ async function loadUsers() {
             html += '</div></div><div style="display:flex;gap:6px;">';
             if (!user.totp_enabled) html += '<button class="btn btn-sm" onclick="setupTotp(\'' + escapeHtml(user.username) + '\')" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);font-size:11px;">Enable 2FA</button>';
             else html += '<button class="btn btn-sm" onclick="disableTotp(\'' + escapeHtml(user.username) + '\')" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);font-size:11px;">Disable 2FA</button>';
-            html += '<button class="btn btn-sm" onclick="editUserClusters(\'' + escapeHtml(user.username) + '\')" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);font-size:11px;">Clusters</button>';
+            if (perUserClusters) {
+                html += '<button class="btn btn-sm" onclick="editUserClusters(\'' + escapeHtml(user.username) + '\')" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);font-size:11px;">Clusters</button>';
+            }
             html += '<button class="btn btn-sm" onclick="changePassword(\'' + escapeHtml(user.username) + '\')" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);font-size:11px;">Password</button>';
             html += '<button class="btn btn-sm" onclick="deleteUser(\'' + escapeHtml(user.username) + '\')" style="background:rgba(220,38,38,0.1);border:1px solid rgba(220,38,38,0.3);color:var(--danger, #ef4444);font-size:11px;">Delete</button>';
             html += '</div></div>';
