@@ -125,6 +125,18 @@
 - Served on BOTH the main API port (auth not required for /status/*) AND a dedicated no-auth listener on port 8550 — the main-port route is what makes reverse-proxy deployments work
 - Admin UI "public URL" link uses `window.location.origin` for the local cluster, so it automatically matches whatever domain the admin is on (Cloudflare tunnel, nginx, direct IP — all work without config)
 
+## GitHub Backup (v19.2.0+)
+- Settings → 📤 **GitHub Backup** — commit WolfStack configuration to a private GitHub repo as an audit log / rollback story
+- Tracked files: every `/etc/wolfstack/*.json` **except** `github-backup.json` (the token lives there — never pushed), plus every `docker-compose.yml` under `/etc/wolfstack/compose/`
+- Config at `/etc/wolfstack/github-backup.json` (0600). Fields: `enabled`, `token`, `owner`, `repo`, `branch` (default `main`), `commit_name`, `commit_email`, plus last-push metadata
+- Push uses the GitHub Git Data API so every push is **one atomic commit** even across many files (blobs → tree → commit → fast-forward ref). Tree is NOT based on the previous tree, so deletions (e.g. uninstalled appstore stacks) propagate to history
+- Restore pulls the latest tree from the configured branch, recursively walks it, writes each known path back to `/etc/wolfstack/`. Paths outside the `config/` and `compose/` prefixes are ignored so arbitrary files committed to the repo can't be written elsewhere on the host
+- Destructive actions (restore) gated by `confirmTypedYes` typed-YES modal in the frontend
+- Token classic scope: `repo`. Fine-grained: `Contents: Read and write` on the single target repo. **Private repo required** — contents include API keys and passwords
+- Empty repos aren't auto-initialised — the configured branch must already have at least one commit. UI Test-connection surfaces whether the branch exists
+- Endpoints: `GET/POST /api/github-backup/config`, `POST /api/github-backup/push`, `POST /api/github-backup/restore`, `GET /api/github-backup/test`
+- Token never reaches the browser — GET config returns `••••••••XXXX` mask; POST config with blank-or-masked token keeps the stored value untouched
+
 ## Running behind a reverse proxy (Cloudflare Tunnel, nginx, Traefik, etc.)
 - Point the proxy at the main API port (default 8553, or whatever `--port` sets). Status pages, cluster browser sessions, consoles and the SPA all ride that one port.
 - Required proxy headers: `Host` (preserve original), `X-Forwarded-Proto`, `X-Forwarded-For`. actix-web's `connection_info()` reads these for URL generation (cluster browser `connect_url`, etc.).

@@ -4281,6 +4281,7 @@
                         <button class="settings-tab-btn" onclick="switchSettingsTab('systemcheck')">🩺 System Check</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('paths')">📂 File Locations</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('reverseproxy')">🌐 Reverse Proxy</button>
+                        <button class="settings-tab-btn" onclick="switchSettingsTab('github')">📤 GitHub Backup</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('wolfnote')">📝 WolfNote</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('plugins')">🔌 Plugins</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('apikeys')">🔑 API Keys / Enterprise</button>
@@ -5228,6 +5229,62 @@
                                 <button class="btn" onclick="loadReverseProxyConfig()">↻ Reload</button>
                             </div>
                             <div id="reverse-proxy-status" style="margin-top:12px;font-size:13px;"></div>
+                        </div>
+                    </div>
+
+                    <!-- ─── GitHub Backup Tab ─── -->
+                    <div id="settings-tab-github" class="settings-tab-panel">
+                        <h4 style="margin:0 0 8px 0;font-size:16px;font-weight:600;">GitHub Backup</h4>
+                        <p style="font-size:13px;color:var(--text-muted);margin:0 0 16px 0;">
+                            Commit WolfStack's configuration — every <code>/etc/wolfstack/*.json</code> (except the GitHub token itself) plus every <code>docker-compose.yml</code> under <code>/etc/wolfstack/compose/</code> — as a single atomic commit on the branch you configure. Use the commit history as an audit log of state changes; restore pulls the latest tree back into place.
+                        </p>
+                        <div style="max-width:720px;">
+                            <div style="background:var(--bg-input);border:1px solid var(--border);border-radius:8px;padding:14px 16px;margin-bottom:18px;">
+                                <div style="font-weight:600;margin-bottom:6px;font-size:14px;">Setup</div>
+                                <ol style="margin:0;padding-left:20px;font-size:13px;color:var(--text-muted);line-height:1.7;">
+                                    <li>Create a <b>private</b> repository on GitHub (the contents will include API keys and passwords — don't make it public).</li>
+                                    <li>Make sure the repo has at least one commit on the branch below — <code>main</code> by default. An empty repo won't accept pushes.</li>
+                                    <li>Generate a token: <a href="https://github.com/settings/tokens" target="_blank" style="color:var(--accent);">classic tokens</a> need the <code>repo</code> scope, or use a <a href="https://github.com/settings/personal-access-tokens" target="_blank" style="color:var(--accent);">fine-grained token</a> scoped to this single repo with <b>Contents: Read and write</b>.</li>
+                                    <li>Paste the token below, hit <b>Test connection</b>, then <b>Push now</b>.</li>
+                                </ol>
+                            </div>
+                            <div style="display:grid;grid-template-columns:150px 1fr;gap:10px 14px;align-items:center;font-size:13px;">
+                                <label>Enable</label>
+                                <label style="display:inline-flex;gap:6px;align-items:center;"><input type="checkbox" id="gh-enabled"> Enable GitHub backup</label>
+
+                                <label>Token</label>
+                                <input type="password" id="gh-token" placeholder="ghp_… or github_pat_…" autocomplete="off"
+                                    style="padding:9px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text);font-family:monospace;font-size:12px;">
+
+                                <label>Owner</label>
+                                <input type="text" id="gh-owner" placeholder="username or org"
+                                    style="padding:9px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text);font-size:13px;">
+
+                                <label>Repo</label>
+                                <input type="text" id="gh-repo" placeholder="wolfstack-backup"
+                                    style="padding:9px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text);font-size:13px;">
+
+                                <label>Branch</label>
+                                <input type="text" id="gh-branch" placeholder="main" value="main"
+                                    style="padding:9px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text);font-size:13px;">
+
+                                <label>Commit author</label>
+                                <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+                                    <input type="text" id="gh-commit-name" placeholder="WolfStack Backup"
+                                        style="padding:9px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text);font-size:13px;">
+                                    <input type="text" id="gh-commit-email" placeholder="backup@wolfstack.local"
+                                        style="padding:9px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text);font-size:13px;">
+                                </div>
+                            </div>
+                            <div style="display:flex;gap:8px;margin-top:18px;flex-wrap:wrap;">
+                                <button class="btn btn-primary" onclick="saveGithubBackupConfig()">💾 Save config</button>
+                                <button class="btn" onclick="loadGithubBackupConfig()">↻ Reload</button>
+                                <button class="btn" onclick="testGithubBackup()">🔍 Test connection</button>
+                                <button class="btn btn-primary" onclick="pushGithubBackup()">⬆️ Push now</button>
+                                <button class="btn btn-danger" onclick="restoreGithubBackup()">⬇️ Restore from GitHub</button>
+                            </div>
+                            <div id="gh-status" style="margin-top:14px;font-size:13px;min-height:20px;"></div>
+                            <div id="gh-last-push" style="margin-top:8px;font-size:12px;color:var(--text-muted);"></div>
                         </div>
                     </div>
 

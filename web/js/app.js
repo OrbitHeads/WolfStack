@@ -25096,6 +25096,8 @@ function switchSettingsTab(tabName) {
         loadFileLocations();
     } else if (tabName === 'reverseproxy') {
         loadReverseProxyConfig();
+    } else if (tabName === 'github') {
+        loadGithubBackupConfig();
     } else if (tabName === 'users') {
         loadAuthConfig();
         loadUsers();
@@ -26946,6 +26948,171 @@ document.addEventListener('DOMContentLoaded', function() {
 // Eagerly populate the cache so spPublicUrl() has the override on first
 // render of the status-page list.
 document.addEventListener('DOMContentLoaded', fetchReverseProxyConfigSilent);
+
+// ─── GitHub Backup (Settings → 📤 GitHub Backup) ───
+//
+// All state lives server-side (the token is stored in a 0600 file).
+// Load fetches a masked copy of the config; Save POSTs the form.
+// Token blank or starting with "•" tells the backend to keep the
+// stored token untouched, so editing other fields doesn't require
+// re-pasting.
+
+async function loadGithubBackupConfig() {
+    const setStatus = (text, colour) => {
+        const el = document.getElementById('gh-status');
+        if (!el) return;
+        el.textContent = text || '';
+        el.style.color = colour || 'var(--text-muted)';
+    };
+    try {
+        const resp = await fetch('/api/github-backup/config');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const cfg = await resp.json();
+        const get = id => document.getElementById(id);
+        if (get('gh-enabled')) get('gh-enabled').checked = !!cfg.enabled;
+        if (get('gh-token'))   get('gh-token').value    = cfg.token || '';
+        if (get('gh-owner'))   get('gh-owner').value    = cfg.owner || '';
+        if (get('gh-repo'))    get('gh-repo').value     = cfg.repo || '';
+        if (get('gh-branch'))  get('gh-branch').value   = cfg.branch || 'main';
+        if (get('gh-commit-name'))  get('gh-commit-name').value  = cfg.commit_name || '';
+        if (get('gh-commit-email')) get('gh-commit-email').value = cfg.commit_email || '';
+        // Token placeholder hints that existing value is kept on save.
+        if (get('gh-token') && cfg.token) {
+            get('gh-token').placeholder = 'Leave blank to keep the stored token';
+        }
+        renderGithubBackupLastPush(cfg);
+        setStatus('');
+    } catch (e) {
+        setStatus('Failed to load: ' + e.message, 'var(--danger,#ef4444)');
+    }
+}
+
+function renderGithubBackupLastPush(cfg) {
+    const el = document.getElementById('gh-last-push');
+    if (!el) return;
+    const bits = [];
+    if (cfg.last_push_at) {
+        const when = new Date(cfg.last_push_at).toLocaleString();
+        const sha = (cfg.last_push_sha || '').slice(0, 7);
+        bits.push(`Last push: ${escapeHtml(when)}${sha ? ' · ' + escapeHtml(sha) : ''}`);
+    } else {
+        bits.push('Last push: never');
+    }
+    if (cfg.last_push_error) {
+        bits.push(`<span style="color:#ef4444;">Error: ${escapeHtml(cfg.last_push_error)}</span>`);
+    }
+    el.innerHTML = bits.join(' · ');
+}
+
+async function saveGithubBackupConfig() {
+    const get = id => document.getElementById(id);
+    const payload = {
+        enabled: get('gh-enabled')?.checked || false,
+        token: get('gh-token')?.value || '',
+        owner: (get('gh-owner')?.value || '').trim(),
+        repo: (get('gh-repo')?.value || '').trim(),
+        branch: (get('gh-branch')?.value || 'main').trim(),
+        commit_name: (get('gh-commit-name')?.value || '').trim(),
+        commit_email: (get('gh-commit-email')?.value || '').trim(),
+    };
+    const setStatus = (text, colour) => {
+        const el = document.getElementById('gh-status');
+        if (!el) return;
+        el.textContent = text || '';
+        el.style.color = colour || 'var(--text-muted)';
+    };
+    try {
+        const resp = await fetch('/api/github-backup/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            throw new Error(err.error || 'HTTP ' + resp.status);
+        }
+        setStatus('Config saved.', 'var(--success,#10b981)');
+        // Reload so the token field shows the masked version and we
+        // don't accidentally re-send the plaintext the admin just
+        // typed on the next save.
+        await loadGithubBackupConfig();
+        if (typeof showToast === 'function') showToast('GitHub backup config saved', 'success');
+    } catch (e) {
+        setStatus('Save failed: ' + e.message, 'var(--danger,#ef4444)');
+    }
+}
+
+async function testGithubBackup() {
+    const setStatus = (text, colour) => {
+        const el = document.getElementById('gh-status');
+        if (!el) return;
+        el.innerHTML = text || '';
+        el.style.color = colour || 'var(--text-muted)';
+    };
+    setStatus('Testing connection…');
+    try {
+        const resp = await fetch('/api/github-backup/test');
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || 'HTTP ' + resp.status);
+        const branchNote = data.configured_branch_exists
+            ? `✓ branch <code>${escapeHtml(data.configured_branch)}</code> exists`
+            : `⚠ branch <code>${escapeHtml(data.configured_branch)}</code> NOT found — create a commit on it first`;
+        setStatus(
+            `Authenticated as <b>${escapeHtml(data.authenticated_as || '?')}</b> · target <code>${escapeHtml(data.target)}</code> · ${branchNote}`,
+            data.configured_branch_exists ? 'var(--success,#10b981)' : '#f59e0b'
+        );
+    } catch (e) {
+        setStatus('Test failed: ' + escapeHtml(e.message), 'var(--danger,#ef4444)');
+    }
+}
+
+async function pushGithubBackup() {
+    const setStatus = (text, colour) => {
+        const el = document.getElementById('gh-status');
+        if (!el) return;
+        el.textContent = text || '';
+        el.style.color = colour || 'var(--text-muted)';
+    };
+    setStatus('Pushing to GitHub…');
+    try {
+        const resp = await fetch('/api/github-backup/push', { method: 'POST' });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || 'HTTP ' + resp.status);
+        setStatus(`Pushed · commit ${(data.commit_sha || '').slice(0, 7)}`, 'var(--success,#10b981)');
+        if (typeof showToast === 'function') showToast('GitHub backup pushed', 'success');
+        // Refresh last-push metadata on the card.
+        await loadGithubBackupConfig();
+    } catch (e) {
+        setStatus('Push failed: ' + e.message, 'var(--danger,#ef4444)');
+    }
+}
+
+async function restoreGithubBackup() {
+    const ok = await confirmTypedYes({
+        title: 'Restore from GitHub?',
+        message: 'This will <strong style="color:#e74c3c;">overwrite the tracked config files</strong> in <code>/etc/wolfstack/</code> and every <code>docker-compose.yml</code> under <code>/etc/wolfstack/compose/</code> with the latest versions from the configured branch. Other local files are left alone. A WolfStack restart may be needed for some changes to take effect.',
+        detail: 'PUT /etc/wolfstack/ from the configured GitHub branch',
+        requiredWord: 'YES',
+        confirmLabel: 'Restore & overwrite',
+    });
+    if (!ok) return;
+    const setStatus = (text, colour) => {
+        const el = document.getElementById('gh-status');
+        if (!el) return;
+        el.textContent = text || '';
+        el.style.color = colour || 'var(--text-muted)';
+    };
+    setStatus('Restoring from GitHub…');
+    try {
+        const resp = await fetch('/api/github-backup/restore', { method: 'POST' });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || 'HTTP ' + resp.status);
+        setStatus(data.message || `Restored ${data.files_restored} files`, 'var(--success,#10b981)');
+        if (typeof showToast === 'function') showToast('GitHub backup restored', 'success');
+    } catch (e) {
+        setStatus('Restore failed: ' + e.message, 'var(--danger,#ef4444)');
+    }
+}
 
 // ─── Sponsor Header Badge ───
 

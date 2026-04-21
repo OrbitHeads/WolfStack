@@ -3790,6 +3790,82 @@ pub async fn reverse_proxy_config_save(
     HttpResponse::Ok().json(serde_json::json!({"saved": true, "config": cfg}))
 }
 
+// ─── GitHub Backup ──────────────────────────────────────────────────────
+
+/// GET /api/github-backup/config — returns the config with the token
+/// masked to `••••••••XXXX`. UI uses this to pre-fill the form without
+/// the real token ever reaching the browser.
+pub async fn github_backup_config_get(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    HttpResponse::Ok().json(crate::github_backup::GithubBackupConfig::load().masked())
+}
+
+/// POST /api/github-backup/config — save the config. If the token
+/// field is empty or starts with `••••` the existing stored token is
+/// kept, so admins can edit other fields without re-pasting the token.
+pub async fn github_backup_config_save(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<crate::github_backup::GithubBackupConfig>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let mut incoming = body.into_inner();
+    if incoming.token.trim().is_empty() || incoming.token.starts_with('•') {
+        let existing = crate::github_backup::GithubBackupConfig::load();
+        incoming.token = existing.token;
+    }
+    if let Err(e) = incoming.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+    HttpResponse::Ok().json(incoming.masked())
+}
+
+/// POST /api/github-backup/push — run a full backup push now and
+/// return the new commit sha (or an error).
+pub async fn github_backup_push_now(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match crate::github_backup::push_all().await {
+        Ok(sha) => HttpResponse::Ok().json(serde_json::json!({
+            "message": "Pushed to GitHub",
+            "commit_sha": sha,
+        })),
+        Err(e) => {
+            // Best-effort: record the error on the config so the UI
+            // status line can show what went wrong without the user
+            // having to keep the toast visible.
+            let mut cfg = crate::github_backup::GithubBackupConfig::load();
+            cfg.last_push_error = Some(e.clone());
+            let _ = cfg.save();
+            HttpResponse::BadRequest().json(serde_json::json!({ "error": e }))
+        }
+    }
+}
+
+/// POST /api/github-backup/restore — pull latest from the configured
+/// branch and overwrite tracked files in /etc/wolfstack/.
+/// Destructive; the frontend gates this behind the typed-YES modal.
+pub async fn github_backup_restore(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match crate::github_backup::restore_all().await {
+        Ok(count) => HttpResponse::Ok().json(serde_json::json!({
+            "message": format!("Restored {} files from GitHub", count),
+            "files_restored": count,
+        })),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// GET /api/github-backup/test — verify the token + repo + branch
+/// work before an admin tries to push. Returns the authenticated
+/// GitHub user and whether the configured branch exists.
+pub async fn github_backup_test(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match crate::github_backup::test_credentials().await {
+        Ok(info) => HttpResponse::Ok().json(info),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
 // ─── Control Panel (cluster-wide apps view) ─────────────────────────────
 
 /// GET /api/control-panel/inventory — every VM, LXC and Docker container
@@ -19555,6 +19631,11 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/ports", web::post().to(set_ports))
         .route("/api/reverse-proxy/config", web::get().to(reverse_proxy_config_get))
         .route("/api/reverse-proxy/config", web::post().to(reverse_proxy_config_save))
+        .route("/api/github-backup/config", web::get().to(github_backup_config_get))
+        .route("/api/github-backup/config", web::post().to(github_backup_config_save))
+        .route("/api/github-backup/push", web::post().to(github_backup_push_now))
+        .route("/api/github-backup/restore", web::post().to(github_backup_restore))
+        .route("/api/github-backup/test", web::get().to(github_backup_test))
         .route("/api/control-panel/inventory", web::get().to(control_panel_inventory))
         .route("/api/control-panel/groups", web::get().to(control_panel_groups_get))
         .route("/api/control-panel/groups", web::post().to(control_panel_groups_create))

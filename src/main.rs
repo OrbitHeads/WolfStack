@@ -48,6 +48,7 @@ mod paths;
 mod ports;
 mod reverse_proxy;
 mod control_panel;
+mod github_backup;
 mod deps;
 mod systemcheck;
 mod security;
