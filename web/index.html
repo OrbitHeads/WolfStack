@@ -1955,10 +1955,6 @@
                         </select>
                         <input type="text" id="cp-search" placeholder="🔍 search…" oninput="cpRender()"
                             style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text);font-size:13px;min-width:180px;">
-                        <div style="display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;">
-                            <button class="btn btn-sm" id="cp-view-flat" onclick="cpSetViewMode('flat')" style="border:none;border-radius:0;padding:6px 10px;font-size:12px;">▤ Flat</button>
-                            <button class="btn btn-sm" id="cp-view-3d"   onclick="cpSetViewMode('3d')"   style="border:none;border-radius:0;padding:6px 10px;font-size:12px;">🎛 3D</button>
-                        </div>
                         <button class="btn" onclick="cpReload()" title="Refresh inventory">↻</button>
                         <button class="btn btn-primary" id="cp-new-group-btn" onclick="cpCreateGroup()" style="display:none;">+ New group</button>
                     </div>
@@ -1967,13 +1963,6 @@
             <div id="cp-status-line" style="font-size:12px;color:var(--text-muted);margin:0 4px 10px;"></div>
             <div id="cp-rows" style="display:flex;flex-direction:column;gap:10px;">
                 <div style="color:var(--text-muted);text-align:center;padding:30px;">Loading inventory…</div>
-            </div>
-            <div id="cp-3d-container" style="display:none;position:relative;height:620px;background:linear-gradient(180deg, rgba(15,23,42,0.6) 0%, rgba(8,10,20,0.9) 100%);border:1px solid var(--border);border-radius:10px;overflow:hidden;">
-                <canvas id="cp-3d-canvas" style="display:block;width:100%;height:100%;"></canvas>
-                <div id="cp-3d-hud" style="position:absolute;top:10px;left:12px;color:#cbd5e1;font-size:12px;background:rgba(15,23,42,0.6);padding:6px 10px;border-radius:6px;pointer-events:none;">
-                    Drag a ring horizontally to spin · click a tile to pick it up · click a ring to drop it in
-                </div>
-                <div id="cp-3d-selected" style="position:absolute;top:10px;right:12px;color:#fbbf24;font-size:12px;background:rgba(15,23,42,0.6);padding:6px 10px;border-radius:6px;pointer-events:none;display:none;"></div>
             </div>
         </div>
 

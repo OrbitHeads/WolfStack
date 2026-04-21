@@ -39692,6 +39692,8 @@ let _cpInventory = [];        // flat items
 let _cpGroups = [];           // custom groups
 let _cpErrors = [];           // per-node fetch errors from the aggregator
 let _cpLoading = false;
+let _cpNodes = [];            // reachable peer nodes the inventory is fanned over
+let _cpNodeStatus = {};       // node_id -> 'loading' | 'done' | 'error'
 
 // Stable key for an inventory item / member ref — matches backend's MemberRef.
 function cpKey(it) { return `${it.node_id}|${it.kind}|${it.name}`; }
@@ -39699,52 +39701,78 @@ function cpKey(it) { return `${it.node_id}|${it.kind}|${it.name}`; }
 async function cpInit() {
     // Show the New-group button only in custom mode; wire the selector first.
     cpUpdateNewGroupBtn();
-    // Initialise view-mode button highlight (defaults to flat).
-    cpSetViewMode(_cpViewMode || 'flat');
     await cpReload();
 }
 
 async function cpReload() {
     if (_cpLoading) return;
     _cpLoading = true;
+    // Wipe previous run so the placeholder cylinder/rows reflect only
+    // the in-flight fetches (otherwise a stale node hangs around until
+    // its per-node request resolves).
+    _cpInventory = [];
+    _cpErrors = [];
+    _cpNodeStatus = {};
     const status = document.getElementById('cp-status-line');
-    if (status) status.textContent = 'Loading inventory across the datacenter…';
     try {
-        // The backend aggregator now fans out to every peer node this
-        // WolfStack knows about (across every cluster_name label in
-        // the sidebar) plus every registered Proxmox node. No
-        // frontend federation needed — one call returns the whole
-        // datacenter's inventory.
-        const [invResp, grpResp] = await Promise.all([
-            fetch('/api/control-panel/inventory'),
+        // Two fast calls first: the node list (so we can paint per-node
+        // "Loading…" placeholders) and the custom groups. Inventory is
+        // then fetched per-node in parallel below — as each node's
+        // response lands we merge it and repaint, so the user sees
+        // rows fill in rather than staring at one global spinner.
+        if (status) status.textContent = 'Discovering nodes…';
+        const [nodesResp, grpResp] = await Promise.all([
+            fetch('/api/control-panel/nodes'),
             fetch('/api/control-panel/groups'),
         ]);
-        if (!invResp.ok) throw new Error('inventory HTTP ' + invResp.status);
-        if (!grpResp.ok) throw new Error('groups HTTP ' + grpResp.status);
-        const inv = await invResp.json();
+        if (!nodesResp.ok) throw new Error('nodes HTTP ' + nodesResp.status);
+        if (!grpResp.ok)   throw new Error('groups HTTP ' + grpResp.status);
+        const nodesJson = await nodesResp.json();
         const grp = await grpResp.json();
-
-        // Dedupe defensively on (node_id, kind, name). Shouldn't
-        // happen since the backend iterates a deduped node list, but
-        // cheap insurance.
-        const merged = [];
-        const seen = new Set();
-        for (const it of (inv.items || [])) {
-            const k = `${it.node_id}|${it.kind}|${it.name}`;
-            if (seen.has(k)) continue;
-            seen.add(k);
-            merged.push(it);
-        }
-        _cpInventory = merged;
-        _cpErrors = inv.errors || [];
+        _cpNodes = nodesJson.nodes || [];
         _cpGroups = (grp.groups || []).slice().sort((a, b) => (a.order || 0) - (b.order || 0));
+        for (const n of _cpNodes) _cpNodeStatus[n.id] = 'loading';
+
+        // First paint with no inventory yet — shows placeholder rings/rows.
         cpRender();
+
+        // Fire per-node inventory requests in parallel. Merge as each
+        // lands. Re-render only after each completes so the 3D scene
+        // stays responsive; batching every 50ms isn't worth the extra
+        // complexity at the typical datacenter size.
+        const seen = new Set();
+        await Promise.all(_cpNodes.map(async (n) => {
+            try {
+                const r = await fetch(`/api/control-panel/inventory/node/${encodeURIComponent(n.id)}`);
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                const d = await r.json();
+                for (const it of (d.items || [])) {
+                    const k = `${it.node_id}|${it.kind}|${it.name}`;
+                    if (seen.has(k)) continue;
+                    seen.add(k);
+                    _cpInventory.push(it);
+                }
+                for (const e of (d.errors || [])) _cpErrors.push(e);
+                _cpNodeStatus[n.id] = (d.errors && d.errors.length) ? 'error' : 'done';
+            } catch (e) {
+                _cpNodeStatus[n.id] = 'error';
+                _cpErrors.push({ node_id: n.id, node_hostname: n.hostname, kind: 'node', error: e.message });
+            }
+            cpRender();
+        }));
     } catch (e) {
         const rows = document.getElementById('cp-rows');
         if (rows) rows.innerHTML = `<div style="color:var(--danger,#ef4444);padding:20px;">Failed to load: ${escapeHtml(e.message)}</div>`;
     } finally {
         _cpLoading = false;
     }
+}
+
+// Summary for the status line: how many nodes we're still waiting on.
+function cpLoadingSummary() {
+    const total = _cpNodes.length;
+    const done = Object.values(_cpNodeStatus).filter(s => s === 'done' || s === 'error').length;
+    return { total, done, remaining: total - done };
 }
 
 function cpUpdateNewGroupBtn() {
@@ -39782,15 +39810,24 @@ function cpRender() {
         groupings = cpBuildDerivedRows(filtered, mode);
     }
 
-    // Status line — item count + per-node error summary.
+    // Status line — loading progress during fetch, then item count +
+    // per-node error summary once every node has responded.
     if (statusLine) {
+        const { total: nt, done: nd, remaining: nr } = cpLoadingSummary();
         const total = _cpInventory.length;
         const visible = filtered.length;
-        let txt = `${visible} of ${total} items`;
+        let txt;
+        if (nr > 0) {
+            const pending = _cpNodes.filter(n => _cpNodeStatus[n.id] === 'loading').map(n => n.hostname).slice(0, 3).join(', ');
+            const more = nr > 3 ? ` (+${nr - 3} more)` : '';
+            txt = `Loading ${nd}/${nt} nodes — waiting on: ${pending}${more} · ${total} items so far`;
+        } else {
+            txt = `${visible} of ${total} items`;
+        }
         if (_cpErrors.length > 0) {
             const names = _cpErrors.map(e => `${e.node_hostname}·${e.kind}`).slice(0, 3).join(', ');
-            const more = _cpErrors.length > 3 ? ` (+${_cpErrors.length - 3} more)` : '';
-            txt += ` — ⚠ ${_cpErrors.length} node fetch${_cpErrors.length === 1 ? '' : 'es'} failed: ${names}${more}`;
+            const moreErr = _cpErrors.length > 3 ? ` (+${_cpErrors.length - 3} more)` : '';
+            txt += ` — ⚠ ${_cpErrors.length} node fetch${_cpErrors.length === 1 ? '' : 'es'} failed: ${names}${moreErr}`;
         }
         statusLine.textContent = txt;
     }
@@ -39801,10 +39838,6 @@ function cpRender() {
     }
 
     rows.innerHTML = groupings.map((g, idx) => cpRenderRow(g, idx, mode)).join('');
-
-    // Post-render hooks: keep the 3D scene in sync when it's the active
-    // view, and let the lazy-load CSS styles be applied to fresh tiles.
-    if (_cpViewMode === '3d') cp3dRebuild();
     cpLazyRefresh();
 }
 
@@ -39823,19 +39856,42 @@ function cpBuildDerivedRows(items, mode) {
         if (!buckets.has(key)) { buckets.set(key, []); order.push(key); }
         buckets.get(key).push(it);
     }
-    // Sort keys alphabetically for stable render (node axis is most
-    // useful sorted). Keep status in a sensible order, though.
+
+    // When grouping by node, make sure every node the backend told us
+    // about gets a row — even one that hasn't responded yet or returned
+    // zero items — so the user sees a placeholder "Loading…" ring
+    // rather than a missing entry. For the other axes the row keys
+    // don't correspond to nodes, so we can't show per-node placeholders
+    // here; the status line below handles that case.
+    if (mode === 'node') {
+        for (const n of _cpNodes) {
+            const key = n.hostname || n.id;
+            if (!buckets.has(key)) { buckets.set(key, []); order.push(key); }
+        }
+    }
+
     if (mode === 'status') {
         const rank = { running: 0, paused: 1, stopped: 2, unknown: 3 };
         order.sort((a, b) => (rank[a] ?? 99) - (rank[b] ?? 99));
     } else {
         order.sort((a, b) => String(a).localeCompare(String(b)));
     }
-    return order.map(k => ({
-        id: 'derived-' + k,
-        name: cpTitleForKey(mode, k),
-        items: buckets.get(k),
-    }));
+    return order.map(k => {
+        const row = {
+            id: 'derived-' + k,
+            name: cpTitleForKey(mode, k),
+            items: buckets.get(k),
+        };
+        if (mode === 'node') {
+            const n = _cpNodes.find(nn => (nn.hostname || nn.id) === k);
+            if (n) {
+                row.nodeId = n.id;
+                row.loading = _cpNodeStatus[n.id] === 'loading';
+                row.error   = _cpNodeStatus[n.id] === 'error';
+            }
+        }
+        return row;
+    });
 }
 
 function cpTitleForKey(mode, key) {
@@ -39941,9 +39997,22 @@ function cpRenderRow(row, idx, mode) {
             </span>`
         : '';
 
+    // Per-node spinner when this row is still waiting on its node's
+    // inventory request. Replaces the "No items." empty state during
+    // load so the user sees real per-server progress.
+    const loadingHtml = row.loading
+        ? `<div style="display:flex;align-items:center;gap:8px;padding:8px 0;color:var(--text-muted);font-size:13px;">
+               <span class="cp-spinner" style="display:inline-block;width:14px;height:14px;border:2px solid rgba(148,163,184,0.25);border-top-color:#60a5fa;border-radius:50%;animation:cp-spin 0.8s linear infinite;"></span>
+               Loading…
+           </div>`
+        : '';
+    const errorHtml = row.error
+        ? `<div style="padding:8px 0;color:var(--danger,#ef4444);font-size:12px;">⚠ fetch failed — see status line</div>`
+        : '';
     const tiles = row.items.length > 0
         ? row.items.map(it => cpRenderTile(it, row.id, mode)).join('')
-        : `<div style="color:var(--text-muted);font-size:12px;padding:8px 0;">${row.isAll ? 'No items.' : (mode === 'custom' ? 'Empty — drag tiles from ALL here.' : 'No items.')}</div>`;
+        : (loadingHtml || errorHtml
+           || `<div style="color:var(--text-muted);font-size:12px;padding:8px 0;">${row.isAll ? 'No items.' : (mode === 'custom' ? 'Empty — drag tiles from ALL here.' : 'No items.')}</div>`);
 
     return `
         <div class="cp-row" data-row-id="${escapeHtml(row.id)}" ${dropAttrs}
@@ -40425,24 +40494,6 @@ async function cpAction(key, action) {
     }
 }
 
-// ─── View-mode toggle (Flat / 3D) ───
-
-let _cpViewMode = 'flat';  // 'flat' | '3d'
-
-function cpSetViewMode(mode) {
-    if (mode !== 'flat' && mode !== '3d') return;
-    _cpViewMode = mode;
-    const rows = document.getElementById('cp-rows');
-    const cyl = document.getElementById('cp-3d-container');
-    const btnFlat = document.getElementById('cp-view-flat');
-    const btn3d = document.getElementById('cp-view-3d');
-    if (rows) rows.style.display = mode === 'flat' ? '' : 'none';
-    if (cyl)  cyl.style.display  = mode === '3d'   ? '' : 'none';
-    if (btnFlat) btnFlat.classList.toggle('btn-primary', mode === 'flat');
-    if (btn3d)   btn3d.classList.toggle('btn-primary', mode === '3d');
-    if (mode === '3d') cp3dInit(); else cp3dDispose();
-}
-
 // ─── Lazy-load tiles ───
 //
 // Large clusters can blow past 500 tiles. Rather than hand-rolling an
@@ -40462,468 +40513,8 @@ function cpLazyRefresh() { /* no-op: native CSS handles it */ }
             content-visibility: auto;
             contain-intrinsic-size: 110px 200px;
         }
+        @keyframes cp-spin { to { transform: rotate(360deg); } }
     `;
     document.head.appendChild(s);
 })();
 
-// ═══════════════════════════════════════════════════════════════════════
-// 3D cylinder view — same groupings as the flat view, rendered as a
-// vertical stack of rings that each spin independently.
-//
-// Layout: the ALL ring (custom mode) or the first group sits at the
-// top, subsequent rings descend. Tiles are textured planes positioned
-// around each ring's circumference. Drag horizontally on a ring to
-// spin it; click a tile to "pick it up"; click another ring to drop
-// it into that group (custom mode only).
-// ═══════════════════════════════════════════════════════════════════════
-
-let _cp3d = null;  // { scene, camera, renderer, rings: [...], disposed, onResize, ... }
-
-function cp3dInit() {
-    // Guard against the user switching back to flat while we were
-    // waiting for THREE to load — don't build an invisible scene.
-    if (_cpViewMode !== '3d') return;
-    if (typeof THREE === 'undefined') {
-        const hud = document.getElementById('cp-3d-hud');
-        if (hud) hud.textContent = 'Loading 3D engine…';
-        setTimeout(cp3dInit, 500);
-        return;
-    }
-    cp3dDispose();
-    const container = document.getElementById('cp-3d-container');
-    const canvas = document.getElementById('cp-3d-canvas');
-    if (!container || !canvas) return;
-
-    const W = container.clientWidth, H = container.clientHeight;
-    const scene = new THREE.Scene();
-    // Transparent so the CSS gradient on the container shows through —
-    // the 3D scene blends with the rest of the dashboard instead of
-    // feeling like a separate dark window.
-    scene.background = null;
-    scene.fog = new THREE.Fog(0x0f172a, 20, 60);
-
-    const camera = new THREE.PerspectiveCamera(55, W / H, 0.1, 200);
-    camera.position.set(0, 3, 17);
-    camera.lookAt(0, 0, 0);
-
-    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
-    renderer.setSize(W, H);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-
-    scene.add(new THREE.AmbientLight(0xffffff, 0.55));
-    const spot = new THREE.DirectionalLight(0xffffff, 0.6);
-    spot.position.set(10, 15, 10);
-    scene.add(spot);
-
-    const raycaster = new THREE.Raycaster();
-    const pointer = new THREE.Vector2();
-
-    _cp3d = {
-        scene, camera, renderer, raycaster, pointer,
-        rings: [],              // [{ group, mesh (torus), items: [{ mesh, item }], rotation, rowIdx }]
-        selectedKey: null,      // key of the tile currently picked up
-        disposed: false,
-        animId: null,
-        dragging: null,         // { ring, startX, startRotation }
-        onResize() {
-            const w = container.clientWidth, h = container.clientHeight;
-            camera.aspect = w / h;
-            camera.updateProjectionMatrix();
-            renderer.setSize(w, h);
-        },
-        onPointerDown(ev) {
-            const rect = canvas.getBoundingClientRect();
-            const x = (ev.clientX - rect.left) / rect.width * 2 - 1;
-            const y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
-            pointer.set(x, y);
-            raycaster.setFromCamera(pointer, camera);
-            const hits = raycaster.intersectObjects(scene.children, true);
-            if (hits.length === 0) return;
-            const hit = hits[0].object;
-            const tileHit = cp3dFindTile(hit);
-            const ringHit = cp3dFindRing(hit);
-            // Right-click on a tile → context menu, same as flat view.
-            if (ev.button === 2 && tileHit) {
-                ev.preventDefault();
-                cpContextMenu(ev, cpKey(tileHit));
-                return;
-            }
-            if (tileHit) {
-                cp3dHandleTileClick(tileHit);
-            } else if (ringHit) {
-                _cp3d.dragging = { ring: ringHit, startX: ev.clientX, startRotation: ringHit.rotation.y };
-            }
-        },
-        onContextMenu(ev) {
-            // Block the browser's native menu on the 3D canvas — our
-            // custom one opens from pointerdown instead.
-            ev.preventDefault();
-        },
-        onPointerMove(ev) {
-            if (!_cp3d.dragging) return;
-            const dx = ev.clientX - _cp3d.dragging.startX;
-            _cp3d.dragging.ring.rotation.y = _cp3d.dragging.startRotation + dx * 0.005;
-        },
-        onPointerUp(ev) {
-            // If it was basically a click on a ring (no drag), treat as
-            // "drop" target — assign the currently-picked tile to this group.
-            if (_cp3d.dragging && Math.abs(ev.clientX - _cp3d.dragging.startX) < 4) {
-                cp3dHandleRingClick(_cp3d.dragging.ring);
-            }
-            _cp3d.dragging = null;
-        },
-    };
-
-    canvas.addEventListener('pointerdown', _cp3d.onPointerDown);
-    canvas.addEventListener('contextmenu', _cp3d.onContextMenu);
-    window.addEventListener('pointermove', _cp3d.onPointerMove);
-    window.addEventListener('pointerup', _cp3d.onPointerUp);
-    window.addEventListener('resize', _cp3d.onResize);
-
-    const animate = () => {
-        if (!_cp3d || _cp3d.disposed) return;
-        renderer.render(scene, camera);
-        _cp3d.animId = requestAnimationFrame(animate);
-    };
-    animate();
-
-    cp3dRebuild();
-}
-
-function cp3dDispose() {
-    if (!_cp3d) return;
-    _cp3d.disposed = true;
-    if (_cp3d.animId) cancelAnimationFrame(_cp3d.animId);
-    try { _cp3d.renderer.dispose(); } catch (e) {}
-    try {
-        const canvas = document.getElementById('cp-3d-canvas');
-        if (canvas) {
-            canvas.removeEventListener('pointerdown', _cp3d.onPointerDown);
-            canvas.removeEventListener('contextmenu', _cp3d.onContextMenu);
-        }
-    } catch (e) {}
-    window.removeEventListener('pointermove', _cp3d.onPointerMove);
-    window.removeEventListener('pointerup', _cp3d.onPointerUp);
-    window.removeEventListener('resize', _cp3d.onResize);
-    _cp3d = null;
-    const sel = document.getElementById('cp-3d-selected');
-    if (sel) { sel.style.display = 'none'; sel.textContent = ''; }
-}
-
-function cp3dRebuild() {
-    if (!_cp3d) return;
-    // Tear down previous rings (tiles are children of the ring group;
-    // removing the group removes them). Also dispose canvas textures
-    // and materials so repeated rebuilds don't leak GPU memory.
-    for (const ring of _cp3d.rings) {
-        for (const t of ring.items) {
-            if (t.mesh.material && t.mesh.material.map) {
-                try { t.mesh.material.map.dispose(); } catch (e) {}
-            }
-            if (t.mesh.material) try { t.mesh.material.dispose(); } catch (e) {}
-            if (t.mesh.geometry) try { t.mesh.geometry.dispose(); } catch (e) {}
-        }
-        _cp3d.scene.remove(ring.mesh);
-    }
-    _cp3d.rings = [];
-    // Remove any previous central pillar + end caps.
-    if (_cp3d.pillar) { _cp3d.scene.remove(_cp3d.pillar); _cp3d.pillar = null; }
-    if (_cp3d.capTop) { _cp3d.scene.remove(_cp3d.capTop); _cp3d.capTop = null; }
-    if (_cp3d.capBot) { _cp3d.scene.remove(_cp3d.capBot); _cp3d.capBot = null; }
-
-    // Use the same groupings logic as the flat view.
-    const sel = document.getElementById('cp-group-by');
-    const mode = sel ? sel.value : 'node';
-    const searchEl = document.getElementById('cp-search');
-    const q = (searchEl?.value || '').trim().toLowerCase();
-    const filtered = q
-        ? _cpInventory.filter(it =>
-            (it.name || '').toLowerCase().includes(q) ||
-            (it.node_hostname || '').toLowerCase().includes(q) ||
-            (it.kind || '').toLowerCase().includes(q) ||
-            (it.status || '').toLowerCase().includes(q))
-        : _cpInventory.slice();
-    const groupings = mode === 'custom' ? cpBuildCustomRows(filtered) : cpBuildDerivedRows(filtered, mode);
-
-    // Solid cylinder made of coloured bands, one per group. No gaps —
-    // the bands stacked form a continuous vertical drum. Each band is
-    // a separate object so it can spin independently on its Y axis.
-    const radius = 3.8;
-    const bandHeight = 2.2;
-    const totalHeight = groupings.length * bandHeight;
-    const topY = (groupings.length - 1) * bandHeight / 2;
-
-    // Thin end-caps so the top/bottom of the drum look finished, not
-    // hollow. Stationary (not parented to any spinning band).
-    const capGeo = new THREE.CylinderGeometry(radius + 0.02, radius + 0.02, 0.08, 64);
-    const capMat = new THREE.MeshStandardMaterial({
-        color: 0x0f172a,
-        roughness: 0.4,
-        metalness: 0.3,
-    });
-    _cp3d.capTop = new THREE.Mesh(capGeo, capMat);
-    _cp3d.capTop.position.y = totalHeight / 2 + 0.04;
-    _cp3d.scene.add(_cp3d.capTop);
-    _cp3d.capBot = new THREE.Mesh(capGeo, capMat.clone());
-    _cp3d.capBot.position.y = -totalHeight / 2 - 0.04;
-    _cp3d.scene.add(_cp3d.capBot);
-
-    groupings.forEach((g, idx) => {
-        const y = topY - idx * bandHeight;
-        const shade = cpRowShade(idx);
-        const ring = cp3dMakeRing(g, y, shade, idx, mode, radius, bandHeight);
-        _cp3d.rings.push(ring);
-        _cp3d.scene.add(ring.mesh);
-    });
-
-    // Camera — close enough that tiles read clearly; slight up-angle.
-    const frameDist = Math.max(9, 5.5 + totalHeight * 0.55);
-    _cp3d.camera.position.set(0, 0.5, frameDist);
-    _cp3d.camera.lookAt(0, 0, 0);
-}
-
-function cp3dMakeRing(rowData, y, shade, idx, mode, radius, bandHeight) {
-    const colour = rowData.colour || cp3dShadeToHex(shade);
-
-    const ringGroup = new THREE.Group();
-    ringGroup.position.y = y;
-    ringGroup.userData = { kind: 'ring', rowId: rowData.id, rowName: rowData.name, mode };
-
-    // The band IS the cylinder at this group's height. Solid, opaque,
-    // coloured per group. Stacking the bands forms the drum; each one
-    // spins on its own Y axis when the user drags.
-    const bandGeo = new THREE.CylinderGeometry(radius, radius, bandHeight, 96, 1, false);
-    const bandMat = new THREE.MeshStandardMaterial({
-        color: new THREE.Color(colour),
-        roughness: 0.55,
-        metalness: 0.15,
-        transparent: true,
-        opacity: 0.92,
-    });
-    const band = new THREE.Mesh(bandGeo, bandMat);
-    ringGroup.add(band);
-
-    // Thin highlight at the top and bottom edges so band boundaries
-    // read clearly against their neighbours.
-    const edgeGeo = new THREE.TorusGeometry(radius + 0.005, 0.03, 6, 96);
-    const edgeMat = new THREE.MeshBasicMaterial({
-        color: 0x000000, transparent: true, opacity: 0.55,
-    });
-    const edgeTop = new THREE.Mesh(edgeGeo, edgeMat);
-    edgeTop.rotation.x = Math.PI / 2;
-    edgeTop.position.y = bandHeight / 2;
-    ringGroup.add(edgeTop);
-    const edgeBot = new THREE.Mesh(edgeGeo, edgeMat.clone());
-    edgeBot.rotation.x = Math.PI / 2;
-    edgeBot.position.y = -bandHeight / 2;
-    ringGroup.add(edgeBot);
-
-    const label = cp3dMakeLabelSprite(`${rowData.name}  (${rowData.items.length})`);
-    label.position.set(0, bandHeight / 2 + 0.6, 0);
-    ringGroup.add(label);
-
-    // Tiles ON the cylinder's outer surface at the band's middle Y.
-    // Bunched at a fixed angular step (~14°) rather than spread around
-    // the whole circumference — fewer tiles cluster on the front face
-    // so you can see them all at once; lots of tiles wrap right around.
-    const items = [];
-    const cap = 60;
-    const count = Math.min(rowData.items.length, cap);
-    const step = (14 * Math.PI) / 180;          // ~14° between tiles
-    const halfSpan = (count - 1) * step / 2;    // centre the cluster on the +Z face
-    const tileOffset = 0.02;
-    for (let i = 0; i < count; i++) {
-        const angle = -halfSpan + i * step + Math.PI / 2;   // centre on +Z
-        const it = rowData.items[i];
-        const plane = cp3dMakeTileSprite(it);
-        plane.position.set(Math.cos(angle) * (radius + tileOffset), 0, Math.sin(angle) * (radius + tileOffset));
-        plane.rotation.y = Math.PI / 2 - angle;
-        plane.userData = { kind: 'tile', item: it };
-        ringGroup.add(plane);
-        items.push({ mesh: plane, item: it });
-    }
-
-    return { rowData, mesh: ringGroup, items, idx };
-}
-
-function cp3dFindTile(obj) {
-    let cur = obj;
-    while (cur) {
-        if (cur.userData && cur.userData.kind === 'tile') return cur.userData.item;
-        cur = cur.parent;
-    }
-    return null;
-}
-function cp3dFindRing(obj) {
-    let cur = obj;
-    while (cur) {
-        if (cur.userData && cur.userData.kind === 'ring') return cur;
-        cur = cur.parent;
-    }
-    return null;
-}
-
-function cp3dHandleTileClick(item) {
-    _cp3d.selectedKey = cpKey(item);
-    const sel = document.getElementById('cp-3d-selected');
-    if (sel) {
-        sel.style.display = '';
-        sel.textContent = `Picked up: ${item.kind}/${item.name} — click a ring to drop it into that group`;
-    }
-}
-
-async function cp3dHandleRingClick(ringMesh) {
-    const key = _cp3d?.selectedKey;
-    if (!key) return;
-    const rowId = ringMesh.userData.rowId;
-    const mode = ringMesh.userData.mode;
-    if (mode !== 'custom') {
-        showToast('Drop into groups only works in Custom mode.', 'info');
-        return;
-    }
-    const parts = key.split('|');
-    if (parts.length !== 3) return;
-    const member = { node_id: parts[0], kind: parts[1], name: parts[2] };
-    if (rowId === '__all__') {
-        // "drop into ALL" = remove from any group that holds it
-        for (const grp of _cpGroups) {
-            if ((grp.members || []).some(m => `${m.node_id}|${m.kind}|${m.name}` === key)) {
-                await cpSetMembers(grp.id, cpGroupMembersWithout(grp.id, key));
-            }
-        }
-    } else {
-        await cpSetMembers(rowId, cpGroupMembersWith(rowId, member));
-    }
-    _cp3d.selectedKey = null;
-    const sel = document.getElementById('cp-3d-selected');
-    if (sel) { sel.style.display = 'none'; sel.textContent = ''; }
-    await cpReload();
-}
-
-// Draw each item as: status-coloured halo behind, big kind emoji on
-// top, name + host + status word below. Green halo = running, red =
-// not, amber = paused, yellow = stale. Reads at a glance from far
-// enough away that you can't make out the name.
-function cp3dMakeTileSprite(item) {
-    const canvas = document.createElement('canvas');
-    canvas.width = 256; canvas.height = 256;
-    const ctx = canvas.getContext('2d');
-
-    // Match the flat view's running/stopped/paused/unknown/stale
-    // colouring so 2D and 3D feel like the same language.
-    const glowColour = {
-        running: 'rgba(16,185,129,',
-        stopped: 'rgba(239,68,68,',
-        paused:  'rgba(245,158,11,',
-        unknown: 'rgba(239,68,68,',
-        stale:   'rgba(234,179,8,',
-    }[item.status] || 'rgba(100,116,139,';
-
-    // Status halo — a big, soft, radial glow in the status colour.
-    // This is the "green behind if running, red behind if not" the
-    // user wants to read from across the room.
-    const glow = ctx.createRadialGradient(128, 128, 10, 128, 128, 140);
-    glow.addColorStop(0.0, glowColour + '0.85)');
-    glow.addColorStop(0.4, glowColour + '0.35)');
-    glow.addColorStop(0.8, glowColour + '0.05)');
-    glow.addColorStop(1.0, glowColour + '0.0)');
-    ctx.fillStyle = glow;
-    ctx.fillRect(0, 0, 256, 256);
-
-    // Darker inner disc so the icon and text contrast against the
-    // glow, rather than the glow bleaching them out.
-    const disc = ctx.createRadialGradient(128, 128, 20, 128, 128, 95);
-    disc.addColorStop(0.0, 'rgba(15,23,42,0.85)');
-    disc.addColorStop(0.85, 'rgba(15,23,42,0.55)');
-    disc.addColorStop(1.0, 'rgba(15,23,42,0.0)');
-    ctx.fillStyle = disc;
-    ctx.fillRect(0, 0, 256, 256);
-
-    const statusColour = { running: '#10b981', stopped: '#ef4444', paused: '#f59e0b', unknown: '#ef4444', stale: '#eab308' }[item.status] || '#94a3b8';
-
-    // Kind emoji — big, centered horizontally, top half of the canvas.
-    ctx.font = '120px system-ui, -apple-system, "Apple Color Emoji", "Segoe UI Emoji", sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    const emoji = { docker: '🐳', lxc: '📦', vm: '💻' }[item.kind] || '•';
-    ctx.fillText(emoji, 128, 95);
-
-    // Status dot badge nestled against the emoji.
-    ctx.beginPath();
-    ctx.arc(178, 62, 12, 0, Math.PI * 2);
-    ctx.fillStyle = statusColour;
-    ctx.fill();
-    ctx.lineWidth = 3;
-    ctx.strokeStyle = 'rgba(15,23,42,0.9)';
-    ctx.stroke();
-
-    // Name — bold, single line, centered below icon.
-    ctx.font = 'bold 26px system-ui, sans-serif';
-    ctx.fillStyle = '#f1f5f9';
-    const name = cp3dTruncate(ctx, item.name || '', 220);
-    ctx.fillText(name, 128, 180);
-
-    // Host line — smaller, dimmer.
-    ctx.font = '18px system-ui, sans-serif';
-    ctx.fillStyle = '#94a3b8';
-    const host = cp3dTruncate(ctx, item.node_hostname || '', 220);
-    ctx.fillText(host, 128, 208);
-
-    // Status word — small, matches badge colour.
-    ctx.font = '14px system-ui, sans-serif';
-    ctx.fillStyle = statusColour;
-    ctx.fillText(item.status || '', 128, 232);
-
-    const tex = new THREE.CanvasTexture(canvas);
-    tex.needsUpdate = true;
-    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide, depthWrite: false });
-    // Large enough to read at typical camera distance (~10 world units
-    // from the camera to the front of the drum). Below this, the 256px
-    // canvas texture starts to alias.
-    const geo = new THREE.PlaneGeometry(1.6, 1.6);
-    return new THREE.Mesh(geo, mat);
-}
-
-// Trim a string with an ellipsis until it fits maxWidth in the current
-// ctx font. Used for the 3D tile labels.
-function cp3dTruncate(ctx, text, maxWidth) {
-    if (ctx.measureText(text).width <= maxWidth) return text;
-    let s = text;
-    while (s.length > 0 && ctx.measureText(s + '…').width > maxWidth) s = s.slice(0, -1);
-    return s + '…';
-}
-
-// Label above a ring (simple CanvasTexture sprite).
-function cp3dMakeLabelSprite(text) {
-    const canvas = document.createElement('canvas');
-    canvas.width = 512; canvas.height = 96;
-    const ctx = canvas.getContext('2d');
-    ctx.fillStyle = 'rgba(15,23,42,0.0)';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.font = 'bold 40px system-ui, sans-serif';
-    ctx.fillStyle = '#f8fafc';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(text, canvas.width / 2, canvas.height / 2);
-    const tex = new THREE.CanvasTexture(canvas);
-    tex.needsUpdate = true;
-    const mat = new THREE.SpriteMaterial({ map: tex, transparent: true });
-    const sprite = new THREE.Sprite(mat);
-    sprite.scale.set(4, 0.75, 1);
-    return sprite;
-}
-
-// Parse a CSS rgba string back to a hex colour that three.js accepts.
-// Input shapes from cpRowShade(): "rgba(R,G,B,A)".
-function cp3dShadeToHex(rgba) {
-    const m = rgba.match(/rgba?\(([^)]+)\)/i);
-    if (!m) return '#3b82f6';
-    const parts = m[1].split(',').map(p => parseFloat(p.trim()));
-    const r = Math.min(255, Math.max(0, parts[0] | 0));
-    const g = Math.min(255, Math.max(0, parts[1] | 0));
-    const b = Math.min(255, Math.max(0, parts[2] | 0));
-    // Boost saturation a bit — the 6%-alpha palette is too pale for
-    // emissive ring material to look like the flat view's tint.
-    const boost = (x) => Math.min(255, Math.floor(x * 2.2));
-    return '#' + [boost(r), boost(g), boost(b)].map(x => x.toString(16).padStart(2, '0')).join('');
-}

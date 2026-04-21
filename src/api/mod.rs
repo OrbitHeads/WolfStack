@@ -3907,81 +3907,149 @@ pub async fn control_panel_inventory(req: HttpRequest, state: web::Data<AppState
     let mut node_errors: Vec<serde_json::Value> = Vec::new();
 
     for node in &nodes {
-        let cluster_name = node.cluster_name.clone()
-            .or(node.pve_cluster_name.clone())
-            .unwrap_or_else(|| "WolfStack".to_string());
-        let base_entry = serde_json::json!({
-            "node_id": node.id,
-            "node_hostname": node.hostname,
-            "cluster": cluster_name,
-        });
-
-        // Three fetches per node: Docker, LXC, native VMs. PVE guests
-        // are handled separately below for nodes registered as Proxmox.
-        let endpoints = [
-            ("docker", "/api/containers/docker"),
-            ("lxc", "/api/containers/lxc"),
-            ("vm", "/api/vms"),
-        ];
-
-        // Skip non-WolfStack (e.g. Proxmox-only registered) nodes for
-        // the docker/lxc/native-vm endpoints — they won't serve them.
-        let is_wolfstack_node = node.node_type == "wolfstack" || node.node_type.is_empty();
-
-        for (kind, path) in &endpoints {
-            if !is_wolfstack_node { continue; }
-            let raw: Option<serde_json::Value> = if node.is_self {
-                fetch_local_json(&state, path).await
-            } else {
-                fetch_remote_json(&client, &node.address, node.port, path, &secret).await
-            };
-            let Some(raw) = raw else {
-                node_errors.push(serde_json::json!({
-                    "node_id": node.id,
-                    "node_hostname": node.hostname,
-                    "kind": kind,
-                    "error": "unreachable or endpoint failed",
-                }));
-                continue;
-            };
-            let arr = raw.as_array().cloned().unwrap_or_default();
-            for entry in arr {
-                items.push(shape_inventory_item(&base_entry, kind, &entry));
-            }
-        }
-
-        // Proxmox guests — only for nodes registered as node_type "proxmox".
-        if node.node_type == "proxmox" {
-            let token = node.pve_token.clone().unwrap_or_default();
-            let pve_name = node.pve_node_name.clone().unwrap_or_default();
-            let fp = node.pve_fingerprint.as_deref();
-            if !token.is_empty() && !pve_name.is_empty() {
-                let pve_client = crate::proxmox::PveClient::new(&node.address, node.port, &token, fp, &pve_name);
-                match pve_client.list_all_guests().await {
-                    Ok(guests) => {
-                        if let Ok(val) = serde_json::to_value(&guests) {
-                            if let Some(arr) = val.as_array() {
-                                for g in arr {
-                                    items.push(shape_pve_item(&base_entry, g));
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => node_errors.push(serde_json::json!({
-                        "node_id": node.id,
-                        "node_hostname": node.hostname,
-                        "kind": "pve",
-                        "error": e,
-                    })),
-                }
-            }
-        }
+        let (mut n_items, mut n_errs) = fetch_one_node_inventory(&state, &client, node, &secret).await;
+        items.append(&mut n_items);
+        node_errors.append(&mut n_errs);
     }
 
     HttpResponse::Ok().json(serde_json::json!({
         "items": items,
         "errors": node_errors,
         "generated_at": now,
+    }))
+}
+
+/// Per-node inventory fetch — Docker/LXC/native-VM plus Proxmox guests for
+/// PVE-registered nodes. Extracted so the aggregate endpoint and the
+/// per-node lazy-load endpoint share the same shaping + error handling.
+async fn fetch_one_node_inventory(
+    state: &web::Data<AppState>,
+    client: &reqwest::Client,
+    node: &crate::agent::Node,
+    secret: &str,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let cluster_name = node.cluster_name.clone()
+        .or(node.pve_cluster_name.clone())
+        .unwrap_or_else(|| "WolfStack".to_string());
+    let base_entry = serde_json::json!({
+        "node_id": node.id,
+        "node_hostname": node.hostname,
+        "cluster": cluster_name,
+    });
+
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    let mut errors: Vec<serde_json::Value> = Vec::new();
+
+    let endpoints = [
+        ("docker", "/api/containers/docker"),
+        ("lxc", "/api/containers/lxc"),
+        ("vm", "/api/vms"),
+    ];
+    let is_wolfstack_node = node.node_type == "wolfstack" || node.node_type.is_empty();
+    for (kind, path) in &endpoints {
+        if !is_wolfstack_node { continue; }
+        let raw: Option<serde_json::Value> = if node.is_self {
+            fetch_local_json(state, path).await
+        } else {
+            fetch_remote_json(client, &node.address, node.port, path, secret).await
+        };
+        let Some(raw) = raw else {
+            errors.push(serde_json::json!({
+                "node_id": node.id,
+                "node_hostname": node.hostname,
+                "kind": kind,
+                "error": "unreachable or endpoint failed",
+            }));
+            continue;
+        };
+        let arr = raw.as_array().cloned().unwrap_or_default();
+        for entry in arr {
+            items.push(shape_inventory_item(&base_entry, kind, &entry));
+        }
+    }
+
+    if node.node_type == "proxmox" {
+        let token = node.pve_token.clone().unwrap_or_default();
+        let pve_name = node.pve_node_name.clone().unwrap_or_default();
+        let fp = node.pve_fingerprint.as_deref();
+        if !token.is_empty() && !pve_name.is_empty() {
+            let pve_client = crate::proxmox::PveClient::new(&node.address, node.port, &token, fp, &pve_name);
+            match pve_client.list_all_guests().await {
+                Ok(guests) => {
+                    if let Ok(val) = serde_json::to_value(&guests) {
+                        if let Some(arr) = val.as_array() {
+                            for g in arr {
+                                items.push(shape_pve_item(&base_entry, g));
+                            }
+                        }
+                    }
+                }
+                Err(e) => errors.push(serde_json::json!({
+                    "node_id": node.id,
+                    "node_hostname": node.hostname,
+                    "kind": "pve",
+                    "error": e,
+                })),
+            }
+        }
+    }
+
+    (items, errors)
+}
+
+/// GET /api/control-panel/nodes — reachable peers the inventory will be
+/// fetched from. Returned up-front so the frontend can paint per-node
+/// "Loading…" placeholders and then fire parallel per-node requests.
+pub async fn control_panel_nodes(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let nodes: Vec<serde_json::Value> = state.cluster.get_all_nodes()
+        .into_iter()
+        .filter(|n| n.is_self || (n.online && now.saturating_sub(n.last_seen) < 300))
+        .map(|n| {
+            let cluster_name = n.cluster_name.clone()
+                .or(n.pve_cluster_name.clone())
+                .unwrap_or_else(|| "WolfStack".to_string());
+            serde_json::json!({
+                "id": n.id,
+                "hostname": n.hostname,
+                "cluster": cluster_name,
+                "node_type": n.node_type,
+                "is_self": n.is_self,
+            })
+        })
+        .collect();
+    HttpResponse::Ok().json(serde_json::json!({ "nodes": nodes }))
+}
+
+/// GET /api/control-panel/inventory/node/{id} — inventory for one node.
+/// Fans out to just that node's listing endpoints; returns the same
+/// `{items, errors}` shape as the aggregate endpoint so the frontend
+/// can merge responses without special-casing.
+pub async fn control_panel_inventory_node(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let Some(node) = state.cluster.get_node(&id) else {
+        return HttpResponse::NotFound().json(serde_json::json!({"error": "node not found"}));
+    };
+    let secret = state.cluster_secret.clone();
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let (items, errors) = fetch_one_node_inventory(&state, &client, &node, &secret).await;
+    HttpResponse::Ok().json(serde_json::json!({
+        "node_id": node.id,
+        "items": items,
+        "errors": errors,
     }))
 }
 
@@ -19611,6 +19679,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/github-backup/restore", web::post().to(github_backup_restore))
         .route("/api/github-backup/test", web::get().to(github_backup_test))
         .route("/api/control-panel/inventory", web::get().to(control_panel_inventory))
+        .route("/api/control-panel/inventory/node/{id}", web::get().to(control_panel_inventory_node))
+        .route("/api/control-panel/nodes", web::get().to(control_panel_nodes))
         .route("/api/control-panel/groups", web::get().to(control_panel_groups_get))
         .route("/api/control-panel/groups", web::post().to(control_panel_groups_create))
         .route("/api/control-panel/groups/{id}", web::put().to(control_panel_groups_update))
