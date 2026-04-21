@@ -204,14 +204,18 @@
             };
 
             ws.onclose = (e) => {
-                statusEl.textContent = 'Disconnected';
-                statusEl.className = 'status error';
                 if (type === 'upgrade') {
+                    // Disconnect during upgrade is expected — wolfstack
+                    // is restarting. Don't show it as an error.
+                    statusEl.textContent = 'Upgrade complete — service restarting';
+                    statusEl.className = 'status';
                     term.writeln('\r\n\x1b[33m─────────────────────────────────────────────\x1b[0m');
                     term.writeln('\r\n\x1b[32m✅ WolfStack service is restarting...\x1b[0m');
                     term.writeln('\r\n\x1b[36mPlease refresh your browser and log in again.\x1b[0m');
                     term.writeln('\r\n\x1b[33m─────────────────────────────────────────────\x1b[0m');
                 } else {
+                    statusEl.textContent = 'Disconnected';
+                    statusEl.className = 'status error';
                     term.writeln('\r\n\x1b[31mConnection closed (code: ' + e.code + ').\x1b[0m');
                 }
             };

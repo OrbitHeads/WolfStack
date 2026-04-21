@@ -1002,8 +1002,10 @@ impl VmManager {
             }
             return Ok(());
         }
-        // On libvirt, delegate to virsh (VM must be stopped for CPU/memory changes)
-        if containers::is_libvirt() {
+        // On libvirt, delegate to virsh (VM must be stopped for CPU/memory
+        // changes). Pre-libvirt native VMs fall through to the JSON config
+        // update path below.
+        if containers::is_libvirt() && self.virsh_has_domain(name) {
             if let Some(c) = cpus {
                 if c > 0 {
                     let cs = c.to_string();
@@ -1212,8 +1214,10 @@ impl VmManager {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!("qm start failed: {}", stderr.trim()));
         }
-        // On libvirt, delegate to virsh start
-        if containers::is_libvirt() {
+        // On libvirt, delegate to virsh start — but only for VMs that
+        // libvirt actually owns. Pre-libvirt native VMs with a JSON
+        // config fall through to the qemu path below.
+        if containers::is_libvirt() && self.virsh_has_domain(name) {
             let output = Command::new("virsh").args(["start", name]).output()
                 .map_err(|e| format!("Failed to run virsh start: {}", e))?;
             if output.status.success() {
@@ -2385,8 +2389,9 @@ impl VmManager {
             return Ok(());
         }
         // On libvirt: graceful = `virsh shutdown` (ACPI, fire-and-forget);
-        // force = `virsh destroy` (immediate)
-        if containers::is_libvirt() {
+        // force = `virsh destroy` (immediate). Only for libvirt-owned
+        // domains — pre-libvirt native VMs fall through to pkill below.
+        if containers::is_libvirt() && self.virsh_has_domain(name) {
             let (action, label) = if force { ("destroy", "virsh destroy") } else { ("shutdown", "virsh shutdown") };
             let output = Command::new("virsh").args([action, name]).output()
                 .map_err(|e| format!("Failed to run {}: {}", label, e))?;
@@ -2440,8 +2445,10 @@ impl VmManager {
         if containers::is_proxmox() {
             return self.qm_list_all().into_iter().find(|vm| vm.name == name);
         }
-        // On libvirt, get VM details via virsh
-        if containers::is_libvirt() {
+        // On libvirt, get VM details via virsh — but only for VMs that
+        // libvirt actually owns. Pre-libvirt native VMs fall through to
+        // the JSON-config path below.
+        if containers::is_libvirt() && self.virsh_has_domain(name) {
             return self.virsh_vm_to_config(name);
         }
 
@@ -2482,8 +2489,10 @@ impl VmManager {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!("qm destroy failed: {}", stderr.trim()));
         }
-        // On libvirt, delegate to virsh undefine (keeps disk files — user can delete manually)
-        if containers::is_libvirt() {
+        // On libvirt, delegate to virsh undefine (keeps disk files — user
+        // can delete manually). Pre-libvirt native VMs fall through to
+        // the qemu/disk removal path below.
+        if containers::is_libvirt() && self.virsh_has_domain(name) {
             // Stop first if running
             let _ = Command::new("virsh").args(["destroy", name]).output();
             // Undefine the VM definition (does NOT delete disk files)
@@ -2571,17 +2580,72 @@ impl VmManager {
     // ─── Libvirt VM Management (virsh) ───
 
     /// List all VMs from libvirt via `virsh list --all`
+    /// Is this VM defined in libvirt? Used to route operations per-VM
+    /// on libvirt hosts — VMs created before libvirt was installed
+    /// (plain qemu with a JSON config in base_dir) are still managed
+    /// natively even when libvirtd is running.
+    fn virsh_has_domain(&self, name: &str) -> bool {
+        Command::new("virsh").args(["domstate", name]).output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
     fn virsh_list_all(&self) -> Vec<VmConfig> {
         let output = match Command::new("virsh").args(["list", "--all", "--name"]).output() {
             Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
             _ => return vec![],
         };
 
-        output.lines()
+        let libvirt_names: std::collections::HashSet<String> = output.lines()
             .map(|l| l.trim().to_string())
             .filter(|name| !name.is_empty())
-            .filter_map(|name| self.virsh_vm_to_config(&name))
-            .collect()
+            .collect();
+
+        let mut vms: Vec<VmConfig> = libvirt_names.iter()
+            .filter_map(|n| self.virsh_vm_to_config(n))
+            .collect();
+
+        // Pre-libvirt native VMs: JSON configs in base_dir for names
+        // not defined in libvirt. These were created by WolfStack
+        // before libvirtd was installed and are still managed the
+        // native qemu way — surfacing them in the list means they
+        // don't silently vanish from the UI just because libvirt is
+        // now present. The per-VM dispatch in start/stop/delete uses
+        // virsh_has_domain() so these still get the native path.
+        if let Ok(entries) = fs::read_dir(&self.base_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
+                let stem = match path.file_stem().and_then(|n| n.to_str()) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                if stem.ends_with(".runtime") { continue; }
+                if libvirt_names.contains(stem) { continue; }
+                let content = match fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let mut vm = match serde_json::from_str::<VmConfig>(&content) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("Failed to parse native VM config {} on libvirt host: {}", path.display(), e);
+                        continue;
+                    }
+                };
+                vm.running = self.check_running(&vm.name);
+                if vm.running {
+                    vm.vnc_port = self.read_runtime_vnc_port(&vm.name);
+                    vm.vnc_ws_port = self.read_runtime_ws_port(&vm.name);
+                } else {
+                    vm.vnc_port = None;
+                    vm.vnc_ws_port = None;
+                }
+                vms.push(vm);
+            }
+        }
+
+        vms
     }
 
     /// Convert a libvirt VM into a VmConfig (used by list and get)
@@ -2678,7 +2742,7 @@ impl VmManager {
 
         let (usb_devices, pci_devices) = parse_libvirt_hostdevs(&dumpxml);
 
-        Some(VmConfig {
+        let mut config = VmConfig {
             name: name.to_string(),
             cpus,
             memory_mb: (memory_kb / 1024) as u32,
@@ -2703,7 +2767,29 @@ impl VmManager {
             bios_type,
             host_id: Some(crate::agent::self_node_id()),
             skip_default_nic: false,
-        })
+        };
+
+        // Overlay adoption sidecar for WolfStack-specific fields that
+        // libvirt doesn't carry (wolfnet_ip, extra_disks/nics that the
+        // virsh parse above leaves empty, etc.). Libvirt remains
+        // authoritative for anything libvirt owns — cpu/memory/running
+        // state — so we only backfill gaps.
+        if let Ok(text) = fs::read_to_string(self.vm_config_path(name)) {
+            if let Ok(sidecar) = serde_json::from_str::<VmConfig>(&text) {
+                if config.wolfnet_ip.is_none() { config.wolfnet_ip = sidecar.wolfnet_ip; }
+                if config.extra_disks.is_empty() { config.extra_disks = sidecar.extra_disks; }
+                if config.extra_nics.is_empty() { config.extra_nics = sidecar.extra_nics; }
+                if !sidecar.net_model.is_empty() && sidecar.net_model != "virtio" {
+                    config.net_model = sidecar.net_model;
+                }
+                if !sidecar.os_disk_bus.is_empty() && sidecar.os_disk_bus != "virtio" {
+                    config.os_disk_bus = sidecar.os_disk_bus;
+                }
+                config.skip_default_nic = sidecar.skip_default_nic;
+            }
+        }
+
+        Some(config)
     }
 
     /// Create a VM via libvirt (virt-install)

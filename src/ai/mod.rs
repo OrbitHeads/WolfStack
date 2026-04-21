@@ -1033,7 +1033,19 @@ impl AiAgent {
                         if findings.is_empty() {
                             String::new()
                         } else {
-                            let port = crate::ports::PortConfig::load().api;
+                            // Prefer the reverse-proxy public URL when
+                            // configured — admins behind Cloudflare /
+                            // nginx need the email link to go to the
+                            // public domain, not the internal host:port.
+                            let base_url = {
+                                let rp = crate::reverse_proxy::ReverseProxyConfig::load().normalised();
+                                if !rp.public_base_url.is_empty() {
+                                    rp.public_base_url
+                                } else {
+                                    let port = crate::ports::PortConfig::load().api;
+                                    format!("https://{}:{}", hostname, port)
+                                }
+                            };
                             let mut b = String::from("\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
                             b.push_str("SUPPRESS FUTURE ALERTS (\"I know, not going to fix\")\n");
                             b.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n");
@@ -1047,8 +1059,8 @@ impl AiAgent {
                                     })
                                     .collect();
                                 b.push_str(&format!(
-                                    "• {}\n  Click to suppress: https://{}:{}/api/ai/suppress?p={}&t={}\n\n",
-                                    phrase, hostname, port, url_phrase, token,
+                                    "• {}\n  Click to suppress: {}/api/ai/suppress?p={}&t={}\n\n",
+                                    phrase, base_url, url_phrase, token,
                                 ));
                             }
                             b

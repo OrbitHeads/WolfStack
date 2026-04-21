@@ -8089,13 +8089,32 @@ async function upgradeNode(nodeId) {
     }
     window.open(url, 'upgrade_console_' + nodeId, 'width=960,height=600,menubar=no,toolbar=no');
 
-    // Track in task log
+    // Track in task log — type 'upgrade' tells loadTaskLog not to
+    // flip this to 'failed' if the browser reloads mid-upgrade (the
+    // backend is deliberately restarting, it hasn't actually failed).
     const taskId = addTaskLogEntry({
         cluster: node.cluster_name || 'WolfStack',
         node: node.hostname || node.address,
         description: 'Upgrading WolfStack...',
         status: 'running',
+        type: 'upgrade',
     });
+
+    // Persist a tracker so _startUpgradeTracking picks this up after
+    // a page reload — otherwise the task-log entry sits in 'running'
+    // forever with no poller driving it to completion.
+    {
+        const persisted = JSON.parse(localStorage.getItem('wolfstack_upgrade_trackers') || '[]');
+        persisted.push({
+            nodeId: nodeId,
+            hostname: node.hostname || node.address,
+            cluster: node.cluster_name || 'WolfStack',
+            startedAt: Date.now(),
+            taskId: taskId,
+            done: false,
+        });
+        localStorage.setItem('wolfstack_upgrade_trackers', JSON.stringify(persisted));
+    }
 
     showToast('Upgrade started for ' + machine, 'info');
 
@@ -8333,11 +8352,17 @@ function loadTaskLog() {
         if (raw) {
             const parsed = JSON.parse(raw);
             if (Array.isArray(parsed)) {
+                // Flip 'running' → 'failed' on reload: a browser restart
+                // usually means the in-flight op is lost. EXCEPT for
+                // upgrade entries — upgrades deliberately span a
+                // backend restart, and _startUpgradeTracking will drive
+                // them to completion. Flipping those makes every
+                // successful multi-node upgrade look like it failed.
                 _taskLogEntries = parsed.map(e => ({
                     ...e,
                     time: new Date(e.time),
                     expanded: false,
-                    status: e.status === 'running' ? 'failed' : e.status,
+                    status: (e.status === 'running' && e.type !== 'upgrade') ? 'failed' : e.status,
                 }));
             }
         }
@@ -22930,6 +22955,7 @@ function _startUpgradeTracking() {
                 node: t.hostname,
                 description: 'Upgrading... (resumed after page reload)',
                 status: 'running',
+                type: 'upgrade',
             });
         }
     });
