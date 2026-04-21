@@ -2936,29 +2936,13 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         },
 
 
-        AppManifest {
-            id: "authentik".into(),
-            name: "Authentik".into(),
-            icon: "🛡️".into(),
-            category: "Security".into(),
-            description: "Identity provider with SSO, MFA, and user management".into(),
-            website: Some("https://goauthentik.io".into()),
-            docker: Some(DockerTarget {
-                image: "ghcr.io/goauthentik/server:latest".into(),
-                ports: vec!["9003:9000".into(), "9444:9443".into()],
-                env: vec![
-                    "AUTHENTIK_SECRET_KEY=${SECRET_KEY}".into(),
-                ],
-                volumes: vec!["authentik_media:/media".into(), "authentik_templates:/templates".into()],
-                sidecars: vec![],
-                seed_files: vec![], cmd: vec![],
-            }),
-            lxc: None,
-            bare_metal: None,
-            vm: None, user_inputs: vec![
-                UserInput { id: "SECRET_KEY".into(), label: "Secret Key".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Long random string".into()), options: vec![] },
-            ],
-        },
+        // Authentik removed — needs a Postgres DB, a Redis broker AND
+        // a separate `worker` container running the same image with a
+        // different command. A single-container DockerTarget can't
+        // spawn the worker, so the server container starts but every
+        // login stalls waiting on background tasks that never run.
+        // Add a Compose template (postgres + redis + server + worker)
+        // if we bring it back.
 
 
         AppManifest {
@@ -3550,7 +3534,12 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
             name: "Keycloak".into(),
             icon: "🔑".into(),
             category: "Security".into(),
-            description: "Enterprise identity and access management — SSO for your apps".into(),
+            // Keycloak 17+ needs an explicit `start` or `start-dev`
+            // command — the bare image exits with "Please specify a
+            // command". start-dev uses the in-container H2 DB, good
+            // enough for a one-click demo; production users should
+            // switch to `start` + a Postgres sidecar.
+            description: "Enterprise identity and access management — SSO for your apps. Dev mode — data is stored in H2 locally; use Compose mode for production Postgres.".into(),
             website: Some("https://www.keycloak.org".into()),
             docker: Some(DockerTarget {
                 image: "quay.io/keycloak/keycloak:latest".into(),
@@ -3562,7 +3551,7 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
                 ],
                 volumes: vec!["keycloak_data:/opt/keycloak/data".into()],
                 sidecars: vec![],
-                seed_files: vec![], cmd: vec![],
+                seed_files: vec![], cmd: vec!["start-dev".into()],
             }),
             lxc: None,
             bare_metal: None,
@@ -4269,35 +4258,12 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         },
 
 
-        AppManifest {
-            id: "rocketchat".into(),
-            name: "Rocket.Chat".into(),
-            icon: "💬".into(),
-            category: "Communication".into(),
-            description: "Team communication platform — open-source Slack alternative".into(),
-            website: Some("https://rocket.chat".into()),
-            docker: Some(DockerTarget {
-                image: "rocketchat/rocket.chat:latest".into(),
-                ports: vec!["3009:3000".into()],
-                env: vec![
-                    "MONGO_URL=mongodb://${CONTAINER_NAME}-db:27017/rocketchat".into(),
-                    "ROOT_URL=${ROOT_URL}".into(),
-                ],
-                volumes: vec!["rocketchat_uploads:/app/uploads".into()],
-                sidecars: vec![DockerSidecar {
-                    name_suffix: "db".into(),
-                    image: "mongo:6".into(),
-                    ports: vec![],
-                    env: vec![],
-                    volumes: vec!["rocketchat_db:/data/db".into()],
-                }], seed_files: vec![], cmd: vec![],
-            }),
-            lxc: None,
-            bare_metal: None,
-            vm: None, user_inputs: vec![
-                UserInput { id: "ROOT_URL".into(), label: "Root URL".into(), input_type: "text".into(), default: Some("http://localhost:3009".into()), required: true, placeholder: Some("e.g. https://chat.example.com".into()), options: vec![] },
-            ],
-        },
+        // Rocket.Chat removed — requires MongoDB running with a
+        // replica set (`mongod --replSet rs0`) AND a one-off
+        // `rs.initiate()` before the app will talk to it. A bare
+        // `mongo:6` sidecar with no command override and no post-
+        // start hook can't provide either, so the app logged
+        // "not master" and looped forever. Needs a Compose template.
 
 
         AppManifest {
@@ -4344,26 +4310,8 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
 
         // ── Photo & Media ──
 
-        AppManifest {
-            id: "supabase".into(),
-            name: "Supabase".into(),
-            icon: "⚡".into(),
-            category: "Dev Tools".into(),
-            description: "Firebase alternative — Postgres + Auth + Storage + Realtime APIs".into(),
-            website: Some("https://supabase.com".into()),
-            docker: Some(DockerTarget {
-                image: "supabase/studio:latest".into(),
-                ports: vec!["3011:3000".into()],
-                env: vec![],
-                volumes: vec!["supabase_data:/var/lib/supabase".into()],
-                sidecars: vec![],
-                seed_files: vec![], cmd: vec![],
-            }),
-            lxc: None,
-            bare_metal: None,
-            vm: None, user_inputs: vec![],
-        },
-
+        // (duplicate Supabase entry removed — there's a proper LXC-
+        // backed one earlier in the list with the full stack.)
 
         AppManifest {
             id: "syncthing".into(),
@@ -4497,30 +4445,8 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         },
 
 
-        AppManifest {
-            id: "vaultwarden".into(),
-            name: "Vaultwarden".into(),
-            icon: "🔐".into(),
-            category: "Security".into(),
-            description: "Bitwarden-compatible password manager — lightweight and self-hosted".into(),
-            website: Some("https://github.com/dani-garcia/vaultwarden".into()),
-            docker: Some(DockerTarget {
-                image: "vaultwarden/server:latest".into(),
-                ports: vec!["8383:80".into()],
-                env: vec![
-                    "ADMIN_TOKEN=${ADMIN_TOKEN}".into(),
-                ],
-                volumes: vec!["vaultwarden_data:/data".into()],
-                sidecars: vec![],
-                seed_files: vec![], cmd: vec![],
-            }),
-            lxc: None,
-            bare_metal: None,
-            vm: None, user_inputs: vec![
-                UserInput { id: "ADMIN_TOKEN".into(), label: "Admin Token".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Token for admin panel access".into()), options: vec![] },
-            ],
-        },
-
+        // (duplicate Vaultwarden entry removed — there's one further
+        // down with Docker + LXC install paths.)
 
         AppManifest {
             id: "wireguard".into(),
@@ -4793,6 +4719,10 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
             name: "Paperless-ngx".into(),
             icon: "📄".into(),
             category: "Productivity".into(),
+            // Paperless-ngx refuses to start without a Redis broker
+            // for its Celery workers. SQLite is bundled so we don't
+            // need a Postgres sidecar — Redis alone unbricks the
+            // single-container install.
             description: "Document management system that transforms physical documents into a searchable archive".into(),
             website: Some("https://docs.paperless-ngx.com".into()),
             docker: Some(DockerTarget {
@@ -4802,9 +4732,16 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
                     "PAPERLESS_SECRET_KEY=${SECRET_KEY}".into(),
                     "PAPERLESS_ADMIN_USER=admin".into(),
                     "PAPERLESS_ADMIN_PASSWORD=${ADMIN_PASSWORD}".into(),
+                    "PAPERLESS_REDIS=redis://${CONTAINER_NAME}-redis:6379".into(),
                 ],
                 volumes: vec!["paperless_data:/usr/src/paperless/data".into(), "paperless_media:/usr/src/paperless/media".into()],
-                sidecars: vec![],
+                sidecars: vec![DockerSidecar {
+                    name_suffix: "redis".into(),
+                    image: "redis:7-alpine".into(),
+                    ports: vec![],
+                    env: vec![],
+                    volumes: vec!["paperless_redis:/data".into()],
+                }],
                 seed_files: vec![], cmd: vec![],
             }),
             lxc: Some(LxcTarget {
@@ -4866,22 +4803,14 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
             name: "Outline".into(),
             icon: "📝".into(),
             category: "Productivity".into(),
-            description: "Beautiful wiki and knowledge base for growing teams — Notion alternative".into(),
+            description: "Beautiful wiki and knowledge base for growing teams — Notion alternative. LXC install only; Docker mode requires Compose (postgres + redis + app).".into(),
             website: Some("https://getoutline.com".into()),
-            docker: Some(DockerTarget {
-                image: "outlinewiki/outline:latest".into(),
-                ports: vec!["3003:3000".into()],
-                env: vec![
-                    "SECRET_KEY=${SECRET_KEY}".into(),
-                    "UTILS_SECRET=${UTILS_SECRET}".into(),
-                    "DATABASE_URL=postgres://outline:${DB_PASSWORD}@${CONTAINER_NAME}-db:5432/outline".into(),
-                    "REDIS_URL=redis://${CONTAINER_NAME}-redis:6379".into(),
-                    "URL=http://localhost:3003".into(),
-                ],
-                volumes: vec!["outline_data:/var/lib/outline/data".into()],
-                sidecars: vec![],
-                seed_files: vec![], cmd: vec![],
-            }),
+            // Docker mode was previously pointing at undeclared
+            // `${CONTAINER_NAME}-db` and `${CONTAINER_NAME}-redis`
+            // sidecars, so every install was dead on arrival. The
+            // LXC path below bootstraps Postgres + Redis + Outline
+            // on a single host and actually works.
+            docker: None,
             lxc: Some(LxcTarget {
                 distribution: "debian".into(),
                 release: "bookworm".into(),
@@ -4910,19 +4839,13 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
             name: "Supabase".into(),
             icon: "⚡".into(),
             category: "Dev Tools".into(),
-            description: "Open-source Firebase alternative with Postgres, Auth, Storage, and Realtime".into(),
+            description: "Open-source Firebase alternative. LXC install only — the Supabase stack is Postgres + Kong + auth + realtime + storage + studio, not a single container.".into(),
             website: Some("https://supabase.com".into()),
-            docker: Some(DockerTarget {
-                image: "supabase/studio:latest".into(),
-                ports: vec!["3004:3000".into()],
-                env: vec![
-                    "SUPABASE_URL=http://localhost:8000".into(),
-                    "SUPABASE_ANON_KEY=${ANON_KEY}".into(),
-                ],
-                volumes: vec!["supabase_data:/var/lib/supabase".into()],
-                sidecars: vec![],
-                seed_files: vec![], cmd: vec![],
-            }),
+            // Docker mode previously shipped only `supabase/studio`
+            // pointed at a non-existent `http://localhost:8000` Kong
+            // gateway — nothing to log into. LXC path runs the full
+            // upstream compose stack inside the container.
+            docker: None,
             lxc: Some(LxcTarget {
                 distribution: "debian".into(),
                 release: "bookworm".into(),
@@ -8033,9 +7956,19 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
             lxc: None, bare_metal: None, vm: None, user_inputs: vec![],
         },
         AppManifest { id: "guacamole".into(), name: "Apache Guacamole".into(), icon: "🥑".into(), category: "Other".into(),
-            description: "Clientless remote desktop gateway — RDP, VNC, SSH in the browser".into(),
+            // The upstream guacamole/guacamole image is a Tomcat webapp
+            // with no bundled auth backend — it has no login screen at
+            // all unless you wire it up to a Postgres/MySQL DB with the
+            // schema pre-loaded and GUACAMOLE_HOME configured. The
+            // previous manifest paired it with a bare guacd sidecar and
+            // no DB, so every install was dead on arrival.
+            // jasonbean/guacamole bundles guacd + PostgreSQL + schema
+            // into one container — the right shape for a one-click
+            // app-store install. Default credentials: guacadmin /
+            // guacadmin (change on first login).
+            description: "Clientless remote desktop gateway — RDP, VNC, SSH in the browser. Default login: guacadmin / guacadmin".into(),
             website: Some("https://guacamole.apache.org".into()),
-            docker: Some(DockerTarget { image: "guacamole/guacamole:latest".into(), ports: vec!["8080:8080".into()], env: vec!["GUACD_HOSTNAME=guacamole-guacd".into()], volumes: vec![], sidecars: vec![DockerSidecar { name_suffix: "guacd".into(), image: "guacamole/guacd:latest".into(), ports: vec![], env: vec![], volumes: vec![] }], seed_files: vec![], cmd: vec![] }),
+            docker: Some(DockerTarget { image: "jasonbean/guacamole:latest".into(), ports: vec!["8080:8080".into()], env: vec![], volumes: vec!["guacamole_data:/config".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }),
             lxc: None, bare_metal: None, vm: None, user_inputs: vec![],
         },
 
@@ -8473,26 +8406,12 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
 
         // ─── Communication (batch 3) ───
 
-        AppManifest { id: "discourse".into(), name: "Discourse".into(), icon: "💬".into(), category: "Communication".into(),
-            description: "Modern community forum and discussion platform".into(),
-            website: Some("https://www.discourse.org".into()),
-            docker: Some(DockerTarget { image: "discourse/discourse:latest".into(), ports: vec!["8080:80".into()], env: vec![], volumes: vec!["discourse_data:/shared".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }),
-            lxc: None, bare_metal: None, vm: None, user_inputs: vec![],
-        },
-        AppManifest { id: "flarum".into(), name: "Flarum".into(), icon: "💬".into(), category: "Communication".into(),
-            description: "Lightweight, modern community forum".into(),
-            website: Some("https://flarum.org".into()),
-            docker: Some(DockerTarget { image: "crazymax/flarum:latest".into(), ports: vec!["8000:8000".into()], env: vec!["FLARUM_BASE_URL=http://localhost:8000".into()], volumes: vec!["flarum_data:/data".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }),
-            lxc: None, bare_metal: None, vm: None, user_inputs: vec![],
-        },
-        AppManifest { id: "chatwoot".into(), name: "Chatwoot".into(), icon: "💬".into(), category: "Communication".into(),
-            description: "Customer engagement platform — live chat, email, social".into(),
-            website: Some("https://www.chatwoot.com".into()),
-            docker: Some(DockerTarget { image: "chatwoot/chatwoot:latest".into(), ports: vec!["3000:3000".into()], env: vec!["SECRET_KEY_BASE=${SECRET_KEY}".into(), "FRONTEND_URL=http://localhost:3000".into()], volumes: vec!["chatwoot_data:/app/storage".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }),
-            lxc: None, bare_metal: None, vm: None, user_inputs: vec![
-                UserInput { id: "SECRET_KEY".into(), label: "Secret Key".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Long random string".into()), options: vec![] },
-            ],
-        },
+        // Discourse / Flarum / Chatwoot removed — all three need an
+        // external database (and Redis, for Chatwoot) plus an initial
+        // migration step. Discourse in particular isn't even packaged
+        // as a single container upstream (launcher + base image), so
+        // pulling `discourse/discourse:latest` fails outright. Add
+        // Compose templates if wanted back.
 
         // ─── CMS (batch 3) ───
 
@@ -8777,13 +8696,18 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         AppManifest { id: "homebox".into(), name: "Homebox".into(), icon: "📦".into(), category: "Other".into(), description: "Home inventory management with labels and locations".into(), website: Some("https://hay-kot.github.io/homebox/".into()), docker: Some(DockerTarget { image: "ghcr.io/hay-kot/homebox:latest".into(), ports: vec!["7745:7745".into()], env: vec![], volumes: vec!["homebox_data:/data".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
 
         AppManifest { id: "semaphore".into(), name: "Semaphore".into(), icon: "🏗️".into(), category: "Automation".into(), description: "Modern Ansible UI — run playbooks from the browser".into(), website: Some("https://www.semui.co".into()), docker: Some(DockerTarget { image: "semaphoreui/semaphore:latest".into(), ports: vec!["3000:3000".into()], env: vec!["SEMAPHORE_DB_DIALECT=bolt".into(), "SEMAPHORE_ADMIN_PASSWORD=${ADMIN_PASSWORD}".into(), "SEMAPHORE_ADMIN_NAME=admin".into(), "SEMAPHORE_ADMIN_EMAIL=admin@localhost".into(), "SEMAPHORE_ADMIN=admin".into()], volumes: vec!["semaphore_data:/var/lib/semaphore".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "ADMIN_PASSWORD".into(), label: "Admin Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Semaphore admin password".into()), options: vec![] }] },
-        AppManifest { id: "ansible-awx".into(), name: "AWX".into(), icon: "🔴".into(), category: "Automation".into(), description: "Ansible Tower community edition — enterprise automation platform".into(), website: Some("https://github.com/ansible/awx".into()), docker: Some(DockerTarget { image: "quay.io/awx/awx:latest".into(), ports: vec!["8052:8052".into()], env: vec![], volumes: vec!["awx_data:/var/lib/awx".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
+        // AWX removed — not distributed as a single container; the
+        // upstream project only supports install via the AWX Operator
+        // on Kubernetes. quay.io/awx/awx:latest pulls but won't run
+        // standalone.
         AppManifest { id: "rundeck".into(), name: "Rundeck".into(), icon: "⚙️".into(), category: "Automation".into(), description: "Runbook automation — schedule and run operational tasks".into(), website: Some("https://www.rundeck.com".into()), docker: Some(DockerTarget { image: "rundeck/rundeck:latest".into(), ports: vec!["4440:4440".into()], env: vec![], volumes: vec!["rundeck_data:/home/rundeck/server/data".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
 
-        AppManifest { id: "mastodon".into(), name: "Mastodon".into(), icon: "🐘".into(), category: "Communication".into(), description: "Decentralised social network — Twitter/X alternative".into(), website: Some("https://joinmastodon.org".into()), docker: Some(DockerTarget { image: "tootsuite/mastodon:latest".into(), ports: vec!["3000:3000".into(), "4000:4000".into()], env: vec![], volumes: vec!["mastodon_data:/mastodon/public/system".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
-        AppManifest { id: "pixelfed".into(), name: "Pixelfed".into(), icon: "📸".into(), category: "Communication".into(), description: "Decentralised photo sharing — Instagram alternative".into(), website: Some("https://pixelfed.org".into()), docker: Some(DockerTarget { image: "pixelfed/pixelfed:latest".into(), ports: vec!["8080:80".into()], env: vec![], volumes: vec!["pixelfed_data:/var/www/storage".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
-        AppManifest { id: "lemmy".into(), name: "Lemmy".into(), icon: "🐭".into(), category: "Communication".into(), description: "Federated link aggregator — Reddit alternative".into(), website: Some("https://join-lemmy.org".into()), docker: Some(DockerTarget { image: "dessalines/lemmy:latest".into(), ports: vec!["8536:8536".into()], env: vec![], volumes: vec!["lemmy_data:/data".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
-        AppManifest { id: "misskey".into(), name: "Misskey".into(), icon: "🌟".into(), category: "Communication".into(), description: "Decentralised social media with customisable UI".into(), website: Some("https://misskey-hub.net".into()), docker: Some(DockerTarget { image: "misskey/misskey:latest".into(), ports: vec!["3000:3000".into()], env: vec![], volumes: vec!["misskey_data:/misskey/files".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
+        // Mastodon / Pixelfed / Lemmy / Misskey removed — all four are
+        // multi-container stacks (Postgres + Redis + worker + streaming
+        // for Mastodon, Pictrs + lemmy-ui for Lemmy, etc.) that need
+        // initial migrations and secret generation. A one-container
+        // DockerTarget can't express any of that, so every install was
+        // DOA. Add proper Compose templates if these are wanted back.
 
         AppManifest { id: "supavisor".into(), name: "Supavisor".into(), icon: "🐘".into(), category: "Database".into(), description: "Scalable PostgreSQL connection pooler by Supabase".into(), website: Some("https://github.com/supabase/supavisor".into()), docker: Some(DockerTarget { image: "supabase/supavisor:latest".into(), ports: vec!["4000:4000".into()], env: vec![], volumes: vec![], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
         AppManifest { id: "pgbouncer".into(), name: "PgBouncer".into(), icon: "🏀".into(), category: "Database".into(), description: "Lightweight PostgreSQL connection pooler".into(), website: Some("https://www.pgbouncer.org".into()), docker: Some(DockerTarget { image: "edoburu/pgbouncer:latest".into(), ports: vec!["5432:5432".into()], env: vec!["DATABASE_URL=postgres://postgres:${DB_PASSWORD}@db:5432/postgres".into()], volumes: vec![], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "DB_PASSWORD".into(), label: "Database Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("PostgreSQL password".into()), options: vec![] }] },
@@ -8799,7 +8723,10 @@ pub fn built_in_catalogue() -> Vec<AppManifest> {
         AppManifest { id: "traggo-v2".into(), name: "Wakapi (coding stats)".into(), icon: "📊".into(), category: "Productivity".into(), description: "WakaTime-compatible coding activity dashboard".into(), website: Some("https://wakapi.dev".into()), docker: Some(DockerTarget { image: "ghcr.io/muety/wakapi:latest".into(), ports: vec!["3000:3000".into()], env: vec![], volumes: vec!["wakapi_v2_data:/data".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
 
         AppManifest { id: "mirotalk".into(), name: "MiroTalk".into(), icon: "📹".into(), category: "Communication".into(), description: "WebRTC video calls — Zoom alternative, no account required".into(), website: Some("https://mirotalk.com".into()), docker: Some(DockerTarget { image: "mirotalk/p2p:latest".into(), ports: vec!["3000:3000".into()], env: vec![], volumes: vec![], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
-        AppManifest { id: "jitsi".into(), name: "Jitsi Meet".into(), icon: "📞".into(), category: "Communication".into(), description: "Secure video conferencing — no account needed to join".into(), website: Some("https://jitsi.org".into()), docker: Some(DockerTarget { image: "jitsi/web:latest".into(), ports: vec!["8000:80".into(), "8443:443".into()], env: vec![], volumes: vec!["jitsi_web:/config".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
+        // Jitsi Meet removed — `jitsi/web` is only the front-end
+        // Nginx; a working install also needs prosody, jicofo and jvb
+        // containers plus UDP ports for the video bridge. Add a
+        // Compose template when we bring it back.
 
         AppManifest { id: "livebook".into(), name: "Livebook".into(), icon: "📓".into(), category: "AI / ML".into(), description: "Interactive Elixir notebooks for data exploration and ML".into(), website: Some("https://livebook.dev".into()), docker: Some(DockerTarget { image: "ghcr.io/livebook-dev/livebook:latest".into(), ports: vec!["8080:8080".into(), "8081:8081".into()], env: vec!["LIVEBOOK_PASSWORD=${PASSWORD}".into()], volumes: vec!["livebook_data:/data".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![UserInput { id: "PASSWORD".into(), label: "Access Password".into(), input_type: "password".into(), default: None, required: true, placeholder: Some("Min 12 characters".into()), options: vec![] }] },
         AppManifest { id: "comfyui".into(), name: "ComfyUI".into(), icon: "🎨".into(), category: "AI / ML".into(), description: "Node-based Stable Diffusion UI for advanced workflows".into(), website: Some("https://github.com/comfyanonymous/ComfyUI".into()), docker: Some(DockerTarget { image: "ghcr.io/ai-dock/comfyui:latest-cpu".into(), ports: vec!["8188:8188".into()], env: vec![], volumes: vec!["comfyui_models:/opt/ComfyUI/models".into(), "comfyui_output:/opt/ComfyUI/output".into()], sidecars: vec![], seed_files: vec![], cmd: vec![] }), lxc: None, bare_metal: None, vm: None, user_inputs: vec![] },
