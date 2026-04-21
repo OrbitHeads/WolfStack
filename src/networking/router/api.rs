@@ -208,6 +208,15 @@ pub async fn config_receive(
     // instances for LANs that were removed; starts/restarts current ones.
     let self_id = crate::agent::self_node_id();
     dhcp::start_all_for_node(&new_cfg, &self_id);
+    // Re-render reverse-proxy iptables rules. The originating node
+    // already applied locally; every other node needs to do the same
+    // so a proxy bound to a peer node stays live after config sync.
+    // apply_for_node filters to entries whose node_id == self_id, so
+    // this is cheap for peers that don't host any proxies.
+    let pwarn = proxy::apply_for_node(&new_cfg.proxies, &self_id);
+    for w in &pwarn {
+        tracing::warn!("router config-receive: proxy apply: {}", w);
+    }
     HttpResponse::Ok().body("synced")
 }
 
@@ -2559,6 +2568,190 @@ pub async fn import_config(
     }))
 }
 
+// ─── Reverse-proxy entries ───
+
+pub async fn list_proxies(req: HttpRequest, state: S) -> HttpResponse {
+    auth_or_return!(req, state);
+    HttpResponse::Ok().json(&state.router.config.read().unwrap().proxies)
+}
+
+/// Returns every candidate backend the operator can point a proxy at,
+/// grouped so the UI can show VMs by type (libvirt vs Proxmox vs …)
+/// and containers by engine (Docker vs LXC) in separate lists. Each
+/// entry carries the pre-resolved host+port so the UI doesn't need
+/// extra round-trips to learn where the backend actually lives.
+pub async fn list_proxy_backends(req: HttpRequest, state: S) -> HttpResponse {
+    auth_or_return!(req, state);
+
+    // VMs — split by vm_type so the picker can group them. "libvirt"
+    // covers WolfStack's native KVM-over-libvirt VMs; "proxmox" covers
+    // VMs owned by a Proxmox VE cluster member (they carry a vmid).
+    let mut vms_libvirt = Vec::new();
+    let mut vms_proxmox = Vec::new();
+    for v in state.vms.lock().unwrap().list_vms() {
+        let host = v.wolfnet_ip.clone().unwrap_or_default();
+        let is_pve = v.vmid.is_some();
+        let entry = serde_json::json!({
+            "id": v.name,
+            "name": v.name,
+            "host": host,
+            "running": v.running,
+            "vm_type": if is_pve { "proxmox" } else { "libvirt" },
+            "node_id": v.host_id,
+        });
+        if is_pve { vms_proxmox.push(entry); } else { vms_libvirt.push(entry); }
+    }
+
+    // Docker containers — only include those with an IP (otherwise
+    // there's nowhere for nginx to proxy_pass to). docker_list_all_cached
+    // fills ip_address with the bridge IP or WolfNet IP depending on
+    // which network the container's on; either works from the host's
+    // nginx as long as it's non-empty.
+    let mut containers_docker = Vec::new();
+    for c in crate::containers::docker_list_all_cached() {
+        if c.ip_address.is_empty() { continue; }
+        containers_docker.push(serde_json::json!({
+            "id": c.id,
+            "name": c.name,
+            "host": c.ip_address,
+            "running": c.state == "running",
+            "container_type": "docker",
+        }));
+    }
+
+    // LXC containers — same idea, different manager.
+    let mut containers_lxc = Vec::new();
+    for c in crate::containers::lxc_list_all_cached() {
+        if c.ip_address.is_empty() { continue; }
+        containers_lxc.push(serde_json::json!({
+            "id": c.name,
+            "name": c.name,
+            "host": c.ip_address,
+            "running": c.state == "running",
+            "container_type": "lxc",
+        }));
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "vms": {
+            "libvirt": vms_libvirt,
+            "proxmox": vms_proxmox,
+        },
+        "containers": {
+            "docker": containers_docker,
+            "lxc":    containers_lxc,
+        },
+    }))
+}
+
+pub async fn create_proxy(req: HttpRequest, state: S, body: web::Json<proxy::ProxyEntry>) -> HttpResponse {
+    auth_or_return!(req, state);
+    let mut entry = body.into_inner();
+    if entry.id.is_empty() { entry.id = gen_id("proxy"); }
+    if entry.domain.trim().is_empty() {
+        return HttpResponse::BadRequest().body("domain is required");
+    }
+    if entry.node_id.is_empty() {
+        entry.node_id = crate::agent::self_node_id();
+    }
+
+    // Resolve the domain up front so the stored entry always carries a
+    // pinned IP. We don't want the forward silently following DNS flaps
+    // — the operator picks what the rules bind to at save time.
+    if let Err(e) = proxy::resolve_entry_public_ip(&mut entry) {
+        return HttpResponse::BadRequest().body(e);
+    }
+
+    let (applies_here, proxies) = {
+        let mut cfg = state.router.config.write().unwrap();
+        cfg.proxies.retain(|p| p.id != entry.id);
+        cfg.proxies.push(entry.clone());
+        if let Err(e) = cfg.save() {
+            return HttpResponse::InternalServerError().body(e);
+        }
+        let self_id = crate::agent::self_node_id();
+        let applies = entry.node_id == self_id;
+        (applies, cfg.proxies.clone())
+    };
+    let mut warnings = Vec::new();
+    if applies_here {
+        warnings = proxy::apply_for_node(&proxies, &crate::agent::self_node_id());
+    }
+    replicate_config_to_cluster(state);
+    HttpResponse::Ok().json(serde_json::json!({
+        "entry": entry,
+        "warnings": warnings,
+    }))
+}
+
+pub async fn update_proxy(
+    req: HttpRequest,
+    state: S,
+    path: web::Path<String>,
+    body: web::Json<proxy::ProxyEntry>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let id = path.into_inner();
+    let mut updated = body.into_inner();
+    if updated.id != id {
+        return HttpResponse::BadRequest().body("id mismatch");
+    }
+    if updated.node_id.is_empty() {
+        updated.node_id = crate::agent::self_node_id();
+    }
+    if let Err(e) = proxy::resolve_entry_public_ip(&mut updated) {
+        return HttpResponse::BadRequest().body(e);
+    }
+
+    let (applies_here, proxies) = {
+        let mut cfg = state.router.config.write().unwrap();
+        let idx = match cfg.proxies.iter().position(|p| p.id == id) {
+            Some(i) => i,
+            None => return HttpResponse::NotFound().body("not found"),
+        };
+        cfg.proxies[idx] = updated.clone();
+        if let Err(e) = cfg.save() {
+            return HttpResponse::InternalServerError().body(e);
+        }
+        let self_id = crate::agent::self_node_id();
+        let applies = updated.node_id == self_id;
+        (applies, cfg.proxies.clone())
+    };
+    let mut warnings = Vec::new();
+    if applies_here {
+        warnings = proxy::apply_for_node(&proxies, &crate::agent::self_node_id());
+    }
+    replicate_config_to_cluster(state);
+    HttpResponse::Ok().json(serde_json::json!({
+        "entry": updated,
+        "warnings": warnings,
+    }))
+}
+
+pub async fn delete_proxy(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
+    auth_or_return!(req, state);
+    let id = path.into_inner();
+    let proxies = {
+        let mut cfg = state.router.config.write().unwrap();
+        cfg.proxies.retain(|p| p.id != id);
+        if let Err(e) = cfg.save() {
+            return HttpResponse::InternalServerError().body(e);
+        }
+        cfg.proxies.clone()
+    };
+    // Best-effort cleanup of the on-disk nginx config + self-signed cert
+    // for this id, then re-render everything else. Calling apply_for_node
+    // would also remove the stale config, but being explicit keeps the
+    // intent clear.
+    proxy::remove_one(&id);
+    let warnings = proxy::apply_for_node(&proxies, &crate::agent::self_node_id());
+    replicate_config_to_cluster(state);
+    HttpResponse::Ok().json(serde_json::json!({
+        "deleted": id,
+        "warnings": warnings,
+    }))
+}
+
 // ─── Mount ───
 
 pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
@@ -2607,7 +2800,12 @@ pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
         .route("/api/router/host-dns",              web::get().to(get_host_dns))
         .route("/api/router/host-dns/release",      web::post().to(release_host_dns))
         .route("/api/router/host-dns/restore",      web::post().to(restore_host_dns))
-        .route("/api/router/host-dns/lan-dns-port", web::post().to(set_lan_dns_port));
+        .route("/api/router/host-dns/lan-dns-port", web::post().to(set_lan_dns_port))
+        .route("/api/router/proxies",          web::get().to(list_proxies))
+        .route("/api/router/proxies",          web::post().to(create_proxy))
+        .route("/api/router/proxies/{id}",     web::put().to(update_proxy))
+        .route("/api/router/proxies/{id}",     web::delete().to(delete_proxy))
+        .route("/api/router/proxy-backends",   web::get().to(list_proxy_backends));
 }
 
 /// GET /api/router/host-dns — detect what's holding port 53 on this

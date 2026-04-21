@@ -74,6 +74,7 @@
         topology: null,
         rules: [],
         lans: [],
+        proxies: [],
         zones: { assignments: {} },
         rollbackTimerInterval: null,
         rollbackDeadline: null,
@@ -104,6 +105,13 @@
     window.wrSaveRule = wrSaveRule;
     window.wrSaveLan = wrSaveLan;
     window.wrAssignZone = wrAssignZone;
+    window.wrShowProxyEditor = wrShowProxyEditor;
+    window.wrSaveProxy = wrSaveProxy;
+    window.wrDeleteProxy = wrDeleteProxy;
+    window.wrToggleProxy = wrToggleProxy;
+    window.wrProxyBackendKindChanged = wrProxyBackendKindChanged;
+    window.wrProxyAddBackend = wrProxyAddBackend;
+    window.wrProxyRemoveBackend = wrProxyRemoveBackend;
 
     // Hook into the existing networking page loader so WolfRouter
     // kicks in whenever the page is shown.
@@ -147,6 +155,7 @@
             wrState.topology = null;
             wrState.lans = [];
             wrState.rules = [];
+            wrState.proxies = [];
             wrState.zones = { assignments: {} };
             wrState.wan = [];
             wrState.lastRackHash = '';  // force a full re-render once data arrives
@@ -204,7 +213,7 @@
             </div>`;
         };
         try {
-            const [topoR, rulesR, lansR, zonesR, managedR, snapR, wanR] = await Promise.all([
+            const [topoR, rulesR, lansR, zonesR, managedR, snapR, wanR, proxyR] = await Promise.all([
                 fetch(wrUrl('/api/router/topology')),
                 fetch(wrUrl('/api/router/rules')),
                 fetch(wrUrl('/api/router/segments')),
@@ -212,6 +221,7 @@
                 fetch(wrUrl('/api/router/managed-overview')),
                 fetch(wrUrl('/api/router/host-snapshot')),
                 fetch(wrUrl('/api/router/wan')),
+                fetch(wrUrl('/api/router/proxies')),
             ]);
             if (!topoR.ok) {
                 const body = await topoR.text().catch(() => '');
@@ -226,6 +236,7 @@
             if (managedR.ok) wrState.managed = await managedR.json();
             if (snapR.ok) wrState.snapshot = await snapR.json();
             if (wanR.ok)  wrState.wan = await wanR.json();
+            if (proxyR.ok) wrState.proxies = await proxyR.json();
             wrRenderAll();
         } catch (e) {
             console.error('wolfrouter load:', e);
@@ -286,6 +297,20 @@
 
     function wrSelectTab(tab) {
         wrState.activeTab = tab;
+        // Selecting a tab implies we want the table view — force the rack
+        // container hidden and the tab bar visible. Without this, a stale
+        // state or a direct wrSelectTab call leaves the rack container
+        // open and the tab panel ends up rendering UNDER the graphical
+        // router instead of replacing it.
+        wrState.view = 'table';
+        const rack = document.getElementById('wr-rack-container');
+        const tabs = document.getElementById('wr-tabs');
+        const btnRack = document.getElementById('wr-view-rack');
+        const btnTable = document.getElementById('wr-view-table');
+        if (rack) rack.style.display = 'none';
+        if (tabs) tabs.style.display = 'flex';
+        if (btnRack) btnRack.classList.remove('btn-primary');
+        if (btnTable) btnTable.classList.add('btn-primary');
         document.querySelectorAll('.wr-tab').forEach(t => {
             t.classList.toggle('active', t.dataset.tab === tab);
         });
@@ -298,6 +323,7 @@
         if (tab === 'zones')        wrRenderZones();
         if (tab === 'policy')       wrRenderPolicyMap();
         if (tab === 'wan')          wrRenderWan();
+        if (tab === 'proxy')        wrRenderProxies();
         if (tab === 'connections')  wrRenderConnections();
         if (tab === 'packets')      wrRenderPackets();
         if (tab === 'tools')        wrRenderDnsTools();
@@ -6306,4 +6332,430 @@
         }
     }
     window.wrRunImportConfig = wrRunImportConfig;
+
+    // ─── Reverse proxy (domain → backend, all ports + all protocols) ───
+
+    function wrRenderProxies() {
+        const list = document.getElementById('wr-proxy-list');
+        if (!list) return;
+        const items = wrState.proxies || [];
+        if (!items.length) {
+            list.innerHTML = `<div style="color:var(--text-muted); text-align:center; padding:40px; font-size:13px; border:1px dashed var(--border); border-radius:8px;">
+                No domain forwards yet. Click <strong>+ Domain forward</strong> to create one.
+            </div>`;
+            return;
+        }
+        // Sort: enabled first, then alphabetical by domain.
+        const sorted = [...items].sort((a, b) => {
+            if (a.enabled !== b.enabled) return a.enabled ? -1 : 1;
+            return (a.domain || '').localeCompare(b.domain || '');
+        });
+        list.innerHTML = sorted.map(p => proxyCardHtml(p)).join('');
+    }
+
+    function proxyBackendLabel(b) {
+        if (!b || !b.kind) return '<span style="color:var(--text-muted);">no backend</span>';
+        if (b.kind === 'custom') {
+            return `<code>${escHtml(b.host || '?')}</code>`;
+        }
+        if (b.kind === 'vm') {
+            const typeIcon = b.vm_type === 'proxmox' ? '🟠' : '🖥';
+            return `${typeIcon} ${escHtml(b.vm_name || b.vm_id)} <span style="color:var(--text-muted); font-size:11px;">(${escHtml(b.vm_type || 'vm')} — <code>${escHtml(b.host || '?')}</code>)</span>`;
+        }
+        if (b.kind === 'container') {
+            const icon = b.container_type === 'lxc' ? '🧊' : '📦';
+            return `${icon} ${escHtml(b.container_name || b.container_id)} <span style="color:var(--text-muted); font-size:11px;">(${escHtml(b.container_type || 'container')} — <code>${escHtml(b.host || '?')}</code>)</span>`;
+        }
+        return escHtml(JSON.stringify(b));
+    }
+
+    function proxyLbLabel(policy, count) {
+        if (count <= 1) return '';
+        const label = policy === 'ip_hash' ? 'weighted random' : 'round-robin';
+        return `<span class="badge" style="background:rgba(168,85,247,0.12); color:#a855f7; font-size:10px; margin-left:8px;">${label}</span>`;
+    }
+
+    function proxyCardHtml(p) {
+        const disabled = !p.enabled;
+        const backends = Array.isArray(p.backends) ? p.backends : [];
+        const backendsHtml = backends.length
+            ? backends.map(b => `<div style="font-size:13px; padding:2px 0;">→ ${proxyBackendLabel(b)}</div>`).join('')
+            : '<div style="font-size:13px; color:var(--text-muted);">→ (no backends)</div>';
+        return `<div style="border:1px solid var(--border); border-radius:8px; padding:12px 16px; background:var(--bg-card); ${disabled ? 'opacity:0.55;' : ''}">
+            <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap;">
+                <div style="flex:1; min-width:260px;">
+                    <div style="font-size:15px; font-weight:600; margin-bottom:4px;">
+                        🔀 ${escHtml(p.domain || '(no domain)')}
+                        ${proxyLbLabel(p.lb_policy, backends.length)}
+                        ${disabled ? '<span class="badge" style="background:rgba(148,163,184,0.15); color:#94a3b8; font-size:10px; margin-left:8px;">disabled</span>' : ''}
+                    </div>
+                    <div style="font-size:12px; color:var(--text-muted); margin-bottom:6px;">
+                        Public IP <code>${escHtml(p.resolved_public_ip || '(unresolved)')}</code>
+                        ${p.description ? ` · ${escHtml(p.description)}` : ''}
+                    </div>
+                    ${backendsHtml}
+                </div>
+                <div style="display:flex; gap:6px;">
+                    <button class="btn btn-sm" onclick="wrToggleProxy('${escHtml(p.id)}')" title="${disabled ? 'Enable' : 'Disable'}">${disabled ? '▶' : '⏸'}</button>
+                    <button class="btn btn-sm" onclick="wrShowProxyEditor('${escHtml(p.id)}')" title="Edit">✎</button>
+                    <button class="btn btn-sm" onclick="wrDeleteProxy('${escHtml(p.id)}')" title="Delete">🗑</button>
+                </div>
+            </div>
+        </div>`;
+    }
+
+    // Cache for the backend picker — /api/router/proxy-backends is cheap
+    // but we fetch it every modal open since VMs/containers come and go.
+    async function loadProxyBackends() {
+        try {
+            const r = await fetch(wrUrl('/api/router/proxy-backends'));
+            if (!r.ok) return { vms: { libvirt: [], proxmox: [] }, containers: { docker: [], lxc: [] } };
+            return await r.json();
+        } catch (e) {
+            return { vms: { libvirt: [], proxmox: [] }, containers: { docker: [], lxc: [] } };
+        }
+    }
+
+    // State for the editor — we rebuild the backend rows in place so
+    // this persists across "Add backend" clicks. Cleared on modal close.
+    let wrProxyEditorState = null;
+
+    function proxyPickerOptionsHtml(picks, selectedRaw) {
+        const out = [];
+        if (picks.vms?.libvirt?.length) {
+            out.push(`<optgroup label="🖥 WolfStack / libvirt VMs">`);
+            for (const v of picks.vms.libvirt) {
+                const val = `vm::libvirt::${v.id}::${v.host || ''}::${v.name}`;
+                out.push(`<option value="${escHtml(val)}" ${val === selectedRaw ? 'selected' : ''}>${escHtml(v.name)} — ${escHtml(v.host || 'no IP')}</option>`);
+            }
+            out.push(`</optgroup>`);
+        }
+        if (picks.vms?.proxmox?.length) {
+            out.push(`<optgroup label="🟠 Proxmox VE VMs">`);
+            for (const v of picks.vms.proxmox) {
+                const val = `vm::proxmox::${v.id}::${v.host || ''}::${v.name}`;
+                out.push(`<option value="${escHtml(val)}" ${val === selectedRaw ? 'selected' : ''}>${escHtml(v.name)} — ${escHtml(v.host || 'no IP')}</option>`);
+            }
+            out.push(`</optgroup>`);
+        }
+        if (picks.containers?.docker?.length) {
+            out.push(`<optgroup label="📦 Docker containers">`);
+            for (const c of picks.containers.docker) {
+                const val = `container::docker::${c.id}::${c.host || ''}::${c.name}`;
+                out.push(`<option value="${escHtml(val)}" ${val === selectedRaw ? 'selected' : ''}>${escHtml(c.name)} — ${escHtml(c.host || 'no IP')}</option>`);
+            }
+            out.push(`</optgroup>`);
+        }
+        if (picks.containers?.lxc?.length) {
+            out.push(`<optgroup label="🧊 LXC containers">`);
+            for (const c of picks.containers.lxc) {
+                const val = `container::lxc::${c.id}::${c.host || ''}::${c.name}`;
+                out.push(`<option value="${escHtml(val)}" ${val === selectedRaw ? 'selected' : ''}>${escHtml(c.name)} — ${escHtml(c.host || 'no IP')}</option>`);
+            }
+            out.push(`</optgroup>`);
+        }
+        if (!out.length) return '<option value="">(no running VMs or containers with an IP)</option>';
+        return `<option value="">— Pick a VM or container —</option>${out.join('')}`;
+    }
+
+    /// Render one row of the backends list. `idx` is the array index
+    /// used for event routing; `backend` is the current shape.
+    function proxyBackendRowHtml(idx, backend, picks) {
+        const kindIsCustom = backend.kind === 'custom';
+        let selectedRaw = '';
+        if (backend.kind === 'vm') {
+            selectedRaw = `vm::${backend.vm_type || 'libvirt'}::${backend.vm_id || ''}::${backend.host || ''}::${backend.vm_name || ''}`;
+        } else if (backend.kind === 'container') {
+            selectedRaw = `container::${backend.container_type || 'docker'}::${backend.container_id || ''}::${backend.host || ''}::${backend.container_name || ''}`;
+        }
+        const pickerOpts = proxyPickerOptionsHtml(picks, selectedRaw);
+        return `<div class="wr-proxy-backend-row" data-idx="${idx}" style="border:1px solid var(--border); border-radius:6px; padding:10px 12px; display:grid; gap:8px; background:var(--bg-secondary);">
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+                <div style="font-size:12px; color:var(--text-muted);">Backend #${idx + 1}</div>
+                <div style="display:flex; gap:16px; font-size:12px;">
+                    <label style="font-weight:normal;"><input type="radio" name="wr-proxy-kind-${idx}" value="picker" ${!kindIsCustom ? 'checked' : ''} onchange="wrProxyBackendKindChanged(${idx})" /> VM / container</label>
+                    <label style="font-weight:normal;"><input type="radio" name="wr-proxy-kind-${idx}" value="custom" ${kindIsCustom ? 'checked' : ''} onchange="wrProxyBackendKindChanged(${idx})" /> Custom IP</label>
+                    <button class="btn btn-sm" type="button" onclick="wrProxyRemoveBackend(${idx})" title="Remove this backend">🗑</button>
+                </div>
+            </div>
+            <div class="wr-proxy-picker-row" data-idx="${idx}" style="${kindIsCustom ? 'display:none;' : ''}">
+                <select class="form-control wr-proxy-picker" data-idx="${idx}">${pickerOpts}</select>
+            </div>
+            <div class="wr-proxy-custom-row" data-idx="${idx}" style="${!kindIsCustom ? 'display:none;' : ''}">
+                <input class="form-control wr-proxy-custom-host" data-idx="${idx}" value="${escHtml(kindIsCustom ? (backend.host || '') : '')}" placeholder="10.10.10.5 or backend.internal" />
+            </div>
+        </div>`;
+    }
+
+    function rerenderBackendRows() {
+        const wrap = document.getElementById('wr-proxy-backends-wrap');
+        if (!wrap || !wrProxyEditorState) return;
+        const { backends, picks } = wrProxyEditorState;
+        wrap.innerHTML = backends.map((b, i) => proxyBackendRowHtml(i, b, picks)).join('');
+        // Show/hide the lb policy selector based on count.
+        const lbRow = document.getElementById('wr-proxy-lb-row');
+        if (lbRow) lbRow.style.display = backends.length > 1 ? '' : 'none';
+    }
+
+    /// Collect current form state of the N backend rows into the
+    /// editor state array before we rebuild the DOM (otherwise adding
+    /// a row blows away any unsaved picker selections in the other
+    /// rows).
+    function snapshotBackendRows() {
+        if (!wrProxyEditorState) return;
+        const rows = document.querySelectorAll('.wr-proxy-backend-row');
+        const collected = [];
+        rows.forEach((row) => {
+            const idx = parseInt(row.dataset.idx, 10);
+            const kindRadio = row.querySelector(`input[name="wr-proxy-kind-${idx}"]:checked`);
+            const kind = kindRadio ? kindRadio.value : 'picker';
+            if (kind === 'custom') {
+                const host = row.querySelector('.wr-proxy-custom-host')?.value.trim() || '';
+                collected.push({ kind: 'custom', host });
+            } else {
+                const raw = row.querySelector('.wr-proxy-picker')?.value || '';
+                if (!raw) { collected.push({ kind: 'custom', host: '' }); return; }
+                const parts = raw.split('::');
+                if (parts[0] === 'vm') {
+                    collected.push({
+                        kind: 'vm', vm_type: parts[1], vm_id: parts[2],
+                        host: parts[3], vm_name: parts[4],
+                    });
+                } else {
+                    collected.push({
+                        kind: 'container', container_type: parts[1], container_id: parts[2],
+                        host: parts[3], container_name: parts[4],
+                    });
+                }
+            }
+        });
+        wrProxyEditorState.backends = collected;
+    }
+
+    function wrProxyBackendKindChanged(idx) {
+        const pickerRow = document.querySelector(`.wr-proxy-picker-row[data-idx="${idx}"]`);
+        const customRow = document.querySelector(`.wr-proxy-custom-row[data-idx="${idx}"]`);
+        const kind = document.querySelector(`input[name="wr-proxy-kind-${idx}"]:checked`)?.value || 'picker';
+        if (pickerRow) pickerRow.style.display = kind === 'picker' ? '' : 'none';
+        if (customRow) customRow.style.display = kind === 'custom' ? '' : 'none';
+    }
+
+    function wrProxyAddBackend() {
+        if (!wrProxyEditorState) return;
+        snapshotBackendRows();
+        wrProxyEditorState.backends.push({ kind: 'custom', host: '' });
+        rerenderBackendRows();
+    }
+
+    function wrProxyRemoveBackend(idx) {
+        if (!wrProxyEditorState) return;
+        snapshotBackendRows();
+        wrProxyEditorState.backends.splice(idx, 1);
+        if (wrProxyEditorState.backends.length === 0) {
+            wrProxyEditorState.backends.push({ kind: 'custom', host: '' });
+        }
+        rerenderBackendRows();
+    }
+
+    async function wrShowProxyEditor(id) {
+        const existing = id ? (wrState.proxies || []).find(p => p.id === id) : null;
+        const entry = existing || {
+            id: '', domain: '', node_id: '',
+            resolved_public_ip: '',
+            backends: [{ kind: 'custom', host: '' }],
+            lb_policy: 'round_robin',
+            enabled: true,
+            description: '',
+        };
+        // Back-compat: older configs may have `backend` (singular). Coerce.
+        if (!Array.isArray(entry.backends) || !entry.backends.length) {
+            entry.backends = entry.backend ? [entry.backend] : [{ kind: 'custom', host: '' }];
+        }
+
+        const nodes = (wrState.topology?.nodes) || [];
+        const nodeOptionsHtml = nodes.map(n =>
+            `<option value="${escHtml(n.node_id)}" ${entry.node_id === n.node_id ? 'selected' : ''}>${escHtml(n.node_name || n.node_id)}</option>`
+        ).join('') || '<option value="">(no nodes discovered)</option>';
+
+        const picks = await loadProxyBackends();
+        wrProxyEditorState = {
+            picks,
+            backends: entry.backends.map(b => ({ ...b })),
+        };
+
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay active';
+        overlay.id = 'wr-proxy-editor-overlay';
+        overlay.style.zIndex = '10000';
+        overlay.innerHTML = `
+            <div class="modal" style="max-width:720px;">
+                <div class="modal-header">
+                    <h3>${existing ? 'Edit' : 'New'} domain forward</h3>
+                    <button class="modal-close" onclick="document.getElementById('wr-proxy-editor-overlay').remove(); wrProxyEditorState=null;">×</button>
+                </div>
+                <div class="modal-body">
+                    <div style="display:grid; gap:12px;">
+                        <label>Domain
+                            <input id="wr-proxy-domain" class="form-control" value="${escHtml(entry.domain || '')}" placeholder="e.g. pbs.home.example.com" />
+                            <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">Must already resolve to a public IP on the selected node. If you haven't set up DNS, enter the public IP manually below.</div>
+                        </label>
+                        <label>Public IP <span style="color:var(--text-muted); font-weight:normal;">(optional — auto-resolved from the domain if blank)</span>
+                            <input id="wr-proxy-public-ip" class="form-control" value="${escHtml(entry.resolved_public_ip || '')}" placeholder="auto" />
+                        </label>
+                        <label>Owning node
+                            <select id="wr-proxy-node" class="form-control">${nodeOptionsHtml}</select>
+                            <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">iptables rules are installed only on this node — it must be the one the public IP actually lives on.</div>
+                        </label>
+                        <div>
+                            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                                <label style="margin:0;">Backends</label>
+                                <button class="btn btn-sm" type="button" onclick="wrProxyAddBackend()">+ Add backend</button>
+                            </div>
+                            <div id="wr-proxy-backends-wrap" style="display:grid; gap:8px;"></div>
+                        </div>
+                        <div id="wr-proxy-lb-row" style="display:${entry.backends.length > 1 ? '' : 'none'};">
+                            <label>Load balancing
+                                <select id="wr-proxy-lb" class="form-control">
+                                    <option value="round_robin" ${entry.lb_policy === 'round_robin' ? 'selected' : ''}>Round-robin (even cycle)</option>
+                                    <option value="ip_hash" ${entry.lb_policy === 'ip_hash' ? 'selected' : ''}>Weighted random</option>
+                                </select>
+                                <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">
+                                    Round-robin sends each new connection to the next backend in order.
+                                    Weighted random picks a backend at random for each connection (no session stickiness).
+                                </div>
+                            </label>
+                        </div>
+                        <label>Description <span style="color:var(--text-muted); font-weight:normal;">(optional)</span>
+                            <input id="wr-proxy-description" class="form-control" value="${escHtml(entry.description || '')}" placeholder="e.g. PBS backup server" maxlength="120" />
+                        </label>
+                        <label style="display:flex; align-items:center; gap:8px;">
+                            <input type="checkbox" id="wr-proxy-enabled" ${entry.enabled !== false ? 'checked' : ''} />
+                            Enabled
+                        </label>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn" onclick="document.getElementById('wr-proxy-editor-overlay').remove(); wrProxyEditorState=null;">Cancel</button>
+                    <button class="btn btn-primary" onclick="wrSaveProxy('${escHtml(entry.id || '')}')">Save</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(overlay);
+        rerenderBackendRows();
+    }
+
+    async function wrSaveProxy(existingId) {
+        const domain = document.getElementById('wr-proxy-domain').value.trim();
+        if (!domain) {
+            showProxyWarning('Domain is required.');
+            return;
+        }
+        const node_id = document.getElementById('wr-proxy-node').value;
+        const resolved_public_ip = document.getElementById('wr-proxy-public-ip').value.trim();
+        const description = document.getElementById('wr-proxy-description').value.trim();
+        const enabled = document.getElementById('wr-proxy-enabled').checked;
+        const lb_policy = document.getElementById('wr-proxy-lb')?.value || 'round_robin';
+
+        snapshotBackendRows();
+        const backends = (wrProxyEditorState?.backends || []).filter(b => (b.host || '').trim() !== '');
+        if (!backends.length) {
+            showProxyWarning('At least one backend with an IP or hostname is required.');
+            return;
+        }
+
+        const body = {
+            id: existingId || '',
+            domain,
+            node_id,
+            resolved_public_ip,
+            backends,
+            lb_policy,
+            enabled,
+            description,
+        };
+
+        const url = existingId
+            ? wrUrl('/api/router/proxies/' + encodeURIComponent(existingId))
+            : wrUrl('/api/router/proxies');
+        const method = existingId ? 'PUT' : 'POST';
+        try {
+            const resp = await fetch(url, {
+                method,
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            if (!resp.ok) {
+                const text = await resp.text();
+                showProxyWarning('Save failed: ' + text);
+                return;
+            }
+            const data = await resp.json();
+            document.getElementById('wr-proxy-editor-overlay')?.remove();
+            wrProxyEditorState = null;
+            if (Array.isArray(data.warnings) && data.warnings.length) {
+                showProxyWarning(data.warnings.join('\n'));
+            } else {
+                hideProxyWarning();
+            }
+            await wrLoadAll();
+        } catch (e) {
+            showProxyWarning('Save failed: ' + (e.message || e));
+        }
+    }
+
+    async function wrDeleteProxy(id) {
+        if (!confirm('Delete this domain forward? iptables rules will be removed immediately.')) return;
+        try {
+            const resp = await fetch(wrUrl('/api/router/proxies/' + encodeURIComponent(id)), { method: 'DELETE' });
+            if (!resp.ok) {
+                const text = await resp.text();
+                showProxyWarning('Delete failed: ' + text);
+                return;
+            }
+            hideProxyWarning();
+            await wrLoadAll();
+        } catch (e) {
+            showProxyWarning('Delete failed: ' + (e.message || e));
+        }
+    }
+
+    async function wrToggleProxy(id) {
+        const entry = (wrState.proxies || []).find(p => p.id === id);
+        if (!entry) return;
+        const updated = { ...entry, enabled: !entry.enabled };
+        try {
+            const resp = await fetch(wrUrl('/api/router/proxies/' + encodeURIComponent(id)), {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(updated),
+            });
+            if (!resp.ok) {
+                const text = await resp.text();
+                showProxyWarning('Toggle failed: ' + text);
+                return;
+            }
+            const data = await resp.json();
+            if (Array.isArray(data.warnings) && data.warnings.length) {
+                showProxyWarning(data.warnings.join('\n'));
+            } else {
+                hideProxyWarning();
+            }
+            await wrLoadAll();
+        } catch (e) {
+            showProxyWarning('Toggle failed: ' + (e.message || e));
+        }
+    }
+
+    function showProxyWarning(msg) {
+        const el = document.getElementById('wr-proxy-warnings');
+        if (!el) return;
+        el.textContent = msg;
+        el.style.display = 'block';
+    }
+
+    function hideProxyWarning() {
+        const el = document.getElementById('wr-proxy-warnings');
+        if (el) el.style.display = 'none';
+    }
+
 })();

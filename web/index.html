@@ -6320,6 +6320,7 @@
                         <button class="wr-tab" data-tab="zones" onclick="wrSelectTab('zones')">🎯 Zones</button>
                         <button class="wr-tab" data-tab="policy" onclick="wrSelectTab('policy')">🕸 Policy map</button>
                         <button class="wr-tab" data-tab="wan" onclick="wrSelectTab('wan')">🌍 WAN / PPPoE</button>
+                        <button class="wr-tab" data-tab="proxy" onclick="wrSelectTab('proxy')">🔀 Reverse proxy</button>
                         <button class="wr-tab" data-tab="connections" onclick="wrSelectTab('connections')">🔗 Connections</button>
                         <button class="wr-tab" data-tab="packets" onclick="wrSelectTab('packets')">📡 Packets</button>
                         <button class="wr-tab" data-tab="tools" onclick="wrSelectTab('tools')">🛠 DNS Tools</button>
@@ -6482,6 +6483,20 @@
                             <button class="btn btn-sm btn-primary" onclick="wrShowWanEditor()">+ WAN connection</button>
                         </div>
                         <div id="wr-wan-list" style="display:grid; gap:12px;"></div>
+                    </div>
+
+                    <div id="wr-tab-proxy" class="wr-tab-panel" style="padding:16px; display:none;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; flex-wrap:wrap; gap:8px;">
+                            <div style="font-size:12px; color:var(--text-muted); max-width:720px;">
+                                Forward <strong>every port and every protocol</strong> from a domain's public IP to any backend — a VM, a Docker/LXC container, or a bare IP.
+                                Not an HTTP proxy — pure iptables DNAT + SNAT, so SSH, SMTP, game servers, anything TCP or UDP works.
+                                Point the domain's DNS at a public IP on this node; WolfStack resolves the record and installs the NAT rules.
+                                One domain per public IP (there's no "Host header" for non-HTTP traffic to multiplex on).
+                            </div>
+                            <button class="btn btn-sm btn-primary" onclick="wrShowProxyEditor()">+ Domain forward</button>
+                        </div>
+                        <div id="wr-proxy-warnings" style="display:none; margin-bottom:12px; padding:10px 12px; background:rgba(234,179,8,0.1); border:1px solid rgba(234,179,8,0.4); border-radius:6px; font-size:12px; white-space:pre-wrap;"></div>
+                        <div id="wr-proxy-list" style="display:grid; gap:12px;"></div>
                     </div>
 
                     <div id="wr-tab-connections" class="wr-tab-panel" style="padding:16px; display:none;">

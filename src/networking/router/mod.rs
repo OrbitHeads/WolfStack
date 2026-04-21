@@ -30,6 +30,7 @@ pub mod topology;
 pub mod api;
 pub mod wan;
 pub mod host_dns;
+pub mod proxy;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -382,6 +383,12 @@ pub struct RouterConfig {
     /// are reverted. Prevents lockout. 0 disables.
     #[serde(default = "default_safe_mode_seconds")]
     pub safe_mode_seconds: u32,
+    /// Reverse-proxy entries. Each one maps an incoming domain to a
+    /// backend (custom IP:port, a VM, or a container). The runtime
+    /// generates one nginx site config per entry on the node that
+    /// owns it. See `proxy::apply_for_node` for the generator.
+    #[serde(default)]
+    pub proxies: Vec<proxy::ProxyEntry>,
 }
 
 fn default_safe_mode_seconds() -> u32 { 30 }
@@ -472,7 +479,8 @@ pub fn apply_on_startup(state: std::sync::Arc<RouterState>, self_node_id: &str) 
         .any(|c| c.enabled && c.node_id == self_node_id)
         || cfg.lans.iter().any(|l| l.node_id == self_node_id)
         || cfg.rules.iter().any(|r| r.enabled
-            && r.node_id.as_deref().map(|n| n == self_node_id).unwrap_or(true));
+            && r.node_id.as_deref().map(|n| n == self_node_id).unwrap_or(true))
+        || cfg.proxies.iter().any(|p| p.enabled && p.node_id == self_node_id);
     if !applies_here {
         tracing::debug!(
             "WolfRouter startup: no router config bound to this node — skipping apply"
@@ -522,6 +530,24 @@ pub fn apply_on_startup(state: std::sync::Arc<RouterState>, self_node_id: &str) 
         }
         Err(e) => {
             tracing::error!("WolfRouter startup: firewall apply failed: {}", e);
+        }
+    }
+
+    // Reverse-proxy vhosts — regenerate nginx site configs for every
+    // proxy bound to this node. Skip entirely when no proxies target
+    // this node, so a bare install without nginx doesn't log scary
+    // "nginx not installed" warnings on every boot.
+    if cfg.proxies.iter().any(|p| p.enabled && p.node_id == self_node_id) {
+        let warnings = proxy::apply_for_node(&cfg.proxies, self_node_id);
+        if warnings.is_empty() {
+            tracing::info!(
+                "WolfRouter startup: {} reverse-proxy vhost(s) regenerated",
+                cfg.proxies.iter().filter(|p| p.enabled && p.node_id == self_node_id).count()
+            );
+        } else {
+            for w in &warnings {
+                tracing::warn!("WolfRouter startup: proxy apply: {}", w);
+            }
         }
     }
 }
