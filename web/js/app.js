@@ -26892,11 +26892,11 @@ async function loadUsers() {
             html += '<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">';
             html += '<span style="padding:2px 6px;border-radius:4px;background:var(--bg-tertiary);border:1px solid var(--border);font-size:10px;text-transform:uppercase;font-weight:600;">' + escapeHtml(user.role) + '</span>';
             if (user.totp_enabled) html += ' <span style="padding:2px 6px;border-radius:4px;background:rgba(34,197,94,0.1);color:var(--success);border:1px solid rgba(34,197,94,0.3);font-size:10px;font-weight:600;">2FA ENABLED</span>';
-            // Cluster access badge — only rendered on Enterprise
-            // installs (feature flag `per_user_clusters`). On non-
-            // enterprise installs the feature is invisible: no badge,
-            // no button, no hint it exists. Admins always see all
-            // clusters regardless, so we skip the badge for them too.
+            // Cluster access badge — only rendered when a valid
+            // enterprise license is loaded. On non-enterprise installs
+            // the feature is invisible: no badge, no button, no hint
+            // it exists. Admins always see all clusters regardless, so
+            // we skip the badge for them too.
             if (perUserClusters && user.role !== 'admin') {
                 const ac = Array.isArray(user.allowed_clusters) ? user.allowed_clusters : [];
                 const label = ac.length === 0 ? 'ALL CLUSTERS' : ac.join(', ');
