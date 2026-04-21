@@ -19,14 +19,15 @@ use std::time::Duration;
 
 pub mod baseline;
 
-/// Outcome of a single health check. Callers use this to drive
-/// status-page incident open/close: Alert opens (or appends), Ok
-/// resolves, Error leaves existing incidents alone (a transient
-/// LLM API failure must not auto-resolve a real incident).
+/// Outcome of a single health check. `Ok` drives the alert→OK
+/// transition (fire "cleared" notifications on private channels).
+/// `Alert` means notifications have already been sent inside
+/// health_check itself. `Error` means a transient LLM API failure —
+/// leave all state alone so we don't mis-clear.
 #[derive(Debug, Clone)]
 pub enum HealthOutcome {
     Ok,
-    Alert { severity: String, message: String },
+    Alert,
     NotConfigured,
     Error,
 }
@@ -756,10 +757,14 @@ impl AiAgent {
     /// `sample` is recorded into the rolling 7-day baseline; the delta
     /// summary (now vs 24h/7d ago) is appended to the LLM prompt so it
     /// can flag slow drift the static thresholds miss.
-    /// `open_incidents_summary` lists status-page incidents the AI has
-    /// previously opened (still unresolved) so it can append context
-    /// rather than re-raising the same alarm.
-    pub async fn health_check(&self, sample: baseline::Sample, metrics_summary: &str, open_incidents_summary: &str) -> HealthOutcome {
+    ///
+    /// Alerts are fanned out to the operator's private channels (email
+    /// + Discord/Telegram/Slack). They are NEVER posted to the public
+    /// status page — AI output describes host internals (processes,
+    /// ports, security findings, config choices) that must not leak to
+    /// anonymous status-page viewers. Status pages auto-post only
+    /// monitor-driven user-facing outages (HTTP/TCP/ping/container).
+    pub async fn health_check(&self, sample: baseline::Sample, metrics_summary: &str) -> HealthOutcome {
         let config = self.config.lock().unwrap().clone();
         if !config.is_configured() { return HealthOutcome::NotConfigured; }
 
@@ -815,12 +820,9 @@ impl AiAgent {
              The admin will see these actions in the WolfStack dashboard AND in the alert email, and can approve them with one click.\n\n\
              The rolling baseline below shows how current metrics compare to 24h and 7d ago. Use it to flag drift that \
              static thresholds miss — e.g. disk usage creeping up 1 GB/day, CPU trending higher over the week, container \
-             count unexpectedly growing. A stable trend at a high absolute value is different from a rising trend.\n\
-             Open AI incidents from previous health checks are listed below. If a current issue matches an open incident, \
-             just acknowledge it — do NOT restate the full alert. The status page will auto-resolve incidents when you \
-             return ALL_OK, so only report net-new problems.\n\n\
-             Current server metrics:\n{}{}{}{}",
-            metrics_summary, baseline_summary, security_summary, open_incidents_summary
+             count unexpectedly growing. A stable trend at a high absolute value is different from a rising trend.\n\n\
+             Current server metrics:\n{}{}{}",
+            metrics_summary, baseline_summary, security_summary
         );
 
         let system = "You are a WolfStack server health monitoring agent. Be concise and technical. Only flag genuine issues. Propose fixes with [ACTION] tags when possible.";
@@ -927,7 +929,7 @@ impl AiAgent {
                         });
                     }
 
-                    HealthOutcome::Alert { severity: severity.to_string(), message: clean_response }
+                    HealthOutcome::Alert
                 } else {
                     HealthOutcome::Ok
                 }
