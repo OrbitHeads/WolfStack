@@ -41512,6 +41512,7 @@ function dbOpenConnection(id) {
         <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:8px; padding:6px 10px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:6px;">
             <div style="display:flex; align-items:center; gap:10px; font-size:13px; min-width:0; flex:1;">
                 <button class="btn btn-sm" onclick="dbCloseConnection()" title="Back to connection list" style="padding:3px 8px; font-size:12px;">← Connections</button>
+                <button class="btn btn-sm" onclick="dbToggleFullscreen()" title="Toggle fullscreen (Esc exits)" style="padding:3px 8px; font-size:12px;">⛶ Fullscreen</button>
                 <span>${kindIcon} <strong>${escapeHtml(conn.label)}</strong></span>
                 <span style="color:var(--text-muted); font-size:11px;">${kindLabel}</span>
                 <code style="font-size:11px; color:var(--text-muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(conn.username)}@${escapeHtml(conn.host)}:${conn.port}${conn.database ? '/' + escapeHtml(conn.database) : ''}${conn.cluster ? ' · ' + escapeHtml(conn.cluster) + (nodeLabel ? '/' + escapeHtml(nodeLabel) : '') : ''}</code>
@@ -41532,15 +41533,19 @@ function dbOpenConnection(id) {
             </div>
             <!-- Right: tabs -->
             <div style="border:1px solid var(--border); border-radius:8px; overflow:hidden; display:flex; flex-direction:column; background:var(--bg-secondary);">
-                <div style="display:flex; border-bottom:1px solid var(--border);">
+                <div style="display:flex; border-bottom:1px solid var(--border); overflow-x:auto;">
                     <button class="btn-sm db-mgr-tab" data-tab="data" onclick="dbMgrSwitchTab('data')"
-                        style="padding:9px 16px; border:none; background:none; cursor:pointer; border-bottom:2px solid transparent;">📊 Data</button>
+                        style="padding:9px 14px; border:none; background:none; cursor:pointer; border-bottom:2px solid transparent; white-space:nowrap;">📊 Data</button>
                     <button class="btn-sm db-mgr-tab" data-tab="structure" onclick="dbMgrSwitchTab('structure')"
-                        style="padding:9px 16px; border:none; background:none; cursor:pointer; border-bottom:2px solid transparent;">🏗️ Structure</button>
+                        style="padding:9px 14px; border:none; background:none; cursor:pointer; border-bottom:2px solid transparent; white-space:nowrap;">🏗️ Structure</button>
+                    <button class="btn-sm db-mgr-tab" data-tab="diagram" onclick="dbMgrSwitchTab('diagram')"
+                        style="padding:9px 14px; border:none; background:none; cursor:pointer; border-bottom:2px solid transparent; white-space:nowrap;">🗺️ Diagram</button>
                     <button class="btn-sm db-mgr-tab" data-tab="query" onclick="dbMgrSwitchTab('query')"
-                        style="padding:9px 16px; border:none; background:none; cursor:pointer; border-bottom:2px solid transparent;">⚡ Query</button>
+                        style="padding:9px 14px; border:none; background:none; cursor:pointer; border-bottom:2px solid transparent; white-space:nowrap;">⚡ Query</button>
+                    <button class="btn-sm db-mgr-tab" data-tab="server" onclick="dbMgrSwitchTab('server')"
+                        style="padding:9px 14px; border:none; background:none; cursor:pointer; border-bottom:2px solid transparent; white-space:nowrap;">🖥️ Server</button>
                     <div style="flex:1;"></div>
-                    <div id="db-mgr-info" style="padding:9px 12px; font-size:11px; color:var(--text-muted);"></div>
+                    <div id="db-mgr-info" style="padding:9px 12px; font-size:11px; color:var(--text-muted); white-space:nowrap;"></div>
                 </div>
                 <div id="db-mgr-body" style="flex:1; overflow:auto; padding:12px;">
                     <div style="color:var(--text-muted); text-align:center; padding:60px 10px; font-size:13px;">Pick a table on the left, or use the Query tab.</div>
@@ -41604,7 +41609,7 @@ async function dbMgrLoadTree(force) {
             return;
         }
     }
-    // Pre-load tables for any expanded schema we don't have cached yet.
+    // Pre-load tables + routines for any expanded schema we don't have cached yet.
     for (const schema of _dbMgrExpanded) {
         if (_dbMgrTablesCache[schema] === undefined) {
             try {
@@ -41613,19 +41618,32 @@ async function dbMgrLoadTree(force) {
                 _dbMgrTablesCache[schema] = { error: e.message };
             }
         }
+        if (_dbMgrRoutinesCache[schema] === undefined) {
+            _dbMgrRoutinesCache[schema] = await dbLoadRoutines(conn, schema);
+        }
     }
     dbMgrRenderTree(tree);
 }
 
+let _dbMgrRoutinesCache = {};
+
 async function dbMgrLoadTables(conn, schema) {
+    // Returns an array of {name, kind} where kind is 'table' or 'view'.
+    // Tree renderer shows the icons and orders tables before views.
     if (conn.kind === 'postgres') {
         const r = await dbMgrRunSql(
-            `SELECT table_name FROM information_schema.tables WHERE table_schema = '${schema.replace(/'/g, "''")}' ORDER BY table_name`
+            `SELECT table_name, table_type FROM information_schema.tables
+             WHERE table_schema = '${schema.replace(/'/g, "''")}'
+             ORDER BY table_type DESC, table_name`
         );
-        return r.rows.map(x => x[0]);
+        return r.rows.map(x => ({ name: x[0], kind: String(x[1]).toUpperCase() === 'VIEW' ? 'view' : 'table' }));
     }
-    const r = await dbMgrRunSql(`SHOW TABLES FROM ${dbMgrEscapeIdent(conn.kind, schema)}`);
-    return r.rows.map(x => x[0]);
+    const r = await dbMgrRunSql(`SHOW FULL TABLES FROM ${dbMgrEscapeIdent(conn.kind, schema)}`);
+    // SHOW FULL TABLES returns [Tables_in_<db>, Table_type] — Table_type is 'BASE TABLE' | 'VIEW' | 'SYSTEM VIEW'
+    return r.rows.map(x => ({
+        name: String(x[0]),
+        kind: String(x[1]).toUpperCase() === 'VIEW' ? 'view' : 'table',
+    }));
 }
 
 function dbMgrRenderTree(tree) {
@@ -41645,24 +41663,1212 @@ function dbMgrRenderTree(tree) {
         </div>`;
         if (expanded) {
             const cached = _dbMgrTablesCache[schema];
+            // Schema-level actions.
+            html += `<div style="padding:2px 28px 4px; font-size:11px; display:flex; gap:12px; flex-wrap:wrap;">
+                <a href="#" onclick="event.preventDefault(); dbWizCreateTable('${safe}')" style="color:var(--accent, #a855f7);">+ New table</a>
+                <a href="#" onclick="event.preventDefault(); dbDumpSchema('${safe}', false)" style="color:var(--text-muted);">Dump schema</a>
+                <a href="#" onclick="event.preventDefault(); dbDumpSchema('${safe}', true)" style="color:var(--text-muted);">Dump + data</a>
+            </div>`;
             if (cached && cached.error) {
                 html += `<div style="padding:4px 28px; font-size:11px; color:var(--danger);">${escapeHtml(cached.error)}</div>`;
             } else if (!cached || !cached.length) {
-                html += `<div style="padding:4px 28px; font-size:11px; color:var(--text-muted);">(no tables)</div>`;
+                html += `<div style="padding:4px 28px; font-size:11px; color:var(--text-muted);">(no objects)</div>`;
             } else {
-                for (const name of cached) {
-                    const active = _dbMgrCurrentDb === schema && _dbMgrCurrentTable === name;
-                    const safeT = escapeHtml(name).replace(/'/g, "\\'");
-                    html += `<div onclick="dbMgrPickTable('${safe}','${safeT}')"
-                        style="cursor:pointer; padding:4px 28px; font-size:13px; background:${active ? 'var(--accent-bg, rgba(168,85,247,0.15))' : 'transparent'};">
-                        📋 ${escapeHtml(name)}
-                    </div>`;
+                // Support both the new {name, kind} shape and old string[]
+                // shape so an in-flight upgrade doesn't break. Group by kind.
+                const entries = cached.map(x => typeof x === 'string' ? { name: x, kind: 'table' } : x);
+                const tables = entries.filter(e => e.kind === 'table');
+                const views = entries.filter(e => e.kind === 'view');
+                if (tables.length) {
+                    html += `<div style="padding:4px 28px 2px; font-size:10px; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.5px;">Tables (${tables.length})</div>`;
+                    for (const e of tables) {
+                        const active = _dbMgrCurrentDb === schema && _dbMgrCurrentTable === e.name;
+                        const safeT = escapeHtml(e.name).replace(/'/g, "\\'");
+                        html += `<div onclick="dbMgrPickTable('${safe}','${safeT}')"
+                            style="cursor:pointer; padding:4px 28px; font-size:13px; background:${active ? 'var(--accent-bg, rgba(168,85,247,0.15))' : 'transparent'};">
+                            📋 ${escapeHtml(e.name)}
+                        </div>`;
+                    }
+                }
+                if (views.length) {
+                    html += `<div style="padding:6px 28px 2px; font-size:10px; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.5px;">Views (${views.length})</div>`;
+                    for (const e of views) {
+                        const active = _dbMgrCurrentDb === schema && _dbMgrCurrentTable === e.name;
+                        const safeT = escapeHtml(e.name).replace(/'/g, "\\'");
+                        html += `<div onclick="dbMgrPickTable('${safe}','${safeT}')"
+                            style="cursor:pointer; padding:4px 28px; font-size:13px; background:${active ? 'var(--accent-bg, rgba(168,85,247,0.15))' : 'transparent'};">
+                            👁️ ${escapeHtml(e.name)}
+                        </div>`;
+                    }
+                }
+            }
+            // Routines (procedures / functions / triggers) — read-only definition viewer.
+            const routines = _dbMgrRoutinesCache[schema];
+            if (routines) {
+                for (const kind of ['procedures', 'functions', 'triggers']) {
+                    const list = routines[kind];
+                    if (!list || !list.length) continue;
+                    const icon = kind === 'procedures' ? '⚙️' : kind === 'functions' ? 'ƒ' : '⚡';
+                    const singular = kind.replace(/s$/, '');
+                    html += `<div style="padding:6px 28px 2px; font-size:10px; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.5px;">${kind.charAt(0).toUpperCase() + kind.slice(1)} (${list.length})</div>`;
+                    for (const name of list) {
+                        const safeN = escapeHtml(name).replace(/'/g, "\\'");
+                        html += `<div onclick="dbShowRoutineDefinition('${safe}','${safeN}','${singular}')"
+                            style="cursor:pointer; padding:4px 28px; font-size:13px;">
+                            ${icon} ${escapeHtml(name)}
+                        </div>`;
+                    }
                 }
             }
         }
     }
     tree.innerHTML = html;
 }
+
+// ─── Create Table wizard ───
+async function dbWizCreateTable(schema) {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    // Build a modal with a small column-editor grid.
+    const existing = document.getElementById('db-wiz-modal');
+    if (existing) existing.remove();
+    const modal = document.createElement('div');
+    modal.id = 'db-wiz-modal';
+    modal.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:10000; display:flex; align-items:center; justify-content:center;';
+    modal.innerHTML = `
+        <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:20px; width:720px; max-width:95vw; max-height:90vh; overflow:auto;">
+            <h3 style="margin:0 0 12px;">Create table in <code>${escapeHtml(schema)}</code></h3>
+            <label style="display:block; font-size:13px;">Table name
+                <input id="db-wiz-name" class="form-control" placeholder="customers" autocomplete="off">
+            </label>
+            <div style="margin-top:12px;">
+                <div style="font-size:13px; margin-bottom:6px;">Columns</div>
+                <table id="db-wiz-cols" style="width:100%; font-size:12px; border-collapse:collapse;">
+                    <thead><tr style="background:var(--bg-tertiary);">
+                        <th style="padding:5px; text-align:left;">Name</th>
+                        <th style="padding:5px; text-align:left;">Type</th>
+                        <th style="padding:5px; text-align:center;">NULL</th>
+                        <th style="padding:5px; text-align:center;">PK</th>
+                        <th style="padding:5px; text-align:left;">Default</th>
+                        <th></th>
+                    </tr></thead>
+                    <tbody id="db-wiz-cols-body"></tbody>
+                </table>
+                <button class="btn btn-sm" onclick="dbWizAddRow()" style="margin-top:8px;">+ Add column</button>
+            </div>
+            <div style="margin-top:12px; display:flex; gap:8px; justify-content:flex-end;">
+                <button class="btn btn-sm" onclick="document.getElementById('db-wiz-modal').remove()">Cancel</button>
+                <button class="btn btn-primary btn-sm" onclick="dbWizSubmit('${escapeHtml(schema).replace(/'/g, "\\'")}')">Create table</button>
+            </div>
+            <div id="db-wiz-preview" style="margin-top:14px; font-family:monospace; font-size:11px; color:var(--text-muted); white-space:pre-wrap;"></div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+    // Seed with two starter rows — id PK + first user column.
+    dbWizAddRow({ name: 'id', type: conn.kind === 'postgres' ? 'SERIAL' : 'INT AUTO_INCREMENT', nullable: false, pk: true });
+    dbWizAddRow({ name: 'name', type: 'VARCHAR(255)', nullable: false, pk: false });
+}
+
+function dbWizAddRow(seed) {
+    const body = document.getElementById('db-wiz-cols-body');
+    if (!body) return;
+    const row = document.createElement('tr');
+    row.innerHTML = `
+        <td style="padding:3px;"><input class="form-control db-wiz-col-name" placeholder="column_name" value="${escapeHtml((seed && seed.name) || '')}" style="font-size:12px; padding:4px 6px;"></td>
+        <td style="padding:3px;"><input class="form-control db-wiz-col-type" placeholder="VARCHAR(255)" value="${escapeHtml((seed && seed.type) || 'VARCHAR(255)')}" style="font-size:12px; padding:4px 6px;"></td>
+        <td style="padding:3px; text-align:center;"><input type="checkbox" class="db-wiz-col-null" ${seed && seed.nullable === false ? '' : 'checked'}></td>
+        <td style="padding:3px; text-align:center;"><input type="checkbox" class="db-wiz-col-pk" ${seed && seed.pk ? 'checked' : ''}></td>
+        <td style="padding:3px;"><input class="form-control db-wiz-col-default" placeholder="(none)" style="font-size:12px; padding:4px 6px;"></td>
+        <td style="padding:3px; text-align:right;"><button class="btn btn-sm" onclick="this.closest('tr').remove(); dbWizUpdatePreview()" style="padding:2px 8px; font-size:11px;">✕</button></td>
+    `;
+    body.appendChild(row);
+    // Live preview
+    ['input', 'change'].forEach(ev => {
+        row.querySelectorAll('input').forEach(i => i.addEventListener(ev, dbWizUpdatePreview));
+    });
+    dbWizUpdatePreview();
+}
+
+function dbWizBuildSql(schema) {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return '';
+    const name = (document.getElementById('db-wiz-name') || {}).value;
+    if (!name || !name.trim()) return '';
+    const rows = [...document.querySelectorAll('#db-wiz-cols-body tr')];
+    const cols = [];
+    const pks = [];
+    for (const r of rows) {
+        const colName = r.querySelector('.db-wiz-col-name').value.trim();
+        const colType = r.querySelector('.db-wiz-col-type').value.trim();
+        if (!colName || !colType) continue;
+        const nullable = r.querySelector('.db-wiz-col-null').checked;
+        const isPk = r.querySelector('.db-wiz-col-pk').checked;
+        const def = r.querySelector('.db-wiz-col-default').value.trim();
+        let line = `${dbMgrEscapeIdent(conn.kind, colName)} ${colType}`;
+        if (!nullable) line += ' NOT NULL';
+        if (def) line += ` DEFAULT ${def}`;
+        cols.push(line);
+        if (isPk) pks.push(dbMgrEscapeIdent(conn.kind, colName));
+    }
+    if (pks.length) cols.push(`PRIMARY KEY (${pks.join(', ')})`);
+    const fq = `${dbMgrEscapeIdent(conn.kind, schema)}.${dbMgrEscapeIdent(conn.kind, name.trim())}`;
+    return `CREATE TABLE ${fq} (\n  ${cols.join(',\n  ')}\n)`;
+}
+
+function dbWizUpdatePreview() {
+    const schema = _dbMgrExpanded.size ? [..._dbMgrExpanded][0] : (_dbMgrCurrentDb || '');
+    const el = document.getElementById('db-wiz-preview');
+    if (!el) return;
+    el.textContent = dbWizBuildSql(schema) || '-- complete the form to see the generated SQL';
+}
+
+async function dbWizSubmit(schema) {
+    const sql = dbWizBuildSql(schema);
+    if (!sql) { showToast('Fill in the name and at least one column', 'warning'); return; }
+    const ok = await wolfConfirm(`Run this CREATE TABLE?\n\n${sql}`, 'Create table', { okText: 'Create', danger: true });
+    if (!ok) return;
+    try {
+        const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_dbCurrentId)}/query`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: sql, permission: 'schema', timeout_secs: 30 }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Create failed', 'error'); return; }
+        showToast('Table created', 'success');
+        document.getElementById('db-wiz-modal').remove();
+        delete _dbMgrTablesCache[schema];
+        dbMgrLoadTree();
+    } catch (e) { showToast('Create failed: ' + e.message, 'error'); }
+}
+
+// ═══════════════════════════════════════════════════
+// ─── SQL file upload / multi-statement execution ───
+// ═══════════════════════════════════════════════════
+
+// Split a SQL script into individual statements. Handles:
+//   - line comments (--) and block comments (/* */)
+//   - string literals ', ", and `` (with backslash and doubled-quote escapes)
+//   - DELIMITER directives (MySQL procedure bodies)
+// Returns [{sql, line}] — line is 1-based start line of each statement.
+function dbSplitSqlScript(src) {
+    const statements = [];
+    let buf = '';
+    let bufLine = 1;
+    let line = 1;
+    let delimiter = ';';
+    let i = 0;
+    const N = src.length;
+    while (i < N) {
+        const c = src[i];
+        // DELIMITER directive (must be at line start, ignoring whitespace)
+        if (c === 'D' || c === 'd') {
+            // Cheap check — only match at start of a trimmed line.
+            const lineStart = src.lastIndexOf('\n', i - 1) + 1;
+            const prefix = src.slice(lineStart, i);
+            if (/^\s*$/.test(prefix)) {
+                const word = src.slice(i, i + 10).toUpperCase();
+                if (word.startsWith('DELIMITER ')) {
+                    const eol = src.indexOf('\n', i);
+                    const j = eol === -1 ? N : eol;
+                    const spec = src.slice(i + 10, j).trim();
+                    if (spec) delimiter = spec;
+                    // Flush anything pending
+                    if (buf.trim()) { statements.push({ sql: buf.trim(), line: bufLine }); buf = ''; }
+                    line += 1;
+                    i = j + 1;
+                    bufLine = line;
+                    continue;
+                }
+            }
+        }
+        // Line comment
+        if (c === '-' && src[i + 1] === '-') {
+            const eol = src.indexOf('\n', i);
+            const j = eol === -1 ? N : eol;
+            buf += src.slice(i, j);
+            i = j;
+            continue;
+        }
+        // Block comment
+        if (c === '/' && src[i + 1] === '*') {
+            const end = src.indexOf('*/', i + 2);
+            const j = end === -1 ? N : end + 2;
+            buf += src.slice(i, j);
+            // Count newlines inside the comment
+            for (let k = i; k < j; k++) if (src[k] === '\n') line++;
+            i = j;
+            continue;
+        }
+        // String literal
+        if (c === "'" || c === '"' || c === '`') {
+            let j = i + 1;
+            while (j < N) {
+                if (src[j] === '\\') { j += 2; continue; }
+                if (src[j] === c) { j++; break; }
+                if (src[j] === '\n') line++;
+                j++;
+            }
+            buf += src.slice(i, j);
+            i = j;
+            continue;
+        }
+        // Delimiter match
+        if (src.startsWith(delimiter, i)) {
+            if (buf.trim()) statements.push({ sql: buf.trim(), line: bufLine });
+            buf = '';
+            i += delimiter.length;
+            // Skip trailing whitespace/newlines
+            while (i < N && /\s/.test(src[i])) {
+                if (src[i] === '\n') line++;
+                i++;
+            }
+            bufLine = line;
+            continue;
+        }
+        if (c === '\n') line++;
+        buf += c;
+        i++;
+    }
+    if (buf.trim()) statements.push({ sql: buf.trim(), line: bufLine });
+    return statements;
+}
+
+async function dbUploadSqlFile() {
+    if (!_dbCurrentId) return;
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.sql,.txt,application/sql,text/plain';
+    input.onchange = async () => {
+        const file = input.files && input.files[0];
+        if (!file) return;
+        const text = await file.text();
+        const statements = dbSplitSqlScript(text);
+        if (!statements.length) { showToast('No executable statements found', 'warning'); return; }
+        const ok = await wolfConfirm(
+            `Execute ${statements.length} statement${statements.length === 1 ? '' : 's'} from ${file.name}?\n\n` +
+            `Schema permission will be used (the file may contain DDL). First statement starts on line ${statements[0].line}.`,
+            'Run SQL file', { okText: 'Run', danger: true }
+        );
+        if (!ok) return;
+        await dbRunStatementBatch(statements.map(s => s.sql), { sourceLabel: file.name, lines: statements.map(s => s.line) });
+    };
+    input.click();
+}
+
+async function dbRunStatementBatch(statements, meta) {
+    const resultEl = document.getElementById('db-result');
+    if (resultEl) resultEl.innerHTML = `<div style="color:var(--text-muted);">Running ${statements.length} statements…</div>`;
+    try {
+        const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_dbCurrentId)}/query-multi`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ statements, permission: 'schema', timeout_secs: 60, stop_on_error: true }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { if (resultEl) resultEl.innerHTML = `<div style="color:var(--danger);">${escapeHtml(data.error || 'Failed')}</div>`; return; }
+        let ok = 0, failed = 0;
+        for (const r of data.results) { if (r.ok) ok++; else if (r.error) failed++; }
+        let html = `<div style="padding:10px; background:var(--bg-primary); border:1px solid var(--border); border-radius:6px;">
+            <strong>${escapeHtml(meta.sourceLabel || 'Batch')}:</strong> ${ok} succeeded · ${failed} failed · ${data.total} total`;
+        if (data.failed_at !== null && data.failed_at !== undefined) {
+            const lineInfo = meta.lines ? ` (started around line ${meta.lines[data.failed_at] || '?'})` : '';
+            html += `<br><span style="color:var(--danger);">Stopped at statement ${data.failed_at + 1}${lineInfo}</span>`;
+        }
+        html += '</div>';
+        // Expand the first failure inline for easy diagnosis.
+        for (let i = 0; i < data.results.length; i++) {
+            const r = data.results[i];
+            if (!r.ok && r.error) {
+                html += `<div style="margin-top:8px; padding:10px; background:var(--bg-primary); border-left:3px solid var(--danger); font-family:monospace; font-size:12px; white-space:pre-wrap;"><strong>Statement ${i + 1} failed:</strong>\n${escapeHtml(statements[i] || '')}\n\n<span style="color:var(--danger);">${escapeHtml(r.error)}</span></div>`;
+                break;
+            }
+        }
+        if (resultEl) resultEl.innerHTML = html;
+        showToast(`${ok}/${data.total} statements succeeded`, failed ? 'warning' : 'success');
+    } catch (e) {
+        if (resultEl) resultEl.innerHTML = `<div style="color:var(--danger);">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+// ═══════════════════════════════════════════════════
+// ─── Dump to SQL (mysqldump-equivalent, client-driven) ───
+// ═══════════════════════════════════════════════════
+//
+// Client loops through every table in the schema, issuing
+// SHOW CREATE TABLE + SELECT * queries and concatenating the
+// results into a downloadable .sql file. For big databases
+// this can be slow; we show progress in a toast.
+
+async function dbDumpSchema(schema, includeData) {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    // Find tables.
+    let tables;
+    try {
+        if (conn.kind === 'postgres') {
+            const r = await dbMgrRunSql(
+                `SELECT table_name FROM information_schema.tables
+                 WHERE table_schema = '${schema.replace(/'/g, "''")}' AND table_type = 'BASE TABLE'
+                 ORDER BY table_name`);
+            tables = r.rows.map(x => x[0]);
+        } else {
+            const r = await dbMgrRunSql(`SHOW FULL TABLES FROM ${dbMgrEscapeIdent(conn.kind, schema)} WHERE Table_type = 'BASE TABLE'`);
+            tables = r.rows.map(x => String(x[0]));
+        }
+    } catch (e) { showToast('Dump failed: ' + e.message, 'error'); return; }
+    if (!tables.length) { showToast('No tables to dump', 'warning'); return; }
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    let sql = `-- WolfStack SQL dump
+-- Host: ${conn.host}:${conn.port}
+-- Database: ${schema}
+-- Engine: ${conn.kind}
+-- Generated: ${new Date().toISOString()}
+-- Tables: ${tables.length}
+-- Include data: ${includeData ? 'yes' : 'no'}
+
+SET NAMES utf8mb4;
+${conn.kind === 'postgres' ? 'SET client_encoding = \'UTF8\';' : 'SET SQL_MODE = "NO_AUTO_VALUE_ON_ZERO";'}
+
+`;
+
+    const total = tables.length;
+    showToast(`Dumping ${total} table${total === 1 ? '' : 's'}…`, 'info');
+    for (let i = 0; i < tables.length; i++) {
+        const t = tables[i];
+        sql += `\n-- ─── Table: ${t} ───\n`;
+        try {
+            let createSql;
+            if (conn.kind === 'postgres') {
+                // Postgres doesn't have SHOW CREATE TABLE. Reconstruct
+                // from information_schema: columns, PK, FKs, indexes.
+                createSql = await dbPgReconstructCreate(schema, t);
+            } else {
+                const r = await dbMgrRunSql(`SHOW CREATE TABLE ${dbMgrEscapeIdent(conn.kind, schema)}.${dbMgrEscapeIdent(conn.kind, t)}`);
+                createSql = r.rows[0] ? String(r.rows[0][1]) : '';
+            }
+            if (createSql) sql += `DROP TABLE IF EXISTS ${dbMgrEscapeIdent(conn.kind, schema)}.${dbMgrEscapeIdent(conn.kind, t)};\n${createSql};\n\n`;
+
+            if (includeData) {
+                // Page through rows in 500-row chunks.
+                let offset = 0;
+                const chunk = 500;
+                for (;;) {
+                    const r = await dbMgrRunSql(
+                        `SELECT * FROM ${dbMgrEscapeIdent(conn.kind, schema)}.${dbMgrEscapeIdent(conn.kind, t)} LIMIT ${chunk} OFFSET ${offset}`);
+                    if (!r.rows.length) break;
+                    const colList = r.columns.map(c => dbMgrEscapeIdent(conn.kind, c)).join(', ');
+                    for (const row of r.rows) {
+                        const vals = row.map(v => v == null ? 'NULL'
+                            : typeof v === 'number' ? String(v)
+                            : typeof v === 'boolean' ? (v ? 'TRUE' : 'FALSE')
+                            : `'${String(v).replace(/\\/g, '\\\\').replace(/'/g, "''")}'`);
+                        sql += `INSERT INTO ${dbMgrEscapeIdent(conn.kind, schema)}.${dbMgrEscapeIdent(conn.kind, t)} (${colList}) VALUES (${vals.join(', ')});\n`;
+                    }
+                    if (r.rows.length < chunk) break;
+                    offset += chunk;
+                }
+            }
+        } catch (e) {
+            sql += `-- ERROR dumping ${t}: ${e.message}\n`;
+        }
+    }
+
+    const blob = new Blob([sql], { type: 'text/sql' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `${schema}-${stamp}.sql`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showToast(`Dump saved: ${tables.length} tables, ${sql.length.toLocaleString()} bytes`, 'success');
+}
+
+async function dbPgReconstructCreate(schema, table) {
+    // Minimal CREATE TABLE for Postgres — covers columns, NOT NULL,
+    // defaults, and primary keys. Indexes and FKs get emitted as
+    // separate ALTER TABLE statements for readability.
+    const cols = await dbMgrRunSql(
+        `SELECT column_name, data_type, character_maximum_length, is_nullable, column_default
+         FROM information_schema.columns
+         WHERE table_schema = '${schema.replace(/'/g, "''")}' AND table_name = '${table.replace(/'/g, "''")}'
+         ORDER BY ordinal_position`);
+    const pk = await dbMgrRunSql(
+        `SELECT kcu.column_name
+         FROM information_schema.table_constraints tc
+         JOIN information_schema.key_column_usage kcu ON kcu.constraint_name = tc.constraint_name
+         WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = '${schema.replace(/'/g, "''")}' AND tc.table_name = '${table.replace(/'/g, "''")}'
+         ORDER BY kcu.ordinal_position`);
+    const lines = cols.rows.map(r => {
+        const [name, type, maxLen, nullable, def] = r;
+        let l = `  "${name}" ${type}${maxLen ? `(${maxLen})` : ''}`;
+        if (nullable === 'NO') l += ' NOT NULL';
+        if (def != null) l += ` DEFAULT ${def}`;
+        return l;
+    });
+    if (pk.rows.length) {
+        lines.push(`  PRIMARY KEY (${pk.rows.map(r => `"${r[0]}"`).join(', ')})`);
+    }
+    return `CREATE TABLE "${schema}"."${table}" (\n${lines.join(',\n')}\n)`;
+}
+
+// ═══════════════════════════════════════════════════
+// ─── Stored procedures / triggers / functions browser ───
+// ═══════════════════════════════════════════════════
+//
+// Adds three read-only groups to the schema tree. Clicking a name
+// opens a modal with the object's CREATE definition. We don't
+// support in-UI editing of procedures — operators who need to
+// modify them use the Query tab with the Schema permission.
+
+async function dbLoadRoutines(conn, schema) {
+    // Returns {procedures: [], functions: [], triggers: []}
+    try {
+        if (conn.kind === 'postgres') {
+            const routines = await dbMgrRunSql(
+                `SELECT routine_name, routine_type FROM information_schema.routines
+                 WHERE specific_schema = '${schema.replace(/'/g, "''")}'
+                 ORDER BY routine_type, routine_name`);
+            const trigs = await dbMgrRunSql(
+                `SELECT trigger_name FROM information_schema.triggers
+                 WHERE trigger_schema = '${schema.replace(/'/g, "''")}'
+                 GROUP BY trigger_name ORDER BY trigger_name`);
+            const out = { procedures: [], functions: [], triggers: [] };
+            for (const r of routines.rows) {
+                if (String(r[1]).toUpperCase() === 'FUNCTION') out.functions.push(r[0]);
+                else out.procedures.push(r[0]);
+            }
+            out.triggers = trigs.rows.map(r => r[0]);
+            return out;
+        }
+        const routines = await dbMgrRunSql(
+            `SELECT routine_name, routine_type FROM information_schema.routines
+             WHERE routine_schema = '${schema.replace(/'/g, "''")}'
+             ORDER BY routine_type, routine_name`);
+        const trigs = await dbMgrRunSql(
+            `SELECT trigger_name FROM information_schema.triggers
+             WHERE trigger_schema = '${schema.replace(/'/g, "''")}' ORDER BY trigger_name`);
+        const out = { procedures: [], functions: [], triggers: [] };
+        for (const r of routines.rows) {
+            if (String(r[1]).toUpperCase() === 'FUNCTION') out.functions.push(String(r[0]));
+            else out.procedures.push(String(r[0]));
+        }
+        out.triggers = trigs.rows.map(r => String(r[0]));
+        return out;
+    } catch { return { procedures: [], functions: [], triggers: [] }; }
+}
+
+async function dbShowRoutineDefinition(schema, name, kind) {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    try {
+        let definition = '';
+        if (conn.kind === 'postgres') {
+            if (kind === 'trigger') {
+                const r = await dbMgrRunSql(
+                    `SELECT action_statement FROM information_schema.triggers
+                     WHERE trigger_schema = '${schema.replace(/'/g, "''")}' AND trigger_name = '${name.replace(/'/g, "''")}' LIMIT 1`);
+                definition = r.rows[0] ? String(r.rows[0][0]) : '(not found)';
+            } else {
+                const r = await dbMgrRunSql(
+                    `SELECT pg_get_functiondef(p.oid) FROM pg_proc p
+                     JOIN pg_namespace n ON n.oid = p.pronamespace
+                     WHERE n.nspname = '${schema.replace(/'/g, "''")}' AND p.proname = '${name.replace(/'/g, "''")}' LIMIT 1`);
+                definition = r.rows[0] ? String(r.rows[0][0]) : '(not found)';
+            }
+        } else {
+            const stmt = kind === 'trigger' ? 'SHOW CREATE TRIGGER'
+                : kind === 'function' ? 'SHOW CREATE FUNCTION' : 'SHOW CREATE PROCEDURE';
+            const r = await dbMgrRunSql(`${stmt} ${dbMgrEscapeIdent(conn.kind, schema)}.${dbMgrEscapeIdent(conn.kind, name)}`);
+            // 4th column on MySQL SHOW CREATE * is the definition.
+            definition = r.rows[0] ? String(r.rows[0][2] || r.rows[0][1] || '') : '(not found)';
+        }
+        const modal = document.createElement('div');
+        modal.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:10000; display:flex; align-items:center; justify-content:center;';
+        modal.innerHTML = `
+            <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:16px; width:840px; max-width:95vw; max-height:85vh; display:flex; flex-direction:column;">
+                <h3 style="margin:0 0 10px;">${kind === 'trigger' ? '⚡' : kind === 'function' ? 'ƒ' : '⚙️'} ${escapeHtml(name)} <span style="color:var(--text-muted); font-weight:normal; font-size:13px;">— ${kind}</span></h3>
+                <pre style="flex:1; overflow:auto; background:var(--bg-primary); border:1px solid var(--border); border-radius:6px; padding:10px; font-family:monospace; font-size:12px; white-space:pre-wrap; margin:0;">${escapeHtml(definition)}</pre>
+                <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:10px;">
+                    <button class="btn btn-sm" onclick="navigator.clipboard.writeText(this.closest('div').parentElement.querySelector('pre').textContent)">📋 Copy</button>
+                    <button class="btn btn-sm" onclick="this.closest('div').parentElement.remove()">Close</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+    } catch (e) { showToast('Fetch definition failed: ' + e.message, 'error'); }
+}
+
+// ═══════════════════════════════════════════════════
+// ─── CSV import ───
+// ═══════════════════════════════════════════════════
+
+async function dbImportCsv() {
+    if (!_dbMgrCurrentTable) { showToast('Pick a target table first', 'warning'); return; }
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.csv,text/csv';
+    input.onchange = async () => {
+        const file = input.files && input.files[0];
+        if (!file) return;
+        const text = await file.text();
+        const rows = dbParseCsv(text);
+        if (rows.length < 2) { showToast('CSV needs a header row and at least one data row', 'warning'); return; }
+        const header = rows[0];
+        const dataRows = rows.slice(1);
+        const fq = `${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentDb)}.${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentTable)}`;
+        const colList = header.map(c => dbMgrEscapeIdent(conn.kind, c)).join(', ');
+        const statements = dataRows.map(row => {
+            const vals = row.map(v => v === '' ? 'NULL' : `'${String(v).replace(/'/g, "''")}'`);
+            return `INSERT INTO ${fq} (${colList}) VALUES (${vals.join(', ')})`;
+        });
+        const ok = await wolfConfirm(
+            `Insert ${dataRows.length} rows into ${_dbMgrCurrentTable} from ${file.name}?\n\n` +
+            `Columns: ${header.join(', ')}`,
+            'Import CSV', { okText: 'Import', danger: true }
+        );
+        if (!ok) return;
+        await dbRunStatementBatch(statements, { sourceLabel: file.name });
+        dbDataReload();
+    };
+    input.click();
+}
+
+function dbParseCsv(text) {
+    // Minimal RFC 4180 parser: quoted fields with embedded commas and
+    // quoted quotes ("Smith, ""Jr"". Bob"). Linebreaks inside quotes
+    // are preserved.
+    const rows = [];
+    let row = [], field = '';
+    let inQuote = false;
+    let i = 0;
+    while (i < text.length) {
+        const c = text[i];
+        if (inQuote) {
+            if (c === '"') {
+                if (text[i + 1] === '"') { field += '"'; i += 2; continue; }
+                inQuote = false; i++; continue;
+            }
+            field += c; i++; continue;
+        }
+        if (c === '"') { inQuote = true; i++; continue; }
+        if (c === ',') { row.push(field); field = ''; i++; continue; }
+        if (c === '\n' || c === '\r') {
+            if (c === '\r' && text[i + 1] === '\n') i++;
+            row.push(field); field = '';
+            rows.push(row); row = [];
+            i++; continue;
+        }
+        field += c; i++;
+    }
+    if (field !== '' || row.length) { row.push(field); rows.push(row); }
+    // Drop fully empty trailing rows.
+    while (rows.length && rows[rows.length - 1].length === 1 && rows[rows.length - 1][0] === '') rows.pop();
+    return rows;
+}
+
+// ═══════════════════════════════════════════════════
+// ─── Inline row editing (Data tab) ───
+// ═══════════════════════════════════════════════════
+//
+// We detect the primary key columns on first render and use them
+// to scope UPDATE / DELETE. Without a PK we disable edit/delete.
+// Insert-new-row always works.
+
+let _dbDataPks = {};  // key: "db.table" -> [pkColName, ...]
+
+async function dbDataLoadPk() {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return [];
+    const k = dbDataKey();
+    if (_dbDataPks[k]) return _dbDataPks[k];
+    try {
+        let data;
+        if (conn.kind === 'postgres') {
+            data = await dbMgrRunSql(
+                `SELECT kcu.column_name FROM information_schema.table_constraints tc
+                 JOIN information_schema.key_column_usage kcu ON kcu.constraint_name = tc.constraint_name
+                 WHERE tc.constraint_type = 'PRIMARY KEY'
+                   AND tc.table_schema = '${_dbMgrCurrentDb.replace(/'/g, "''")}'
+                   AND tc.table_name = '${_dbMgrCurrentTable.replace(/'/g, "''")}'
+                 ORDER BY kcu.ordinal_position`);
+        } else {
+            data = await dbMgrRunSql(
+                `SELECT column_name FROM information_schema.key_column_usage
+                 WHERE table_schema = '${_dbMgrCurrentDb.replace(/'/g, "''")}'
+                   AND table_name = '${_dbMgrCurrentTable.replace(/'/g, "''")}'
+                   AND constraint_name = 'PRIMARY'
+                 ORDER BY ordinal_position`);
+        }
+        _dbDataPks[k] = data.rows.map(r => String(r[0]));
+    } catch { _dbDataPks[k] = []; }
+    return _dbDataPks[k];
+}
+
+async function dbDataEditCell(rowIdx, colIdx) {
+    if (!_dbDataLast) return;
+    const pks = await dbDataLoadPk();
+    if (!pks.length) { showToast('No primary key — inline edit disabled. Use the Query tab.', 'warning'); return; }
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    const colName = _dbDataLast.columns[colIdx];
+    const oldVal = _dbDataLast.rows[rowIdx][colIdx];
+    const newVal = prompt(`New value for ${colName}:`, oldVal == null ? '' : String(oldVal));
+    if (newVal === null) return;
+    // Build WHERE clause from PK values.
+    const pkCells = pks.map(pkName => {
+        const idx = _dbDataLast.columns.indexOf(pkName);
+        return idx < 0 ? null : { col: pkName, val: _dbDataLast.rows[rowIdx][idx] };
+    }).filter(Boolean);
+    if (!pkCells.length) { showToast('PK columns not in current result — reload and retry.', 'warning'); return; }
+    const whereClause = pkCells.map(p => `${dbMgrEscapeIdent(conn.kind, p.col)} = ${p.val == null ? 'NULL' : (typeof p.val === 'number' ? p.val : `'${String(p.val).replace(/'/g, "''")}'`)}`).join(' AND ');
+    const fq = `${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentDb)}.${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentTable)}`;
+    const setClause = `${dbMgrEscapeIdent(conn.kind, colName)} = ${newVal === '' ? 'NULL' : `'${newVal.replace(/'/g, "''")}'`}`;
+    const sql = `UPDATE ${fq} SET ${setClause} WHERE ${whereClause}`;
+    const ok = await wolfConfirm(`Run this UPDATE?\n\n${sql}`, 'Update row', { okText: 'Update', danger: true });
+    if (!ok) return;
+    try {
+        const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_dbCurrentId)}/query`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: sql, permission: 'update', timeout_secs: 30 }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Update failed', 'error'); return; }
+        showToast('Row updated', 'success');
+        dbDataReload();
+    } catch (e) { showToast('Update failed: ' + e.message, 'error'); }
+}
+
+async function dbDataDeleteRow(rowIdx) {
+    if (!_dbDataLast) return;
+    const pks = await dbDataLoadPk();
+    if (!pks.length) { showToast('No primary key — delete disabled. Use the Query tab.', 'warning'); return; }
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    const pkCells = pks.map(pkName => {
+        const idx = _dbDataLast.columns.indexOf(pkName);
+        return idx < 0 ? null : { col: pkName, val: _dbDataLast.rows[rowIdx][idx] };
+    }).filter(Boolean);
+    if (!pkCells.length) { showToast('PK columns not in current result — reload and retry.', 'warning'); return; }
+    const whereClause = pkCells.map(p => `${dbMgrEscapeIdent(conn.kind, p.col)} = ${p.val == null ? 'NULL' : (typeof p.val === 'number' ? p.val : `'${String(p.val).replace(/'/g, "''")}'`)}`).join(' AND ');
+    const fq = `${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentDb)}.${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentTable)}`;
+    const sql = `DELETE FROM ${fq} WHERE ${whereClause}`;
+    const ok = await wolfConfirm(`Run this DELETE?\n\n${sql}`, 'Delete row', { okText: 'Delete', danger: true });
+    if (!ok) return;
+    try {
+        const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_dbCurrentId)}/query`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: sql, permission: 'delete', timeout_secs: 30 }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Delete failed', 'error'); return; }
+        showToast('Row deleted', 'success');
+        dbDataReload();
+    } catch (e) { showToast('Delete failed: ' + e.message, 'error'); }
+}
+
+async function dbDataInsertRow() {
+    if (!_dbDataLast || !_dbDataLast.columns) return;
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    const cols = _dbDataLast.columns;
+    const vals = [];
+    for (const c of cols) {
+        const v = prompt(`${c} (leave blank for NULL):`);
+        if (v === null) return;  // cancel
+        vals.push(v);
+    }
+    const fq = `${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentDb)}.${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentTable)}`;
+    const colList = cols.map(c => dbMgrEscapeIdent(conn.kind, c)).join(', ');
+    const valList = vals.map(v => v === '' ? 'NULL' : `'${v.replace(/'/g, "''")}'`).join(', ');
+    const sql = `INSERT INTO ${fq} (${colList}) VALUES (${valList})`;
+    const ok = await wolfConfirm(`Run this INSERT?\n\n${sql}`, 'Insert row', { okText: 'Insert', danger: true });
+    if (!ok) return;
+    try {
+        const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_dbCurrentId)}/query`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: sql, permission: 'update', timeout_secs: 30 }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Insert failed', 'error'); return; }
+        showToast('Row inserted', 'success');
+        dbDataReload();
+    } catch (e) { showToast('Insert failed: ' + e.message, 'error'); }
+}
+
+// ═══════════════════════════════════════════════════
+// ─── Schema compare ───
+// ═══════════════════════════════════════════════════
+//
+// Picks a source connection+schema and a target connection+schema
+// (may be the same connection). Pulls table/column/index/FK lists
+// from both and renders a side-by-side diff: tables only in source,
+// tables only in target, tables in both with column/index/FK
+// differences per table. Optionally emits the CREATE/ALTER SQL that
+// would migrate target → source.
+
+let _dbCmpSrc = { conn: '', schema: '' };
+let _dbCmpDst = { conn: '', schema: '' };
+
+function dbSchemaCompareOpen() {
+    const existing = document.getElementById('db-cmp-modal');
+    if (existing) existing.remove();
+    const conns = _dbConnsCache || [];
+    if (!conns.length) { showToast('Load connections first', 'warning'); return; }
+    // Build a select listing each connection, pre-selecting the
+    // currently-open one if any.
+    const connOptions = conns.map(c => `<option value="${escapeHtml(c.id)}"${c.id === _dbCurrentId ? ' selected' : ''}>${escapeHtml(c.label)}</option>`).join('');
+    const modal = document.createElement('div');
+    modal.id = 'db-cmp-modal';
+    modal.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:10000; display:flex; align-items:center; justify-content:center;';
+    modal.innerHTML = `
+        <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:18px; width:900px; max-width:95vw; max-height:90vh; display:flex; flex-direction:column;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                <h3 style="margin:0;">🧭 Compare schemas</h3>
+                <button class="btn btn-sm" onclick="document.getElementById('db-cmp-modal').remove()">Close</button>
+            </div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+                <div>
+                    <div style="font-size:12px; color:var(--text-muted); margin-bottom:4px;">SOURCE</div>
+                    <select id="db-cmp-src-conn" class="form-control" onchange="dbCmpLoadSchemas('src')">${connOptions}</select>
+                    <select id="db-cmp-src-schema" class="form-control" style="margin-top:6px;"><option value="">— loading —</option></select>
+                </div>
+                <div>
+                    <div style="font-size:12px; color:var(--text-muted); margin-bottom:4px;">TARGET</div>
+                    <select id="db-cmp-dst-conn" class="form-control" onchange="dbCmpLoadSchemas('dst')">${connOptions}</select>
+                    <select id="db-cmp-dst-schema" class="form-control" style="margin-top:6px;"><option value="">— loading —</option></select>
+                </div>
+            </div>
+            <div style="display:flex; gap:8px; margin-top:10px; align-items:center;">
+                <button class="btn btn-primary btn-sm" onclick="dbCmpRun()">▶ Run compare</button>
+                <button class="btn btn-sm" id="db-cmp-migrate" onclick="dbCmpEmitMigration()" disabled>📜 Generate target→source migration SQL</button>
+                <span id="db-cmp-stat" style="margin-left:auto; font-size:11px; color:var(--text-muted);"></span>
+            </div>
+            <div id="db-cmp-result" style="flex:1; overflow:auto; margin-top:10px; border:1px solid var(--border); border-radius:6px; padding:10px; background:var(--bg-primary); font-size:12px;">Pick source + target and click Run compare.</div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+    dbCmpLoadSchemas('src');
+    dbCmpLoadSchemas('dst');
+}
+
+async function dbCmpLoadSchemas(side) {
+    const connId = document.getElementById(`db-cmp-${side}-conn`).value;
+    const sel = document.getElementById(`db-cmp-${side}-schema`);
+    sel.innerHTML = '<option value="">— loading —</option>';
+    const conn = _dbConnsCache.find(c => c.id === connId);
+    if (!conn) return;
+    try {
+        const resp = await fetch(`/api/sql-connections/${encodeURIComponent(connId)}/query`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                query: conn.kind === 'postgres'
+                    ? "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('pg_catalog','information_schema','pg_toast') ORDER BY schema_name"
+                    : 'SHOW DATABASES',
+                permission: 'read', timeout_secs: 15,
+            }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { sel.innerHTML = `<option value="">${escapeHtml(data.error || 'error')}</option>`; return; }
+        const ignore = new Set(['information_schema','performance_schema','mysql','sys']);
+        const schemas = data.rows.map(r => String(r[0])).filter(s => !ignore.has(s));
+        // Preselect the connection's default DB if we have it.
+        sel.innerHTML = schemas.map(s => `<option value="${escapeHtml(s)}"${s === conn.database ? ' selected' : ''}>${escapeHtml(s)}</option>`).join('');
+    } catch (e) {
+        sel.innerHTML = `<option value="">${escapeHtml(e.message)}</option>`;
+    }
+}
+
+async function dbCmpRun() {
+    const srcConn = document.getElementById('db-cmp-src-conn').value;
+    const srcSchema = document.getElementById('db-cmp-src-schema').value;
+    const dstConn = document.getElementById('db-cmp-dst-conn').value;
+    const dstSchema = document.getElementById('db-cmp-dst-schema').value;
+    if (!srcConn || !srcSchema || !dstConn || !dstSchema) { showToast('Pick both sides first', 'warning'); return; }
+    const result = document.getElementById('db-cmp-result');
+    const stat = document.getElementById('db-cmp-stat');
+    result.textContent = 'Scanning source and target…';
+    stat.textContent = '';
+    try {
+        const [srcDef, dstDef] = await Promise.all([
+            dbCmpScan(srcConn, srcSchema),
+            dbCmpScan(dstConn, dstSchema),
+        ]);
+        _dbCmpSrc = { conn: srcConn, schema: srcSchema, def: srcDef };
+        _dbCmpDst = { conn: dstConn, schema: dstSchema, def: dstDef };
+        const diff = dbCmpDiff(srcDef, dstDef);
+        dbCmpRender(result, diff, srcSchema, dstSchema);
+        document.getElementById('db-cmp-migrate').disabled = false;
+        stat.textContent = `${diff.onlyInSrc.length} only in source · ${diff.onlyInDst.length} only in target · ${diff.changed.length} differ`;
+    } catch (e) {
+        result.innerHTML = `<div style="color:var(--danger); font-family:monospace; white-space:pre-wrap;">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+async function dbCmpScan(connId, schema) {
+    const conn = _dbConnsCache.find(c => c.id === connId);
+    if (!conn) throw new Error('connection not found');
+    const runSql = async (sql) => {
+        const resp = await fetch(`/api/sql-connections/${encodeURIComponent(connId)}/query`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: sql, permission: 'read', timeout_secs: 60 }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || 'query failed');
+        return data;
+    };
+    // Tables
+    let tableList;
+    if (conn.kind === 'postgres') {
+        const r = await runSql(
+            `SELECT table_name FROM information_schema.tables WHERE table_schema = '${schema.replace(/'/g, "''")}' AND table_type = 'BASE TABLE' ORDER BY table_name`);
+        tableList = r.rows.map(x => String(x[0]));
+    } else {
+        const r = await runSql(`SHOW FULL TABLES FROM \`${schema.replace(/`/g, '``')}\` WHERE Table_type = 'BASE TABLE'`);
+        tableList = r.rows.map(x => String(x[0]));
+    }
+    // Columns / indexes / FKs for each table, in parallel.
+    const tables = await Promise.all(tableList.map(async (t) => {
+        const colSql = conn.kind === 'postgres'
+            ? `SELECT column_name, data_type, is_nullable, column_default
+               FROM information_schema.columns
+               WHERE table_schema = '${schema.replace(/'/g, "''")}' AND table_name = '${t.replace(/'/g, "''")}'
+               ORDER BY ordinal_position`
+            : `SELECT column_name, column_type, is_nullable, column_default
+               FROM information_schema.columns
+               WHERE table_schema = '${schema.replace(/'/g, "''")}' AND table_name = '${t.replace(/'/g, "''")}'
+               ORDER BY ordinal_position`;
+        const idxSql = conn.kind === 'postgres'
+            ? `SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = '${schema.replace(/'/g, "''")}' AND tablename = '${t.replace(/'/g, "''")}' ORDER BY indexname`
+            : `SELECT DISTINCT index_name FROM information_schema.statistics WHERE table_schema = '${schema.replace(/'/g, "''")}' AND table_name = '${t.replace(/'/g, "''")}' ORDER BY index_name`;
+        const fkSql = conn.kind === 'postgres'
+            ? `SELECT tc.constraint_name, kcu.column_name, ccu.table_name, ccu.column_name
+               FROM information_schema.table_constraints tc
+               JOIN information_schema.key_column_usage kcu ON kcu.constraint_name = tc.constraint_name
+               JOIN information_schema.constraint_column_usage ccu ON ccu.constraint_name = tc.constraint_name
+               WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = '${schema.replace(/'/g, "''")}' AND tc.table_name = '${t.replace(/'/g, "''")}'`
+            : `SELECT constraint_name, column_name, referenced_table_name, referenced_column_name
+               FROM information_schema.key_column_usage
+               WHERE table_schema = '${schema.replace(/'/g, "''")}' AND table_name = '${t.replace(/'/g, "''")}' AND referenced_table_name IS NOT NULL`;
+        const [cols, idxs, fks] = await Promise.all([runSql(colSql), runSql(idxSql), runSql(fkSql)]);
+        return {
+            name: t,
+            columns: cols.rows.map(r => ({ name: String(r[0]), type: String(r[1]), nullable: String(r[2]) === 'YES', default: r[3] == null ? null : String(r[3]) })),
+            indexes: idxs.rows.map(r => String(r[0])),
+            fks: fks.rows.map(r => ({ name: String(r[0]), col: String(r[1]), refTable: String(r[2]), refCol: String(r[3]) })),
+        };
+    }));
+    return { tables, kind: conn.kind, schema };
+}
+
+function dbCmpDiff(src, dst) {
+    const srcMap = Object.fromEntries(src.tables.map(t => [t.name, t]));
+    const dstMap = Object.fromEntries(dst.tables.map(t => [t.name, t]));
+    const onlyInSrc = src.tables.filter(t => !dstMap[t.name]);
+    const onlyInDst = dst.tables.filter(t => !srcMap[t.name]);
+    const changed = [];
+    for (const t of src.tables) {
+        const other = dstMap[t.name];
+        if (!other) continue;
+        const colsSrc = Object.fromEntries(t.columns.map(c => [c.name, c]));
+        const colsDst = Object.fromEntries(other.columns.map(c => [c.name, c]));
+        const colOnlySrc = t.columns.filter(c => !colsDst[c.name]);
+        const colOnlyDst = other.columns.filter(c => !colsSrc[c.name]);
+        const colDiff = [];
+        for (const c of t.columns) {
+            const o = colsDst[c.name];
+            if (!o) continue;
+            if (c.type !== o.type || c.nullable !== o.nullable || (c.default || '') !== (o.default || '')) {
+                colDiff.push({ col: c.name, src: c, dst: o });
+            }
+        }
+        const idxSrc = new Set(t.indexes);
+        const idxDst = new Set(other.indexes);
+        const idxOnlySrc = [...idxSrc].filter(x => !idxDst.has(x));
+        const idxOnlyDst = [...idxDst].filter(x => !idxSrc.has(x));
+        const fkSrc = new Set(t.fks.map(f => `${f.col}→${f.refTable}.${f.refCol}`));
+        const fkDst = new Set(other.fks.map(f => `${f.col}→${f.refTable}.${f.refCol}`));
+        const fkOnlySrc = [...fkSrc].filter(x => !fkDst.has(x));
+        const fkOnlyDst = [...fkDst].filter(x => !fkSrc.has(x));
+        if (colOnlySrc.length || colOnlyDst.length || colDiff.length || idxOnlySrc.length || idxOnlyDst.length || fkOnlySrc.length || fkOnlyDst.length) {
+            changed.push({ name: t.name, colOnlySrc, colOnlyDst, colDiff, idxOnlySrc, idxOnlyDst, fkOnlySrc, fkOnlyDst, srcT: t, dstT: other });
+        }
+    }
+    return { onlyInSrc, onlyInDst, changed };
+}
+
+function dbCmpRender(el, diff, srcSchema, dstSchema) {
+    let h = `<div style="margin-bottom:12px; display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+        <div style="background:var(--bg-secondary); padding:8px 10px; border-radius:6px;"><strong>Source:</strong> ${escapeHtml(srcSchema)}</div>
+        <div style="background:var(--bg-secondary); padding:8px 10px; border-radius:6px;"><strong>Target:</strong> ${escapeHtml(dstSchema)}</div>
+    </div>`;
+    if (!diff.onlyInSrc.length && !diff.onlyInDst.length && !diff.changed.length) {
+        h += '<div style="color:#22c55e; font-weight:600;">✓ Schemas are identical.</div>';
+        el.innerHTML = h;
+        return;
+    }
+    if (diff.onlyInSrc.length) {
+        h += `<h4 style="margin:14px 0 6px; color:#22c55e;">Tables only in source (+${diff.onlyInSrc.length})</h4><ul style="margin:0 0 0 20px;">`;
+        for (const t of diff.onlyInSrc) h += `<li>${escapeHtml(t.name)} <span style="color:var(--text-muted);">(${t.columns.length} cols)</span></li>`;
+        h += '</ul>';
+    }
+    if (diff.onlyInDst.length) {
+        h += `<h4 style="margin:14px 0 6px; color:#ef4444;">Tables only in target (−${diff.onlyInDst.length})</h4><ul style="margin:0 0 0 20px;">`;
+        for (const t of diff.onlyInDst) h += `<li>${escapeHtml(t.name)} <span style="color:var(--text-muted);">(${t.columns.length} cols)</span></li>`;
+        h += '</ul>';
+    }
+    if (diff.changed.length) {
+        h += `<h4 style="margin:14px 0 6px; color:#eab308;">Tables with differences (~${diff.changed.length})</h4>`;
+        for (const t of diff.changed) {
+            h += `<details style="margin-bottom:8px; border:1px solid var(--border); border-radius:6px; padding:8px 10px;">
+                <summary style="cursor:pointer; font-weight:600;">📋 ${escapeHtml(t.name)}</summary>
+                <div style="margin-top:6px; padding-left:10px;">`;
+            if (t.colOnlySrc.length) h += `<div style="color:#22c55e;">+ columns: ${t.colOnlySrc.map(c => escapeHtml(c.name)).join(', ')}</div>`;
+            if (t.colOnlyDst.length) h += `<div style="color:#ef4444;">− columns: ${t.colOnlyDst.map(c => escapeHtml(c.name)).join(', ')}</div>`;
+            for (const cd of t.colDiff) {
+                h += `<div style="color:#eab308;">~ ${escapeHtml(cd.col)}: <code>${escapeHtml(cd.dst.type)}</code> → <code>${escapeHtml(cd.src.type)}</code>${cd.src.nullable !== cd.dst.nullable ? `, NULL ${cd.dst.nullable ? 'allowed' : 'disallowed'} → ${cd.src.nullable ? 'allowed' : 'disallowed'}` : ''}</div>`;
+            }
+            if (t.idxOnlySrc.length) h += `<div style="color:#22c55e;">+ indexes: ${t.idxOnlySrc.map(escapeHtml).join(', ')}</div>`;
+            if (t.idxOnlyDst.length) h += `<div style="color:#ef4444;">− indexes: ${t.idxOnlyDst.map(escapeHtml).join(', ')}</div>`;
+            if (t.fkOnlySrc.length) h += `<div style="color:#22c55e;">+ foreign keys: ${t.fkOnlySrc.map(escapeHtml).join(', ')}</div>`;
+            if (t.fkOnlyDst.length) h += `<div style="color:#ef4444;">− foreign keys: ${t.fkOnlyDst.map(escapeHtml).join(', ')}</div>`;
+            h += `</div></details>`;
+        }
+    }
+    el.innerHTML = h;
+}
+
+function dbCmpEmitMigration() {
+    // Produce the SQL that would transform TARGET into SOURCE. Covers
+    // CREATE TABLE for tables only in source, DROP TABLE for tables
+    // only in target, and ALTER TABLE for column diffs. Conservative
+    // — leaves data transformation + complex constraint changes to
+    // the operator; the output is a starting point, not a guarantee.
+    if (!_dbCmpSrc.def || !_dbCmpDst.def) return;
+    const diff = dbCmpDiff(_dbCmpSrc.def, _dbCmpDst.def);
+    const dstSchema = _dbCmpDst.schema;
+    const kind = _dbCmpDst.def.kind;
+    const esc = (ident) => kind === 'postgres' ? `"${ident.replace(/"/g, '""')}"` : `\`${ident.replace(/`/g, '``')}\``;
+    let sql = `-- Migration: ${_dbCmpDst.schema} (target) → ${_dbCmpSrc.schema} (source)\n-- Generated ${new Date().toISOString()}\n-- Review before running.\n\n`;
+    for (const t of diff.onlyInDst) {
+        sql += `DROP TABLE ${esc(dstSchema)}.${esc(t.name)};\n`;
+    }
+    for (const t of diff.onlyInSrc) {
+        sql += `-- TODO: new table ${t.name} — copy CREATE TABLE from source\nCREATE TABLE ${esc(dstSchema)}.${esc(t.name)} (\n`;
+        sql += t.columns.map(c => `  ${esc(c.name)} ${c.type}${c.nullable ? '' : ' NOT NULL'}${c.default != null ? ` DEFAULT ${c.default}` : ''}`).join(',\n');
+        sql += '\n);\n';
+    }
+    for (const t of diff.changed) {
+        for (const c of t.colOnlySrc) sql += `ALTER TABLE ${esc(dstSchema)}.${esc(t.name)} ADD COLUMN ${esc(c.name)} ${c.type}${c.nullable ? '' : ' NOT NULL'}${c.default != null ? ` DEFAULT ${c.default}` : ''};\n`;
+        for (const c of t.colOnlyDst) sql += `ALTER TABLE ${esc(dstSchema)}.${esc(t.name)} DROP COLUMN ${esc(c.name)};\n`;
+        for (const cd of t.colDiff) sql += `-- TODO: ${t.name}.${cd.col}: ${cd.dst.type} → ${cd.src.type} (engine-specific ALTER syntax — review)\n`;
+    }
+    // Show in a scrollable block the user can copy.
+    const el = document.getElementById('db-cmp-result');
+    el.innerHTML = `<div style="margin-bottom:8px; display:flex; gap:8px; align-items:center;">
+        <strong>Migration SQL</strong>
+        <button class="btn btn-sm" onclick="navigator.clipboard.writeText(document.getElementById('db-cmp-migration-sql').textContent); showToast('Copied to clipboard', 'success')">📋 Copy</button>
+        <button class="btn btn-sm" onclick="dbCmpRun()">← Back to diff</button>
+    </div>
+    <pre id="db-cmp-migration-sql" style="background:var(--bg-primary); border:1px solid var(--border); border-radius:6px; padding:10px; font-family:monospace; font-size:12px; white-space:pre-wrap; margin:0;">${escapeHtml(sql)}</pre>`;
+}
+
+// ═══════════════════════════════════════════════════
+// ─── SQL autocomplete (Ctrl+Space) ───
+// ═══════════════════════════════════════════════════
+//
+// Context-aware completion for the Query tab textarea:
+//   - After FROM / JOIN / INTO / UPDATE → table names from any
+//     expanded schema on this connection (lazy-fetched if needed)
+//   - After `<ident>.` → columns of that table (lazy-fetched)
+//   - Otherwise → SQL keywords + table names
+//
+// Triggered by Ctrl+Space (or Alt+Space). Popup is a floating
+// <div> anchored just below the cursor; arrow keys navigate,
+// Enter / Tab accept, Esc dismisses.
+
+let _dbAcState = { popup: null, items: [], active: 0, prefix: '', startPos: 0 };
+let _dbAcColumnCache = {};  // key: "schema.table" -> [colName]
+
+async function dbAcEnsureColumns(schema, table) {
+    const k = `${schema}.${table}`;
+    if (_dbAcColumnCache[k]) return _dbAcColumnCache[k];
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return [];
+    try {
+        const r = await dbMgrRunSql(
+            `SELECT column_name FROM information_schema.columns
+             WHERE table_schema = '${schema.replace(/'/g, "''")}' AND table_name = '${table.replace(/'/g, "''")}'
+             ORDER BY ordinal_position`);
+        _dbAcColumnCache[k] = r.rows.map(r => String(r[0]));
+    } catch { _dbAcColumnCache[k] = []; }
+    return _dbAcColumnCache[k];
+}
+
+function dbAcKnownTables() {
+    // Every table (and view) we already know about from the tree
+    // cache. No extra round-trip required — operators will have
+    // expanded at least one schema to get here.
+    const out = [];
+    for (const schema of Object.keys(_dbMgrTablesCache)) {
+        const entries = _dbMgrTablesCache[schema];
+        if (!entries || entries.error) continue;
+        for (const e of entries) {
+            const name = typeof e === 'string' ? e : e.name;
+            out.push({ schema, name });
+        }
+    }
+    return out;
+}
+
+async function dbAcTrigger() {
+    const ta = document.getElementById('db-query');
+    if (!ta) return;
+    const pos = ta.selectionStart;
+    const src = ta.value;
+    // Word under cursor: scan back until non-word char, forward until same.
+    let s = pos;
+    while (s > 0 && /[A-Za-z0-9_]/.test(src[s - 1])) s--;
+    const prefix = src.slice(s, pos);
+    _dbAcState.prefix = prefix;
+    _dbAcState.startPos = s;
+    // Look back for either "FROM"/"JOIN"/"INTO"/"UPDATE" or a preceding "ident.".
+    const before = src.slice(0, s);
+    const dotMatch = before.match(/([A-Za-z_][A-Za-z0-9_]*)\.\s*$/);
+    let candidates = [];
+    if (dotMatch) {
+        // Column completion for this table. Table could be qualified
+        // with schema (schema.table.) — we only look at the last
+        // ident. Use the current open schema if unknown.
+        const tableName = dotMatch[1];
+        const schema = _dbMgrCurrentDb || (_dbMgrExpanded.size ? [..._dbMgrExpanded][0] : null);
+        const cols = schema ? await dbAcEnsureColumns(schema, tableName) : [];
+        candidates = cols.map(c => ({ label: c, kind: 'column', insert: c }));
+    } else {
+        const afterKw = /\b(FROM|JOIN|INTO|UPDATE|TABLE)\s+(?:[A-Za-z_][A-Za-z0-9_]*\s*,\s*)*$/i.test(before);
+        const tables = dbAcKnownTables();
+        const tableCands = tables.map(t => ({ label: `${t.name} · ${t.schema}`, kind: 'table', insert: t.name }));
+        if (afterKw) {
+            candidates = tableCands;
+        } else {
+            const kwCands = [...SQL_KEYWORDS].map(k => ({ label: k, kind: 'keyword', insert: k }));
+            candidates = [...tableCands, ...kwCands];
+        }
+    }
+    // Filter by prefix (case-insensitive), cap at 20.
+    const pl = prefix.toLowerCase();
+    candidates = candidates
+        .filter(c => c.insert.toLowerCase().startsWith(pl))
+        .slice(0, 20);
+    if (!candidates.length) { dbAcClose(); return; }
+    _dbAcState.items = candidates;
+    _dbAcState.active = 0;
+    dbAcShowPopup(ta);
+}
+
+function dbAcShowPopup(ta) {
+    dbAcClose();
+    const popup = document.createElement('div');
+    popup.id = 'db-ac-popup';
+    popup.style.cssText = 'position:fixed; background:var(--bg-card); border:1px solid var(--border); border-radius:6px; box-shadow:0 4px 16px rgba(0,0,0,0.3); z-index:10001; max-height:280px; overflow-y:auto; min-width:200px; font-family:var(--font-mono, ui-monospace, monospace); font-size:13px;';
+    dbAcRenderItems(popup);
+    document.body.appendChild(popup);
+    _dbAcState.popup = popup;
+    // Position: use getBoundingClientRect + a rough cursor offset
+    // (we can't easily measure exact cursor pixel without a mirror
+    // div; anchoring below the textarea bottom-left is good enough
+    // for a context-sensitive popup).
+    const rect = ta.getBoundingClientRect();
+    const approxLine = (ta.value.slice(0, ta.selectionStart).match(/\n/g) || []).length;
+    const lineHeight = 19;  // matches our 1.45 line-height at 13px
+    const top = Math.min(window.innerHeight - 300, rect.top + (approxLine - ta.scrollTop / lineHeight) * lineHeight + lineHeight);
+    popup.style.left = `${rect.left + 10}px`;
+    popup.style.top = `${top}px`;
+}
+
+function dbAcRenderItems(popup) {
+    let h = '';
+    _dbAcState.items.forEach((c, i) => {
+        const icon = c.kind === 'table' ? '📋' : c.kind === 'column' ? '·' : '🔑';
+        h += `<div onclick="dbAcAccept(${i})" onmouseover="dbAcState(${i})"
+            style="padding:5px 10px; cursor:pointer; background:${i === _dbAcState.active ? 'var(--bg-secondary)' : 'transparent'}; display:flex; gap:8px; align-items:center;">
+            <span style="color:var(--text-muted); width:14px;">${icon}</span>
+            <span>${escapeHtml(c.label)}</span>
+        </div>`;
+    });
+    popup.innerHTML = h;
+}
+
+function dbAcState(i) {
+    _dbAcState.active = i;
+    if (_dbAcState.popup) dbAcRenderItems(_dbAcState.popup);
+}
+
+function dbAcAccept(i) {
+    if (i == null) i = _dbAcState.active;
+    const item = _dbAcState.items[i];
+    if (!item) { dbAcClose(); return; }
+    const ta = document.getElementById('db-query');
+    if (!ta) return;
+    const before = ta.value.slice(0, _dbAcState.startPos);
+    const after = ta.value.slice(ta.selectionStart);
+    ta.value = before + item.insert + after;
+    const newPos = _dbAcState.startPos + item.insert.length;
+    ta.selectionStart = ta.selectionEnd = newPos;
+    if (_dbQueryTabs[_dbQueryActive]) _dbQueryTabs[_dbQueryActive].sql = ta.value;
+    dbAcClose();
+    dbHighlightSql();
+    dbScheduleValidate();
+}
+
+function dbAcClose() {
+    if (_dbAcState.popup) _dbAcState.popup.remove();
+    _dbAcState.popup = null;
+}
+
+// Close autocomplete popup if the user clicks outside of it or types
+// into the editor (the candidates would be stale — Ctrl+Space re-triggers).
+document.addEventListener('click', (e) => {
+    if (_dbAcState.popup && !_dbAcState.popup.contains(e.target) && e.target.id !== 'db-query') {
+        dbAcClose();
+    }
+});
+document.addEventListener('input', (e) => {
+    if (_dbAcState.popup && e.target && e.target.id === 'db-query') dbAcClose();
+});
+
+// Wire Ctrl+Space / arrow nav into the Query editor keydown handler.
+// We hook onto the document so we catch arrows even when focus is in
+// the textarea (arrow keys are otherwise consumed by the textarea).
+document.addEventListener('keydown', (e) => {
+    if (!_dbAcState.popup) {
+        // Trigger on Ctrl+Space (or Alt+Space) while editing the db-query textarea.
+        if ((e.ctrlKey || e.altKey) && e.code === 'Space') {
+            const target = e.target;
+            if (target && target.id === 'db-query') {
+                e.preventDefault();
+                dbAcTrigger();
+            }
+        }
+        return;
+    }
+    // Popup open — intercept nav keys.
+    if (e.key === 'Escape') { e.preventDefault(); dbAcClose(); return; }
+    if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        _dbAcState.active = Math.min(_dbAcState.items.length - 1, _dbAcState.active + 1);
+        dbAcRenderItems(_dbAcState.popup);
+        return;
+    }
+    if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        _dbAcState.active = Math.max(0, _dbAcState.active - 1);
+        dbAcRenderItems(_dbAcState.popup);
+        return;
+    }
+    if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault();
+        dbAcAccept();
+        return;
+    }
+});
 
 function dbMgrToggleSchema(schema) {
     if (_dbMgrExpanded.has(schema)) {
@@ -41699,31 +42905,561 @@ function dbMgrRefreshTab() {
     const body = document.getElementById('db-mgr-body');
     if (!body) return;
     if (_dbMgrTab === 'query') return dbMgrRenderQueryTab(body);
+    if (_dbMgrTab === 'diagram') return dbMgrRenderDiagramTab(body);
+    if (_dbMgrTab === 'server') return dbMgrRenderServerTab(body);
     if (!_dbMgrCurrentTable) {
-        body.innerHTML = '<div style="color:var(--text-muted); text-align:center; padding:60px 10px; font-size:13px;">Pick a table on the left to view its data or structure.</div>';
+        body.innerHTML = '<div style="color:var(--text-muted); text-align:center; padding:60px 10px; font-size:13px;">Pick a table on the left to view its data or structure, or use the Diagram tab to see the schema as an ERD.</div>';
         return;
     }
     if (_dbMgrTab === 'data') return dbMgrRenderDataTab(body);
     if (_dbMgrTab === 'structure') return dbMgrRenderStructureTab(body);
 }
 
+// Per-table view state: sort column, direction, page, page size, filter.
+let _dbDataState = {};  // key: "db.table" -> {sortCol, sortDir, page, pageSize, filter}
+let _dbDataLast = null; // last rendered result, used for export
+
+function dbDataKey() { return `${_dbMgrCurrentDb}.${_dbMgrCurrentTable}`; }
+function dbDataGetState() {
+    const k = dbDataKey();
+    if (!_dbDataState[k]) _dbDataState[k] = { sortCol: null, sortDir: 'asc', page: 0, pageSize: 100, filter: '' };
+    return _dbDataState[k];
+}
+
 async function dbMgrRenderDataTab(body) {
     const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
     if (!conn) return;
-    body.innerHTML = '<div style="color:var(--text-muted);">Loading rows…</div>';
-    try {
-        const fq = conn.kind === 'postgres'
-            ? `${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentDb)}.${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentTable)}`
-            : `${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentDb)}.${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentTable)}`;
-        const data = await dbMgrRunSql(`SELECT * FROM ${fq} LIMIT 200`);
-        document.getElementById('db-mgr-info').textContent = `${data.row_count} rows${data.truncated ? ' (truncated)' : ''} · ${data.elapsed_ms}ms`;
-        const wrap = document.createElement('div');
-        sqlConnRenderResult(wrap, data);
-        body.innerHTML = '';
-        body.appendChild(wrap);
-    } catch (e) {
-        body.innerHTML = `<div style="color:var(--danger); white-space:pre-wrap; font-family:monospace; padding:10px; background:var(--bg-primary); border-radius:6px;">${escapeHtml(e.message)}</div>`;
+    const st = dbDataGetState();
+    body.innerHTML = `
+        <div style="display:flex; gap:6px; align-items:center; margin-bottom:8px; flex-wrap:wrap;">
+            <input id="db-data-filter" type="text" class="form-control" placeholder="Filter (client-side, plain text match)…" value="${escapeHtml(st.filter || '')}" oninput="dbDataFilterChange(this.value)" style="max-width:240px; font-size:12px;">
+            <label style="font-size:12px;">Rows/page:
+                <select onchange="dbDataPageSizeChange(this.value)" class="form-control" style="display:inline-block; width:auto; font-size:12px; padding:3px 6px; margin-left:4px;">
+                    <option value="50"${st.pageSize===50?' selected':''}>50</option>
+                    <option value="100"${st.pageSize===100?' selected':''}>100</option>
+                    <option value="250"${st.pageSize===250?' selected':''}>250</option>
+                    <option value="500"${st.pageSize===500?' selected':''}>500</option>
+                </select>
+            </label>
+            <button class="btn btn-sm" onclick="dbDataPrev()">◀ Prev</button>
+            <span id="db-data-page-label" style="font-size:12px; color:var(--text-muted);">Page ${st.page + 1}</span>
+            <button class="btn btn-sm" onclick="dbDataNext()">Next ▶</button>
+            <button class="btn btn-sm" onclick="dbMgrRenderDataTab(document.getElementById('db-mgr-body'))">🔄 Reload</button>
+            <button class="btn btn-sm" onclick="dbDataInsertRow()" title="Insert a new row (prompts for each column)">➕ Row</button>
+            <button class="btn btn-sm" onclick="dbImportCsv()" title="Upload a CSV and INSERT its rows into this table">📥 Import CSV</button>
+            <div style="flex:1;"></div>
+            <div class="btn-group" style="position:relative;">
+                <button class="btn btn-sm" onclick="document.getElementById('db-data-export-menu').style.display=(document.getElementById('db-data-export-menu').style.display==='block'?'none':'block')">📤 Export ▾</button>
+                <div id="db-data-export-menu" style="display:none; position:absolute; right:0; top:100%; background:var(--bg-card); border:1px solid var(--border); border-radius:6px; z-index:10; min-width:160px; box-shadow:0 4px 12px rgba(0,0,0,0.2);">
+                    <div onclick="dbDataExport('csv')" style="padding:8px 12px; cursor:pointer; font-size:13px;">📄 CSV</div>
+                    <div onclick="dbDataExport('json')" style="padding:8px 12px; cursor:pointer; font-size:13px;">🧾 JSON</div>
+                    <div onclick="dbDataExport('sql')" style="padding:8px 12px; cursor:pointer; font-size:13px;">🗃️ SQL INSERTs</div>
+                </div>
+            </div>
+        </div>
+        <div id="db-data-grid-wrap" style="overflow:auto; border:1px solid var(--border); border-radius:6px;">Loading…</div>
+    `;
+    await dbDataReload();
+}
+
+async function dbDataReload() {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    const st = dbDataGetState();
+    const wrap = document.getElementById('db-data-grid-wrap');
+    if (!wrap) return;
+    wrap.textContent = 'Loading…';
+    const fq = `${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentDb)}.${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentTable)}`;
+    let sql = `SELECT * FROM ${fq}`;
+    if (st.sortCol) {
+        sql += ` ORDER BY ${dbMgrEscapeIdent(conn.kind, st.sortCol)} ${st.sortDir === 'desc' ? 'DESC' : 'ASC'}`;
     }
+    const offset = st.page * st.pageSize;
+    sql += ` LIMIT ${st.pageSize} OFFSET ${offset}`;
+    try {
+        const data = await dbMgrRunSql(sql);
+        _dbDataLast = data;
+        document.getElementById('db-mgr-info').textContent = `${data.row_count} rows (page ${st.page + 1})${data.truncated ? ' (truncated)' : ''} · ${data.elapsed_ms}ms`;
+        document.getElementById('db-data-page-label').textContent = `Page ${st.page + 1}`;
+        dbDataRenderGrid(wrap, data, st);
+    } catch (e) {
+        wrap.innerHTML = `<div style="color:var(--danger); padding:10px; font-family:monospace; white-space:pre-wrap; font-size:12px;">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function dbDataRenderGrid(wrap, data, st) {
+    if (!data.columns || !data.columns.length) {
+        wrap.innerHTML = '<div style="padding:16px; color:var(--text-muted); font-size:12px;">No rows.</div>';
+        return;
+    }
+    // Apply client-side filter (cheap text match across serialised cells).
+    let rows = data.rows;
+    if (st.filter) {
+        const needle = st.filter.toLowerCase();
+        rows = rows.filter(r => r.some(v => v != null && String(v).toLowerCase().includes(needle)));
+    }
+    let html = '<table style="width:100%; font-size:12px; border-collapse:collapse;"><thead><tr style="background:var(--bg-tertiary); position:sticky; top:0; z-index:1;">';
+    for (const col of data.columns) {
+        const isSorted = st.sortCol === col;
+        const arrow = isSorted ? (st.sortDir === 'desc' ? ' ▼' : ' ▲') : '';
+        html += `<th onclick="dbDataSortBy('${escapeHtml(col).replace(/'/g, "\\'")}')"
+            style="padding:6px 8px; text-align:left; border-bottom:1px solid var(--border); cursor:pointer; user-select:none; white-space:nowrap;">${escapeHtml(col)}${arrow}</th>`;
+    }
+    html += '<th style="padding:6px 8px; border-bottom:1px solid var(--border); white-space:nowrap;"></th></tr></thead><tbody>';
+    // Note: we iterate rows (filtered) but pass the ORIGINAL index to
+    // edit/delete so the PK lookup lines up with _dbDataLast.rows.
+    for (let ri = 0; ri < rows.length; ri++) {
+        const origIdx = data.rows.indexOf(rows[ri]);
+        html += '<tr>';
+        for (let ci = 0; ci < rows[ri].length; ci++) {
+            const v = rows[ri][ci];
+            const txt = v == null ? '<span style="color:var(--text-muted); font-style:italic;">NULL</span>' : escapeHtml(String(v));
+            html += `<td ondblclick="dbDataEditCell(${origIdx}, ${ci})"
+                style="padding:4px 8px; border-bottom:1px solid var(--border); max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:text;"
+                title="${v == null ? '' : escapeHtml(String(v))}&#10;(double-click to edit)">${txt}</td>`;
+        }
+        html += `<td style="padding:4px 8px; border-bottom:1px solid var(--border); white-space:nowrap; text-align:right;">
+            <button class="btn btn-sm" onclick="dbDataEditCell(${origIdx}, 0)" title="Edit first column" style="padding:1px 6px; font-size:10px;">✏️</button>
+            <button class="btn btn-sm" onclick="dbDataDeleteRow(${origIdx})" title="Delete row" style="padding:1px 6px; font-size:10px;">🗑️</button>
+        </td>`;
+        html += '</tr>';
+    }
+    html += '</tbody></table>';
+    if (st.filter && rows.length !== data.rows.length) {
+        html += `<div style="padding:6px 10px; font-size:11px; color:var(--text-muted);">Filter matched ${rows.length} of ${data.rows.length} rows on this page.</div>`;
+    }
+    wrap.innerHTML = html;
+}
+
+function dbDataSortBy(col) {
+    const st = dbDataGetState();
+    if (st.sortCol === col) {
+        st.sortDir = st.sortDir === 'asc' ? 'desc' : 'asc';
+    } else {
+        st.sortCol = col;
+        st.sortDir = 'asc';
+    }
+    st.page = 0;
+    dbDataReload();
+}
+function dbDataFilterChange(v) { dbDataGetState().filter = v; dbDataReload(); }
+function dbDataPageSizeChange(v) {
+    const st = dbDataGetState();
+    st.pageSize = parseInt(v, 10) || 100;
+    st.page = 0;
+    dbDataReload();
+}
+function dbDataPrev() { const st = dbDataGetState(); if (st.page > 0) { st.page--; dbDataReload(); } }
+function dbDataNext() { const st = dbDataGetState(); st.page++; dbDataReload(); }
+
+function dbDataExport(fmt) {
+    const menu = document.getElementById('db-data-export-menu');
+    if (menu) menu.style.display = 'none';
+    if (!_dbDataLast || !_dbDataLast.columns) { showToast('Nothing to export', 'warning'); return; }
+    const { columns, rows } = _dbDataLast;
+    const table = _dbMgrCurrentTable || 'export';
+    let text = '', mime = 'text/plain', ext = 'txt';
+    if (fmt === 'csv') {
+        const esc = s => (s == null ? '' : (String(s).includes(',') || String(s).includes('"') || String(s).includes('\n')) ? `"${String(s).replace(/"/g, '""')}"` : String(s));
+        text = columns.map(esc).join(',') + '\n' + rows.map(r => r.map(esc).join(',')).join('\n');
+        mime = 'text/csv'; ext = 'csv';
+    } else if (fmt === 'json') {
+        text = JSON.stringify(rows.map(r => Object.fromEntries(columns.map((c, i) => [c, r[i]]))), null, 2);
+        mime = 'application/json'; ext = 'json';
+    } else if (fmt === 'sql') {
+        const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+        const fq = `${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentDb)}.${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentTable)}`;
+        const colList = columns.map(c => dbMgrEscapeIdent(conn.kind, c)).join(', ');
+        const lines = rows.map(r => {
+            const vals = r.map(v => v == null ? 'NULL' : (typeof v === 'number' ? String(v) : `'${String(v).replace(/'/g, "''")}'`));
+            return `INSERT INTO ${fq} (${colList}) VALUES (${vals.join(', ')});`;
+        });
+        text = lines.join('\n');
+        mime = 'text/sql'; ext = 'sql';
+    }
+    const blob = new Blob([text], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `${table}.${ext}`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showToast(`Exported ${rows.length} rows as ${fmt.toUpperCase()}`, 'success');
+}
+
+// ═══════════════════════════════════════════════════
+// ─── ER Diagram tab ───
+// ═══════════════════════════════════════════════════
+
+// Diagram state: persistent per-schema positions so user's drag layout
+// survives tab switches. Key: `${db}:${table}` -> {x, y}.
+let _dbDiagState = { schema: null, positions: {}, zoom: 1, panX: 0, panY: 0 };
+
+async function dbMgrRenderDiagramTab(body) {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    const schema = _dbMgrCurrentDb || (_dbMgrExpanded.size ? [..._dbMgrExpanded][0] : null);
+    if (!schema) {
+        body.innerHTML = '<div style="color:var(--text-muted); text-align:center; padding:60px 20px;">Pick a schema from the left tree first.</div>';
+        return;
+    }
+    if (_dbDiagState.schema !== schema) {
+        _dbDiagState = { schema, positions: {}, zoom: 1, panX: 0, panY: 0 };
+    }
+    body.innerHTML = `
+        <div style="display:flex; gap:6px; align-items:center; margin-bottom:6px; flex-wrap:wrap;">
+            <span style="font-size:13px;"><strong>Schema:</strong> ${escapeHtml(schema)}</span>
+            <button class="btn btn-sm" onclick="dbDiagAutoLayout()">🗂️ Auto-layout</button>
+            <button class="btn btn-sm" onclick="dbDiagZoom(1.2)">🔍+</button>
+            <button class="btn btn-sm" onclick="dbDiagZoom(1/1.2)">🔍−</button>
+            <button class="btn btn-sm" onclick="dbDiagReset()">Reset view</button>
+            <button class="btn btn-sm" onclick="dbDiagExportSvg()">💾 Save SVG</button>
+            <div style="flex:1;"></div>
+            <span id="db-diag-stat" style="font-size:11px; color:var(--text-muted);"></span>
+        </div>
+        <div id="db-diag-canvas" style="position:relative; border:1px solid var(--border); border-radius:6px; overflow:hidden; background:var(--bg-primary); height:calc(100vh - 340px); min-height:400px; cursor:grab;">
+            <svg id="db-diag-svg" style="width:100%; height:100%; display:block;"></svg>
+            <div id="db-diag-loading" style="position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:var(--text-muted); font-size:13px; background:var(--bg-primary);">Loading schema…</div>
+        </div>
+    `;
+    document.getElementById('db-mgr-info').textContent = '';
+    try {
+        await dbDiagLoad(conn, schema);
+    } catch (e) {
+        document.getElementById('db-diag-loading').innerHTML = `<div style="color:var(--danger);">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+let _dbDiagTables = [];  // [{name, columns:[{name, type, is_pk}]}]
+let _dbDiagFks = [];     // [{from_table, from_col, to_table, to_col}]
+
+async function dbDiagLoad(conn, schema) {
+    // List tables in this schema.
+    let tables;
+    if (conn.kind === 'postgres') {
+        const r = await dbMgrRunSql(
+            `SELECT table_name FROM information_schema.tables WHERE table_schema = '${schema.replace(/'/g, "''")}' AND table_type = 'BASE TABLE' ORDER BY table_name`
+        );
+        tables = r.rows.map(x => x[0]);
+    } else {
+        const r = await dbMgrRunSql(`SHOW FULL TABLES FROM ${dbMgrEscapeIdent(conn.kind, schema)} WHERE Table_type = 'BASE TABLE'`);
+        tables = r.rows.map(x => x[0]);
+    }
+    // Fetch columns for each table (parallel for speed).
+    const tableDefs = await Promise.all(tables.map(async (t) => {
+        try {
+            let cols;
+            if (conn.kind === 'postgres') {
+                const r = await dbMgrRunSql(
+                    `SELECT c.column_name, c.data_type,
+                            EXISTS (SELECT 1 FROM information_schema.table_constraints tc
+                                    JOIN information_schema.key_column_usage kcu
+                                        ON kcu.constraint_name = tc.constraint_name
+                                    WHERE tc.constraint_type = 'PRIMARY KEY'
+                                      AND tc.table_schema = c.table_schema
+                                      AND tc.table_name = c.table_name
+                                      AND kcu.column_name = c.column_name) AS is_pk
+                     FROM information_schema.columns c
+                     WHERE c.table_schema = '${schema.replace(/'/g, "''")}'
+                       AND c.table_name = '${t.replace(/'/g, "''")}'
+                     ORDER BY c.ordinal_position`
+                );
+                cols = r.rows.map(row => ({ name: row[0], type: row[1], is_pk: row[2] === true || row[2] === 't' || row[2] === 1 }));
+            } else {
+                const r = await dbMgrRunSql(`DESCRIBE ${dbMgrEscapeIdent(conn.kind, schema)}.${dbMgrEscapeIdent(conn.kind, t)}`);
+                // DESCRIBE columns: Field, Type, Null, Key, Default, Extra
+                cols = r.rows.map(row => ({ name: String(row[0]), type: String(row[1]), is_pk: String(row[3]) === 'PRI' }));
+            }
+            return { name: t, columns: cols };
+        } catch (e) {
+            return { name: t, columns: [], error: e.message };
+        }
+    }));
+    _dbDiagTables = tableDefs;
+    // Fetch FKs across the schema.
+    let fks = [];
+    try {
+        if (conn.kind === 'postgres') {
+            const r = await dbMgrRunSql(
+                `SELECT tc.table_name, kcu.column_name, ccu.table_name, ccu.column_name
+                 FROM information_schema.table_constraints tc
+                 JOIN information_schema.key_column_usage kcu
+                     ON kcu.constraint_name = tc.constraint_name
+                     AND kcu.table_schema = tc.table_schema
+                 JOIN information_schema.constraint_column_usage ccu
+                     ON ccu.constraint_name = tc.constraint_name
+                 WHERE tc.constraint_type = 'FOREIGN KEY'
+                   AND tc.table_schema = '${schema.replace(/'/g, "''")}'`
+            );
+            fks = r.rows.map(row => ({ from_table: row[0], from_col: row[1], to_table: row[2], to_col: row[3] }));
+        } else {
+            const r = await dbMgrRunSql(
+                `SELECT table_name, column_name, referenced_table_name, referenced_column_name
+                 FROM information_schema.key_column_usage
+                 WHERE table_schema = '${schema.replace(/'/g, "''")}'
+                   AND referenced_table_name IS NOT NULL`
+            );
+            fks = r.rows.map(row => ({ from_table: String(row[0]), from_col: String(row[1]), to_table: String(row[2]), to_col: String(row[3]) }));
+        }
+    } catch (e) { /* some engines lock down info schema — diagram still useful without FKs */ }
+    _dbDiagFks = fks;
+    document.getElementById('db-diag-loading').style.display = 'none';
+    document.getElementById('db-diag-stat').textContent = `${_dbDiagTables.length} tables · ${_dbDiagFks.length} relationships`;
+    if (!Object.keys(_dbDiagState.positions).length) dbDiagAutoLayout();
+    else dbDiagRender();
+    dbDiagAttachPanZoom();
+}
+
+function dbDiagAutoLayout() {
+    // Grid layout: sqrt(n) cols, 320px wide, 260px tall cells.
+    const n = _dbDiagTables.length;
+    const cols = Math.max(1, Math.ceil(Math.sqrt(n)));
+    const boxW = 260, boxH = 180, gapX = 60, gapY = 60;
+    _dbDiagTables.forEach((t, i) => {
+        const col = i % cols, row = Math.floor(i / cols);
+        _dbDiagState.positions[t.name] = { x: 40 + col * (boxW + gapX), y: 40 + row * (boxH + gapY) };
+    });
+    _dbDiagState.zoom = 1;
+    _dbDiagState.panX = 0;
+    _dbDiagState.panY = 0;
+    dbDiagRender();
+}
+
+function dbDiagReset() {
+    _dbDiagState.zoom = 1; _dbDiagState.panX = 0; _dbDiagState.panY = 0;
+    dbDiagRender();
+}
+
+function dbDiagZoom(factor) {
+    _dbDiagState.zoom = Math.max(0.2, Math.min(3, _dbDiagState.zoom * factor));
+    dbDiagRender();
+}
+
+function dbDiagRender() {
+    const svg = document.getElementById('db-diag-svg');
+    if (!svg) return;
+    const boxW = 260;
+    const rowH = 20;
+    const headerH = 30;
+    // Compute viewBox spanning all table positions.
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const t of _dbDiagTables) {
+        const p = _dbDiagState.positions[t.name] || { x: 0, y: 0 };
+        const h = headerH + rowH * Math.min(t.columns.length, 20);
+        if (p.x < minX) minX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.x + boxW > maxX) maxX = p.x + boxW;
+        if (p.y + h > maxY) maxY = p.y + h;
+    }
+    if (!isFinite(minX)) { minX = 0; minY = 0; maxX = 800; maxY = 600; }
+    const pad = 80;
+    const vbW = (maxX - minX + pad * 2) / _dbDiagState.zoom;
+    const vbH = (maxY - minY + pad * 2) / _dbDiagState.zoom;
+    const vbX = minX - pad + _dbDiagState.panX;
+    const vbY = minY - pad + _dbDiagState.panY;
+    let svgContent = '';
+    // FK arrows (draw first so they go behind boxes).
+    for (const fk of _dbDiagFks) {
+        const from = _dbDiagState.positions[fk.from_table];
+        const to   = _dbDiagState.positions[fk.to_table];
+        if (!from || !to) continue;
+        const fromT = _dbDiagTables.find(t => t.name === fk.from_table);
+        const toT   = _dbDiagTables.find(t => t.name === fk.to_table);
+        const fromIdx = fromT ? fromT.columns.findIndex(c => c.name === fk.from_col) : -1;
+        const toIdx   = toT   ? toT.columns.findIndex(c => c.name === fk.to_col)   : -1;
+        const fy = from.y + headerH + (fromIdx >= 0 ? fromIdx * rowH + rowH / 2 : headerH / 2);
+        const ty = to.y   + headerH + (toIdx   >= 0 ? toIdx   * rowH + rowH / 2 : headerH / 2);
+        const fromRight = from.x + boxW < to.x;
+        const fx = fromRight ? from.x + boxW : from.x;
+        const tx = fromRight ? to.x : to.x + boxW;
+        const dx = (tx - fx) * 0.5;
+        const d = `M ${fx} ${fy} C ${fx + dx} ${fy}, ${tx - dx} ${ty}, ${tx} ${ty}`;
+        svgContent += `<path d="${d}" fill="none" stroke="#a855f7" stroke-width="1.5" marker-end="url(#db-diag-arrow)" opacity="0.75"/>`;
+    }
+    // Tables
+    for (const t of _dbDiagTables) {
+        const p = _dbDiagState.positions[t.name] || { x: 0, y: 0 };
+        const n = Math.min(t.columns.length, 20);
+        const h = headerH + rowH * n;
+        const active = (_dbMgrCurrentTable === t.name && _dbMgrCurrentDb === _dbDiagState.schema);
+        const stroke = active ? '#a855f7' : '#444';
+        svgContent += `<g class="db-diag-box" data-table="${escapeHtml(t.name)}" style="cursor:move;" transform="translate(${p.x},${p.y})">`;
+        svgContent += `<rect width="${boxW}" height="${h}" rx="6" fill="#1a1a24" stroke="${stroke}" stroke-width="${active ? 2 : 1}"/>`;
+        svgContent += `<rect width="${boxW}" height="${headerH}" rx="6" fill="#2a2538" stroke="none"/>`;
+        svgContent += `<text x="10" y="20" fill="#e4e4e7" font-size="13" font-weight="600" font-family="ui-monospace, monospace">📋 ${escapeHtml(t.name)}</text>`;
+        for (let i = 0; i < n; i++) {
+            const c = t.columns[i];
+            const y = headerH + i * rowH + 14;
+            const pk = c.is_pk ? '🔑 ' : '';
+            const line = `${pk}${c.name} : ${c.type}`;
+            svgContent += `<text x="10" y="${y}" fill="#a1a1aa" font-size="11" font-family="ui-monospace, monospace">${escapeHtml(line.length > 38 ? line.slice(0, 38) + '…' : line)}</text>`;
+        }
+        if (t.columns.length > 20) {
+            svgContent += `<text x="10" y="${headerH + 20 * rowH + 14}" fill="#71717a" font-size="10" font-family="ui-monospace, monospace">…${t.columns.length - 20} more columns</text>`;
+        }
+        svgContent += `</g>`;
+    }
+    svg.setAttribute('viewBox', `${vbX} ${vbY} ${vbW} ${vbH}`);
+    svg.innerHTML = `
+        <defs>
+            <marker id="db-diag-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+                <path d="M0,0 L10,5 L0,10 z" fill="#a855f7"/>
+            </marker>
+        </defs>
+        ${svgContent}
+    `;
+    // Wire up drag on boxes + click-to-select.
+    svg.querySelectorAll('.db-diag-box').forEach(g => {
+        const name = g.dataset.table;
+        g.addEventListener('mousedown', (e) => dbDiagBoxDrag(e, name, g));
+        g.addEventListener('dblclick', () => {
+            _dbMgrCurrentDb = _dbDiagState.schema;
+            _dbMgrCurrentTable = name;
+            _dbMgrExpanded.add(_dbDiagState.schema);
+            dbMgrLoadTree();
+            dbMgrSwitchTab('structure');
+        });
+    });
+}
+
+function dbDiagBoxDrag(e, name, g) {
+    e.stopPropagation();
+    const svg = document.getElementById('db-diag-svg');
+    if (!svg) return;
+    const startPos = { ..._dbDiagState.positions[name] };
+    const pt = svg.createSVGPoint();
+    const startSvgPt = svgCoordsFromEvent(svg, e);
+    const onMove = (ev) => {
+        const cur = svgCoordsFromEvent(svg, ev);
+        _dbDiagState.positions[name] = {
+            x: startPos.x + (cur.x - startSvgPt.x),
+            y: startPos.y + (cur.y - startSvgPt.y),
+        };
+        dbDiagRender();
+    };
+    const onUp = () => {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+}
+
+function svgCoordsFromEvent(svg, e) {
+    const pt = svg.createSVGPoint();
+    pt.x = e.clientX; pt.y = e.clientY;
+    const m = svg.getScreenCTM();
+    return m ? pt.matrixTransform(m.inverse()) : { x: e.clientX, y: e.clientY };
+}
+
+function dbDiagAttachPanZoom() {
+    const canvas = document.getElementById('db-diag-canvas');
+    const svg = document.getElementById('db-diag-svg');
+    if (!canvas || !svg) return;
+    // Pan on canvas drag (outside table boxes).
+    canvas.addEventListener('mousedown', (e) => {
+        if (e.target.closest('.db-diag-box')) return;
+        canvas.style.cursor = 'grabbing';
+        const startX = e.clientX, startY = e.clientY;
+        const origPanX = _dbDiagState.panX, origPanY = _dbDiagState.panY;
+        const viewBox = svg.viewBox.baseVal;
+        const scaleX = viewBox.width / svg.clientWidth;
+        const scaleY = viewBox.height / svg.clientHeight;
+        const onMove = (ev) => {
+            _dbDiagState.panX = origPanX - (ev.clientX - startX) * scaleX;
+            _dbDiagState.panY = origPanY - (ev.clientY - startY) * scaleY;
+            dbDiagRender();
+        };
+        const onUp = () => {
+            canvas.style.cursor = 'grab';
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup', onUp);
+        };
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+    });
+    // Wheel to zoom.
+    canvas.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+        dbDiagZoom(factor);
+    }, { passive: false });
+}
+
+function dbDiagExportSvg() {
+    const svg = document.getElementById('db-diag-svg');
+    if (!svg) return;
+    const clone = svg.cloneNode(true);
+    clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+    const blob = new Blob([clone.outerHTML], { type: 'image/svg+xml' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `${_dbDiagState.schema || 'schema'}-erd.svg`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showToast('Diagram saved', 'success');
+}
+
+// ═══════════════════════════════════════════════════
+// ─── Server info tab ───
+// ═══════════════════════════════════════════════════
+
+async function dbMgrRenderServerTab(body) {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    body.innerHTML = `
+        <div style="display:grid; gap:14px;">
+            <div id="db-srv-version">Loading version…</div>
+            <div id="db-srv-vars">Loading variables…</div>
+            <div id="db-srv-procs">Loading processes…</div>
+        </div>
+    `;
+    // Version + status
+    try {
+        const v = conn.kind === 'postgres'
+            ? await dbMgrRunSql('SELECT version() AS version, current_database() AS db, current_user AS "user", inet_server_addr()::text AS host, inet_server_port() AS port')
+            : await dbMgrRunSql("SELECT VERSION() AS version, DATABASE() AS db, USER() AS user, @@hostname AS host, @@port AS port");
+        const el = document.getElementById('db-srv-version');
+        if (el) el.innerHTML = '<h4 style="margin:0 0 6px; font-size:13px;">Server</h4>' + renderKvTable(v);
+    } catch (e) { document.getElementById('db-srv-version').innerHTML = `<div style="color:var(--danger);">Version: ${escapeHtml(e.message)}</div>`; }
+    // Variables
+    try {
+        const vars = conn.kind === 'postgres'
+            ? await dbMgrRunSql("SELECT name, setting, unit FROM pg_settings WHERE name IN ('max_connections','shared_buffers','work_mem','effective_cache_size','max_wal_size','checkpoint_timeout','autovacuum','listen_addresses','server_version','server_encoding','timezone','log_statement','log_duration') ORDER BY name")
+            : await dbMgrRunSql("SHOW VARIABLES WHERE Variable_name IN ('version','version_comment','max_connections','innodb_buffer_pool_size','character_set_server','collation_server','sql_mode','time_zone','datadir','socket','tmpdir','wait_timeout','max_allowed_packet')");
+        const el = document.getElementById('db-srv-vars');
+        if (el) el.innerHTML = '<h4 style="margin:0 0 6px; font-size:13px;">Key variables</h4>' + renderResultTable(vars);
+    } catch (e) { document.getElementById('db-srv-vars').innerHTML = `<div style="color:var(--danger);">Variables: ${escapeHtml(e.message)}</div>`; }
+    // Process list
+    try {
+        const procs = conn.kind === 'postgres'
+            ? await dbMgrRunSql("SELECT pid, datname, usename, application_name, client_addr, state, query_start, LEFT(query, 80) AS query FROM pg_stat_activity ORDER BY query_start DESC NULLS LAST LIMIT 50")
+            : await dbMgrRunSql("SHOW FULL PROCESSLIST");
+        const el = document.getElementById('db-srv-procs');
+        if (el) el.innerHTML = '<h4 style="margin:0 0 6px; font-size:13px;">Active sessions</h4>' + renderResultTable(procs);
+    } catch (e) { document.getElementById('db-srv-procs').innerHTML = `<div style="color:var(--danger);">Processes: ${escapeHtml(e.message)}</div>`; }
+}
+
+function renderResultTable(r) {
+    if (!r || !r.columns || !r.rows.length) return '<div style="color:var(--text-muted); font-size:12px;">(no rows)</div>';
+    let html = '<div style="overflow:auto; border:1px solid var(--border); border-radius:6px;"><table style="width:100%; font-size:12px; border-collapse:collapse;"><thead><tr style="background:var(--bg-tertiary);">';
+    for (const c of r.columns) html += `<th style="padding:6px 8px; text-align:left; border-bottom:1px solid var(--border); white-space:nowrap;">${escapeHtml(c)}</th>`;
+    html += '</tr></thead><tbody>';
+    for (const row of r.rows) {
+        html += '<tr>';
+        for (const v of row) html += `<td style="padding:5px 8px; border-bottom:1px solid var(--border); max-width:360px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${v == null ? '' : escapeHtml(String(v))}">${v == null ? '<span style="color:var(--text-muted);">NULL</span>' : escapeHtml(String(v))}</td>`;
+        html += '</tr>';
+    }
+    return html + '</tbody></table></div>';
+}
+
+function renderKvTable(r) {
+    if (!r || !r.rows.length) return '<div style="color:var(--text-muted);">no data</div>';
+    const row = r.rows[0];
+    let html = '<div style="display:grid; grid-template-columns:auto 1fr; gap:4px 12px; font-size:12px;">';
+    for (let i = 0; i < r.columns.length; i++) {
+        html += `<div style="color:var(--text-muted);">${escapeHtml(r.columns[i])}</div><div style="font-family:monospace; overflow:hidden; text-overflow:ellipsis;">${row[i] == null ? '—' : escapeHtml(String(row[i]))}</div>`;
+    }
+    return html + '</div>';
 }
 
 async function dbMgrRenderStructureTab(body) {
@@ -42010,6 +43746,19 @@ async function dbStructDropFk(fkName) {
     if (await dbStructExec(sql, `Drop FK ${fkName}`)) { dbStructLoadFks(); }
 }
 
+function dbToggleFullscreen() {
+    // Use the Fullscreen API on the whole Databases page — hides the
+    // main sidebar/topnav and gives operators the full browser
+    // viewport for the Manager. The browser handles the Esc exit.
+    const page = document.getElementById('page-databases');
+    if (!page) return;
+    if (!document.fullscreenElement) {
+        page.requestFullscreen?.().catch(e => showToast('Fullscreen not available: ' + e.message, 'error'));
+    } else {
+        document.exitFullscreen?.();
+    }
+}
+
 function dbCloseConnection() {
     _dbCurrentId = null;
     _dbLastResult = null;
@@ -42060,12 +43809,82 @@ async function dbLoadHistory() {
     return _dbHistoryCache;
 }
 
+// ─── Multi-tab query editor (per-connection) ───
+// Each tab carries: {id, title, sql, dirty}. Active tab's SQL is
+// always mirrored into the #db-query textarea; switching tabs
+// swaps the buffer. Tabs live in memory for the session; survive
+// Data/Structure/Diagram navigation but not page reload.
+let _dbQueryTabs = [];
+let _dbQueryActive = 0;
+
+function dbQueryEnsureTabs() {
+    if (!_dbQueryTabs.length) {
+        _dbQueryTabs.push({ id: 'q1', title: 'Query 1', sql: '', dirty: false });
+        _dbQueryActive = 0;
+    }
+}
+
+function dbQueryNewTab() {
+    const n = _dbQueryTabs.length + 1;
+    _dbQueryTabs.push({ id: `q${n}${Date.now()}`, title: `Query ${n}`, sql: '', dirty: false });
+    _dbQueryActive = _dbQueryTabs.length - 1;
+    dbMgrRenderQueryTab(document.getElementById('db-mgr-body'));
+}
+
+function dbQuerySwitchTab(idx) {
+    // Save current textarea into the active tab first so edits don't vanish.
+    const ta = document.getElementById('db-query');
+    if (ta && _dbQueryTabs[_dbQueryActive]) _dbQueryTabs[_dbQueryActive].sql = ta.value;
+    _dbQueryActive = idx;
+    dbMgrRenderQueryTab(document.getElementById('db-mgr-body'));
+}
+
+function dbQueryCloseTab(idx, ev) {
+    if (ev) ev.stopPropagation();
+    if (_dbQueryTabs.length === 1) {
+        // Don't let the last tab close — clear its buffer instead.
+        _dbQueryTabs[0].sql = '';
+        _dbQueryTabs[0].title = 'Query 1';
+        dbMgrRenderQueryTab(document.getElementById('db-mgr-body'));
+        return;
+    }
+    _dbQueryTabs.splice(idx, 1);
+    if (_dbQueryActive >= _dbQueryTabs.length) _dbQueryActive = _dbQueryTabs.length - 1;
+    dbMgrRenderQueryTab(document.getElementById('db-mgr-body'));
+}
+
+function dbQueryRenameTab(idx) {
+    const cur = _dbQueryTabs[idx];
+    const name = prompt('Tab name:', cur.title);
+    if (!name) return;
+    cur.title = name;
+    dbMgrRenderQueryTab(document.getElementById('db-mgr-body'));
+}
+
 function dbMgrRenderQueryTab(body) {
+    dbQueryEnsureTabs();
     const hint = _dbMgrCurrentTable
         ? `SELECT * FROM ${_dbMgrCurrentTable} LIMIT 100;`
         : 'SELECT 1;';
+    const active = _dbQueryTabs[_dbQueryActive];
+    // Tab strip
+    let tabsHtml = '';
+    for (let i = 0; i < _dbQueryTabs.length; i++) {
+        const t = _dbQueryTabs[i];
+        const isActive = i === _dbQueryActive;
+        tabsHtml += `<div onclick="dbQuerySwitchTab(${i})" ondblclick="dbQueryRenameTab(${i})"
+            style="padding:5px 10px; cursor:pointer; display:flex; align-items:center; gap:6px; border-right:1px solid var(--border); background:${isActive ? 'var(--bg-card)' : 'transparent'}; font-size:12px; ${isActive ? 'border-bottom:2px solid var(--accent, #a855f7);' : ''}">
+            <span>${escapeHtml(t.title)}</span>
+            <span onclick="dbQueryCloseTab(${i}, event)" style="color:var(--text-muted); font-size:11px; padding:0 2px;">✕</span>
+        </div>`;
+    }
+    tabsHtml += `<div onclick="dbQueryNewTab()" style="padding:5px 12px; cursor:pointer; font-size:12px; color:var(--accent, #a855f7);" title="New query tab">+</div>`;
+
     body.innerHTML = `
-        <div style="display:flex; gap:8px; align-items:center; margin-bottom:6px; flex-wrap:wrap;">
+        <div style="display:flex; border:1px solid var(--border); border-radius:6px 6px 0 0; overflow:auto; background:var(--bg-secondary); margin-bottom:0;">
+            ${tabsHtml}
+        </div>
+        <div style="display:flex; gap:8px; align-items:center; margin-bottom:6px; flex-wrap:wrap; padding:8px; border:1px solid var(--border); border-top:none; background:var(--bg-card);">
             <label style="font-size:13px; margin:0;">Permission:
                 <select id="db-perm" class="form-control" style="display:inline-block; width:auto; margin-left:6px;">
                     <option value="read">Read (SELECT / SHOW / EXPLAIN)</option>
@@ -42079,9 +43898,13 @@ function dbMgrRenderQueryTab(body) {
             </label>
             <span id="db-validate" style="font-size:12px; padding:3px 8px; border-radius:5px; background:var(--bg-tertiary); color:var(--text-muted); margin-left:auto;">type to validate…</span>
         </div>
-        <textarea id="db-query" class="form-control" placeholder="${escapeHtml(hint)}"
-            style="font-family:var(--font-mono, ui-monospace, monospace); font-size:13px; min-height:240px; line-height:1.45; tab-size:4;"
-            spellcheck="false"></textarea>
+        <div id="db-editor-wrap" style="position:relative;">
+            <pre id="db-query-hl" aria-hidden="true"
+                style="position:absolute; inset:0; margin:0; padding:8px 10px; font-family:var(--font-mono, ui-monospace, monospace); font-size:13px; line-height:1.45; tab-size:4; white-space:pre-wrap; word-wrap:break-word; pointer-events:none; color:var(--text); overflow:hidden; background:var(--bg-primary); border:1px solid var(--border); border-radius:4px;"></pre>
+            <textarea id="db-query" class="form-control" placeholder="${escapeHtml(hint)}"
+                style="position:relative; font-family:var(--font-mono, ui-monospace, monospace); font-size:13px; min-height:260px; line-height:1.45; tab-size:4; background:transparent; caret-color:var(--text); color:transparent;"
+                spellcheck="false">${escapeHtml(active.sql || '')}</textarea>
+        </div>
         <div style="display:flex; gap:6px; margin-top:8px; align-items:center; flex-wrap:wrap;">
             <button class="btn btn-primary btn-sm" onclick="dbRunQuery()">▶ Run</button>
             <button class="btn btn-sm" onclick="dbExplainQuery()" title="Prepend EXPLAIN and run">🔍 Explain</button>
@@ -42093,11 +43916,12 @@ function dbMgrRenderQueryTab(body) {
             <select id="db-hist-select" onchange="dbLoadHistSelected()" class="form-control" style="display:inline-block; width:auto; font-size:12px; padding:4px 8px;">
                 <option value="">— Recent —</option>
             </select>
+            <button class="btn btn-sm" onclick="dbUploadSqlFile()" title="Upload a .sql file and run every statement">📂 Run SQL file…</button>
             <div style="flex:1;"></div>
             <button class="btn btn-sm" id="db-copy-csv" onclick="dbCopyCsv()" disabled>📋 CSV</button>
             <button class="btn btn-sm" id="db-copy-md" onclick="dbCopyMarkdown()" disabled>📋 Markdown</button>
         </div>
-        <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">Ctrl/Cmd + Enter runs. Validate is live — the classifier runs server-side as you type.</div>
+        <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">Ctrl/Cmd + Enter runs. Tab indents. Double-click a tab name to rename.</div>
         <div id="db-result" style="margin-top:14px;"></div>
     `;
     dbRefreshSavedDropdown();
@@ -42109,18 +43933,114 @@ function dbMgrRenderQueryTab(body) {
                 e.preventDefault();
                 dbRunQuery();
             }
-            // Tab should insert a tab instead of leaving the textarea.
             if (e.key === 'Tab') {
                 e.preventDefault();
                 const s = ta.selectionStart, e2 = ta.selectionEnd;
                 ta.value = ta.value.slice(0, s) + '    ' + ta.value.slice(e2);
                 ta.selectionStart = ta.selectionEnd = s + 4;
                 dbScheduleValidate();
+                dbHighlightSql();
             }
         });
-        ta.addEventListener('input', dbScheduleValidate);
+        ta.addEventListener('input', () => {
+            // Mirror into the active tab so switching preserves it.
+            if (_dbQueryTabs[_dbQueryActive]) _dbQueryTabs[_dbQueryActive].sql = ta.value;
+            dbScheduleValidate();
+            dbHighlightSql();
+        });
+        ta.addEventListener('scroll', () => {
+            const hl = document.getElementById('db-query-hl');
+            if (hl) { hl.scrollTop = ta.scrollTop; hl.scrollLeft = ta.scrollLeft; }
+        });
     }
+    dbHighlightSql();
     dbScheduleValidate();
+}
+
+// ─── Lightweight SQL syntax highlighter (regex tokeniser overlay) ───
+// We paint coloured spans in a <pre> element positioned behind a
+// transparent-background <textarea>. The two share font metrics so
+// the cursor and coloured text line up. It's not as nice as Monaco,
+// but it's 50 lines of JS and requires zero external deps.
+const SQL_KEYWORDS = new Set([
+    'SELECT','FROM','WHERE','AND','OR','NOT','IN','IS','NULL','LIKE','BETWEEN',
+    'GROUP','BY','ORDER','ASC','DESC','HAVING','LIMIT','OFFSET','DISTINCT','AS',
+    'JOIN','LEFT','RIGHT','INNER','OUTER','FULL','CROSS','ON','USING','WITH',
+    'UNION','ALL','INTERSECT','EXCEPT','CASE','WHEN','THEN','ELSE','END',
+    'INSERT','INTO','VALUES','UPDATE','SET','DELETE','TRUNCATE','MERGE',
+    'CREATE','ALTER','DROP','RENAME','TABLE','INDEX','VIEW','TRIGGER','FUNCTION','PROCEDURE',
+    'DATABASE','SCHEMA','COLUMN','CONSTRAINT','PRIMARY','KEY','FOREIGN','REFERENCES',
+    'UNIQUE','CHECK','DEFAULT','AUTO_INCREMENT','IF','EXISTS','CASCADE','RESTRICT',
+    'SHOW','DESCRIBE','DESC','EXPLAIN','ANALYZE','USE','BEGIN','COMMIT','ROLLBACK','TRANSACTION',
+    'VARCHAR','CHAR','TEXT','INT','INTEGER','BIGINT','SMALLINT','TINYINT','DECIMAL','NUMERIC',
+    'FLOAT','DOUBLE','BOOLEAN','BOOL','DATE','DATETIME','TIMESTAMP','TIME','BLOB','JSON','UUID','SERIAL',
+    'COUNT','SUM','AVG','MIN','MAX','NOW','CURRENT_TIMESTAMP','CURRENT_DATE','CONCAT','COALESCE','IFNULL',
+]);
+function dbHighlightSql() {
+    const ta = document.getElementById('db-query');
+    const hl = document.getElementById('db-query-hl');
+    if (!ta || !hl) return;
+    const src = ta.value;
+    // Tokenise: strings, line comments, block comments, numbers, keywords, idents.
+    // Replacement keeps characters 1:1 so metrics stay aligned.
+    let html = '';
+    let i = 0;
+    while (i < src.length) {
+        const c = src[i];
+        // Line comment
+        if (c === '-' && src[i + 1] === '-') {
+            const end = src.indexOf('\n', i);
+            const j = end === -1 ? src.length : end;
+            html += `<span style="color:#71717a;">${escapeHtml(src.slice(i, j))}</span>`;
+            i = j; continue;
+        }
+        // Block comment
+        if (c === '/' && src[i + 1] === '*') {
+            const end = src.indexOf('*/', i + 2);
+            const j = end === -1 ? src.length : end + 2;
+            html += `<span style="color:#71717a;">${escapeHtml(src.slice(i, j))}</span>`;
+            i = j; continue;
+        }
+        // String literal (single or double quote)
+        if (c === "'" || c === '"' || c === '`') {
+            let j = i + 1;
+            while (j < src.length) {
+                if (src[j] === '\\') { j += 2; continue; }
+                if (src[j] === c) { j++; break; }
+                j++;
+            }
+            html += `<span style="color:#f59e0b;">${escapeHtml(src.slice(i, j))}</span>`;
+            i = j; continue;
+        }
+        // Number
+        if (/\d/.test(c)) {
+            let j = i;
+            while (j < src.length && /[\d.]/.test(src[j])) j++;
+            html += `<span style="color:#22d3ee;">${escapeHtml(src.slice(i, j))}</span>`;
+            i = j; continue;
+        }
+        // Identifier / keyword
+        if (/[A-Za-z_]/.test(c)) {
+            let j = i;
+            while (j < src.length && /[A-Za-z0-9_]/.test(src[j])) j++;
+            const word = src.slice(i, j);
+            if (SQL_KEYWORDS.has(word.toUpperCase())) {
+                html += `<span style="color:#a855f7; font-weight:600;">${escapeHtml(word)}</span>`;
+            } else {
+                html += escapeHtml(word);
+            }
+            i = j; continue;
+        }
+        // Operators + punctuation
+        if ('=<>!+-*/%(),;.'.includes(c)) {
+            html += `<span style="color:#f472b6;">${escapeHtml(c)}</span>`;
+            i++; continue;
+        }
+        html += escapeHtml(c);
+        i++;
+    }
+    // Trailing newline ensures the <pre> matches the textarea's trailing empty line.
+    hl.innerHTML = html + '\n';
 }
 
 let _dbValidateTimer = null;

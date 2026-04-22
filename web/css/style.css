@@ -3704,3 +3704,12 @@ body.sidebar-collapsed #task-log-footer {
         min-width: 0;
     }
 }
+/* Database Manager fullscreen — when an operator toggles fullscreen on
+   the #page-databases element, the browser isolates it and paints the
+   backdrop black by default. Give it our real background + padding so
+   the Manager looks the same as it does in-page. */
+#page-databases:fullscreen {
+    background: var(--bg-primary);
+    padding: 16px;
+    overflow: auto;
+}

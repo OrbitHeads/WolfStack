@@ -20234,6 +20234,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/sql-connections/{id}/test", web::post().to(sql_connections_test))
         .route("/api/sql-connections/{id}/validate", web::post().to(sql_connections_validate))
         .route("/api/sql-connections/{id}/query", web::post().to(sql_connections_query))
+        .route("/api/sql-connections/{id}/query-multi", web::post().to(sql_connections_query_multi))
         .route("/api/sql-connections/{id}/saved-queries", web::get().to(sql_saved_queries_list))
         .route("/api/sql-connections/{id}/saved-queries", web::post().to(sql_saved_queries_upsert))
         .route("/api/sql-connections/{id}/saved-queries/{name}", web::delete().to(sql_saved_queries_delete))
@@ -20493,6 +20494,89 @@ pub async fn sql_connections_query(
 pub struct SavedQueryBody {
     pub name: String,
     pub sql: String,
+}
+
+#[derive(Deserialize)]
+pub struct SqlMultiRequest {
+    pub statements: Vec<String>,
+    #[serde(default)]
+    pub permission: Option<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub stop_on_error: Option<bool>,  // default true
+}
+
+/// POST /api/sql-connections/{id}/query-multi — run a batch of
+/// statements one at a time. Used by:
+///   - the Database Manager's "Execute SQL file" upload flow
+///   - dump-restore and bulk INSERT paths that would otherwise round-
+///     trip hundreds of single-statement requests
+///
+/// Each statement is classified + executed independently (the classifier
+/// rejects stacked statements, so we split up-front on the client).
+/// Returns a per-statement outcome array so the UI can report "stmt 47
+/// failed at byte N" without losing the successes before it.
+pub async fn sql_connections_query_multi(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<SqlMultiRequest>,
+) -> HttpResponse {
+    let username = match require_auth(&req, &state) {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+    let id = path.into_inner();
+
+    // ACL check identical to /query.
+    if username != "cluster-node" {
+        let enterprise = crate::compat::platform_ready();
+        let cfg = crate::sql_connections::load();
+        if let Some(conn) = cfg.connections.iter().find(|c| c.id == id) {
+            if !conn.user_permitted(&username, enterprise) {
+                return HttpResponse::Forbidden().json(serde_json::json!({
+                    "error": format!("user '{}' is not in the allowed_users list for connection '{}'", username, id)
+                }));
+            }
+        }
+    }
+
+    let perm = match body.permission.as_deref().unwrap_or("read") {
+        "schema" => crate::sql_connections::SqlPermission::Schema,
+        "delete" => crate::sql_connections::SqlPermission::Delete,
+        "update" => crate::sql_connections::SqlPermission::Update,
+        _ => crate::sql_connections::SqlPermission::Read,
+    };
+    let timeout = body.timeout_secs.map(std::time::Duration::from_secs);
+    let stop_on_error = body.stop_on_error.unwrap_or(true);
+
+    let mut results = Vec::with_capacity(body.statements.len());
+    let mut failed_at: Option<usize> = None;
+    for (i, stmt) in body.statements.iter().enumerate() {
+        let s = stmt.trim();
+        if s.is_empty() { results.push(serde_json::json!({ "skipped": true })); continue; }
+        let caller = crate::sql_connections::Caller::Ui(username.clone());
+        match crate::sql_connections::execute(
+            &id, s, perm, caller, &state.cluster_secret, timeout, Some(&state.cluster),
+        ).await {
+            Ok(r) => results.push(serde_json::json!({
+                "ok": true,
+                "row_count": r.row_count,
+                "affected_rows": r.affected_rows,
+                "elapsed_ms": r.elapsed_ms,
+            })),
+            Err(e) => {
+                results.push(serde_json::json!({ "ok": false, "error": e }));
+                if stop_on_error { failed_at = Some(i); break; }
+            }
+        }
+    }
+    HttpResponse::Ok().json(serde_json::json!({
+        "results": results,
+        "failed_at": failed_at,
+        "total": body.statements.len(),
+    }))
 }
 
 /// GET /api/sql-connections/{id}/saved-queries — per-user saved queries.
