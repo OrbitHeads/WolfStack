@@ -41007,8 +41007,8 @@ function sqlConnShowEditor(existing) {
                             <input id="sql-e-port" type="number" class="form-control" value="${existing?.port || 3306}" min="1" max="65535">
                         </label>
                     </div>
-                    <label>Database
-                        <input id="sql-e-database" class="form-control" value="${escapeHtml(existing?.database || '')}" placeholder="accounts">
+                    <label>Database <span style="color:var(--text-muted); font-weight:normal;">(optional — leave blank for MariaDB/MySQL to pick later; Postgres requires one)</span>
+                        <input id="sql-e-database" class="form-control" value="${escapeHtml(existing?.database || '')}" placeholder="accounts (optional)">
                     </label>
                     <label>Username
                         <input id="sql-e-username" class="form-control" value="${escapeHtml(existing?.username || '')}" placeholder="readonly_user">
@@ -41245,8 +41245,12 @@ async function sqlConnSave(existingId) {
         ssl_mode: document.getElementById('sql-e-ssl').value,
         allowed_users: allowedUsers,
     };
-    if (!body.label || !body.host || !body.database || !body.username) {
-        showToast('Label, host, database, and username are required.', 'error');
+    if (!body.label || !body.host || !body.username) {
+        showToast('Label, host, and username are required.', 'error');
+        return;
+    }
+    if (body.kind === 'postgres' && !body.database) {
+        showToast('PostgreSQL connections must specify a database.', 'error');
         return;
     }
     const url = existingId ? `/api/sql-connections/${encodeURIComponent(existingId)}` : '/api/sql-connections';
@@ -41467,6 +41471,8 @@ function dbFilterConnections() { dbRenderConnections(); }
 let _dbMgrTab = 'tables';
 let _dbMgrCurrentDb = null;      // active schema (MySQL), 'public' (Postgres)
 let _dbMgrCurrentTable = null;
+let _dbMgrExpanded = new Set();  // schema/db names currently showing tables
+let _dbMgrTablesCache = {};      // schema -> [table names]
 
 function dbOpenConnection(id) {
     _dbCurrentId = id;
@@ -41474,10 +41480,11 @@ function dbOpenConnection(id) {
     _dbMgrTab = 'tables';
     _dbMgrCurrentDb = null;
     _dbMgrCurrentTable = null;
+    _dbMgrExpanded = new Set();
+    _dbMgrTablesCache = {};
     dbRenderConnections();
     const conn = _dbConnsCache.find(c => c.id === id);
     if (!conn) return;
-    _dbMgrCurrentDb = conn.kind === 'postgres' ? 'public' : conn.database;
     const ws = document.getElementById('db-workspace');
     if (!ws) return;
     const kindIcon = conn.kind === 'postgres' ? '🐘' : (conn.kind === 'mariadb' ? '🦭' : '🐬');
@@ -41487,19 +41494,26 @@ function dbOpenConnection(id) {
         const n = (allNodes || []).find(n => n.id === conn.node_id);
         if (n) nodeLabel = n.hostname || n.id;
     }
+    // Auto-expand the connection's default schema so tables appear without an extra click.
+    if (conn.kind === 'postgres') {
+        _dbMgrCurrentDb = 'public';
+        _dbMgrExpanded.add('public');
+    } else if (conn.database) {
+        _dbMgrCurrentDb = conn.database;
+        _dbMgrExpanded.add(conn.database);
+    }
     ws.innerHTML = `
-        <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap; margin-bottom:12px;">
-            <div>
-                <h3 style="margin:0;">${kindIcon} ${escapeHtml(conn.label)} <span style="color:var(--text-muted); font-weight:normal; font-size:13px;">— ${kindLabel}</span></h3>
-                <div style="font-size:12px; color:var(--text-muted); margin-top:4px;">
-                    <code>${escapeHtml(conn.username)}@${escapeHtml(conn.host)}:${conn.port}/${escapeHtml(conn.database)}</code>
-                    ${conn.cluster ? ` · ${escapeHtml(conn.cluster)}${nodeLabel ? ' / ' + escapeHtml(nodeLabel) : ''}` : ''}
-                </div>
+        <!-- Compact connection strip -->
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:8px; padding:6px 10px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:6px;">
+            <div style="display:flex; align-items:center; gap:10px; font-size:13px; min-width:0; flex:1;">
+                <span>${kindIcon} <strong>${escapeHtml(conn.label)}</strong></span>
+                <span style="color:var(--text-muted); font-size:11px;">${kindLabel}</span>
+                <code style="font-size:11px; color:var(--text-muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(conn.username)}@${escapeHtml(conn.host)}:${conn.port}${conn.database ? '/' + escapeHtml(conn.database) : ''}${conn.cluster ? ' · ' + escapeHtml(conn.cluster) + (nodeLabel ? '/' + escapeHtml(nodeLabel) : '') : ''}</code>
             </div>
-            <button class="btn btn-sm" onclick="dbTestConnection('${escapeHtml(conn.id)}', this)">Test</button>
+            <button class="btn btn-sm" onclick="dbTestConnection('${escapeHtml(conn.id)}', this)" style="padding:3px 10px; font-size:12px;">Test</button>
         </div>
 
-        <div style="display:grid; grid-template-columns:240px 1fr; gap:12px; height:calc(100vh - 320px); min-height:420px;">
+        <div style="display:grid; grid-template-columns:240px 1fr; gap:12px; height:calc(100vh - 240px); min-height:460px;">
             <!-- Tree: databases + tables -->
             <div style="border:1px solid var(--border); border-radius:8px; overflow:hidden; display:flex; flex-direction:column; background:var(--bg-secondary);">
                 <div style="padding:8px 10px; border-bottom:1px solid var(--border); font-size:12px; font-weight:600; display:flex; justify-content:space-between; align-items:center;">
@@ -41550,75 +41564,113 @@ function dbMgrEscapeIdent(kind, ident) {
     return '`' + String(ident).replace(/`/g, '``') + '`';
 }
 
-async function dbMgrLoadTree() {
+// Internal state:
+//   _dbMgrSchemas — last-fetched top-level schema list (null = not loaded)
+//   _dbMgrExpanded — set of schemas whose tables are currently shown
+//   _dbMgrTablesCache — schema -> [table names], keeps clicks instant
+let _dbMgrSchemas = null;
+
+async function dbMgrLoadTree(force) {
     const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
     if (!conn) return;
     const tree = document.getElementById('db-mgr-tree');
     if (!tree) return;
-    tree.innerHTML = '<div style="padding:12px; color:var(--text-muted); font-size:12px;">Loading…</div>';
-    try {
-        let html = '';
-        if (conn.kind === 'postgres') {
-            // Postgres connections are bound to one DB; list schemas + tables within.
-            const schemas = await dbMgrRunSql(
-                "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('pg_catalog','information_schema','pg_toast') ORDER BY schema_name"
-            );
-            for (const row of schemas.rows) {
-                const schema = row[0];
-                html += `<div style="padding:6px 10px; font-size:11px; font-weight:600; color:var(--text-muted); text-transform:uppercase;">${escapeHtml(schema)}</div>`;
-                const tables = await dbMgrRunSql(
-                    `SELECT table_name FROM information_schema.tables WHERE table_schema = '${schema.replace(/'/g, "''")}' ORDER BY table_name`
+    if (force) {
+        _dbMgrSchemas = null;
+        _dbMgrTablesCache = {};
+    }
+    if (_dbMgrSchemas === null) {
+        tree.innerHTML = '<div style="padding:12px; color:var(--text-muted); font-size:12px;">Loading…</div>';
+        try {
+            if (conn.kind === 'postgres') {
+                const schemas = await dbMgrRunSql(
+                    "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('pg_catalog','information_schema','pg_toast') ORDER BY schema_name"
                 );
-                for (const t of tables.rows) {
-                    const name = t[0];
+                _dbMgrSchemas = schemas.rows.map(r => r[0]);
+            } else {
+                const dbs = await dbMgrRunSql('SHOW DATABASES');
+                _dbMgrSchemas = dbs.rows
+                    .map(r => r[0])
+                    .filter(d => !['information_schema','performance_schema','mysql','sys'].includes(d));
+            }
+        } catch (e) {
+            tree.innerHTML = `<div style="padding:12px; color:var(--danger); font-size:12px;">${escapeHtml(e.message)}</div>`;
+            return;
+        }
+    }
+    // Pre-load tables for any expanded schema we don't have cached yet.
+    for (const schema of _dbMgrExpanded) {
+        if (_dbMgrTablesCache[schema] === undefined) {
+            try {
+                _dbMgrTablesCache[schema] = await dbMgrLoadTables(conn, schema);
+            } catch (e) {
+                _dbMgrTablesCache[schema] = { error: e.message };
+            }
+        }
+    }
+    dbMgrRenderTree(tree);
+}
+
+async function dbMgrLoadTables(conn, schema) {
+    if (conn.kind === 'postgres') {
+        const r = await dbMgrRunSql(
+            `SELECT table_name FROM information_schema.tables WHERE table_schema = '${schema.replace(/'/g, "''")}' ORDER BY table_name`
+        );
+        return r.rows.map(x => x[0]);
+    }
+    const r = await dbMgrRunSql(`SHOW TABLES FROM ${dbMgrEscapeIdent(conn.kind, schema)}`);
+    return r.rows.map(x => x[0]);
+}
+
+function dbMgrRenderTree(tree) {
+    if (!_dbMgrSchemas || !_dbMgrSchemas.length) {
+        tree.innerHTML = '<div style="padding:12px; color:var(--text-muted); font-size:12px;">(no schemas)</div>';
+        return;
+    }
+    let html = '';
+    for (const schema of _dbMgrSchemas) {
+        const expanded = _dbMgrExpanded.has(schema);
+        const chev = expanded ? '▾' : '▸';
+        const safe = escapeHtml(schema).replace(/'/g, "\\'");
+        html += `<div onclick="dbMgrToggleSchema('${safe}')"
+            style="cursor:pointer; padding:6px 10px; font-size:12px; font-weight:600; color:var(--text-muted); text-transform:uppercase; user-select:none; display:flex; align-items:center; gap:6px;">
+            <span style="width:10px; display:inline-block;">${chev}</span>
+            <span>${escapeHtml(schema)}</span>
+        </div>`;
+        if (expanded) {
+            const cached = _dbMgrTablesCache[schema];
+            if (cached && cached.error) {
+                html += `<div style="padding:4px 28px; font-size:11px; color:var(--danger);">${escapeHtml(cached.error)}</div>`;
+            } else if (!cached || !cached.length) {
+                html += `<div style="padding:4px 28px; font-size:11px; color:var(--text-muted);">(no tables)</div>`;
+            } else {
+                for (const name of cached) {
                     const active = _dbMgrCurrentDb === schema && _dbMgrCurrentTable === name;
-                    html += `<div onclick="dbMgrPickTable('${escapeHtml(schema)}','${escapeHtml(name).replace(/'/g, "\\'")}')"
-                        style="cursor:pointer; padding:4px 18px; font-size:13px; background:${active ? 'var(--accent-bg, rgba(168,85,247,0.15))' : 'transparent'};">
+                    const safeT = escapeHtml(name).replace(/'/g, "\\'");
+                    html += `<div onclick="dbMgrPickTable('${safe}','${safeT}')"
+                        style="cursor:pointer; padding:4px 28px; font-size:13px; background:${active ? 'var(--accent-bg, rgba(168,85,247,0.15))' : 'transparent'};">
                         📋 ${escapeHtml(name)}
                     </div>`;
                 }
             }
-        } else {
-            // MySQL / MariaDB: list every database the user can see, then tables per db.
-            const dbs = await dbMgrRunSql('SHOW DATABASES');
-            for (const row of dbs.rows) {
-                const db = row[0];
-                if (['information_schema','performance_schema','mysql','sys'].includes(db)) continue;
-                const isCurrent = _dbMgrCurrentDb === db;
-                html += `<div style="padding:6px 10px; font-size:11px; font-weight:600; color:var(--text-muted); text-transform:uppercase; display:flex; justify-content:space-between;">
-                    <span>${escapeHtml(db)}</span>
-                    ${isCurrent ? '' : `<a href="#" onclick="event.preventDefault(); dbMgrSetDb('${escapeHtml(db).replace(/'/g, "\\'")}')" style="font-size:10px;">use</a>`}
-                </div>`;
-                if (isCurrent) {
-                    const tables = await dbMgrRunSql(`SHOW TABLES FROM ${dbMgrEscapeIdent(conn.kind, db)}`);
-                    for (const t of tables.rows) {
-                        const name = t[0];
-                        const active = _dbMgrCurrentDb === db && _dbMgrCurrentTable === name;
-                        html += `<div onclick="dbMgrPickTable('${escapeHtml(db).replace(/'/g, "\\'")}','${escapeHtml(name).replace(/'/g, "\\'")}')"
-                            style="cursor:pointer; padding:4px 18px; font-size:13px; background:${active ? 'var(--accent-bg, rgba(168,85,247,0.15))' : 'transparent'};">
-                            📋 ${escapeHtml(name)}
-                        </div>`;
-                    }
-                }
-            }
         }
-        tree.innerHTML = html || '<div style="padding:12px; color:var(--text-muted); font-size:12px;">(empty)</div>';
-    } catch (e) {
-        tree.innerHTML = `<div style="padding:12px; color:var(--danger); font-size:12px;">${escapeHtml(e.message)}</div>`;
     }
+    tree.innerHTML = html;
 }
 
-function dbMgrSetDb(db) {
-    _dbMgrCurrentDb = db;
-    _dbMgrCurrentTable = null;
+function dbMgrToggleSchema(schema) {
+    if (_dbMgrExpanded.has(schema)) {
+        _dbMgrExpanded.delete(schema);
+    } else {
+        _dbMgrExpanded.add(schema);
+    }
     dbMgrLoadTree();
-    const body = document.getElementById('db-mgr-body');
-    if (body) body.innerHTML = '<div style="color:var(--text-muted); text-align:center; padding:60px 10px; font-size:13px;">Pick a table on the left.</div>';
 }
 
 function dbMgrPickTable(db, table) {
     _dbMgrCurrentDb = db;
     _dbMgrCurrentTable = table;
+    _dbMgrExpanded.add(db);
     dbMgrLoadTree();
     dbMgrRefreshTab();
 }

@@ -365,12 +365,19 @@ fn get_or_build_pool(conn: &SqlConnection, cluster_secret: &str) -> Result<PoolH
 
     let handle = match conn.kind {
         SqlKind::Mariadb | SqlKind::Mysql => {
+            // For MariaDB/MySQL the default-schema is optional. If the
+            // operator leaves it blank the connection opens with no
+            // current DB and the Database Manager / agent just issues
+            // fully-qualified `db.table` references (or `USE db` via
+            // the SHOW-tree's "use" action).
             let mut builder = mysql_async::OptsBuilder::default()
                 .ip_or_hostname(conn.host.clone())
                 .tcp_port(conn.port)
                 .user(Some(conn.username.clone()))
-                .pass(Some(password))
-                .db_name(Some(conn.database.clone()));
+                .pass(Some(password));
+            if !conn.database.trim().is_empty() {
+                builder = builder.db_name(Some(conn.database.clone()));
+            }
             if !matches!(conn.ssl_mode, SslMode::Disable) {
                 // mysql_async's SslOpts are fine with defaults for
                 // Prefer/Require; we don't pin a CA here since the
