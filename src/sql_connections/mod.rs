@@ -312,9 +312,17 @@ fn statement_tier(stmt: &sqlparser::ast::Statement) -> Result<SqlPermission, Str
             // list from sqlparser.
             let dbg = format!("{:?}", other);
             let kind = dbg.split(|c: char| !c.is_alphanumeric()).next().unwrap_or("unknown");
+            let lower = kind.to_lowercase();
+            // Read-only introspection: SHOW*, DESCRIBE, USE (schema switch
+            // is harmless — the connection pool is per-profile anyway).
+            // These don't have dedicated variants we match on directly
+            // across all sqlparser minor versions, so gate by name prefix.
+            if lower.starts_with("show") || lower == "describe" || lower == "use" {
+                return Ok(SqlPermission::Read);
+            }
             Err(format!(
                 "statement kind not permitted via this interface: {}",
-                kind.to_lowercase()
+                lower
             ))
         }
     }
