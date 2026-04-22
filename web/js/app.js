@@ -42017,6 +42017,19 @@ async function dbDumpSchema(schema, includeData) {
     } catch (e) { showToast('Dump failed: ' + e.message, 'error'); return; }
     if (!tables.length) { showToast('No tables to dump', 'warning'); return; }
 
+    // Confirm before starting — dumps can take a long time for large
+    // databases (each table = 1 SHOW CREATE + N×SELECT round-trips
+    // over the cluster proxy). The browser tab needs to stay open
+    // until the .sql download pops up.
+    const warnBody = includeData
+        ? `About to dump ${tables.length} table${tables.length === 1 ? '' : 's'} from "${schema}" including all rows.\n\n` +
+          `This runs entirely client-side — every SELECT round-trips through your browser, so large tables (millions of rows) can take many minutes and push a lot of data over the cluster link.\n\n` +
+          `Keep this tab open until the download starts.`
+        : `About to dump the structure of ${tables.length} table${tables.length === 1 ? '' : 's'} from "${schema}" (no row data).\n\n` +
+          `Schema-only dumps are fast — usually a few seconds.`;
+    const ok = await wolfConfirm(warnBody, includeData ? 'Dump schema + data' : 'Dump schema', { okText: 'Start dump' });
+    if (!ok) return;
+
     const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
     let sql = `-- WolfStack SQL dump
 -- Host: ${conn.host}:${conn.port}
