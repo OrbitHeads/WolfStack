@@ -42773,15 +42773,15 @@ async function dbAcTrigger() {
         const tableName = dotMatch[1];
         const schema = _dbMgrCurrentDb || (_dbMgrExpanded.size ? [..._dbMgrExpanded][0] : null);
         const cols = schema ? await dbAcEnsureColumns(schema, tableName) : [];
-        candidates = cols.map(c => ({ label: c, kind: 'column', insert: c }));
+        candidates = cols.map(c => ({ label: c, source: `column in ${schema}.${tableName}`, kind: 'column', insert: c }));
     } else {
         const afterKw = /\b(FROM|JOIN|INTO|UPDATE|TABLE)\s+(?:[A-Za-z_][A-Za-z0-9_]*\s*,\s*)*$/i.test(before);
         const tables = dbAcKnownTables();
-        const tableCands = tables.map(t => ({ label: `${t.name} · ${t.schema}`, kind: 'table', insert: t.name }));
+        const tableCands = tables.map(t => ({ label: t.name, source: `table in ${t.schema}`, kind: 'table', insert: t.name }));
         if (afterKw) {
             candidates = tableCands;
         } else {
-            const kwCands = [...SQL_KEYWORDS].map(k => ({ label: k, kind: 'keyword', insert: k }));
+            const kwCands = [...SQL_KEYWORDS].map(k => ({ label: k, source: 'SQL keyword', kind: 'keyword', insert: k }));
             candidates = [...tableCands, ...kwCands];
         }
     }
@@ -42821,9 +42821,12 @@ function dbAcRenderItems(popup) {
     _dbAcState.items.forEach((c, i) => {
         const icon = c.kind === 'table' ? '📋' : c.kind === 'column' ? '·' : '🔑';
         h += `<div onclick="dbAcAccept(${i})" onmouseover="dbAcState(${i})"
-            style="padding:5px 10px; cursor:pointer; background:${i === _dbAcState.active ? 'var(--bg-secondary)' : 'transparent'}; display:flex; gap:8px; align-items:center;">
-            <span style="color:var(--text-muted); width:14px;">${icon}</span>
-            <span>${escapeHtml(c.label)}</span>
+            style="padding:5px 10px; cursor:pointer; background:${i === _dbAcState.active ? 'var(--bg-secondary)' : 'transparent'}; display:flex; gap:8px; align-items:center; justify-content:space-between;">
+            <span style="display:flex; gap:6px; align-items:center; min-width:0;">
+                <span style="color:var(--text-muted); width:14px; flex-shrink:0;">${icon}</span>
+                <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(c.label)}</span>
+            </span>
+            <span style="color:var(--text-muted); font-size:11px; flex-shrink:0; margin-left:10px;">${escapeHtml(c.source || '')}</span>
         </div>`;
     });
     popup.innerHTML = h;
@@ -42894,6 +42897,13 @@ document.addEventListener('keydown', (e) => {
         e.preventDefault();
         _dbAcState.active = Math.max(0, _dbAcState.active - 1);
         dbAcRenderItems(_dbAcState.popup);
+        return;
+    }
+    // Ctrl/Cmd + Enter always means "run the query" — don't let an
+    // open autocomplete popup steal the keystroke. Close the popup
+    // so the run handler fires cleanly.
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        dbAcClose();
         return;
     }
     if (e.key === 'Enter' || e.key === 'Tab') {
@@ -43955,9 +43965,9 @@ function dbMgrRenderQueryTab(body) {
         </div>
         <div id="db-editor-wrap" style="position:relative;">
             <pre id="db-query-hl" aria-hidden="true"
-                style="position:absolute; inset:0; margin:0; padding:8px 10px; font-family:var(--font-mono, ui-monospace, monospace); font-size:13px; line-height:1.45; tab-size:4; white-space:pre-wrap; word-wrap:break-word; pointer-events:none; color:var(--text); overflow:hidden; background:var(--bg-primary); border:1px solid var(--border); border-radius:4px; z-index:1;"></pre>
+                style="position:absolute; inset:0; margin:0; padding:8px 10px; font-family:var(--font-mono, ui-monospace, monospace); font-size:13px; line-height:1.45; tab-size:4; white-space:pre-wrap; word-wrap:break-word; pointer-events:none; color:var(--text-primary); overflow:hidden; background:var(--bg-primary); border:1px solid var(--border); border-radius:4px; z-index:1;"></pre>
             <textarea id="db-query" class="form-control" placeholder="${escapeHtml(hint)}"
-                style="position:relative; z-index:2; font-family:var(--font-mono, ui-monospace, monospace); font-size:13px; min-height:260px; line-height:1.45; tab-size:4; background:transparent; caret-color:var(--text); color:transparent; text-shadow:0 0 0 transparent;"
+                style="position:relative; z-index:2; font-family:var(--font-mono, ui-monospace, monospace); font-size:13px; min-height:260px; line-height:1.45; tab-size:4; background:transparent; caret-color:var(--text-primary); color:transparent; text-shadow:0 0 0 transparent;"
                 spellcheck="false">${escapeHtml(active.sql || '')}</textarea>
         </div>
         <div style="display:flex; gap:6px; margin-top:8px; align-items:center; flex-wrap:wrap;">
@@ -44212,18 +44222,56 @@ async function dbSaveCurrentQuery() {
     if (!_dbCurrentId) return;
     const sql = (document.getElementById('db-query') || {}).value || '';
     if (!sql.trim()) { showToast('Nothing to save', 'warning'); return; }
-    const name = prompt('Name this saved query:');
-    if (!name) return;
-    try {
-        const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_dbCurrentId)}/saved-queries`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name, sql }),
-        });
-        const data = await resp.json();
-        if (!resp.ok) { showToast(data.error || 'Save failed', 'error'); return; }
-        await dbRefreshSavedDropdown();
-        showToast(`Saved as "${name}"`, 'success');
-    } catch (e) { showToast('Save failed: ' + e.message, 'error'); }
+    // Pull the current saved list so we can hint about overwrites
+    // and show the existing names alongside the name input.
+    const saved = await dbLoadSaved();
+    const existingList = saved.length
+        ? `<div style="font-size:11px; color:var(--text-muted); margin-top:6px;">Existing: ${saved.map(s => escapeHtml(s.name)).join(', ')}</div>`
+        : '';
+    const existing = document.getElementById('db-save-modal');
+    if (existing) existing.remove();
+    const modal = document.createElement('div');
+    modal.id = 'db-save-modal';
+    modal.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:10000; display:flex; align-items:center; justify-content:center;';
+    modal.innerHTML = `
+        <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:18px; width:520px; max-width:95vw;">
+            <h3 style="margin:0 0 12px;">💾 Save query</h3>
+            <label style="display:block; font-size:13px;">Name
+                <input id="db-save-name" class="form-control" placeholder="Nightly active users" autocomplete="off">
+            </label>
+            ${existingList}
+            <div style="margin-top:10px; font-size:12px; color:var(--text-muted);">Saved to your account — visible only to you, available across devices.</div>
+            <details style="margin-top:10px;">
+                <summary style="cursor:pointer; font-size:12px; color:var(--text-muted);">Preview SQL</summary>
+                <pre style="margin-top:6px; padding:8px; background:var(--bg-primary); border:1px solid var(--border); border-radius:4px; font-size:11px; max-height:140px; overflow:auto;">${escapeHtml(sql)}</pre>
+            </details>
+            <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:14px;">
+                <button class="btn btn-sm" onclick="document.getElementById('db-save-modal').remove()">Cancel</button>
+                <button class="btn btn-primary btn-sm" id="db-save-submit">Save</button>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+    const nameInput = modal.querySelector('#db-save-name');
+    const submit = modal.querySelector('#db-save-submit');
+    const doSave = async () => {
+        const name = nameInput.value.trim();
+        if (!name) { nameInput.focus(); return; }
+        try {
+            const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_dbCurrentId)}/saved-queries`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, sql }),
+            });
+            const data = await resp.json();
+            if (!resp.ok) { showToast(data.error || 'Save failed', 'error'); return; }
+            modal.remove();
+            await dbRefreshSavedDropdown();
+            showToast(`Saved as "${name}"`, 'success');
+        } catch (e) { showToast('Save failed: ' + e.message, 'error'); }
+    };
+    submit.addEventListener('click', doSave);
+    nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); doSave(); } });
+    setTimeout(() => nameInput.focus(), 0);
 }
 
 async function dbRefreshSavedDropdown() {
@@ -44251,16 +44299,58 @@ function dbLoadSavedSelected() {
 
 async function dbManageSavedQueries() {
     const saved = _dbSavedCache;
-    if (!saved.length) return;
-    const names = saved.map(s => s.name).join('\n');
-    const toDelete = prompt(`Delete which saved query? (type the exact name)\n\nExisting:\n${names}`);
-    if (!toDelete) return;
+    if (!saved.length) { showToast('No saved queries', 'info'); return; }
+    const existing = document.getElementById('db-manage-modal');
+    if (existing) existing.remove();
+    const modal = document.createElement('div');
+    modal.id = 'db-manage-modal';
+    modal.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:10000; display:flex; align-items:center; justify-content:center;';
+    const rows = saved.map(s => `
+        <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px; padding:8px 10px; border-bottom:1px solid var(--border);">
+            <div style="min-width:0; flex:1;">
+                <div style="font-weight:600; font-size:13px;">${escapeHtml(s.name)}</div>
+                <pre style="margin:4px 0 0; font-size:11px; color:var(--text-muted); white-space:pre-wrap; max-height:80px; overflow:auto;">${escapeHtml(s.sql)}</pre>
+            </div>
+            <div style="display:flex; gap:4px; flex-shrink:0;">
+                <button class="btn btn-sm" onclick="dbManageLoad('${escapeHtml(s.name).replace(/'/g, "\\'")}')">Load</button>
+                <button class="btn btn-sm" onclick="dbManageDelete('${escapeHtml(s.name).replace(/'/g, "\\'")}')" style="color:var(--danger);">Delete</button>
+            </div>
+        </div>
+    `).join('');
+    modal.innerHTML = `
+        <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:18px; width:700px; max-width:95vw; max-height:80vh; display:flex; flex-direction:column;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                <h3 style="margin:0;">💾 Saved queries (${saved.length})</h3>
+                <button class="btn btn-sm" onclick="document.getElementById('db-manage-modal').remove()">Close</button>
+            </div>
+            <div style="overflow:auto; border:1px solid var(--border); border-radius:6px;">${rows}</div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+}
+
+function dbManageLoad(name) {
+    const s = _dbSavedCache.find(x => x.name === name);
+    if (!s) return;
+    const ta = document.getElementById('db-query');
+    if (ta) { ta.value = s.sql; if (_dbQueryTabs[_dbQueryActive]) _dbQueryTabs[_dbQueryActive].sql = s.sql; dbHighlightSql(); dbScheduleValidate(); }
+    document.getElementById('db-manage-modal')?.remove();
+    showToast(`Loaded "${name}"`, 'success');
+}
+
+async function dbManageDelete(name) {
+    const ok = await wolfConfirm(`Delete saved query "${name}"?`, 'Delete saved query', { okText: 'Delete', danger: true });
+    if (!ok) return;
     try {
-        const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_dbCurrentId)}/saved-queries/${encodeURIComponent(toDelete)}`, { method: 'DELETE' });
-        if (resp.status === 404) { showToast('No query by that name', 'warning'); return; }
+        const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_dbCurrentId)}/saved-queries/${encodeURIComponent(name)}`, { method: 'DELETE' });
+        if (resp.status === 404) { showToast('Already gone', 'warning'); return; }
         if (!resp.ok) { showToast('Delete failed', 'error'); return; }
         await dbRefreshSavedDropdown();
-        showToast(`Deleted "${toDelete}"`, 'success');
+        // Re-open the manage modal with the updated list.
+        document.getElementById('db-manage-modal')?.remove();
+        await dbLoadSaved();
+        if (_dbSavedCache.length) dbManageSavedQueries();
+        showToast(`Deleted "${name}"`, 'success');
     } catch (e) { showToast('Delete failed: ' + e.message, 'error'); }
 }
 
