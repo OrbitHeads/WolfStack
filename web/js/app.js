@@ -43559,15 +43559,46 @@ function dbDiagAttachPanZoom() {
 function dbDiagExportSvg() {
     const svg = document.getElementById('db-diag-svg');
     if (!svg) return;
+    // outerHTML on an SVG inside an HTML document produces HTML-serialised
+    // markup — self-closing rules, entity escaping, and namespace
+    // declarations all differ from XML. Opening the resulting .svg in
+    // an XML viewer (file:// in browser, Inkscape, etc.) blows up with
+    // things like "Opening and ending tag mismatch". XMLSerializer
+    // outputs proper namespaced XML that survives round-trip.
     const clone = svg.cloneNode(true);
     clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
-    const blob = new Blob([clone.outerHTML], { type: 'image/svg+xml' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = `${_dbDiagState.schema || 'schema'}-erd.svg`;
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    showToast('Diagram saved', 'success');
+    clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink');
+    // Give the saved file explicit pixel dimensions so viewers that
+    // don't honour CSS width/height still render it at the right size.
+    const vb = svg.viewBox.baseVal;
+    const w = vb.width || 1600, h = vb.height || 1000;
+    clone.setAttribute('width', String(Math.round(w)));
+    clone.setAttribute('height', String(Math.round(h)));
+    // The app's emoji→icon-pack replacement injects <img> tags into
+    // live DOM elements; those are illegal inside SVG <text> and the
+    // XML parser rejects the file with
+    // "Opening and ending tag mismatch: img … text".
+    // Strip any <img> from the clone so the exported SVG is valid.
+    clone.querySelectorAll('img').forEach(img => img.remove());
+    // <foreignObject> is another non-portable hazard — remove those too.
+    clone.querySelectorAll('foreignObject').forEach(fo => fo.remove());
+    try {
+        const serializer = new XMLSerializer();
+        const body = serializer.serializeToString(clone);
+        const xml = '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n' + body;
+        const blob = new Blob([xml], { type: 'image/svg+xml;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${_dbDiagState.schema || 'schema'}-erd.svg`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        showToast('Diagram saved', 'success');
+    } catch (e) {
+        showToast('SVG export failed: ' + e.message, 'error');
+    }
 }
 
 // ═══════════════════════════════════════════════════
