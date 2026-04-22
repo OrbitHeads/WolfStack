@@ -394,6 +394,31 @@ pub fn classify(query: &str, kind: SqlKind) -> Result<SqlPermission, String> {
         return Err("query is empty".into());
     }
 
+    // Fast path for MySQL/MariaDB SHOW variants that sqlparser doesn't
+    // fully cover (SHOW FULL PROCESSLIST, SHOW FULL TABLES, SHOW ENGINE
+    // INNODB STATUS, SHOW GRANTS, SHOW CREATE *, etc.). These are all
+    // read-only introspection and the UI's Server / Structure tabs
+    // need them to work. Same for DESCRIBE and USE. Short-circuit to
+    // Read before sqlparser gets a chance to reject them.
+    let trimmed = query.trim_start().to_ascii_lowercase();
+    if trimmed.starts_with("show ")
+        || trimmed == "show"
+        || trimmed.starts_with("describe ")
+        || trimmed.starts_with("desc ")
+        || trimmed.starts_with("use ")
+    {
+        // Single-statement check: refuse if a second statement sneaks in
+        // after the SHOW (we split on a semicolon that isn't followed
+        // only by whitespace/end).
+        let body = query.trim_end_matches(';').trim();
+        if body.contains(';') {
+            return Err(
+                "multi-statement queries are not allowed (one statement per call)".into()
+            );
+        }
+        return Ok(SqlPermission::Read);
+    }
+
     let dialect: Box<dyn Dialect> = match kind {
         SqlKind::Mariadb | SqlKind::Mysql => Box::new(MySqlDialect {}),
         SqlKind::Postgres => Box::new(PostgreSqlDialect {}),
