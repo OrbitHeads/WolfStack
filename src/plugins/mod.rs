@@ -16,6 +16,17 @@ use std::sync::{LazyLock, RwLock};
 
 const PLUGINS_DIR: &str = "/etc/wolfstack/plugins";
 
+/// Shared HTTP client for proxying UI requests through to loopback
+/// plugin backends. Each proxied request used to build a fresh
+/// `reqwest::Client` — one leaked pool per UI click.
+static PLUGIN_PROXY_CLIENT: LazyLock<reqwest::Client> =
+    LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
     pub id: String,
@@ -353,11 +364,7 @@ pub async fn proxy_request(
 
     let url = format!("http://127.0.0.1:{}/{}", port, sub_path.trim_start_matches('/'));
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
-
+    let client = &*PLUGIN_PROXY_CLIENT;
     let mut req = match method {
         "GET" => client.get(&url),
         "POST" => client.post(&url),

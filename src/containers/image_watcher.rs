@@ -12,6 +12,20 @@ use tracing::{error, warn};
 
 const CONFIG_FILE: &str = "/etc/wolfstack/image-watcher.json";
 
+/// Shared HTTP client for registry auth + manifest fetches. Same
+/// pattern as src/wolfrun/mod.rs (v19.8.1): one pool for the lifetime
+/// of the process. Per-call `reqwest::Client::new()` was leaking
+/// connection pools on every image check (one call to the token
+/// endpoint + one HEAD to the registry per watched container, every
+/// `check_interval_secs`).
+static IMG_WATCH_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
 // ═══════════════════════════════════════════════
 // ─── Data Types ───
 // ═══════════════════════════════════════════════
@@ -290,19 +304,17 @@ pub async fn get_registry_token(registry: &str, repo: &str) -> Result<String, St
         }
     };
 
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = IMG_WATCH_CLIENT
         .get(&url)
         .send()
         .await
         .map_err(|e| format!("Token request to {} failed: {}", url, e))?;
 
     if !resp.status().is_success() {
-        return Err(format!(
-            "Token endpoint returned {}: {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default()
-        ));
+        let status = resp.status();
+        // `.text()` consumes the body, returning the socket to the pool.
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Token endpoint returned {}: {}", status, body));
     }
 
     let body: TokenResponse = resp
@@ -326,8 +338,7 @@ pub async fn get_remote_digest(image_ref: &ImageRef) -> Result<String, String> {
         image_ref.registry, image_ref.repo, image_ref.tag
     );
 
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = IMG_WATCH_CLIENT
         .head(&url)
         .header("Authorization", format!("Bearer {}", token))
         .header(
@@ -347,19 +358,20 @@ pub async fn get_remote_digest(image_ref: &ImageRef) -> Result<String, String> {
         .map_err(|e| format!("Manifest HEAD request to {} failed: {}", url, e))?;
 
     if !resp.status().is_success() {
-        return Err(format!(
-            "Registry returned {} for {}: {}",
-            resp.status(),
-            url,
-            resp.text().await.unwrap_or_default()
-        ));
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Registry returned {} for {}: {}", status, url, body));
     }
 
-    resp.headers()
+    // Extract the digest header, then drain any body bytes so the
+    // socket returns to the pool. HEAD responses usually have no
+    // body, but draining is cheap and explicit.
+    let digest = resp.headers()
         .get("docker-content-digest")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .ok_or_else(|| format!("No Docker-Content-Digest header in response from {}", url))
+        .map(|s| s.to_string());
+    let _ = resp.bytes().await;
+    digest.ok_or_else(|| format!("No Docker-Content-Digest header in response from {}", url))
 }
 
 // ═══════════════════════════════════════════════

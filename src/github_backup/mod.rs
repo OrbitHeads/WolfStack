@@ -380,12 +380,23 @@ pub async fn test_credentials() -> Result<serde_json::Value, String> {
 
 // ─── HTTP helpers ──────────────────────────────────────────────────────
 
+/// Shared HTTP client for all GitHub REST API calls. Previously
+/// `client()` built a fresh Client per backup run; one pool per run
+/// × many requests per run leaked connection pools through
+/// process lifetime. User-Agent and timeout are baked in here.
+static GITHUB_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .user_agent(USER_AGENT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
 fn client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent(USER_AGENT)
-        .build()
-        .map_err(|e| e.to_string())
+    // Cheap Arc clone of the shared pool. Return Result to keep the
+    // existing call-site shape (`client()?`) stable.
+    Ok(reqwest::Client::clone(&GITHUB_CLIENT))
 }
 
 async fn get_json(client: &reqwest::Client, token: &str, url: &str) -> Result<serde_json::Value, String> {

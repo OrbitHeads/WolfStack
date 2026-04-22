@@ -8733,6 +8733,8 @@ async function refreshComponentDetail(name) {
         if (actionsBar) actionsBar.style.display = 'none';
         if (configSection) configSection.style.display = 'none';
         if (logsSection) logsSection.style.display = 'none';
+        ['detail-top-btn-start', 'detail-top-btn-restart', 'detail-top-btn-stop']
+            .forEach(id => { const el = document.getElementById(id); if (el) el.style.display = 'none'; });
 
         // Just load the configurator — reads from the container via ExecTarget
         const cfgSection = document.getElementById('detail-configurator-section');
@@ -8788,6 +8790,15 @@ async function refreshComponentDetail(name) {
         document.getElementById('detail-btn-start').style.display = d.running ? 'none' : '';
         document.getElementById('detail-btn-restart').style.display = d.running ? '' : 'none';
         document.getElementById('detail-btn-stop').style.display = d.running ? '' : 'none';
+        // Top-bar mirrors — always visible when the service is installed so users
+        // don't have to scroll to restart. Start only when stopped; Restart/Stop
+        // only when running.
+        const topStart = document.getElementById('detail-top-btn-start');
+        const topRestart = document.getElementById('detail-top-btn-restart');
+        const topStop = document.getElementById('detail-top-btn-stop');
+        if (topStart) topStart.style.display = (d.installed && !d.running) ? '' : 'none';
+        if (topRestart) topRestart.style.display = (d.installed && d.running) ? '' : 'none';
+        if (topStop) topStop.style.display = (d.installed && d.running) ? '' : 'none';
 
         // Structured settings panels (hide all first, then show the right one)
         const mdbSection = document.getElementById('detail-mariadb-section');

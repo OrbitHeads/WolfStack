@@ -45,6 +45,19 @@ use tracing::{info, warn};
 
 type AppData = web::Data<crate::api::AppState>;
 
+/// Shared HTTP client for every Discord bot. Same pattern as
+/// src/telegram_bot/mod.rs — one connection pool for all bots
+/// combined. Each outbound call sets its own timeout via
+/// `RequestBuilder::timeout` because the gateway lookup (15s) and
+/// send-message (implicit default) differ.
+pub(crate) static DISCORD_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
 /// Gateway opcodes we care about. Full list is in the Discord docs;
 /// opcodes we don't send never need to appear here.
 const OP_DISPATCH: u64 = 0;
@@ -99,19 +112,26 @@ struct IdentifyProperties {
 /// task. Returns when the connection dies (caller restarts us).
 pub async fn run_once(bot_token: String, state: AppData) -> Result<(), String> {
     // ── Step 1: resolve gateway URL ─────────────────────────────
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
-    let gateway: GatewayInfo = http
+    // Shared pool — see DISCORD_CLIENT. Every bot gateway session
+    // and every send_discord_message reuses the same connection pool.
+    let http = &*DISCORD_CLIENT;
+    let gateway_resp = http
         .get("https://discord.com/api/v10/gateway/bot")
         .header("Authorization", format!("Bot {}", bot_token))
         .header("User-Agent", "WolfStack/18 (https://wolf.uk.com)")
+        .timeout(Duration::from_secs(15))
         .send().await
-        .map_err(|e| format!("gateway lookup: {}", e))?
-        .error_for_status()
-        .map_err(|e| format!("gateway status: {}", e))?
-        .json().await
+        .map_err(|e| format!("gateway lookup: {}", e))?;
+    // Capture status then drain → parse in one path so the socket
+    // always goes back to the pool cleanly (error_for_status drops
+    // the unread body on non-2xx, which was a latent leak here).
+    let gateway_status = gateway_resp.status();
+    let gateway_body = gateway_resp.text().await
+        .map_err(|e| format!("gateway read: {}", e))?;
+    if !gateway_status.is_success() {
+        return Err(format!("gateway status {}: {}", gateway_status, gateway_body.chars().take(200).collect::<String>()));
+    }
+    let gateway: GatewayInfo = serde_json::from_str(&gateway_body)
         .map_err(|e| format!("gateway decode: {}", e))?;
 
     let ws_url = format!("{}/?v=10&encoding=json", gateway.url);
@@ -271,7 +291,10 @@ pub async fn run_once(bot_token: String, state: AppData) -> Result<(), String> {
                         // loop keeps draining. Agent turns can take
                         // seconds; blocking the loop would stall
                         // heartbeat seq updates.
-                        let http_reply = http.clone();
+                        // UFCS clone forces an owned `Client` (cheap
+                        // Arc clone) instead of cloning the &Client
+                        // reference — spawned futures need 'static.
+                        let http_reply: reqwest::Client = reqwest::Client::clone(http);
                         let token = bot_token.clone();
                         let s = state.clone();
                         tokio::spawn(async move {
@@ -397,10 +420,12 @@ pub async fn send_discord_message(
         .json(&body)
         .send().await
         .map_err(|e| format!("http send: {}", e))?;
-    if !resp.status().is_success() {
-        let code = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Discord API {}: {}", code, body.chars().take(200).collect::<String>()));
+    let status = resp.status();
+    // `.text()` drains the body whether success or error, so the
+    // socket returns to the keep-alive pool in both paths.
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("Discord API {}: {}", status.as_u16(), body.chars().take(200).collect::<String>()));
     }
     Ok(())
 }

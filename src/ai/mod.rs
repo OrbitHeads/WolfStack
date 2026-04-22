@@ -19,6 +19,19 @@ use std::time::Duration;
 
 pub mod baseline;
 
+/// Shared HTTP client for the stateless `simple_chat` entry point
+/// (used by plugins and the wolfagents dispatcher). AiAgent owns its
+/// own `client` field, so this is only for callers who don't have an
+/// AiAgent instance handy. 120s timeout matches the inference latency
+/// budget the AI paths expect.
+static AI_SIMPLE_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
 /// Outcome of a single health check. `Ok` drives the alert→OK
 /// transition (fire "cleared" notifications on private channels).
 /// `Alert` means notifications have already been sent inside
@@ -1803,16 +1816,15 @@ pub async fn simple_chat(
     if !config.is_configured() {
         return Err("AI not configured — set provider/key in Settings → AI Agent".to_string());
     }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
+    // Shared pool — see AI_SIMPLE_CLIENT. Per-call Client::builder()
+    // was leaking a connection pool on every AI chat invocation.
+    let client = &*AI_SIMPLE_CLIENT;
     match config.provider.as_str() {
-        "gemini" => call_gemini(&client, &config.gemini_api_key, &config.model, system_prompt, history, user_message).await,
-        "openrouter" => call_local(&client, "https://openrouter.ai/api/v1", &config.openrouter_api_key, &config.model, system_prompt, history, user_message).await,
-        "local" => call_local(&client, &config.local_url, &config.local_api_key, &config.model, system_prompt, history, user_message).await,
+        "gemini" => call_gemini(client, &config.gemini_api_key, &config.model, system_prompt, history, user_message).await,
+        "openrouter" => call_local(client, "https://openrouter.ai/api/v1", &config.openrouter_api_key, &config.model, system_prompt, history, user_message).await,
+        "local" => call_local(client, &config.local_url, &config.local_api_key, &config.model, system_prompt, history, user_message).await,
         // Default to Claude (also covers empty/default provider string).
-        _ => call_claude(&client, &config.claude_api_key, &config.model, system_prompt, history, user_message).await,
+        _ => call_claude(client, &config.claude_api_key, &config.model, system_prompt, history, user_message).await,
     }
 }
 
@@ -2294,11 +2306,14 @@ async fn web_search(client: &reqwest::Client, query: &str) -> Result<String, Str
         .timeout(std::time::Duration::from_secs(10))
         .send().await
         .map_err(|e| format!("network: {}", e))?;
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {}", resp.status().as_u16()));
-    }
+    let status = resp.status();
+    // `.text()` drains the body whether or not status is success,
+    // so the socket returns to the pool in both paths.
     let html = resp.text().await
         .map_err(|e| format!("read body: {}", e))?;
+    if !status.is_success() {
+        return Err(format!("HTTP {}", status.as_u16()));
+    }
     // Cheap, no-dep HTML parsing — DDG's result rows always have the
     // classes `result__title` (a link) followed by `result__snippet`.
     // We scan linearly, pluck up to 5 pairs. If the structure ever

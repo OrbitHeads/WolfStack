@@ -28,6 +28,19 @@ use tracing::{error, warn};
 
 use super::AppState;
 
+/// Shared HTTP client for proxying cluster-browser session traffic.
+/// Previously a fresh Client was built per request — one pool leak
+/// per proxied browser request. redirect::none() is preserved
+/// because selkies sessions rely on exact-status pass-through (no
+/// transparent redirect following).
+static BROWSER_PROXY_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
 /// Headers that must NOT be copied end-to-end (hop-by-hop per RFC 7230).
 /// Also strip `host` since reqwest sets it from the target URL.
 fn is_hop_by_hop(name: &str) -> bool {
@@ -121,11 +134,7 @@ async fn proxy_http(
         body_bytes.extend_from_slice(&chunk);
     }
 
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
-    let mut builder = client.request(method, &target).body(body_bytes.freeze());
+    let mut builder = BROWSER_PROXY_CLIENT.request(method, &target).body(body_bytes.freeze());
     for (name, val) in req.headers() {
         if is_hop_by_hop(name.as_str()) {
             continue;

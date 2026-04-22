@@ -166,12 +166,13 @@ pub async fn send_reply(
         .form(&form)
         .send().await
         .map_err(|e| format!("http: {}", e))?;
-    if !resp.status().is_success() {
-        let code = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
+    let status = resp.status();
+    // `.text()` drains regardless of status — socket returns to pool.
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
         return Err(format!(
             "Twilio API {}: {}",
-            code,
+            status.as_u16(),
             body.chars().take(200).collect::<String>()
         ));
     }

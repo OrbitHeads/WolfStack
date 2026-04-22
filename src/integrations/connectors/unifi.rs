@@ -17,17 +17,31 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-pub struct UnifiConnector;
-
-impl UnifiConnector {
-    /// Build a base HTTP client (no cookies yet).
-    fn base_client() -> Result<reqwest::Client, String> {
+/// Shared HTTP client for every Unifi API call. The old `base_client()`
+/// built a fresh Client for every login + every request (api_get and
+/// api_post each call login() which called base_client()) — one leaked
+/// pool per request. Unifi sessions are identified by cookie headers
+/// that we set per-request, so a single Client works for all sessions.
+/// Policy::none() preserved — Unifi returns a 302 on login failure and
+/// we want to see that instead of following it.
+static UNIFI_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
         reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
             .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|e| format!("HTTP client error: {}", e))
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
+pub struct UnifiConnector;
+
+impl UnifiConnector {
+    /// Return a cheap (Arc-refcounted) clone of the shared Client so
+    /// the existing callers can keep using owned Client by value
+    /// without re-plumbing references through the API.
+    fn base_client() -> Result<reqwest::Client, String> {
+        Ok(reqwest::Client::clone(&UNIFI_CLIENT))
     }
 
     /// Login to the Unifi controller and return the session cookie string.
@@ -56,11 +70,10 @@ impl UnifiConnector {
             .await
             .map_err(|e| format!("Login request failed: {}", e))?;
 
-        if !resp.status().is_success() {
-            return Err(format!("Unifi login failed: {}", resp.status()));
-        }
+        let status = resp.status();
 
-        // Extract all Set-Cookie headers and combine them
+        // Pull cookies out of the headers BEFORE consuming the body
+        // — headers() is a &self reference so resp is still live.
         let cookies: Vec<String> = resp.headers()
             .get_all("set-cookie")
             .iter()
@@ -70,6 +83,15 @@ impl UnifiConnector {
                 v.split(';').next().unwrap_or(v).to_string()
             })
             .collect();
+
+        // Drain the body so the socket returns to the keep-alive
+        // pool regardless of status. Every failed-login previously
+        // orphaned a socket here.
+        let _ = resp.bytes().await;
+
+        if !status.is_success() {
+            return Err(format!("Unifi login failed: {}", status));
+        }
 
         if cookies.is_empty() {
             return Err("Unifi login returned no cookies".to_string());
@@ -95,10 +117,15 @@ impl UnifiConnector {
             .await
             .map_err(|e| format!("Request failed: {}", e))?;
 
-        if !resp.status().is_success() {
-            return Err(format!("Unifi API error: {} {}", resp.status(), url));
+        let status = resp.status();
+        if !status.is_success() {
+            // Drain the error body so the socket returns to the pool.
+            let _ = resp.bytes().await;
+            return Err(format!("Unifi API error: {} {}", status, url));
         }
 
+        // Success: `.json()` consumes the body internally, freeing
+        // the connection back to the pool.
         resp.json().await.map_err(|e| format!("JSON parse error: {}", e))
     }
 

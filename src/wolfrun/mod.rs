@@ -621,6 +621,15 @@ pub async fn broadcast_to_cluster(
     cluster_secret: &str,
 ) {
     let services = wolfrun.list_all();
+    // Zero-service fast path — skip the whole peer fan-out. Without
+    // this every node was POSTing an empty services payload to every
+    // peer every 15s, burning sockets + CPU even on clusters that
+    // don't use WolfRun at all. Reported by Bel: CPU climbing from
+    // ~15% baseline to 90% alongside CLOSE_WAIT accumulation at
+    // :8553, no WolfRun services configured.
+    if services.is_empty() {
+        return;
+    }
     let nodes = cluster.get_all_nodes();
 
     // Find our cluster name
@@ -1693,6 +1702,13 @@ pub async fn manage_standby(
     };
 
     let services = wolfrun.list(Some(&self_cluster));
+    // Zero-service fast path — matches the guard in reconcile() and
+    // the one added to broadcast_to_cluster(). Without this the
+    // function still read the full node list and pulled in the RPC
+    // pool every 15s on clusters with no WolfRun services.
+    if services.is_empty() {
+        return;
+    }
     let all_nodes = cluster.get_all_nodes();
 
     // Shared long-timeout client — same pool used everywhere else in
@@ -1876,6 +1892,11 @@ pub async fn check_failover(
     };
 
     let services = wolfrun.list(Some(&self_cluster));
+    // Zero-service fast path — identical to the other three WolfRun
+    // loop functions. Keeps an idle cluster quiet.
+    if services.is_empty() {
+        return;
+    }
     let all_nodes = cluster.get_all_nodes();
 
     // Shared pool — see RPC_CLIENT_LONG docs at top of file.

@@ -66,13 +66,19 @@ pub struct ProxyEntry {
     #[serde(default)]
     pub backends: Vec<ProxyBackend>,
     /// Load-balancing policy when `backends.len() > 1`:
-    /// - `round_robin` — iptables `statistic --mode nth` cycle
-    /// - `ip_hash`     — iptables `statistic --mode random` (note: this
-    ///   is weighted random, not true hash-based stickiness. Matches the
-    ///   existing WolfRun VIP behavior so operators see one consistent
-    ///   primitive. If a future requirement needs real source-IP
-    ///   stickiness, add a separate `sticky` policy and use conntrack
-    ///   zones or the `hashmark` target.)
+    /// - `round_robin`  — weighted round-robin via iptables
+    ///   `statistic --mode nth`. Each backend is emitted `weight` times
+    ///   in the rule chain, giving exact weighted distribution.
+    /// - `ip_hash`      — weighted random via iptables
+    ///   `statistic --mode random --probability`. Conntrack pins each
+    ///   connection to its first-picked backend, so stickiness holds
+    ///   for the lifetime of a TCP stream but not across reconnects.
+    ///   The UI calls this "Random (per-connection)" to stop operators
+    ///   mistaking it for real source-IP stickiness.
+    /// - `source_hash`  — true source-IP stickiness via **nftables**
+    ///   `ip saddr jhash N mod <total_weight>`. Generator lives in
+    ///   `apply_source_hash_nft`. Requires the `nft` binary — we fall
+    ///   back to `ip_hash` semantics with a warning if it isn't there.
     #[serde(default = "default_lb_policy")]
     pub lb_policy: String,
     /// Public IP on this node that receives packets for `domain`. Set
@@ -87,6 +93,14 @@ pub struct ProxyEntry {
     /// Free-text label for the operator — shown in the UI.
     #[serde(default)]
     pub description: Option<String>,
+    /// If true, install iptables/nftables rules on **every** online
+    /// WolfStack node — not just `node_id`. Lets a peer keep serving
+    /// traffic when the primary goes down (assuming the public IP
+    /// migrates via DNS, VIP, or operator action). When false, only
+    /// the owning node installs rules — the existing default that
+    /// matches the pre-failover behavior.
+    #[serde(default)]
+    pub failover: bool,
 }
 
 fn default_lb_policy() -> String { "round_robin".into() }
@@ -94,12 +108,19 @@ fn default_lb_policy() -> String { "round_robin".into() }
 /// Where the proxy forwards traffic. The `Vm` / `Container` variants
 /// carry a resolved host at save time so apply doesn't need to re-query
 /// the VM/container manager every time rules are rebuilt.
+///
+/// `weight` governs per-backend distribution under every lb_policy.
+/// Weight 0 is treated as 1 (backends with 0 weight would never be
+/// picked — we silently coerce rather than drop them so the operator's
+/// list matches what's installed).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ProxyBackend {
     /// Free-form IP or hostname.
     Custom {
         host: String,
+        #[serde(default = "default_weight")]
+        weight: u32,
     },
     /// VM picked from the cluster.
     Vm {
@@ -109,6 +130,8 @@ pub enum ProxyBackend {
         /// proxmox, etc. Used for UI labeling and grouping.
         vm_type: String,
         host: String,
+        #[serde(default = "default_weight")]
+        weight: u32,
     },
     /// Docker or LXC container.
     Container {
@@ -117,16 +140,29 @@ pub enum ProxyBackend {
         /// "docker" or "lxc".
         container_type: String,
         host: String,
+        #[serde(default = "default_weight")]
+        weight: u32,
     },
 }
+
+fn default_weight() -> u32 { 1 }
 
 impl ProxyBackend {
     pub fn host(&self) -> &str {
         match self {
-            ProxyBackend::Custom { host } => host,
+            ProxyBackend::Custom { host, .. } => host,
             ProxyBackend::Vm { host, .. } => host,
             ProxyBackend::Container { host, .. } => host,
         }
+    }
+    /// Weight for distribution, normalized so zero never means "never".
+    pub fn weight(&self) -> u32 {
+        let w = match self {
+            ProxyBackend::Custom { weight, .. } => *weight,
+            ProxyBackend::Vm { weight, .. } => *weight,
+            ProxyBackend::Container { weight, .. } => *weight,
+        };
+        if w == 0 { 1 } else { w }
     }
 }
 
@@ -210,6 +246,216 @@ fn purge_by_comment(comment: &str) {
     }
 }
 
+/// nftables table + chain names the source_hash policy writes into.
+/// Kept in their own table so `nft flush table` only affects our rules
+/// — it never touches anything another admin or tool installed.
+const NFT_TABLE: &str = "wolfstack_proxy";
+fn nft_chain(id: &str) -> String {
+    // nftables chain names can't contain '-', so translate the id into
+    // underscores. `id` is always an alphanumeric gen_id, so this is a
+    // straight char replacement.
+    format!("e_{}", id.replace('-', "_"))
+}
+
+/// True if `nft` is on PATH. Used to gate the source_hash policy —
+/// without it we fall back to ip_hash with a warning.
+fn nft_available() -> bool {
+    Command::new("nft").arg("--version").output()
+        .map(|o| o.status.success()).unwrap_or(false)
+}
+
+/// Remove any existing nftables chain for this entry id. Idempotent —
+/// runs `nft delete chain ...` and discards errors (chain may not yet
+/// exist). Table is created lazily in apply_source_hash_nft.
+fn purge_nft_for_entry(id: &str) {
+    if !nft_available() { return; }
+    let chain = nft_chain(id);
+    // Flush first to drop any jumps from PREROUTING/OUTPUT into this
+    // chain, then delete. If the chain doesn't exist yet, both fail
+    // silently — which is fine.
+    let _ = Command::new("nft")
+        .args(["flush", "chain", "ip", NFT_TABLE, &chain])
+        .output();
+    let _ = Command::new("nft")
+        .args(["delete", "chain", "ip", NFT_TABLE, &chain])
+        .output();
+    // Also remove any jump rules in our root chains that reference this
+    // per-entry chain (otherwise they'd dangle). We re-derive the rule
+    // from the chain name rather than tracking handles.
+    for root in &["wolfstack_pre", "wolfstack_out"] {
+        // nft -a lists rule handles; we match jumps into our chain and
+        // delete by handle. Errors swallowed.
+        let out = Command::new("nft")
+            .args(["-a", "list", "chain", "ip", NFT_TABLE, root])
+            .output();
+        if let Ok(o) = out {
+            if o.status.success() {
+                let text = String::from_utf8_lossy(&o.stdout);
+                let needle = format!("jump {}", chain);
+                for line in text.lines() {
+                    if !line.contains(&needle) { continue; }
+                    // Extract "handle N" from the end of the line.
+                    if let Some(idx) = line.rfind("handle ") {
+                        let h = line[idx + 7..].trim().trim_end_matches(|c: char| !c.is_ascii_digit());
+                        if !h.is_empty() {
+                            let _ = Command::new("nft")
+                                .args(["delete", "rule", "ip", NFT_TABLE, root, "handle", h])
+                                .output();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Ensure the nftables scaffolding exists: table + two root chains
+/// hooked into prerouting/output at priority -100 so we run before the
+/// built-in iptables DNAT (priority -100 is the same as nat type
+/// prerouting, but nftables flat-priorities means whichever loads
+/// first wins — for our hash-first semantics we use priority -110,
+/// higher priority than iptables nat).
+fn ensure_nft_scaffold() -> Result<(), String> {
+    // `nft add table` and `nft add chain` are idempotent — adding an
+    // existing object returns success on recent nft versions. If the
+    // binary is older and errors on re-add, we don't care: subsequent
+    // rule adds will still succeed.
+    let _ = Command::new("nft")
+        .args(["add", "table", "ip", NFT_TABLE])
+        .output();
+    for (root, hook) in [("wolfstack_pre", "prerouting"), ("wolfstack_out", "output")] {
+        let spec = format!(
+            "chain {} {{ type nat hook {} priority -110; }}",
+            root, hook
+        );
+        let out = Command::new("nft")
+            .args(["add", "chain", "ip", NFT_TABLE, &spec])
+            .output()
+            .map_err(|e| format!("nft add chain {}: {}", root, e))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            // "File exists" is the idempotent case; anything else is real.
+            if !err.contains("File exists") && !err.contains("already exists") {
+                return Err(format!("nft add chain {}: {}", root, err));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Emit nftables rules for the source_hash policy: true source-IP
+/// stickiness via `jhash`. A client always lands on the same backend
+/// (for the same backend set — reordering the list reshuffles the map,
+/// which is inherent to hash-based LB).
+///
+/// Structure per entry:
+///   chain e_<id> {
+///     ip saddr jhash dport mod <total_weight> vmap {
+///       0: dnat to <b0>, 1: dnat to <b0>, ..., k: dnat to <bk>, ...
+///     }
+///   }
+///   wolfstack_pre { ip daddr <public_ip> jump e_<id> }
+///   wolfstack_out { ip daddr <public_ip> jump e_<id> }
+///
+/// Weights are honored by assigning `weight` consecutive hash slots to
+/// the same backend — same trick we use in the iptables round-robin
+/// path.
+fn apply_source_hash_nft(entry: &ProxyEntry, public_ip: &str, backends: &[(String, u32)])
+    -> Result<(), String>
+{
+    ensure_nft_scaffold()?;
+    let chain = nft_chain(&entry.id);
+    let total: u32 = backends.iter().map(|(_, w)| *w).sum();
+    if total == 0 {
+        return Err("total backend weight is 0".into());
+    }
+
+    // Build the vmap contents: plain "slot : ip" pairs. nftables'
+    // `dnat to ... map { ... }` form takes the DNAT destination (a
+    // bare IP) as the map *value* — the outer `dnat to` keyword is
+    // NOT repeated per entry.
+    let mut entries: Vec<String> = Vec::with_capacity(total as usize);
+    let mut slot: u32 = 0;
+    for (host, weight) in backends {
+        for _ in 0..*weight {
+            entries.push(format!("{} : {}", slot, host));
+            slot += 1;
+        }
+    }
+    let vmap = entries.join(", ");
+
+    // Create the per-entry chain (regular chain, not hooked — we jump
+    // into it from wolfstack_pre/wolfstack_out).
+    let add_chain = format!("chain {} {{ }}", chain);
+    let out = Command::new("nft")
+        .args(["add", "chain", "ip", NFT_TABLE, &add_chain])
+        .output()
+        .map_err(|e| format!("nft add chain {}: {}", chain, e))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if !err.contains("File exists") && !err.contains("already exists") {
+            return Err(format!("nft add chain {}: {}", chain, err));
+        }
+    }
+
+    // Stateless source-IP-hash DNAT. `jhash ip saddr mod N` produces a
+    // slot in [0, N-1]; the vmap turns that slot into a backend IP.
+    // 0xdeadbeef is a fixed seed so two nodes running the same config
+    // send a given source IP to the same backend — matters when the
+    // public IP migrates between cluster peers.
+    let hash_rule = format!(
+        "add rule ip {} {} ip daddr {} meta l4proto {{ tcp, udp }} \
+         dnat to jhash ip saddr mod {} seed 0xdeadbeef map {{ {} }}",
+        NFT_TABLE, chain, public_ip, total, vmap
+    );
+    let out = Command::new("nft").args(["-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(stdin) = child.stdin.as_mut() {
+                stdin.write_all(hash_rule.as_bytes())?;
+            }
+            child.wait_with_output()
+        })
+        .map_err(|e| format!("nft add rule: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "nft add rule failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+
+    // Hook into our root chains — one jump per hook, filtered to this
+    // entry's public IP so other entries aren't affected.
+    for root in &["wolfstack_pre", "wolfstack_out"] {
+        let jump = format!(
+            "add rule ip {} {} ip daddr {} jump {}",
+            NFT_TABLE, root, public_ip, chain
+        );
+        let out = Command::new("nft").args(["-f", "-"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                if let Some(stdin) = child.stdin.as_mut() {
+                    stdin.write_all(jump.as_bytes())?;
+                }
+                child.wait_with_output()
+            })
+            .map_err(|e| format!("nft add jump in {}: {}", root, e))?;
+        if !out.status.success() {
+            return Err(format!(
+                "nft add jump in {} failed: {}",
+                root, String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Detect this host's first routable IPv4 — used as the SNAT source
 /// when the backend lives on a private network the original client
 /// can't reach. Falls back to the public_ip itself if nothing obvious
@@ -248,103 +494,164 @@ fn run_iptables(args: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-/// Write iptables rules for one entry across its one-or-more backends.
+/// Write iptables/nftables rules for one entry across its backends.
 /// Captures TCP+UDP on every port — no --dport, no -p filter — so
 /// every service the backend listens on is reachable.
 ///
-/// Load-balancing with multiple backends uses the same approach as
-/// WolfRun VIPs in `src/networking/mod.rs::apply_vip_mapping_rules`:
-/// iptables `statistic --mode nth` for round-robin, `--mode random`
-/// for weighted random (exposed as "ip_hash" in the UI to match the
-/// existing terminology).
+/// Policy dispatch:
+/// - `round_robin`  — iptables `statistic --mode nth`, each backend
+///    emitted once per weight unit so the distribution is exactly
+///    weighted over `total_weight` consecutive packets.
+/// - `ip_hash`      — iptables `statistic --mode random --probability`
+///    cascade. rule i has probability `w_i / remaining_weight_total`;
+///    fall-through guarantees every packet lands somewhere.
+/// - `source_hash`  — nftables `jhash ip saddr mod total_weight vmap`
+///    for real source-IP stickiness. Falls back to `ip_hash` with a
+///    warning if nft isn't installed.
 ///
-/// Return-path SNAT rewrites the source to this node's routable IP
-/// so the backend's reply comes back through this host and conntrack
-/// un-DNATs it correctly.
+/// Return-path SNAT + FORWARD-ACCEPT always use plain iptables —
+/// they're policy-agnostic.
 fn apply_entry(entry: &ProxyEntry, public_ip: &str) -> Result<(), String> {
-    // Collect backend hosts, reject empties early. An entry with zero
-    // valid backends can't forward anything.
-    let hosts: Vec<String> = entry.backends.iter()
-        .map(|b| b.host().trim().to_string())
-        .filter(|h| !h.is_empty())
+    // Collect (host, weight) pairs, rejecting backends with empty hosts.
+    let backends: Vec<(String, u32)> = entry.backends.iter()
+        .map(|b| (b.host().trim().to_string(), b.weight()))
+        .filter(|(h, _)| !h.is_empty())
         .collect();
-    if hosts.is_empty() {
+    if backends.is_empty() {
         return Err(format!(
             "no valid backend IPs for '{}' — pick a running VM/container or enter an IP",
             entry.domain
         ));
     }
     let tag = comment_tag(&entry.id);
-    let lb = entry.lb_policy.as_str();
-    let n = hosts.len();
 
-    // PREROUTING + OUTPUT DNAT — one rule per backend with a statistic
-    // match when n > 1. "remaining" shrinks as we advance so each
-    // backend gets an equal share even though `statistic --mode nth`
-    // evaluates rules top-to-bottom.
-    for chain in &["PREROUTING", "OUTPUT"] {
-        for (i, backend) in hosts.iter().enumerate() {
-            let remaining = n - i;
-            let mut args: Vec<String> = vec![
-                "-t".into(), "nat".into(), "-A".into(), (*chain).to_string(),
-                "-d".into(), public_ip.to_string(),
-            ];
-            if remaining > 1 {
-                if lb == "ip_hash" {
-                    // Weighted random — see module docs on policy naming.
-                    let prob = 1.0 / remaining as f64;
-                    args.extend_from_slice(&[
-                        "-m".into(), "statistic".into(),
-                        "--mode".into(), "random".into(),
-                        "--probability".into(), format!("{:.6}", prob),
-                    ]);
-                } else {
-                    // round_robin
-                    args.extend_from_slice(&[
-                        "-m".into(), "statistic".into(),
-                        "--mode".into(), "nth".into(),
-                        "--every".into(), remaining.to_string(),
-                        "--packet".into(), "0".into(),
-                    ]);
-                }
-            }
-            args.extend_from_slice(&[
-                "-j".into(), "DNAT".into(),
-                "--to-destination".into(), backend.clone(),
-                "-m".into(), "comment".into(),
-                "--comment".into(), tag.clone(),
-            ]);
-            run_iptables_vec(&args)?;
+    // Dispatch source_hash to nftables *before* installing any iptables
+    // DNAT — nft hooks at priority -110 so it runs first, and we don't
+    // want iptables statistic rules also rewriting traffic in parallel.
+    let mut effective_policy = entry.lb_policy.clone();
+    if effective_policy == "source_hash" {
+        if nft_available() {
+            apply_source_hash_nft(entry, public_ip, &backends)?;
+            // SNAT + FORWARD-ACCEPT still needed so replies come back
+            // through this host and the kernel forwards them.
+            install_return_path(&backends, &tag)?;
+            return Ok(());
+        } else {
+            // Graceful fallback: keep going with ip_hash semantics and
+            // surface the missing-tool problem as a warning upstream.
+            effective_policy = "ip_hash".into();
+            tracing::warn!(
+                "proxy '{}' requested source_hash but 'nft' is not installed — \
+                 falling back to per-connection random. Install nftables for \
+                 true source-IP stickiness.",
+                entry.id
+            );
         }
     }
 
-    // Return path — SNAT + FORWARD accept, one pair per backend. SNAT
-    // source is this host's local routable IP relative to each backend
-    // (detected per-backend — they may sit on different subnets).
-    for backend in &hosts {
-        let snat_src = detect_snat_source(backend);
+    // round_robin: expand by weight. backends A,B,C with weights 3,1,2
+    // become A,A,A,B,C,C. `statistic --mode nth --every total --packet k`
+    // then picks exactly one per rule, giving perfect weighted RR.
+    //
+    // ip_hash: probability cascade. remaining_weight shrinks per-backend,
+    // rule i probability = w_i / remaining_weight.
+    let total_weight: u32 = backends.iter().map(|(_, w)| *w).sum();
+
+    for chain in &["PREROUTING", "OUTPUT"] {
+        match effective_policy.as_str() {
+            "round_robin" => {
+                let mut packet_idx: u32 = 0;
+                for (host, weight) in &backends {
+                    for _ in 0..*weight {
+                        let mut args: Vec<String> = vec![
+                            "-t".into(), "nat".into(), "-A".into(), (*chain).to_string(),
+                            "-d".into(), public_ip.to_string(),
+                        ];
+                        if total_weight > 1 {
+                            args.extend_from_slice(&[
+                                "-m".into(), "statistic".into(),
+                                "--mode".into(), "nth".into(),
+                                "--every".into(), total_weight.to_string(),
+                                "--packet".into(), packet_idx.to_string(),
+                            ]);
+                        }
+                        args.extend_from_slice(&[
+                            "-j".into(), "DNAT".into(),
+                            "--to-destination".into(), host.clone(),
+                            "-m".into(), "comment".into(),
+                            "--comment".into(), tag.clone(),
+                        ]);
+                        run_iptables_vec(&args)?;
+                        packet_idx += 1;
+                    }
+                }
+            }
+            _ => {
+                // ip_hash (and anything we don't recognize — safest
+                // default is probability cascade).
+                let mut remaining = total_weight;
+                for (i, (host, weight)) in backends.iter().enumerate() {
+                    let mut args: Vec<String> = vec![
+                        "-t".into(), "nat".into(), "-A".into(), (*chain).to_string(),
+                        "-d".into(), public_ip.to_string(),
+                    ];
+                    // Last backend gets no probability match — it's the
+                    // fall-through for anything the earlier rules didn't
+                    // claim, which guarantees 100% delivery.
+                    if i + 1 < backends.len() && remaining > *weight {
+                        let prob = *weight as f64 / remaining as f64;
+                        args.extend_from_slice(&[
+                            "-m".into(), "statistic".into(),
+                            "--mode".into(), "random".into(),
+                            "--probability".into(), format!("{:.6}", prob),
+                        ]);
+                    }
+                    args.extend_from_slice(&[
+                        "-j".into(), "DNAT".into(),
+                        "--to-destination".into(), host.clone(),
+                        "-m".into(), "comment".into(),
+                        "--comment".into(), tag.clone(),
+                    ]);
+                    run_iptables_vec(&args)?;
+                    remaining = remaining.saturating_sub(*weight);
+                }
+            }
+        }
+    }
+
+    install_return_path(&backends, &tag)?;
+    Ok(())
+}
+
+/// SNAT + FORWARD-ACCEPT pair for each distinct backend. Shared between
+/// the iptables policies and the nftables source_hash path — the return
+/// path works the same regardless of how we DNAT'd going out.
+fn install_return_path(backends: &[(String, u32)], tag: &str) -> Result<(), String> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (host, _) in backends {
+        if !seen.insert(host.as_str()) { continue; }
+        let snat_src = detect_snat_source(host);
         let snat_args: Vec<String> = vec![
             "-t".into(), "nat".into(), "-A".into(), "POSTROUTING".into(),
-            "-d".into(), backend.clone(),
+            "-d".into(), host.clone(),
             "-j".into(), "SNAT".into(),
             "--to-source".into(), snat_src,
             "-m".into(), "comment".into(),
-            "--comment".into(), tag.clone(),
+            "--comment".into(), tag.to_string(),
         ];
         run_iptables_vec(&snat_args)?;
 
         let fwd_args: Vec<String> = vec![
             "-I".into(), "FORWARD".into(), "1".into(),
-            "-d".into(), backend.clone(),
+            "-d".into(), host.clone(),
             "-m".into(), "conntrack".into(),
             "--ctstate".into(), "DNAT".into(),
             "-j".into(), "ACCEPT".into(),
             "-m".into(), "comment".into(),
-            "--comment".into(), tag.clone(),
+            "--comment".into(), tag.to_string(),
         ];
         run_iptables_vec(&fwd_args)?;
     }
-
     Ok(())
 }
 
@@ -365,12 +672,23 @@ pub fn apply_for_node(proxies: &[ProxyEntry], self_node_id: &str) -> Vec<String>
     let _ = std::fs::write("/proc/sys/net/ipv4/ip_forward", "1");
 
     for entry in proxies {
-        // Always purge first, even for disabled entries — an operator
-        // toggling `enabled=false` expects the forward to go away.
+        // Always purge first (both iptables AND nftables), even for
+        // disabled entries — an operator toggling `enabled=false`
+        // expects the forward to go away regardless of which policy
+        // installed the last set of rules.
         purge_by_comment(&comment_tag(entry.id.as_str()));
+        purge_nft_for_entry(entry.id.as_str());
 
         if !entry.enabled { continue; }
-        if entry.node_id != self_node_id { continue; }
+
+        // Apply on this node if either (a) we're the declared owner,
+        // or (b) the entry opts into cluster-wide failover — in which
+        // case every WolfStack node installs the rules so any peer
+        // that receives traffic (via DNS, VIP, or manual takeover)
+        // can forward it to the backends.
+        let owns = entry.node_id == self_node_id;
+        let failover = entry.failover;
+        if !owns && !failover { continue; }
 
         // Clone so we can write the resolved IP back without fighting
         // with the caller's borrow — the real persistence happens in
@@ -398,9 +716,11 @@ pub fn apply_for_node(proxies: &[ProxyEntry], self_node_id: &str) -> Vec<String>
     warnings
 }
 
-/// Remove all iptables rules belonging to one entry id. Called from
-/// the DELETE handler so stale rules don't linger between the config
-/// write and the next apply.
+/// Remove all iptables AND nftables rules belonging to one entry id.
+/// Called from the DELETE handler so stale rules don't linger between
+/// the config write and the next apply, on every node — not just the
+/// owner — so failover'd entries clean up everywhere.
 pub fn remove_one(id: &str) {
     purge_by_comment(&comment_tag(id));
+    purge_nft_for_entry(id);
 }

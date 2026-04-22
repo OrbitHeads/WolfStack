@@ -2274,10 +2274,17 @@
 
         <!-- ═══ Component Detail Page ═══ -->
         <div id="page-component-detail" class="page-view" style="display:none;">
-            <div style="margin-bottom: 16px;">
+            <div style="margin-bottom: 16px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
                 <button class="btn btn-sm" onclick="selectServerView(currentNodeId, 'components')" id="back-to-components">
                     ← Back to Components
                 </button>
+                <div style="flex:1;"></div>
+                <button class="btn btn-success btn-sm" id="detail-top-btn-start" style="display:none;"
+                    onclick="detailServiceAction('start')">▶ Start</button>
+                <button class="btn btn-sm" id="detail-top-btn-restart" style="display:none;"
+                    onclick="detailServiceAction('restart')">↻ Restart</button>
+                <button class="btn btn-danger btn-sm" id="detail-top-btn-stop" style="display:none;"
+                    onclick="detailServiceAction('stop')">■ Stop</button>
             </div>
 
             <div id="detail-stats-grid" class="stats-grid" style="margin-bottom: 20px;">

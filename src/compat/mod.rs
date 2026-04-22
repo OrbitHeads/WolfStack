@@ -192,16 +192,30 @@ pub async fn report_license_heartbeat(cluster: &crate::agent::ClusterState) {
         "arch": std::env::consts::ARCH,
     });
 
-    let _ = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap_or_default()
+    // Shared pool — see HEARTBEAT_CLIENT below. Daily heartbeat; low
+    // volume but no reason to leak a pool each run.
+    let resp = HEARTBEAT_CLIENT
         .post("https://wolfstack.org/adminsys/heartbeat.php")
         .json(&payload)
         .send()
         .await;
+    if let Ok(r) = resp {
+        // Drain body so the socket returns to the keep-alive pool
+        // — we don't care about the response content.
+        let _ = r.bytes().await;
+    }
 }
+
+/// Shared HTTP client for the daily license heartbeat. One pool for
+/// the lifetime of the process.
+static HEARTBEAT_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
 
 fn ts_full() -> String {
     let s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();

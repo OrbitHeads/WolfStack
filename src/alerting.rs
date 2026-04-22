@@ -5,8 +5,24 @@ use std::time::Instant;
 
 fn alerts_config_file() -> String { crate::paths::get().alerts_config }
 
+/// Shared HTTP client for every outbound alert notification (Discord
+/// webhook, Slack webhook, Telegram bot API). Same pattern as
+/// src/wolfrun/mod.rs (v19.8.1 fix) and the new shared clients in
+/// src/statuspage/mod.rs and src/networking/router/api.rs: one pool
+/// for the lifetime of the process. Alerts are event-driven, so the
+/// per-call leak rate was lower than the statuspage tick loops — but
+/// during an incident storm (many alerts firing back-to-back) the
+/// same CLOSE_WAIT pile-up still applied.
+static ALERT_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
 /// Cooldown duration — same alert type for the same node won't re-fire within this window
-const ALERT_COOLDOWN_SECS: u64 = 15 * 60; // 15 minutes
+const ALERT_COOLDOWN_SECS: u64 = 900; // 15 minutes = 900 seconds.
 
 /// A threshold alert that was triggered
 #[derive(Debug, Clone)]
@@ -354,10 +370,7 @@ pub async fn send_test(config: &AlertConfig) -> Vec<(String, Result<(), String>)
 
 // ── Discord webhook ──
 async fn send_discord(webhook_url: &str, title: &str, message: &str) -> Result<(), String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = &*ALERT_CLIENT;
 
     let payload = serde_json::json!({
         "embeds": [{
@@ -375,19 +388,22 @@ async fn send_discord(webhook_url: &str, title: &str, message: &str) -> Result<(
         .await
         .map_err(|e| e.to_string())?;
 
-    if resp.status().is_success() || resp.status().as_u16() == 204 {
+    let status = resp.status();
+    let is_ok = status.is_success() || status.as_u16() == 204;
+    // Drain the body so the socket returns to the keep-alive pool.
+    // Discord's 204 ack and error bodies both carry content that
+    // reqwest won't release the connection for until consumed.
+    let _ = resp.bytes().await;
+    if is_ok {
         Ok(())
     } else {
-        Err(format!("Discord HTTP {}", resp.status()))
+        Err(format!("Discord HTTP {}", status))
     }
 }
 
 // ── Slack webhook ──
 async fn send_slack(webhook_url: &str, title: &str, message: &str) -> Result<(), String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = &*ALERT_CLIENT;
 
     let payload = serde_json::json!({
         "blocks": [
@@ -403,19 +419,18 @@ async fn send_slack(webhook_url: &str, title: &str, message: &str) -> Result<(),
         .await
         .map_err(|e| e.to_string())?;
 
-    if resp.status().is_success() {
+    let status = resp.status();
+    let _ = resp.bytes().await;
+    if status.is_success() {
         Ok(())
     } else {
-        Err(format!("Slack HTTP {}", resp.status()))
+        Err(format!("Slack HTTP {}", status))
     }
 }
 
 // ── Telegram bot ──
 async fn send_telegram(bot_token: &str, chat_id: &str, title: &str, message: &str) -> Result<(), String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = &*ALERT_CLIENT;
 
     let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
     let text = format!("*{}*\n\n{}", title, message);
@@ -433,7 +448,10 @@ async fn send_telegram(bot_token: &str, chat_id: &str, title: &str, message: &st
         .await
         .map_err(|e| e.to_string())?;
 
+    // `.text()` fully consumes the body, so this path already drains
+    // the socket properly for both success and failure.
     if resp.status().is_success() {
+        let _ = resp.text().await;
         Ok(())
     } else {
         let body = resp.text().await.unwrap_or_default();

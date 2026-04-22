@@ -6,6 +6,19 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+/// Shared HTTP client for every PveClient instance and the ad-hoc
+/// upload/preflight/sync calls. Previously every PveClient::new()
+/// built a fresh Client (one leaked pool per managed PVE node), and
+/// the upload/preflight/sync sites did the same per call.
+static PVE_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .danger_accept_invalid_certs(true) // PVE often uses self-signed certs
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
 /// Proxmox VE API client for managing remote PVE nodes
 pub struct PveClient {
     base_url: String,
@@ -50,18 +63,13 @@ impl PveClient {
     /// Create a new PVE API client
     /// token format: "PVEAPIToken=user@realm!tokenid=uuid"
     pub fn new(address: &str, port: u16, token: &str, fingerprint: Option<&str>, node_name: &str) -> Self {
-        let builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .danger_accept_invalid_certs(true); // PVE often uses self-signed certs
-
-        let client = builder.build().unwrap_or_else(|_| reqwest::Client::new());
-
+        // Cheap Arc clone of the shared pool — see PVE_CLIENT.
         Self {
             base_url: format!("https://{}:{}", address, port),
             token: token.to_string(),
             fingerprint: fingerprint.map(|s| s.to_string()),
             node_name: node_name.to_string(),
-            client,
+            client: reqwest::Client::clone(&PVE_CLIENT),
         }
     }
 
@@ -440,12 +448,10 @@ impl PveClient {
     ) -> Result<(u64, String), String> {
         let storage_id = storage.unwrap_or("local");
 
-        // Build a long-timeout client for large file uploads
-        let upload_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(600)) // 10 min
-            .danger_accept_invalid_certs(true)
-            .build()
-            .map_err(|e| format!("Failed to build upload client: {}", e))?;
+        // Shared pool (see PVE_CLIENT) with a per-request 10-minute
+        // timeout for large uploads. RequestBuilder::timeout overrides
+        // the Client default.
+        let upload_client = &*PVE_CLIENT;
 
         // Step 1: Upload the archive to storage via multipart form
         //   POST /api2/json/nodes/{node}/storage/{storage}/upload
@@ -466,6 +472,7 @@ impl PveClient {
 
         let resp = upload_client.post(&upload_url)
             .header("Authorization", self.auth_header())
+            .timeout(Duration::from_secs(600))
             .multipart(form)
             .send()
             .await
@@ -476,6 +483,10 @@ impl PveClient {
             let body = resp.text().await.unwrap_or_default();
             return Err(format!("PVE upload failed ({}): {}", status.as_u16(), body));
         }
+        // Drain the success body too so the socket returns to the
+        // pool. PVE's upload response is a tiny JSON ack we don't
+        // need to parse.
+        let _ = resp.bytes().await;
 
 
         // Step 2: Get the next available VMID
@@ -519,6 +530,8 @@ impl PveClient {
             let body = resp.text().await.unwrap_or_default();
             return Err(format!("PVE restore failed ({}): {}", status.as_u16(), body));
         }
+        // Drain the success body → socket back to pool.
+        let _ = resp.bytes().await;
 
         let msg = format!("Container '{}' restored as VMID {} on {} (storage: {})",
             new_name, new_vmid, self.node_name, restore_storage);

@@ -28,6 +28,19 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::{info, warn};
 
+/// Shared HTTP client across every Telegram bot polling task. Each
+/// bot was building its own per-task Client; a shared pool means we
+/// keep one connection pool total (per operator typically runs 1–3
+/// bots). Timeout is set per request — getUpdates uses 65s (long-poll
+/// deadline + slack), send_message uses the default 30s.
+pub(crate) static TELEGRAM_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
 type AppData = web::Data<crate::api::AppState>;
 
 /// Minimal shape of a Telegram `Message`. Only fields we route on.
@@ -256,10 +269,12 @@ pub async fn send_telegram_message(
         .json(&payload)
         .send().await
         .map_err(|e| format!("http: {}", e))?;
-    if !resp.status().is_success() {
-        let code = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Telegram API {}: {}", code, body.chars().take(200).collect::<String>()));
+    let status = resp.status();
+    // `.text()` drains the body regardless of status, so the
+    // connection returns to the pool cleanly in both arms.
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("Telegram API {}: {}", status.as_u16(), body.chars().take(200).collect::<String>()));
     }
     Ok(())
 }
@@ -334,19 +349,11 @@ fn tok_tail(t: &str) -> String {
 /// Each bot keeps its own `offset` so Telegram's ack semantics are
 /// correct per-bot (offsets are scoped to the bot that issued them).
 async fn long_poll_forever(bot_token: String, state: AppData) {
-    let http = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("telegram_bot: cannot build http client for …{}: {}", tok_tail(&bot_token), e);
-            return;
-        }
-    };
+    // Shared pool — see TELEGRAM_CLIENT. Every bot task reuses it.
+    let http = &*TELEGRAM_CLIENT;
     let mut offset: i64 = 0;
     loop {
-        match poll_once(&http, &bot_token, offset, &state).await {
+        match poll_once(http, &bot_token, offset, &state).await {
             Ok(next) => { offset = next; }
             Err(e) => {
                 warn!("telegram_bot (bot …{}): poll error — {}", tok_tail(&bot_token), e);

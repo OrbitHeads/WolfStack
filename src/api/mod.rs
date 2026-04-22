@@ -24,6 +24,31 @@ use crate::appstore;
 mod pve_console;
 mod cluster_browser_proxy;
 
+/// Shared HTTP client for every cluster-peer / external / self-loop
+/// call in this file. Previously ~40 API handlers each built their
+/// own `reqwest::Client::builder()...build()`, leaking a connection
+/// pool per handler invocation. Timeouts are set per-request via
+/// `RequestBuilder::timeout` because each call site uses a different
+/// deadline (3s health-check through 600s VM migration). A 3s
+/// `connect_timeout` at Client level makes dead peers fail fast
+/// without burning the full per-request budget on TCP handshake.
+pub(crate) static API_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
+/// Drain a response body before discarding so the socket returns to
+/// the keep-alive pool. Used by handlers that only care about
+/// `.status()` and would otherwise drop the Response unread.
+#[allow(dead_code)]
+async fn drain_response(resp: reqwest::Response) {
+    let _ = resp.bytes().await;
+}
+
 /// Build ordered URLs to try for inter-node communication.
 /// Tries: HTTPS on main port, HTTP on internal port (port+1), HTTP on main port.
 /// This ensures both TLS-enabled and HTTP-only nodes are reachable.
@@ -1121,11 +1146,7 @@ pub async fn cluster_secret_generate(req: HttpRequest, state: web::Data<AppState
 
     // Propagate to all online nodes across all clusters
     let nodes = state.cluster.get_all_nodes();
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap_or_default();
+    let client = &*API_HTTP_CLIENT;
 
     let mut results = Vec::new();
     for node in &nodes {
@@ -1137,13 +1158,14 @@ pub async fn cluster_secret_generate(req: HttpRequest, state: web::Data<AppState
         let mut err = String::new();
         for url in &urls {
             match client.post(url)
+                .timeout(std::time::Duration::from_secs(10))
                 .header("X-WolfStack-Secret", crate::auth::default_cluster_secret())
                 .json(&serde_json::json!({ "secret": new_secret }))
                 .send()
                 .await
             {
-                Ok(resp) if resp.status().is_success() => { pushed = true; break; }
-                Ok(resp) => { err = format!("HTTP {}", resp.status()); }
+                Ok(resp) if resp.status().is_success() => { pushed = true; let _ = resp.bytes().await; break; }
+                Ok(resp) => { err = format!("HTTP {}", resp.status()); let _ = resp.bytes().await; }
                 Err(e) => { err = format!("{}", e); }
             }
         }
@@ -1173,11 +1195,7 @@ pub async fn cluster_secret_repush(req: HttpRequest, state: web::Data<AppState>)
     }
 
     let nodes = state.cluster.get_all_nodes();
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap_or_default();
+    let client = &*API_HTTP_CLIENT;
 
     let mut results = Vec::new();
     for node in &nodes {
@@ -1189,13 +1207,14 @@ pub async fn cluster_secret_repush(req: HttpRequest, state: web::Data<AppState>)
         let mut err = String::new();
         for url in &urls {
             match client.post(url)
+                .timeout(std::time::Duration::from_secs(10))
                 .header("X-WolfStack-Secret", crate::auth::default_cluster_secret())
                 .json(&serde_json::json!({ "secret": active }))
                 .send()
                 .await
             {
-                Ok(resp) if resp.status().is_success() => { pushed = true; break; }
-                Ok(resp) => { err = format!("HTTP {}", resp.status()); }
+                Ok(resp) if resp.status().is_success() => { pushed = true; let _ = resp.bytes().await; break; }
+                Ok(resp) => { err = format!("HTTP {}", resp.status()); let _ = resp.bytes().await; }
                 Err(e) => { err = format!("{}", e); }
             }
         }
@@ -1350,22 +1369,12 @@ pub async fn add_node(req: HttpRequest, state: web::Data<AppState>, body: web::J
             format!("http://{}:{}{}", body.address, port, verify_path),
         ];
 
-        let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .danger_accept_invalid_certs(true)
-            .build() {
-            Ok(c) => c,
-            Err(e) => {
-                return HttpResponse::InternalServerError().json(serde_json::json!({
-                    "error": format!("HTTP client error: {}", e)
-                }));
-            }
-        };
+        let client = &*API_HTTP_CLIENT;
 
         let mut last_error = String::new();
         let mut verified = false;
         for url in &urls {
-            match client.get(url).send().await {
+            match client.get(url).timeout(std::time::Duration::from_secs(5)).send().await {
                 Ok(resp) => {
                     if let Ok(data) = resp.json::<serde_json::Value>().await {
                         if data.get("valid").and_then(|v| v.as_bool()) == Some(true) {
@@ -1406,6 +1415,7 @@ pub async fn add_node(req: HttpRequest, state: web::Data<AppState>, body: web::J
             // Try the active cluster secret first, then the default (new node may not have received custom secret yet)
             for secret in [&cluster_secret, &default_secret.to_string()] {
                 if let Ok(resp) = client.get(url)
+                    .timeout(std::time::Duration::from_secs(5))
                     .header("X-WolfStack-Secret", secret)
                     .send().await
                 {
@@ -1469,20 +1479,19 @@ pub async fn add_node(req: HttpRequest, state: web::Data<AppState>, body: web::J
             let addr = body.address.clone();
             let secret = active_secret;
             tokio::spawn(async move {
-                let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(10))
-                    .danger_accept_invalid_certs(true)
-                    .build()
-                    .unwrap_or_default();
+                let client = &*API_HTTP_CLIENT;
                 let urls = build_node_urls(&addr, port, "/api/cluster/secret/receive");
                 for url in &urls {
                     if let Ok(resp) = client.post(url)
+                        .timeout(std::time::Duration::from_secs(10))
                         .header("X-WolfStack-Secret", crate::auth::default_cluster_secret())
                         .json(&serde_json::json!({ "secret": secret }))
                         .send()
                         .await
                     {
-                        if resp.status().is_success() { break; }
+                        let success = resp.status().is_success();
+                        let _ = resp.bytes().await;
+                        if success { break; }
                     }
                 }
             });
@@ -1508,20 +1517,19 @@ pub async fn remove_node(req: HttpRequest, state: web::Data<AppState>, path: web
         let secret = state.cluster_secret.clone();
         let delete_id = id.clone();
         tokio::spawn(async move {
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .unwrap_or_default();
+            let client = &*API_HTTP_CLIENT;
             for node in &nodes {
                 if node.is_self || !node.online { continue; }
                 // Try HTTPS first, then HTTP on port+1, then HTTP on main port
                 let urls = build_node_urls(&node.address, node.port, &format!("/api/nodes/{}", delete_id));
                 for url in &urls {
-                    if let Ok(_) = client.delete(url)
+                    if let Ok(resp) = client.delete(url)
+                        .timeout(std::time::Duration::from_secs(5))
                         .header("X-WolfStack-Secret", &secret)
                         .send()
                         .await
                     {
+                        let _ = resp.bytes().await;
                         break; // Success, no need to try next URL
                     }
                 }
@@ -1615,22 +1623,19 @@ pub async fn update_node_settings(req: HttpRequest, state: web::Data<AppState>, 
                     let address = node.address.clone();
                     let port = node.port;
                     tokio::spawn(async move {
-                        let client = reqwest::Client::builder()
-                            .timeout(std::time::Duration::from_secs(5))
-                            .danger_accept_invalid_certs(true)
-                            .build()
-                            .unwrap_or_default();
+                        let client = &*API_HTTP_CLIENT;
                         let urls = build_node_urls(&address, port, "/api/settings/login-disabled");
                         let payload = serde_json::json!({ "login_disabled": disabled });
                         for url in &urls {
-                            if let Ok(_) = client.post(url)
+                            if let Ok(resp) = client.post(url)
+                                .timeout(std::time::Duration::from_secs(5))
                                 .header("X-WolfStack-Secret", &secret)
                                 .header("Content-Type", "application/json")
                                 .body(payload.to_string())
                                 .send()
                                 .await
                             {
-
+                                let _ = resp.bytes().await;
                                 break;
                             }
                         }
@@ -1649,22 +1654,18 @@ pub async fn update_node_settings(req: HttpRequest, state: web::Data<AppState>, 
                     let port = node.port;
                     let cluster_name_val = name.clone();
                     tokio::spawn(async move {
-                        let client = reqwest::Client::builder()
-                            .timeout(std::time::Duration::from_secs(5))
-                            .danger_accept_invalid_certs(true)
-                            .build()
-                            .unwrap_or_default();
+                        let client = &*API_HTTP_CLIENT;
                         let urls = build_node_urls(&address, port, "/api/agent/cluster-name");
                         let payload = serde_json::json!({ "cluster_name": cluster_name_val });
                         for url in &urls {
-                            if client.post(url)
+                            if let Ok(resp) = client.post(url)
+                                .timeout(std::time::Duration::from_secs(5))
                                 .header("X-WolfStack-Secret", &secret)
                                 .json(&payload)
                                 .send()
                                 .await
-                                .is_ok()
                             {
-
+                                let _ = resp.bytes().await;
                                 break;
                             }
                         }
@@ -1747,13 +1748,7 @@ pub async fn wolfnet_sync_cluster(req: HttpRequest, state: web::Data<AppState>, 
         port: u16,
     }
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("HTTP client error: {}", e)})),
-    };
+    let client = &*API_HTTP_CLIENT;
 
     let mut infos: Vec<NodeWnInfo> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
@@ -1812,6 +1807,7 @@ pub async fn wolfnet_sync_cluster(req: HttpRequest, state: web::Data<AppState>, 
             let mut fetched = false;
             for url in &urls {
                 match client.get(url)
+                    .timeout(std::time::Duration::from_secs(10))
                     .header("X-WolfStack-Secret", &state.cluster_secret)
                     .send().await
                 {
@@ -1901,6 +1897,7 @@ pub async fn wolfnet_sync_cluster(req: HttpRequest, state: web::Data<AppState>, 
                 let mut posted = false;
                 for url in &urls {
                     match client.post(url)
+                        .timeout(std::time::Duration::from_secs(10))
                         .header("X-WolfStack-Secret", &state.cluster_secret)
                         .header("Content-Type", "application/json")
                         .body(payload.to_string())
@@ -1950,14 +1947,7 @@ pub async fn cluster_diagnose(req: HttpRequest, state: web::Data<AppState>, body
     let node_ids = &body.node_ids;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .danger_accept_invalid_certs(true)
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("HTTP client error: {}", e)})),
-    };
+    let client = &*API_HTTP_CLIENT;
 
     let mut results = Vec::new();
 
@@ -2023,6 +2013,7 @@ pub async fn cluster_diagnose(req: HttpRequest, state: web::Data<AppState>, body
         for url in &urls {
             let start = std::time::Instant::now();
             match client.get(url)
+                .timeout(std::time::Duration::from_secs(15))
                 .header("X-WolfStack-Secret", &state.cluster_secret)
                 .send().await
             {
@@ -3058,31 +3049,22 @@ pub async fn geolocate(req: HttpRequest, state: web::Data<AppState>, query: web:
 
     // Call ip-api.com server-side (HTTP is fine from backend)
     let url = format!("http://ip-api.com/json/{}", ip);
-    match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-    {
-        Ok(client) => {
-            match client.get(&url).send().await {
-                Ok(resp) => {
-                    match resp.json::<serde_json::Value>().await {
-                        Ok(data) => HttpResponse::Ok().json(data),
-                        Err(e) => HttpResponse::Ok().json(serde_json::json!({
-                            "status": "fail",
-                            "message": format!("Failed to parse response: {}", e),
-                            "query": ip
-                        })),
-                    }
-                }
+    let client = &*API_HTTP_CLIENT;
+    match client.get(&url).timeout(std::time::Duration::from_secs(5)).send().await {
+        Ok(resp) => {
+            match resp.json::<serde_json::Value>().await {
+                Ok(data) => HttpResponse::Ok().json(data),
                 Err(e) => HttpResponse::Ok().json(serde_json::json!({
                     "status": "fail",
-                    "message": format!("Request failed: {}", e),
+                    "message": format!("Failed to parse response: {}", e),
                     "query": ip
                 })),
             }
         }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
-            "error": format!("HTTP client error: {}", e)
+        Err(e) => HttpResponse::Ok().json(serde_json::json!({
+            "status": "fail",
+            "message": format!("Request failed: {}", e),
+            "query": ip
         })),
     }
 }
@@ -3129,17 +3111,8 @@ pub async fn node_proxy(
 
     let timeout_secs = if method == actix_web::http::Method::POST || method == actix_web::http::Method::PUT { 300 } else { 120 };
 
-    // Build a client that accepts self-signed certificates (inter-node traffic)
-    // Short connect_timeout so failed URL schemes fail fast without blocking
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout_secs))
-        .connect_timeout(std::time::Duration::from_secs(3))
-        .danger_accept_invalid_certs(true)
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("HTTP client error: {}", e)})),
-    };
+    // Use the shared client (accepts self-signed certs, connect_timeout 3s)
+    let client = &*API_HTTP_CLIENT;
 
     let mut last_error = String::new();
 
@@ -3153,6 +3126,7 @@ pub async fn node_proxy(
             _ => client.get(url),
         };
 
+        builder = builder.timeout(std::time::Duration::from_secs(timeout_secs));
         builder = builder.header("content-type", &content_type);
         builder = builder.header("X-WolfStack-Secret", state.cluster_secret.clone());
         if !body_vec.is_empty() {
@@ -3566,16 +3540,12 @@ pub async fn remote_storage_list(
     };
 
     let urls = build_external_urls(&target, "/api/storage/list");
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(10))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap_or_default();
+    let client = &*API_HTTP_CLIENT;
 
     let mut last_err = String::new();
     for url in &urls {
         match client.get(url)
+            .timeout(std::time::Duration::from_secs(10))
             .header("X-WolfStack-Secret", state.cluster_secret.clone())
             .send()
             .await
@@ -3587,7 +3557,9 @@ pub async fn remote_storage_list(
                     .body(body);
             }
             Ok(r) => {
-                last_err = format!("{}: HTTP {}", url, r.status());
+                let status = r.status();
+                last_err = format!("{}: HTTP {}", url, status);
+                let _ = r.bytes().await;
                 continue;
             }
             Err(e) => {
@@ -3706,17 +3678,14 @@ pub async fn wolfnet_network_status(req: HttpRequest, state: web::Data<AppState>
     let mut remote_used: Vec<u8> = Vec::new();
     let nodes = state.cluster.get_all_nodes();
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap_or_default();
+    let client = &*API_HTTP_CLIENT;
 
     for node in &nodes {
         if node.is_self || !node.online { continue; }
         let urls = build_node_urls(&node.address, node.port, "/api/wolfnet/used-ips");
         for url in &urls {
             if let Ok(resp) = client.get(url)
+                .timeout(std::time::Duration::from_secs(3))
                 .header("X-WolfStack-Secret", state.cluster_secret.clone())
                 .send().await {
                 if let Ok(ips) = resp.json::<Vec<String>>().await {
@@ -4010,17 +3979,13 @@ pub async fn control_panel_inventory(req: HttpRequest, state: web::Data<AppState
         .filter(|n| n.is_self || (n.online && now.saturating_sub(n.last_seen) < 300))
         .collect();
     let secret = state.cluster_secret.clone();
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    let client = &*API_HTTP_CLIENT;
 
     let mut items: Vec<serde_json::Value> = Vec::new();
     let mut node_errors: Vec<serde_json::Value> = Vec::new();
 
     for node in &nodes {
-        let (mut n_items, mut n_errs) = fetch_one_node_inventory(&state, &client, node, &secret).await;
+        let (mut n_items, mut n_errs) = fetch_one_node_inventory(&state, client, node, &secret).await;
         items.append(&mut n_items);
         node_errors.append(&mut n_errs);
     }
@@ -4153,12 +4118,8 @@ pub async fn control_panel_inventory_node(
         return HttpResponse::NotFound().json(serde_json::json!({"error": "node not found"}));
     };
     let secret = state.cluster_secret.clone();
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    let (items, errors) = fetch_one_node_inventory(&state, &client, &node, &secret).await;
+    let client = &*API_HTTP_CLIENT;
+    let (items, errors) = fetch_one_node_inventory(&state, client, &node, &secret).await;
     HttpResponse::Ok().json(serde_json::json!({
         "node_id": node.id,
         "items": items,
@@ -4174,15 +4135,17 @@ async fn fetch_local_json(state: &web::Data<AppState>, path: &str) -> Option<ser
     // listener is bound.
     let ports = crate::ports::PortConfig::load();
     let port = if state.tls_enabled { ports.inter_node } else { ports.api };
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .ok()?;
+    let client = &*API_HTTP_CLIENT;
     let url = format!("http://127.0.0.1:{}{}", port, path);
     let resp = client.get(&url)
+        .timeout(std::time::Duration::from_secs(5))
         .header("X-WolfStack-Secret", state.cluster_secret.clone())
         .send().await.ok()?;
-    if !resp.status().is_success() { return None; }
+    if !resp.status().is_success() {
+        // Drain error body → socket returns to keep-alive pool.
+        let _ = resp.bytes().await;
+        return None;
+    }
     resp.json::<serde_json::Value>().await.ok()
 }
 
@@ -4197,10 +4160,17 @@ async fn fetch_remote_json(
     for url in &urls {
         if let Ok(resp) = client.get(url)
             .header("X-WolfStack-Secret", secret)
+            .timeout(std::time::Duration::from_secs(5))
             .send().await
         {
             if resp.status().is_success() {
                 if let Ok(j) = resp.json::<serde_json::Value>().await { return Some(j); }
+                // json() failing still consumed the body.
+            } else {
+                // Non-success: drain the body so the connection
+                // returns to the keep-alive pool. Previously this
+                // dropped `resp` unread, preventing reuse.
+                let _ = resp.bytes().await;
             }
         }
     }
@@ -5090,12 +5060,7 @@ async fn lxc_remote_clone(
 
     let storage_val = storage.unwrap_or("").to_string();
 
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(600))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap_or_default();
+    let client = &*API_HTTP_CLIENT;
 
     let file_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
     let meta_json = serde_json::to_string(&meta).unwrap_or_default();
@@ -5115,6 +5080,7 @@ async fn lxc_remote_clone(
         }
 
         match client.post(import_url)
+            .timeout(std::time::Duration::from_secs(600))
             .header("X-WolfStack-Secret", state.cluster_secret.clone())
             .multipart(form)
             .send()
@@ -5542,23 +5508,19 @@ pub async fn lxc_migrate_external(
     tokio::spawn(async move {
         // 1. Pre-flight
         let preflight_urls = build_external_urls(&target_url, "/api/storage/list");
-        let preflight_client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(10))
-            .danger_accept_invalid_certs(true)
-            .build()
-            .unwrap_or_default();
+        let preflight_client = &*API_HTTP_CLIENT;
 
         let mut preflight_ok = false;
         let mut preflight_err = String::new();
         for url in &preflight_urls {
             // Just check connectivity — any HTTP response means the destination is running
             match preflight_client.get(url)
+                .timeout(std::time::Duration::from_secs(10))
                 .header("X-WolfStack-Secret", cluster_secret.clone())
                 .send()
                 .await
             {
-                Ok(_) => { preflight_ok = true; break; } // any response = reachable
+                Ok(resp) => { let _ = resp.bytes().await; preflight_ok = true; break; } // any response = reachable
                 Err(e) => { preflight_err = format!("{}: {}", url, e); }
             }
         }
@@ -5597,12 +5559,7 @@ pub async fn lxc_migrate_external(
         let import_urls = build_external_urls(&target_url, "/api/containers/lxc/import-external");
         let file_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
 
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(600))
-            .danger_accept_invalid_certs(true)
-            .build()
-            .unwrap_or_default();
+        let client = &*API_HTTP_CLIENT;
 
         let mut last_err: Option<String> = None;
 
@@ -5615,6 +5572,7 @@ pub async fn lxc_migrate_external(
                     .file_name(file_name.clone()));
 
             match client.post(import_url)
+                .timeout(std::time::Duration::from_secs(600))
                 .header("X-Transfer-Token", &target_token)
                 .header("X-WolfStack-Secret", cluster_secret.clone())
                 .multipart(form)
@@ -5624,6 +5582,7 @@ pub async fn lxc_migrate_external(
                 Ok(r) => {
                     containers::lxc_export_cleanup(archive_path.to_str().unwrap_or(""));
                     if r.status().is_success() {
+                        let _ = r.bytes().await;
                         migration_update(&tasks, &tid, "import", "Importing on destination...");
                         migration_done(&tasks, &tid, &format!("Container '{}' transferred. Destination is stopped — start it manually.", name));
                     } else {
@@ -6087,11 +6046,7 @@ pub async fn wolfnet_next_ip(
     // Query ALL remote cluster nodes for their used WolfNet IPs
     // to prevent cross-node IP collisions
     let nodes = state.cluster.get_all_nodes();
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap_or_default();
+    let client = &*API_HTTP_CLIENT;
 
     let mut remote_ips: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -6100,6 +6055,7 @@ pub async fn wolfnet_next_ip(
         let urls = build_node_urls(&node.address, node.port, "/api/wolfnet/used-ips");
         for url in &urls {
             if let Ok(resp) = client.get(url)
+                .timeout(std::time::Duration::from_secs(3))
                 .header("X-WolfStack-Secret", state.cluster_secret.clone())
                 .send().await
             {
@@ -7110,8 +7066,8 @@ pub async fn ai_models(
         }
         let base = config.local_url.trim_end_matches('/');
         let url = if base.ends_with("/v1") { format!("{}/models", base) } else { format!("{}/v1/models", base) };
-        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).danger_accept_invalid_certs(true).build().unwrap_or_default();
-        let mut req_builder = client.get(&url);
+        let client = &*API_HTTP_CLIENT;
+        let mut req_builder = client.get(&url).timeout(std::time::Duration::from_secs(5));
         if !config.local_api_key.is_empty() {
             req_builder = req_builder.header("Authorization", format!("Bearer {}", config.local_api_key));
         }
@@ -7128,7 +7084,11 @@ pub async fn ai_models(
                 }
                 HttpResponse::Ok().json(serde_json::json!({ "models": ["llama3", "mistral", "codellama"], "note": "Could not parse model list — showing defaults" }))
             }
-            Ok(resp) => HttpResponse::Ok().json(serde_json::json!({ "models": ["llama3", "mistral"], "error": format!("Server returned {}", resp.status()) })),
+            Ok(resp) => {
+                let status = resp.status();
+                let _ = resp.bytes().await;
+                HttpResponse::Ok().json(serde_json::json!({ "models": ["llama3", "mistral"], "error": format!("Server returned {}", status) }))
+            }
             Err(e) => HttpResponse::Ok().json(serde_json::json!({ "models": ["llama3", "mistral"], "error": format!("Cannot reach {}: {}", url, e) })),
         }
     } else {
@@ -11354,11 +11314,7 @@ pub async fn wolfflow_infrastructure(req: HttpRequest, state: web::Data<AppState
 
     let nodes = state.cluster.get_all_nodes();
     let cluster_secret = state.cluster_secret.clone();
-    let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap_or_default();
+    let http_client = &*API_HTTP_CLIENT;
 
     let mut clusters: std::collections::HashMap<String, Vec<serde_json::Value>> = std::collections::HashMap::new();
 
@@ -11385,6 +11341,7 @@ pub async fn wolfflow_infrastructure(req: HttpRequest, state: web::Data<AppState
             let urls = build_node_urls(&node.address, node.port, "/api/containers/docker");
             for url in &urls {
                 if let Ok(resp) = http_client.get(url)
+                    .timeout(std::time::Duration::from_secs(5))
                     .header("X-WolfStack-Secret", &cluster_secret)
                     .send().await
                 {
@@ -11402,6 +11359,7 @@ pub async fn wolfflow_infrastructure(req: HttpRequest, state: web::Data<AppState
             let urls = build_node_urls(&node.address, node.port, "/api/containers/lxc");
             for url in &urls {
                 if let Ok(resp) = http_client.get(url)
+                    .timeout(std::time::Duration::from_secs(5))
                     .header("X-WolfStack-Secret", &cluster_secret)
                     .send().await
                 {
@@ -11419,6 +11377,7 @@ pub async fn wolfflow_infrastructure(req: HttpRequest, state: web::Data<AppState
             let urls = build_node_urls(&node.address, node.port, "/api/vms");
             for url in &urls {
                 if let Ok(resp) = http_client.get(url)
+                    .timeout(std::time::Duration::from_secs(5))
                     .header("X-WolfStack-Secret", &cluster_secret)
                     .send().await
                 {
@@ -11438,6 +11397,7 @@ pub async fn wolfflow_infrastructure(req: HttpRequest, state: web::Data<AppState
             // PVE guests fetched via the local /pve/resources endpoint below
             let pve_url = format!("/api/nodes/{}/pve/resources", node.id);
             if let Ok(resp) = http_client.get(&format!("https://{}:{}{}", "127.0.0.1", 8553, pve_url))
+                .timeout(std::time::Duration::from_secs(5))
                 .header("X-WolfStack-Secret", &cluster_secret)
                 .send().await
             {
@@ -12051,19 +12011,16 @@ pub async fn wolfusb_attach(req: HttpRequest, state: web::Data<AppState>, body: 
 /// attach and post-reboot vhci-survived attachments).
 async fn query_source_bus_addr(source_address: &str, busid: &str, secret: &str) -> Option<(u8, u8)> {
     let urls = build_node_urls(source_address, 8553, "/api/wolfusb/prepare-for-export");
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .connect_timeout(std::time::Duration::from_secs(3))
-        .danger_accept_invalid_certs(true)
-        .build().ok()?;
+    let client = &*API_HTTP_CLIENT;
     let body = serde_json::json!({ "busid": busid });
     for url in &urls {
         if let Ok(resp) = client.post(url)
+            .timeout(std::time::Duration::from_secs(10))
             .header("X-WolfStack-Secret", secret)
             .json(&body)
             .send().await
         {
-            if !resp.status().is_success() { continue; }
+            if !resp.status().is_success() { let _ = resp.bytes().await; continue; }
             let Ok(v) = resp.json::<serde_json::Value>().await else { continue; };
             let Some(arr) = v.get("bus_addr").and_then(|x| x.as_array()) else { continue; };
             if arr.len() != 2 { continue; }
@@ -12192,25 +12149,11 @@ pub async fn wolfusb_reattach(
         };
         let urls = build_node_urls(&target.address, target.port,
             &format!("/api/wolfusb/reattach/{}", urlencoding_simple(&busid)));
-        let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .connect_timeout(std::time::Duration::from_secs(3))
-            .danger_accept_invalid_certs(true)
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => return HttpResponse::Ok().json(serde_json::json!({
-                "ok": false,
-                "steps": [{
-                    "step": "Build inter-node HTTP client",
-                    "ok": false,
-                    "detail": format!("http client build failed: {}", e),
-                }],
-            })),
-        };
+        let client = &*API_HTTP_CLIENT;
         let mut last_err = String::new();
         for url in &urls {
             let res = client.post(url)
+                .timeout(std::time::Duration::from_secs(60))
                 .header("X-WolfStack-Secret", &state.cluster_secret)
                 .send().await;
             match res {
@@ -12284,50 +12227,47 @@ pub async fn wolfusb_reattach(
             return HttpResponse::Ok().json(serde_json::json!({ "ok": false, "steps": all_steps }));
         };
         let urls = build_node_urls(&source.address, source.port, "/api/wolfusb/prepare-for-export");
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(3))
-            .danger_accept_invalid_certs(true)
-            .build().ok();
+        let client = &*API_HTTP_CLIENT;
         let body = serde_json::json!({ "busid": busid });
         let mut source_reached = false;
-        if let Some(c) = client {
-            for url in &urls {
-                if let Ok(resp) = c.post(url)
-                    .header("X-WolfStack-Secret", &state.cluster_secret)
-                    .json(&body)
-                    .send().await
-                {
-                    if resp.status().is_success() {
-                        source_reached = true;
-                        if let Ok(v) = resp.json::<serde_json::Value>().await {
-                            if let Some(arr) = v.get("steps").and_then(|s| s.as_array()) {
-                                for step in arr {
-                                    all_steps.push(crate::wolfusb::ReattachStep {
-                                        step: format!("[{}] {}", source.hostname,
-                                            step.get("step").and_then(|x| x.as_str()).unwrap_or("?")),
-                                        ok: step.get("ok").and_then(|x| x.as_bool()).unwrap_or(false),
-                                        detail: step.get("detail").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                                    });
-                                }
+        for url in &urls {
+            if let Ok(resp) = client.post(url)
+                .timeout(std::time::Duration::from_secs(30))
+                .header("X-WolfStack-Secret", &state.cluster_secret)
+                .json(&body)
+                .send().await
+            {
+                if resp.status().is_success() {
+                    source_reached = true;
+                    if let Ok(v) = resp.json::<serde_json::Value>().await {
+                        if let Some(arr) = v.get("steps").and_then(|s| s.as_array()) {
+                            for step in arr {
+                                all_steps.push(crate::wolfusb::ReattachStep {
+                                    step: format!("[{}] {}", source.hostname,
+                                        step.get("step").and_then(|x| x.as_str()).unwrap_or("?")),
+                                    ok: step.get("ok").and_then(|x| x.as_bool()).unwrap_or(false),
+                                    detail: step.get("detail").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                                });
                             }
-                            // [bus, addr] — optional; new in v18.7.21.
-                            // Older sources don't include the field, which
-                            // leaves source_bus_addr as None and the target
-                            // falls back to local sysfs (the old broken
-                            // behaviour, but no regression).
-                            if let Some(arr) = v.get("bus_addr").and_then(|x| x.as_array()) {
-                                if arr.len() == 2 {
-                                    let b = arr[0].as_u64().and_then(|n| u8::try_from(n).ok());
-                                    let a_ = arr[1].as_u64().and_then(|n| u8::try_from(n).ok());
-                                    if let (Some(b), Some(a_)) = (b, a_) {
-                                        source_bus_addr = Some((b, a_));
-                                    }
+                        }
+                        // [bus, addr] — optional; new in v18.7.21.
+                        // Older sources don't include the field, which
+                        // leaves source_bus_addr as None and the target
+                        // falls back to local sysfs (the old broken
+                        // behaviour, but no regression).
+                        if let Some(arr) = v.get("bus_addr").and_then(|x| x.as_array()) {
+                            if arr.len() == 2 {
+                                let b = arr[0].as_u64().and_then(|n| u8::try_from(n).ok());
+                                let a_ = arr[1].as_u64().and_then(|n| u8::try_from(n).ok());
+                                if let (Some(b), Some(a_)) = (b, a_) {
+                                    source_bus_addr = Some((b, a_));
                                 }
                             }
                         }
-                        break;
                     }
+                    break;
+                } else {
+                    let _ = resp.bytes().await;
                 }
             }
         }
@@ -13087,12 +13027,6 @@ pub async fn k8s_list_clusters(req: HttpRequest, state: web::Data<AppState>) -> 
     // Aggregate clusters from remote WolfStack nodes
     let nodes = state.cluster.get_all_nodes();
     let cluster_secret = state.cluster_secret.clone();
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .connect_timeout(std::time::Duration::from_secs(2))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap_or_default();
 
     let mut remote_futures = Vec::new();
     for node in &nodes {
@@ -13101,11 +13035,12 @@ pub async fn k8s_list_clusters(req: HttpRequest, state: web::Data<AppState>) -> 
         }
         let node_id = node.id.clone();
         let urls = build_node_urls(&node.address, node.port, "/api/kubernetes/clusters");
-        let client = client.clone();
         let secret = cluster_secret.clone();
         remote_futures.push(async move {
+            let client = &*API_HTTP_CLIENT;
             for url in &urls {
                 if let Ok(resp) = client.get(url)
+                    .timeout(std::time::Duration::from_secs(5))
                     .header("X-WolfStack-Secret", &secret)
                     .send()
                     .await
@@ -13117,6 +13052,8 @@ pub async fn k8s_list_clusters(req: HttpRequest, state: web::Data<AppState>) -> 
                             }
                             return clusters;
                         }
+                    } else {
+                        let _ = resp.bytes().await;
                     }
                     break; // got a response (even if error), don't try other URL schemes
                 }
@@ -13937,13 +13874,10 @@ fn run_script_locally(script: &str) -> Result<String, String> {
 /// Run a script on a remote node via the /api/kubernetes/run-script proxy endpoint
 async fn run_script_on_remote(address: &str, port: u16, cluster_secret: &str, script: &str) -> Result<String, String> {
     let urls = build_node_urls(address, port, "/api/kubernetes/run-script");
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
+    let client = &*API_HTTP_CLIENT;
     for url in &urls {
         match client.post(url)
+            .timeout(std::time::Duration::from_secs(300))
             .header("X-WolfStack-Secret", cluster_secret)
             .json(&serde_json::json!({ "script": script }))
             .send()
@@ -13954,7 +13888,8 @@ async fn run_script_on_remote(address: &str, port: u16, cluster_secret: &str, sc
                 return body["output"].as_str().map(|s| s.to_string())
                     .ok_or_else(|| body["error"].as_str().unwrap_or("Unknown error").to_string());
             }
-            _ => continue,
+            Ok(resp) => { let _ = resp.bytes().await; continue; }
+            Err(_) => continue,
         }
     }
     Err(format!("Failed to reach remote node at {}", address))
@@ -13963,13 +13898,10 @@ async fn run_script_on_remote(address: &str, port: u16, cluster_secret: &str, sc
 /// Fetch a JSON value from a remote node endpoint
 async fn fetch_from_remote(address: &str, port: u16, path: &str, cluster_secret: &str) -> Result<serde_json::Value, String> {
     let urls = build_node_urls(address, port, path);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
+    let client = &*API_HTTP_CLIENT;
     for url in &urls {
         match client.get(url)
+            .timeout(std::time::Duration::from_secs(10))
             .header("X-WolfStack-Secret", cluster_secret)
             .send()
             .await
@@ -13977,7 +13909,8 @@ async fn fetch_from_remote(address: &str, port: u16, path: &str, cluster_secret:
             Ok(resp) if resp.status().is_success() => {
                 return resp.json().await.map_err(|e| format!("JSON parse error: {}", e));
             }
-            _ => continue,
+            Ok(resp) => { let _ = resp.bytes().await; continue; }
+            Err(_) => continue,
         }
     }
     Err(format!("Failed to reach remote node at {}", address))
@@ -14069,15 +14002,12 @@ pub async fn k8s_provision(req: HttpRequest, state: web::Data<AppState>, body: w
             "cluster_type": dist,
         });
         let urls = build_node_urls(&server_address, server_port, "/api/kubernetes/clusters");
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .danger_accept_invalid_certs(true)
-            .build()
-            .unwrap();
+        let client = &*API_HTTP_CLIENT;
         let mut registered = false;
         let mut cluster_resp = None;
         for url in &urls {
             match client.post(url)
+                .timeout(std::time::Duration::from_secs(30))
                 .header("X-WolfStack-Secret", &cluster_secret)
                 .json(&import_body)
                 .send()
@@ -14088,7 +14018,8 @@ pub async fn k8s_provision(req: HttpRequest, state: web::Data<AppState>, body: w
                     registered = true;
                     break;
                 }
-                _ => continue,
+                Ok(resp) => { let _ = resp.bytes().await; continue; }
+                Err(_) => continue,
             }
         }
         if !registered {
@@ -14565,30 +14496,26 @@ async fn push_wolfnet_route_to_cluster(wolfnet_ip: &str, gateway_ip: &str, state
     let route_body = serde_json::json!({
         "routes": { wolfnet_ip: gateway_ip }
     });
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .connect_timeout(std::time::Duration::from_secs(2))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap_or_default();
-
     for node in &nodes {
         if node.is_self || node.node_type != "wolfstack" {
             continue;
         }
         let urls = build_node_urls(&node.address, node.port, "/api/agent/wolfnet-routes");
-        let client = client.clone();
         let secret = secret.clone();
         let body = route_body.clone();
         tokio::spawn(async move {
+            let client = &*API_HTTP_CLIENT;
             for url in &urls {
                 if let Ok(resp) = client.post(url)
+                    .timeout(std::time::Duration::from_secs(5))
                     .header("X-WolfStack-Secret", &secret)
                     .json(&body)
                     .send()
                     .await
                 {
-                    if resp.status().is_success() { break; }
+                    let success = resp.status().is_success();
+                    let _ = resp.bytes().await;
+                    if success { break; }
                 }
             }
         });
@@ -16628,11 +16555,7 @@ pub async fn wolfrun_delete(req: HttpRequest, state: web::Data<AppState>, path: 
             crate::wolfrun::remove_lb_rules_for_vip(vip);
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .danger_accept_invalid_certs(true)
-            .build()
-            .ok();
+        let client = &*API_HTTP_CLIENT;
 
         for inst in &svc.instances {
             // Destroy clones (contain "wolfrun" in name) and standby instances, leave original template
@@ -16654,7 +16577,7 @@ pub async fn wolfrun_delete(req: HttpRequest, state: web::Data<AppState>, path: 
                         }
                     }
                     destroyed.push(inst.container_name.clone());
-                } else if let Some(ref c) = client {
+                } else {
                     // Remote node: use the action API to stop then remove
                     let action_path = match svc.runtime {
                         crate::wolfrun::Runtime::Docker => format!("/api/containers/docker/{}/action", inst.container_name),
@@ -16664,13 +16587,14 @@ pub async fn wolfrun_delete(req: HttpRequest, state: web::Data<AppState>, path: 
 
                     // Stop the container first
                     for url in &action_urls {
-                        match c.post(url)
+                        match client.post(url)
+                            .timeout(std::time::Duration::from_secs(30))
                             .header("X-WolfStack-Secret", &state.cluster_secret)
                             .header("Content-Type", "application/json")
                             .body(r#"{"action":"stop"}"#)
                             .send().await
                         {
-                            Ok(_) => break,
+                            Ok(resp) => { let _ = resp.bytes().await; break; }
                             Err(_) => continue,
                         }
                     }
@@ -16684,7 +16608,8 @@ pub async fn wolfrun_delete(req: HttpRequest, state: web::Data<AppState>, path: 
                         crate::wolfrun::Runtime::Lxc => r#"{"action":"destroy"}"#,
                     };
                     for url in &action_urls {
-                        match c.post(url)
+                        match client.post(url)
+                            .timeout(std::time::Duration::from_secs(30))
                             .header("X-WolfStack-Secret", &state.cluster_secret)
                             .header("Content-Type", "application/json")
                             .body(remove_action)
@@ -16694,6 +16619,7 @@ pub async fn wolfrun_delete(req: HttpRequest, state: web::Data<AppState>, path: 
                                 if resp.status().is_success() {
                                     destroyed.push(inst.container_name.clone());
                                 }
+                                let _ = resp.bytes().await;
                                 break;
                             }
                             Err(_) => continue,
@@ -16748,11 +16674,7 @@ pub async fn wolfrun_service_action(req: HttpRequest, state: web::Data<AppState>
         crate::wolfrun::Runtime::Lxc => "lxc",
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap_or_default();
+    let client = &*API_HTTP_CLIENT;
 
     let mut ok_count = 0u32;
     let mut fail_count = 0u32;
@@ -16792,10 +16714,11 @@ pub async fn wolfrun_service_action(req: HttpRequest, state: web::Data<AppState>
                 let mut success = false;
                 for url in &urls {
                     match client.post(url)
+                        .timeout(std::time::Duration::from_secs(30))
                         .header("X-WolfStack-Secret", &state.cluster_secret)
                         .json(&payload)
                         .send().await {
-                        Ok(resp) if resp.status().is_success() => { success = true; break; }
+                        Ok(resp) if resp.status().is_success() => { let _ = resp.bytes().await; success = true; break; }
                         Ok(resp) => {
                             let body = resp.text().await.unwrap_or_default();
                             errors.push(format!("{} on {}: {}", inst.container_name, node.hostname, body));
@@ -18891,16 +18814,13 @@ pub async fn plugins_store(req: HttpRequest, state: web::Data<AppState>) -> Http
     // users could wait up to 5 minutes for a new plugin to appear in
     // the store, and stale-cache debugging ate a chunk of v17.4.14
     // support time.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap_or_default();
+    let client = &*API_HTTP_CLIENT;
     let bust = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis()).unwrap_or(0);
     let url = format!("{}?t={}", PLUGIN_INDEX_URL, bust);
     match client.get(&url)
+        .timeout(std::time::Duration::from_secs(10))
         .header("Cache-Control", "no-cache")
         .header("Pragma", "no-cache")
         .send().await
@@ -18923,9 +18843,13 @@ pub async fn plugins_store(req: HttpRequest, state: web::Data<AppState>) -> Http
                 .insert_header(("Pragma", "no-cache"))
                 .json(plugins)
         }
-        Ok(resp) => HttpResponse::BadGateway().json(serde_json::json!({
-            "error": format!("Plugin store returned HTTP {}", resp.status())
-        })),
+        Ok(resp) => {
+            let status = resp.status();
+            let _ = resp.bytes().await;
+            HttpResponse::BadGateway().json(serde_json::json!({
+                "error": format!("Plugin store returned HTTP {}", status)
+            }))
+        }
         Err(e) => HttpResponse::BadGateway().json(serde_json::json!({
             "error": format!("Failed to reach plugin store: {}", e)
         })),

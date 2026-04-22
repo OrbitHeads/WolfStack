@@ -27,6 +27,34 @@ macro_rules! auth_or_return {
     };
 }
 
+/// Shared HTTP client for every router-level cluster RPC. Same pattern
+/// as src/wolfrun/mod.rs (fixed in v19.8.1) and src/statuspage/mod.rs:
+/// a Client owns a keep-alive pool + background worker, so constructing
+/// one per call leaks pools on drop. Individual call sites pick their
+/// own total timeout via `RequestBuilder::timeout` because the three
+/// call sites (replicate 10s / topology fan-out 5s / proxy read 30s)
+/// all want different deadlines. `connect_timeout` is not settable per
+/// request, so we set it here to the shortest sensible value (3s) —
+/// matches what `proxy_router_get_to_node` used before consolidation,
+/// and replicate/topology both benefit from failing fast on dead peers
+/// rather than burning their full budget on a TCP handshake that won't
+/// complete.
+static ROUTER_RPC_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
+/// Drain a response body before discarding it so the socket returns
+/// to the keep-alive pool. Non-success branches that only inspect
+/// `.status()` would otherwise leak.
+async fn drain_response(resp: reqwest::Response) {
+    let _ = resp.bytes().await;
+}
+
 /// Push the current RouterConfig to every other cluster node so the
 /// firewall, LANs, and zone assignments stay in sync. Fired (in the
 /// background, doesn't block the originating user request) after every
@@ -49,14 +77,10 @@ fn replicate_config_to_cluster(state: S) {
             Ok(b) => b,
             Err(e) => { tracing::warn!("router replicate: serialize failed: {}", e); return; }
         };
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)  // cluster nodes may use self-signed
-            .timeout(std::time::Duration::from_secs(10))
-            .build();
-        let client = match client {
-            Ok(c) => c,
-            Err(e) => { tracing::warn!("router replicate: client build: {}", e); return; }
-        };
+        // Process-wide pool — see ROUTER_RPC_CLIENT. Timeout is set
+        // per request so this shared client can serve every call site
+        // with their own deadline.
+        let client = &*ROUTER_RPC_CLIENT;
         for node in nodes {
             // Skip ourselves, offline nodes, and non-WolfStack nodes
             // (Proxmox-only members can't host WolfRouter).
@@ -67,14 +91,20 @@ fn replicate_config_to_cluster(state: S) {
             let res = client.post(&url)
                 .header("X-WolfStack-Secret", &secret)
                 .header("Content-Type", "application/json")
+                .timeout(std::time::Duration::from_secs(10))
                 .body(body.clone())
                 .send().await;
             match res {
                 Ok(r) if r.status().is_success() => {
                     tracing::debug!("router config replicated to {}", node.id);
+                    // Drain ack body so the socket returns to the pool.
+                    drain_response(r).await;
                 }
                 Ok(r) => {
-                    tracing::warn!("router config replicate to {} returned {}", node.id, r.status());
+                    let status = r.status();
+                    tracing::warn!("router config replicate to {} returned {}", node.id, status);
+                    // Non-success still has an (error) body to drain.
+                    drain_response(r).await;
                 }
                 Err(e) => {
                     tracing::warn!("router config replicate to {} failed: {}", node.id, e);
@@ -120,21 +150,19 @@ async fn proxy_router_get_to_node(
         format!("http://{}:{}/api/{}{}", node.address, node.port, api_path, qs),
     ];
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .connect_timeout(std::time::Duration::from_secs(3))
-        .danger_accept_invalid_certs(true)
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return HttpResponse::InternalServerError()
-            .body(format!("http client build failed: {}", e)),
-    };
+    // Process-wide pool — see ROUTER_RPC_CLIENT. Per-request timeout
+    // replaces what used to be a per-call builder (30s overall, 3s
+    // connect). connect_timeout isn't supported at request level, so
+    // we bundle it into the overall request timeout; for a read
+    // proxy this is close enough and avoids leaking a pool every
+    // call.
+    let client = &*ROUTER_RPC_CLIENT;
 
     let mut last_err = String::new();
     for url in &urls {
         let res = client.get(url)
             .header("X-WolfStack-Secret", &state.cluster_secret)
+            .timeout(std::time::Duration::from_secs(30))
             .send().await;
         match res {
             Ok(r) => {
@@ -190,6 +218,19 @@ pub async fn config_receive(
 ) -> HttpResponse {
     auth_or_return!(req, state);
     let new_cfg = body.into_inner();
+    // Capture the set of proxy IDs we had BEFORE overwriting so we can
+    // clean up rules for entries that were deleted on the originating
+    // node. Without this, a delete-on-node-1 would leave stale iptables
+    // /nftables rules on every other peer until a manual restart.
+    let removed_proxy_ids: Vec<String> = {
+        let cur = state.router.config.read().unwrap();
+        let new_ids: std::collections::HashSet<&str> =
+            new_cfg.proxies.iter().map(|p| p.id.as_str()).collect();
+        cur.proxies.iter()
+            .filter(|p| !new_ids.contains(p.id.as_str()))
+            .map(|p| p.id.clone())
+            .collect()
+    };
     {
         let mut cur = state.router.config.write().unwrap();
         *cur = new_cfg.clone();
@@ -208,11 +249,16 @@ pub async fn config_receive(
     // instances for LANs that were removed; starts/restarts current ones.
     let self_id = crate::agent::self_node_id();
     dhcp::start_all_for_node(&new_cfg, &self_id);
-    // Re-render reverse-proxy iptables rules. The originating node
-    // already applied locally; every other node needs to do the same
-    // so a proxy bound to a peer node stays live after config sync.
-    // apply_for_node filters to entries whose node_id == self_id, so
-    // this is cheap for peers that don't host any proxies.
+    // Purge rules for entries that no longer exist in the config —
+    // otherwise failover'd or previously-owned forwards keep running
+    // here long after the originator deleted them.
+    for id in &removed_proxy_ids {
+        proxy::remove_one(id);
+    }
+    // Re-render reverse-proxy iptables/nftables rules. Each entry now
+    // may opt into failover, in which case apply_for_node installs its
+    // rules here too — so every peer stays in sync with the authoritative
+    // config, not just the owner.
     let pwarn = proxy::apply_for_node(&new_cfg.proxies, &self_id);
     for w in &pwarn {
         tracing::warn!("router config-receive: proxy apply: {}", w);
@@ -408,17 +454,20 @@ pub async fn get_topology(
     // endpoint, filtered by cluster name when one was requested.
     let cluster_nodes = state.cluster.get_all_nodes();
     let secret = state.cluster_secret.clone();
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(std::time::Duration::from_secs(5))
-        .build();
+    // Process-wide pool — see ROUTER_RPC_CLIENT. Per-request timeout
+    // (5s) is set on the RequestBuilder below. Previously this site
+    // built a fresh Client every topology fetch and handed it out to
+    // N concurrent peer futures; each cloned Arc shared the same
+    // pool but when the outer Client dropped at function exit the
+    // pool's idle sockets were orphaned.
+    let client = &*ROUTER_RPC_CLIENT;
 
     // Per-peer diagnostic trail so when a node is missing from the
     // rack view, the response tells you *why* (filtered out / offline /
     // HTTP error / etc) instead of leaving you guessing.
     let mut peer_diagnostics: Vec<serde_json::Value> = Vec::new();
 
-    if let Ok(client) = client {
+    {
         let mut futures = Vec::new();
         for node in cluster_nodes {
             // Self isn't a "peer" — it's already in the result as the
@@ -460,7 +509,14 @@ pub async fn get_topology(
             let hostname = node.hostname.clone();
             let stub_name = if hostname.is_empty() { id.clone() } else { hostname.clone() };
             let secret_h = secret.clone();
-            let client_c = client.clone();
+            // `client` is `&reqwest::Client` (LazyLock deref). Method
+            // resolution on `&T::clone()` picks the blanket
+            // `Clone for &T` impl and returns another reference, which
+            // can't cross into an `async move` future (not 'static).
+            // UFCS forces the call to `<Client as Clone>::clone`, which
+            // takes `&Client` and returns an owned `Client`. The clone
+            // is cheap — Client is internally refcounted.
+            let client_c: reqwest::Client = reqwest::Client::clone(client);
             futures.push(async move {
                 let urls = [
                     format!("https://{}:{}/api/router/topology-local", host, port),
@@ -472,6 +528,7 @@ pub async fn get_topology(
                     for url in &urls {
                         match client_c.get(url)
                             .header("X-WolfStack-Secret", &secret_h)
+                            .timeout(std::time::Duration::from_secs(5))
                             .send().await
                         {
                             Ok(r) if r.status().is_success() => {
@@ -485,7 +542,15 @@ pub async fn get_topology(
                                         format!("decode error after {} attempt(s): {}", attempt, e))),
                                 };
                             }
-                            Ok(r) => { last_err = format!("HTTP {} from {}", r.status(), url); }
+                            // Capture status + drain the body before
+                            // dropping `r`. Previously `Ok(r)` let `r`
+                            // fall out of scope unread, so the socket
+                            // never went back to the keep-alive pool.
+                            Ok(r) => {
+                                let status = r.status();
+                                last_err = format!("HTTP {} from {}", status, url);
+                                let _ = r.bytes().await;
+                            }
                             Err(e) => { last_err = format!("{} ({})", e, url); }
                         }
                     }
@@ -1532,17 +1597,16 @@ pub async fn packet_capture(
                 format!("https://{}:{}/api/router/capture", target_node.address, target_node.port),
                 format!("http://{}:{}/api/router/capture",  target_node.address, target_node.port),
             ];
-            let client = match reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
-                .timeout(std::time::Duration::from_secs(r.timeout_seconds + 10))
-                .build()
-            {
-                Ok(c) => c,
-                Err(e) => return HttpResponse::InternalServerError().body(format!("client build: {}", e)),
-            };
+            // Shared pool — see ROUTER_RPC_CLIENT. Per-request timeout
+            // below (user-controlled capture window + 10s slack)
+            // replaces the client-level timeout that used to be set
+            // per call.
+            let client = &*ROUTER_RPC_CLIENT;
+            let proxy_timeout = std::time::Duration::from_secs(r.timeout_seconds + 10);
             for url in &urls {
                 match client.post(url)
                     .header("X-WolfStack-Secret", &secret)
+                    .timeout(proxy_timeout)
                     .json(&proxy_body)
                     .send().await
                 {
@@ -1947,13 +2011,9 @@ pub async fn interface_up(
             };
             let secret = state.cluster_secret.clone();
             let body_json = serde_json::json!({ "iface": r.iface });
-            let client = match reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
-                .timeout(std::time::Duration::from_secs(10)).build()
-            {
-                Ok(c) => c,
-                Err(e) => return HttpResponse::InternalServerError().body(format!("client build: {}", e)),
-            };
+            // Shared pool — see ROUTER_RPC_CLIENT. 10s total timeout
+            // set per-request below replaces the old client-level one.
+            let client = &*ROUTER_RPC_CLIENT;
             let urls = [
                 format!("https://{}:{}/api/router/interface-up", target_node.address, target_node.port),
                 format!("http://{}:{}/api/router/interface-up", target_node.address, target_node.port),
@@ -1961,6 +2021,7 @@ pub async fn interface_up(
             for url in &urls {
                 if let Ok(resp) = client.post(url)
                     .header("X-WolfStack-Secret", &secret)
+                    .timeout(std::time::Duration::from_secs(10))
                     .json(&body_json).send().await
                 {
                     if resp.status().is_success() {

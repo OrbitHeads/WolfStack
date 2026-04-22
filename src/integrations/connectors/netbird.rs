@@ -13,24 +13,29 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-pub struct NetBirdConnector;
-
-impl NetBirdConnector {
-    /// Build a reqwest client with the Bearer token set.
-    fn client(
-        credentials: &serde_json::Value,
-    ) -> Result<(reqwest::Client, String), String> {
-        let token = credentials.get("token")
-            .and_then(|v| v.as_str())
-            .ok_or("Missing 'token' in credentials")?;
-
-        let client = reqwest::Client::builder()
+/// Shared HTTP client for every NetBird API call. Auth token travels
+/// per-request in the Authorization header (see `auth_header`), so
+/// one shared pool works across all instances. Replaces the per-call
+/// `reqwest::Client::builder()` that leaked a connection pool on
+/// every api_get / api_post / api_put.
+static NETBIRD_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
             .timeout(Duration::from_secs(30))
             .build()
-            .map_err(|e| format!("HTTP client error: {}", e))?;
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
 
-        Ok((client, format!("Token {}", token)))
+pub struct NetBirdConnector;
+
+impl NetBirdConnector {
+    /// Build the Authorization header value from the stored token.
+    fn auth_header(credentials: &serde_json::Value) -> Result<String, String> {
+        let token = credentials.get("token")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'token' in credentials")?;
+        Ok(format!("Token {}", token))
     }
 
     async fn api_get(
@@ -38,17 +43,20 @@ impl NetBirdConnector {
         credentials: &serde_json::Value,
         path: &str,
     ) -> Result<serde_json::Value, String> {
-        let (client, auth) = Self::client(credentials)?;
+        let auth = Self::auth_header(credentials)?;
         let url = format!("{}{}", base_url.trim_end_matches('/'), path);
-        let resp = client.get(&url)
+        let resp = NETBIRD_CLIENT.get(&url)
             .header("Authorization", &auth)
             .header("Accept", "application/json")
             .send()
             .await
             .map_err(|e| format!("Request failed: {}", e))?;
 
-        if !resp.status().is_success() {
-            return Err(format!("NetBird API error: {} {}", resp.status(), url));
+        let status = resp.status();
+        if !status.is_success() {
+            // Drain error body so the socket returns to the pool.
+            let _ = resp.bytes().await;
+            return Err(format!("NetBird API error: {} {}", status, url));
         }
 
         resp.json().await.map_err(|e| format!("JSON parse error: {}", e))
@@ -60,9 +68,9 @@ impl NetBirdConnector {
         path: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let (client, auth) = Self::client(credentials)?;
+        let auth = Self::auth_header(credentials)?;
         let url = format!("{}{}", base_url.trim_end_matches('/'), path);
-        let resp = client.post(&url)
+        let resp = NETBIRD_CLIENT.post(&url)
             .header("Authorization", &auth)
             .header("Accept", "application/json")
             .json(body)
@@ -70,8 +78,10 @@ impl NetBirdConnector {
             .await
             .map_err(|e| format!("Request failed: {}", e))?;
 
-        if !resp.status().is_success() {
-            return Err(format!("NetBird API error: {} {}", resp.status(), url));
+        let status = resp.status();
+        if !status.is_success() {
+            let _ = resp.bytes().await;
+            return Err(format!("NetBird API error: {} {}", status, url));
         }
 
         resp.json().await.map_err(|e| format!("JSON parse error: {}", e))
@@ -83,9 +93,9 @@ impl NetBirdConnector {
         path: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let (client, auth) = Self::client(credentials)?;
+        let auth = Self::auth_header(credentials)?;
         let url = format!("{}{}", base_url.trim_end_matches('/'), path);
-        let resp = client.put(&url)
+        let resp = NETBIRD_CLIENT.put(&url)
             .header("Authorization", &auth)
             .header("Accept", "application/json")
             .json(body)
@@ -93,8 +103,10 @@ impl NetBirdConnector {
             .await
             .map_err(|e| format!("Request failed: {}", e))?;
 
-        if !resp.status().is_success() {
-            return Err(format!("NetBird API error: {} {}", resp.status(), url));
+        let status = resp.status();
+        if !status.is_success() {
+            let _ = resp.bytes().await;
+            return Err(format!("NetBird API error: {} {}", status, url));
         }
 
         resp.json().await.map_err(|e| format!("JSON parse error: {}", e))

@@ -14,6 +14,18 @@ use serde::{Deserialize, Serialize};
 
 fn wolfnote_config_path() -> String { crate::paths::get().wolfnote_config }
 
+/// Shared HTTP client for every WolfNote API call. Replaces the
+/// per-`WolfNoteClient::new` + per-`login()` fresh Client that was
+/// leaking a connection pool on every note/folder list/create.
+static WOLFNOTE_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .use_rustls_tls()
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
 /// Default WolfNote instance URL
 const DEFAULT_WOLFNOTE_URL: &str = "https://app.wolfnote.org";
 
@@ -173,12 +185,9 @@ pub struct WolfNoteClient {
 
 impl WolfNoteClient {
     pub fn new(base_url: &str, token: &str) -> Self {
+        // Cheap Arc clone of the shared pool — see WOLFNOTE_CLIENT.
         Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(15))
-                .use_rustls_tls()
-                .build()
-                .unwrap_or_default(),
+            client: reqwest::Client::clone(&WOLFNOTE_CLIENT),
             base_url: base_url.trim_end_matches('/').to_string(),
             token: token.to_string(),
         }
@@ -186,11 +195,7 @@ impl WolfNoteClient {
 
     /// Login to WolfNote and get a JWT token
     pub async fn login(base_url: &str, username: &str, password: &str, company: &str) -> Result<WolfNoteLoginResponse, String> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .use_rustls_tls()
-            .build()
-            .map_err(|e| e.to_string())?;
+        let client = &*WOLFNOTE_CLIENT;
 
         let url = format!("{}/api/auth/login", base_url.trim_end_matches('/'));
         let resp = client.post(&url)
@@ -223,8 +228,10 @@ impl WolfNoteClient {
             .await
             .map_err(|e| format!("WolfNote request failed: {}", e))?;
 
-        if !resp.status().is_success() {
-            return Err(format!("WolfNote error: {}", resp.status()));
+        let status = resp.status();
+        if !status.is_success() {
+            let _ = resp.bytes().await;  // drain → socket back to pool
+            return Err(format!("WolfNote error: {}", status));
         }
 
         resp.json().await.map_err(|e| format!("Invalid response: {}", e))
@@ -239,8 +246,10 @@ impl WolfNoteClient {
             .await
             .map_err(|e| format!("WolfNote request failed: {}", e))?;
 
-        if !resp.status().is_success() {
-            return Err(format!("WolfNote error: {}", resp.status()));
+        let status = resp.status();
+        if !status.is_success() {
+            let _ = resp.bytes().await;
+            return Err(format!("WolfNote error: {}", status));
         }
 
         resp.json().await.map_err(|e| format!("Invalid response: {}", e))
@@ -282,8 +291,10 @@ impl WolfNoteClient {
             .await
             .map_err(|e| format!("WolfNote request failed: {}", e))?;
 
-        if !resp.status().is_success() {
-            return Err(format!("WolfNote error: {}", resp.status()));
+        let status = resp.status();
+        if !status.is_success() {
+            let _ = resp.bytes().await;
+            return Err(format!("WolfNote error: {}", status));
         }
 
         resp.json().await.map_err(|e| format!("Invalid response: {}", e))

@@ -28,6 +28,17 @@
 //! chat; documenting this in the UI is the operator's safety net.
 
 use serde::{Deserialize, Serialize};
+
+/// Shared HTTP client for every agent tool-use turn (OpenAI-compat,
+/// Gemini, Claude). Per-turn `reqwest::Client::builder()` was
+/// leaking a connection pool on every round of every agent
+/// conversation. 180s timeout set per-request via RequestBuilder.
+static AGENT_LOOP_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
 use tracing::warn;
 
 use super::{Agent, dispatch, tools::{ToolId, Danger}};
@@ -145,10 +156,7 @@ async fn openai_tool_loop(
     if base_url.trim().is_empty() {
         return Err("Local/OpenRouter base URL not configured — set it in Settings → AI Agent".into());
     }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(180))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
+    let client = &*AGENT_LOOP_CLIENT;
 
     // Normalise base_url → fully-qualified chat/completions URL. Matches
     // the heuristic in ai::call_local so operators can paste either
@@ -186,6 +194,7 @@ async fn openai_tool_loop(
         }
 
         let mut req = client.post(&url)
+            .timeout(std::time::Duration::from_secs(180))
             .header("content-type", "application/json")
             .json(&body);
         if !api_key.is_empty() {
@@ -319,10 +328,7 @@ async fn gemini_tool_loop(
     user_message: &str,
     state: &crate::api::AppState,
 ) -> Result<AgentTurn, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
+    let client = &*AGENT_LOOP_CLIENT;
 
     // Build the initial contents array. Gemini uses "model" for the
     // assistant role; translate from our canonical "assistant".
@@ -367,7 +373,9 @@ async fn gemini_tool_loop(
             });
         }
 
-        let resp = client.post(&url).json(&body).send().await
+        let resp = client.post(&url)
+            .timeout(std::time::Duration::from_secs(120))
+            .json(&body).send().await
             .map_err(|e| format!("Gemini API error: {}", e))?;
         let status = resp.status();
         let text = resp.text().await.map_err(|e| format!("read body: {}", e))?;
@@ -718,10 +726,7 @@ async fn claude_tool_loop(
     user_message: &str,
     state: &crate::api::AppState,
 ) -> Result<AgentTurn, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
+    let client = &*AGENT_LOOP_CLIENT;
 
     // Build the initial messages array. Claude's format uses role +
     // content blocks (content can be a string for simple turns).
@@ -756,6 +761,7 @@ async fn claude_tool_loop(
 
         let resp = client
             .post("https://api.anthropic.com/v1/messages")
+            .timeout(std::time::Duration::from_secs(120))
             .header("x-api-key", &cfg.claude_api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")

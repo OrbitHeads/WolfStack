@@ -6469,12 +6469,17 @@
             selectedRaw = `container::${backend.container_type || 'docker'}::${backend.container_id || ''}::${backend.host || ''}::${backend.container_name || ''}`;
         }
         const pickerOpts = proxyPickerOptionsHtml(picks, selectedRaw);
+        const weight = (backend.weight === 0 || backend.weight) ? backend.weight : 1;
         return `<div class="wr-proxy-backend-row" data-idx="${idx}" style="border:1px solid var(--border); border-radius:6px; padding:10px 12px; display:grid; gap:8px; background:var(--bg-secondary);">
             <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
                 <div style="font-size:12px; color:var(--text-muted);">Backend #${idx + 1}</div>
-                <div style="display:flex; gap:16px; font-size:12px;">
+                <div style="display:flex; gap:16px; font-size:12px; align-items:center;">
                     <label style="font-weight:normal;"><input type="radio" name="wr-proxy-kind-${idx}" value="picker" ${!kindIsCustom ? 'checked' : ''} onchange="wrProxyBackendKindChanged(${idx})" /> VM / container</label>
                     <label style="font-weight:normal;"><input type="radio" name="wr-proxy-kind-${idx}" value="custom" ${kindIsCustom ? 'checked' : ''} onchange="wrProxyBackendKindChanged(${idx})" /> Custom IP</label>
+                    <label style="font-weight:normal; display:flex; align-items:center; gap:4px;" title="Relative weight — 2 gets twice as many connections as 1">
+                        Weight
+                        <input type="number" class="form-control wr-proxy-weight" data-idx="${idx}" value="${weight}" min="1" max="100" style="width:64px; padding:2px 6px; font-size:12px;" />
+                    </label>
                     <button class="btn btn-sm" type="button" onclick="wrProxyRemoveBackend(${idx})" title="Remove this backend">🗑</button>
                 </div>
             </div>
@@ -6509,22 +6514,26 @@
             const idx = parseInt(row.dataset.idx, 10);
             const kindRadio = row.querySelector(`input[name="wr-proxy-kind-${idx}"]:checked`);
             const kind = kindRadio ? kindRadio.value : 'picker';
+            // Clamp weight to [1, 100] — backend coerces 0 to 1 but we
+            // prefer to prevent the user from entering nonsense at source.
+            const rawWeight = parseInt(row.querySelector('.wr-proxy-weight')?.value, 10);
+            const weight = (Number.isFinite(rawWeight) && rawWeight > 0) ? Math.min(rawWeight, 100) : 1;
             if (kind === 'custom') {
                 const host = row.querySelector('.wr-proxy-custom-host')?.value.trim() || '';
-                collected.push({ kind: 'custom', host });
+                collected.push({ kind: 'custom', host, weight });
             } else {
                 const raw = row.querySelector('.wr-proxy-picker')?.value || '';
-                if (!raw) { collected.push({ kind: 'custom', host: '' }); return; }
+                if (!raw) { collected.push({ kind: 'custom', host: '', weight }); return; }
                 const parts = raw.split('::');
                 if (parts[0] === 'vm') {
                     collected.push({
                         kind: 'vm', vm_type: parts[1], vm_id: parts[2],
-                        host: parts[3], vm_name: parts[4],
+                        host: parts[3], vm_name: parts[4], weight,
                     });
                 } else {
                     collected.push({
                         kind: 'container', container_type: parts[1], container_id: parts[2],
-                        host: parts[3], container_name: parts[4],
+                        host: parts[3], container_name: parts[4], weight,
                     });
                 }
             }
@@ -6543,7 +6552,7 @@
     function wrProxyAddBackend() {
         if (!wrProxyEditorState) return;
         snapshotBackendRows();
-        wrProxyEditorState.backends.push({ kind: 'custom', host: '' });
+        wrProxyEditorState.backends.push({ kind: 'custom', host: '', weight: 1 });
         rerenderBackendRows();
     }
 
@@ -6552,7 +6561,7 @@
         snapshotBackendRows();
         wrProxyEditorState.backends.splice(idx, 1);
         if (wrProxyEditorState.backends.length === 0) {
-            wrProxyEditorState.backends.push({ kind: 'custom', host: '' });
+            wrProxyEditorState.backends.push({ kind: 'custom', host: '', weight: 1 });
         }
         rerenderBackendRows();
     }
@@ -6562,14 +6571,15 @@
         const entry = existing || {
             id: '', domain: '', node_id: '',
             resolved_public_ip: '',
-            backends: [{ kind: 'custom', host: '' }],
+            backends: [{ kind: 'custom', host: '', weight: 1 }],
             lb_policy: 'round_robin',
             enabled: true,
+            failover: false,
             description: '',
         };
         // Back-compat: older configs may have `backend` (singular). Coerce.
         if (!Array.isArray(entry.backends) || !entry.backends.length) {
-            entry.backends = entry.backend ? [entry.backend] : [{ kind: 'custom', host: '' }];
+            entry.backends = entry.backend ? [entry.backend] : [{ kind: 'custom', host: '', weight: 1 }];
         }
 
         const nodes = (wrState.topology?.nodes) || [];
@@ -6616,12 +6626,14 @@
                         <div id="wr-proxy-lb-row" style="display:${entry.backends.length > 1 ? '' : 'none'};">
                             <label>Load balancing
                                 <select id="wr-proxy-lb" class="form-control">
-                                    <option value="round_robin" ${entry.lb_policy === 'round_robin' ? 'selected' : ''}>Round-robin (even cycle)</option>
-                                    <option value="ip_hash" ${entry.lb_policy === 'ip_hash' ? 'selected' : ''}>Weighted random</option>
+                                    <option value="round_robin" ${entry.lb_policy === 'round_robin' ? 'selected' : ''}>Round-robin (weighted cycle)</option>
+                                    <option value="ip_hash" ${entry.lb_policy === 'ip_hash' ? 'selected' : ''}>Random per connection</option>
+                                    <option value="source_hash" ${entry.lb_policy === 'source_hash' ? 'selected' : ''}>Sticky by source IP (nftables)</option>
                                 </select>
                                 <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">
-                                    Round-robin sends each new connection to the next backend in order.
-                                    Weighted random picks a backend at random for each connection (no session stickiness).
+                                    <b>Round-robin</b> cycles through backends in order; per-backend weight controls how many consecutive slots each one gets.<br>
+                                    <b>Random per connection</b> picks a backend at random for each new TCP connection (weighted). Connections stay on their first pick for the life of the stream — not across reconnects.<br>
+                                    <b>Sticky by source IP</b> hashes the client IP so the same client always lands on the same backend. Requires <code>nftables</code> installed on every forwarding node; falls back to random if not.
                                 </div>
                             </label>
                         </div>
@@ -6631,6 +6643,13 @@
                         <label style="display:flex; align-items:center; gap:8px;">
                             <input type="checkbox" id="wr-proxy-enabled" ${entry.enabled !== false ? 'checked' : ''} />
                             Enabled
+                        </label>
+                        <label style="display:flex; align-items:flex-start; gap:8px;" title="Install rules on every cluster node — lets a peer take over if the owning node goes down.">
+                            <input type="checkbox" id="wr-proxy-failover" ${entry.failover ? 'checked' : ''} style="margin-top:3px;" />
+                            <div>
+                                <div>Cluster failover</div>
+                                <div style="font-size:11px; color:var(--text-muted); font-weight:normal;">Install the forward on every online WolfStack node, not just the owner. Any peer receiving traffic (via DNS, a floating public IP, or manual takeover) can then serve it. Pin the public IP above so every node binds to the same address.</div>
+                            </div>
                         </label>
                     </div>
                 </div>
@@ -6654,6 +6673,7 @@
         const resolved_public_ip = document.getElementById('wr-proxy-public-ip').value.trim();
         const description = document.getElementById('wr-proxy-description').value.trim();
         const enabled = document.getElementById('wr-proxy-enabled').checked;
+        const failover = document.getElementById('wr-proxy-failover')?.checked || false;
         const lb_policy = document.getElementById('wr-proxy-lb')?.value || 'round_robin';
 
         snapshotBackendRows();
@@ -6671,6 +6691,7 @@
             backends,
             lb_policy,
             enabled,
+            failover,
             description,
         };
 

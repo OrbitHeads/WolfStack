@@ -13,31 +13,31 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+/// Shared HTTP client for every TrueNAS API call. Previously each
+/// api_get / api_post built its own Client with a baked-in auth
+/// header via default_headers — one leaked connection pool per call.
+/// We now send the Authorization header per-request so the shared
+/// pool works across every instance (different tokens = different
+/// instances, same connection pool is safe since each request
+/// carries its own header).
+static TRUENAS_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
 pub struct TrueNasConnector;
 
 impl TrueNasConnector {
-    /// Build a reqwest client with Bearer auth headers.
-    fn client(credentials: &serde_json::Value) -> Result<(reqwest::Client, String), String> {
+    /// Extract the bearer token from the credentials blob.
+    fn auth_header(credentials: &serde_json::Value) -> Result<String, String> {
         let token = credentials.get("token")
             .and_then(|v| v.as_str())
             .ok_or("Missing 'token' in credentials")?;
-
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .timeout(Duration::from_secs(30))
-            .default_headers({
-                let mut headers = reqwest::header::HeaderMap::new();
-                headers.insert(
-                    "Authorization",
-                    reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token))
-                        .map_err(|e| format!("Invalid token: {}", e))?,
-                );
-                headers
-            })
-            .build()
-            .map_err(|e| format!("HTTP client error: {}", e))?;
-
-        Ok((client, token.to_string()))
+        Ok(format!("Bearer {}", token))
     }
 
     async fn api_get(
@@ -45,16 +45,20 @@ impl TrueNasConnector {
         credentials: &serde_json::Value,
         path: &str,
     ) -> Result<serde_json::Value, String> {
-        let (client, _) = Self::client(credentials)?;
+        let auth = Self::auth_header(credentials)?;
         let url = format!("{}{}", base_url.trim_end_matches('/'), path);
-        let resp = client.get(&url)
+        let resp = TRUENAS_CLIENT.get(&url)
+            .header("Authorization", auth)
             .header("Accept", "application/json")
             .send()
             .await
             .map_err(|e| format!("Request failed: {}", e))?;
 
-        if !resp.status().is_success() {
-            return Err(format!("TrueNAS API error: {} {}", resp.status(), url));
+        let status = resp.status();
+        if !status.is_success() {
+            // Drain error body → socket returns to the pool.
+            let _ = resp.bytes().await;
+            return Err(format!("TrueNAS API error: {} {}", status, url));
         }
 
         resp.json().await.map_err(|e| format!("JSON parse error: {}", e))
@@ -66,9 +70,10 @@ impl TrueNasConnector {
         path: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let (client, _) = Self::client(credentials)?;
+        let auth = Self::auth_header(credentials)?;
         let url = format!("{}{}", base_url.trim_end_matches('/'), path);
-        let resp = client.post(&url)
+        let resp = TRUENAS_CLIENT.post(&url)
+            .header("Authorization", auth)
             .header("Accept", "application/json")
             .json(body)
             .send()

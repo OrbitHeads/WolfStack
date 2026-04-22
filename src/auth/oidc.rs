@@ -12,6 +12,16 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Shared HTTP client for every OIDC discovery + token-exchange call.
+/// Per-request timeouts set at each call site. Previously each
+/// discovery and each token exchange built its own Client.
+static OIDC_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
 fn oidc_config_path() -> String {
     let cfg = crate::paths::get().config_dir;
     format!("{}/oidc.json", cfg)
@@ -250,22 +260,18 @@ async fn discover(issuer_url: &str) -> Result<DiscoveryDocument, String> {
         issuer_url.trim_end_matches('/')
     );
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
-
-    let resp = client
+    let resp = OIDC_CLIENT
         .get(&discovery_url)
+        .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
         .map_err(|e| format!("OIDC discovery request failed: {}", e))?;
 
-    if !resp.status().is_success() {
-        return Err(format!(
-            "OIDC discovery returned HTTP {}",
-            resp.status().as_u16()
-        ));
+    let status = resp.status();
+    if !status.is_success() {
+        // Drain body so socket returns to the pool.
+        let _ = resp.bytes().await;
+        return Err(format!("OIDC discovery returned HTTP {}", status.as_u16()));
     }
 
     resp.json::<DiscoveryDocument>()
@@ -367,11 +373,6 @@ pub async fn exchange_code(
     // Decrypt the client secret if it's encrypted at rest
     let client_secret = decrypt_secret(&provider.client_secret, cluster_secret)?;
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
-
     let params: HashMap<&str, &str> = HashMap::from([
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -381,8 +382,9 @@ pub async fn exchange_code(
         ("code_verifier", pending.pkce_verifier.as_str()),
     ]);
 
-    let resp = client
+    let resp = OIDC_CLIENT
         .post(&discovery.token_endpoint)
+        .timeout(std::time::Duration::from_secs(15))
         .form(&params)
         .send()
         .await

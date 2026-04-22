@@ -602,12 +602,9 @@ fn mirror_exchange_to_surfaces(agent: &Agent, user_msg: &str, reply: &str, origi
                 tracing::warn!("wolfagents mirror: bad telegram chat_id on agent {}", agent_id);
                 return;
             };
-            let http = match reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(15)).build()
-            {
-                Ok(c) => c,
-                Err(_) => return,
-            };
+            // Reuse the telegram_bot module's shared pool instead of
+            // building a new Client per mirror. Cheap Arc clone.
+            let http = reqwest::Client::clone(&crate::telegram_bot::TELEGRAM_CLIENT);
             let q = format!("👤 {}", truncate_for_chat(&user_msg, 3500));
             let a = truncate_for_chat(&reply, 3900);
             if let Err(e) = crate::telegram_bot::send_telegram_message(
@@ -631,12 +628,8 @@ fn mirror_exchange_to_surfaces(agent: &Agent, user_msg: &str, reply: &str, origi
         let agent_id = agent.id.clone();
         tokio::spawn(async move {
             if bot_token.trim().is_empty() { return; }
-            let http = match reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(15)).build()
-            {
-                Ok(c) => c,
-                Err(_) => return,
-            };
+            // Reuse discord_bot's shared pool. Cheap Arc clone.
+            let http = reqwest::Client::clone(&crate::discord_bot::DISCORD_CLIENT);
             let q = format!("👤 {}", truncate_for_chat(&user_msg, 1900));
             let a = truncate_for_chat(&reply, 1900);
             if let Err(e) = crate::discord_bot::send_discord_message(

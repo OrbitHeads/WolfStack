@@ -14,6 +14,18 @@ use std::sync::RwLock;
 
 fn config_path() -> String { crate::paths::get().patreon_config }
 
+/// Shared HTTP client for Patreon OAuth token refresh + identity
+/// fetch. Same pattern as src/wolfrun/mod.rs (v19.8.1). The old code
+/// built a fresh Client per call; token refresh fires on every boot
+/// and periodically during membership sync.
+static PATREON_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
 /// Public client ID — safe to embed (visible in OAuth URLs anyway).
 const PATREON_CLIENT_ID: &str = "NawRwaiiX2WMqOuin7Tp0t8KTsarYTbi4g4e-C2Ab75QrdXjbN_6nx5JN73i6JVN";
 
@@ -146,11 +158,7 @@ impl PatreonState {
 
     /// Refresh the access token via the wolfscale.org proxy (which holds the client secret).
     pub async fn refresh_access_token(refresh_token: &str) -> Result<(String, String), String> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build()
-            .map_err(|e| e.to_string())?;
-
+        let client = &*PATREON_CLIENT;
         let url = format!("{}?action=refresh", OAUTH_PROXY_BASE);
 
         let resp = client
@@ -183,11 +191,7 @@ impl PatreonState {
 
     /// Fetch the user's identity and membership info from Patreon API v2 directly.
     pub async fn fetch_identity(access_token: &str) -> Result<PatreonIdentity, String> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build()
-            .map_err(|e| e.to_string())?;
-
+        let client = &*PATREON_CLIENT;
         let url = format!(
             "{}?include=memberships.currently_entitled_tiers&fields%5Buser%5D=full_name,email&fields%5Bmember%5D=currently_entitled_amount_cents,patron_status&fields%5Btier%5D=title,amount_cents",
             PATREON_IDENTITY_URL

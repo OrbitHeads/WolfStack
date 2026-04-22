@@ -34,6 +34,21 @@ use tracing::warn;
 
 use super::{Agent, safety, tools::{self, AuthDecision, ToolId}};
 
+/// Shared HTTP client for every inter-node dispatch call in this
+/// module. Previously every tool-fan-out site built its own Client
+/// (`reqwest::Client::builder()...build()`) — thirteen separate
+/// pools, each leaked at function exit. One shared pool reuses
+/// connections across all tool invocations. Timeout is set per
+/// request via `RequestBuilder::timeout` because each tool picks
+/// its own deadline (5s–30s).
+static DISPATCH_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
 /// Result of one dispatched tool call — what we hand back to the
 /// LLM as the tool_result block on its next turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -262,12 +277,8 @@ async fn tool_list_containers(
     }
 
     // Remote nodes — one HTTP call per online non-self node.
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .ok();
-    if let Some(http) = http {
+    let http = &*DISPATCH_CLIENT;
+    {
         for node in nodes.iter().filter(|n| n.online && !n.is_self) {
             // Skip nodes outside the caller's cluster filter — saves
             // per-node HTTP when the agent asked for one cluster.
@@ -299,9 +310,14 @@ async fn tool_list_containers(
                 let url = format!("{}://{}:{}{}", scheme, node.address, node.port, path);
                 let resp = http.get(&url)
                     .header("X-WolfStack-Secret", &state.cluster_secret)
+                    .timeout(std::time::Duration::from_secs(8))
                     .send().await;
                 let Ok(r) = resp else { continue; };
-                if !r.status().is_success() { continue; }
+                if !r.status().is_success() {
+                    // Drain error body → socket back to pool.
+                    let _ = r.bytes().await;
+                    continue;
+                }
                 let Ok(val) = r.json::<serde_json::Value>().await else { continue; };
                 // Most endpoints return {"containers": [...]} — unwrap
                 // that, else treat the whole response as the array.
@@ -349,11 +365,7 @@ async fn tool_get_metrics(args: &serde_json::Value, state: &crate::api::AppState
     let target = args.get("node").and_then(|v| v.as_str());
     let nodes = state.cluster.get_all_nodes();
 
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .ok();
+    let http = &*DISPATCH_CLIENT;
 
     let mut per_node: Vec<serde_json::Value> = Vec::new();
     for node in &nodes {
@@ -378,14 +390,17 @@ async fn tool_get_metrics(args: &serde_json::Value, state: &crate::api::AppState
             continue;
         }
         // Remote node — GET /api/metrics with cluster-secret auth.
-        let Some(http) = http.as_ref() else { continue; };
         let scheme = if node.port == 443 || node.port == 8553 { "https" } else { "http" };
         let url = format!("{}://{}:{}/api/metrics", scheme, node.address, node.port);
         let resp = http.get(&url)
             .header("X-WolfStack-Secret", &state.cluster_secret)
+            .timeout(std::time::Duration::from_secs(8))
             .send().await;
         let Ok(r) = resp else { continue; };
-        if !r.status().is_success() { continue; }
+        if !r.status().is_success() {
+            let _ = r.bytes().await;  // drain → pool
+            continue;
+        }
         let Ok(val) = r.json::<serde_json::Value>().await else { continue; };
         per_node.push(serde_json::json!({
             "node": node.hostname,
@@ -470,10 +485,7 @@ async fn tool_read_log(
     // Discover which node hosts a container named `target` by walking
     // the cluster's container cache, then call that node's log endpoint.
     let nodes = state.cluster.get_all_nodes();
-    let http = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .danger_accept_invalid_certs(true)
-        .build() { Ok(c) => c, Err(_) => return ToolResult::err("http client build failed".into()) };
+    let http = &*DISPATCH_CLIENT;
 
     for node in &nodes {
         if !node.online || node.is_self { continue; }
@@ -491,9 +503,13 @@ async fn tool_read_log(
             let url = format!("{}://{}:{}{}", scheme, node.address, node.port, path);
             let resp = http.get(&url)
                 .header("X-WolfStack-Secret", &state.cluster_secret)
+                .timeout(std::time::Duration::from_secs(10))
                 .send().await;
             let Ok(r) = resp else { continue; };
-            if !r.status().is_success() { continue; }
+            if !r.status().is_success() {
+                let _ = r.bytes().await;
+                continue;
+            }
             let text = r.text().await.unwrap_or_default();
             // Some endpoints return JSON, some plain text — try JSON
             // first, fall back to the raw body.
@@ -544,11 +560,8 @@ async fn tool_check_disk_usage(
                 .and_then(|n| n.cluster_name.clone()).unwrap_or_default(),
             true, String::new(), 0));
     }
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .danger_accept_invalid_certs(true)
-        .build().ok();
-    if let Some(http) = http.as_ref() {
+    let http = &*DISPATCH_CLIENT;
+    {
         for node in nodes.iter().filter(|n| n.online && !n.is_self) {
             if let Some(fc) = filter_cluster {
                 if node.cluster_name.as_deref() != Some(fc) { continue; }
@@ -561,9 +574,13 @@ async fn tool_check_disk_usage(
                 let url = format!("{}://{}:{}{}", scheme, node.address, node.port, path);
                 let Ok(r) = http.get(&url)
                     .header("X-WolfStack-Secret", &state.cluster_secret)
+                    .timeout(std::time::Duration::from_secs(8))
                     .send().await
                 else { continue; };
-                if !r.status().is_success() { continue; }
+                if !r.status().is_success() {
+                    let _ = r.bytes().await;
+                    continue;
+                }
                 let Ok(val) = r.json::<serde_json::Value>().await else { continue; };
                 let arr = val.get("containers").cloned().unwrap_or(val);
                 if let Some(a) = arr.as_array() {
@@ -609,7 +626,7 @@ async fn tool_check_disk_usage(
                 Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).to_string()),
                 _ => None,
             }
-        } else if let Some(http) = http.as_ref() {
+        } else {
             // Remote exec via /api/containers/{runtime}/{id}/exec —
             // runs `df -P /` in the container on the remote node.
             let scheme = if port == 443 || port == 8553 { "https" } else { "http" };
@@ -618,15 +635,21 @@ async fn tool_check_disk_usage(
             let body = serde_json::json!({ "command": "df -P /" });
             match http.post(&url)
                 .header("X-WolfStack-Secret", &state.cluster_secret)
+                .timeout(std::time::Duration::from_secs(8))
                 .json(&body).send().await
             {
                 Ok(r) if r.status().is_success() => {
                     r.json::<serde_json::Value>().await.ok()
                         .and_then(|v| v.get("stdout").and_then(|s| s.as_str()).map(String::from))
                 }
-                _ => None,
+                Ok(r) => {
+                    // Drain the error body before giving up.
+                    let _ = r.bytes().await;
+                    None
+                }
+                Err(_) => None,
             }
-        } else { None };
+        };
 
         let (used_pct, avail_kb, total_kb) = match df_output {
             Some(text) if !text.is_empty() => parse_df(&text),
@@ -724,14 +747,12 @@ async fn read_file_on_remote(
     if !node.online {
         return ToolResult::err(format!("node '{}' is offline", node.hostname));
     }
-    let http = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .danger_accept_invalid_certs(true)
-        .build() { Ok(c) => c, Err(e) => return ToolResult::err(format!("http client: {}", e)) };
+    let http = &*DISPATCH_CLIENT;
     let scheme = if node.port == 443 || node.port == 8553 { "https" } else { "http" };
     let url = format!("{}://{}:{}/api/cluster/file/read", scheme, node.address, node.port);
     let resp = http.post(&url)
         .header("X-WolfStack-Secret", &state.cluster_secret)
+        .timeout(std::time::Duration::from_secs(15))
         .json(&serde_json::json!({ "path": path }))
         .send().await;
     match resp {
@@ -877,18 +898,19 @@ async fn tool_restart_container(
     }
 
     // Not local — find the owning node via inventory, then restart once.
-    let http = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .danger_accept_invalid_certs(true)
-        .build() { Ok(c) => c, Err(_) => return ToolResult::err("http client build failed".into()) };
+    let http = &*DISPATCH_CLIENT;
     for node in state.cluster.get_all_nodes().iter().filter(|n| n.online && !n.is_self) {
         let scheme = if node.port == 443 || node.port == 8553 { "https" } else { "http" };
         let list_path = if runtime == "docker" { "/api/containers/docker" } else { "/api/containers/lxc" };
         let list_url = format!("{}://{}:{}{}", scheme, node.address, node.port, list_path);
         let Ok(list_r) = http.get(&list_url)
             .header("X-WolfStack-Secret", &state.cluster_secret)
+            .timeout(std::time::Duration::from_secs(15))
             .send().await else { continue; };
-        if !list_r.status().is_success() { continue; }
+        if !list_r.status().is_success() {
+            let _ = list_r.bytes().await;
+            continue;
+        }
         let Ok(list_val) = list_r.json::<serde_json::Value>().await else { continue; };
         let arr = list_val.get("containers").cloned().unwrap_or(list_val);
         let has_it = arr.as_array().map(|a| a.iter().any(|c|
@@ -898,10 +920,15 @@ async fn tool_restart_container(
             scheme, node.address, node.port, runtime, name);
         let resp = http.post(&action_url)
             .header("X-WolfStack-Secret", &state.cluster_secret)
+            .timeout(std::time::Duration::from_secs(15))
             .json(&serde_json::json!({ "action": "restart" }))
             .send().await;
         let Ok(r) = resp else { continue; };
-        if !r.status().is_success() { continue; }
+        if !r.status().is_success() {
+            let _ = r.bytes().await;
+            continue;
+        }
+        let _ = r.bytes().await;  // drain success body, action endpoint returns ack
         return ToolResult::ok(
             format!("restarted {}:{} on {}", runtime, name, node.hostname),
             serde_json::json!({
@@ -1103,14 +1130,12 @@ async fn write_file_on_remote(
     if !node.online {
         return ToolResult::err(format!("node '{}' is offline", node.hostname));
     }
-    let http = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .danger_accept_invalid_certs(true)
-        .build() { Ok(c) => c, Err(e) => return ToolResult::err(format!("http client: {}", e)) };
+    let http = &*DISPATCH_CLIENT;
     let scheme = if node.port == 443 || node.port == 8553 { "https" } else { "http" };
     let url = format!("{}://{}:{}/api/cluster/file/write", scheme, node.address, node.port);
     let resp = http.post(&url)
         .header("X-WolfStack-Secret", &state.cluster_secret)
+        .timeout(std::time::Duration::from_secs(30))
         .json(&serde_json::json!({ "path": path, "content": content, "append": append }))
         .send().await;
     match resp {
@@ -1184,10 +1209,8 @@ async fn tool_exec_in_container(
     }
 
     // Not local — fan out to find which online node owns it.
-    let http = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout_secs + 5))
-        .danger_accept_invalid_certs(true)
-        .build() { Ok(c) => c, Err(e) => return ToolResult::err(format!("http client build failed: {}", e)) };
+    let http = &*DISPATCH_CLIENT;
+    let req_timeout = std::time::Duration::from_secs(timeout_secs + 5);
     for node in state.cluster.get_all_nodes().iter().filter(|n| n.online && !n.is_self) {
         let scheme = if node.port == 443 || node.port == 8553 { "https" } else { "http" };
         // Check inventory first (cheap list call) so we don't
@@ -1196,8 +1219,12 @@ async fn tool_exec_in_container(
         let list_url = format!("{}://{}:{}{}", scheme, node.address, node.port, list_path);
         let Ok(list_r) = http.get(&list_url)
             .header("X-WolfStack-Secret", &state.cluster_secret)
+            .timeout(req_timeout)
             .send().await else { continue; };
-        if !list_r.status().is_success() { continue; }
+        if !list_r.status().is_success() {
+            let _ = list_r.bytes().await;
+            continue;
+        }
         let Ok(list_val) = list_r.json::<serde_json::Value>().await else { continue; };
         let arr = list_val.get("containers").cloned().unwrap_or(list_val);
         let has_it = arr.as_array().map(|a| a.iter().any(|c|
@@ -1208,10 +1235,14 @@ async fn tool_exec_in_container(
             scheme, node.address, node.port, runtime, name);
         let resp = http.post(&exec_url)
             .header("X-WolfStack-Secret", &state.cluster_secret)
+            .timeout(req_timeout)
             .json(&serde_json::json!({ "command": command }))
             .send().await;
         let Ok(r) = resp else { continue; };
-        if !r.status().is_success() { continue; }
+        if !r.status().is_success() {
+            let _ = r.bytes().await;
+            continue;
+        }
         let Ok(val) = r.json::<serde_json::Value>().await else { continue; };
         let stdout = val.get("stdout").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let stderr = val.get("stderr").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -1272,14 +1303,12 @@ async fn tool_exec_on_node(
     if !node.online {
         return ToolResult::err(format!("node '{}' is offline", node_id));
     }
-    let http = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout_secs + 5))
-        .danger_accept_invalid_certs(true)
-        .build() { Ok(c) => c, Err(e) => return ToolResult::err(format!("http client build failed: {}", e)) };
+    let http = &*DISPATCH_CLIENT;
     let scheme = if node.port == 443 || node.port == 8553 { "https" } else { "http" };
     let url = format!("{}://{}:{}/api/ai/exec", scheme, node.address, node.port);
     let resp = http.post(&url)
         .header("X-WolfStack-Secret", &state.cluster_secret)
+        .timeout(std::time::Duration::from_secs(timeout_secs + 5))
         .json(&serde_json::json!({ "command": command }))
         .send().await;
     match resp {
@@ -1310,7 +1339,11 @@ async fn tool_exec_on_node(
                 Err(e) => ToolResult::err(format!("remote response parse failed: {}", e)),
             }
         }
-        Ok(r) => ToolResult::err(format!("remote exec HTTP {} on {}", r.status(), node.hostname)),
+        Ok(r) => {
+            let code = r.status();
+            let _ = r.bytes().await;
+            ToolResult::err(format!("remote exec HTTP {} on {}", code, node.hostname))
+        }
         Err(e) => ToolResult::err(format!("remote exec failed on {}: {}", node.hostname, e)),
     }
 }
@@ -1354,14 +1387,12 @@ async fn tool_delete_file(
     if !n.online {
         return ToolResult::err(format!("node '{}' is offline", n.hostname));
     }
-    let http = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .danger_accept_invalid_certs(true)
-        .build() { Ok(c) => c, Err(e) => return ToolResult::err(format!("http client: {}", e)) };
+    let http = &*DISPATCH_CLIENT;
     let scheme = if n.port == 443 || n.port == 8553 { "https" } else { "http" };
     let url = format!("{}://{}:{}/api/cluster/file/delete", scheme, n.address, n.port);
     let resp = http.post(&url)
         .header("X-WolfStack-Secret", &state.cluster_secret)
+        .timeout(std::time::Duration::from_secs(15))
         .json(&serde_json::json!({ "path": path }))
         .send().await;
     match resp {
@@ -1434,13 +1465,7 @@ async fn tool_wolfstack_api(
     // fine for observation and admin ops.
     let port = crate::ports::PortConfig::load().api;
     let url = format!("http://127.0.0.1:{}{}", port, path);
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return ToolResult::err(format!("http client build failed: {}", e)),
-    };
+    let client = &*DISPATCH_CLIENT;
     let req_builder = match method.as_str() {
         "GET" => client.get(&url),
         "POST" => client.post(&url),
@@ -1449,7 +1474,9 @@ async fn tool_wolfstack_api(
         "DELETE" => client.delete(&url),
         _ => unreachable!(),
     };
-    let req_builder = req_builder.header("X-WolfStack-Secret", &state.cluster_secret);
+    let req_builder = req_builder
+        .timeout(Duration::from_secs(30))
+        .header("X-WolfStack-Secret", &state.cluster_secret);
     let req_builder = if let Some(b) = body {
         req_builder.header("Content-Type", "application/json").json(b)
     } else {
@@ -1814,16 +1841,17 @@ fn is_ip_private(ip: &std::net::IpAddr) -> bool {
 }
 
 async fn web_fetch_http(url: &str) -> ToolResult {
-    let client = match reqwest::Client::builder()
+    // Shared pool — see DISPATCH_CLIENT. The builder used to set
+    // `redirect::Policy::limited(5)` per call; DISPATCH_CLIENT
+    // defaults to up to 10 redirects, which is strictly more
+    // permissive — acceptable for an agent web fetch. User-Agent
+    // and per-request timeout set below.
+    let client = &*DISPATCH_CLIENT;
+    let resp = match client.get(url)
         .timeout(std::time::Duration::from_secs(WEB_FETCH_TIMEOUT_SECS))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .user_agent("WolfStackAgent/1.0 (+https://wolfstack.io)")
-        .build()
+        .header("User-Agent", "WolfStackAgent/1.0 (+https://wolfstack.io)")
+        .send().await
     {
-        Ok(c) => c,
-        Err(e) => return ToolResult::err(format!("web_fetch: build client failed: {}", e)),
-    };
-    let resp = match client.get(url).send().await {
         Ok(r) => r,
         Err(e) => return ToolResult::err(format!("web_fetch: request failed: {}", e)),
     };
@@ -2028,10 +2056,7 @@ async fn tool_semantic_search(
     // Cluster-wide or specific remote.
     let want_all = node == "*" || node == "all";
     let nodes = state.cluster.get_all_nodes();
-    let http = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .danger_accept_invalid_certs(true)
-        .build() { Ok(c) => c, Err(e) => return ToolResult::err(format!("http client: {}", e)) };
+    let http = &*DISPATCH_CLIENT;
 
     // Collect raw matches with their source-node tag, then BM25 already
     // gave each one a score — we just sort globally and take top-N.
@@ -2058,12 +2083,16 @@ async fn tool_semantic_search(
             scheme, n.address, n.port);
         let resp = http.post(&url)
             .header("X-WolfStack-Secret", &state.cluster_secret)
+            .timeout(std::time::Duration::from_secs(15))
             .json(&serde_json::json!({
                 "query": query, "limit": limit * 2, "sources": sources,
             }))
             .send().await;
         let Ok(r) = resp else { continue; };
-        if !r.status().is_success() { continue; }
+        if !r.status().is_success() {
+            let _ = r.bytes().await;
+            continue;
+        }
         let Ok(val) = r.json::<serde_json::Value>().await else { continue; };
         if let Some(arr) = val.get("matches").and_then(|v| v.as_array()) {
             for m in arr {

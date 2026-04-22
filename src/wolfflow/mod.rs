@@ -18,6 +18,31 @@ use tracing::{info, warn, error};
 
 use crate::agent::ClusterState;
 
+/// Shared HTTP clients for WolfFlow action execution. Two flavors
+/// because the `HttpRequest` action exposes a `verify_tls` toggle to
+/// the user — we honour it by dispatching to the appropriate pool.
+/// Per-call `reqwest::Client::builder()` was leaking one connection
+/// pool per workflow step; on a scheduled workflow with many HTTP
+/// actions, that compounded per run.
+///
+/// `_INSECURE` is also used for cluster-internal calls (remote step
+/// execution, Unifi sessions) because WolfStack commonly talks to
+/// self-signed peers and the existing behaviour was
+/// `danger_accept_invalid_certs(true)`.
+static WOLFFLOW_CLIENT_STRICT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+static WOLFFLOW_CLIENT_INSECURE: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
 // ─── Constants ───
 
 fn wolfflow_dir() -> String { crate::paths::get().wolfflow_dir }
@@ -1019,11 +1044,14 @@ pub async fn execute_action_local(action: &ActionType) -> Result<StepOutput, Str
 
         // ─── Generic HTTP Request ───
         ActionType::HttpRequest { method, url, headers, body, auth, timeout_secs, fail_on_error, verify_tls } => {
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(*timeout_secs))
-                .danger_accept_invalid_certs(!verify_tls)
-                .build()
-                .map_err(|e| format!("HTTP client error: {}", e))?;
+            // Route to the right shared pool based on the user's
+            // `verify_tls` toggle. Timeout goes on the RequestBuilder
+            // below so both pools can serve every timeout value.
+            let client: &reqwest::Client = if *verify_tls {
+                &WOLFFLOW_CLIENT_STRICT
+            } else {
+                &WOLFFLOW_CLIENT_INSECURE
+            };
 
             let req_method = match method.to_uppercase().as_str() {
                 "GET" => reqwest::Method::GET,
@@ -1035,7 +1063,8 @@ pub async fn execute_action_local(action: &ActionType) -> Result<StepOutput, Str
                 _ => return Err(format!("Unsupported HTTP method: {}", method)),
             };
 
-            let mut req = client.request(req_method, url);
+            let mut req = client.request(req_method, url)
+                .timeout(std::time::Duration::from_secs(*timeout_secs));
 
             // Apply auth
             if let Some(a) = auth {
@@ -1142,8 +1171,14 @@ pub async fn execute_action_local(action: &ActionType) -> Result<StepOutput, Str
                 .json(&login_body)
                 .send().await
                 .map_err(|e| format!("Unifi login failed: {}", e))?;
-            if !login_resp.status().is_success() {
-                return Err(format!("Unifi login failed: HTTP {}", login_resp.status()));
+            let login_status = login_resp.status();
+            // Drain the login response body so the socket returns to
+            // the keep-alive pool — cookies were already parsed into
+            // the jar during send(), so we don't need to inspect the
+            // body content itself.
+            let _ = login_resp.bytes().await;
+            if !login_status.is_success() {
+                return Err(format!("Unifi login failed: HTTP {}", login_status));
             }
 
             // Execute the actual request (session cookies are sent automatically)
@@ -1562,12 +1597,12 @@ pub async fn execute_workflow(
     let mut had_failure = false;
     let mut aborted = false;
 
-    // Build HTTP client for remote calls
-    let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .ok();
+    // Shared pool for remote step execution — see
+    // WOLFFLOW_CLIENT_INSECURE. Per-workflow-run Client construction
+    // was leaking a pool every time a scheduled workflow fired. We
+    // wrap in Some() so the downstream `.clone()` sites keep their
+    // existing shape.
+    let http_client: Option<reqwest::Client> = Some(reqwest::Client::clone(&WOLFFLOW_CLIENT_INSECURE));
 
     // Index-based execution loop with branching, context passing, and retry
     let mut step_idx: usize = 0;

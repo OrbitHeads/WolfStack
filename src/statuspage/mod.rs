@@ -18,6 +18,47 @@ use std::sync::{Arc, RwLock};
 fn config_file() -> String { crate::paths::get().statuspage_config }
 fn uptime_file() -> String { crate::paths::get().statuspage_uptime }
 
+// ─── Shared HTTP clients ───
+//
+// Same pattern as src/wolfrun/mod.rs (fixed in v19.8.1). Building a
+// `reqwest::Client` per call leaks: each client owns its own
+// keep-alive pool, and dropping the client strands idle connections
+// that the remote eventually FINs — sockets then sit in CLOSE_WAIT
+// on our side until the fd is forcibly reclaimed. One pool for the
+// lifetime of the process, reused by every call site in this module,
+// eliminates that accumulation.
+//
+// Two clients because the cluster-RPC path wants a uniform 10s
+// timeout, while monitor HTTP checks set their timeout per-request
+// from the user-configured `timeout_secs` (different per monitor)
+// via RequestBuilder::timeout.
+
+static SP_RPC_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
+static SP_HTTP_CHECK_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
+/// Drain a response body and discard it. reqwest cannot return the
+/// TCP socket to its keep-alive pool until the body is consumed;
+/// without this, every non-success `.send().await` branch that only
+/// inspects `.status()` leaks a socket. Mirrors the `send_and_drain`
+/// helper added to src/wolfrun/mod.rs in v19.8.1.
+async fn drain_response(resp: reqwest::Response) {
+    let _ = resp.bytes().await;
+}
+
 // ═══════════════════════════════════════════════
 // ─── Data Types ───
 // ═══════════════════════════════════════════════
@@ -468,15 +509,11 @@ pub async fn broadcast_to_cluster(
         return;
     }
 
-    // Build HTTP client
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .danger_accept_invalid_certs(true)
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+    // Shared process-wide client — see SP_RPC_CLIENT docs at top of
+    // file. Previously built a fresh Client here on every 60s tick,
+    // which was the primary statuspage contribution to CLOSE_WAIT
+    // accumulation reported by Bel.
+    let client = &*SP_RPC_CLIENT;
 
     // Send to all online same-cluster peers (not self)
     for node in &nodes {
@@ -499,12 +536,20 @@ pub async fn broadcast_to_cluster(
                 Ok(resp) if resp.status().is_success() => {
                     tracing::info!("StatusPage sync: sent {} pages, {} monitors to {} ({})",
                         page_count, monitor_count, node.hostname, url);
+                    // Drain the ack body so the socket returns to the
+                    // keep-alive pool cleanly.
+                    drain_response(resp).await;
                     sent = true;
                     break;
                 }
                 Ok(resp) => {
+                    let status = resp.status();
                     tracing::warn!("StatusPage sync: {} returned HTTP {} — trying next URL",
-                        url, resp.status());
+                        url, status);
+                    // Non-success responses still have a body (often
+                    // an error message) — drain it or the socket
+                    // leaks the same way as success would.
+                    drain_response(resp).await;
                     continue;
                 }
                 Err(e) => {
@@ -541,14 +586,9 @@ pub async fn pull_from_peers(
         }
     }
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .danger_accept_invalid_certs(true)
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+    // Shared process-wide client — see SP_RPC_CLIENT docs at top of
+    // file. Building per-call was the same leak as broadcast_to_cluster.
+    let client = &*SP_RPC_CLIENT;
 
     // Try each online same-cluster peer
     for peer in nodes.iter().filter(|n| {
@@ -561,6 +601,9 @@ pub async fn pull_from_peers(
                 .send().await
             {
                 Ok(resp) if resp.status().is_success() => {
+                    // `.json()` consumes the body internally, which
+                    // returns the socket to the pool — so this arm is
+                    // already drain-safe.
                     if let Ok(peer_config) = resp.json::<StatusPageConfig>().await {
                         // Filter to only our cluster's data — peer may have replicated data from other clusters
                         let filtered = StatusPageConfig {
@@ -577,8 +620,15 @@ pub async fn pull_from_peers(
                     }
                     break; // Peer responded but had no data — try next peer
                 }
-                Ok(_) => continue, // Non-success HTTP — try next URL
-                Err(_) => continue, // Network error — try next URL
+                // Non-success HTTP: bind resp so we can drain the
+                // error body before discarding. The old `Ok(_)` arm
+                // dropped an unconsumed Response, which prevented the
+                // socket from going back to the keep-alive pool.
+                Ok(resp) => {
+                    drain_response(resp).await;
+                    continue;
+                }
+                Err(_) => continue, // Network error — no Response to drain.
             }
         }
     }
@@ -702,18 +752,23 @@ pub async fn run_checks(state: &Arc<StatusPageState>) {
 }
 
 async fn run_http_check(url: &str, expected_status: u16, timeout: std::time::Duration) -> (bool, Option<String>) {
-    let client = match reqwest::Client::builder()
-        .timeout(timeout)
-        .danger_accept_invalid_certs(true)
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return (false, Some(format!("Client error: {}", e))),
-    };
+    // Shared pool (SP_HTTP_CHECK_CLIENT) carries no default timeout —
+    // each monitor has its own `timeout_secs`, so we set it per
+    // request via RequestBuilder::timeout. Previously this function
+    // built a fresh Client per monitor per 30s tick; on a host with
+    // N monitors that was N leaked connection pools per tick, the
+    // dominant fire source for Bel's CLOSE_WAIT climb.
+    let client = &*SP_HTTP_CHECK_CLIENT;
 
-    match client.get(url).send().await {
+    match client.get(url).timeout(timeout).send().await {
         Ok(resp) => {
             let status = resp.status().as_u16();
+            // Drain the body BEFORE returning so the socket goes
+            // back to the keep-alive pool. `status()` doesn't consume
+            // the response; dropping it unread was the second half of
+            // the leak. Errors from drain are ignored — the check's
+            // pass/fail verdict is already decided by status code.
+            let _ = resp.bytes().await;
             if status == expected_status {
                 (true, None)
             } else {

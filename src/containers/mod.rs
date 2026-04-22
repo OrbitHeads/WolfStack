@@ -18,6 +18,19 @@ use std::sync::Mutex;
 use std::time::Instant;
 use tracing::{error, info, warn};
 
+/// Shared HTTP client for sync_wolfnet_peer_routes. Per-call was a
+/// latent leak source even though the function is currently
+/// `#[allow(dead_code)]` — keeping it leak-clean so whenever it's
+/// wired back up it doesn't regress.
+static CONTAINER_WOLFNET_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
 /// One-time WolfNet networking initialization — called at WolfStack startup.
 /// Sets kernel parameters and iptables rules needed for container traffic to flow through wolfnet0.
 /// Called once at startup. The reconciliation loop (cleanup_stale_wolfnet_routes) re-applies
@@ -1175,14 +1188,8 @@ pub async fn sync_wolfnet_peer_routes() {
         None => return,
     };
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .danger_accept_invalid_certs(true)
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+    // Shared pool — see CONTAINER_WOLFNET_CLIENT.
+    let client = &*CONTAINER_WOLFNET_CLIENT;
 
     let mut subnet_routes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 

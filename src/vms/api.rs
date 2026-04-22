@@ -7,6 +7,19 @@ use serde::Deserialize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// Shared HTTP clients for VM migration. Two flavors because uploads
+/// want a 1-hour total deadline but still a short connect_timeout so
+/// an unreachable target fails fast. Per-migration Client builders
+/// were leaking connection pools for every VM transfer attempt.
+static VM_MIGRATION_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
 use crate::api::{
     AppState, MigrationTasks, require_auth, build_node_urls,
     migration_create, migration_update, migration_fail, migration_done, migration_progress,
@@ -878,12 +891,10 @@ async fn vm_migrate(
             build_node_urls(&node.address, node.port, "/api/vms/import-external")
         };
 
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(3600))
-            .danger_accept_invalid_certs(true)
-            .build()
-            .unwrap_or_default();
+        // Shared pool — see VM_MIGRATION_CLIENT. 1-hour total timeout
+        // set per-request for the long upload; 5s connect_timeout is
+        // baked into the client.
+        let client = &*VM_MIGRATION_CLIENT;
 
         let file_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
         let mut last_err: Option<String> = None;
@@ -913,6 +924,7 @@ async fn vm_migrate(
 
             match client.post(import_url)
                 .header("X-WolfStack-Secret", state_clone.cluster_secret.clone())
+                .timeout(Duration::from_secs(3600))
                 .multipart(form)
                 .send()
                 .await
@@ -920,6 +932,9 @@ async fn vm_migrate(
                 Ok(r) => {
                     super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
                     if r.status().is_success() {
+                        // Drain any ack body so the socket returns
+                        // to the pool.
+                        let _ = r.bytes().await;
                         migration_done(&state_clone.migration_tasks, &tid,
                             &format!("VM '{}' transferred to '{}' on node '{}'. Destination is stopped — start it manually when ready.",
                                 name, new_name, target_label));
@@ -1230,22 +1245,25 @@ async fn vm_migrate_external(
     tokio::spawn(async move {
         migration_update(&state_clone.migration_tasks, &tid, "preflight", &format!("Checking connectivity to {}…", target_label));
         let preflight_urls = crate::api::build_external_urls(&target_url, "/api/storage/list");
-        let preflight_client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(10))
-            .danger_accept_invalid_certs(true)
-            .build()
-            .unwrap_or_default();
+        let preflight_client = &*VM_MIGRATION_CLIENT;
 
         let mut preflight_ok = false;
         let mut preflight_err = String::new();
         for url in &preflight_urls {
             match preflight_client.get(url)
                 .header("X-WolfStack-Secret", state_clone.cluster_secret.clone())
+                .timeout(Duration::from_secs(10))
                 .send()
                 .await
             {
-                Ok(_) => { preflight_ok = true; break; }
+                Ok(resp) => {
+                    // Drain the body so the preflight socket returns
+                    // to the pool; we only care that the request
+                    // succeeded at the transport layer.
+                    let _ = resp.bytes().await;
+                    preflight_ok = true;
+                    break;
+                }
                 Err(e) => { preflight_err = format!("{}: {}", url, e); }
             }
         }
@@ -1320,11 +1338,8 @@ async fn vm_migrate_external(
         migration_progress(&state_clone.migration_tasks, &tid, Some(0), Some(total_bytes), Some(0.0));
 
         let import_urls = crate::api::build_external_urls(&target_url, "/api/vms/import-external");
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(3600))
-            .danger_accept_invalid_certs(true)
-            .build()
-            .unwrap_or_default();
+        // Shared pool — see VM_MIGRATION_CLIENT. 1h timeout per-request.
+        let client = &*VM_MIGRATION_CLIENT;
         let file_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
         let mut last_err: Option<String> = None;
         let mut finished = false;
@@ -1351,6 +1366,7 @@ async fn vm_migrate_external(
             match client.post(import_url)
                 .header("X-Transfer-Token", &target_token)
                 .header("X-WolfStack-Secret", state_clone.cluster_secret.clone())
+                .timeout(Duration::from_secs(3600))
                 .multipart(form)
                 .send()
                 .await
@@ -1358,6 +1374,7 @@ async fn vm_migrate_external(
                 Ok(r) => {
                     super::manager::export_cleanup(archive_path.to_str().unwrap_or(""));
                     if r.status().is_success() {
+                        let _ = r.bytes().await;
                         migration_done(&state_clone.migration_tasks, &tid,
                             &format!("VM '{}' transferred to {}. Destination is stopped — start it manually when ready.",
                                 name, target_url));
