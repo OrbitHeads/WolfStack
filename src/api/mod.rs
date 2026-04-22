@@ -20233,7 +20233,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/sql-connections/{id}", web::delete().to(sql_connections_delete))
         .route("/api/sql-connections/{id}/test", web::post().to(sql_connections_test))
         .route("/api/sql-connections/{id}/query", web::post().to(sql_connections_query))
+        .route("/api/sql-connections/{id}/query-proxy", web::post().to(sql_connections_query_proxy))
+        .route("/api/sql-connections/receive", web::post().to(sql_connections_receive))
         .route("/api/sql-connections/audit", web::get().to(sql_connections_audit))
+        .route("/api/nodes/{id}/ips", web::get().to(node_ips_list))
         // Status Page (public — NO auth)
         .route("/status", web::get().to(statuspage_public_index))
         .route("/status/{slug}", web::get().to(statuspage_public_page));
@@ -20245,10 +20248,23 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
 
 /// GET /api/sql-connections — list every configured connection with
 /// passwords masked (just `has_password: true|false`).
+///
+/// Enterprise: filters connections by the caller's username against
+/// `SqlConnection::allowed_users`. Empty allowlist = visible to all
+/// (the default, and the only behaviour on the free tier).
+/// Cluster-node callers always see everything — profiles are
+/// cluster-wide config, not per-user scope, and the proxy endpoint
+/// needs to resolve profiles regardless of who initiated.
 pub async fn sql_connections_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let caller = match require_auth(&req, &state) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let enterprise = crate::compat::platform_ready();
+    let is_cluster_node = caller == "cluster-node";
     let cfg = crate::sql_connections::load();
     let safe: Vec<serde_json::Value> = cfg.connections.iter()
+        .filter(|c| is_cluster_node || c.user_permitted(&caller, enterprise))
         .map(|c| c.to_safe_json())
         .collect();
     HttpResponse::Ok().json(serde_json::json!({ "connections": safe }))
@@ -20280,6 +20296,9 @@ pub async fn sql_connections_create(
     if let Err(e) = crate::sql_connections::save(&cfg) {
         return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
     }
+    // Fan-out: every WolfStack peer needs this profile so queries to
+    // its node_id can be served cluster-wide.
+    replicate_sql_connections_to_cluster(state.clone());
     HttpResponse::Ok().json(serde_json::json!({ "connection": conn.to_safe_json() }))
 }
 
@@ -20309,6 +20328,7 @@ pub async fn sql_connections_update(
         return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
     }
     // save() already drops all pools; no extra invalidation needed.
+    replicate_sql_connections_to_cluster(state.clone());
     HttpResponse::Ok().json(serde_json::json!({ "connection": incoming.to_safe_json() }))
 }
 
@@ -20329,6 +20349,7 @@ pub async fn sql_connections_delete(
     if let Err(e) = crate::sql_connections::save(&cfg) {
         return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
     }
+    replicate_sql_connections_to_cluster(state.clone());
     HttpResponse::Ok().json(serde_json::json!({ "deleted": id }))
 }
 
@@ -20383,6 +20404,24 @@ pub async fn sql_connections_query(
         Err(resp) => return resp,
     };
     let id = path.into_inner();
+
+    // Enterprise per-user ACL. Cluster-secret callers are exempt —
+    // they're the query-proxy path or an internal subsystem.
+    if username != "cluster-node" {
+        let enterprise = crate::compat::platform_ready();
+        let cfg = crate::sql_connections::load();
+        if let Some(conn) = cfg.connections.iter().find(|c| c.id == id) {
+            if !conn.user_permitted(&username, enterprise) {
+                return HttpResponse::Forbidden().json(serde_json::json!({
+                    "error": format!(
+                        "user '{}' is not in the allowed_users list for connection '{}'",
+                        username, id
+                    )
+                }));
+            }
+        }
+    }
+
     let perm = match body.permission.as_deref().unwrap_or("read") {
         "delete" => crate::sql_connections::SqlPermission::Delete,
         "update" => crate::sql_connections::SqlPermission::Update,
@@ -20394,6 +20433,7 @@ pub async fn sql_connections_query(
         crate::sql_connections::Caller::Ui(username),
         &state.cluster_secret,
         timeout,
+        Some(&state.cluster),
     ).await {
         Ok(r) => HttpResponse::Ok().json(r),
         Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
@@ -20412,6 +20452,308 @@ pub async fn sql_connections_audit(
     HttpResponse::Ok().json(serde_json::json!({
         "entries": crate::sql_connections::read_audit_tail(n)
     }))
+}
+
+#[derive(Deserialize)]
+pub struct SqlProxyRequest {
+    pub query: String,
+    #[serde(default)]
+    pub permission: Option<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// Opaque caller tag from the originator — included in the target
+    /// node's audit log so a trace like "ui:paul via wolfstack-1 →
+    /// wolfstack-2" is visible on every hop.
+    #[serde(default)]
+    pub origin_caller: Option<String>,
+}
+
+/// GET /api/nodes/{id}/ips — enumerate IPs reachable FROM that node,
+/// for the SQL-connections IP picker. Returns local interfaces, the
+/// WolfNet overlay range (if configured), Docker and LXC container
+/// IPs (with container name for quick recognition), and VM WolfNet
+/// IPs (with VM name). Session auth — operator-only.
+///
+/// When `id == self`, enumeration happens locally. Otherwise we
+/// cluster-secret-proxy the same call to the target peer, which runs
+/// it in its own local context and returns the list. No port-scanning
+/// or probing — the node just reports IPs it is already aware of.
+pub async fn node_ips_list(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let node_id = path.into_inner();
+    let self_id = crate::agent::self_node_id();
+
+    if node_id == self_id {
+        return HttpResponse::Ok().json(serde_json::json!({
+            "node_id": node_id,
+            "ips": enumerate_local_ips(&state).await,
+        }));
+    }
+
+    // Remote — find the peer and proxy the same URL with cluster secret.
+    let peer = match state.cluster.get_node(&node_id) {
+        Some(n) => n,
+        None => return HttpResponse::NotFound().json(serde_json::json!({
+            "error": format!("node '{}' not found in cluster state", node_id)
+        })),
+    };
+    if !peer.online {
+        return HttpResponse::Ok().json(serde_json::json!({
+            "node_id": node_id,
+            "ips": [],
+            "error": format!("peer '{}' is offline", peer.hostname),
+        }));
+    }
+
+    let urls = build_node_urls(&peer.address, peer.port,
+        &format!("/api/nodes/{}/ips", urlencoding_simple(&node_id)));
+    let client = &*API_HTTP_CLIENT;
+    for url in &urls {
+        match client.get(url)
+            .header("X-WolfStack-Secret", &state.cluster_secret)
+            .timeout(std::time::Duration::from_secs(8))
+            .send().await
+        {
+            Ok(r) if r.status().is_success() => {
+                match r.bytes().await {
+                    Ok(body) => return HttpResponse::Ok()
+                        .content_type("application/json")
+                        .body(body),
+                    Err(e) => return HttpResponse::BadGateway()
+                        .json(serde_json::json!({
+                            "error": format!("read body: {}", e)
+                        })),
+                }
+            }
+            Ok(r) => {
+                let _ = r.bytes().await;
+                continue;  // try next URL
+            }
+            Err(_) => continue,
+        }
+    }
+    HttpResponse::BadGateway().json(serde_json::json!({
+        "error": format!("could not reach peer '{}'", peer.hostname)
+    }))
+}
+
+/// Enumerate every IP this node would realistically want to expose as
+/// a database target — host interfaces, WolfNet overlay, Docker + LXC
+/// containers (with their human name), and VMs. Each entry carries a
+/// `source` tag so the UI can group them.
+async fn enumerate_local_ips(state: &web::Data<AppState>) -> Vec<serde_json::Value> {
+    let mut out: Vec<serde_json::Value> = Vec::new();
+
+    // Host-side interfaces via `ip -4 -o addr`. One line per interface.
+    if let Ok(o) = std::process::Command::new("ip").args(["-4", "-o", "addr"]).output() {
+        if o.status.success() {
+            let text = String::from_utf8_lossy(&o.stdout);
+            for line in text.lines() {
+                // Format: "2: eth0    inet 10.0.0.5/24 brd 10.0.0.255 scope global eth0"
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() < 4 { continue; }
+                let iface = parts.get(1).unwrap_or(&"").to_string();
+                let cidr = parts.get(3).unwrap_or(&"").to_string();
+                let addr = cidr.split('/').next().unwrap_or("").to_string();
+                if addr.is_empty() || addr.starts_with("127.") { continue; }
+                out.push(serde_json::json!({
+                    "address": addr,
+                    "source": format!("iface:{}", iface),
+                    "label": format!("{} ({})", addr, iface),
+                }));
+            }
+        }
+    }
+
+    // Docker containers
+    for c in crate::containers::docker_list_all_cached() {
+        // ip_address may be "10.0.0.5" or "10.0.0.5, 10.0.1.7 (wolfnet)" etc.
+        for part in c.ip_address.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            let addr = part.split_whitespace().next().unwrap_or("").to_string();
+            if addr.is_empty() { continue; }
+            let tag = if part.contains("wolfnet") { "docker-wolfnet" } else { "docker" };
+            out.push(serde_json::json!({
+                "address": addr,
+                "source": format!("{}:{}", tag, c.name),
+                "label": format!("{} — docker:{}", addr, c.name),
+            }));
+        }
+    }
+
+    // LXC containers
+    for c in crate::containers::lxc_list_all_cached() {
+        for part in c.ip_address.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            let addr = part.split_whitespace().next().unwrap_or("").to_string();
+            if addr.is_empty() { continue; }
+            let tag = if part.contains("wolfnet") { "lxc-wolfnet" } else { "lxc" };
+            out.push(serde_json::json!({
+                "address": addr,
+                "source": format!("{}:{}", tag, c.name),
+                "label": format!("{} — lxc:{}", addr, c.name),
+            }));
+        }
+    }
+
+    // VMs — only WolfNet IP is known without guest-agent probing,
+    // which is fine for DB hosting (typically one WolfNet IP per VM).
+    let vms = state.vms.lock().unwrap().list_vms();
+    for vm in vms {
+        if let Some(ip) = &vm.wolfnet_ip {
+            if !ip.trim().is_empty() {
+                out.push(serde_json::json!({
+                    "address": ip,
+                    "source": format!("vm:{}", vm.name),
+                    "label": format!("{} — vm:{}", ip, vm.name),
+                }));
+            }
+        }
+    }
+
+    // Deduplicate by address while keeping the first source tag.
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|v| {
+        let addr = v.get("address").and_then(|a| a.as_str()).unwrap_or("").to_string();
+        seen.insert(addr)
+    });
+    out
+}
+
+/// POST /api/sql-connections/{id}/query-proxy — inter-node query
+/// execution endpoint.
+///
+/// **Cluster-secret auth ONLY.** Session auth is explicitly rejected:
+/// permission for this call is already enforced on the originating
+/// node (where the UI session / agent / workflow lives). Letting a
+/// remote session hit this endpoint directly would bypass the
+/// originator's authorization. The cluster secret is the trust
+/// token; any node holding it is trusted peer-equivalent.
+///
+/// On success the target node executes locally (its own `node_id`
+/// matches the profile's) and returns the `SqlResult` body. The
+/// target's audit log records the call with the originator's caller
+/// tag so cross-node traces are intact.
+pub async fn sql_connections_query_proxy(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<SqlProxyRequest>,
+) -> HttpResponse {
+    // Cluster-secret-only: deliberately distinct from the UI
+    // /query handler so a session-authenticated user can't reach
+    // this path directly. `require_cluster_auth` rejects requests
+    // that either lack the X-WolfStack-Secret header or present an
+    // invalid one; it does NOT fall back to session auth.
+    if let Err(resp) = require_cluster_auth(&req, &state) { return resp; }
+
+    let id = path.into_inner();
+    let perm = match body.permission.as_deref().unwrap_or("read") {
+        "delete" => crate::sql_connections::SqlPermission::Delete,
+        "update" => crate::sql_connections::SqlPermission::Update,
+        _ => crate::sql_connections::SqlPermission::Read,
+    };
+    let timeout = body.timeout_secs.map(std::time::Duration::from_secs);
+
+    // Reconstruct the caller from the origin tag. The tag string is
+    // opaque ("agent:foo", "workflow:x:step", "ui:paul") — we wrap it
+    // as Caller::Ui so the target's audit log shows the origin exactly
+    // as the originator stamped it.
+    let caller = crate::sql_connections::Caller::Ui(
+        body.origin_caller.clone().unwrap_or_else(|| "remote".into())
+    );
+
+    match crate::sql_connections::execute(
+        &id, &body.query, perm,
+        caller,
+        &state.cluster_secret,
+        timeout,
+        Some(&state.cluster),
+    ).await {
+        Ok(r) => HttpResponse::Ok().json(r),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// POST /api/sql-connections/receive — receive the full connection
+/// list from a cluster peer and overwrite local config. Cluster-secret
+/// auth only — same threat model as /api/router/config-receive.
+///
+/// We treat profiles as cluster-wide: every WolfStack node holds the
+/// same list so any node can serve as the query-proxy target for any
+/// connection. Proxmox-only peers are excluded from the replication
+/// fan-out in `replicate_sql_connections_to_cluster` because they don't
+/// run WolfStack.
+pub async fn sql_connections_receive(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<crate::sql_connections::SqlConnectionsConfig>,
+) -> HttpResponse {
+    // Cluster-secret-only. A session-auth user on node A has no
+    // business overwriting node B's SQL connection config — writes
+    // go through the regular /api/sql-connections CRUD on the
+    // originator, and the originator fans out via
+    // `replicate_sql_connections_to_cluster` with the cluster secret.
+    if let Err(resp) = require_cluster_auth(&req, &state) { return resp; }
+    let cfg = body.into_inner();
+    if let Err(e) = crate::sql_connections::save(&cfg) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+    HttpResponse::Ok().json(serde_json::json!({ "received": cfg.connections.len() }))
+}
+
+/// Push the current SQL-connections config to every online WolfStack
+/// peer. Fire-and-forget from the caller's perspective (spawns a task
+/// so the originating HTTP handler can return immediately). Excludes
+/// Proxmox-only peers, which don't run WolfStack.
+fn replicate_sql_connections_to_cluster(state: web::Data<AppState>) {
+    let cluster = state.cluster.clone();
+    let cluster_secret = state.cluster_secret.clone();
+    let self_id = crate::agent::self_node_id();
+    tokio::spawn(async move {
+        let cfg = crate::sql_connections::load();
+        let body = match serde_json::to_string(&cfg) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("sql-connections replicate: serialize failed: {}", e);
+                return;
+            }
+        };
+        let nodes = cluster.get_all_nodes();
+        let client = &*API_HTTP_CLIENT;
+        for node in nodes {
+            if node.is_self || node.id == self_id { continue; }
+            if !node.online { continue; }
+            if node.node_type != "wolfstack" { continue; }
+            let urls = build_node_urls(&node.address, node.port, "/api/sql-connections/receive");
+            for url in &urls {
+                let res = client.post(url)
+                    .header("X-WolfStack-Secret", &cluster_secret)
+                    .header("Content-Type", "application/json")
+                    .timeout(std::time::Duration::from_secs(10))
+                    .body(body.clone())
+                    .send().await;
+                match res {
+                    Ok(r) if r.status().is_success() => {
+                        let _ = r.bytes().await;
+                        tracing::debug!("sql-connections replicated to {}", node.id);
+                        break;
+                    }
+                    Ok(r) => {
+                        let _ = r.bytes().await;
+                        // Non-success = authoritative failure on that URL
+                        // scheme; don't try the other URL variants.
+                        break;
+                    }
+                    Err(_) => {
+                        // Transport error — try next URL in the fallback chain.
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// GET /status/{slug} — public status page on dedicated port 8550.

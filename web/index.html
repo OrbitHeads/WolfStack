@@ -248,6 +248,11 @@
                     style="display:flex;align-items:center;justify-content:center;width:40px;height:40px;padding:0;border-radius:10px;">
                     <span class="icon" style="margin:0;font-size:20px;">🔗</span>
                 </a>
+                <a class="nav-item" data-page="databases" onclick="selectView('databases')"
+                    title="Databases — query any configured SQL connection across the cluster"
+                    style="display:flex;align-items:center;justify-content:center;width:40px;height:40px;padding:0;border-radius:10px;">
+                    <span class="icon" style="margin:0;font-size:20px;">🗄️</span>
+                </a>
                 <a class="nav-item" data-page="control-panel" onclick="selectView('control-panel')"
                     title="Control Panel — every VM, LXC and Docker across the cluster, one view"
                     style="display:flex;align-items:center;justify-content:center;width:40px;height:40px;padding:0;border-radius:10px;">
@@ -1957,6 +1962,55 @@
             </div>
         </div>
 
+        <!-- ═══ Databases Page ═══ -->
+        <!-- Cluster-wide SQL query interface. Uses predefined profiles
+             from Settings → SQL Connections. Routing (local vs proxy
+             via peer's /api/sql-connections/{id}/query-proxy) is
+             transparent to the UI — `POST /api/sql-connections/{id}/query`
+             handles it all server-side. -->
+        <div id="page-databases" class="page-view" style="display:none;">
+            <div class="card" style="margin-bottom:16px;">
+                <div class="card-body" style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;">
+                    <div>
+                        <h2 style="margin:0; display:flex; align-items:center; gap:10px;">
+                            <span>🗄️</span> Databases
+                        </h2>
+                        <div style="font-size:12px; color:var(--text-muted); margin-top:4px;">
+                            Query any configured database, anywhere in the cluster, through one interface. Connections live in
+                            <a href="#" onclick="selectView('settings'); switchSettingsTab('sql'); return false;">Settings → SQL Connections</a>.
+                        </div>
+                    </div>
+                    <div style="display:flex; gap:8px;">
+                        <button class="btn btn-sm" onclick="dbLoadConnections()">Refresh</button>
+                        <button class="btn btn-primary btn-sm" onclick="selectView('settings'); switchSettingsTab('sql');">+ New connection</button>
+                    </div>
+                </div>
+            </div>
+
+            <div style="display:grid; grid-template-columns: 280px 1fr; gap:16px;">
+                <!-- LEFT: connection list grouped by cluster → node -->
+                <div class="card" style="padding:0;">
+                    <div class="card-body" style="padding:12px;">
+                        <input type="text" id="db-search" class="form-control" placeholder="🔍 Filter connections..." oninput="dbFilterConnections()" style="margin-bottom:10px; font-size:13px;">
+                        <div id="db-conn-list" style="max-height: calc(100vh - 280px); overflow-y:auto;">
+                            <div style="color:var(--text-muted); text-align:center; padding:20px; font-size:13px;">Loading…</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- RIGHT: query interface for the selected connection -->
+                <div class="card">
+                    <div class="card-body" id="db-workspace">
+                        <div style="color:var(--text-muted); text-align:center; padding:60px 20px;">
+                            <div style="font-size:36px; margin-bottom:8px;">🗄️</div>
+                            <div style="font-size:14px;">Pick a connection on the left to start querying.</div>
+                            <div style="font-size:12px; margin-top:4px;">Queries are executed on the node that owns the connection — cross-node access is proxied automatically.</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- ═══ Control Panel Page ═══ -->
         <div id="page-control-panel" class="page-view" style="display:none;">
             <div class="card" style="margin-bottom:16px;">
@@ -2369,7 +2423,7 @@
                 <div class="card-header">
                     <h3>MariaDB Settings</h3>
                     <div style="display:flex;gap:8px;align-items:center;">
-                        <button class="btn btn-sm" onclick="selectServerView(currentNodeId, 'mysql-editor')">🔌 Database Manager</button>
+                        <button class="btn btn-sm" onclick="selectView('databases')">🗄️ Open Databases</button>
                         <button class="btn btn-primary btn-sm" onclick="saveMariaDBSettings()">💾 Apply &amp; Restart</button>
                     </div>
                 </div>
@@ -2513,7 +2567,7 @@
                 <div class="card-header">
                     <h3>PostgreSQL Settings</h3>
                     <div style="display:flex;gap:8px;align-items:center;">
-                        <button class="btn btn-sm" onclick="selectServerView(currentNodeId, 'mysql-editor')">🔌 Database Manager</button>
+                        <button class="btn btn-sm" onclick="selectView('databases')">🗄️ Open Databases</button>
                         <button class="btn btn-primary btn-sm" onclick="savePostgreSQLSettings()">💾 Apply &amp; Restart</button>
                     </div>
                 </div>

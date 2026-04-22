@@ -1212,7 +1212,7 @@ function selectView(page) {
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     document.querySelector(`.nav-item[data-page="${page}"]`)?.classList.add('active');
 
-    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', wolfagents: 'WolfAgents', 'cluster-browser': 'Cluster Browser', 'control-panel': 'Control Panel' };
+    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', wolfagents: 'WolfAgents', 'cluster-browser': 'Cluster Browser', databases: 'Databases', 'control-panel': 'Control Panel' };
     document.getElementById('page-title').textContent = titles[page] || page;
 
     if (page === 'datacenter') {
@@ -1250,6 +1250,8 @@ function selectView(page) {
         wolfAgentsLoad();
     } else if (page === 'cluster-browser') {
         loadClusterBrowser();
+    } else if (page === 'databases') {
+        dbLoadConnections();
     } else if (page === 'control-panel') {
         cpInit();
     }
@@ -1388,7 +1390,12 @@ function selectServerView(nodeId, view) {
     if (view === 'certificates') loadCertificates().finally(() => hidePageLoadingOverlay(el));
     if (view === 'cron') loadCronJobs().finally(() => hidePageLoadingOverlay(el));
     if (view === 'pve-resources') { renderPveResourcesView(nodeId); hidePageLoadingOverlay(el); }
-    if (view === 'mysql-editor') { loadMySQLEditor(); hidePageLoadingOverlay(el); }
+    // 'mysql-editor' per-node route retired — redirect any stale
+    // links / open tabs to the cluster-wide Databases page.
+    if (view === 'mysql-editor') {
+        selectView('databases');
+        hidePageLoadingOverlay(el);
+    }
     if (view === 'security') loadNodeSecurity().finally(() => hidePageLoadingOverlay(el));
     if (view === 'ceph') loadCephStatus().finally(() => hidePageLoadingOverlay(el));
     if (view === 'wolfkube') loadNodeWolfKube().finally(() => hidePageLoadingOverlay(el));
@@ -1527,9 +1534,10 @@ function buildServerTree(nodes) {
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="cron" onclick="selectServerView('${node.id}', 'cron')">
                             <span class="icon">🕐</span> Cron Jobs
                         </a>
-                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="mysql-editor" onclick="selectServerView('${node.id}', 'mysql-editor')">
-                            <span class="icon">🗄️</span> Database Manager
-                        </a>
+                        <!-- Per-node Database Manager retired — use the cluster-wide
+                             🗄️ Databases page in the main sidebar, which drives
+                             predefined SQL connections and transparently proxies
+                             queries to the owning node. -->
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="containers" onclick="selectServerView('${node.id}', 'containers')">
                             <span class="icon">🐳</span> Docker
                             ${node.docker_count ? `<span class="badge" style="font-size:10px; padding:1px 6px;">${node.docker_count}</span>` : ''}
@@ -25723,7 +25731,6 @@ const SIDEBAR_FEATURES = [
         { key: 'certificates',  label: '🔒 Certificates' },
         { key: 'compose',       label: '📋 Compose' },
         { key: 'cron',          label: '🕐 Cron Jobs' },
-        { key: 'mysql-editor',  label: '🗄️ Database Manager' },
         { key: 'containers',    label: '🐳 Docker' },
         { key: 'files',         label: '📂 Files' },
         { key: 'lxc',           label: '📦 LXC' },
@@ -40887,6 +40894,20 @@ function sqlConnRender() {
 function sqlConnRow(c) {
     const kindIcon = c.kind === 'postgres' ? '🐘' : (c.kind === 'mariadb' ? '🦭' : '🐬');
     const kindLabel = { postgres: 'PostgreSQL', mariadb: 'MariaDB', mysql: 'MySQL' }[c.kind] || c.kind;
+    // Resolve node_id → node hostname for display. Falls back to the
+    // raw id if we can't match (happens if the node has been removed
+    // from the cluster but the profile still points at it).
+    let nodeLabel = c.node_id || '';
+    if (c.node_id) {
+        const n = (allNodes || []).find(n => n.id === c.node_id);
+        if (n) nodeLabel = n.hostname || n.id;
+    }
+    const target = (c.cluster || c.node_id)
+        ? `<div style="font-size:11px; color:var(--text-muted); margin-top:2px;">🎯 ${escapeHtml(c.cluster || '?')} / ${escapeHtml(nodeLabel || '?')}</div>`
+        : '';
+    const acl = (c.allowed_users && c.allowed_users.length)
+        ? `<div style="font-size:11px; color:var(--accent, #a855f7); margin-top:2px;">🔒 users: ${escapeHtml(c.allowed_users.join(', '))}</div>`
+        : '';
     return `<div style="border:1px solid var(--border); border-radius:8px; padding:12px 14px; background:var(--bg-card);">
         <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px;">
             <div style="flex:1; min-width:0;">
@@ -40896,6 +40917,8 @@ function sqlConnRow(c) {
                     <code>${escapeHtml(c.username)}@${escapeHtml(c.host)}:${c.port}/${escapeHtml(c.database)}</code>
                     ${c.has_password ? '' : ' <span style="color:var(--warning);">(no password)</span>'}
                 </div>
+                ${target}
+                ${acl}
                 <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">id: <code>${escapeHtml(c.id)}</code></div>
             </div>
             <div style="display:flex; gap:6px; flex-wrap:wrap;">
@@ -40921,11 +40944,18 @@ function sqlConnEdit(id) {
 
 function sqlConnShowEditor(existing) {
     const isEdit = !!existing;
+    const existingCluster = existing?.cluster || '';
+    const existingNodeId = existing?.node_id || '';
+    const existingHost = existing?.host || '';
+    const existingUsers = Array.isArray(existing?.allowed_users)
+        ? existing.allowed_users.join(', ') : '';
+    const enterprise = !!(window._enterpriseReady);
+
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay active';
     overlay.id = 'sql-conn-editor';
     overlay.innerHTML = `
-        <div class="modal" style="max-width:560px;">
+        <div class="modal" style="max-width:640px;">
             <div class="modal-header">
                 <h3>${isEdit ? 'Edit' : 'New'} SQL Connection</h3>
                 <button class="modal-close" onclick="document.getElementById('sql-conn-editor').remove()">×</button>
@@ -40942,9 +40972,36 @@ function sqlConnShowEditor(existing) {
                             <option value="postgres" ${existing?.kind === 'postgres' ? 'selected' : ''}>PostgreSQL</option>
                         </select>
                     </label>
+
+                    <!-- Target: cluster : node : ip — cascading dropdowns OR shorthand text -->
+                    <div style="border:1px solid var(--border); border-radius:8px; padding:10px 12px; background:var(--bg-secondary);">
+                        <div style="font-size:13px; font-weight:600; margin-bottom:6px;">Target node & IP</div>
+                        <div style="font-size:11px; color:var(--text-muted); margin-bottom:8px;">
+                            Where this database is reachable. Queries from any other node will be proxied to the owning node via the cluster's internal API.
+                        </div>
+                        <div style="display:grid; grid-template-columns:1fr 1fr 2fr; gap:8px;">
+                            <select id="sql-e-cluster" class="form-control" onchange="sqlConnClusterChanged()">
+                                <option value="">— cluster —</option>
+                            </select>
+                            <select id="sql-e-node" class="form-control" onchange="sqlConnNodeChanged()" disabled>
+                                <option value="">— node —</option>
+                            </select>
+                            <select id="sql-e-ip-dd" class="form-control" onchange="sqlConnIpDropdownChanged()" disabled>
+                                <option value="">— IP —</option>
+                            </select>
+                        </div>
+                        <div style="margin-top:8px; display:flex; gap:6px; align-items:center;">
+                            <label style="flex:1; margin:0; font-weight:500;">
+                                <span style="font-size:11px; color:var(--text-muted);">Or paste <code>cluster:node:ip</code></span>
+                                <input id="sql-e-shorthand" class="form-control" placeholder="e.g. WolfStack-Proxmox:wolfstack-1:10.10.10.105" oninput="sqlConnShorthandChanged()" style="font-family:monospace;">
+                            </label>
+                            <div id="sql-e-shorthand-status" style="width:80px; font-size:11px; color:var(--text-muted); text-align:right; align-self:flex-end; padding-bottom:6px;"></div>
+                        </div>
+                    </div>
+
                     <div style="display:grid; grid-template-columns: 2fr 1fr; gap:8px;">
-                        <label>Host
-                            <input id="sql-e-host" class="form-control" value="${escapeHtml(existing?.host || '')}" placeholder="db.internal or 10.0.0.5">
+                        <label>Host IP (resolved)
+                            <input id="sql-e-host" class="form-control" value="${escapeHtml(existingHost)}" placeholder="10.0.0.5 — auto-filled from the picker above">
                         </label>
                         <label>Port
                             <input id="sql-e-port" type="number" class="form-control" value="${existing?.port || 3306}" min="1" max="65535">
@@ -40966,6 +41023,17 @@ function sqlConnShowEditor(existing) {
                             <option value="require" ${existing?.ssl_mode === 'require' ? 'selected' : ''}>Require</option>
                         </select>
                     </label>
+
+                    ${enterprise ? `
+                    <label>Allowed users <span style="color:var(--text-muted); font-weight:normal; font-size:11px;">(Enterprise — empty = all users)</span>
+                        <input id="sql-e-allowed-users" class="form-control" value="${escapeHtml(existingUsers)}" placeholder="paul, ops, ricky">
+                        <small style="color:var(--text-muted); display:block; margin-top:2px;">Comma-separated usernames. Only these users will see and be able to query this connection.</small>
+                    </label>
+                    ` : `
+                    <div style="font-size:11px; color:var(--text-muted); border:1px dashed var(--border); border-radius:6px; padding:8px 10px;">
+                        🔒 Per-user access limits are an Enterprise feature. On the free tier, every logged-in user can use every configured connection.
+                    </div>
+                    `}
                 </div>
             </div>
             <div class="modal-footer">
@@ -40975,6 +41043,174 @@ function sqlConnShowEditor(existing) {
         </div>`;
     document.body.appendChild(overlay);
     sqlConnKindChanged();
+
+    // Populate cascading dropdowns with the current cluster/node/ip.
+    // Deferred so the DOM is there before we prod it.
+    setTimeout(() => sqlConnPopulateTarget(existingCluster, existingNodeId, existingHost), 0);
+}
+
+// ─── Cascading cluster → node → IP picker ───
+// State lives in the DOM via the select values. Helpers rebuild the
+// dropdowns based on the selected parent and fetch node IPs on demand.
+
+function sqlConnPopulateTarget(preCluster, preNodeId, preHost) {
+    const clusterSel = document.getElementById('sql-e-cluster');
+    if (!clusterSel) return;
+    // allNodes is the global populated by /api/nodes polling — reuse it
+    // so we never need a second round-trip just to list clusters.
+    const clusters = Array.from(new Set(
+        (allNodes || []).map(n => (n.cluster_name || n.pve_cluster_name || '').trim()).filter(Boolean)
+    )).sort();
+    clusterSel.innerHTML = '<option value="">— cluster —</option>' +
+        clusters.map(c => `<option value="${escapeHtml(c)}" ${c === preCluster ? 'selected' : ''}>${escapeHtml(c)}</option>`).join('');
+    if (preCluster) {
+        sqlConnClusterChanged(preNodeId, preHost);
+    }
+}
+
+function sqlConnClusterChanged(preNodeId, preHost) {
+    const cluster = document.getElementById('sql-e-cluster').value;
+    const nodeSel = document.getElementById('sql-e-node');
+    const ipSel = document.getElementById('sql-e-ip-dd');
+    if (!cluster) {
+        nodeSel.innerHTML = '<option value="">— node —</option>';
+        nodeSel.disabled = true;
+        ipSel.innerHTML = '<option value="">— IP —</option>';
+        ipSel.disabled = true;
+        sqlConnSyncShorthand();
+        return;
+    }
+    const matching = (allNodes || []).filter(n =>
+        (n.cluster_name || n.pve_cluster_name || '').trim() === cluster
+    ).sort((a, b) => (a.hostname || a.id).localeCompare(b.hostname || b.id));
+    nodeSel.innerHTML = '<option value="">— node —</option>' +
+        matching.map(n => {
+            const label = n.hostname || n.id;
+            return `<option value="${escapeHtml(n.id)}" ${n.id === preNodeId ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+        }).join('');
+    nodeSel.disabled = false;
+    ipSel.innerHTML = '<option value="">— IP —</option>';
+    ipSel.disabled = true;
+    if (preNodeId) sqlConnNodeChanged(preHost);
+    sqlConnSyncShorthand();
+}
+
+async function sqlConnNodeChanged(preHost) {
+    const nodeId = document.getElementById('sql-e-node').value;
+    const ipSel = document.getElementById('sql-e-ip-dd');
+    if (!nodeId) {
+        ipSel.innerHTML = '<option value="">— IP —</option>';
+        ipSel.disabled = true;
+        sqlConnSyncShorthand();
+        return;
+    }
+    ipSel.innerHTML = '<option value="">⏳ Loading IPs…</option>';
+    ipSel.disabled = true;
+    try {
+        const resp = await fetch(`/api/nodes/${encodeURIComponent(nodeId)}/ips`);
+        const data = await resp.json();
+        const ips = data.ips || [];
+        const grouped = {};
+        for (const ip of ips) {
+            const source = (ip.source || '').split(':')[0] || 'other';
+            if (!grouped[source]) grouped[source] = [];
+            grouped[source].push(ip);
+        }
+        const labelMap = {
+            'iface': 'Host interfaces',
+            'docker': 'Docker containers',
+            'docker-wolfnet': 'Docker (WolfNet)',
+            'lxc': 'LXC containers',
+            'lxc-wolfnet': 'LXC (WolfNet)',
+            'vm': 'Virtual machines',
+        };
+        let html = '<option value="">— IP —</option>';
+        for (const key of Object.keys(grouped).sort()) {
+            html += `<optgroup label="${escapeHtml(labelMap[key] || key)}">`;
+            for (const ip of grouped[key]) {
+                const selected = ip.address === preHost ? 'selected' : '';
+                html += `<option value="${escapeHtml(ip.address)}" ${selected}>${escapeHtml(ip.label || ip.address)}</option>`;
+            }
+            html += '</optgroup>';
+        }
+        html += '<option value="__custom__">Custom (type below)…</option>';
+        ipSel.innerHTML = html;
+        ipSel.disabled = false;
+        // If the pre-set host wasn't in the list, leave ipSel at none
+        // and let the host field stand on its own.
+    } catch (e) {
+        ipSel.innerHTML = `<option value="">⚠ failed: ${escapeHtml(e.message)}</option>`;
+    }
+    sqlConnSyncShorthand();
+}
+
+function sqlConnIpDropdownChanged() {
+    const ipSel = document.getElementById('sql-e-ip-dd');
+    const hostInput = document.getElementById('sql-e-host');
+    const val = ipSel.value;
+    if (!val) return;
+    if (val === '__custom__') {
+        hostInput.focus();
+        return;
+    }
+    hostInput.value = val;
+    sqlConnSyncShorthand();
+}
+
+function sqlConnSyncShorthand() {
+    // Reflect current cluster/node/ip selection into the shorthand
+    // field so users see the equivalent format.
+    const cluster = document.getElementById('sql-e-cluster')?.value || '';
+    const nodeSel = document.getElementById('sql-e-node');
+    const nodeLabel = nodeSel?.options[nodeSel.selectedIndex]?.text || '';
+    const host = document.getElementById('sql-e-host')?.value || '';
+    const shorthand = document.getElementById('sql-e-shorthand');
+    const status = document.getElementById('sql-e-shorthand-status');
+    if (!shorthand) return;
+    if (cluster && nodeLabel && nodeLabel !== '— node —' && host) {
+        shorthand.value = `${cluster}:${nodeLabel}:${host}`;
+        if (status) { status.textContent = '✓ in sync'; status.style.color = 'var(--success)'; }
+    } else if (status) {
+        status.textContent = '';
+    }
+}
+
+function sqlConnShorthandChanged() {
+    // Parse "cluster:node:ip" on the fly. Flag which part is unknown
+    // so the user knows what to fix. On a valid match sync back into
+    // the dropdowns.
+    const raw = document.getElementById('sql-e-shorthand').value.trim();
+    const status = document.getElementById('sql-e-shorthand-status');
+    if (!raw) { if (status) status.textContent = ''; return; }
+    const parts = raw.split(':');
+    if (parts.length !== 3) {
+        if (status) { status.textContent = 'need 3 parts'; status.style.color = 'var(--warning)'; }
+        return;
+    }
+    const [wantCluster, wantNode, wantIp] = parts.map(s => s.trim());
+    const clusterExists = (allNodes || []).some(n =>
+        (n.cluster_name || n.pve_cluster_name || '').trim() === wantCluster
+    );
+    if (!clusterExists) {
+        if (status) { status.textContent = 'unknown cluster'; status.style.color = 'var(--danger)'; }
+        return;
+    }
+    const node = (allNodes || []).find(n =>
+        (n.cluster_name || n.pve_cluster_name || '').trim() === wantCluster &&
+        ((n.hostname || n.id) === wantNode)
+    );
+    if (!node) {
+        if (status) { status.textContent = 'unknown node'; status.style.color = 'var(--danger)'; }
+        return;
+    }
+    // Accept the IP even if we don't see it in the node's IP list —
+    // operators sometimes know a DB is reachable at an IP that isn't
+    // auto-advertised (e.g. a bind mount, a specific container IP
+    // we missed). We'll still mark it "custom" so they notice.
+    document.getElementById('sql-e-cluster').value = wantCluster;
+    sqlConnClusterChanged(node.id, wantIp);
+    document.getElementById('sql-e-host').value = wantIp;
+    if (status) { status.textContent = '✓ parsed'; status.style.color = 'var(--success)'; }
 }
 
 function sqlConnKindChanged() {
@@ -40989,16 +41225,25 @@ function sqlConnKindChanged() {
 }
 
 async function sqlConnSave(existingId) {
+    const clusterSel = document.getElementById('sql-e-cluster');
+    const nodeSel = document.getElementById('sql-e-node');
+    const allowedUsersInput = document.getElementById('sql-e-allowed-users');
+    const allowedUsers = allowedUsersInput
+        ? allowedUsersInput.value.split(',').map(s => s.trim()).filter(Boolean)
+        : [];
     const body = {
         id: existingId,
         label: document.getElementById('sql-e-label').value.trim(),
         kind: document.getElementById('sql-e-kind').value,
+        cluster: clusterSel ? clusterSel.value : '',
+        node_id: nodeSel ? nodeSel.value : '',
         host: document.getElementById('sql-e-host').value.trim(),
         port: parseInt(document.getElementById('sql-e-port').value, 10) || 3306,
         database: document.getElementById('sql-e-database').value.trim(),
         username: document.getElementById('sql-e-username').value.trim(),
         password: document.getElementById('sql-e-password').value,  // empty = keep
         ssl_mode: document.getElementById('sql-e-ssl').value,
+        allowed_users: allowedUsers,
     };
     if (!body.label || !body.host || !body.database || !body.username) {
         showToast('Label, host, database, and username are required.', 'error');
@@ -41125,5 +41370,233 @@ function sqlConnRenderResult(el, r) {
         html += `<div style="font-size:11px; color:var(--text-muted); margin-top:4px;">Showing first ${maxShow} of ${r.rows.length} rows.</div>`;
     }
     el.innerHTML = html;
+}
+
+// ═══════════════════════════════════════════════════
+// ─── Databases main-sidebar page ───
+// ═══════════════════════════════════════════════════
+//
+// Single cluster-wide SQL interface. Predefined connections live in
+// Settings → SQL Connections; this page just picks from them and
+// sends queries. Routing (local-or-proxy-via-peer) is entirely
+// server-side — the frontend just POSTs to
+// /api/sql-connections/{id}/query and gets back `{columns, rows, …}`.
+
+let _dbConnsCache = [];         // last load from GET /api/sql-connections
+let _dbCurrentId = null;        // currently opened connection id
+let _dbLastResult = null;       // last query result (for CSV export)
+
+async function dbLoadConnections() {
+    const list = document.getElementById('db-conn-list');
+    if (!list) return;
+    list.innerHTML = '<div style="color:var(--text-muted); text-align:center; padding:20px; font-size:13px;">Loading…</div>';
+    try {
+        const resp = await fetch('/api/sql-connections');
+        if (handleAuthError(resp)) return;
+        const data = await resp.json();
+        _dbConnsCache = data.connections || [];
+        dbRenderConnections();
+    } catch (e) {
+        list.innerHTML = `<div style="color:var(--danger); padding:12px; font-size:13px;">Failed to load: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function dbRenderConnections() {
+    const list = document.getElementById('db-conn-list');
+    if (!list) return;
+    const q = (document.getElementById('db-search')?.value || '').toLowerCase();
+    const filtered = _dbConnsCache.filter(c => {
+        if (!q) return true;
+        const hay = `${c.label} ${c.cluster} ${c.database} ${c.username} ${c.host}`.toLowerCase();
+        return hay.includes(q);
+    });
+    if (filtered.length === 0) {
+        if (_dbConnsCache.length === 0) {
+            list.innerHTML = `<div style="text-align:center; padding:24px; color:var(--text-muted); font-size:13px;">
+                No connections configured.<br>
+                <a href="#" onclick="selectView('settings'); switchSettingsTab('sql'); return false;">Configure one →</a>
+            </div>`;
+        } else {
+            list.innerHTML = `<div style="text-align:center; padding:24px; color:var(--text-muted); font-size:13px;">No matches.</div>`;
+        }
+        return;
+    }
+    // Group by cluster → then by node, for scannability.
+    const groups = {};
+    for (const c of filtered) {
+        const cluster = c.cluster || '(no cluster)';
+        if (!groups[cluster]) groups[cluster] = {};
+        let nodeLabel = c.node_id || '(no node)';
+        if (c.node_id) {
+            const n = (allNodes || []).find(n => n.id === c.node_id);
+            if (n) nodeLabel = n.hostname || n.id;
+        }
+        if (!groups[cluster][nodeLabel]) groups[cluster][nodeLabel] = [];
+        groups[cluster][nodeLabel].push(c);
+    }
+    let html = '';
+    for (const cluster of Object.keys(groups).sort()) {
+        html += `<div style="font-size:11px; font-weight:600; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.5px; margin:10px 0 4px; padding:0 4px;">${escapeHtml(cluster)}</div>`;
+        for (const node of Object.keys(groups[cluster]).sort()) {
+            html += `<div style="font-size:12px; color:var(--text-muted); padding:2px 8px;">🎯 ${escapeHtml(node)}</div>`;
+            for (const c of groups[cluster][node]) {
+                const kindIcon = c.kind === 'postgres' ? '🐘' : (c.kind === 'mariadb' ? '🦭' : '🐬');
+                const isActive = c.id === _dbCurrentId;
+                const acl = (c.allowed_users && c.allowed_users.length)
+                    ? '<span title="Enterprise ACL active" style="color:var(--accent,#a855f7);">🔒</span> ' : '';
+                html += `<div onclick="dbOpenConnection('${escapeHtml(c.id)}')"
+                    style="cursor:pointer; padding:8px 10px; margin:2px 0; border-radius:6px; background:${isActive ? 'var(--accent-bg, rgba(168,85,247,0.15))' : 'transparent'};
+                           border:1px solid ${isActive ? 'var(--accent, #a855f7)' : 'transparent'}; transition:background 0.15s;"
+                    onmouseover="if (this.dataset.active !== '1') this.style.background='var(--bg-secondary)'"
+                    onmouseout="if (this.dataset.active !== '1') this.style.background='transparent'"
+                    data-active="${isActive ? '1' : '0'}">
+                    <div style="font-size:13px; font-weight:500;">${acl}${kindIcon} ${escapeHtml(c.label)}</div>
+                    <div style="font-size:11px; color:var(--text-muted); font-family:monospace; margin-top:2px;">${escapeHtml(c.database)}</div>
+                </div>`;
+            }
+        }
+    }
+    list.innerHTML = html;
+}
+
+function dbFilterConnections() { dbRenderConnections(); }
+
+function dbOpenConnection(id) {
+    _dbCurrentId = id;
+    _dbLastResult = null;
+    dbRenderConnections();  // re-render to highlight selection
+    const conn = _dbConnsCache.find(c => c.id === id);
+    if (!conn) return;
+    const ws = document.getElementById('db-workspace');
+    if (!ws) return;
+    const kindIcon = conn.kind === 'postgres' ? '🐘' : (conn.kind === 'mariadb' ? '🦭' : '🐬');
+    const kindLabel = { postgres: 'PostgreSQL', mariadb: 'MariaDB', mysql: 'MySQL' }[conn.kind] || conn.kind;
+    let nodeLabel = conn.node_id || '';
+    if (conn.node_id) {
+        const n = (allNodes || []).find(n => n.id === conn.node_id);
+        if (n) nodeLabel = n.hostname || n.id;
+    }
+    ws.innerHTML = `
+        <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap; margin-bottom:12px;">
+            <div>
+                <h3 style="margin:0;">${kindIcon} ${escapeHtml(conn.label)} <span style="color:var(--text-muted); font-weight:normal; font-size:13px;">— ${kindLabel}</span></h3>
+                <div style="font-size:12px; color:var(--text-muted); margin-top:4px;">
+                    <code>${escapeHtml(conn.username)}@${escapeHtml(conn.host)}:${conn.port}/${escapeHtml(conn.database)}</code>
+                    ${conn.cluster ? ` · ${escapeHtml(conn.cluster)}${nodeLabel ? ' / ' + escapeHtml(nodeLabel) : ''}` : ''}
+                </div>
+            </div>
+            <button class="btn btn-sm" onclick="dbTestConnection('${escapeHtml(conn.id)}', this)">Test</button>
+        </div>
+
+        <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap;">
+            <label style="font-size:13px; margin:0;">Permission:
+                <select id="db-perm" class="form-control" style="display:inline-block; width:auto; margin-left:6px;">
+                    <option value="read">Read (SELECT / SHOW / EXPLAIN)</option>
+                    <option value="update">Update (+ INSERT / UPDATE)</option>
+                    <option value="delete">Delete (+ DELETE / TRUNCATE)</option>
+                </select>
+            </label>
+            <label style="font-size:13px; margin:0;">Timeout (s):
+                <input id="db-timeout" type="number" min="1" max="300" value="30" class="form-control" style="display:inline-block; width:90px; margin-left:6px;">
+            </label>
+        </div>
+
+        <textarea id="db-query" class="form-control" rows="6" placeholder="SELECT COUNT(*) FROM customers;" style="font-family:monospace; font-size:13px;"></textarea>
+        <div style="display:flex; gap:8px; margin-top:8px; align-items:center;">
+            <button class="btn btn-primary btn-sm" onclick="dbRunQuery()">▶ Run query</button>
+            <button class="btn btn-sm" id="db-copy-csv" onclick="dbCopyCsv()" disabled>📋 Copy CSV</button>
+            <button class="btn btn-sm" id="db-copy-md" onclick="dbCopyMarkdown()" disabled>📋 Copy Markdown</button>
+            <span style="font-size:11px; color:var(--text-muted);">Ctrl/Cmd + Enter runs the query.</span>
+        </div>
+        <div id="db-result" style="margin-top:14px;"></div>
+    `;
+
+    // Ctrl/Cmd+Enter convenience — most SQL editors support it, our
+    // agents' habit-memory expects it.
+    const ta = document.getElementById('db-query');
+    if (ta) ta.addEventListener('keydown', (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+            e.preventDefault();
+            dbRunQuery();
+        }
+    });
+}
+
+async function dbRunQuery() {
+    if (!_dbCurrentId) return;
+    const query = document.getElementById('db-query').value;
+    const permission = document.getElementById('db-perm').value;
+    const timeout_secs = parseInt(document.getElementById('db-timeout').value, 10) || 30;
+    const resultEl = document.getElementById('db-result');
+    resultEl.innerHTML = '<div style="color:var(--text-muted);">Running…</div>';
+    try {
+        const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_dbCurrentId)}/query`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query, permission, timeout_secs }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+            _dbLastResult = null;
+            document.getElementById('db-copy-csv').disabled = true;
+            document.getElementById('db-copy-md').disabled = true;
+            resultEl.innerHTML = `<div style="color:var(--danger); padding:10px; background:var(--bg-primary); border-radius:6px; white-space:pre-wrap; font-family:monospace;">${escapeHtml(data.error || 'Query failed')}</div>`;
+            return;
+        }
+        _dbLastResult = data;
+        document.getElementById('db-copy-csv').disabled = false;
+        document.getElementById('db-copy-md').disabled = false;
+        sqlConnRenderResult(resultEl, data);  // reuse renderer from Settings tester
+    } catch (e) {
+        resultEl.innerHTML = `<div style="color:var(--danger);">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+async function dbTestConnection(id, btn) {
+    if (btn) btn.disabled = true;
+    try {
+        const resp = await fetch(`/api/sql-connections/${encodeURIComponent(id)}/test`, { method: 'POST' });
+        const data = await resp.json();
+        if (data.ok) showToast(`✅ ${data.version || 'Connected'}`, 'success');
+        else showToast(`❌ ${data.error || 'Connection failed'}`, 'error');
+    } catch (e) {
+        showToast(`❌ ${e.message}`, 'error');
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
+function dbCopyCsv() {
+    if (!_dbLastResult) return;
+    const { columns, rows } = _dbLastResult;
+    const esc = (s) => {
+        if (s == null) return '';
+        const str = String(s);
+        return (str.includes(',') || str.includes('"') || str.includes('\n'))
+            ? `"${str.replace(/"/g, '""')}"` : str;
+    };
+    let csv = columns.map(esc).join(',') + '\n';
+    for (const row of rows) csv += row.map(esc).join(',') + '\n';
+    navigator.clipboard.writeText(csv).then(
+        () => showToast('CSV copied to clipboard', 'success'),
+        () => showToast('Clipboard write failed', 'error'),
+    );
+}
+
+function dbCopyMarkdown() {
+    if (!_dbLastResult) return;
+    const { columns, rows } = _dbLastResult;
+    let md = '| ' + columns.join(' | ') + ' |\n';
+    md += '| ' + columns.map(() => '---').join(' | ') + ' |\n';
+    for (const row of rows.slice(0, 200)) {
+        md += '| ' + row.map(v => {
+            if (v == null) return '';
+            return String(v).replace(/\|/g, '\\|').replace(/\n/g, ' ');
+        }).join(' | ') + ' |\n';
+    }
+    if (rows.length > 200) md += `\n_…${rows.length - 200} more rows_\n`;
+    navigator.clipboard.writeText(md).then(
+        () => showToast('Markdown copied to clipboard', 'success'),
+        () => showToast('Clipboard write failed', 'error'),
+    );
 }
 

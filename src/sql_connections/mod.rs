@@ -69,18 +69,38 @@ pub enum SslMode {
     Require,
 }
 
-/// One operator-configured database connection. Up to 3 are exposed
-/// in the Settings UI by default, but the underlying Vec is unbounded
-/// — no reason to artificially cap when the runtime cost is trivial.
+/// One operator-configured database connection. Scoped to a specific
+/// WolfStack node (`node_id`) so the routing layer knows which peer
+/// can actually reach the database — a DB running on a container on
+/// `wolfstack-1` can't be dialled directly from `wolfstack-2`'s
+/// network, so we proxy the query through the owning node instead.
 ///
 /// `password` is ALWAYS stored encrypted on disk. In-memory after load
-/// it may still carry the `encrypted:aes256:...` prefix; `decrypt()`
-/// normalises it before handing to the driver.
+/// it still carries the `encrypted:aes256:…` prefix; decryption
+/// happens lazily inside `get_or_build_pool` just before handing the
+/// plaintext to the driver.
+///
+/// `allowed_users` is the enterprise per-user ACL. Empty = all users
+/// (backward-compatible default, and the only behaviour on the free
+/// tier). On enterprise (`compat::platform_ready`), non-empty =
+/// allowlist; everyone else is denied.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqlConnection {
     pub id: String,
     pub label: String,
     pub kind: SqlKind,
+    /// Cluster-label grouping — purely cosmetic / for filtering in
+    /// the UI. Defaults to the operator's current cluster name when
+    /// a profile is created from the editor.
+    #[serde(default)]
+    pub cluster: String,
+    /// The WolfStack node that can reach this database. Empty or
+    /// matching `self_node_id` = local execution; any other value
+    /// routes the query through that peer's `/api/sql-connections/
+    /// {id}/query-proxy` endpoint. Missing = legacy profile, treated
+    /// as local (current behaviour preserved).
+    #[serde(default)]
+    pub node_id: String,
     pub host: String,
     pub port: u16,
     pub database: String,
@@ -89,6 +109,10 @@ pub struct SqlConnection {
     pub password: String,
     #[serde(default)]
     pub ssl_mode: SslMode,
+    /// Enterprise-only per-user allowlist. Empty = all users. See
+    /// module-level docs on the enforcement model.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
 }
 
 impl SqlConnection {
@@ -100,13 +124,29 @@ impl SqlConnection {
             "id": self.id,
             "label": self.label,
             "kind": self.kind,
+            "cluster": self.cluster,
+            "node_id": self.node_id,
             "host": self.host,
             "port": self.port,
             "database": self.database,
             "username": self.username,
             "has_password": !self.password.is_empty(),
             "ssl_mode": self.ssl_mode,
+            "allowed_users": self.allowed_users,
         })
+    }
+
+    /// Return true if `username` is allowed to see/use this profile.
+    /// Free tier (platform not licensed) always returns true — the
+    /// ACL is an enterprise feature.
+    ///
+    /// Passes the current platform_ready state in rather than calling
+    /// it inline so tests can exercise both modes without a global
+    /// license-state fixture.
+    pub fn user_permitted(&self, username: &str, enterprise: bool) -> bool {
+        if !enterprise { return true; }
+        if self.allowed_users.is_empty() { return true; }
+        self.allowed_users.iter().any(|u| u.eq_ignore_ascii_case(username))
     }
 }
 
@@ -173,8 +213,10 @@ pub enum SqlPermission {
 
 /// Result shape returned to callers — mirrors what the MySQL editor
 /// already produces so the frontend and prompt formatting can be
-/// shared across surfaces.
-#[derive(Debug, Clone, Serialize)]
+/// shared across surfaces. `Deserialize` is required so
+/// `execute_proxied` can decode the `SqlResult` from a peer's
+/// `/query-proxy` response body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqlResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<serde_json::Value>>,
@@ -384,6 +426,18 @@ impl Caller {
 /// Execute `query` on `connection_id` with the declared permission
 /// tier. Returns a bounded `SqlResult` or an error. Audit-logs the
 /// outcome regardless.
+///
+/// Routing:
+///   - If the profile's `node_id` is empty or matches this node's
+///     `self_node_id`, the query runs LOCALLY — direct driver
+///     connection to `host:port`. This is the common case and
+///     preserves the behaviour of older profiles that predate the
+///     node_id field.
+///   - Otherwise the query is proxied: a cluster-secret-authenticated
+///     POST to the target node's `/api/sql-connections/{id}/query-proxy`
+///     endpoint. That peer re-enters `execute` locally and returns
+///     the `SqlResult` verbatim. The audit log on BOTH nodes records
+///     the call, with the originator also noting `via_node=<target>`.
 pub async fn execute(
     connection_id: &str,
     query: &str,
@@ -391,6 +445,11 @@ pub async fn execute(
     caller: Caller,
     cluster_secret: &str,
     exec_timeout: Option<Duration>,
+    // ClusterState is `Option` because a few deep wolfflow paths
+    // (`execute_action_local`) don't carry full runtime state. With
+    // `None`, remote-node profiles refuse with a clear error instead
+    // of silently failing or calling a dead address.
+    cluster: Option<&crate::agent::ClusterState>,
 ) -> Result<SqlResult, String> {
     let cfg = load();
     let conn = cfg.connections.iter()
@@ -399,7 +458,7 @@ pub async fn execute(
         .ok_or_else(|| format!("unknown sql connection '{}'", connection_id))?;
 
     // Classify first — tier must be ≤ requested. This is the main
-    // authorization gate.
+    // authorization gate and applies regardless of routing.
     let tier = classify(query, conn.kind)?;
     if !tier_within(tier, requested) {
         let outcome = format!(
@@ -410,7 +469,47 @@ pub async fn execute(
         return Err(outcome);
     }
 
-    let pool = get_or_build_pool(&conn, cluster_secret)?;
+    // Routing decision. `node_id` empty or equal to self → local.
+    // Use the ClusterState's authoritative self_id if provided,
+    // otherwise fall back to the on-disk node-id file — fine for
+    // local-only checks, only proxying truly needs live cluster data.
+    let self_id = cluster
+        .map(|c| c.self_id.clone())
+        .unwrap_or_else(|| crate::agent::self_node_id());
+    let is_local = conn.node_id.is_empty() || conn.node_id == self_id;
+
+    if is_local {
+        execute_local(&conn, query, &caller, cluster_secret, exec_timeout).await
+    } else {
+        let cluster = match cluster {
+            Some(c) => c,
+            None => {
+                let msg = format!(
+                    "sql connection '{}' targets node '{}' but caller has no cluster state — \
+                     routing is only available from handler/agent contexts, not \
+                     execute_action_local. Configure this connection on its owning node \
+                     instead, or call from a context that provides state.",
+                    conn.id, conn.node_id
+                );
+                write_audit(&caller, &conn.id, query, false, 0, 0, &msg);
+                return Err(msg);
+            }
+        };
+        execute_proxied(&conn, query, requested, &caller, cluster_secret, exec_timeout, cluster).await
+    }
+}
+
+/// Local execution — open a driver pool to `conn.host:conn.port` and
+/// run the query in-process. Bounded by `exec_timeout` (default 30s)
+/// and the module-level row / byte caps.
+async fn execute_local(
+    conn: &SqlConnection,
+    query: &str,
+    caller: &Caller,
+    cluster_secret: &str,
+    exec_timeout: Option<Duration>,
+) -> Result<SqlResult, String> {
+    let pool = get_or_build_pool(conn, cluster_secret)?;
     let timeout = exec_timeout.unwrap_or(DEFAULT_EXEC_TIMEOUT);
 
     let start = std::time::Instant::now();
@@ -427,19 +526,127 @@ pub async fn execute(
     match result {
         Ok(Ok(mut r)) => {
             r.elapsed_ms = elapsed_ms;
-            write_audit(&caller, &conn.id, query, true, r.row_count, elapsed_ms, "ok");
+            write_audit(caller, &conn.id, query, true, r.row_count, elapsed_ms, "ok");
             Ok(r)
         }
         Ok(Err(e)) => {
-            write_audit(&caller, &conn.id, query, false, 0, elapsed_ms, &e);
+            write_audit(caller, &conn.id, query, false, 0, elapsed_ms, &e);
             Err(e)
         }
         Err(_) => {
             let msg = format!("query exceeded {}s timeout", timeout.as_secs());
-            write_audit(&caller, &conn.id, query, false, 0, elapsed_ms, &msg);
+            write_audit(caller, &conn.id, query, false, 0, elapsed_ms, &msg);
             Err(msg)
         }
     }
+}
+
+/// Proxied execution — POST the query to the target node's
+/// `/api/sql-connections/{id}/query-proxy` endpoint with cluster-secret
+/// auth. That peer runs `execute_local` on our behalf and returns the
+/// same `SqlResult` shape.
+///
+/// We re-validate the SQL on BOTH sides: the classifier already ran
+/// before we got here (so we know the caller is authorized), and the
+/// target node's handler will classify again before executing (so a
+/// compromised originator can't smuggle disallowed SQL through this
+/// path by faking the `requested` tier).
+async fn execute_proxied(
+    conn: &SqlConnection,
+    query: &str,
+    requested: SqlPermission,
+    caller: &Caller,
+    cluster_secret: &str,
+    exec_timeout: Option<Duration>,
+    cluster: &crate::agent::ClusterState,
+) -> Result<SqlResult, String> {
+    // Resolve the target peer's address from cluster state. We rely on
+    // the agent module's snapshot rather than re-reading nodes.json so
+    // the address reflects the currently-observed reachable value
+    // (pinned IP, last heartbeat, etc.).
+    let node_info = match cluster.get_node(&conn.node_id) {
+        Some(n) => n,
+        None => {
+            let msg = format!(
+                "sql connection '{}' targets node '{}' but that node is not in the cluster state",
+                conn.id, conn.node_id
+            );
+            write_audit(caller, &conn.id, query, false, 0, 0, &msg);
+            return Err(msg);
+        }
+    };
+    if !node_info.online {
+        let msg = format!(
+            "sql connection '{}' targets node '{}' which is offline — try again when the peer is up",
+            conn.id, node_info.hostname
+        );
+        write_audit(caller, &conn.id, query, false, 0, 0, &msg);
+        return Err(msg);
+    }
+
+    let start = std::time::Instant::now();
+    let urls = crate::api::build_node_urls(
+        &node_info.address, node_info.port,
+        &format!("/api/sql-connections/{}/query-proxy", conn.id),
+    );
+    let body = serde_json::json!({
+        "query": query,
+        "permission": match requested {
+            SqlPermission::Read => "read",
+            SqlPermission::Update => "update",
+            SqlPermission::Delete => "delete",
+        },
+        "timeout_secs": exec_timeout.map(|d| d.as_secs()),
+        "origin_caller": caller.as_tag(),
+    });
+
+    let client = &*crate::api::API_HTTP_CLIENT;
+    let total_timeout = exec_timeout.unwrap_or(DEFAULT_EXEC_TIMEOUT) + Duration::from_secs(10);
+
+    let mut last_err = String::new();
+    for url in &urls {
+        let resp = client.post(url)
+            .header("X-WolfStack-Secret", cluster_secret)
+            .timeout(total_timeout)
+            .json(&body)
+            .send().await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                match r.json::<SqlResult>().await {
+                    Ok(result) => {
+                        write_audit(
+                            caller, &conn.id, query, true, result.row_count, elapsed_ms,
+                            &format!("ok (via {})", node_info.hostname),
+                        );
+                        return Ok(result);
+                    }
+                    Err(e) => {
+                        last_err = format!("decode proxy response: {}", e);
+                        break;
+                    }
+                }
+            }
+            Ok(r) => {
+                let status = r.status();
+                let body_text = r.text().await.unwrap_or_default();
+                last_err = format!("HTTP {} from {}: {}", status, url, body_text);
+                // Authentic HTTP errors don't retry with different
+                // URL schemes — a 403 on https is going to be 403 on
+                // http too (same handler). Only retry on network errors.
+                break;
+            }
+            Err(e) => {
+                // Transport error — try the next URL in the fallback chain.
+                last_err = format!("{} ({})", e, url);
+            }
+        }
+    }
+
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    let msg = format!("proxy to '{}' failed: {}", node_info.hostname, last_err);
+    write_audit(caller, &conn.id, query, false, 0, elapsed_ms, &msg);
+    Err(msg)
 }
 
 fn tier_within(required: SqlPermission, granted: SqlPermission) -> bool {

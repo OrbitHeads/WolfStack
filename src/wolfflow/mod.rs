@@ -1353,6 +1353,11 @@ pub async fn execute_action_local(action: &ActionType) -> Result<StepOutput, Str
                 },
                 &cluster_secret,
                 Some(std::time::Duration::from_secs(*timeout_secs)),
+                // execute_action_local has no ClusterState handle; remote-node
+                // profiles will refuse with a clear error. Workflows that
+                // need cross-node SQL should pin node_id = self and let
+                // execute() short-circuit to local.
+                None,
             ).await;
             match res {
                 Ok(r) => {

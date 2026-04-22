@@ -106,6 +106,20 @@ const PATH_DENY_PREFIXES: &[&str] = &[
     "/etc/wolfstack/agents/",
     "/etc/wolfstack/ai.json",
     "/etc/wolfstack/wolfusb.json",
+    // SQL-connections config contains encrypted passwords + plaintext
+    // host / port / database / username for every configured DB.
+    // Encrypted blobs are useless without the cluster secret, but the
+    // plaintext fields still expose topology an attacker could use
+    // for lateral movement.
+    "/etc/wolfstack/sql-connections.json",
+    // SQL audit log records every query ever run via the agent /
+    // workflow / UI surfaces — recovering it gives the attacker a
+    // read of historical DB access including row counts that leak
+    // data-presence info.
+    "/var/log/wolfstack/sql-audit.log",
+    // OIDC config — same pattern as sql-connections (encrypted
+    // client_secret + plaintext issuer / client_id / redirect URLs).
+    "/etc/wolfstack/oidc.json",
     // Kernel + boot + hardware
     "/boot/",
     "/dev/",
@@ -137,6 +151,34 @@ const API_DENY_PATTERNS: &[&str] = &[
     r"^/api/wolfstack/update(/|$)",     // self-upgrade
     r"/shutdown$",                      // any node-shutdown endpoint
     r"/reboot$",
+    // SQL connections tree. Agents must NEVER reach SQL via the
+    // generic wolfstack_api tool — that route inherits cluster-node
+    // trust (cluster-secret header), which bypasses every per-agent
+    // guard (sql_read/update/delete flags, allowed_sql_connections,
+    // enterprise allowed_users). If an operator wants an agent to
+    // run SQL, they enable the dedicated `sql_read` / `sql_update` /
+    // `sql_delete` tools with matching connection allowlists, and
+    // the dispatcher's gate chain enforces it end-to-end. Blocking
+    // every /api/sql-connections endpoint (list, create, update,
+    // delete, query, query-proxy, receive, test, audit) closes the
+    // whole tree including ones we haven't added yet.
+    r"^/api/sql-connections(/|$)",
+    // Node-internal IP enumeration. Agents know the cluster via the
+    // `list_nodes` tool already; the /ips endpoint adds container +
+    // VM IPs which is richer topology data than any agent should
+    // harvest by default. Operators who need this in an agent flow
+    // can add a custom tool; wolfstack_api isn't the hatch for it.
+    r"^/api/nodes/[^/]+/ips$",
+    // Legacy per-node MySQL editor API. Same threat as the SQL
+    // connections tree — agent with wolfstack_api inherits
+    // cluster-node auth, and these endpoints accept raw host /
+    // port / user / password inputs to open arbitrary DB
+    // connections and run arbitrary SQL. With the per-node editor
+    // retired in favour of cluster-wide profiles, there's no
+    // legitimate agent use of this tree. Operators who need SQL
+    // in an agent flow use the cluster-wide sql_read / sql_update
+    // / sql_delete tools.
+    r"^/api/mysql(/|$)",
 ];
 
 /// Validate a shell command against the hardcoded denylist. Call this
@@ -321,6 +363,12 @@ mod tests {
         assert!(validate_path("/root/.ssh/authorized_keys").is_err());
         assert!(validate_path("/etc/systemd/system/rogue.service").is_err());
         assert!(validate_path("/etc/wolfstack/agents.json").is_err());
+        // SQL-connections config + audit log + OIDC config — all
+        // leak host/port/user/db or historical query info even though
+        // the on-disk secrets are encrypted.
+        assert!(validate_path("/etc/wolfstack/sql-connections.json").is_err());
+        assert!(validate_path("/var/log/wolfstack/sql-audit.log").is_err());
+        assert!(validate_path("/etc/wolfstack/oidc.json").is_err());
     }
 
     #[test]
@@ -346,5 +394,61 @@ mod tests {
         assert!(validate_api_path("/api/containers").is_ok());
         assert!(validate_api_path("/api/wolfflow/workflows").is_ok());
         assert!(validate_api_path("/api/system-check").is_ok());
+        // /api/nodes itself is still allowed — it's the per-node
+        // /ips sub-endpoint specifically that's denied, because it
+        // leaks internal container + VM IPs agents shouldn't harvest.
+        assert!(validate_api_path("/api/nodes/abc-def").is_ok());
+    }
+
+    #[test]
+    fn blocks_sql_connections_tree_end_to_end() {
+        // Every variant of the /api/sql-connections path MUST be
+        // refused via wolfstack_api. The dedicated sql_read /
+        // sql_update / sql_delete tools are the ONLY sanctioned
+        // route for agents. The danger of NOT blocking these paths:
+        //   - cluster-secret auth makes the target see "cluster-node",
+        //     which exempts it from the enterprise allowed_users ACL
+        //   - the agent's sql_read/sql_update/sql_delete flags are
+        //     never checked at the API layer
+        //   - the agent's allowed_sql_connections scope is never
+        //     consulted — so ANY connection becomes reachable
+        //   - the agent could create a rogue connection pointing at
+        //     an attacker-controlled DB, or delete a legitimate one
+        // So the denylist must catch list, create, update, delete,
+        // test, query, query-proxy, receive, audit — the entire tree.
+        assert!(validate_api_path("/api/sql-connections").is_err());
+        assert!(validate_api_path("/api/sql-connections/").is_err());
+        assert!(validate_api_path("/api/sql-connections/mike-prod").is_err());
+        assert!(validate_api_path("/api/sql-connections/mike-prod/query").is_err());
+        assert!(validate_api_path("/api/sql-connections/mike-prod/query-proxy").is_err());
+        assert!(validate_api_path("/api/sql-connections/mike-prod/test").is_err());
+        assert!(validate_api_path("/api/sql-connections/receive").is_err());
+        assert!(validate_api_path("/api/sql-connections/audit").is_err());
+    }
+
+    #[test]
+    fn blocks_legacy_mysql_editor_api() {
+        // Same escalation vector as /api/sql-connections: an agent
+        // with wolfstack_api would inherit cluster-node auth and
+        // reach the raw MySQL editor endpoints that accept arbitrary
+        // host/port/credentials. Dedicated SQL tools are the only
+        // agent-sanctioned SQL path.
+        assert!(validate_api_path("/api/mysql/connect").is_err());
+        assert!(validate_api_path("/api/mysql/query").is_err());
+        assert!(validate_api_path("/api/mysql/dump").is_err());
+        assert!(validate_api_path("/api/mysql/data").is_err());
+    }
+
+    #[test]
+    fn blocks_node_ips_endpoint() {
+        // /api/nodes/{id}/ips surfaces internal container + VM IPs
+        // — richer than the topology agents get from list_nodes.
+        assert!(validate_api_path("/api/nodes/wolfstack-1/ips").is_err());
+        assert!(validate_api_path("/api/nodes/abc123/ips").is_err());
+        // But /api/nodes itself and /api/nodes/{id}/other-subpath
+        // remain permitted — this rule is narrow on purpose.
+        assert!(validate_api_path("/api/nodes").is_ok());
+        assert!(validate_api_path("/api/nodes/wolfstack-1").is_ok());
+        assert!(validate_api_path("/api/nodes/wolfstack-1/metrics").is_ok());
     }
 }

@@ -2328,6 +2328,7 @@ async fn tool_sql_query(
         crate::sql_connections::Caller::Agent(agent.id.clone()),
         &state.cluster_secret,
         timeout_secs.map(std::time::Duration::from_secs),
+        Some(&state.cluster),
     ).await {
         Ok(r) => ToolResult::ok(
             format!("sql {:?} on '{}' — {} rows in {}ms{}",
