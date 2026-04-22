@@ -499,6 +499,41 @@ pub async fn execute(
     }
 }
 
+/// Force LOCAL execution of a connection, regardless of its `node_id`.
+/// Used by the `/query-proxy` handler: the originator has already
+/// routed to us, so re-running the routing logic is harmful (the
+/// receiver's `self_id` may not match the stored `node_id` verbatim
+/// even though the originator's cluster snapshot resolved this node
+/// as the target — e.g. gossip id drift, stale node-id file, or the
+/// originator simply picked this node because it is the owning node's
+/// nearest reachable peer). Classify the SQL, then execute locally.
+pub async fn execute_as_target(
+    connection_id: &str,
+    query: &str,
+    requested: SqlPermission,
+    caller: Caller,
+    cluster_secret: &str,
+    exec_timeout: Option<Duration>,
+) -> Result<SqlResult, String> {
+    let cfg = load();
+    let conn = cfg.connections.iter()
+        .find(|c| c.id == connection_id)
+        .cloned()
+        .ok_or_else(|| format!("unknown sql connection '{}'", connection_id))?;
+
+    let tier = classify(query, conn.kind)?;
+    if !tier_within(tier, requested) {
+        let outcome = format!(
+            "query requires {:?} permission but caller holds {:?}",
+            tier, requested
+        );
+        write_audit(&caller, &conn.id, query, false, 0, 0, &outcome);
+        return Err(outcome);
+    }
+
+    execute_local(&conn, query, &caller, cluster_secret, exec_timeout).await
+}
+
 /// Local execution — open a driver pool to `conn.host:conn.port` and
 /// run the query in-process. Bounded by `exec_timeout` (default 30s)
 /// and the module-level row / byte caps.
@@ -661,31 +696,38 @@ fn tier_within(required: SqlPermission, granted: SqlPermission) -> bool {
 
 /// Try to connect to the database and issue a cheap health check.
 /// Used by the "Test Connection" button in the Settings UI.
-pub async fn test(conn: &SqlConnection, cluster_secret: &str) -> Result<String, String> {
-    // Clone into a throw-away profile so building a pool doesn't
-    // disturb the live registry.
-    let temp = SqlConnection { id: format!("__test__{}", conn.id), ..conn.clone() };
-    let pool = get_or_build_pool(&temp, cluster_secret)?;
-    let probe = match pool {
-        PoolHandle::Mysql(p) => {
-            use mysql_async::prelude::Queryable;
-            let mut c = p.get_conn().await.map_err(|e| format!("connect: {}", e))?;
-            let v: Option<String> = c.query_first("SELECT VERSION()").await
-                .map_err(|e| format!("probe: {}", e))?;
-            let _ = c.disconnect().await;
-            v.unwrap_or_else(|| "unknown".into())
-        }
-        PoolHandle::Postgres(p) => {
-            let c = p.get().await.map_err(|e| format!("connect: {}", e))?;
-            let row = c.query_one("SELECT version()", &[]).await
-                .map_err(|e| format!("probe: {}", e))?;
-            row.try_get::<_, String>(0).unwrap_or_else(|_| "unknown".into())
-        }
+///
+/// Routes through `execute()` so remote-node profiles are proxied to
+/// their owning peer — a DB on a container that's only reachable from
+/// `wolfstack-2` must be tested from `wolfstack-2`, not from the node
+/// the operator happens to be logged into. We classify the probe as
+/// Read and bound the wall-clock to 8 seconds so a black-holed port
+/// fails fast instead of hanging the UI.
+pub async fn test(
+    conn: &SqlConnection,
+    cluster_secret: &str,
+    cluster: Option<&crate::agent::ClusterState>,
+) -> Result<String, String> {
+    let probe = match conn.kind {
+        SqlKind::Mariadb | SqlKind::Mysql => "SELECT VERSION()",
+        SqlKind::Postgres => "SELECT version()",
     };
-    // Drop the throw-away pool from the registry so we don't leak
-    // short-lived entries if the test button is pressed repeatedly.
-    POOLS.lock().unwrap().remove(&temp.id);
-    Ok(probe)
+    let result = execute(
+        &conn.id,
+        probe,
+        SqlPermission::Read,
+        Caller::Ui("test-connection".into()),
+        cluster_secret,
+        Some(Duration::from_secs(8)),
+        cluster,
+    ).await?;
+    // First row, first column is the version string; otherwise fall
+    // back to a generic "ok" so operators still get a success toast.
+    let version = result.rows.first()
+        .and_then(|r| r.first())
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "connected".into());
+    Ok(version)
 }
 
 // ═══════════════════════════════════════════════════

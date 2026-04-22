@@ -41461,12 +41461,23 @@ function dbRenderConnections() {
 
 function dbFilterConnections() { dbRenderConnections(); }
 
+// Database Manager state — one connection selected at a time.
+// All server-side work goes through /api/sql-connections/{id}/query so
+// cluster routing, audit logging, and permission tiering are automatic.
+let _dbMgrTab = 'tables';
+let _dbMgrCurrentDb = null;      // active schema (MySQL), 'public' (Postgres)
+let _dbMgrCurrentTable = null;
+
 function dbOpenConnection(id) {
     _dbCurrentId = id;
     _dbLastResult = null;
-    dbRenderConnections();  // re-render to highlight selection
+    _dbMgrTab = 'tables';
+    _dbMgrCurrentDb = null;
+    _dbMgrCurrentTable = null;
+    dbRenderConnections();
     const conn = _dbConnsCache.find(c => c.id === id);
     if (!conn) return;
+    _dbMgrCurrentDb = conn.kind === 'postgres' ? 'public' : conn.database;
     const ws = document.getElementById('db-workspace');
     if (!ws) return;
     const kindIcon = conn.kind === 'postgres' ? '🐘' : (conn.kind === 'mariadb' ? '🦭' : '🐬');
@@ -41488,6 +41499,208 @@ function dbOpenConnection(id) {
             <button class="btn btn-sm" onclick="dbTestConnection('${escapeHtml(conn.id)}', this)">Test</button>
         </div>
 
+        <div style="display:grid; grid-template-columns:240px 1fr; gap:12px; height:calc(100vh - 320px); min-height:420px;">
+            <!-- Tree: databases + tables -->
+            <div style="border:1px solid var(--border); border-radius:8px; overflow:hidden; display:flex; flex-direction:column; background:var(--bg-secondary);">
+                <div style="padding:8px 10px; border-bottom:1px solid var(--border); font-size:12px; font-weight:600; display:flex; justify-content:space-between; align-items:center;">
+                    <span>📁 Schema</span>
+                    <button class="btn btn-sm" onclick="dbMgrLoadTree()" title="Refresh" style="padding:2px 6px;">🔄</button>
+                </div>
+                <div id="db-mgr-tree" style="flex:1; overflow-y:auto; padding:4px 0; font-size:13px;">
+                    <div style="padding:16px; color:var(--text-muted); text-align:center; font-size:12px;">Loading…</div>
+                </div>
+            </div>
+            <!-- Right: tabs -->
+            <div style="border:1px solid var(--border); border-radius:8px; overflow:hidden; display:flex; flex-direction:column; background:var(--bg-secondary);">
+                <div style="display:flex; border-bottom:1px solid var(--border);">
+                    <button class="btn-sm db-mgr-tab" data-tab="data" onclick="dbMgrSwitchTab('data')"
+                        style="padding:9px 16px; border:none; background:none; cursor:pointer; border-bottom:2px solid transparent;">📊 Data</button>
+                    <button class="btn-sm db-mgr-tab" data-tab="structure" onclick="dbMgrSwitchTab('structure')"
+                        style="padding:9px 16px; border:none; background:none; cursor:pointer; border-bottom:2px solid transparent;">🏗️ Structure</button>
+                    <button class="btn-sm db-mgr-tab" data-tab="query" onclick="dbMgrSwitchTab('query')"
+                        style="padding:9px 16px; border:none; background:none; cursor:pointer; border-bottom:2px solid transparent;">⚡ Query</button>
+                    <div style="flex:1;"></div>
+                    <div id="db-mgr-info" style="padding:9px 12px; font-size:11px; color:var(--text-muted);"></div>
+                </div>
+                <div id="db-mgr-body" style="flex:1; overflow:auto; padding:12px;">
+                    <div style="color:var(--text-muted); text-align:center; padding:60px 10px; font-size:13px;">Pick a table on the left, or use the Query tab.</div>
+                </div>
+            </div>
+        </div>
+    `;
+    dbMgrSwitchTab('data', true);
+    dbMgrLoadTree();
+}
+
+async function dbMgrRunSql(sql, permission = 'read', timeout_secs = 30) {
+    const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_dbCurrentId)}/query`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: sql, permission, timeout_secs }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+    return data;
+}
+
+function dbMgrEscapeIdent(kind, ident) {
+    // Postgres + modern MySQL both accept double-quotes for identifiers,
+    // but MySQL's default ANSI_QUOTES is off, so use backticks for mysql/mariadb.
+    if (kind === 'postgres') return '"' + String(ident).replace(/"/g, '""') + '"';
+    return '`' + String(ident).replace(/`/g, '``') + '`';
+}
+
+async function dbMgrLoadTree() {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    const tree = document.getElementById('db-mgr-tree');
+    if (!tree) return;
+    tree.innerHTML = '<div style="padding:12px; color:var(--text-muted); font-size:12px;">Loading…</div>';
+    try {
+        let html = '';
+        if (conn.kind === 'postgres') {
+            // Postgres connections are bound to one DB; list schemas + tables within.
+            const schemas = await dbMgrRunSql(
+                "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('pg_catalog','information_schema','pg_toast') ORDER BY schema_name"
+            );
+            for (const row of schemas.rows) {
+                const schema = row[0];
+                html += `<div style="padding:6px 10px; font-size:11px; font-weight:600; color:var(--text-muted); text-transform:uppercase;">${escapeHtml(schema)}</div>`;
+                const tables = await dbMgrRunSql(
+                    `SELECT table_name FROM information_schema.tables WHERE table_schema = '${schema.replace(/'/g, "''")}' ORDER BY table_name`
+                );
+                for (const t of tables.rows) {
+                    const name = t[0];
+                    const active = _dbMgrCurrentDb === schema && _dbMgrCurrentTable === name;
+                    html += `<div onclick="dbMgrPickTable('${escapeHtml(schema)}','${escapeHtml(name).replace(/'/g, "\\'")}')"
+                        style="cursor:pointer; padding:4px 18px; font-size:13px; background:${active ? 'var(--accent-bg, rgba(168,85,247,0.15))' : 'transparent'};">
+                        📋 ${escapeHtml(name)}
+                    </div>`;
+                }
+            }
+        } else {
+            // MySQL / MariaDB: list every database the user can see, then tables per db.
+            const dbs = await dbMgrRunSql('SHOW DATABASES');
+            for (const row of dbs.rows) {
+                const db = row[0];
+                if (['information_schema','performance_schema','mysql','sys'].includes(db)) continue;
+                const isCurrent = _dbMgrCurrentDb === db;
+                html += `<div style="padding:6px 10px; font-size:11px; font-weight:600; color:var(--text-muted); text-transform:uppercase; display:flex; justify-content:space-between;">
+                    <span>${escapeHtml(db)}</span>
+                    ${isCurrent ? '' : `<a href="#" onclick="event.preventDefault(); dbMgrSetDb('${escapeHtml(db).replace(/'/g, "\\'")}')" style="font-size:10px;">use</a>`}
+                </div>`;
+                if (isCurrent) {
+                    const tables = await dbMgrRunSql(`SHOW TABLES FROM ${dbMgrEscapeIdent(conn.kind, db)}`);
+                    for (const t of tables.rows) {
+                        const name = t[0];
+                        const active = _dbMgrCurrentDb === db && _dbMgrCurrentTable === name;
+                        html += `<div onclick="dbMgrPickTable('${escapeHtml(db).replace(/'/g, "\\'")}','${escapeHtml(name).replace(/'/g, "\\'")}')"
+                            style="cursor:pointer; padding:4px 18px; font-size:13px; background:${active ? 'var(--accent-bg, rgba(168,85,247,0.15))' : 'transparent'};">
+                            📋 ${escapeHtml(name)}
+                        </div>`;
+                    }
+                }
+            }
+        }
+        tree.innerHTML = html || '<div style="padding:12px; color:var(--text-muted); font-size:12px;">(empty)</div>';
+    } catch (e) {
+        tree.innerHTML = `<div style="padding:12px; color:var(--danger); font-size:12px;">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function dbMgrSetDb(db) {
+    _dbMgrCurrentDb = db;
+    _dbMgrCurrentTable = null;
+    dbMgrLoadTree();
+    const body = document.getElementById('db-mgr-body');
+    if (body) body.innerHTML = '<div style="color:var(--text-muted); text-align:center; padding:60px 10px; font-size:13px;">Pick a table on the left.</div>';
+}
+
+function dbMgrPickTable(db, table) {
+    _dbMgrCurrentDb = db;
+    _dbMgrCurrentTable = table;
+    dbMgrLoadTree();
+    dbMgrRefreshTab();
+}
+
+function dbMgrSwitchTab(tab, skipRefresh) {
+    _dbMgrTab = tab;
+    document.querySelectorAll('.db-mgr-tab').forEach(b => {
+        if (b.dataset.tab === tab) {
+            b.style.borderBottomColor = 'var(--accent, #a855f7)';
+            b.style.color = 'var(--text)';
+        } else {
+            b.style.borderBottomColor = 'transparent';
+            b.style.color = 'var(--text-muted)';
+        }
+    });
+    if (!skipRefresh) dbMgrRefreshTab();
+}
+
+function dbMgrRefreshTab() {
+    const body = document.getElementById('db-mgr-body');
+    if (!body) return;
+    if (_dbMgrTab === 'query') return dbMgrRenderQueryTab(body);
+    if (!_dbMgrCurrentTable) {
+        body.innerHTML = '<div style="color:var(--text-muted); text-align:center; padding:60px 10px; font-size:13px;">Pick a table on the left to view its data or structure.</div>';
+        return;
+    }
+    if (_dbMgrTab === 'data') return dbMgrRenderDataTab(body);
+    if (_dbMgrTab === 'structure') return dbMgrRenderStructureTab(body);
+}
+
+async function dbMgrRenderDataTab(body) {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    body.innerHTML = '<div style="color:var(--text-muted);">Loading rows…</div>';
+    try {
+        const fq = conn.kind === 'postgres'
+            ? `${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentDb)}.${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentTable)}`
+            : `${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentDb)}.${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentTable)}`;
+        const data = await dbMgrRunSql(`SELECT * FROM ${fq} LIMIT 200`);
+        document.getElementById('db-mgr-info').textContent = `${data.row_count} rows${data.truncated ? ' (truncated)' : ''} · ${data.elapsed_ms}ms`;
+        const wrap = document.createElement('div');
+        sqlConnRenderResult(wrap, data);
+        body.innerHTML = '';
+        body.appendChild(wrap);
+    } catch (e) {
+        body.innerHTML = `<div style="color:var(--danger); white-space:pre-wrap; font-family:monospace; padding:10px; background:var(--bg-primary); border-radius:6px;">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+async function dbMgrRenderStructureTab(body) {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    body.innerHTML = '<div style="color:var(--text-muted);">Loading structure…</div>';
+    try {
+        let data;
+        if (conn.kind === 'postgres') {
+            data = await dbMgrRunSql(
+                `SELECT column_name, data_type, is_nullable, column_default
+                 FROM information_schema.columns
+                 WHERE table_schema = '${_dbMgrCurrentDb.replace(/'/g, "''")}'
+                   AND table_name = '${_dbMgrCurrentTable.replace(/'/g, "''")}'
+                 ORDER BY ordinal_position`
+            );
+        } else {
+            const fq = `${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentDb)}.${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentTable)}`;
+            data = await dbMgrRunSql(`DESCRIBE ${fq}`);
+        }
+        document.getElementById('db-mgr-info').textContent = `${data.row_count} columns`;
+        const wrap = document.createElement('div');
+        sqlConnRenderResult(wrap, data);
+        body.innerHTML = '';
+        body.appendChild(wrap);
+    } catch (e) {
+        body.innerHTML = `<div style="color:var(--danger); white-space:pre-wrap; font-family:monospace; padding:10px; background:var(--bg-primary); border-radius:6px;">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function dbMgrRenderQueryTab(body) {
+    const hint = _dbMgrCurrentTable
+        ? `SELECT * FROM ${_dbMgrCurrentTable} LIMIT 100;`
+        : 'SELECT 1;';
+    body.innerHTML = `
         <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap;">
             <label style="font-size:13px; margin:0;">Permission:
                 <select id="db-perm" class="form-control" style="display:inline-block; width:auto; margin-left:6px;">
@@ -41500,8 +41713,7 @@ function dbOpenConnection(id) {
                 <input id="db-timeout" type="number" min="1" max="300" value="30" class="form-control" style="display:inline-block; width:90px; margin-left:6px;">
             </label>
         </div>
-
-        <textarea id="db-query" class="form-control" rows="6" placeholder="SELECT COUNT(*) FROM customers;" style="font-family:monospace; font-size:13px;"></textarea>
+        <textarea id="db-query" class="form-control" rows="6" placeholder="${escapeHtml(hint)}" style="font-family:monospace; font-size:13px;"></textarea>
         <div style="display:flex; gap:8px; margin-top:8px; align-items:center;">
             <button class="btn btn-primary btn-sm" onclick="dbRunQuery()">▶ Run query</button>
             <button class="btn btn-sm" id="db-copy-csv" onclick="dbCopyCsv()" disabled>📋 Copy CSV</button>
@@ -41510,9 +41722,6 @@ function dbOpenConnection(id) {
         </div>
         <div id="db-result" style="margin-top:14px;"></div>
     `;
-
-    // Ctrl/Cmd+Enter convenience — most SQL editors support it, our
-    // agents' habit-memory expects it.
     const ta = document.getElementById('db-query');
     if (ta) ta.addEventListener('keydown', (e) => {
         if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {

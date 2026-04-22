@@ -20368,7 +20368,7 @@ pub async fn sql_connections_test(
         Some(c) => c.clone(),
         None => return HttpResponse::NotFound().json(serde_json::json!({ "error": "not found" })),
     };
-    match crate::sql_connections::test(&conn, &state.cluster_secret).await {
+    match crate::sql_connections::test(&conn, &state.cluster_secret, Some(&state.cluster)).await {
         Ok(version) => HttpResponse::Ok().json(serde_json::json!({
             "ok": true, "version": version,
         })),
@@ -20665,12 +20665,17 @@ pub async fn sql_connections_query_proxy(
         body.origin_caller.clone().unwrap_or_else(|| "remote".into())
     );
 
-    match crate::sql_connections::execute(
+    // Force local execution: the originator has already routed to us.
+    // Re-running the routing logic on the receiver is harmful because the
+    // stored `node_id` was resolved from the originator's cluster snapshot
+    // and may not match the receiver's `self_node_id` verbatim (id drift,
+    // manual join-with-different-id, etc.). The originator's choice to
+    // POST us this request IS the authorisation to execute locally.
+    match crate::sql_connections::execute_as_target(
         &id, &body.query, perm,
         caller,
         &state.cluster_secret,
         timeout,
-        Some(&state.cluster),
     ).await {
         Ok(r) => HttpResponse::Ok().json(r),
         Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
