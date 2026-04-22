@@ -41345,23 +41345,70 @@ async function sqlConnRunQuery() {
     }
 }
 
+// Generic result renderer — used by the Settings tester and the
+// Query tab. Hard-caps display at 1000 rows (the backend's
+// MAX_ROWS=10000 guard is separate; this cap is purely UI so a
+// Query-tab result doesn't freeze the browser laying out 10k
+// <tr> elements). Clicking a column header sorts ascending,
+// clicking again flips to descending — sort is client-side only
+// on the already-returned page.
+let _sqlRenderSort = { el: null, col: null, dir: 'asc' };
+
 function sqlConnRenderResult(el, r) {
+    const MAX_SHOW = 1000;
     const meta = `<div style="font-size:12px; color:var(--text-muted); margin-bottom:6px;">
         ${r.row_count} row${r.row_count === 1 ? '' : 's'}
         ${r.affected_rows != null ? ` · affected ${r.affected_rows}` : ''}
-        · ${r.elapsed_ms}ms${r.truncated ? ' · <span style="color:var(--warning);">truncated</span>' : ''}
+        · ${r.elapsed_ms}ms${r.truncated ? ' · <span style="color:var(--warning);">server-truncated</span>' : ''}
+        ${r.rows && r.rows.length > MAX_SHOW ? ` · <span style="color:var(--warning);">table view capped at ${MAX_SHOW}</span>` : ''}
     </div>`;
     if (!r.rows || r.rows.length === 0) {
         el.innerHTML = meta + '<div style="color:var(--text-muted);">(no rows)</div>';
         return;
     }
-    const maxShow = 200;
-    const shown = r.rows.slice(0, maxShow);
+    // Store the full result on the element so the sort click handler
+    // can find it — avoids re-executing the query.
+    el.__sqlResult = r;
+    el.__sqlRenderOpts = { maxShow: MAX_SHOW };
+    sqlConnRenderResultInto(el);
+}
+
+function sqlConnRenderResultInto(el) {
+    const r = el.__sqlResult;
+    if (!r) return;
+    const maxShow = (el.__sqlRenderOpts && el.__sqlRenderOpts.maxShow) || 1000;
+    // Apply sort if one is set for this element.
+    let rows = r.rows.slice(0, maxShow);
+    if (_sqlRenderSort.el === el && _sqlRenderSort.col != null) {
+        const idx = _sqlRenderSort.col;
+        const dir = _sqlRenderSort.dir === 'desc' ? -1 : 1;
+        rows = rows.slice().sort((a, b) => {
+            const av = a[idx], bv = b[idx];
+            if (av == null && bv == null) return 0;
+            if (av == null) return 1;
+            if (bv == null) return -1;
+            // Numeric if both are numbers-like.
+            const an = Number(av), bn = Number(bv);
+            if (!isNaN(an) && !isNaN(bn) && av !== '' && bv !== '') return (an - bn) * dir;
+            return String(av).localeCompare(String(bv)) * dir;
+        });
+    }
+    const meta = `<div style="font-size:12px; color:var(--text-muted); margin-bottom:6px;">
+        ${r.row_count} row${r.row_count === 1 ? '' : 's'}
+        ${r.affected_rows != null ? ` · affected ${r.affected_rows}` : ''}
+        · ${r.elapsed_ms}ms${r.truncated ? ' · <span style="color:var(--warning);">server-truncated</span>' : ''}
+        ${r.rows.length > maxShow ? ` · <span style="color:var(--warning);">table view capped at ${maxShow}</span>` : ''}
+    </div>`;
     let html = meta + '<div style="max-height:400px; overflow:auto; border:1px solid var(--border); border-radius:6px;">';
     html += '<table class="data-table" style="width:100%; font-family:monospace; font-size:12px;"><thead><tr>';
-    for (const c of r.columns) html += `<th>${escapeHtml(c)}</th>`;
+    for (let i = 0; i < r.columns.length; i++) {
+        const c = r.columns[i];
+        const isSorted = _sqlRenderSort.el === el && _sqlRenderSort.col === i;
+        const arrow = isSorted ? (_sqlRenderSort.dir === 'desc' ? ' ▼' : ' ▲') : '';
+        html += `<th data-sort-idx="${i}" style="cursor:pointer; user-select:none;" title="Click to sort">${escapeHtml(c)}${arrow}</th>`;
+    }
     html += '</tr></thead><tbody>';
-    for (const row of shown) {
+    for (const row of rows) {
         html += '<tr>';
         for (const v of row) {
             const text = v === null ? '<span style="color:var(--text-muted);">NULL</span>' : escapeHtml(String(v));
@@ -41371,9 +41418,21 @@ function sqlConnRenderResult(el, r) {
     }
     html += '</tbody></table></div>';
     if (r.rows.length > maxShow) {
-        html += `<div style="font-size:11px; color:var(--text-muted); margin-top:4px;">Showing first ${maxShow} of ${r.rows.length} rows.</div>`;
+        html += `<div style="font-size:11px; color:var(--text-muted); margin-top:4px;">Showing first ${maxShow} of ${r.rows.length} rows — export (CSV / JSON / SQL) still covers the whole result set.</div>`;
     }
     el.innerHTML = html;
+    // Wire up the sort click handler.
+    el.querySelectorAll('th[data-sort-idx]').forEach(th => {
+        th.addEventListener('click', () => {
+            const idx = parseInt(th.dataset.sortIdx, 10);
+            if (_sqlRenderSort.el === el && _sqlRenderSort.col === idx) {
+                _sqlRenderSort.dir = _sqlRenderSort.dir === 'asc' ? 'desc' : 'asc';
+            } else {
+                _sqlRenderSort = { el, col: idx, dir: 'asc' };
+            }
+            sqlConnRenderResultInto(el);
+        });
+    });
 }
 
 // ═══════════════════════════════════════════════════
@@ -41520,17 +41579,21 @@ function dbOpenConnection(id) {
             <button class="btn btn-sm" onclick="dbTestConnection('${escapeHtml(conn.id)}', this)" style="padding:3px 10px; font-size:12px;">Test</button>
         </div>
 
-        <div style="display:grid; grid-template-columns:240px 1fr; gap:12px; height:calc(100vh - 240px); min-height:460px;">
+        <div id="db-mgr-grid" style="display:grid; grid-template-columns:${_dbTreeCollapsed ? '0 1fr' : '240px 1fr'}; gap:${_dbTreeCollapsed ? '0' : '12px'}; height:calc(100vh - 240px); min-height:460px; position:relative;">
             <!-- Tree: databases + tables -->
-            <div style="border:1px solid var(--border); border-radius:8px; overflow:hidden; display:flex; flex-direction:column; background:var(--bg-secondary);">
+            <div id="db-mgr-tree-panel" style="border:1px solid var(--border); border-radius:8px; overflow:hidden; display:${_dbTreeCollapsed ? 'none' : 'flex'}; flex-direction:column; background:var(--bg-secondary);">
                 <div style="padding:8px 10px; border-bottom:1px solid var(--border); font-size:12px; font-weight:600; display:flex; justify-content:space-between; align-items:center;">
                     <span>📁 Schema</span>
-                    <button class="btn btn-sm" onclick="dbMgrLoadTree()" title="Refresh" style="padding:2px 6px;">🔄</button>
+                    <div style="display:flex; gap:4px;">
+                        <button class="btn btn-sm" onclick="dbMgrLoadTree(true)" title="Refresh" style="padding:2px 6px;">🔄</button>
+                        <button class="btn btn-sm" onclick="dbToggleTree()" title="Hide the schema tree" style="padding:2px 6px;">◀</button>
+                    </div>
                 </div>
                 <div id="db-mgr-tree" style="flex:1; overflow-y:auto; padding:4px 0; font-size:13px;">
                     <div style="padding:16px; color:var(--text-muted); text-align:center; font-size:12px;">Loading…</div>
                 </div>
             </div>
+            ${_dbTreeCollapsed ? `<button onclick="dbToggleTree()" title="Show the schema tree" style="position:absolute; left:0; top:8px; z-index:3; padding:6px 8px; background:var(--bg-secondary); border:1px solid var(--border); border-left:none; border-radius:0 6px 6px 0; cursor:pointer; font-size:12px;">📁 ▶</button>` : ''}
             <!-- Right: tabs -->
             <div style="border:1px solid var(--border); border-radius:8px; overflow:hidden; display:flex; flex-direction:column; background:var(--bg-secondary);">
                 <div style="display:flex; border-bottom:1px solid var(--border); overflow-x:auto;">
@@ -41540,6 +41603,8 @@ function dbOpenConnection(id) {
                         style="padding:9px 14px; border:none; background:none; cursor:pointer; border-bottom:2px solid transparent; white-space:nowrap;">🏗️ Structure</button>
                     <button class="btn-sm db-mgr-tab" data-tab="diagram" onclick="dbMgrSwitchTab('diagram')"
                         style="padding:9px 14px; border:none; background:none; cursor:pointer; border-bottom:2px solid transparent; white-space:nowrap;">🗺️ Diagram</button>
+                    <button class="btn-sm db-mgr-tab" data-tab="builder" onclick="dbMgrSwitchTab('builder')"
+                        style="padding:9px 14px; border:none; background:none; cursor:pointer; border-bottom:2px solid transparent; white-space:nowrap;">🧱 Build</button>
                     <button class="btn-sm db-mgr-tab" data-tab="query" onclick="dbMgrSwitchTab('query')"
                         style="padding:9px 14px; border:none; background:none; cursor:pointer; border-bottom:2px solid transparent; white-space:nowrap;">⚡ Query</button>
                     <button class="btn-sm db-mgr-tab" data-tab="server" onclick="dbMgrSwitchTab('server')"
@@ -42931,14 +42996,40 @@ function dbMgrPickTable(db, table) {
     _dbMgrCurrentDb = db;
     _dbMgrCurrentTable = table;
     _dbMgrExpanded.add(db);
+    // If the operator's current Query tab is empty, seed it with
+    // the default browse query — one click then Run and they're
+    // off. Never overwrite existing SQL, that would destroy work.
+    const tab = _dbQueryTabs[_dbQueryActive];
+    if (tab && !tab.sql.trim()) {
+        const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+        if (conn) {
+            const fq = `${dbMgrEscapeIdent(conn.kind, db)}.${dbMgrEscapeIdent(conn.kind, table)}`;
+            tab.sql = `SELECT * FROM ${fq} LIMIT 100;`;
+        }
+    }
     dbUpdateSchemaBadge();
     dbMgrLoadTree();
     dbMgrRefreshTab();
 }
 
 function dbUpdateSchemaBadge() {
+    // The badge shows the ACTIVE TAB's schema, not the tree selection —
+    // switching tables doesn't retroactively change an open tab's
+    // context. Re-render path calls this so a fresh tab's schema
+    // propagates, and the explicit rebind button does too.
     const b = document.getElementById('db-schema-badge');
-    if (b) b.textContent = `📂 ${_dbMgrCurrentDb || '(default)'}`;
+    const active = _dbQueryTabs[_dbQueryActive];
+    if (b && active) b.textContent = `📂 ${active.schema || '(default)'}`;
+}
+
+function dbRebindTabSchema() {
+    // Explicit "use the currently-selected schema in this tab"
+    // action — for when the operator navigated around the tree
+    // and wants this tab to follow along.
+    if (!_dbQueryTabs[_dbQueryActive]) return;
+    _dbQueryTabs[_dbQueryActive].schema = _dbMgrCurrentDb || '';
+    dbUpdateSchemaBadge();
+    showToast(`Query tab rebound to ${_dbMgrCurrentDb || 'default'}`, 'success');
 }
 
 function dbMgrSwitchTab(tab, skipRefresh) {
@@ -42960,6 +43051,7 @@ function dbMgrRefreshTab() {
     if (!body) return;
     if (_dbMgrTab === 'query') return dbMgrRenderQueryTab(body);
     if (_dbMgrTab === 'diagram') return dbMgrRenderDiagramTab(body);
+    if (_dbMgrTab === 'builder') return dbMgrRenderBuilderTab(body);
     if (_dbMgrTab === 'server') return dbMgrRenderServerTab(body);
     if (!_dbMgrCurrentTable) {
         body.innerHTML = '<div style="color:var(--text-muted); text-align:center; padding:60px 10px; font-size:13px;">Pick a table on the left to view its data or structure, or use the Diagram tab to see the schema as an ERD.</div>';
@@ -42993,6 +43085,7 @@ async function dbMgrRenderDataTab(body) {
                     <option value="100"${st.pageSize===100?' selected':''}>100</option>
                     <option value="250"${st.pageSize===250?' selected':''}>250</option>
                     <option value="500"${st.pageSize===500?' selected':''}>500</option>
+                    <option value="1000"${st.pageSize===1000?' selected':''}>1000 (max)</option>
                 </select>
             </label>
             <button class="btn btn-sm" onclick="dbDataPrev()">◀ Prev</button>
@@ -43099,7 +43192,10 @@ function dbDataSortBy(col) {
 function dbDataFilterChange(v) { dbDataGetState().filter = v; dbDataReload(); }
 function dbDataPageSizeChange(v) {
     const st = dbDataGetState();
-    st.pageSize = parseInt(v, 10) || 100;
+    // Hard cap at 1000 rows per page — browser layout choked above
+    // this on real-world data. Use the Query tab with pagination
+    // when bigger sets are needed.
+    st.pageSize = Math.min(1000, parseInt(v, 10) || 100);
     st.page = 0;
     dbDataReload();
 }
@@ -43264,13 +43360,34 @@ async function dbDiagLoad(conn, schema) {
 }
 
 function dbDiagAutoLayout() {
-    // Grid layout: sqrt(n) cols, 320px wide, 260px tall cells.
+    // Variable-height row layout — each box is sized to its column
+    // count, so wide tables (20 columns) no longer bleed into the
+    // next row's boxes. Row height = max box height in that row.
     const n = _dbDiagTables.length;
     const cols = Math.max(1, Math.ceil(Math.sqrt(n)));
-    const boxW = 260, boxH = 180, gapX = 60, gapY = 60;
+    const boxW = 260, gapX = 60, gapY = 60;
+    const headerH = 30, rowH = 20;
+    const heights = _dbDiagTables.map(t => headerH + rowH * Math.min(t.columns.length, 20));
+    // Compute each row's max height.
+    const rowHeights = [];
+    for (let r = 0; r * cols < n; r++) {
+        let maxH = 0;
+        for (let c = 0; c < cols && r * cols + c < n; c++) {
+            maxH = Math.max(maxH, heights[r * cols + c]);
+        }
+        rowHeights.push(maxH);
+    }
+    // Cumulative Y for each row.
+    const rowY = [40];
+    for (let r = 1; r < rowHeights.length; r++) {
+        rowY.push(rowY[r - 1] + rowHeights[r - 1] + gapY);
+    }
     _dbDiagTables.forEach((t, i) => {
         const col = i % cols, row = Math.floor(i / cols);
-        _dbDiagState.positions[t.name] = { x: 40 + col * (boxW + gapX), y: 40 + row * (boxH + gapY) };
+        _dbDiagState.positions[t.name] = {
+            x: 40 + col * (boxW + gapX),
+            y: rowY[row],
+        };
     });
     _dbDiagState.zoom = 1;
     _dbDiagState.panX = 0;
@@ -43454,6 +43571,369 @@ function dbDiagExportSvg() {
 }
 
 // ═══════════════════════════════════════════════════
+// ─── Visual query builder ───
+// ═══════════════════════════════════════════════════
+//
+// Drag tables onto a canvas, tick the columns you want, click-drag
+// from one column to another to create a JOIN, and add WHERE
+// conditions in the bottom panel. The generated SELECT lives
+// underneath and updates in real time. Hit "Send to Query tab" to
+// hand the SQL off to the Query editor where you can run it.
+
+let _dbBldTables = [];   // [{schema, name, x, y, columns:[{name, type, selected}]}]
+let _dbBldJoins = [];    // [{fromTable, fromCol, toTable, toCol, type}]  type = INNER|LEFT|RIGHT
+let _dbBldWhere = [];    // [{table, col, op, value}]
+let _dbBldConnectStart = null;  // {table, col} while drag-connecting
+let _dbBldLimit = 100;
+
+function dbMgrRenderBuilderTab(body) {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    body.innerHTML = `
+        <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap;">
+            <span style="font-size:13px;"><strong>Query builder</strong> — pick columns to SELECT, drag column→column to JOIN, add WHERE conditions. Generated SQL below updates live.</span>
+            <div style="flex:1;"></div>
+            <select id="db-bld-add" class="form-control" style="display:inline-block; width:auto; font-size:12px;">
+                <option value="">— Add table… —</option>
+            </select>
+            <button class="btn btn-sm" onclick="dbBldReset()" title="Clear everything">🗑️ Clear</button>
+            <button class="btn btn-sm" onclick="dbBldSendToQuery()" title="Open the generated SQL in a new Query tab">▶ Send to Query</button>
+        </div>
+        <div style="display:grid; grid-template-columns:1fr; gap:10px;">
+            <div id="db-bld-canvas-wrap" style="position:relative; border:1px solid var(--border); border-radius:6px; background:var(--bg-primary); height:380px; overflow:auto;">
+                <svg id="db-bld-svg" style="position:absolute; inset:0; width:100%; height:100%; pointer-events:none; z-index:1;"></svg>
+                <div id="db-bld-canvas" style="position:relative; width:2400px; height:1400px;"></div>
+            </div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+                <div style="border:1px solid var(--border); border-radius:6px; padding:10px; background:var(--bg-secondary);">
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
+                        <strong style="font-size:13px;">WHERE conditions</strong>
+                        <button class="btn btn-sm" onclick="dbBldAddWhere()" style="padding:2px 8px; font-size:11px;">+ Condition</button>
+                    </div>
+                    <div id="db-bld-where" style="font-size:12px;"></div>
+                </div>
+                <div style="border:1px solid var(--border); border-radius:6px; padding:10px; background:var(--bg-secondary);">
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
+                        <strong style="font-size:13px;">Options</strong>
+                    </div>
+                    <label style="font-size:12px;">Row limit
+                        <input id="db-bld-limit" type="number" min="1" max="100000" value="${_dbBldLimit}" class="form-control" style="display:inline-block; width:100px; margin-left:6px; font-size:12px;" oninput="_dbBldLimit=parseInt(this.value,10)||100; dbBldRenderSql()">
+                    </label>
+                </div>
+            </div>
+            <div style="border:1px solid var(--border); border-radius:6px; padding:10px; background:var(--bg-primary);">
+                <strong style="font-size:13px;">Generated SQL</strong>
+                <pre id="db-bld-sql" style="margin:6px 0 0; font-family:monospace; font-size:12px; white-space:pre-wrap; color:var(--text-primary);"></pre>
+            </div>
+        </div>
+    `;
+    // Populate the "Add table" dropdown with every known table from
+    // the tree cache (MySQL + Postgres both supported via _dbMgrTablesCache).
+    const sel = document.getElementById('db-bld-add');
+    const known = dbAcKnownTables();
+    if (!known.length) {
+        sel.innerHTML = '<option value="">(expand a schema in the tree first)</option>';
+    } else {
+        let html = '<option value="">— Add table… —</option>';
+        for (const t of known) html += `<option value="${escapeHtml(t.schema)}::${escapeHtml(t.name)}">${escapeHtml(t.schema)}.${escapeHtml(t.name)}</option>`;
+        sel.innerHTML = html;
+        sel.onchange = () => {
+            const val = sel.value;
+            sel.value = '';
+            if (!val) return;
+            const [schema, name] = val.split('::');
+            dbBldAddTable(schema, name);
+        };
+    }
+    dbBldRenderCanvas();
+    dbBldRenderWhere();
+    dbBldRenderSql();
+}
+
+async function dbBldAddTable(schema, name) {
+    if (_dbBldTables.some(t => t.schema === schema && t.name === name)) {
+        showToast('Table already on canvas', 'info'); return;
+    }
+    // Lazy-fetch columns.
+    const cols = await dbAcEnsureColumns(schema, name);
+    // Position in a staggered grid so they don't all stack.
+    const x = 40 + (_dbBldTables.length % 3) * 260;
+    const y = 30 + Math.floor(_dbBldTables.length / 3) * 220;
+    _dbBldTables.push({
+        schema, name, x, y,
+        columns: cols.map(c => ({ name: c, selected: false })),
+    });
+    dbBldRenderCanvas();
+    dbBldRenderSql();
+}
+
+function dbBldRenderCanvas() {
+    const canvas = document.getElementById('db-bld-canvas');
+    if (!canvas) return;
+    canvas.innerHTML = '';
+    for (const t of _dbBldTables) {
+        const box = document.createElement('div');
+        box.dataset.table = `${t.schema}.${t.name}`;
+        box.style.cssText = `position:absolute; left:${t.x}px; top:${t.y}px; width:220px; background:#1a1a24; border:1px solid #4a4a6a; border-radius:6px; z-index:2; font-size:12px; user-select:none;`;
+        let ih = `<div class="db-bld-header" style="padding:6px 10px; background:#2a2538; border-bottom:1px solid #4a4a6a; border-radius:6px 6px 0 0; cursor:move; display:flex; justify-content:space-between; align-items:center;">
+            <span>📋 <strong>${escapeHtml(t.name)}</strong> <span style="color:#888; font-size:10px;">· ${escapeHtml(t.schema)}</span></span>
+            <span onclick="dbBldRemoveTable('${escapeHtml(t.schema).replace(/'/g, "\\'")}','${escapeHtml(t.name).replace(/'/g, "\\'")}')" style="cursor:pointer; color:#888;" title="Remove from canvas">✕</span>
+        </div>`;
+        for (let i = 0; i < t.columns.length; i++) {
+            const c = t.columns[i];
+            ih += `<div class="db-bld-col" data-col="${escapeHtml(c.name)}" style="padding:3px 10px; display:flex; gap:6px; align-items:center; border-bottom:1px solid #2a2a3a;">
+                <input type="checkbox" ${c.selected ? 'checked' : ''} onchange="dbBldToggleCol('${escapeHtml(t.schema).replace(/'/g, "\\'")}','${escapeHtml(t.name).replace(/'/g, "\\'")}','${escapeHtml(c.name).replace(/'/g, "\\'")}')">
+                <span title="Drag from here to another column to create a JOIN" onmousedown="dbBldStartJoin(event, '${escapeHtml(t.schema).replace(/'/g, "\\'")}','${escapeHtml(t.name).replace(/'/g, "\\'")}','${escapeHtml(c.name).replace(/'/g, "\\'")}')" style="cursor:crosshair; flex:1;">
+                    ${escapeHtml(c.name)}
+                </span>
+            </div>`;
+        }
+        box.innerHTML = ih;
+        canvas.appendChild(box);
+        // Drag the table around by its header.
+        const header = box.querySelector('.db-bld-header');
+        header.addEventListener('mousedown', (e) => {
+            if (e.target.tagName === 'SPAN' && e.target.getAttribute('onclick')) return;
+            e.preventDefault();
+            const start = { x: e.clientX, y: e.clientY, tx: t.x, ty: t.y };
+            const onMove = (ev) => {
+                t.x = Math.max(0, start.tx + (ev.clientX - start.x));
+                t.y = Math.max(0, start.ty + (ev.clientY - start.y));
+                box.style.left = `${t.x}px`;
+                box.style.top = `${t.y}px`;
+                dbBldRenderJoinLines();
+            };
+            const onUp = () => {
+                document.removeEventListener('mousemove', onMove);
+                document.removeEventListener('mouseup', onUp);
+            };
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+        });
+    }
+    dbBldRenderJoinLines();
+}
+
+function dbBldRemoveTable(schema, name) {
+    _dbBldTables = _dbBldTables.filter(t => !(t.schema === schema && t.name === name));
+    _dbBldJoins = _dbBldJoins.filter(j =>
+        !(j.fromTable === `${schema}.${name}` || j.toTable === `${schema}.${name}`));
+    _dbBldWhere = _dbBldWhere.filter(w => w.table !== `${schema}.${name}`);
+    dbBldRenderCanvas();
+    dbBldRenderWhere();
+    dbBldRenderSql();
+}
+
+function dbBldToggleCol(schema, name, col) {
+    const t = _dbBldTables.find(t => t.schema === schema && t.name === name);
+    if (!t) return;
+    const c = t.columns.find(c => c.name === col);
+    if (c) c.selected = !c.selected;
+    dbBldRenderSql();
+}
+
+function dbBldStartJoin(ev, schema, name, col) {
+    ev.stopPropagation();
+    ev.preventDefault();
+    _dbBldConnectStart = { table: `${schema}.${name}`, col };
+    const onMove = (e) => dbBldPreviewJoin(e);
+    const onUp = (e) => {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+        // Hit-test which column we released on.
+        const target = document.elementFromPoint(e.clientX, e.clientY);
+        const colEl = target && target.closest('.db-bld-col');
+        const boxEl = target && target.closest('[data-table]');
+        if (colEl && boxEl) {
+            const targetTable = boxEl.dataset.table;
+            const targetCol = colEl.dataset.col;
+            if (targetTable !== _dbBldConnectStart.table) {
+                _dbBldJoins.push({
+                    fromTable: _dbBldConnectStart.table,
+                    fromCol: _dbBldConnectStart.col,
+                    toTable: targetTable,
+                    toCol: targetCol,
+                    type: 'INNER',
+                });
+                dbBldRenderSql();
+            }
+        }
+        _dbBldConnectStart = null;
+        dbBldRenderJoinLines();
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+}
+
+function dbBldPreviewJoin(_e) { /* visual-only preview left as future work */ }
+
+function dbBldRenderJoinLines() {
+    const svg = document.getElementById('db-bld-svg');
+    const wrap = document.getElementById('db-bld-canvas-wrap');
+    if (!svg || !wrap) return;
+    const wrapRect = wrap.getBoundingClientRect();
+    // Size the SVG to the canvas size + scroll offset.
+    svg.setAttribute('viewBox', `0 0 2400 1400`);
+    svg.style.width = '2400px';
+    svg.style.height = '1400px';
+    let content = `<defs><marker id="db-bld-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="4" markerHeight="4" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#a855f7"/></marker></defs>`;
+    for (let i = 0; i < _dbBldJoins.length; i++) {
+        const j = _dbBldJoins[i];
+        const from = dbBldColPoint(j.fromTable, j.fromCol);
+        const to = dbBldColPoint(j.toTable, j.toCol);
+        if (!from || !to) continue;
+        const mx = (from.x + to.x) / 2;
+        content += `<path d="M ${from.x} ${from.y} C ${mx} ${from.y}, ${mx} ${to.y}, ${to.x} ${to.y}" fill="none" stroke="#a855f7" stroke-width="1.5" marker-end="url(#db-bld-arrow)"/>`;
+        // Clickable "X" label to remove the join.
+        content += `<g onclick="dbBldRemoveJoin(${i})" style="cursor:pointer;"><circle cx="${mx}" cy="${(from.y + to.y) / 2}" r="9" fill="#2a2538" stroke="#a855f7"/><text x="${mx}" y="${(from.y + to.y) / 2 + 4}" text-anchor="middle" font-size="11" fill="#ef4444">✕</text></g>`;
+    }
+    svg.innerHTML = content;
+}
+
+function dbBldColPoint(tableKey, col) {
+    // Find the column row's center-edge point inside the canvas.
+    const box = document.querySelector(`[data-table="${tableKey.replace(/"/g, '\\"')}"]`);
+    if (!box) return null;
+    const colEl = box.querySelector(`.db-bld-col[data-col="${col.replace(/"/g, '\\"')}"]`);
+    if (!colEl) return null;
+    const t = _dbBldTables.find(t => `${t.schema}.${t.name}` === tableKey);
+    if (!t) return null;
+    const colIndex = t.columns.findIndex(c => c.name === col);
+    // Box header ~30px, each col ~24px, middle of row = 30 + colIndex*24 + 12.
+    return { x: t.x + 220, y: t.y + 30 + colIndex * 24 + 12 };
+}
+
+function dbBldRemoveJoin(i) {
+    _dbBldJoins.splice(i, 1);
+    dbBldRenderJoinLines();
+    dbBldRenderSql();
+}
+
+function dbBldAddWhere() {
+    if (!_dbBldTables.length) { showToast('Add a table first', 'warning'); return; }
+    _dbBldWhere.push({ table: `${_dbBldTables[0].schema}.${_dbBldTables[0].name}`, col: _dbBldTables[0].columns[0]?.name || '', op: '=', value: '' });
+    dbBldRenderWhere();
+    dbBldRenderSql();
+}
+
+function dbBldRenderWhere() {
+    const el = document.getElementById('db-bld-where');
+    if (!el) return;
+    if (!_dbBldWhere.length) { el.innerHTML = '<div style="color:var(--text-muted);">No conditions — SELECT returns all rows (up to the limit).</div>'; return; }
+    const tableOpts = _dbBldTables.map(t => `<option value="${escapeHtml(t.schema)}.${escapeHtml(t.name)}">${escapeHtml(t.schema)}.${escapeHtml(t.name)}</option>`).join('');
+    const opOpts = ['=','!=','<','<=','>','>=','LIKE','NOT LIKE','IS NULL','IS NOT NULL','IN'].map(o => `<option>${o}</option>`).join('');
+    let html = '';
+    for (let i = 0; i < _dbBldWhere.length; i++) {
+        const w = _dbBldWhere[i];
+        const t = _dbBldTables.find(t => `${t.schema}.${t.name}` === w.table);
+        const colOpts = t ? t.columns.map(c => `<option${c.name === w.col ? ' selected' : ''}>${escapeHtml(c.name)}</option>`).join('') : '';
+        html += `<div style="display:flex; gap:4px; align-items:center; margin-bottom:4px;">
+            <select onchange="_dbBldWhere[${i}].table=this.value; dbBldRenderWhere(); dbBldRenderSql()" class="form-control" style="display:inline-block; width:auto; font-size:12px;">${tableOpts.replace(`value="${w.table}"`, `value="${w.table}" selected`)}</select>
+            <select onchange="_dbBldWhere[${i}].col=this.value; dbBldRenderSql()" class="form-control" style="display:inline-block; width:auto; font-size:12px;">${colOpts}</select>
+            <select onchange="_dbBldWhere[${i}].op=this.value; dbBldRenderSql()" class="form-control" style="display:inline-block; width:auto; font-size:12px;">${opOpts.replace(`<option>${w.op}</option>`, `<option selected>${w.op}</option>`)}</select>
+            <input value="${escapeHtml(w.value || '')}" oninput="_dbBldWhere[${i}].value=this.value; dbBldRenderSql()" class="form-control" placeholder="value" style="flex:1; font-size:12px;">
+            <button class="btn btn-sm" onclick="_dbBldWhere.splice(${i},1); dbBldRenderWhere(); dbBldRenderSql()" style="padding:2px 6px; font-size:10px;">✕</button>
+        </div>`;
+    }
+    el.innerHTML = html;
+}
+
+function dbBldRenderSql() {
+    const el = document.getElementById('db-bld-sql');
+    if (!el) return;
+    const sql = dbBldBuildSql();
+    el.textContent = sql;
+    // Also feed the live-syntax-highlight feeling by keeping it as plain text.
+}
+
+function dbBldBuildSql() {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return '';
+    if (!_dbBldTables.length) return '-- Add a table to get started.';
+    const esc = (s) => dbMgrEscapeIdent(conn.kind, s);
+    // SELECT cols
+    const selected = [];
+    for (const t of _dbBldTables) {
+        for (const c of t.columns) {
+            if (c.selected) selected.push(`${esc(t.name)}.${esc(c.name)}`);
+        }
+    }
+    const selClause = selected.length ? selected.join(', ') : '*';
+    const from = _dbBldTables[0];
+    let sql = `SELECT ${selClause}\nFROM ${esc(from.schema)}.${esc(from.name)}`;
+    // For each other table not reached via a join, add a CROSS JOIN
+    // warning comment. For tables reached via a join, emit the JOIN.
+    const reached = new Set([`${from.schema}.${from.name}`]);
+    // Walk joins in insertion order; any join whose source is already
+    // reachable pulls its target into the query.
+    for (const j of _dbBldJoins) {
+        const [fromT, toT] = [j.fromTable, j.toTable];
+        let addTable = null, joinLhs = null, joinRhs = null;
+        if (reached.has(fromT) && !reached.has(toT)) { addTable = toT; joinLhs = fromT; joinRhs = toT; }
+        else if (reached.has(toT) && !reached.has(fromT)) { addTable = fromT; joinLhs = toT; joinRhs = fromT; }
+        else { continue; }
+        const [schema, name] = addTable.split(/\.(.+)/);
+        // Actually addTable like "schema.name" — split on first dot.
+        const dotIdx = addTable.indexOf('.');
+        const s = addTable.slice(0, dotIdx), n = addTable.slice(dotIdx + 1);
+        sql += `\n${j.type} JOIN ${esc(s)}.${esc(n)} ON ${esc(j.fromTable.split('.').slice(1).join('.'))}.${esc(j.fromCol)} = ${esc(j.toTable.split('.').slice(1).join('.'))}.${esc(j.toCol)}`;
+        reached.add(addTable);
+    }
+    // Any remaining tables: cross-join with a TODO comment.
+    for (const t of _dbBldTables) {
+        const key = `${t.schema}.${t.name}`;
+        if (!reached.has(key)) {
+            sql += `\n-- TODO: table ${key} isn't joined — add a join line on the canvas\nCROSS JOIN ${esc(t.schema)}.${esc(t.name)}`;
+            reached.add(key);
+        }
+    }
+    // WHERE
+    if (_dbBldWhere.length) {
+        const parts = [];
+        for (const w of _dbBldWhere) {
+            if (!w.col) continue;
+            const dotIdx = w.table.indexOf('.');
+            const tblName = w.table.slice(dotIdx + 1);
+            const colRef = `${esc(tblName)}.${esc(w.col)}`;
+            if (w.op === 'IS NULL' || w.op === 'IS NOT NULL') parts.push(`${colRef} ${w.op}`);
+            else if (w.op === 'IN') parts.push(`${colRef} IN (${w.value})`);
+            else {
+                const val = /^-?\d+(\.\d+)?$/.test(w.value) ? w.value : `'${String(w.value).replace(/'/g, "''")}'`;
+                parts.push(`${colRef} ${w.op} ${val}`);
+            }
+        }
+        if (parts.length) sql += `\nWHERE ${parts.join('\n  AND ')}`;
+    }
+    sql += `\nLIMIT ${_dbBldLimit || 100}`;
+    return sql;
+}
+
+function dbBldReset() {
+    _dbBldTables = [];
+    _dbBldJoins = [];
+    _dbBldWhere = [];
+    dbBldRenderCanvas();
+    dbBldRenderWhere();
+    dbBldRenderSql();
+}
+
+function dbBldSendToQuery() {
+    const sql = dbBldBuildSql();
+    if (!sql || sql.startsWith('-- ')) { showToast('Add tables and columns first', 'warning'); return; }
+    // Open a new Query tab populated with this SQL.
+    dbQueryEnsureTabs();
+    dbQuerySyncActiveTab();
+    _dbQueryTabs.push({
+        id: `qb${Date.now()}`,
+        title: `Build ${_dbQueryTabs.length + 1}`,
+        sql, dirty: true, caret: sql.length, caretEnd: sql.length,
+        schema: _dbMgrCurrentDb || '',
+    });
+    _dbQueryActive = _dbQueryTabs.length - 1;
+    dbMgrSwitchTab('query');
+}
+
+// ═══════════════════════════════════════════════════
 // ─── Server info tab ───
 // ═══════════════════════════════════════════════════
 
@@ -43467,30 +43947,174 @@ async function dbMgrRenderServerTab(body) {
             <div id="db-srv-procs">Loading processes…</div>
         </div>
     `;
-    // Version + status
+    dbSrvLoadVersion();
+    dbSrvLoadVars();
+    dbSrvLoadProcs();
+}
+
+async function dbSrvLoadVersion() {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    const el = document.getElementById('db-srv-version');
+    if (!el) return;
     try {
         const v = conn.kind === 'postgres'
             ? await dbMgrRunSql('SELECT version() AS version, current_database() AS db, current_user AS "user", inet_server_addr()::text AS host, inet_server_port() AS port')
             : await dbMgrRunSql("SELECT VERSION() AS version, DATABASE() AS db, USER() AS user, @@hostname AS host, @@port AS port");
-        const el = document.getElementById('db-srv-version');
-        if (el) el.innerHTML = '<h4 style="margin:0 0 6px; font-size:13px;">Server</h4>' + renderKvTable(v);
-    } catch (e) { document.getElementById('db-srv-version').innerHTML = `<div style="color:var(--danger);">Version: ${escapeHtml(e.message)}</div>`; }
-    // Variables
+        el.innerHTML = '<h4 style="margin:0 0 6px; font-size:13px; display:flex; gap:8px; align-items:center;"><span>Server</span> <button class="btn btn-sm" onclick="dbSrvLoadVersion()" style="padding:2px 8px; font-size:10px;">🔄</button></h4>' + renderKvTable(v);
+    } catch (e) { el.innerHTML = `<div style="color:var(--danger);">Version: ${escapeHtml(e.message)}</div>`; }
+}
+
+async function dbSrvLoadVars() {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    const el = document.getElementById('db-srv-vars');
+    if (!el) return;
     try {
         const vars = conn.kind === 'postgres'
-            ? await dbMgrRunSql("SELECT name, setting, unit FROM pg_settings WHERE name IN ('max_connections','shared_buffers','work_mem','effective_cache_size','max_wal_size','checkpoint_timeout','autovacuum','listen_addresses','server_version','server_encoding','timezone','log_statement','log_duration') ORDER BY name")
-            : await dbMgrRunSql("SHOW VARIABLES WHERE Variable_name IN ('version','version_comment','max_connections','innodb_buffer_pool_size','character_set_server','collation_server','sql_mode','time_zone','datadir','socket','tmpdir','wait_timeout','max_allowed_packet')");
-        const el = document.getElementById('db-srv-vars');
-        if (el) el.innerHTML = '<h4 style="margin:0 0 6px; font-size:13px;">Key variables</h4>' + renderResultTable(vars);
-    } catch (e) { document.getElementById('db-srv-vars').innerHTML = `<div style="color:var(--danger);">Variables: ${escapeHtml(e.message)}</div>`; }
-    // Process list
+            ? await dbMgrRunSql("SELECT name, setting, unit, context FROM pg_settings WHERE name IN ('max_connections','shared_buffers','work_mem','effective_cache_size','max_wal_size','checkpoint_timeout','autovacuum','listen_addresses','server_version','server_encoding','timezone','log_statement','log_duration','statement_timeout','idle_in_transaction_session_timeout','tcp_keepalives_idle','ssl') ORDER BY name")
+            : await dbMgrRunSql("SHOW VARIABLES WHERE Variable_name IN ('version','version_comment','max_connections','innodb_buffer_pool_size','character_set_server','collation_server','sql_mode','time_zone','datadir','socket','tmpdir','wait_timeout','max_allowed_packet','long_query_time','slow_query_log','general_log','connect_timeout','net_read_timeout','net_write_timeout','innodb_flush_log_at_trx_commit','sync_binlog')");
+        // Custom row renderer so we can add an Edit button per variable.
+        let html = `<h4 style="margin:0 0 6px; font-size:13px; display:flex; gap:8px; align-items:center;">
+            <span>Key variables</span>
+            <button class="btn btn-sm" onclick="dbSrvLoadVars()" style="padding:2px 8px; font-size:10px;">🔄</button>
+            <span style="font-size:11px; color:var(--text-muted);">Click ✏️ to change — requires Schema permission</span>
+        </h4>`;
+        html += '<div style="overflow:auto; border:1px solid var(--border); border-radius:6px;"><table style="width:100%; font-size:12px; border-collapse:collapse;"><thead><tr style="background:var(--bg-tertiary);">';
+        for (const c of vars.columns) html += `<th style="padding:6px 8px; text-align:left; border-bottom:1px solid var(--border); white-space:nowrap;">${escapeHtml(c)}</th>`;
+        html += '<th style="padding:6px 8px; border-bottom:1px solid var(--border);"></th></tr></thead><tbody>';
+        for (const row of vars.rows) {
+            const name = String(row[0]);
+            const value = row[1] == null ? '' : String(row[1]);
+            // Postgres: skip rows whose context is 'internal' (read-only).
+            const readOnly = conn.kind === 'postgres' && row[3] === 'internal';
+            html += '<tr>';
+            for (const v of row) html += `<td style="padding:5px 8px; border-bottom:1px solid var(--border);">${v == null ? '<span style="color:var(--text-muted);">NULL</span>' : escapeHtml(String(v))}</td>`;
+            html += `<td style="padding:5px 8px; border-bottom:1px solid var(--border); text-align:right;">
+                ${readOnly ? '<span style="color:var(--text-muted); font-size:10px;">read-only</span>' : `<button class="btn btn-sm" onclick="dbSrvEditVar('${escapeHtml(name).replace(/'/g, "\\'")}', '${escapeHtml(value).replace(/'/g, "\\'")}')" title="Change this variable" style="padding:1px 8px; font-size:10px;">✏️</button>`}
+            </td></tr>`;
+        }
+        html += '</tbody></table></div>';
+        el.innerHTML = html;
+    } catch (e) { el.innerHTML = `<div style="color:var(--danger);">Variables: ${escapeHtml(e.message)}</div>`; }
+}
+
+async function dbSrvLoadProcs() {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    const el = document.getElementById('db-srv-procs');
+    if (!el) return;
     try {
         const procs = conn.kind === 'postgres'
             ? await dbMgrRunSql("SELECT pid, datname, usename, application_name, client_addr, state, query_start, LEFT(query, 80) AS query FROM pg_stat_activity ORDER BY query_start DESC NULLS LAST LIMIT 50")
             : await dbMgrRunSql("SHOW FULL PROCESSLIST");
-        const el = document.getElementById('db-srv-procs');
-        if (el) el.innerHTML = '<h4 style="margin:0 0 6px; font-size:13px;">Active sessions</h4>' + renderResultTable(procs);
-    } catch (e) { document.getElementById('db-srv-procs').innerHTML = `<div style="color:var(--danger);">Processes: ${escapeHtml(e.message)}</div>`; }
+        let html = `<h4 style="margin:0 0 6px; font-size:13px; display:flex; gap:8px; align-items:center;">
+            <span>Active sessions (${procs.row_count})</span>
+            <button class="btn btn-sm" onclick="dbSrvLoadProcs()" style="padding:2px 8px; font-size:10px;">🔄</button>
+            <span style="font-size:11px; color:var(--text-muted);">Click ✕ to kill a session — requires Schema permission</span>
+        </h4>`;
+        html += '<div style="overflow:auto; border:1px solid var(--border); border-radius:6px;"><table style="width:100%; font-size:12px; border-collapse:collapse;"><thead><tr style="background:var(--bg-tertiary);">';
+        for (const c of procs.columns) html += `<th style="padding:6px 8px; text-align:left; border-bottom:1px solid var(--border); white-space:nowrap;">${escapeHtml(c)}</th>`;
+        html += '<th style="padding:6px 8px; border-bottom:1px solid var(--border);"></th></tr></thead><tbody>';
+        for (const row of procs.rows) {
+            // PID/Id is the first column on both engines.
+            const pid = row[0];
+            html += '<tr>';
+            for (const v of row) html += `<td style="padding:5px 8px; border-bottom:1px solid var(--border); max-width:360px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${v == null ? '' : escapeHtml(String(v))}">${v == null ? '<span style="color:var(--text-muted);">NULL</span>' : escapeHtml(String(v))}</td>`;
+            html += `<td style="padding:5px 8px; border-bottom:1px solid var(--border); text-align:right;">
+                <button class="btn btn-sm" onclick="dbSrvKillSession('${escapeHtml(String(pid))}')" title="Kill session ${pid}" style="padding:1px 8px; font-size:10px;">✕</button>
+            </td></tr>`;
+        }
+        html += '</tbody></table></div>';
+        el.innerHTML = html;
+    } catch (e) { el.innerHTML = `<div style="color:var(--danger);">Processes: ${escapeHtml(e.message)}</div>`; }
+}
+
+async function dbSrvEditVar(name, currentValue) {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    // Proper modal for the input.
+    const modal = document.createElement('div');
+    modal.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:10000; display:flex; align-items:center; justify-content:center;';
+    const scopeOptions = conn.kind === 'postgres'
+        ? `<option value="session" selected>Session only</option><option value="system">Cluster-wide (ALTER SYSTEM + reload)</option>`
+        : `<option value="session" selected>Session only (SET SESSION)</option><option value="global">Cluster-wide (SET GLOBAL)</option>`;
+    modal.innerHTML = `
+        <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:18px; width:520px; max-width:95vw;">
+            <h3 style="margin:0 0 10px;">✏️ Change ${escapeHtml(name)}</h3>
+            <label style="display:block; font-size:13px;">New value
+                <input id="db-var-val" class="form-control" value="${escapeHtml(currentValue)}" autocomplete="off">
+            </label>
+            <label style="display:block; font-size:13px; margin-top:10px;">Scope
+                <select id="db-var-scope" class="form-control">${scopeOptions}</select>
+            </label>
+            <div style="font-size:11px; color:var(--text-muted); margin-top:8px;">${conn.kind === 'postgres' ? 'ALTER SYSTEM persists across restarts and runs pg_reload_conf(). Session variant only affects this connection.' : 'GLOBAL persists for new connections (not existing ones). SESSION only affects this connection. Neither survives restart unless also set in my.cnf.'}</div>
+            <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:14px;">
+                <button class="btn btn-sm" id="db-var-cancel">Cancel</button>
+                <button class="btn btn-primary btn-sm" id="db-var-submit">Apply</button>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+    const close = () => modal.remove();
+    modal.querySelector('#db-var-cancel').addEventListener('click', close);
+    const submit = async () => {
+        const newVal = modal.querySelector('#db-var-val').value;
+        const scope = modal.querySelector('#db-var-scope').value;
+        let sql;
+        if (conn.kind === 'postgres') {
+            // Quote non-numeric values. Be conservative — we wrap anything
+            // that isn't a plain number in single quotes.
+            const v = /^-?\d+(\.\d+)?$/.test(newVal) ? newVal : `'${newVal.replace(/'/g, "''")}'`;
+            sql = scope === 'system' ? `ALTER SYSTEM SET ${name} = ${v}` : `SET ${name} = ${v}`;
+        } else {
+            const v = /^-?\d+(\.\d+)?$/.test(newVal) ? newVal : `'${newVal.replace(/'/g, "''")}'`;
+            sql = scope === 'global' ? `SET GLOBAL ${name} = ${v}` : `SET SESSION ${name} = ${v}`;
+        }
+        const ok = await wolfConfirm(`Run this?\n\n${sql}${conn.kind === 'postgres' && scope === 'system' ? '\nSELECT pg_reload_conf();' : ''}`, 'Change variable', { okText: 'Apply', danger: true });
+        if (!ok) return;
+        try {
+            // Use query-multi so we can pg_reload_conf in the same request.
+            const statements = [sql];
+            if (conn.kind === 'postgres' && scope === 'system') statements.push('SELECT pg_reload_conf()');
+            const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_dbCurrentId)}/query-multi`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ statements, permission: 'schema', timeout_secs: 30, stop_on_error: true }),
+            });
+            const data = await resp.json();
+            if (!resp.ok || (data.results || []).some(r => r.ok === false)) {
+                const firstErr = (data.results || []).find(r => r.ok === false);
+                showToast(firstErr ? firstErr.error : (data.error || 'Failed'), 'error');
+                return;
+            }
+            close();
+            showToast(`Applied ${name} = ${newVal}`, 'success');
+            dbSrvLoadVars();
+        } catch (e) { showToast('Apply failed: ' + e.message, 'error'); }
+    };
+    modal.querySelector('#db-var-submit').addEventListener('click', submit);
+    modal.querySelector('#db-var-val').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+    setTimeout(() => modal.querySelector('#db-var-val').focus(), 0);
+}
+
+async function dbSrvKillSession(pid) {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    const sql = conn.kind === 'postgres'
+        ? `SELECT pg_terminate_backend(${parseInt(pid, 10)})`
+        : `KILL ${parseInt(pid, 10)}`;
+    const ok = await wolfConfirm(`Kill session ${pid}?\n\n${sql}`, 'Kill session', { okText: 'Kill', danger: true });
+    if (!ok) return;
+    try {
+        const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_dbCurrentId)}/query`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: sql, permission: 'schema', timeout_secs: 10 }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Kill failed', 'error'); return; }
+        showToast(`Session ${pid} killed`, 'success');
+        dbSrvLoadProcs();
+    } catch (e) { showToast('Kill failed: ' + e.message, 'error'); }
 }
 
 function renderResultTable(r) {
@@ -43870,10 +44494,24 @@ async function dbLoadHistory() {
 // Data/Structure/Diagram navigation but not page reload.
 let _dbQueryTabs = [];
 let _dbQueryActive = 0;
+let _dbEditorHeight = 260;  // persisted height of the SQL editor (px)
+let _dbTreeCollapsed = false;
+
+function dbToggleTree() {
+    _dbTreeCollapsed = !_dbTreeCollapsed;
+    const ws = document.getElementById('db-workspace');
+    if (ws && _dbCurrentId) {
+        // Re-render the whole workspace so the grid-template-columns
+        // flips. Cheaper than hunting down every style to toggle.
+        dbOpenConnection(_dbCurrentId);
+    }
+}
 
 function dbQueryEnsureTabs() {
     if (!_dbQueryTabs.length) {
-        _dbQueryTabs.push({ id: 'q1', title: 'Query 1', sql: '', dirty: false, caret: 0 });
+        // First tab inherits whichever schema the tree currently has
+        // selected, matching the "new tab snapshots current" rule.
+        _dbQueryTabs.push({ id: 'q1', title: 'Query 1', sql: '', dirty: false, caret: 0, schema: _dbMgrCurrentDb || '' });
         _dbQueryActive = 0;
     }
 }
@@ -43881,7 +44519,11 @@ function dbQueryEnsureTabs() {
 function dbQueryNewTab() {
     dbQuerySyncActiveTab();
     const n = _dbQueryTabs.length + 1;
-    _dbQueryTabs.push({ id: `q${n}${Date.now()}`, title: `Query ${n}`, sql: '', dirty: false, caret: 0 });
+    // Navicat-style: a NEW tab snapshots the schema the tree is on
+    // right now, but existing tabs keep whichever schema they were
+    // created in — so clicking around the tree doesn't rewrite the
+    // context of open work.
+    _dbQueryTabs.push({ id: `q${n}${Date.now()}`, title: `Query ${n}`, sql: '', dirty: false, caret: 0, schema: _dbMgrCurrentDb || '' });
     _dbQueryActive = _dbQueryTabs.length - 1;
     dbMgrRenderQueryTab(document.getElementById('db-mgr-body'));
 }
@@ -43960,16 +44602,18 @@ function dbMgrRenderQueryTab(body) {
             <label style="font-size:13px; margin:0;">Timeout (s):
                 <input id="db-timeout" type="number" min="1" max="300" value="30" class="form-control" style="display:inline-block; width:90px; margin-left:6px;">
             </label>
-            <span id="db-schema-badge" title="Queries in this tab run against this schema. Pick a schema in the left tree to change it." style="font-size:12px; padding:3px 8px; border-radius:5px; background:rgba(168,85,247,0.15); color:#c084fc; margin-left:auto;">📂 ${escapeHtml(_dbMgrCurrentDb || '(default)')}</span>
+            <span id="db-schema-badge" title="This tab's working schema — snapshot when the tab was created. New tabs inherit the currently-selected tree schema; existing tabs stay with theirs so clicking around doesn't change their context. Click to rebind to the current tree selection." onclick="dbRebindTabSchema()" style="cursor:pointer; font-size:12px; padding:3px 8px; border-radius:5px; background:rgba(168,85,247,0.15); color:#c084fc; margin-left:auto;">📂 ${escapeHtml(active.schema || '(default)')}</span>
             <span id="db-validate" style="font-size:12px; padding:3px 8px; border-radius:5px; background:var(--bg-tertiary); color:var(--text-muted);">type to validate…</span>
         </div>
-        <div id="db-editor-wrap" style="position:relative;">
+        <div id="db-editor-wrap" style="position:relative; width:100%; height:${_dbEditorHeight || 260}px; min-height:120px;">
             <pre id="db-query-hl" aria-hidden="true"
-                style="position:absolute; inset:0; margin:0; padding:8px 10px; font-family:var(--font-mono, ui-monospace, monospace); font-size:13px; line-height:1.45; tab-size:4; white-space:pre-wrap; word-wrap:break-word; pointer-events:none; color:var(--text-primary); overflow:hidden; background:var(--bg-primary); border:1px solid var(--border); border-radius:4px; z-index:1;"></pre>
+                style="position:absolute; inset:0; margin:0; padding:8px 10px; font-family:var(--font-mono, ui-monospace, monospace); font-size:13px; line-height:1.45; tab-size:4; white-space:pre-wrap; word-wrap:break-word; pointer-events:none; color:var(--text-primary); overflow:hidden; background:var(--bg-primary); border:1px solid var(--border); border-radius:4px; z-index:1; box-sizing:border-box;"></pre>
             <textarea id="db-query" class="form-control" placeholder="${escapeHtml(hint)}"
-                style="position:relative; z-index:2; font-family:var(--font-mono, ui-monospace, monospace); font-size:13px; min-height:260px; line-height:1.45; tab-size:4; background:transparent; caret-color:var(--text-primary); color:transparent; text-shadow:0 0 0 transparent;"
+                style="position:absolute; inset:0; z-index:2; width:100%; height:100%; resize:none; font-family:var(--font-mono, ui-monospace, monospace); font-size:13px; line-height:1.45; tab-size:4; background:transparent; caret-color:var(--text-primary); color:transparent; text-shadow:0 0 0 transparent; box-sizing:border-box;"
                 spellcheck="false">${escapeHtml(active.sql || '')}</textarea>
         </div>
+        <div id="db-editor-resize" title="Drag to resize"
+            style="height:8px; margin:4px 0; cursor:ns-resize; background:linear-gradient(var(--border), var(--border)) center/40px 2px no-repeat; border-radius:3px;"></div>
         <div style="display:flex; gap:6px; margin-top:8px; align-items:center; flex-wrap:wrap;">
             <button class="btn btn-primary btn-sm" onclick="dbRunQuery()">▶ Run</button>
             <button class="btn btn-sm" onclick="dbExplainQuery()" title="Prepend EXPLAIN and run">🔍 Explain</button>
@@ -44026,6 +44670,31 @@ function dbMgrRenderQueryTab(body) {
         // exactly where the operator left off.
         ta.addEventListener('keyup', dbQuerySyncActiveTab);
         ta.addEventListener('mouseup', dbQuerySyncActiveTab);
+    }
+    // Wire the resize divider so operators can grow the result area
+    // by dragging the editor shorter (or the reverse). Height is held
+    // in memory so it persists across tab switches in this session.
+    const resizer = document.getElementById('db-editor-resize');
+    const wrap = document.getElementById('db-editor-wrap');
+    if (resizer && wrap) {
+        resizer.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            const startY = e.clientY;
+            const startH = wrap.getBoundingClientRect().height;
+            document.body.style.cursor = 'ns-resize';
+            const onMove = (ev) => {
+                const h = Math.max(80, Math.min(window.innerHeight - 200, startH + (ev.clientY - startY)));
+                _dbEditorHeight = h;
+                wrap.style.height = `${h}px`;
+            };
+            const onUp = () => {
+                document.body.style.cursor = '';
+                document.removeEventListener('mousemove', onMove);
+                document.removeEventListener('mouseup', onUp);
+            };
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+        });
     }
     // Restore caret from the active tab (see dbQuerySyncActiveTab).
     if (ta && active) {
@@ -44399,12 +45068,40 @@ function dbDangerousQueryWarning(sql) {
     return null;
 }
 
+// Heuristic check for "you are about to pull a lot" — a SELECT /
+// WITH query with no LIMIT / FETCH / TOP clause. We strip string
+// literals and comments first so WHERE clauses can safely mention
+// LIMIT without suppressing the warning. Always returns null if
+// the query isn't a read statement — DML / DDL have their own
+// danger warnings.
+function dbHugeDatasetWarning(sql) {
+    const stripped = sql
+        .replace(/--[^\n]*/g, '')
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/'([^'\\]|\\.|'')*'/g, "''")
+        .replace(/"([^"\\]|\\.|"")*"/g, '""')
+        .replace(/`([^`]|``)*`/g, '``')
+        .trim();
+    if (!/^\s*(SELECT|WITH|TABLE)\b/i.test(stripped)) return null;
+    // Heuristic: LIMIT / FETCH / TOP keyword present anywhere.
+    if (/\b(LIMIT|FETCH\s+FIRST|FETCH\s+NEXT|TOP\s+\d)\b/i.test(stripped)) return null;
+    // Aggregates (COUNT, SUM, ...) implicitly return a small rowset
+    // when paired with a scalar GROUP BY. Skip warning if the query
+    // is clearly a SELECT COUNT(*) style summary.
+    if (/^\s*SELECT\s+COUNT\s*\(/i.test(stripped) && !/\bGROUP\s+BY\b/i.test(stripped)) return null;
+    return 'This query has no LIMIT — every matching row will be fetched.';
+}
+
 async function dbRunQuery() {
     if (!_dbCurrentId) return;
     const query = document.getElementById('db-query').value;
     const permission = document.getElementById('db-perm').value;
     const timeout_secs = parseInt(document.getElementById('db-timeout').value, 10) || 30;
-    const schema = _dbMgrCurrentDb || undefined;
+    // Use THIS TAB's schema (set at tab creation), not the tree
+    // selection, so running a query in an older tab doesn't accidentally
+    // execute against whichever DB the operator last clicked on.
+    const activeTab = _dbQueryTabs[_dbQueryActive];
+    const schema = (activeTab && activeTab.schema) || undefined;
     const resultEl = document.getElementById('db-result');
     if (!query.trim()) return;
     // Danger check — give the operator one chance to cancel a
@@ -44415,6 +45112,20 @@ async function dbRunQuery() {
             `${danger}\n\nQuery:\n${query.slice(0, 500)}${query.length > 500 ? '…' : ''}`,
             'Destructive query',
             { okText: 'Run anyway', danger: true }
+        );
+        if (!ok) return;
+    }
+    // Huge-dataset check — SELECT with no LIMIT on a potentially
+    // large table can pull megabytes down the cluster proxy and
+    // chew browser memory. The backend already caps at MAX_ROWS but
+    // that's 10k rows; warn operators before they commit to a full
+    // table scan even if they're under that ceiling.
+    const huge = dbHugeDatasetWarning(query);
+    if (huge) {
+        const ok = await wolfConfirm(
+            `${huge}\n\nConsider adding a LIMIT clause — the result table caps display at 1000 rows, but the full result still travels over the network first.`,
+            'Unlimited query',
+            { okText: 'Run anyway' }
         );
         if (!ok) return;
     }
