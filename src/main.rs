@@ -58,6 +58,7 @@ mod compat;
 mod danger;
 mod plugins;
 mod sql_connections;
+mod netguard;
 mod certbot;
 #[allow(dead_code)]
 mod integrations;

@@ -13019,7 +13019,23 @@ pub async fn appstore_uninstall(
 
 /// GET /api/kubernetes/clusters
 pub async fn k8s_list_clusters(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    // `require_auth` returns the caller principal. "cluster-node" means
+    // another WolfStack node is calling us — in that case we MUST NOT
+    // fan out to peers again, because that peer's handler then fans
+    // back to us, which fans out again, recursive amplification.
+    // Only UI session callers trigger the cluster-wide aggregation.
+    //
+    // Reported by Bel (v19.9.1): three-node cluster spent 70% CPU each
+    // doing 2100 connect()/sec to peer :8553/:8554, traced to this
+    // endpoint via perf (51% of CPU in k8s_list_clusters::{{closure}}
+    // → reqwest send → connect). Every remote_future here calls the
+    // same path on the peer, which re-runs this handler, which
+    // fans out again. Classic mutual recursion across the cluster.
+    let caller = match require_auth(&req, &state) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let from_peer = caller == "cluster-node";
 
     let self_id = state.cluster.self_id.clone();
 
@@ -13034,7 +13050,14 @@ pub async fn k8s_list_clusters(req: HttpRequest, state: web::Data<AppState>) -> 
         })
         .collect();
 
-    // Aggregate clusters from remote WolfStack nodes
+    // Short-circuit for inter-node calls — return LOCAL clusters only.
+    // The UI on the originating node is responsible for aggregating
+    // results from every peer via its own fan-out.
+    if from_peer {
+        return HttpResponse::Ok().json(all_clusters);
+    }
+
+    // Aggregate clusters from remote WolfStack nodes — UI-originated only.
     let nodes = state.cluster.get_all_nodes();
     let cluster_secret = state.cluster_secret.clone();
 
