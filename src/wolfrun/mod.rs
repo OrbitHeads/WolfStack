@@ -19,6 +19,71 @@ use tracing::warn;
 
 use crate::agent::ClusterState;
 
+// ─── Shared HTTP client for cluster RPC ───
+//
+// Every HTTP call this module makes to a peer goes through one of these
+// two statics. Previously `reconcile()` and `broadcast_to_cluster()`
+// built a fresh `reqwest::Client` on every 15s tick — each client owns
+// its own connection pool + background worker, so dropping it orphaned
+// live connections that the kernel eventually parked in CLOSE_WAIT on
+// our side once the peer FIN'd them. On long-running cluster hosts
+// this accumulated to tens of thousands of leaked FDs and eventually
+// knocked out actix_server with "No file descriptors available".
+//
+// LazyLock<Client> means one pool for the lifetime of the process,
+// connections keep-alive between calls, and everything drops cleanly
+// only on process exit. Same pattern the agent poller uses at
+// src/agent/mod.rs:765-772.
+//
+// Two clients because reconcile needs a longer timeout (container
+// state queries can be slow on a loaded node); sync + broadcast
+// prefer a tighter 10s so a hung peer doesn't stall the whole tick.
+static RPC_CLIENT_SHORT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
+static RPC_CLIENT_LONG: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
+static RPC_CLIENT_MIGRATE: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(600))
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+
+/// Fire a request, drain the body so the socket can return to the
+/// keepalive pool, and return whether the response was 2xx. Dropping
+/// a `reqwest::Response` without consuming its body prevents reqwest
+/// from reclaiming the underlying TCP connection — on the next call
+/// a new connection is opened, and the unread one eventually shows up
+/// in `ss -tn state close-wait`. Every call site in this module that
+/// used to do `.send().await.is_ok()` or drop the Response unconsumed
+/// now goes through here.
+async fn send_and_drain(req: reqwest::RequestBuilder) -> Option<bool> {
+    match req.send().await {
+        Ok(resp) => {
+            let ok = resp.status().is_success();
+            let _ = resp.bytes().await;
+            Some(ok)
+        }
+        Err(_) => None,
+    }
+}
+
 // ─── Data Model ───
 
 /// Container runtime for a service
@@ -564,15 +629,10 @@ pub async fn broadcast_to_cluster(
         .and_then(|n| n.cluster_name.clone())
         .unwrap_or_else(|| "WolfStack".to_string());
 
-    // Build HTTP client (reuse for all peers)
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .danger_accept_invalid_certs(true)
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+    // Process-wide shared client — see RPC_CLIENT_SHORT docs at top of
+    // file. Previously we built a fresh client here on every 15s tick;
+    // that was the primary cause of CLOSE_WAIT accumulation to peers.
+    let client = &*RPC_CLIENT_SHORT;
 
     // Send to all online same-cluster peers (not self)
     for node in &nodes {
@@ -586,13 +646,15 @@ pub async fn broadcast_to_cluster(
 
         let urls = crate::api::build_node_urls(&node.address, node.port, "/api/wolfrun/sync");
         for url in &urls {
-            match client.post(url)
-                .header("X-WolfStack-Secret", cluster_secret)
-                .json(&services)
-                .send().await
-            {
-                Ok(_) => break, // Success — move to next node
-                Err(_) => continue, // Try next URL variant
+            // send_and_drain reads the body so the connection returns
+            // to the pool. `Ok(_)` previously dropped the Response
+            // unconsumed, which was the leak source.
+            if send_and_drain(
+                client.post(url)
+                    .header("X-WolfStack-Secret", cluster_secret)
+                    .json(&services)
+            ).await.is_some() {
+                break;  // Success (or HTTP error) — move to next node
             }
         }
     }
@@ -791,17 +853,10 @@ pub async fn reconcile(
     let services = wolfrun.list(Some(&self_cluster));
     if services.is_empty() { return; }
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .danger_accept_invalid_certs(true)
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("WolfRun reconcile: failed to create HTTP client: {}", e);
-            return;
-        }
-    };
+    // Shared long-timeout client — see RPC_CLIENT_LONG docs at top of
+    // file. Building a new client here every 15s was leaking connection
+    // pools; we now use one for the lifetime of the process.
+    let client = &*RPC_CLIENT_LONG;
 
     for service in &services {
         // 1. Check actual state — query each instance's node for its container status
@@ -885,7 +940,11 @@ pub async fn reconcile(
                         {
                             Ok(resp) => {
                                 if !resp.status().is_success() {
-                                    // HTTP error (401, 403, 500, etc.) — can't verify container state
+                                    // HTTP error (401, 403, 500, etc.) — can't verify
+                                    // container state. Drain the body before breaking so
+                                    // reqwest can return the socket to the pool; dropping
+                                    // the Response unconsumed was a CLOSE_WAIT leak.
+                                    let _ = resp.bytes().await;
                                     break;
                                 }
                                 if let Ok(containers) = resp.json::<Vec<serde_json::Value>>().await {
@@ -1113,10 +1172,7 @@ pub async fn reconcile(
                                 // Both source and target on same remote node
                                 let clone_path = format!("/api/containers/lxc/{}/clone", template_name);
                                 let urls = crate::api::build_node_urls(&sn.address, sn.port, &clone_path);
-                                let clone_client = reqwest::Client::builder()
-                                    .timeout(std::time::Duration::from_secs(120))
-                                    .danger_accept_invalid_certs(true)
-                                    .build().unwrap_or_default();
+                                let clone_client = &*RPC_CLIENT_LONG;
                                 let mut ok = false;
                                 for url in &urls {
                                     if let Ok(resp) = clone_client.post(url)
@@ -1125,13 +1181,18 @@ pub async fn reconcile(
                                         .send().await
                                     {
                                         if resp.status().is_success() {
+                                            let _ = resp.bytes().await;
                                             // Start the clone
                                             let sp = format!("/api/containers/lxc/{}/start", clone_name);
                                             let su = crate::api::build_node_urls(&sn.address, sn.port, &sp);
                                             for u in &su {
-                                                if clone_client.post(u).header("X-WolfStack-Secret", cluster_secret).send().await.is_ok() { break; }
+                                                if send_and_drain(
+                                                    clone_client.post(u).header("X-WolfStack-Secret", cluster_secret)
+                                                ).await.is_some() { break; }
                                             }
                                             ok = true;
+                                        } else {
+                                            let _ = resp.bytes().await;
                                         }
                                         break;
                                     }
@@ -1176,10 +1237,7 @@ pub async fn reconcile(
                                     crate::api::build_node_urls(&sn.address, sn.port, &clone_path)
                                 };
 
-                                let migrate_client = reqwest::Client::builder()
-                                    .timeout(std::time::Duration::from_secs(600))
-                                    .danger_accept_invalid_certs(true)
-                                    .build().unwrap_or_default();
+                                let migrate_client = &*RPC_CLIENT_MIGRATE;
 
                                 for url in &urls {
                                     match migrate_client.post(url)
@@ -1285,13 +1343,12 @@ pub async fn reconcile(
                         );
                         let payload = serde_json::json!({ "action": "start" });
                         for url in &urls {
-                            if client.post(url)
-                                .header("X-WolfStack-Secret", cluster_secret)
-                                .header("Content-Type", "application/json")
-                                .body(payload.to_string())
-                                .send().await
-                                .is_ok()
-                            {
+                            if send_and_drain(
+                                client.post(url)
+                                    .header("X-WolfStack-Secret", cluster_secret)
+                                    .header("Content-Type", "application/json")
+                                    .body(payload.to_string())
+                            ).await.is_some() {
                                 break;
                             }
                         }
@@ -1338,12 +1395,11 @@ pub async fn reconcile(
                         let urls = crate::api::build_node_urls(&n.address, n.port, &action_path);
                         let stop_payload = serde_json::json!({ "action": "stop" });
                         for url in &urls {
-                            if client.post(url)
-                                .header("X-WolfStack-Secret", cluster_secret)
-                                .json(&stop_payload)
-                                .send().await
-                                .is_ok()
-                            { break; }
+                            if send_and_drain(
+                                client.post(url)
+                                    .header("X-WolfStack-Secret", cluster_secret)
+                                    .json(&stop_payload)
+                            ).await.is_some() { break; }
                         }
                         let rm_action = match service.runtime {
                             Runtime::Docker => "remove",
@@ -1351,12 +1407,11 @@ pub async fn reconcile(
                         };
                         let rm_payload = serde_json::json!({ "action": rm_action });
                         for url in &urls {
-                            if client.post(url)
-                                .header("X-WolfStack-Secret", cluster_secret)
-                                .json(&rm_payload)
-                                .send().await
-                                .is_ok()
-                            { break; }
+                            if send_and_drain(
+                                client.post(url)
+                                    .header("X-WolfStack-Secret", cluster_secret)
+                                    .json(&rm_payload)
+                            ).await.is_some() { break; }
                         }
                     }
                 }
@@ -1413,13 +1468,12 @@ async fn deploy_docker(
         let pull_payload = serde_json::json!({ "image": service.image });
         let mut pulled = false;
         for url in &pull_urls {
-            if let Ok(resp) = client.post(url)
-                .header("X-WolfStack-Secret", cluster_secret)
-                .json(&pull_payload)
-                .send().await
-            {
-                if resp.status().is_success() { pulled = true; break; }
-            }
+            // send_and_drain reads the body so the socket is pooled.
+            if matches!(send_and_drain(
+                client.post(url)
+                    .header("X-WolfStack-Secret", cluster_secret)
+                    .json(&pull_payload)
+            ).await, Some(true)) { pulled = true; break; }
         }
         if !pulled {
             warn!("WolfRun: failed to pull image {} on {}", service.image, node.hostname);
@@ -1435,7 +1489,12 @@ async fn deploy_docker(
                 .json(&payload)
                 .send().await
             {
-                if resp.status().is_success() { created = true; break; }
+                if resp.status().is_success() {
+                    // Drain body to pool the connection.
+                    let _ = resp.bytes().await;
+                    created = true;
+                    break;
+                }
                 let body = resp.text().await.unwrap_or_default();
                 warn!("WolfRun: create failed on {}: {}", node.hostname, body);
                 break;
@@ -1451,16 +1510,11 @@ async fn deploy_docker(
             &container_action_path(&Runtime::Docker, container_name));
         let start_payload = serde_json::json!({ "action": "start" });
         for url in &start_urls {
-            if let Ok(resp) = client.post(url)
-                .header("X-WolfStack-Secret", cluster_secret)
-                .json(&start_payload)
-                .send().await
-            {
-                if resp.status().is_success() {
-
-                    break;
-                }
-            }
+            if matches!(send_and_drain(
+                client.post(url)
+                    .header("X-WolfStack-Secret", cluster_secret)
+                    .json(&start_payload)
+            ).await, Some(true)) { break; }
         }
 
         wolfrun.add_instance(&service.id, ServiceInstance {
@@ -1520,7 +1574,11 @@ async fn deploy_lxc(
                 .json(&payload)
                 .send().await
             {
-                if resp.status().is_success() { created = true; break; }
+                if resp.status().is_success() {
+                    let _ = resp.bytes().await;
+                    created = true;
+                    break;
+                }
                 let body = resp.text().await.unwrap_or_default();
                 warn!("WolfRun: LXC create failed on {}: {}", node.hostname, body);
                 break;
@@ -1536,16 +1594,11 @@ async fn deploy_lxc(
             &container_action_path(&Runtime::Lxc, container_name));
         let start_payload = serde_json::json!({ "action": "start" });
         for url in &start_urls {
-            if let Ok(resp) = client.post(url)
-                .header("X-WolfStack-Secret", cluster_secret)
-                .json(&start_payload)
-                .send().await
-            {
-                if resp.status().is_success() {
-
-                    break;
-                }
-            }
+            if matches!(send_and_drain(
+                client.post(url)
+                    .header("X-WolfStack-Secret", cluster_secret)
+                    .json(&start_payload)
+            ).await, Some(true)) { break; }
         }
 
         wolfrun.add_instance(&service.id, ServiceInstance {
@@ -1586,12 +1639,11 @@ async fn stop_and_remove(
         );
         let stop_payload = serde_json::json!({ "action": "stop" });
         for url in &urls {
-            if client.post(url)
-                .header("X-WolfStack-Secret", cluster_secret)
-                .json(&stop_payload)
-                .send().await
-                .is_ok()
-            {
+            if send_and_drain(
+                client.post(url)
+                    .header("X-WolfStack-Secret", cluster_secret)
+                    .json(&stop_payload)
+            ).await.is_some() {
                 break;
             }
         }
@@ -1601,12 +1653,11 @@ async fn stop_and_remove(
         };
         let rm_payload = serde_json::json!({ "action": rm_action });
         for url in &urls {
-            if client.post(url)
-                .header("X-WolfStack-Secret", cluster_secret)
-                .json(&rm_payload)
-                .send().await
-                .is_ok()
-            {
+            if send_and_drain(
+                client.post(url)
+                    .header("X-WolfStack-Secret", cluster_secret)
+                    .json(&rm_payload)
+            ).await.is_some() {
                 break;
             }
         }
@@ -1644,14 +1695,9 @@ pub async fn manage_standby(
     let services = wolfrun.list(Some(&self_cluster));
     let all_nodes = cluster.get_all_nodes();
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .danger_accept_invalid_certs(true)
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+    // Shared long-timeout client — same pool used everywhere else in
+    // this module. Previously built per-call = leaked connection pools.
+    let client = &*RPC_CLIENT_LONG;
 
     for service in &services {
         if !service.failover { continue; }
@@ -1731,9 +1777,9 @@ pub async fn manage_standby(
                         let pull_payload = serde_json::json!({ "image": service.image });
                         let mut pulled = false;
                         for url in &pull_urls {
-                            if let Ok(resp) = client.post(url).header("X-WolfStack-Secret", cluster_secret).json(&pull_payload).send().await {
-                                if resp.status().is_success() { pulled = true; break; }
-                            }
+                            if matches!(send_and_drain(
+                                client.post(url).header("X-WolfStack-Secret", cluster_secret).json(&pull_payload)
+                            ).await, Some(true)) { pulled = true; break; }
                         }
                         if pulled {
                             let create_urls = crate::api::build_node_urls(&target_node.address, target_node.port, "/api/containers/docker/create");
@@ -1746,9 +1792,12 @@ pub async fn manage_standby(
                             });
                             let mut ok = false;
                             for url in &create_urls {
-                                if let Ok(resp) = client.post(url).header("X-WolfStack-Secret", cluster_secret).json(&payload).send().await {
-                                    if resp.status().is_success() { ok = true; break; }
-                                    break;
+                                match send_and_drain(
+                                    client.post(url).header("X-WolfStack-Secret", cluster_secret).json(&payload)
+                                ).await {
+                                    Some(true) => { ok = true; break; }
+                                    Some(false) => break,  // HTTP error — don't retry next URL
+                                    None => continue,       // Network error — try next URL
                                 }
                             }
                             ok
@@ -1786,21 +1835,18 @@ pub async fn manage_standby(
                         crate::api::build_node_urls(&source_node.address, source_node.port, &clone_path)
                     };
 
-                    let clone_client = reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_secs(600))
-                        .danger_accept_invalid_certs(true)
-                        .build().unwrap_or_default();
+                    let clone_client = &*RPC_CLIENT_MIGRATE;
 
                     let mut ok = false;
                     for url in &urls {
-                        match clone_client.post(url)
-                            .header("X-WolfStack-Secret", cluster_secret)
-                            .json(&clone_payload)
-                            .send().await
-                        {
-                            Ok(resp) if resp.status().is_success() => { ok = true; break; }
-                            Ok(_) => break,
-                            Err(_) => continue,
+                        match send_and_drain(
+                            clone_client.post(url)
+                                .header("X-WolfStack-Secret", cluster_secret)
+                                .json(&clone_payload)
+                        ).await {
+                            Some(true) => { ok = true; break; }
+                            Some(false) => break,
+                            None => continue,
                         }
                     }
 
@@ -1832,14 +1878,8 @@ pub async fn check_failover(
     let services = wolfrun.list(Some(&self_cluster));
     let all_nodes = cluster.get_all_nodes();
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .danger_accept_invalid_certs(true)
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+    // Shared pool — see RPC_CLIENT_LONG docs at top of file.
+    let client = &*RPC_CLIENT_LONG;
 
     for service in &services {
         if !service.failover { continue; }
@@ -1906,13 +1946,14 @@ pub async fn check_failover(
                 let payload = serde_json::json!({ "action": "start" });
                 let mut ok = false;
                 for url in &urls {
-                    if let Ok(resp) = client.post(url)
-                        .header("X-WolfStack-Secret", cluster_secret)
-                        .json(&payload)
-                        .send().await
-                    {
-                        if resp.status().is_success() { ok = true; break; }
-                        break;
+                    match send_and_drain(
+                        client.post(url)
+                            .header("X-WolfStack-Secret", cluster_secret)
+                            .json(&payload)
+                    ).await {
+                        Some(true) => { ok = true; break; }
+                        Some(false) => break,
+                        None => continue,
                     }
                 }
                 ok
