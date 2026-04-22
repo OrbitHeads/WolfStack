@@ -766,6 +766,12 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                 reqwest::Client::builder()
                     .timeout(Duration::from_secs(10))
                     .danger_accept_invalid_certs(true)
+                    // Aggressive pool tuning so cluster polling doesn't
+                    // leave orphaned idle sockets in CLOSE_WAIT when
+                    // peers close early. See api/mod.rs API_HTTP_CLIENT.
+                    .pool_idle_timeout(Duration::from_secs(15))
+                    .pool_max_idle_per_host(4)
+                    .tcp_keepalive(Duration::from_secs(30))
                     .build()
                     .unwrap_or_else(|_| reqwest::Client::new())
             });

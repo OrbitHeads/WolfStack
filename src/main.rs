@@ -2086,6 +2086,15 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                     .route("/", web::get().to(index_handler))
                     .service(actix_files::Files::new("/", &web_dir).index_file("login.html"))
             })
+            // Tighten the lifecycle so peers churning connections (cluster
+            // polling, wolfrun/statuspage broadcasts from older peers)
+            // don't accumulate in CLOSE_WAIT on our side. Defaults are
+            // 5s / 5s / 1s — halving them drops fd residence time ~80%
+            // under peer-initiated-close workloads. Reported by Bel:
+            // 26k CLOSE_WAIT on :8553 → fd exhaustion.
+            .keep_alive(std::time::Duration::from_secs(2))
+            .client_request_timeout(std::time::Duration::from_secs(3))
+            .client_disconnect_timeout(std::time::Duration::from_millis(500))
             .bind_openssl(&https_bind, ssl_builder)
             .map_err(|e| {
                 tracing::error!("❌ Failed to bind HTTPS on {}: {}", https_bind, e);
@@ -2103,6 +2112,9 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                     .route("/", web::get().to(index_handler))
                     .service(actix_files::Files::new("/", &web_dir2).index_file("login.html"))
             })
+            .keep_alive(std::time::Duration::from_secs(2))
+            .client_request_timeout(std::time::Duration::from_secs(3))
+            .client_disconnect_timeout(std::time::Duration::from_millis(500))
             .bind(&http_bind)
             .map_err(|e| {
                 tracing::error!("❌ Failed to bind HTTP on {}: {}", http_bind, e);
@@ -2160,6 +2172,12 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                     .route("/", web::get().to(index_handler))
                     .service(actix_files::Files::new("/", &web_dir).index_file("login.html"))
             })
+            // See matching block above on the TLS path for why these
+            // lifecycle knobs matter. Keep-alive / disconnect tuning
+            // caps CLOSE_WAIT residence time to protect fd budget.
+            .keep_alive(std::time::Duration::from_secs(2))
+            .client_request_timeout(std::time::Duration::from_secs(3))
+            .client_disconnect_timeout(std::time::Duration::from_millis(500))
             .bind(format!("{}:{}", cli.bind, api_port))?
             .run();
 

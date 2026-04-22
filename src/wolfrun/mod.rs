@@ -38,11 +38,23 @@ use crate::agent::ClusterState;
 // Two clients because reconcile needs a longer timeout (container
 // state queries can be slow on a loaded node); sync + broadcast
 // prefer a tighter 10s so a hung peer doesn't stall the whole tick.
+// Pool tuning, shared across all three clients:
+// - `pool_idle_timeout(15s)`: reap idle pooled connections after 15s
+//   instead of the reqwest default of 90s. Peers often close their
+//   side well before 90s, leaving us with CLOSE_WAIT sockets until
+//   the reap. Reported by Bel after v19.9.0.
+// - `pool_max_idle_per_host(4)`: keep the per-peer pool small —
+//   there's only one tick firing at a time.
+// - `tcp_keepalive(30s)`: kernel probes detect half-dead connections
+//   and tear them down before they need app-level cleanup.
 static RPC_CLIENT_SHORT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .danger_accept_invalid_certs(true)
+            .pool_idle_timeout(std::time::Duration::from_secs(15))
+            .pool_max_idle_per_host(4)
+            .tcp_keepalive(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     });
@@ -52,6 +64,9 @@ static RPC_CLIENT_LONG: std::sync::LazyLock<reqwest::Client> =
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .danger_accept_invalid_certs(true)
+            .pool_idle_timeout(std::time::Duration::from_secs(15))
+            .pool_max_idle_per_host(4)
+            .tcp_keepalive(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     });
@@ -61,6 +76,9 @@ static RPC_CLIENT_MIGRATE: std::sync::LazyLock<reqwest::Client> =
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(600))
             .danger_accept_invalid_certs(true)
+            .pool_idle_timeout(std::time::Duration::from_secs(30))
+            .pool_max_idle_per_host(2)
+            .tcp_keepalive(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     });

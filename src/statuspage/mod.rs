@@ -38,6 +38,9 @@ static SP_RPC_CLIENT: std::sync::LazyLock<reqwest::Client> =
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .danger_accept_invalid_certs(true)
+            .pool_idle_timeout(std::time::Duration::from_secs(15))
+            .pool_max_idle_per_host(4)
+            .tcp_keepalive(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     });
@@ -46,6 +49,13 @@ static SP_HTTP_CHECK_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
         reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
+            // Monitors hit user-configured external URLs — each
+            // target probably answers once per tick and stays idle
+            // otherwise, so a short idle timeout keeps orphaned
+            // sockets from piling up.
+            .pool_idle_timeout(std::time::Duration::from_secs(15))
+            .pool_max_idle_per_host(2)
+            .tcp_keepalive(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     });

@@ -44,6 +44,9 @@ static ROUTER_RPC_CLIENT: std::sync::LazyLock<reqwest::Client> =
         reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(3))
             .danger_accept_invalid_certs(true)
+            .pool_idle_timeout(std::time::Duration::from_secs(15))
+            .pool_max_idle_per_host(4)
+            .tcp_keepalive(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     });

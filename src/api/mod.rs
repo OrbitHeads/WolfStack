@@ -37,6 +37,16 @@ pub(crate) static API_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
         reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(3))
             .danger_accept_invalid_certs(true)
+            // Aggressively trim the idle-connection pool so orphaned
+            // sockets don't sit in CLOSE_WAIT for 90s (the default).
+            // Reported by Bel: 5827 outbound CLOSE_WAIT against peer
+            // :8553 endpoints built up alongside server-side leaks.
+            .pool_idle_timeout(std::time::Duration::from_secs(15))
+            .pool_max_idle_per_host(8)
+            // Enable SO_KEEPALIVE so half-dead connections are
+            // detected and torn down by the kernel rather than
+            // lingering for minutes.
+            .tcp_keepalive(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     });
