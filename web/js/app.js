@@ -42383,37 +42383,116 @@ async function dbDataLoadPk() {
     return _dbDataPks[k];
 }
 
-async function dbDataEditCell(rowIdx, colIdx) {
+async function dbDataEditRow(rowIdx) {
     if (!_dbDataLast) return;
     const pks = await dbDataLoadPk();
     if (!pks.length) { showToast('No primary key — inline edit disabled. Use the Query tab.', 'warning'); return; }
     const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
-    const colName = _dbDataLast.columns[colIdx];
-    const oldVal = _dbDataLast.rows[rowIdx][colIdx];
-    const newVal = prompt(`New value for ${colName}:`, oldVal == null ? '' : String(oldVal));
-    if (newVal === null) return;
-    // Build WHERE clause from PK values.
-    const pkCells = pks.map(pkName => {
-        const idx = _dbDataLast.columns.indexOf(pkName);
-        return idx < 0 ? null : { col: pkName, val: _dbDataLast.rows[rowIdx][idx] };
-    }).filter(Boolean);
-    if (!pkCells.length) { showToast('PK columns not in current result — reload and retry.', 'warning'); return; }
-    const whereClause = pkCells.map(p => `${dbMgrEscapeIdent(conn.kind, p.col)} = ${p.val == null ? 'NULL' : (typeof p.val === 'number' ? p.val : `'${String(p.val).replace(/'/g, "''")}'`)}`).join(' AND ');
-    const fq = `${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentDb)}.${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentTable)}`;
-    const setClause = `${dbMgrEscapeIdent(conn.kind, colName)} = ${newVal === '' ? 'NULL' : `'${newVal.replace(/'/g, "''")}'`}`;
-    const sql = `UPDATE ${fq} SET ${setClause} WHERE ${whereClause}`;
-    const ok = await wolfConfirm(`Run this UPDATE?\n\n${sql}`, 'Update row', { okText: 'Update', danger: true });
-    if (!ok) return;
-    try {
-        const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_dbCurrentId)}/query`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ query: sql, permission: 'update', timeout_secs: 30 }),
-        });
-        const data = await resp.json();
-        if (!resp.ok) { showToast(data.error || 'Update failed', 'error'); return; }
-        showToast('Row updated', 'success');
-        dbDataReload();
-    } catch (e) { showToast('Update failed: ' + e.message, 'error'); }
+    if (!conn) return;
+    const row = _dbDataLast.rows[rowIdx];
+    const cols = _dbDataLast.columns;
+    // Render one input per column in a modal. PK columns are read-only
+    // (operators shouldn't re-key the row through the inline editor;
+    // that's a separate delete-then-insert if really needed).
+    const existing = document.getElementById('db-edit-row-modal');
+    if (existing) existing.remove();
+    const modal = document.createElement('div');
+    modal.id = 'db-edit-row-modal';
+    modal.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:10000; display:flex; align-items:center; justify-content:center;';
+    let fieldsHtml = '';
+    for (let i = 0; i < cols.length; i++) {
+        const colName = cols[i];
+        const v = row[i];
+        const isPk = pks.includes(colName);
+        const isNull = v == null;
+        const valStr = isNull ? '' : String(v);
+        // Use <textarea> for long strings (≥80 chars) so operators can
+        // comfortably edit multi-line content; short values get an input.
+        const long = valStr.length > 80 || valStr.includes('\n');
+        const input = long
+            ? `<textarea class="form-control db-edit-field" data-col="${escapeHtml(colName)}" data-null="${isNull}" ${isPk ? 'readonly' : ''} rows="3" style="font-family:monospace; font-size:12px;">${escapeHtml(valStr)}</textarea>`
+            : `<input class="form-control db-edit-field" data-col="${escapeHtml(colName)}" data-null="${isNull}" ${isPk ? 'readonly' : ''} value="${escapeHtml(valStr)}" style="font-family:monospace; font-size:12px;">`;
+        fieldsHtml += `
+            <div style="display:grid; grid-template-columns:180px 1fr auto; gap:8px; align-items:center; margin-bottom:8px;">
+                <label style="font-size:12px;">
+                    ${escapeHtml(colName)}${isPk ? ' <span style="color:var(--accent, #a855f7); font-size:10px;">(PK)</span>' : ''}
+                </label>
+                ${input}
+                <label style="font-size:11px; color:var(--text-muted); white-space:nowrap;">
+                    <input type="checkbox" class="db-edit-null" data-col="${escapeHtml(colName)}" ${isNull ? 'checked' : ''} ${isPk ? 'disabled' : ''}> NULL
+                </label>
+            </div>`;
+    }
+    modal.innerHTML = `
+        <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:18px; width:760px; max-width:95vw; max-height:85vh; display:flex; flex-direction:column;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                <h3 style="margin:0;">✏️ Edit row in <code>${escapeHtml(_dbMgrCurrentDb + '.' + _dbMgrCurrentTable)}</code></h3>
+                <button class="btn btn-sm" onclick="document.getElementById('db-edit-row-modal').remove()">Close</button>
+            </div>
+            <div style="overflow-y:auto; flex:1; padding-right:6px;">${fieldsHtml}</div>
+            <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:12px; padding-top:10px; border-top:1px solid var(--border);">
+                <button class="btn btn-sm" onclick="document.getElementById('db-edit-row-modal').remove()">Cancel</button>
+                <button class="btn btn-primary btn-sm" id="db-edit-save">Save changes</button>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+    // NULL checkbox toggles disabled-ness of the matching input.
+    modal.querySelectorAll('.db-edit-null').forEach(cb => {
+        const sync = () => {
+            const input = modal.querySelector(`.db-edit-field[data-col="${cb.dataset.col}"]`);
+            if (!input) return;
+            input.disabled = cb.checked;
+            input.style.opacity = cb.checked ? '0.5' : '1';
+        };
+        cb.addEventListener('change', sync);
+        sync();
+    });
+    modal.querySelector('#db-edit-save').addEventListener('click', async () => {
+        // Build UPDATE statement covering only changed non-PK columns.
+        const pkCells = pks.map(pkName => {
+            const idx = cols.indexOf(pkName);
+            return idx < 0 ? null : { col: pkName, val: row[idx] };
+        }).filter(Boolean);
+        if (!pkCells.length) { showToast('PK columns missing from this result — reload the table.', 'warning'); return; }
+        const setParts = [];
+        for (const field of modal.querySelectorAll('.db-edit-field')) {
+            const colName = field.dataset.col;
+            if (pks.includes(colName)) continue;
+            const idx = cols.indexOf(colName);
+            const oldVal = row[idx];
+            const nullBox = modal.querySelector(`.db-edit-null[data-col="${colName}"]`);
+            const setToNull = nullBox && nullBox.checked;
+            const newVal = setToNull ? null : field.value;
+            // Skip identical values so the UPDATE stays minimal.
+            const oldStr = oldVal == null ? null : String(oldVal);
+            if (newVal === oldStr) continue;
+            if (newVal === null) {
+                setParts.push(`${dbMgrEscapeIdent(conn.kind, colName)} = NULL`);
+            } else {
+                setParts.push(`${dbMgrEscapeIdent(conn.kind, colName)} = '${newVal.replace(/'/g, "''")}'`);
+            }
+        }
+        if (!setParts.length) { showToast('No changes', 'info'); modal.remove(); return; }
+        const fq = `${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentDb)}.${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentTable)}`;
+        const whereClause = pkCells.map(p =>
+            `${dbMgrEscapeIdent(conn.kind, p.col)} = ${p.val == null ? 'NULL' : (typeof p.val === 'number' ? p.val : `'${String(p.val).replace(/'/g, "''")}'`)}`
+        ).join(' AND ');
+        const sql = `UPDATE ${fq} SET ${setParts.join(', ')} WHERE ${whereClause}`;
+        const ok = await wolfConfirm(`Run this UPDATE?\n\n${sql}`, 'Save changes', { okText: 'Update', danger: true });
+        if (!ok) return;
+        try {
+            const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_dbCurrentId)}/query`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ query: sql, permission: 'update', timeout_secs: 30 }),
+            });
+            const data = await resp.json();
+            if (!resp.ok) { showToast(data.error || 'Update failed', 'error'); return; }
+            modal.remove();
+            showToast('Row updated', 'success');
+            dbDataReload();
+        } catch (e) { showToast('Update failed: ' + e.message, 'error'); }
+    });
 }
 
 async function dbDataDeleteRow(rowIdx) {
@@ -43145,30 +43224,37 @@ function dbDataRenderGrid(wrap, data, st) {
         const needle = st.filter.toLowerCase();
         rows = rows.filter(r => r.some(v => v != null && String(v).toLowerCase().includes(needle)));
     }
-    let html = '<table style="width:100%; font-size:12px; border-collapse:collapse;"><thead><tr style="background:var(--bg-tertiary); position:sticky; top:0; z-index:1;">';
+    // Sticky action column on the LEFT so the buttons remain visible
+    // no matter how wide the row is or how far the operator has
+    // scrolled horizontally. Same trick for the header cell so it
+    // sticks in both axes (top + left).
+    const stickyActCss = 'position:sticky; left:0; background:var(--bg-primary); z-index:2; border-right:1px solid var(--border);';
+    const stickyHdrCss = 'position:sticky; left:0; top:0; background:var(--bg-tertiary); z-index:3; border-right:1px solid var(--border);';
+    let html = '<table style="width:100%; font-size:12px; border-collapse:separate; border-spacing:0;"><thead><tr>';
+    html += `<th style="padding:6px 8px; white-space:nowrap; ${stickyHdrCss}"></th>`;
     for (const col of data.columns) {
         const isSorted = st.sortCol === col;
         const arrow = isSorted ? (st.sortDir === 'desc' ? ' ▼' : ' ▲') : '';
         html += `<th onclick="dbDataSortBy('${escapeHtml(col).replace(/'/g, "\\'")}')"
-            style="padding:6px 8px; text-align:left; border-bottom:1px solid var(--border); cursor:pointer; user-select:none; white-space:nowrap;">${escapeHtml(col)}${arrow}</th>`;
+            style="padding:6px 8px; text-align:left; border-bottom:1px solid var(--border); cursor:pointer; user-select:none; white-space:nowrap; background:var(--bg-tertiary); position:sticky; top:0; z-index:1;">${escapeHtml(col)}${arrow}</th>`;
     }
-    html += '<th style="padding:6px 8px; border-bottom:1px solid var(--border); white-space:nowrap;"></th></tr></thead><tbody>';
-    // Note: we iterate rows (filtered) but pass the ORIGINAL index to
-    // edit/delete so the PK lookup lines up with _dbDataLast.rows.
+    html += '</tr></thead><tbody>';
+    // Iterate filtered rows but pass the ORIGINAL index to edit/delete
+    // so the PK lookup lines up with _dbDataLast.rows.
     for (let ri = 0; ri < rows.length; ri++) {
         const origIdx = data.rows.indexOf(rows[ri]);
         html += '<tr>';
+        html += `<td style="padding:4px 6px; white-space:nowrap; ${stickyActCss} border-bottom:1px solid var(--border);">
+            <button class="btn btn-sm" onclick="dbDataEditRow(${origIdx})" title="Edit row" style="padding:1px 6px; font-size:10px;">✏️</button>
+            <button class="btn btn-sm" onclick="dbDataDeleteRow(${origIdx})" title="Delete row" style="padding:1px 6px; font-size:10px;">🗑️</button>
+        </td>`;
         for (let ci = 0; ci < rows[ri].length; ci++) {
             const v = rows[ri][ci];
             const txt = v == null ? '<span style="color:var(--text-muted); font-style:italic;">NULL</span>' : escapeHtml(String(v));
-            html += `<td ondblclick="dbDataEditCell(${origIdx}, ${ci})"
+            html += `<td ondblclick="dbDataEditRow(${origIdx})"
                 style="padding:4px 8px; border-bottom:1px solid var(--border); max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:text;"
-                title="${v == null ? '' : escapeHtml(String(v))}&#10;(double-click to edit)">${txt}</td>`;
+                title="${v == null ? '' : escapeHtml(String(v))}&#10;(double-click to edit this row)">${txt}</td>`;
         }
-        html += `<td style="padding:4px 8px; border-bottom:1px solid var(--border); white-space:nowrap; text-align:right;">
-            <button class="btn btn-sm" onclick="dbDataEditCell(${origIdx}, 0)" title="Edit first column" style="padding:1px 6px; font-size:10px;">✏️</button>
-            <button class="btn btn-sm" onclick="dbDataDeleteRow(${origIdx})" title="Delete row" style="padding:1px 6px; font-size:10px;">🗑️</button>
-        </td>`;
         html += '</tr>';
     }
     html += '</tbody></table>';
