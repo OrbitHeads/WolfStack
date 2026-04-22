@@ -41828,7 +41828,7 @@ async function dbWizCreateTable(schema) {
             <div id="db-wiz-preview" style="margin-top:14px; font-family:monospace; font-size:11px; color:var(--text-muted); white-space:pre-wrap;"></div>
         </div>
     `;
-    document.body.appendChild(modal);
+    dbModalHost().appendChild(modal);
     // Seed with two starter rows — id PK + first user column.
     dbWizAddRow({ name: 'id', type: conn.kind === 'postgres' ? 'SERIAL' : 'INT AUTO_INCREMENT', nullable: false, pk: true });
     dbWizAddRow({ name: 'name', type: 'VARCHAR(255)', nullable: false, pk: false });
@@ -42271,7 +42271,7 @@ async function dbShowRoutineDefinition(schema, name, kind) {
                 </div>
             </div>
         `;
-        document.body.appendChild(modal);
+        dbModalHost().appendChild(modal);
     } catch (e) { showToast('Fetch definition failed: ' + e.message, 'error'); }
 }
 
@@ -42436,7 +42436,7 @@ async function dbDataEditRow(rowIdx) {
             </div>
         </div>
     `;
-    document.body.appendChild(modal);
+    dbModalHost().appendChild(modal);
     // NULL checkbox toggles disabled-ness of the matching input.
     modal.querySelectorAll('.db-edit-null').forEach(cb => {
         const sync = () => {
@@ -42601,7 +42601,7 @@ function dbSchemaCompareOpen() {
             <div id="db-cmp-result" style="flex:1; overflow:auto; margin-top:10px; border:1px solid var(--border); border-radius:6px; padding:10px; background:var(--bg-primary); font-size:12px;">Pick source + target and click Run compare.</div>
         </div>
     `;
-    document.body.appendChild(modal);
+    dbModalHost().appendChild(modal);
     dbCmpLoadSchemas('src');
     dbCmpLoadSchemas('dst');
 }
@@ -44172,7 +44172,7 @@ async function dbSrvEditVar(name, currentValue) {
             </div>
         </div>
     `;
-    document.body.appendChild(modal);
+    dbModalHost().appendChild(modal);
     const close = () => modal.remove();
     modal.querySelector('#db-var-cancel').addEventListener('click', close);
     const submit = async () => {
@@ -44540,6 +44540,28 @@ async function dbStructDropFk(fkName) {
     }
     if (await dbStructExec(sql, `Drop FK ${fkName}`)) { dbStructLoadFks(); }
 }
+
+// When the Databases page is in fullscreen mode the browser isolates
+// that element and paints everything else underneath. Modals
+// appended to document.body therefore render BEHIND the fullscreen
+// page. Attach to the fullscreen element instead so the modal sits
+// on top where the operator can see + click it.
+function dbModalHost() {
+    return document.fullscreenElement || document.body;
+}
+
+// The shared wolfConfirm / wolfPrompt dialog lives as a static
+// element in index.html, OUTSIDE #page-databases. Fullscreen hides
+// it. Slide it in/out of the fullscreen element as the operator
+// toggles so Confirm modals (delete row, change variable, etc.)
+// still appear during fullscreen sessions.
+document.addEventListener('fullscreenchange', () => {
+    const dlg = document.getElementById('wolf-dialog-modal');
+    if (!dlg) return;
+    const fs = document.fullscreenElement;
+    if (fs && !fs.contains(dlg)) fs.appendChild(dlg);
+    else if (!fs && dlg.parentElement !== document.body) document.body.appendChild(dlg);
+});
 
 function dbToggleFullscreen() {
     // Use the Fullscreen API on the whole Databases page — hides the
@@ -45037,7 +45059,7 @@ async function dbSaveCurrentQuery() {
             </div>
         </div>
     `;
-    document.body.appendChild(modal);
+    dbModalHost().appendChild(modal);
     const nameInput = modal.querySelector('#db-save-name');
     const submit = modal.querySelector('#db-save-submit');
     const doSave = async () => {
@@ -45112,7 +45134,7 @@ async function dbManageSavedQueries() {
             <div style="overflow:auto; border:1px solid var(--border); border-radius:6px;">${rows}</div>
         </div>
     `;
-    document.body.appendChild(modal);
+    dbModalHost().appendChild(modal);
 }
 
 function dbManageLoad(name) {
