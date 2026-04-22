@@ -42731,6 +42731,26 @@ function dbAcKnownTables() {
     return out;
 }
 
+let _dbAcLiveTimer = null;
+function dbScheduleAutocomplete() {
+    // Only live-trigger when the prefix under the cursor is ≥2 chars —
+    // single-letter popups are noisy. Ctrl+Space still works from 0
+    // chars for the explicit "show me everything" case.
+    if (_dbAcLiveTimer) clearTimeout(_dbAcLiveTimer);
+    _dbAcLiveTimer = setTimeout(() => {
+        const ta = document.getElementById('db-query');
+        if (!ta || document.activeElement !== ta) return;
+        const pos = ta.selectionStart;
+        const src = ta.value;
+        let s = pos;
+        while (s > 0 && /[A-Za-z0-9_]/.test(src[s - 1])) s--;
+        // Also trigger right after typing `.` (column hint) regardless of prefix length.
+        const dotJustTyped = pos > 0 && src[pos - 1] === '.';
+        if (!dotJustTyped && pos - s < 2) { dbAcClose(); return; }
+        dbAcTrigger();
+    }, 220);
+}
+
 async function dbAcTrigger() {
     const ta = document.getElementById('db-query');
     if (!ta) return;
@@ -42843,9 +42863,9 @@ document.addEventListener('click', (e) => {
         dbAcClose();
     }
 });
-document.addEventListener('input', (e) => {
-    if (_dbAcState.popup && e.target && e.target.id === 'db-query') dbAcClose();
-});
+// (Input-driven popup refresh is handled by dbScheduleAutocomplete
+// attached directly to the editor, so we don't close on input here
+// — the debounce keeps the popup in sync as the prefix changes.)
 
 // Wire Ctrl+Space / arrow nav into the Query editor keydown handler.
 // We hook onto the document so we catch arrows even when focus is in
@@ -42888,6 +42908,11 @@ function dbMgrToggleSchema(schema) {
         _dbMgrExpanded.delete(schema);
     } else {
         _dbMgrExpanded.add(schema);
+        // Expanding a schema treats it as the operator's current
+        // working schema — the Query tab badge + /query schema
+        // parameter follow whichever one they're actively browsing.
+        _dbMgrCurrentDb = schema;
+        dbUpdateSchemaBadge();
     }
     dbMgrLoadTree();
 }
@@ -42896,8 +42921,14 @@ function dbMgrPickTable(db, table) {
     _dbMgrCurrentDb = db;
     _dbMgrCurrentTable = table;
     _dbMgrExpanded.add(db);
+    dbUpdateSchemaBadge();
     dbMgrLoadTree();
     dbMgrRefreshTab();
+}
+
+function dbUpdateSchemaBadge() {
+    const b = document.getElementById('db-schema-badge');
+    if (b) b.textContent = `📂 ${_dbMgrCurrentDb || '(default)'}`;
 }
 
 function dbMgrSwitchTab(tab, skipRefresh) {
@@ -43832,32 +43863,42 @@ let _dbQueryActive = 0;
 
 function dbQueryEnsureTabs() {
     if (!_dbQueryTabs.length) {
-        _dbQueryTabs.push({ id: 'q1', title: 'Query 1', sql: '', dirty: false });
+        _dbQueryTabs.push({ id: 'q1', title: 'Query 1', sql: '', dirty: false, caret: 0 });
         _dbQueryActive = 0;
     }
 }
 
 function dbQueryNewTab() {
+    dbQuerySyncActiveTab();
     const n = _dbQueryTabs.length + 1;
-    _dbQueryTabs.push({ id: `q${n}${Date.now()}`, title: `Query ${n}`, sql: '', dirty: false });
+    _dbQueryTabs.push({ id: `q${n}${Date.now()}`, title: `Query ${n}`, sql: '', dirty: false, caret: 0 });
     _dbQueryActive = _dbQueryTabs.length - 1;
     dbMgrRenderQueryTab(document.getElementById('db-mgr-body'));
 }
 
-function dbQuerySwitchTab(idx) {
-    // Save current textarea into the active tab first so edits don't vanish.
+function dbQuerySyncActiveTab() {
+    // Capture SQL and caret into the active tab so a re-render
+    // (tab switch, rename, add/close) doesn't drop the cursor.
     const ta = document.getElementById('db-query');
-    if (ta && _dbQueryTabs[_dbQueryActive]) _dbQueryTabs[_dbQueryActive].sql = ta.value;
+    if (!ta || !_dbQueryTabs[_dbQueryActive]) return;
+    _dbQueryTabs[_dbQueryActive].sql = ta.value;
+    _dbQueryTabs[_dbQueryActive].caret = ta.selectionStart;
+    _dbQueryTabs[_dbQueryActive].caretEnd = ta.selectionEnd;
+}
+
+function dbQuerySwitchTab(idx) {
+    dbQuerySyncActiveTab();
     _dbQueryActive = idx;
     dbMgrRenderQueryTab(document.getElementById('db-mgr-body'));
 }
 
 function dbQueryCloseTab(idx, ev) {
     if (ev) ev.stopPropagation();
+    dbQuerySyncActiveTab();
     if (_dbQueryTabs.length === 1) {
-        // Don't let the last tab close — clear its buffer instead.
         _dbQueryTabs[0].sql = '';
         _dbQueryTabs[0].title = 'Query 1';
+        _dbQueryTabs[0].caret = 0;
         dbMgrRenderQueryTab(document.getElementById('db-mgr-body'));
         return;
     }
@@ -43909,13 +43950,14 @@ function dbMgrRenderQueryTab(body) {
             <label style="font-size:13px; margin:0;">Timeout (s):
                 <input id="db-timeout" type="number" min="1" max="300" value="30" class="form-control" style="display:inline-block; width:90px; margin-left:6px;">
             </label>
-            <span id="db-validate" style="font-size:12px; padding:3px 8px; border-radius:5px; background:var(--bg-tertiary); color:var(--text-muted); margin-left:auto;">type to validate…</span>
+            <span id="db-schema-badge" title="Queries in this tab run against this schema. Pick a schema in the left tree to change it." style="font-size:12px; padding:3px 8px; border-radius:5px; background:rgba(168,85,247,0.15); color:#c084fc; margin-left:auto;">📂 ${escapeHtml(_dbMgrCurrentDb || '(default)')}</span>
+            <span id="db-validate" style="font-size:12px; padding:3px 8px; border-radius:5px; background:var(--bg-tertiary); color:var(--text-muted);">type to validate…</span>
         </div>
         <div id="db-editor-wrap" style="position:relative;">
             <pre id="db-query-hl" aria-hidden="true"
-                style="position:absolute; inset:0; margin:0; padding:8px 10px; font-family:var(--font-mono, ui-monospace, monospace); font-size:13px; line-height:1.45; tab-size:4; white-space:pre-wrap; word-wrap:break-word; pointer-events:none; color:var(--text); overflow:hidden; background:var(--bg-primary); border:1px solid var(--border); border-radius:4px;"></pre>
+                style="position:absolute; inset:0; margin:0; padding:8px 10px; font-family:var(--font-mono, ui-monospace, monospace); font-size:13px; line-height:1.45; tab-size:4; white-space:pre-wrap; word-wrap:break-word; pointer-events:none; color:var(--text); overflow:hidden; background:var(--bg-primary); border:1px solid var(--border); border-radius:4px; z-index:1;"></pre>
             <textarea id="db-query" class="form-control" placeholder="${escapeHtml(hint)}"
-                style="position:relative; font-family:var(--font-mono, ui-monospace, monospace); font-size:13px; min-height:260px; line-height:1.45; tab-size:4; background:transparent; caret-color:var(--text); color:transparent;"
+                style="position:relative; z-index:2; font-family:var(--font-mono, ui-monospace, monospace); font-size:13px; min-height:260px; line-height:1.45; tab-size:4; background:transparent; caret-color:var(--text); color:transparent; text-shadow:0 0 0 transparent;"
                 spellcheck="false">${escapeHtml(active.sql || '')}</textarea>
         </div>
         <div style="display:flex; gap:6px; margin-top:8px; align-items:center; flex-wrap:wrap;">
@@ -43956,15 +43998,33 @@ function dbMgrRenderQueryTab(body) {
             }
         });
         ta.addEventListener('input', () => {
-            // Mirror into the active tab so switching preserves it.
             if (_dbQueryTabs[_dbQueryActive]) _dbQueryTabs[_dbQueryActive].sql = ta.value;
             dbScheduleValidate();
             dbHighlightSql();
+            // Live autocomplete: after the user types ≥2 word chars,
+            // show suggestions (keyword/table/column) without needing
+            // Ctrl+Space. Debounced so every keystroke doesn't
+            // rebuild the popup. Backspace/Delete also retrigger.
+            dbScheduleAutocomplete();
         });
         ta.addEventListener('scroll', () => {
             const hl = document.getElementById('db-query-hl');
             if (hl) { hl.scrollTop = ta.scrollTop; hl.scrollLeft = ta.scrollLeft; }
         });
+        // Persist caret into the tab on every selection change so Run
+        // queries, tab switches, and autocomplete accepts all resume
+        // exactly where the operator left off.
+        ta.addEventListener('keyup', dbQuerySyncActiveTab);
+        ta.addEventListener('mouseup', dbQuerySyncActiveTab);
+    }
+    // Restore caret from the active tab (see dbQuerySyncActiveTab).
+    if (ta && active) {
+        const pos = typeof active.caret === 'number' ? Math.min(active.caret, ta.value.length) : ta.value.length;
+        const endPos = typeof active.caretEnd === 'number' ? Math.min(active.caretEnd, ta.value.length) : pos;
+        try {
+            ta.focus();
+            ta.setSelectionRange(pos, endPos);
+        } catch (_) { /* element not attached yet on some paths */ }
     }
     dbHighlightSql();
     dbScheduleValidate();
@@ -44227,18 +44287,52 @@ function dbLoadHistSelected() {
     if (ta) { ta.value = _dbHistoryCache[idx].sql; dbScheduleValidate(); }
 }
 
+// Heuristic check for "I hope you meant that" queries — TRUNCATE,
+// unqualified DELETE, unqualified UPDATE, DROP TABLE, DROP DATABASE.
+// Returns null if the query is safe, or a warning message string if
+// the user should confirm. We strip string literals and comments
+// before the regex test so the WHERE inside a quoted string doesn't
+// count and a block-commented "WHERE" doesn't hide a naked DELETE.
+function dbDangerousQueryWarning(sql) {
+    const stripped = sql
+        .replace(/--[^\n]*/g, '')
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/'([^'\\]|\\.|'')*'/g, "''")
+        .replace(/"([^"\\]|\\.|"")*"/g, '""')
+        .replace(/`([^`]|``)*`/g, '``')
+        .trim();
+    if (/^\s*TRUNCATE\b/i.test(stripped)) return 'TRUNCATE deletes every row and is not transactional on most engines — you cannot roll back. Continue?';
+    if (/^\s*DROP\s+(TABLE|DATABASE|SCHEMA)\b/i.test(stripped)) return 'DROP TABLE / DATABASE removes the object and all its data. Continue?';
+    if (/^\s*DELETE\s+FROM\s+[^\s;]+\s*;?$/i.test(stripped)) return 'DELETE has no WHERE clause — every row will be deleted. Continue?';
+    if (/^\s*DELETE\s+FROM\s+[^;]+$/i.test(stripped) && !/\bWHERE\b/i.test(stripped)) return 'DELETE has no WHERE clause — every row will be deleted. Continue?';
+    if (/^\s*UPDATE\s+[^;]+\bSET\b[^;]+$/i.test(stripped) && !/\bWHERE\b/i.test(stripped)) return 'UPDATE has no WHERE clause — every row will be rewritten. Continue?';
+    return null;
+}
+
 async function dbRunQuery() {
     if (!_dbCurrentId) return;
     const query = document.getElementById('db-query').value;
     const permission = document.getElementById('db-perm').value;
     const timeout_secs = parseInt(document.getElementById('db-timeout').value, 10) || 30;
+    const schema = _dbMgrCurrentDb || undefined;
     const resultEl = document.getElementById('db-result');
     if (!query.trim()) return;
+    // Danger check — give the operator one chance to cancel a
+    // TRUNCATE / unqualified DELETE / etc. Never skip on a Run click.
+    const danger = dbDangerousQueryWarning(query);
+    if (danger) {
+        const ok = await wolfConfirm(
+            `${danger}\n\nQuery:\n${query.slice(0, 500)}${query.length > 500 ? '…' : ''}`,
+            'Destructive query',
+            { okText: 'Run anyway', danger: true }
+        );
+        if (!ok) return;
+    }
     resultEl.innerHTML = '<div style="color:var(--text-muted);">Running…</div>';
     try {
         const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_dbCurrentId)}/query`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ query, permission, timeout_secs }),
+            body: JSON.stringify({ query, permission, timeout_secs, schema }),
         });
         const data = await resp.json();
         if (!resp.ok) {

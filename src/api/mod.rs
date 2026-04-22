@@ -20388,9 +20388,11 @@ pub async fn sql_connections_test(
 pub struct SqlQueryRequest {
     pub query: String,
     #[serde(default)]
-    pub permission: Option<String>,  // "read" | "update" | "delete"
+    pub permission: Option<String>,  // "read" | "update" | "delete" | "schema"
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub schema: Option<String>,       // optional DB/search_path override
 }
 
 /// POST /api/sql-connections/{id}/validate — parse-only check.
@@ -20471,12 +20473,14 @@ pub async fn sql_connections_query(
     };
     let timeout = body.timeout_secs.map(std::time::Duration::from_secs);
     let caller_username = username.clone();
-    match crate::sql_connections::execute(
+    let schema = body.schema.as_deref();
+    match crate::sql_connections::execute_with_schema(
         &id, &body.query, perm,
         crate::sql_connections::Caller::Ui(username),
         &state.cluster_secret,
         timeout,
         Some(&state.cluster),
+        schema,
     ).await {
         Ok(r) => {
             // Record in per-user history (non-blocking — failure just
@@ -20505,6 +20509,8 @@ pub struct SqlMultiRequest {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub stop_on_error: Option<bool>,  // default true
+    #[serde(default)]
+    pub schema: Option<String>,
 }
 
 /// POST /api/sql-connections/{id}/query-multi — run a batch of
@@ -20557,8 +20563,9 @@ pub async fn sql_connections_query_multi(
         let s = stmt.trim();
         if s.is_empty() { results.push(serde_json::json!({ "skipped": true })); continue; }
         let caller = crate::sql_connections::Caller::Ui(username.clone());
-        match crate::sql_connections::execute(
+        match crate::sql_connections::execute_with_schema(
             &id, s, perm, caller, &state.cluster_secret, timeout, Some(&state.cluster),
+            body.schema.as_deref(),
         ).await {
             Ok(r) => results.push(serde_json::json!({
                 "ok": true,
@@ -20686,6 +20693,8 @@ pub struct SqlProxyRequest {
     pub permission: Option<String>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub schema: Option<String>,
     /// Opaque caller tag from the originator — included in the target
     /// node's audit log so a trace like "ui:paul via wolfstack-1 →
     /// wolfstack-2" is visible on every hop.
@@ -20902,6 +20911,7 @@ pub async fn sql_connections_query_proxy(
         caller,
         &state.cluster_secret,
         timeout,
+        body.schema.as_deref(),
     ).await {
         Ok(r) => HttpResponse::Ok().json(r),
         Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),

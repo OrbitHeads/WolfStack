@@ -627,6 +627,24 @@ pub async fn execute(
     // of silently failing or calling a dead address.
     cluster: Option<&crate::agent::ClusterState>,
 ) -> Result<SqlResult, String> {
+    execute_with_schema(connection_id, query, requested, caller, cluster_secret, exec_timeout, cluster, None).await
+}
+
+/// Same as `execute` but with an optional schema override that the
+/// UI passes when the operator has picked a specific DB in the tree.
+/// For MySQL/MariaDB this issues `USE <schema>` on the pooled
+/// connection before running; for Postgres it issues
+/// `SET search_path TO <schema>, public`.
+pub async fn execute_with_schema(
+    connection_id: &str,
+    query: &str,
+    requested: SqlPermission,
+    caller: Caller,
+    cluster_secret: &str,
+    exec_timeout: Option<Duration>,
+    cluster: Option<&crate::agent::ClusterState>,
+    schema: Option<&str>,
+) -> Result<SqlResult, String> {
     let cfg = load();
     let conn = cfg.connections.iter()
         .find(|c| c.id == connection_id)
@@ -655,7 +673,7 @@ pub async fn execute(
     let is_local = conn.node_id.is_empty() || conn.node_id == self_id;
 
     if is_local {
-        execute_local(&conn, query, &caller, cluster_secret, exec_timeout).await
+        execute_local(&conn, query, &caller, cluster_secret, exec_timeout, schema).await
     } else {
         let cluster = match cluster {
             Some(c) => c,
@@ -671,7 +689,7 @@ pub async fn execute(
                 return Err(msg);
             }
         };
-        execute_proxied(&conn, query, requested, &caller, cluster_secret, exec_timeout, cluster).await
+        execute_proxied(&conn, query, requested, &caller, cluster_secret, exec_timeout, cluster, schema).await
     }
 }
 
@@ -690,6 +708,7 @@ pub async fn execute_as_target(
     caller: Caller,
     cluster_secret: &str,
     exec_timeout: Option<Duration>,
+    schema: Option<&str>,
 ) -> Result<SqlResult, String> {
     let cfg = load();
     let conn = cfg.connections.iter()
@@ -707,7 +726,7 @@ pub async fn execute_as_target(
         return Err(outcome);
     }
 
-    execute_local(&conn, query, &caller, cluster_secret, exec_timeout).await
+    execute_local(&conn, query, &caller, cluster_secret, exec_timeout, schema).await
 }
 
 /// Local execution — open a driver pool to `conn.host:conn.port` and
@@ -719,16 +738,18 @@ async fn execute_local(
     caller: &Caller,
     cluster_secret: &str,
     exec_timeout: Option<Duration>,
+    schema: Option<&str>,
 ) -> Result<SqlResult, String> {
     let pool = get_or_build_pool(conn, cluster_secret)?;
     let timeout = exec_timeout.unwrap_or(DEFAULT_EXEC_TIMEOUT);
 
     let start = std::time::Instant::now();
     let query_owned = query.to_string();
+    let schema_owned = schema.map(|s| s.to_string());
     let fut = async move {
         match pool {
-            PoolHandle::Mysql(p) => run_mysql(p, &query_owned).await,
-            PoolHandle::Postgres(p) => run_postgres(p, &query_owned).await,
+            PoolHandle::Mysql(p) => run_mysql(p, &query_owned, schema_owned.as_deref()).await,
+            PoolHandle::Postgres(p) => run_postgres(p, &query_owned, schema_owned.as_deref()).await,
         }
     };
     let result = tokio::time::timeout(timeout, fut).await;
@@ -770,6 +791,7 @@ async fn execute_proxied(
     cluster_secret: &str,
     exec_timeout: Option<Duration>,
     cluster: &crate::agent::ClusterState,
+    schema: Option<&str>,
 ) -> Result<SqlResult, String> {
     // Resolve the target peer's address from cluster state. We rely on
     // the agent module's snapshot rather than re-reading nodes.json so
@@ -810,6 +832,7 @@ async fn execute_proxied(
         },
         "timeout_secs": exec_timeout.map(|d| d.as_secs()),
         "origin_caller": caller.as_tag(),
+        "schema": schema,
     });
 
     let client = &*crate::api::API_HTTP_CLIENT;
@@ -912,9 +935,19 @@ pub async fn test(
 // ─── Driver-specific execution ───
 // ═══════════════════════════════════════════════════
 
-async fn run_mysql(pool: mysql_async::Pool, query: &str) -> Result<SqlResult, String> {
+async fn run_mysql(pool: mysql_async::Pool, query: &str, schema: Option<&str>) -> Result<SqlResult, String> {
     use mysql_async::prelude::Queryable;
     let mut conn = pool.get_conn().await.map_err(|e| format!("mysql connect: {}", e))?;
+    // Per-request schema override — the UI passes the currently-
+    // selected tree schema so queries target the DB the operator is
+    // looking at, not just the connection's default. USE doesn't
+    // accept bind parameters; we defend against backtick injection
+    // by escaping any backticks in the schema name.
+    if let Some(s) = schema.filter(|s| !s.is_empty()) {
+        let escaped = s.replace('`', "``");
+        conn.query_drop(format!("USE `{}`", escaped)).await
+            .map_err(|e| format!("mysql USE {}: {}", s, e))?;
+    }
 
     // `query::<Row, _>` buffers into a Vec<Row>. MAX_ROWS defence
     // happens after — mysql_async 0.34 doesn't expose a good
@@ -1008,8 +1041,19 @@ fn mysql_value_to_json(v: &mysql_async::Value) -> serde_json::Value {
     }
 }
 
-async fn run_postgres(pool: deadpool_postgres::Pool, query: &str) -> Result<SqlResult, String> {
+async fn run_postgres(pool: deadpool_postgres::Pool, query: &str, schema: Option<&str>) -> Result<SqlResult, String> {
     let client = pool.get().await.map_err(|e| format!("postgres connect: {}", e))?;
+    // Per-request search_path override — mirrors the UI's schema
+    // selector. Postgres doesn't support "USE db" (connections are
+    // pinned to one database at connect time), so we set
+    // search_path on the pooled session instead. Escape embedded
+    // double-quotes; public is kept as a fallback so built-ins
+    // resolve without further qualification.
+    if let Some(s) = schema.filter(|s| !s.is_empty()) {
+        let escaped = s.replace('"', "\"\"");
+        client.simple_query(&format!("SET search_path TO \"{}\", public", escaped)).await
+            .map_err(|e| format!("postgres SET search_path {}: {}", s, e))?;
+    }
 
     // Is this a result-producing query or a DML? simple_query returns
     // a stream of messages that tell us the difference — use it so
