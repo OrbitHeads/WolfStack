@@ -57,6 +57,7 @@ mod cluster_browser;
 mod compat;
 mod danger;
 mod plugins;
+mod sql_connections;
 mod certbot;
 #[allow(dead_code)]
 mod integrations;

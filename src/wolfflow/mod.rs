@@ -304,6 +304,71 @@ pub enum ActionType {
         #[serde(default = "default_agent_chat_timeout")]
         timeout_secs: u64,
     },
+
+    /// Run a SQL query against a configured connection and expose the
+    /// result as `{columns, rows, row_count, rows_csv, rows_markdown}`
+    /// for downstream steps. `permission` picks the classifier tier —
+    /// `read` only accepts SELECT/SHOW, `update` also accepts
+    /// INSERT/UPDATE, `delete` additionally accepts DELETE/TRUNCATE.
+    /// DDL is never allowed from the workflow surface.
+    ///
+    /// Pairs with `SendEmail` for the "run a query every 2h and email
+    /// the result" use case operators asked for.
+    SqlQuery {
+        /// Connection id from Settings → SQL Connections.
+        connection_id: String,
+        /// SQL text. Templated (`{{step.x.…}}` etc. resolved first).
+        query: String,
+        /// Tier the query is expected to fall under. Sqlparser rejects
+        /// anything above this at execution time.
+        #[serde(default = "default_sql_permission")]
+        permission: SqlStepPermission,
+        /// Wall-clock timeout for the query. Default 30s.
+        #[serde(default = "default_sql_timeout")]
+        timeout_secs: u64,
+        /// Fail the step if the query returned zero rows. Useful when
+        /// the workflow is supposed to trigger downstream only when a
+        /// condition is present in the DB.
+        #[serde(default)]
+        fail_on_empty: bool,
+    },
+
+    /// Send an email via the SMTP config in Settings → Alerting.
+    /// Used as the tail of "query → email" workflows. Body supports
+    /// templating so `{{step.qry.rows_markdown}}` drops in the
+    /// formatted result from an upstream SqlQuery.
+    SendEmail {
+        /// One or more addresses. Templated.
+        to: Vec<String>,
+        /// Subject line. Templated.
+        subject: String,
+        /// Plain-text body. Templated.
+        body: String,
+        /// If true, body is treated as HTML and sent with a
+        /// text/html Content-Type. Otherwise plain text.
+        #[serde(default)]
+        html: bool,
+    },
+}
+
+/// Mirror of `sql_connections::SqlPermission` that lives in this
+/// module for serde round-tripping without adding a cross-module
+/// serde dependency loop.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SqlStepPermission { Read, Update, Delete }
+
+fn default_sql_permission() -> SqlStepPermission { SqlStepPermission::Read }
+fn default_sql_timeout() -> u64 { 30 }
+
+impl From<SqlStepPermission> for crate::sql_connections::SqlPermission {
+    fn from(s: SqlStepPermission) -> Self {
+        match s {
+            SqlStepPermission::Read => crate::sql_connections::SqlPermission::Read,
+            SqlStepPermission::Update => crate::sql_connections::SqlPermission::Update,
+            SqlStepPermission::Delete => crate::sql_connections::SqlPermission::Delete,
+        }
+    }
 }
 
 fn default_agent_chat_timeout() -> u64 { 180 }
@@ -1268,7 +1333,137 @@ pub async fn execute_action_local(action: &ActionType) -> Result<StepOutput, Str
                 Err(_) => Err(format!("AgentChat timed out after {}s", timeout_secs)),
             }
         }
+
+        // ─── SQL query + email ─────────────────────────────
+        ActionType::SqlQuery { connection_id, query, permission, timeout_secs, fail_on_empty } => {
+            // Cluster secret is needed to decrypt the stored password
+            // when the pool is (re)built. We look it up from the
+            // running state — same source the API handlers use.
+            let cluster_secret = crate::auth::load_cluster_secret();
+            let perm: crate::sql_connections::SqlPermission = (*permission).into();
+            let workflow_id = "workflow".to_string();  // execute_action_local doesn't
+                                                      // have workflow context; callers
+                                                      // that need full audit path use
+                                                      // execute_workflow which threads
+                                                      // the id through the spawned task.
+            let res = crate::sql_connections::execute(
+                connection_id, query, perm,
+                crate::sql_connections::Caller::Workflow {
+                    workflow_id, step: "sql_query".into(),
+                },
+                &cluster_secret,
+                Some(std::time::Duration::from_secs(*timeout_secs)),
+            ).await;
+            match res {
+                Ok(r) => {
+                    if *fail_on_empty && r.row_count == 0 && r.affected_rows.unwrap_or(0) == 0 {
+                        return Err("SqlQuery returned no rows and fail_on_empty is set".into());
+                    }
+                    let mut data = serde_json::Map::new();
+                    data.insert("columns".into(), serde_json::json!(r.columns));
+                    data.insert("rows".into(), serde_json::json!(r.rows));
+                    data.insert("row_count".into(), serde_json::json!(r.row_count));
+                    data.insert("affected_rows".into(), serde_json::json!(r.affected_rows));
+                    data.insert("elapsed_ms".into(), serde_json::json!(r.elapsed_ms));
+                    data.insert("truncated".into(), serde_json::json!(r.truncated));
+                    // Pre-formatted renderings for downstream email / logs —
+                    // saves every template author from writing their own
+                    // loop over rows.
+                    data.insert("rows_csv".into(), serde_json::json!(render_rows_csv(&r.columns, &r.rows)));
+                    data.insert("rows_markdown".into(), serde_json::json!(render_rows_markdown(&r.columns, &r.rows)));
+                    let summary = format!(
+                        "{:?} on '{}': {} rows{}{}",
+                        permission, connection_id, r.row_count,
+                        r.affected_rows.map(|a| format!(" (affected {})", a)).unwrap_or_default(),
+                        if r.truncated { " (truncated)" } else { "" },
+                    );
+                    Ok(structured_output(summary, data))
+                }
+                Err(e) => Err(format!("SqlQuery failed: {}", e)),
+            }
+        }
+
+        ActionType::SendEmail { to, subject, body, html } => {
+            let cfg = crate::ai::AiConfig::load();
+            if cfg.smtp_host.is_empty() {
+                return Err("SendEmail: SMTP not configured — Settings → AI Agent → Email".into());
+            }
+            if to.is_empty() {
+                return Err("SendEmail: `to` is empty".into());
+            }
+            match crate::wolfagents::dispatch::send_email_generic(
+                &cfg, to, subject, body, *html,
+            ) {
+                Ok(()) => {
+                    let mut data = serde_json::Map::new();
+                    data.insert("to".into(), serde_json::json!(to));
+                    data.insert("subject".into(), serde_json::json!(subject));
+                    Ok(structured_output(
+                        format!("Emailed {} recipient(s): {}", to.len(), subject),
+                        data,
+                    ))
+                }
+                Err(e) => Err(format!("SendEmail failed: {}", e)),
+            }
+        }
     }
+}
+
+/// Turn `{columns, rows}` into a CSV string. Quoting follows RFC 4180:
+/// values containing commas, quotes, or newlines get wrapped in
+/// double-quotes with internal quotes doubled. Null = empty field.
+fn render_rows_csv(columns: &[String], rows: &[Vec<serde_json::Value>]) -> String {
+    fn esc(s: &str) -> String {
+        if s.contains(',') || s.contains('"') || s.contains('\n') {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        } else {
+            s.to_string()
+        }
+    }
+    let mut out = String::new();
+    out.push_str(&columns.iter().map(|c| esc(c)).collect::<Vec<_>>().join(","));
+    out.push('\n');
+    for row in rows {
+        let cells: Vec<String> = row.iter().map(|v| {
+            match v {
+                serde_json::Value::Null => String::new(),
+                serde_json::Value::String(s) => esc(s),
+                other => esc(&other.to_string()),
+            }
+        }).collect();
+        out.push_str(&cells.join(","));
+        out.push('\n');
+    }
+    out
+}
+
+/// Turn `{columns, rows}` into a GitHub-flavoured Markdown table.
+/// First ~50 rows only so a huge result doesn't bloat an email body —
+/// CSV rendering at full fidelity is available alongside.
+fn render_rows_markdown(columns: &[String], rows: &[Vec<serde_json::Value>]) -> String {
+    let mut out = String::new();
+    out.push('|');
+    for c in columns { out.push_str(&format!(" {} |", c)); }
+    out.push('\n');
+    out.push('|');
+    for _ in columns { out.push_str(" --- |"); }
+    out.push('\n');
+    for row in rows.iter().take(50) {
+        out.push('|');
+        for v in row {
+            let s = match v {
+                serde_json::Value::Null => String::new(),
+                serde_json::Value::String(s) => s.replace('|', "\\|").replace('\n', " "),
+                other => other.to_string(),
+            };
+            out.push_str(&format!(" {} |", s));
+        }
+        out.push('\n');
+    }
+    if rows.len() > 50 {
+        out.push_str(&format!("_…{} more rows (CSV attachment has the full set)_\n", rows.len() - 50));
+    }
+    out
 }
 
 /// Run a command with a timeout, capturing stdout+stderr

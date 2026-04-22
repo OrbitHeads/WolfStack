@@ -1846,6 +1846,30 @@
                         </div>
 
                         <div style="border-top:1px solid var(--border); padding-top:12px;">
+                            <label style="font-size:13px; font-weight:600;">🗄️ SQL Access</label>
+                            <small style="color:var(--text-muted); display:block; margin-bottom:8px;">
+                                Three independent tiers. Enable only what this agent needs. Configure connections under <a href="#" onclick="selectView('settings'); switchSettingsTab('sql'); return false;">Settings → 🗄️ SQL Connections</a>.
+                            </small>
+                            <div style="display:flex; gap:16px; flex-wrap:wrap; margin-bottom:8px;">
+                                <label style="display:flex; gap:6px; align-items:center; font-size:13px;">
+                                    <input type="checkbox" id="wolfagents-field-sql-read">
+                                    <span><b>Read</b> — SELECT / SHOW / EXPLAIN</span>
+                                </label>
+                                <label style="display:flex; gap:6px; align-items:center; font-size:13px;">
+                                    <input type="checkbox" id="wolfagents-field-sql-update">
+                                    <span><b>Update</b> — INSERT / UPDATE</span>
+                                </label>
+                                <label style="display:flex; gap:6px; align-items:center; font-size:13px;">
+                                    <input type="checkbox" id="wolfagents-field-sql-delete">
+                                    <span><b>Delete</b> — DELETE / TRUNCATE</span>
+                                </label>
+                            </div>
+                            <label style="font-size:12px; color:var(--text-muted);">Allowed connection IDs (comma-separated)</label>
+                            <input id="wolfagents-field-sql-connections" type="text" class="form-control" placeholder="e.g. mike-prod-ab12, reporting-cd34">
+                            <small style="color:var(--text-muted); display:block; margin-top:2px;">Empty = no SQL access. The agent can only query connections listed here.</small>
+                        </div>
+
+                        <div style="border-top:1px solid var(--border); padding-top:12px;">
                             <label style="font-size:13px; font-weight:600;">🧰 Allowed Tools</label>
                             <small style="color:var(--text-muted); display:block; margin-bottom:6px;">
                                 Each tool must be explicitly granted. Newly created agents start with zero tools — even read-only ones.
@@ -4279,6 +4303,7 @@
                         <button class="settings-tab-btn" onclick="switchSettingsTab('reverseproxy')">🌐 Reverse Proxy</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('github')">📤 GitHub Backup</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('wolfnote')">📝 WolfNote</button>
+                        <button class="settings-tab-btn" onclick="switchSettingsTab('sql')">🗄️ SQL Connections</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('plugins')">🔌 Plugins</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('apikeys')">🔑 API Keys / Enterprise</button>
                     </div>
@@ -5433,6 +5458,51 @@
                             <div id="wolfnote-notes-list" style="display:flex;flex-direction:column;gap:6px;">
                                 <div style="color:var(--text-muted);text-align:center;padding:20px;">Loading...</div>
                             </div>
+                        </div>
+                    </div>
+
+                    <!-- ─── SQL Connections Tab ─── -->
+                    <div id="settings-tab-sql" class="settings-tab-panel">
+                        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+                            <h4 style="margin:0;font-size:16px;font-weight:600;">SQL Connections</h4>
+                            <div style="display:flex;gap:8px;">
+                                <button class="btn btn-sm" onclick="sqlConnLoad()">Refresh</button>
+                                <button class="btn btn-primary btn-sm" onclick="sqlConnNew()">+ Add Connection</button>
+                            </div>
+                        </div>
+                        <p style="font-size:13px; color:var(--text-muted); margin:0 0 16px 0;">
+                            MariaDB, MySQL, and PostgreSQL database profiles shared by <b>AI Agents</b> and <b>WolfFlow workflows</b>.
+                            Passwords are encrypted at rest using the cluster secret.
+                            Per-agent / per-workflow permissions (Read / Update / Delete) are configured separately — this tab just stores credentials.
+                        </p>
+                        <div id="sql-conn-list" style="display:grid; gap:10px;">
+                            <div style="color:var(--text-muted);text-align:center;padding:20px;">Loading…</div>
+                        </div>
+
+                        <!-- Query tester — appears when a connection has been picked -->
+                        <div id="sql-conn-tester" style="margin-top:24px; display:none;">
+                            <h4 style="margin:0 0 8px 0; font-size:15px; font-weight:600;">Run a query against <span id="sql-conn-tester-label"></span></h4>
+                            <p style="font-size:12px; color:var(--text-muted); margin:0 0 10px 0;">
+                                One statement only. Read = SELECT/SHOW/EXPLAIN. Update = +INSERT/UPDATE. Delete = +DELETE/TRUNCATE. DDL (CREATE/ALTER/DROP) is never allowed here — use the dedicated MySQL Editor for schema changes.
+                            </p>
+                            <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px;">
+                                <label style="font-size:13px;">Permission:
+                                    <select id="sql-conn-tester-perm" class="form-control" style="display:inline-block; width:auto; margin-left:6px;">
+                                        <option value="read">Read</option>
+                                        <option value="update">Update</option>
+                                        <option value="delete">Delete</option>
+                                    </select>
+                                </label>
+                                <label style="font-size:13px;">Timeout (s):
+                                    <input id="sql-conn-tester-timeout" type="number" min="1" max="300" value="30" class="form-control" style="display:inline-block; width:90px; margin-left:6px;">
+                                </label>
+                            </div>
+                            <textarea id="sql-conn-tester-query" class="form-control" rows="4" placeholder="SELECT COUNT(*) FROM accounts.invoices;" style="font-family:monospace;"></textarea>
+                            <div style="display:flex; gap:8px; margin-top:8px;">
+                                <button class="btn btn-primary btn-sm" onclick="sqlConnRunQuery()">Run query</button>
+                                <button class="btn btn-sm" onclick="sqlConnTesterHide()">Close</button>
+                            </div>
+                            <div id="sql-conn-tester-result" style="margin-top:12px;"></div>
                         </div>
                     </div>
 

@@ -1089,5 +1089,27 @@ fn input_schema_for(tool: ToolId) -> serde_json::Value {
                 "body": { "description": "Optional JSON body for POST/PUT/PATCH" }
             }
         }),
+        // One schema for all three SQL tools. The dispatcher picks
+        // Read / Update / Delete based on which tool name the model
+        // emits; the sqlparser classifier rejects any statement that
+        // exceeds that tier at execution time.
+        ToolId::SqlRead | ToolId::SqlUpdate | ToolId::SqlDelete => serde_json::json!({
+            "type": "object",
+            "required": ["connection_id", "query"],
+            "properties": {
+                "connection_id": {
+                    "type": "string",
+                    "description": "ID of a configured SQL connection (see allowed_sql_connections in the agent's scope)."
+                },
+                "query": {
+                    "type": "string",
+                    "description": "A single SQL statement. SELECT/SHOW/EXPLAIN for sql_read; INSERT/UPDATE additionally for sql_update; DELETE/TRUNCATE additionally for sql_delete. Multi-statement queries are rejected."
+                },
+                "timeout_secs": {
+                    "type": "integer", "minimum": 1, "maximum": 300,
+                    "description": "Override the default 30s execution timeout."
+                }
+            }
+        }),
     }
 }

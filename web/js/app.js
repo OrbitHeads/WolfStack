@@ -25409,6 +25409,8 @@ function switchSettingsTab(tabName) {
         loadUsers();
     } else if (tabName === 'wolfnote') {
         loadWolfNoteConfig();
+    } else if (tabName === 'sql') {
+        sqlConnLoad();
     } else if (tabName === 'plugins') {
         loadPlugins();
     } else if (tabName === 'apikeys') {
@@ -36344,6 +36346,8 @@ const wfActionColors = {
     truenas_action:     '#14b8a6',
     unifi_action:       '#6366f1',
     integration_action: '#a855f7',
+    sql_query:          '#eab308',
+    send_email:         '#a78bfa',
 };
 const wfActionIcons = {
     update_packages:    '\u{1F4E6}',
@@ -36362,6 +36366,8 @@ const wfActionIcons = {
     truenas_action:     '\u{1F4BE}',
     unifi_action:       '\u{1F4F6}',
     integration_action: '\u{1F517}',
+    sql_query:          '\u{1F5C4}',  // 🗄️
+    send_email:         '\u{1F4E7}',  // 📧
 };
 
 // ═══ Cluster Browser ═══════════════════════════════════════════════════════
@@ -39665,6 +39671,17 @@ async function wolfAgentsOpenEdit() {
         document.getElementById('wolfagents-field-scope-paths').value = _arrayToCsv(scope.allowed_paths);
         document.getElementById('wolfagents-field-scope-api').value = _arrayToCsv(scope.allowed_api_paths);
         document.getElementById('wolfagents-field-scope-email').value = _arrayToCsv(scope.allowed_email_recipients);
+        // SQL permissions + connection allowlist (added in v19.10.0).
+        // Tolerant of older payloads — everything defaults to empty /
+        // unchecked which is the safe-by-default posture.
+        const sqlConnEl = document.getElementById('wolfagents-field-sql-connections');
+        if (sqlConnEl) sqlConnEl.value = _arrayToCsv(scope.allowed_sql_connections);
+        const sqlReadEl = document.getElementById('wolfagents-field-sql-read');
+        if (sqlReadEl) sqlReadEl.checked = !!a.sql_read;
+        const sqlUpdEl = document.getElementById('wolfagents-field-sql-update');
+        if (sqlUpdEl) sqlUpdEl.checked = !!a.sql_update;
+        const sqlDelEl = document.getElementById('wolfagents-field-sql-delete');
+        if (sqlDelEl) sqlDelEl.checked = !!a.sql_delete;
         document.getElementById('wolfagents-field-discord-id').value = (a.discord && a.discord.channel_id) || '';
         document.getElementById('wolfagents-field-discord-label').value = (a.discord && a.discord.channel_label) || '';
         var _dt2 = document.getElementById('wolfagents-field-discord-token'); if (_dt2) _dt2.value = (a.discord && a.discord.bot_token) || '';
@@ -39704,8 +39721,16 @@ async function wolfAgentsSaveFromModal() {
             allowed_paths: _csvToArray(document.getElementById('wolfagents-field-scope-paths').value),
             allowed_api_paths: _csvToArray(document.getElementById('wolfagents-field-scope-api').value),
             allowed_email_recipients: _csvToArray(document.getElementById('wolfagents-field-scope-email').value),
+            allowed_sql_connections: _csvToArray(document.getElementById('wolfagents-field-sql-connections')?.value || ''),
         },
         allowed_tools: _wolfAgentsReadToolCheckboxes(),
+        // SQL permission flags — each is a separate opt-in. The
+        // backend gate-checks every query: operator must enable the
+        // flag AND add the connection to the allowlist AND the
+        // sqlparser must agree the statement fits the tier.
+        sql_read: !!document.getElementById('wolfagents-field-sql-read')?.checked,
+        sql_update: !!document.getElementById('wolfagents-field-sql-update')?.checked,
+        sql_delete: !!document.getElementById('wolfagents-field-sql-delete')?.checked,
     };
     // Avatar: empty string means "clear" (backend sends null), non-empty
     // is either a built-in filename or a data: URL from the uploader.
@@ -40819,4 +40844,286 @@ function cpLazyRefresh() { /* no-op: native CSS handles it */ }
     `;
     document.head.appendChild(s);
 })();
+
+// ═══════════════════════════════════════════════════
+// ─── SQL Connections (Settings → 🗄️ SQL Connections) ───
+// ═══════════════════════════════════════════════════
+//
+// Shared config for AI agents + WolfFlow. The backend lives in
+// src/sql_connections/mod.rs; this UI is pure CRUD plus a query
+// tester. Per-agent / per-workflow permissions are configured in
+// their respective editors — not here.
+
+let _sqlConnCache = [];
+let _sqlConnTesterId = null;
+
+async function sqlConnLoad() {
+    const wrap = document.getElementById('sql-conn-list');
+    if (!wrap) return;
+    wrap.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:20px;">Loading…</div>';
+    try {
+        const resp = await fetch('/api/sql-connections');
+        if (handleAuthError(resp)) return;
+        const data = await resp.json();
+        _sqlConnCache = data.connections || [];
+        sqlConnRender();
+    } catch (e) {
+        wrap.innerHTML = `<div style="color:var(--danger); padding:12px;">Failed to load: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function sqlConnRender() {
+    const wrap = document.getElementById('sql-conn-list');
+    if (!wrap) return;
+    if (_sqlConnCache.length === 0) {
+        wrap.innerHTML = `<div style="text-align:center; padding:24px; color:var(--text-muted); border:1px dashed var(--border); border-radius:8px;">
+            No SQL connections configured yet.<br>Click <b>+ Add Connection</b> to configure the first one.
+        </div>`;
+        return;
+    }
+    wrap.innerHTML = _sqlConnCache.map(c => sqlConnRow(c)).join('');
+}
+
+function sqlConnRow(c) {
+    const kindIcon = c.kind === 'postgres' ? '🐘' : (c.kind === 'mariadb' ? '🦭' : '🐬');
+    const kindLabel = { postgres: 'PostgreSQL', mariadb: 'MariaDB', mysql: 'MySQL' }[c.kind] || c.kind;
+    return `<div style="border:1px solid var(--border); border-radius:8px; padding:12px 14px; background:var(--bg-card);">
+        <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px;">
+            <div style="flex:1; min-width:0;">
+                <div style="font-size:14px; font-weight:600;">${kindIcon} ${escapeHtml(c.label)}
+                    <span style="color:var(--text-muted); font-weight:normal; font-size:12px;">— ${kindLabel}</span></div>
+                <div style="font-size:12px; color:var(--text-muted); margin-top:4px;">
+                    <code>${escapeHtml(c.username)}@${escapeHtml(c.host)}:${c.port}/${escapeHtml(c.database)}</code>
+                    ${c.has_password ? '' : ' <span style="color:var(--warning);">(no password)</span>'}
+                </div>
+                <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">id: <code>${escapeHtml(c.id)}</code></div>
+            </div>
+            <div style="display:flex; gap:6px; flex-wrap:wrap;">
+                <button class="btn btn-sm" onclick="sqlConnTest('${escapeHtml(c.id)}', this)">Test</button>
+                <button class="btn btn-sm" onclick="sqlConnTesterShow('${escapeHtml(c.id)}', '${escapeHtml(c.label)}')">Run query</button>
+                <button class="btn btn-sm" onclick="sqlConnEdit('${escapeHtml(c.id)}')">Edit</button>
+                <button class="btn btn-danger btn-sm" onclick="sqlConnDelete('${escapeHtml(c.id)}')">Delete</button>
+            </div>
+        </div>
+        <div id="sql-conn-status-${c.id}" style="margin-top:6px; font-size:12px;"></div>
+    </div>`;
+}
+
+function sqlConnNew() {
+    sqlConnShowEditor(null);
+}
+
+function sqlConnEdit(id) {
+    const existing = _sqlConnCache.find(c => c.id === id);
+    if (!existing) { showToast('Connection not found', 'error'); return; }
+    sqlConnShowEditor(existing);
+}
+
+function sqlConnShowEditor(existing) {
+    const isEdit = !!existing;
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay active';
+    overlay.id = 'sql-conn-editor';
+    overlay.innerHTML = `
+        <div class="modal" style="max-width:560px;">
+            <div class="modal-header">
+                <h3>${isEdit ? 'Edit' : 'New'} SQL Connection</h3>
+                <button class="modal-close" onclick="document.getElementById('sql-conn-editor').remove()">×</button>
+            </div>
+            <div class="modal-body">
+                <div style="display:grid; gap:12px;">
+                    <label>Label
+                        <input id="sql-e-label" class="form-control" value="${escapeHtml(existing?.label || '')}" placeholder="e.g. mike prod">
+                    </label>
+                    <label>Database type
+                        <select id="sql-e-kind" class="form-control" onchange="sqlConnKindChanged()">
+                            <option value="mariadb" ${existing?.kind === 'mariadb' ? 'selected' : ''}>MariaDB</option>
+                            <option value="mysql" ${existing?.kind === 'mysql' ? 'selected' : ''}>MySQL</option>
+                            <option value="postgres" ${existing?.kind === 'postgres' ? 'selected' : ''}>PostgreSQL</option>
+                        </select>
+                    </label>
+                    <div style="display:grid; grid-template-columns: 2fr 1fr; gap:8px;">
+                        <label>Host
+                            <input id="sql-e-host" class="form-control" value="${escapeHtml(existing?.host || '')}" placeholder="db.internal or 10.0.0.5">
+                        </label>
+                        <label>Port
+                            <input id="sql-e-port" type="number" class="form-control" value="${existing?.port || 3306}" min="1" max="65535">
+                        </label>
+                    </div>
+                    <label>Database
+                        <input id="sql-e-database" class="form-control" value="${escapeHtml(existing?.database || '')}" placeholder="accounts">
+                    </label>
+                    <label>Username
+                        <input id="sql-e-username" class="form-control" value="${escapeHtml(existing?.username || '')}" placeholder="readonly_user">
+                    </label>
+                    <label>Password ${isEdit ? '<span style="color:var(--text-muted); font-weight:normal;">(leave blank to keep existing)</span>' : ''}
+                        <input id="sql-e-password" type="password" class="form-control" placeholder="${isEdit && existing?.has_password ? '••••••••' : ''}" autocomplete="new-password">
+                    </label>
+                    <label>SSL mode
+                        <select id="sql-e-ssl" class="form-control">
+                            <option value="disable" ${existing?.ssl_mode === 'disable' || !existing ? 'selected' : ''}>Disable (plaintext)</option>
+                            <option value="prefer" ${existing?.ssl_mode === 'prefer' ? 'selected' : ''}>Prefer</option>
+                            <option value="require" ${existing?.ssl_mode === 'require' ? 'selected' : ''}>Require</option>
+                        </select>
+                    </label>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="document.getElementById('sql-conn-editor').remove()">Cancel</button>
+                <button class="btn btn-primary" onclick="sqlConnSave('${existing?.id || ''}')">${isEdit ? 'Save changes' : 'Create'}</button>
+            </div>
+        </div>`;
+    document.body.appendChild(overlay);
+    sqlConnKindChanged();
+}
+
+function sqlConnKindChanged() {
+    const kind = document.getElementById('sql-e-kind').value;
+    const portInput = document.getElementById('sql-e-port');
+    // Only auto-fill if the field is empty or still holds the previous
+    // default — don't overwrite a port the operator explicitly set.
+    const current = parseInt(portInput.value, 10);
+    if (current === 3306 || current === 5432 || !current) {
+        portInput.value = kind === 'postgres' ? 5432 : 3306;
+    }
+}
+
+async function sqlConnSave(existingId) {
+    const body = {
+        id: existingId,
+        label: document.getElementById('sql-e-label').value.trim(),
+        kind: document.getElementById('sql-e-kind').value,
+        host: document.getElementById('sql-e-host').value.trim(),
+        port: parseInt(document.getElementById('sql-e-port').value, 10) || 3306,
+        database: document.getElementById('sql-e-database').value.trim(),
+        username: document.getElementById('sql-e-username').value.trim(),
+        password: document.getElementById('sql-e-password').value,  // empty = keep
+        ssl_mode: document.getElementById('sql-e-ssl').value,
+    };
+    if (!body.label || !body.host || !body.database || !body.username) {
+        showToast('Label, host, database, and username are required.', 'error');
+        return;
+    }
+    const url = existingId ? `/api/sql-connections/${encodeURIComponent(existingId)}` : '/api/sql-connections';
+    const method = existingId ? 'PUT' : 'POST';
+    try {
+        const resp = await fetch(url, {
+            method, headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Save failed', 'error'); return; }
+        document.getElementById('sql-conn-editor').remove();
+        showToast(existingId ? 'Connection updated' : 'Connection created', 'success');
+        sqlConnLoad();
+    } catch (e) {
+        showToast('Save failed: ' + e.message, 'error');
+    }
+}
+
+async function sqlConnDelete(id) {
+    const ok = await wolfConfirm(
+        `Delete SQL connection '${id}'? Any agents or workflows that reference it will fail at next invocation.`,
+        'Delete SQL connection', { okText: 'Delete', danger: true }
+    );
+    if (!ok) return;
+    try {
+        const resp = await fetch(`/api/sql-connections/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Delete failed', 'error'); return; }
+        showToast('Connection deleted', 'success');
+        sqlConnLoad();
+    } catch (e) {
+        showToast('Delete failed: ' + e.message, 'error');
+    }
+}
+
+async function sqlConnTest(id, btn) {
+    const statusEl = document.getElementById(`sql-conn-status-${id}`);
+    if (statusEl) statusEl.innerHTML = '<span style="color:var(--text-muted);">Testing…</span>';
+    if (btn) btn.disabled = true;
+    try {
+        const resp = await fetch(`/api/sql-connections/${encodeURIComponent(id)}/test`, { method: 'POST' });
+        const data = await resp.json();
+        if (data.ok) {
+            if (statusEl) statusEl.innerHTML = `<span style="color:var(--success);">✅ OK — ${escapeHtml(data.version || 'connected')}</span>`;
+        } else {
+            if (statusEl) statusEl.innerHTML = `<span style="color:var(--danger);">❌ ${escapeHtml(data.error || 'failed')}</span>`;
+        }
+    } catch (e) {
+        if (statusEl) statusEl.innerHTML = `<span style="color:var(--danger);">❌ ${escapeHtml(e.message)}</span>`;
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
+function sqlConnTesterShow(id, label) {
+    _sqlConnTesterId = id;
+    const tester = document.getElementById('sql-conn-tester');
+    if (!tester) return;
+    tester.style.display = '';
+    document.getElementById('sql-conn-tester-label').textContent = label;
+    document.getElementById('sql-conn-tester-result').innerHTML = '';
+    tester.scrollIntoView({ behavior: 'smooth' });
+}
+
+function sqlConnTesterHide() {
+    _sqlConnTesterId = null;
+    const tester = document.getElementById('sql-conn-tester');
+    if (tester) tester.style.display = 'none';
+}
+
+async function sqlConnRunQuery() {
+    if (!_sqlConnTesterId) return;
+    const query = document.getElementById('sql-conn-tester-query').value;
+    const permission = document.getElementById('sql-conn-tester-perm').value;
+    const timeout_secs = parseInt(document.getElementById('sql-conn-tester-timeout').value, 10) || 30;
+    const resultEl = document.getElementById('sql-conn-tester-result');
+    resultEl.innerHTML = '<div style="color:var(--text-muted);">Running…</div>';
+    try {
+        const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_sqlConnTesterId)}/query`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query, permission, timeout_secs }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+            resultEl.innerHTML = `<div style="color:var(--danger); padding:10px; background:var(--bg-primary); border-radius:6px; white-space:pre-wrap;">${escapeHtml(data.error || 'Query failed')}</div>`;
+            return;
+        }
+        sqlConnRenderResult(resultEl, data);
+    } catch (e) {
+        resultEl.innerHTML = `<div style="color:var(--danger);">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function sqlConnRenderResult(el, r) {
+    const meta = `<div style="font-size:12px; color:var(--text-muted); margin-bottom:6px;">
+        ${r.row_count} row${r.row_count === 1 ? '' : 's'}
+        ${r.affected_rows != null ? ` · affected ${r.affected_rows}` : ''}
+        · ${r.elapsed_ms}ms${r.truncated ? ' · <span style="color:var(--warning);">truncated</span>' : ''}
+    </div>`;
+    if (!r.rows || r.rows.length === 0) {
+        el.innerHTML = meta + '<div style="color:var(--text-muted);">(no rows)</div>';
+        return;
+    }
+    const maxShow = 200;
+    const shown = r.rows.slice(0, maxShow);
+    let html = meta + '<div style="max-height:400px; overflow:auto; border:1px solid var(--border); border-radius:6px;">';
+    html += '<table class="data-table" style="width:100%; font-family:monospace; font-size:12px;"><thead><tr>';
+    for (const c of r.columns) html += `<th>${escapeHtml(c)}</th>`;
+    html += '</tr></thead><tbody>';
+    for (const row of shown) {
+        html += '<tr>';
+        for (const v of row) {
+            const text = v === null ? '<span style="color:var(--text-muted);">NULL</span>' : escapeHtml(String(v));
+            html += `<td style="padding:4px 8px; border-top:1px solid var(--border);">${text}</td>`;
+        }
+        html += '</tr>';
+    }
+    html += '</tbody></table></div>';
+    if (r.rows.length > maxShow) {
+        html += `<div style="font-size:11px; color:var(--text-muted); margin-top:4px;">Showing first ${maxShow} of ${r.rows.length} rows.</div>`;
+    }
+    el.innerHTML = html;
+}
 

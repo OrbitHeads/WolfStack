@@ -164,6 +164,16 @@ pub struct TargetScope {
     /// external addresses.
     #[serde(default)]
     pub allowed_email_recipients: Vec<String>,
+    /// IDs of SQL connections (from `src/sql_connections`) this agent
+    /// may target. Empty = no SQL access. The connection list is
+    /// configured globally in Settings → SQL Connections; this
+    /// allowlist is how operators give agent X access to DB Y
+    /// without also giving it access to DB Z. Combined with the
+    /// three per-agent `sql_read` / `sql_update` / `sql_delete`
+    /// booleans below, the agent can do exactly what the operator
+    /// permits — no more.
+    #[serde(default)]
+    pub allowed_sql_connections: Vec<String>,
 }
 
 /// One named agent. Persisted as an entry in
@@ -240,6 +250,20 @@ pub struct Agent {
     /// operators can see who's active vs dormant.
     #[serde(default)]
     pub last_active_at: Option<u64>,
+    /// SQL query permissions — granular because "read-only" is a
+    /// different risk class from "can delete rows". Each flag gates
+    /// the matching agent tool (`sql_read`, `sql_update`,
+    /// `sql_delete`); the sqlparser dialect classifier inside
+    /// `sql_connections::execute` enforces the same tiering at the
+    /// query level so a typo can't slip a DELETE through a
+    /// read-only channel. Granting `sql_update` or `sql_delete`
+    /// also requires `access_level >= ReadWrite` — we check both.
+    #[serde(default)]
+    pub sql_read: bool,
+    #[serde(default)]
+    pub sql_update: bool,
+    #[serde(default)]
+    pub sql_delete: bool,
 }
 
 fn default_memory_max_lines() -> usize { 40 }
@@ -773,5 +797,11 @@ pub fn new_default(name: String) -> Agent {
         whatsapp: None,
         created_at: now,
         last_active_at: None,
+        // SQL permissions default off; operator explicitly opts in via
+        // the Edit Agent dialog once they've also picked which
+        // connections the agent can touch.
+        sql_read: false,
+        sql_update: false,
+        sql_delete: false,
     }
 }

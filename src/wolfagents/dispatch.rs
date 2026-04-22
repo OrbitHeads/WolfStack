@@ -223,6 +223,10 @@ pub async fn dispatch(
         ToolId::DeleteFile => tool_delete_file(arguments, agent, state).await,
 
         ToolId::WolfstackApi => tool_wolfstack_api(arguments, agent, state).await,
+
+        ToolId::SqlRead => tool_sql_query(arguments, agent, state, crate::sql_connections::SqlPermission::Read).await,
+        ToolId::SqlUpdate => tool_sql_query(arguments, agent, state, crate::sql_connections::SqlPermission::Update).await,
+        ToolId::SqlDelete => tool_sql_query(arguments, agent, state, crate::sql_connections::SqlPermission::Delete).await,
     };
 
     let outcome = if result.ok {
@@ -1678,7 +1682,10 @@ fn recipient_permitted(addr: &str, allowed: &[String], default_to: &str) -> bool
     false
 }
 
-fn send_email_generic(
+/// Exposed `pub(crate)` so `src/wolfflow/mod.rs::ActionType::SendEmail`
+/// can reuse the same SMTP path as the agent `send_email` tool —
+/// single source of truth for email delivery.
+pub(crate) fn send_email_generic(
     config: &crate::ai::AiConfig,
     to: &[String],
     subject: &str,
@@ -2252,6 +2259,92 @@ pub(crate) fn bm25_rank(query: &str, docs: &[SearchDoc], limit: usize) -> Vec<se
             "snippet": truncate(&d.text, 400),
         })
     }).collect()
+}
+
+/// Run a SQL query on behalf of an agent. One implementation for all
+/// three SQL tools — the `requested` permission distinguishes Read /
+/// Update / Delete. Belt-and-braces: we enforce three independent
+/// gates here, any of which is sufficient to refuse:
+///
+/// 1. **Per-agent permission flag** (`agent.sql_read/update/delete`) —
+///    `sql_update` also requires `sql_read=true` implicitly (you can't
+///    write without reading). Same for `sql_delete`. Operators who
+///    grant Delete without Read are rare but possible; we treat the
+///    absence of a prerequisite flag as "missing scope", not as an
+///    auto-grant.
+/// 2. **Connection allowlist** (`agent.allowed_sql_connections`) —
+///    empty = no SQL access.
+/// 3. **Per-statement classifier** (`sql_connections::classify`) —
+///    rejects stacked statements, DDL, and any statement above the
+///    requested tier regardless of which tool the agent invoked.
+async fn tool_sql_query(
+    args: &serde_json::Value,
+    agent: &Agent,
+    state: &crate::api::AppState,
+    requested: crate::sql_connections::SqlPermission,
+) -> ToolResult {
+    use crate::sql_connections::SqlPermission as P;
+
+    // Gate 1: per-agent permission flag.
+    let has_perm = match requested {
+        P::Read => agent.sql_read || agent.sql_update || agent.sql_delete,
+        P::Update => agent.sql_update,
+        P::Delete => agent.sql_delete,
+    };
+    if !has_perm {
+        return ToolResult::err(format!(
+            "agent '{}' does not have the {:?} SQL permission — operator must enable it in the agent editor",
+            agent.id, requested
+        ));
+    }
+
+    let connection_id = args.get("connection_id")
+        .or_else(|| args.get("connection"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("").trim().to_string();
+    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let timeout_secs = args.get("timeout_secs").and_then(|v| v.as_u64());
+
+    if connection_id.is_empty() {
+        return ToolResult::err("sql query requires `connection_id` (the id of a configured SQL connection)".into());
+    }
+    if query.trim().is_empty() {
+        return ToolResult::err("sql query requires a non-empty `query` string".into());
+    }
+
+    // Gate 2: connection allowlist.
+    if !agent.target_scope.allowed_sql_connections.iter().any(|c| c == &connection_id) {
+        return ToolResult::err(format!(
+            "agent '{}' is not permitted to use sql connection '{}' — add it to allowed_sql_connections",
+            agent.id, connection_id
+        ));
+    }
+
+    // Gate 3 (classifier) is inside execute().
+    match crate::sql_connections::execute(
+        &connection_id,
+        &query,
+        requested,
+        crate::sql_connections::Caller::Agent(agent.id.clone()),
+        &state.cluster_secret,
+        timeout_secs.map(std::time::Duration::from_secs),
+    ).await {
+        Ok(r) => ToolResult::ok(
+            format!("sql {:?} on '{}' — {} rows in {}ms{}",
+                requested, connection_id, r.row_count, r.elapsed_ms,
+                if r.truncated { " (truncated)" } else { "" }),
+            serde_json::json!({
+                "connection_id": connection_id,
+                "columns": r.columns,
+                "rows": r.rows,
+                "row_count": r.row_count,
+                "affected_rows": r.affected_rows,
+                "elapsed_ms": r.elapsed_ms,
+                "truncated": r.truncated,
+            }),
+        ),
+        Err(e) => ToolResult::err(e),
+    }
 }
 
 #[cfg(test)]

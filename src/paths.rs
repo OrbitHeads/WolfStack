@@ -145,6 +145,12 @@ pub struct FileLocations {
     // ── Ports ─────────────────────────────────────
     #[serde(default = "default_ports_config")]
     pub ports_config: String,
+
+    // ── SQL Connections (agent + wolfflow) ────────
+    #[serde(default = "default_sql_connections_config")]
+    pub sql_connections_config: String,
+    #[serde(default = "default_sql_audit_log")]
+    pub sql_audit_log: String,
 }
 
 // ── Default value functions ──────────────────────────
@@ -214,6 +220,9 @@ fn default_wolfnote_config() -> String { "/etc/wolfstack/wolfnote.json".into() }
 fn default_web_dir() -> String { "/opt/wolfstack/web".into() }
 
 fn default_ports_config() -> String { "/etc/wolfstack/ports.json".into() }
+
+fn default_sql_connections_config() -> String { "/etc/wolfstack/sql-connections.json".into() }
+fn default_sql_audit_log() -> String { "/var/log/wolfstack/sql-audit.log".into() }
 
 impl Default for FileLocations {
     fn default() -> Self {

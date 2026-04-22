@@ -71,6 +71,8 @@ lz4_flex = "0.11"
 # Database editors
 mysql_async = "0.34"
 tokio-postgres = { version = "0.7", features = ["runtime"] }
+deadpool-postgres = "0.14"
+sqlparser = "0.52"
 async-stream = "0.3.6"
 
 [workspace]

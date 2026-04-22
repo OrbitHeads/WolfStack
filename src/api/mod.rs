@@ -20202,9 +20202,193 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/wolfnote/folders", web::post().to(wolfnote_folders_create))
         .route("/api/wolfnote/notes", web::get().to(wolfnote_notes_list))
         .route("/api/wolfnote/notes", web::post().to(wolfnote_notes_create))
+        // SQL Connections — shared by AI agents + WolfFlow. CRUD only;
+        // query execution goes through the agent or workflow surface.
+        .route("/api/sql-connections", web::get().to(sql_connections_list))
+        .route("/api/sql-connections", web::post().to(sql_connections_create))
+        .route("/api/sql-connections/{id}", web::put().to(sql_connections_update))
+        .route("/api/sql-connections/{id}", web::delete().to(sql_connections_delete))
+        .route("/api/sql-connections/{id}/test", web::post().to(sql_connections_test))
+        .route("/api/sql-connections/{id}/query", web::post().to(sql_connections_query))
+        .route("/api/sql-connections/audit", web::get().to(sql_connections_audit))
         // Status Page (public — NO auth)
         .route("/status", web::get().to(statuspage_public_index))
         .route("/status/{slug}", web::get().to(statuspage_public_page));
+}
+
+// ═══════════════════════════════════════════════════
+// ─── SQL Connections API ───
+// ═══════════════════════════════════════════════════
+
+/// GET /api/sql-connections — list every configured connection with
+/// passwords masked (just `has_password: true|false`).
+pub async fn sql_connections_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let cfg = crate::sql_connections::load();
+    let safe: Vec<serde_json::Value> = cfg.connections.iter()
+        .map(|c| c.to_safe_json())
+        .collect();
+    HttpResponse::Ok().json(serde_json::json!({ "connections": safe }))
+}
+
+/// POST /api/sql-connections — create a new profile. Body is the
+/// SqlConnection struct with plaintext password; we encrypt before
+/// persisting. `id` is optional — if empty we generate one.
+pub async fn sql_connections_create(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<crate::sql_connections::SqlConnection>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let mut conn = body.into_inner();
+    if conn.id.trim().is_empty() {
+        conn.id = crate::sql_connections::gen_id(&conn.label);
+    }
+    let mut cfg = crate::sql_connections::load();
+    if cfg.connections.iter().any(|c| c.id == conn.id) {
+        return HttpResponse::Conflict().json(serde_json::json!({
+            "error": format!("connection id '{}' already exists", conn.id)
+        }));
+    }
+    if let Err(e) = crate::sql_connections::prepare_for_save(&mut conn, None, &state.cluster_secret) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+    cfg.connections.push(conn.clone());
+    if let Err(e) = crate::sql_connections::save(&cfg) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+    HttpResponse::Ok().json(serde_json::json!({ "connection": conn.to_safe_json() }))
+}
+
+/// PUT /api/sql-connections/{id} — update existing. Empty password
+/// means "keep the existing one".
+pub async fn sql_connections_update(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<crate::sql_connections::SqlConnection>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let mut cfg = crate::sql_connections::load();
+    let idx = match cfg.connections.iter().position(|c| c.id == id) {
+        Some(i) => i,
+        None => return HttpResponse::NotFound().json(serde_json::json!({ "error": "not found" })),
+    };
+    let mut incoming = body.into_inner();
+    incoming.id = id.clone();
+    let existing = cfg.connections[idx].clone();
+    if let Err(e) = crate::sql_connections::prepare_for_save(&mut incoming, Some(&existing), &state.cluster_secret) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+    cfg.connections[idx] = incoming.clone();
+    if let Err(e) = crate::sql_connections::save(&cfg) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+    // save() already drops all pools; no extra invalidation needed.
+    HttpResponse::Ok().json(serde_json::json!({ "connection": incoming.to_safe_json() }))
+}
+
+/// DELETE /api/sql-connections/{id}
+pub async fn sql_connections_delete(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let mut cfg = crate::sql_connections::load();
+    let before = cfg.connections.len();
+    cfg.connections.retain(|c| c.id != id);
+    if cfg.connections.len() == before {
+        return HttpResponse::NotFound().json(serde_json::json!({ "error": "not found" }));
+    }
+    if let Err(e) = crate::sql_connections::save(&cfg) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+    HttpResponse::Ok().json(serde_json::json!({ "deleted": id }))
+}
+
+/// POST /api/sql-connections/{id}/test — attempt a connection and run
+/// a cheap probe (SELECT VERSION() / SELECT version()). Returns the
+/// server version on success so the operator can eyeball it.
+pub async fn sql_connections_test(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let cfg = crate::sql_connections::load();
+    let conn = match cfg.connections.iter().find(|c| c.id == id) {
+        Some(c) => c.clone(),
+        None => return HttpResponse::NotFound().json(serde_json::json!({ "error": "not found" })),
+    };
+    match crate::sql_connections::test(&conn, &state.cluster_secret).await {
+        Ok(version) => HttpResponse::Ok().json(serde_json::json!({
+            "ok": true, "version": version,
+        })),
+        Err(e) => HttpResponse::Ok().json(serde_json::json!({
+            "ok": false, "error": e,
+        })),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SqlQueryRequest {
+    pub query: String,
+    #[serde(default)]
+    pub permission: Option<String>,  // "read" | "update" | "delete"
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// POST /api/sql-connections/{id}/query — ad-hoc query from the
+/// Settings UI (the "Run query" button on a connection). Requires
+/// logged-in auth. Audit-logs as `ui:<username>`.
+pub async fn sql_connections_query(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<SqlQueryRequest>,
+) -> HttpResponse {
+    // require_auth returns Ok(principal) — either the session username
+    // or "cluster-node" / "api-key:<id>" for non-interactive callers.
+    // That's exactly what we want to stamp into the audit log.
+    let username = match require_auth(&req, &state) {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+    let id = path.into_inner();
+    let perm = match body.permission.as_deref().unwrap_or("read") {
+        "delete" => crate::sql_connections::SqlPermission::Delete,
+        "update" => crate::sql_connections::SqlPermission::Update,
+        _ => crate::sql_connections::SqlPermission::Read,
+    };
+    let timeout = body.timeout_secs.map(std::time::Duration::from_secs);
+    match crate::sql_connections::execute(
+        &id, &body.query, perm,
+        crate::sql_connections::Caller::Ui(username),
+        &state.cluster_secret,
+        timeout,
+    ).await {
+        Ok(r) => HttpResponse::Ok().json(r),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// GET /api/sql-connections/audit?n=200 — return the last N audit-log
+/// entries. Capped at 1000.
+pub async fn sql_connections_audit(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    q: web::Query<std::collections::HashMap<String, String>>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let n = q.get("n").and_then(|s| s.parse::<usize>().ok()).unwrap_or(200);
+    HttpResponse::Ok().json(serde_json::json!({
+        "entries": crate::sql_connections::read_audit_tail(n)
+    }))
 }
 
 /// GET /status/{slug} — public status page on dedicated port 8550.

@@ -92,6 +92,15 @@ pub enum ToolId {
 
     // ── Universal WolfStack API (danger varies by method) ──────
     WolfstackApi,
+
+    // ── SQL (gated by Agent::sql_* booleans + connection allowlist) ──
+    // Three tools so the agent surface matches the three permission
+    // tiers — granting `sql_read` doesn't imply Update or Delete.
+    // Per-statement enforcement happens in sql_connections::classify
+    // regardless of which tool the agent picked.
+    SqlRead,
+    SqlUpdate,
+    SqlDelete,
 }
 
 impl ToolId {
@@ -121,6 +130,9 @@ impl ToolId {
             ToolId::ExecOnNode => "exec_on_node",
             ToolId::DeleteFile => "delete_file",
             ToolId::WolfstackApi => "wolfstack_api",
+            ToolId::SqlRead => "sql_read",
+            ToolId::SqlUpdate => "sql_update",
+            ToolId::SqlDelete => "sql_delete",
         }
     }
 
@@ -149,6 +161,9 @@ impl ToolId {
             ToolId::ExecOnNode => "Execute a shell command on a cluster node (self: full shell; remote: read-only allowlist — df, ps, cat, systemctl status, etc.)",
             ToolId::DeleteFile => "Delete a file on any cluster node (pass `node`; omit for self). Honours allowed_paths scope.",
             ToolId::WolfstackApi => "Call any WolfStack REST API endpoint",
+            ToolId::SqlRead => "Run a read-only SQL query (SELECT / SHOW / EXPLAIN) against a configured connection. Requires the agent's `sql_read` permission.",
+            ToolId::SqlUpdate => "Run an INSERT or UPDATE against a configured SQL connection. Requires the agent's `sql_update` permission.",
+            ToolId::SqlDelete => "Run a DELETE or TRUNCATE against a configured SQL connection. Requires the agent's `sql_delete` permission.",
         }
     }
 
@@ -181,10 +196,22 @@ impl ToolId {
 
             ToolId::RestartContainer | ToolId::RunWorkflow
             | ToolId::ScheduleWorkflow | ToolId::WriteFile
-            | ToolId::SendEmail | ToolId::WolfstackApi => Danger::Mutating,
+            | ToolId::SendEmail | ToolId::WolfstackApi
+            | ToolId::SqlRead   // Safe within the SQL sense (SELECT-only)
+                                //   but classed as Mutating to require
+                                //   ReadWrite — the operator explicitly
+                                //   opted in by setting `sql_read=true`
+                                //   AND picking connections, so this is
+                                //   their deliberate trust decision,
+                                //   but we don't want a ReadOnly agent
+                                //   to randomly SELECT-count a prod DB.
+            | ToolId::SqlUpdate
+                => Danger::Mutating,
 
             ToolId::ExecInContainer | ToolId::ExecOnNode
-            | ToolId::DeleteFile => Danger::Destructive,
+            | ToolId::DeleteFile
+            | ToolId::SqlDelete
+                => Danger::Destructive,
         }
     }
 
@@ -212,6 +239,9 @@ impl ToolId {
             "exec_on_node" => Some(ToolId::ExecOnNode),
             "delete_file" => Some(ToolId::DeleteFile),
             "wolfstack_api" => Some(ToolId::WolfstackApi),
+            "sql_read" => Some(ToolId::SqlRead),
+            "sql_update" => Some(ToolId::SqlUpdate),
+            "sql_delete" => Some(ToolId::SqlDelete),
             _ => None,
         }
     }
@@ -242,6 +272,9 @@ impl ToolId {
         ToolId::ExecOnNode,
         ToolId::DeleteFile,
         ToolId::WolfstackApi,
+        ToolId::SqlRead,
+        ToolId::SqlUpdate,
+        ToolId::SqlDelete,
     ];
 }
 
