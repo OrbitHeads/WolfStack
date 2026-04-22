@@ -41729,7 +41729,30 @@ async function dbMgrRenderDataTab(body) {
 async function dbMgrRenderStructureTab(body) {
     const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
     if (!conn) return;
-    body.innerHTML = '<div style="color:var(--text-muted);">Loading structure…</div>';
+    body.innerHTML = `
+        <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px;">
+            <button class="btn btn-sm" onclick="dbStructAddColumn()">➕ Add column</button>
+            <button class="btn btn-sm" onclick="dbStructAddIndex()">➕ Add index</button>
+            <button class="btn btn-sm" onclick="dbStructAddFk()">➕ Add foreign key</button>
+            <div style="flex:1;"></div>
+            <span style="font-size:11px; color:var(--text-muted); align-self:center;">Structural changes require <strong>Schema</strong> permission — the operator who submits them is audit-logged.</span>
+        </div>
+        <div style="display:grid; grid-template-columns:1fr; gap:14px;">
+            <div id="db-struct-columns"><div style="color:var(--text-muted);">Loading columns…</div></div>
+            <div id="db-struct-indexes"><div style="color:var(--text-muted);">Loading indexes…</div></div>
+            <div id="db-struct-fks"><div style="color:var(--text-muted);">Loading foreign keys…</div></div>
+        </div>
+    `;
+    dbStructLoadColumns();
+    dbStructLoadIndexes();
+    dbStructLoadFks();
+}
+
+async function dbStructLoadColumns() {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    const el = document.getElementById('db-struct-columns');
+    if (!el) return;
     try {
         let data;
         if (conn.kind === 'postgres') {
@@ -41745,13 +41768,246 @@ async function dbMgrRenderStructureTab(body) {
             data = await dbMgrRunSql(`DESCRIBE ${fq}`);
         }
         document.getElementById('db-mgr-info').textContent = `${data.row_count} columns`;
-        const wrap = document.createElement('div');
-        sqlConnRenderResult(wrap, data);
-        body.innerHTML = '';
-        body.appendChild(wrap);
+        // Render with a "Drop" button per row.
+        let html = '<h4 style="margin:0 0 6px; font-size:13px;">Columns</h4><table style="width:100%; font-size:12px; border-collapse:collapse;">';
+        html += '<thead><tr style="background:var(--bg-tertiary);">';
+        for (const c of data.columns) html += `<th style="padding:6px 8px; text-align:left; border-bottom:1px solid var(--border);">${escapeHtml(c)}</th>`;
+        html += '<th style="padding:6px 8px; border-bottom:1px solid var(--border);"></th></tr></thead><tbody>';
+        for (const row of data.rows) {
+            const colName = String(row[0]);
+            html += '<tr>';
+            for (const v of row) {
+                html += `<td style="padding:5px 8px; border-bottom:1px solid var(--border);">${escapeHtml(v == null ? '' : String(v))}</td>`;
+            }
+            html += `<td style="padding:5px 8px; border-bottom:1px solid var(--border); text-align:right;">
+                <button class="btn btn-sm" onclick="dbStructDropColumn('${escapeHtml(colName).replace(/'/g, "\\'")}')" style="padding:2px 8px; font-size:11px;">Drop</button>
+            </td>`;
+            html += '</tr>';
+        }
+        html += '</tbody></table>';
+        el.innerHTML = html;
     } catch (e) {
-        body.innerHTML = `<div style="color:var(--danger); white-space:pre-wrap; font-family:monospace; padding:10px; background:var(--bg-primary); border-radius:6px;">${escapeHtml(e.message)}</div>`;
+        el.innerHTML = `<div style="color:var(--danger); padding:6px; font-size:12px;">${escapeHtml(e.message)}</div>`;
     }
+}
+
+async function dbStructLoadIndexes() {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    const el = document.getElementById('db-struct-indexes');
+    if (!el) return;
+    try {
+        let data;
+        if (conn.kind === 'postgres') {
+            data = await dbMgrRunSql(
+                `SELECT indexname, indexdef FROM pg_indexes
+                 WHERE schemaname = '${_dbMgrCurrentDb.replace(/'/g, "''")}'
+                   AND tablename = '${_dbMgrCurrentTable.replace(/'/g, "''")}'
+                 ORDER BY indexname`
+            );
+        } else {
+            const fq = `${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentDb)}.${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentTable)}`;
+            data = await dbMgrRunSql(`SHOW INDEX FROM ${fq}`);
+        }
+        let html = '<h4 style="margin:0 0 6px; font-size:13px;">Indexes</h4>';
+        if (!data.rows.length) {
+            html += '<div style="color:var(--text-muted); font-size:12px;">(no indexes)</div>';
+        } else {
+            html += '<table style="width:100%; font-size:12px; border-collapse:collapse;"><thead><tr style="background:var(--bg-tertiary);">';
+            for (const c of data.columns) html += `<th style="padding:6px 8px; text-align:left; border-bottom:1px solid var(--border);">${escapeHtml(c)}</th>`;
+            html += '<th style="padding:6px 8px; border-bottom:1px solid var(--border);"></th></tr></thead><tbody>';
+            // Dedupe by index name (MySQL SHOW INDEX returns one row per column).
+            const seen = new Set();
+            for (const row of data.rows) {
+                const idxName = conn.kind === 'postgres' ? String(row[0]) : String(row[2]);
+                const dropKey = idxName + '||' + (conn.kind === 'postgres' ? '' : String(row[0]));
+                if (conn.kind !== 'postgres' && seen.has(idxName)) continue;
+                seen.add(idxName);
+                html += '<tr>';
+                for (const v of row) {
+                    html += `<td style="padding:5px 8px; border-bottom:1px solid var(--border);">${escapeHtml(v == null ? '' : String(v))}</td>`;
+                }
+                html += `<td style="padding:5px 8px; border-bottom:1px solid var(--border); text-align:right;">
+                    <button class="btn btn-sm" onclick="dbStructDropIndex('${escapeHtml(idxName).replace(/'/g, "\\'")}')" style="padding:2px 8px; font-size:11px;">Drop</button>
+                </td>`;
+                html += '</tr>';
+            }
+            html += '</tbody></table>';
+        }
+        el.innerHTML = html;
+    } catch (e) {
+        el.innerHTML = `<div style="color:var(--danger); padding:6px; font-size:12px;">Indexes: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+async function dbStructLoadFks() {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    const el = document.getElementById('db-struct-fks');
+    if (!el) return;
+    try {
+        let data;
+        if (conn.kind === 'postgres') {
+            data = await dbMgrRunSql(
+                `SELECT tc.constraint_name, kcu.column_name,
+                        ccu.table_schema || '.' || ccu.table_name AS references_table,
+                        ccu.column_name AS references_column,
+                        rc.update_rule, rc.delete_rule
+                 FROM information_schema.table_constraints tc
+                 JOIN information_schema.key_column_usage kcu
+                     ON kcu.constraint_name = tc.constraint_name
+                     AND kcu.table_schema = tc.table_schema
+                 JOIN information_schema.referential_constraints rc
+                     ON rc.constraint_name = tc.constraint_name
+                 JOIN information_schema.constraint_column_usage ccu
+                     ON ccu.constraint_name = tc.constraint_name
+                 WHERE tc.constraint_type = 'FOREIGN KEY'
+                   AND tc.table_schema = '${_dbMgrCurrentDb.replace(/'/g, "''")}'
+                   AND tc.table_name = '${_dbMgrCurrentTable.replace(/'/g, "''")}'`
+            );
+        } else {
+            data = await dbMgrRunSql(
+                `SELECT constraint_name, column_name,
+                        CONCAT(referenced_table_schema, '.', referenced_table_name) AS references_table,
+                        referenced_column_name AS references_column
+                 FROM information_schema.key_column_usage
+                 WHERE table_schema = '${_dbMgrCurrentDb.replace(/'/g, "''")}'
+                   AND table_name = '${_dbMgrCurrentTable.replace(/'/g, "''")}'
+                   AND referenced_table_name IS NOT NULL`
+            );
+        }
+        let html = '<h4 style="margin:0 0 6px; font-size:13px;">Foreign keys</h4>';
+        if (!data.rows.length) {
+            html += '<div style="color:var(--text-muted); font-size:12px;">(no foreign keys)</div>';
+        } else {
+            html += '<table style="width:100%; font-size:12px; border-collapse:collapse;"><thead><tr style="background:var(--bg-tertiary);">';
+            for (const c of data.columns) html += `<th style="padding:6px 8px; text-align:left; border-bottom:1px solid var(--border);">${escapeHtml(c)}</th>`;
+            html += '<th style="padding:6px 8px; border-bottom:1px solid var(--border);"></th></tr></thead><tbody>';
+            for (const row of data.rows) {
+                const fkName = String(row[0]);
+                html += '<tr>';
+                for (const v of row) {
+                    html += `<td style="padding:5px 8px; border-bottom:1px solid var(--border);">${escapeHtml(v == null ? '' : String(v))}</td>`;
+                }
+                html += `<td style="padding:5px 8px; border-bottom:1px solid var(--border); text-align:right;">
+                    <button class="btn btn-sm" onclick="dbStructDropFk('${escapeHtml(fkName).replace(/'/g, "\\'")}')" style="padding:2px 8px; font-size:11px;">Drop</button>
+                </td>`;
+                html += '</tr>';
+            }
+            html += '</tbody></table>';
+        }
+        el.innerHTML = html;
+    } catch (e) {
+        el.innerHTML = `<div style="color:var(--danger); padding:6px; font-size:12px;">Foreign keys: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+// ─── Schema-change helpers: build the ALTER SQL, confirm, execute, reload ───
+async function dbStructExec(sql, opLabel) {
+    const ok = await wolfConfirm(
+        `Run this schema change?\n\n${sql}`,
+        opLabel, { okText: 'Run', danger: true }
+    );
+    if (!ok) return false;
+    try {
+        const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_dbCurrentId)}/query`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: sql, permission: 'schema', timeout_secs: 60 }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Schema change failed', 'error'); return false; }
+        showToast(`${opLabel} succeeded`, 'success');
+        return true;
+    } catch (e) { showToast('Schema change failed: ' + e.message, 'error'); return false; }
+}
+
+function dbStructTableRef(conn) {
+    return `${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentDb)}.${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentTable)}`;
+}
+
+async function dbStructAddColumn() {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    const name = prompt('New column name:');
+    if (!name) return;
+    const type = prompt('Column type (e.g. VARCHAR(255), INT, TIMESTAMP):');
+    if (!type) return;
+    const nullable = confirm('Allow NULL? (OK = NULL, Cancel = NOT NULL)');
+    const defaultVal = prompt('Default value (leave blank for none):') || '';
+    let sql = `ALTER TABLE ${dbStructTableRef(conn)} ADD COLUMN ${dbMgrEscapeIdent(conn.kind, name)} ${type}`;
+    if (!nullable) sql += ' NOT NULL';
+    if (defaultVal.trim()) sql += ` DEFAULT ${defaultVal}`;
+    if (await dbStructExec(sql, 'Add column')) { dbStructLoadColumns(); }
+}
+
+async function dbStructDropColumn(colName) {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    const sql = `ALTER TABLE ${dbStructTableRef(conn)} DROP COLUMN ${dbMgrEscapeIdent(conn.kind, colName)}`;
+    if (await dbStructExec(sql, `Drop column ${colName}`)) { dbStructLoadColumns(); }
+}
+
+async function dbStructAddIndex() {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    const name = prompt('Index name:');
+    if (!name) return;
+    const cols = prompt('Column(s), comma-separated:');
+    if (!cols) return;
+    const unique = confirm('Make this a UNIQUE index? OK = unique, Cancel = normal');
+    const escCols = cols.split(',').map(c => dbMgrEscapeIdent(conn.kind, c.trim())).join(', ');
+    let sql;
+    if (conn.kind === 'postgres') {
+        sql = `CREATE ${unique ? 'UNIQUE ' : ''}INDEX ${dbMgrEscapeIdent(conn.kind, name)} ON ${dbStructTableRef(conn)} (${escCols})`;
+    } else {
+        sql = `CREATE ${unique ? 'UNIQUE ' : ''}INDEX ${dbMgrEscapeIdent(conn.kind, name)} ON ${dbStructTableRef(conn)} (${escCols})`;
+    }
+    if (await dbStructExec(sql, 'Add index')) { dbStructLoadIndexes(); }
+}
+
+async function dbStructDropIndex(idxName) {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    let sql;
+    if (conn.kind === 'postgres') {
+        // Postgres indexes live in the schema, not scoped to a table.
+        sql = `DROP INDEX ${dbMgrEscapeIdent(conn.kind, _dbMgrCurrentDb)}.${dbMgrEscapeIdent(conn.kind, idxName)}`;
+    } else {
+        sql = `DROP INDEX ${dbMgrEscapeIdent(conn.kind, idxName)} ON ${dbStructTableRef(conn)}`;
+    }
+    if (await dbStructExec(sql, `Drop index ${idxName}`)) { dbStructLoadIndexes(); }
+}
+
+async function dbStructAddFk() {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    const name = prompt('Constraint name:');
+    if (!name) return;
+    const col = prompt('Column in this table that references another:');
+    if (!col) return;
+    const refTable = prompt('References which table? (schema.table or just table)');
+    if (!refTable) return;
+    const refCol = prompt('References which column?');
+    if (!refCol) return;
+    const onDelete = prompt('ON DELETE action: NO ACTION / RESTRICT / CASCADE / SET NULL (blank = NO ACTION)') || 'NO ACTION';
+    const refParts = refTable.split('.').map(p => dbMgrEscapeIdent(conn.kind, p.trim())).join('.');
+    const sql = `ALTER TABLE ${dbStructTableRef(conn)} ADD CONSTRAINT ${dbMgrEscapeIdent(conn.kind, name)} `
+              + `FOREIGN KEY (${dbMgrEscapeIdent(conn.kind, col)}) `
+              + `REFERENCES ${refParts} (${dbMgrEscapeIdent(conn.kind, refCol)}) `
+              + `ON DELETE ${onDelete}`;
+    if (await dbStructExec(sql, 'Add foreign key')) { dbStructLoadFks(); }
+}
+
+async function dbStructDropFk(fkName) {
+    const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
+    if (!conn) return;
+    let sql;
+    if (conn.kind === 'postgres') {
+        sql = `ALTER TABLE ${dbStructTableRef(conn)} DROP CONSTRAINT ${dbMgrEscapeIdent(conn.kind, fkName)}`;
+    } else {
+        sql = `ALTER TABLE ${dbStructTableRef(conn)} DROP FOREIGN KEY ${dbMgrEscapeIdent(conn.kind, fkName)}`;
+    }
+    if (await dbStructExec(sql, `Drop FK ${fkName}`)) { dbStructLoadFks(); }
 }
 
 function dbCloseConnection() {
@@ -41777,25 +42033,31 @@ function dbCloseConnection() {
     dbRenderConnections();
 }
 
-// ─── Saved queries + query history (localStorage per connection) ───
-function dbSavedKey(connId) { return `dbmgr:saved:${connId}`; }
-function dbHistKey(connId)  { return `dbmgr:history:${connId}`; }
-function dbLoadSaved(connId) {
-    try { return JSON.parse(localStorage.getItem(dbSavedKey(connId)) || '[]'); } catch { return []; }
+// ─── Saved queries + query history (server-side, per authenticated user) ───
+// Cached in-memory for the current session; refreshed after every
+// save/delete. History is pushed server-side automatically inside
+// the /query handler, so we just re-fetch after running.
+let _dbSavedCache = [];    // [{name, sql, created_at}]
+let _dbHistoryCache = [];  // [{sql, created_at}]
+
+async function dbLoadSaved() {
+    if (!_dbCurrentId) { _dbSavedCache = []; return _dbSavedCache; }
+    try {
+        const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_dbCurrentId)}/saved-queries`);
+        const data = await resp.json();
+        _dbSavedCache = resp.ok ? (data.saved || []) : [];
+    } catch { _dbSavedCache = []; }
+    return _dbSavedCache;
 }
-function dbStoreSaved(connId, arr) {
-    localStorage.setItem(dbSavedKey(connId), JSON.stringify(arr));
-}
-function dbLoadHistory(connId) {
-    try { return JSON.parse(localStorage.getItem(dbHistKey(connId)) || '[]'); } catch { return []; }
-}
-function dbPushHistory(connId, sql) {
-    const h = dbLoadHistory(connId);
-    // Skip consecutive duplicates, cap at 20 entries.
-    if (h.length && h[0].sql === sql) return;
-    h.unshift({ sql, when: Date.now() });
-    if (h.length > 20) h.length = 20;
-    localStorage.setItem(dbHistKey(connId), JSON.stringify(h));
+
+async function dbLoadHistory() {
+    if (!_dbCurrentId) { _dbHistoryCache = []; return _dbHistoryCache; }
+    try {
+        const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_dbCurrentId)}/history`);
+        const data = await resp.json();
+        _dbHistoryCache = resp.ok ? (data.history || []) : [];
+    } catch { _dbHistoryCache = []; }
+    return _dbHistoryCache;
 }
 
 function dbMgrRenderQueryTab(body) {
@@ -41809,6 +42071,7 @@ function dbMgrRenderQueryTab(body) {
                     <option value="read">Read (SELECT / SHOW / EXPLAIN)</option>
                     <option value="update">Update (+ INSERT / UPDATE)</option>
                     <option value="delete">Delete (+ DELETE / TRUNCATE)</option>
+                    <option value="schema">Schema (+ ALTER / CREATE / DROP)</option>
                 </select>
             </label>
             <label style="font-size:13px; margin:0;">Timeout (s):
@@ -41891,18 +42154,21 @@ async function dbRunValidate() {
         });
         const data = await resp.json();
         if (data.ok) {
-            const tierColor = data.tier === 'delete' ? '#ef4444'
+            const tierColor = data.tier === 'schema' ? '#a855f7'
+                : data.tier === 'delete' ? '#ef4444'
                 : data.tier === 'update' ? '#eab308' : '#22c55e';
             badge.style.background = `${tierColor}22`;
             badge.style.color = tierColor;
             badge.textContent = `✓ ${data.tier} tier`;
             // Auto-advance the permission selector up to the detected
-            // tier — a DELETE query needs the Delete permission selected
-            // or the server will reject it even though the classifier
-            // said it's valid. Never downgrade though, respect operator choice.
+            // tier — queries need the matching permission or higher or
+            // the server rejects them even if the classifier accepted.
+            // Never downgrade, respect operator choice.
             const perm = document.getElementById('db-perm');
-            if (perm && data.tier === 'delete') perm.value = 'delete';
-            else if (perm && data.tier === 'update' && perm.value === 'read') perm.value = 'update';
+            if (perm) {
+                const order = { read: 0, update: 1, delete: 2, schema: 3 };
+                if (order[data.tier] > order[perm.value]) perm.value = data.tier;
+            }
         } else {
             badge.style.background = 'rgba(239,68,68,0.15)';
             badge.style.color = '#ef4444';
@@ -41949,27 +42215,28 @@ function dbFormatQuery() {
     dbScheduleValidate();
 }
 
-function dbSaveCurrentQuery() {
+async function dbSaveCurrentQuery() {
     if (!_dbCurrentId) return;
     const sql = (document.getElementById('db-query') || {}).value || '';
     if (!sql.trim()) { showToast('Nothing to save', 'warning'); return; }
     const name = prompt('Name this saved query:');
     if (!name) return;
-    const saved = dbLoadSaved(_dbCurrentId);
-    // Upsert by name — saving twice with the same name overwrites.
-    const existing = saved.findIndex(s => s.name === name);
-    if (existing >= 0) saved[existing] = { name, sql };
-    else saved.push({ name, sql });
-    saved.sort((a, b) => a.name.localeCompare(b.name));
-    dbStoreSaved(_dbCurrentId, saved);
-    dbRefreshSavedDropdown();
-    showToast(`Saved as "${name}"`, 'success');
+    try {
+        const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_dbCurrentId)}/saved-queries`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, sql }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Save failed', 'error'); return; }
+        await dbRefreshSavedDropdown();
+        showToast(`Saved as "${name}"`, 'success');
+    } catch (e) { showToast('Save failed: ' + e.message, 'error'); }
 }
 
-function dbRefreshSavedDropdown() {
+async function dbRefreshSavedDropdown() {
     const sel = document.getElementById('db-saved-select');
     if (!sel || !_dbCurrentId) return;
-    const saved = dbLoadSaved(_dbCurrentId);
+    const saved = await dbLoadSaved();
     let html = '<option value="">— Saved queries —</option>';
     for (const s of saved) html += `<option value="${escapeHtml(s.name)}">${escapeHtml(s.name)}</option>`;
     if (saved.length) html += '<option value="__manage">Manage saved…</option>';
@@ -41983,30 +42250,31 @@ function dbLoadSavedSelected() {
     sel.value = '';
     if (!val) return;
     if (val === '__manage') { dbManageSavedQueries(); return; }
-    const saved = dbLoadSaved(_dbCurrentId);
-    const s = saved.find(x => x.name === val);
+    const s = _dbSavedCache.find(x => x.name === val);
     if (!s) return;
     const ta = document.getElementById('db-query');
     if (ta) { ta.value = s.sql; dbScheduleValidate(); }
 }
 
-function dbManageSavedQueries() {
-    const saved = dbLoadSaved(_dbCurrentId);
+async function dbManageSavedQueries() {
+    const saved = _dbSavedCache;
     if (!saved.length) return;
     const names = saved.map(s => s.name).join('\n');
     const toDelete = prompt(`Delete which saved query? (type the exact name)\n\nExisting:\n${names}`);
     if (!toDelete) return;
-    const filtered = saved.filter(s => s.name !== toDelete);
-    if (filtered.length === saved.length) { showToast('No query by that name', 'warning'); return; }
-    dbStoreSaved(_dbCurrentId, filtered);
-    dbRefreshSavedDropdown();
-    showToast(`Deleted "${toDelete}"`, 'success');
+    try {
+        const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_dbCurrentId)}/saved-queries/${encodeURIComponent(toDelete)}`, { method: 'DELETE' });
+        if (resp.status === 404) { showToast('No query by that name', 'warning'); return; }
+        if (!resp.ok) { showToast('Delete failed', 'error'); return; }
+        await dbRefreshSavedDropdown();
+        showToast(`Deleted "${toDelete}"`, 'success');
+    } catch (e) { showToast('Delete failed: ' + e.message, 'error'); }
 }
 
-function dbRefreshHistoryDropdown() {
+async function dbRefreshHistoryDropdown() {
     const sel = document.getElementById('db-hist-select');
     if (!sel || !_dbCurrentId) return;
-    const h = dbLoadHistory(_dbCurrentId);
+    const h = await dbLoadHistory();
     let html = '<option value="">— Recent —</option>';
     for (let i = 0; i < h.length; i++) {
         const preview = h[i].sql.replace(/\s+/g, ' ').slice(0, 60);
@@ -42021,10 +42289,9 @@ function dbLoadHistSelected() {
     const idx = parseInt(sel.value, 10);
     sel.value = '';
     if (isNaN(idx)) return;
-    const h = dbLoadHistory(_dbCurrentId);
-    if (!h[idx]) return;
+    if (!_dbHistoryCache[idx]) return;
     const ta = document.getElementById('db-query');
-    if (ta) { ta.value = h[idx].sql; dbScheduleValidate(); }
+    if (ta) { ta.value = _dbHistoryCache[idx].sql; dbScheduleValidate(); }
 }
 
 async function dbRunQuery() {
@@ -42052,9 +42319,8 @@ async function dbRunQuery() {
         document.getElementById('db-copy-csv').disabled = false;
         document.getElementById('db-copy-md').disabled = false;
         sqlConnRenderResult(resultEl, data);
-        // Ring-buffer history + refresh the dropdown so the operator can
-        // replay this query later.
-        dbPushHistory(_dbCurrentId, query);
+        // Server pushed to per-user history inside the /query handler;
+        // refresh the dropdown to pull the new entry.
         dbRefreshHistoryDropdown();
     } catch (e) {
         resultEl.innerHTML = `<div style="color:var(--danger);">${escapeHtml(e.message)}</div>`;

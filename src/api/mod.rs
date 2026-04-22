@@ -20234,6 +20234,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/sql-connections/{id}/test", web::post().to(sql_connections_test))
         .route("/api/sql-connections/{id}/validate", web::post().to(sql_connections_validate))
         .route("/api/sql-connections/{id}/query", web::post().to(sql_connections_query))
+        .route("/api/sql-connections/{id}/saved-queries", web::get().to(sql_saved_queries_list))
+        .route("/api/sql-connections/{id}/saved-queries", web::post().to(sql_saved_queries_upsert))
+        .route("/api/sql-connections/{id}/saved-queries/{name}", web::delete().to(sql_saved_queries_delete))
+        .route("/api/sql-connections/{id}/history", web::get().to(sql_saved_queries_history))
         .route("/api/sql-connections/{id}/query-proxy", web::post().to(sql_connections_query_proxy))
         .route("/api/sql-connections/receive", web::post().to(sql_connections_receive))
         .route("/api/sql-connections/audit", web::get().to(sql_connections_audit))
@@ -20415,6 +20419,7 @@ pub async fn sql_connections_validate(
                 crate::sql_connections::SqlPermission::Read => "read",
                 crate::sql_connections::SqlPermission::Update => "update",
                 crate::sql_connections::SqlPermission::Delete => "delete",
+                crate::sql_connections::SqlPermission::Schema => "schema",
             };
             HttpResponse::Ok().json(serde_json::json!({ "ok": true, "tier": tier_str }))
         }
@@ -20458,11 +20463,13 @@ pub async fn sql_connections_query(
     }
 
     let perm = match body.permission.as_deref().unwrap_or("read") {
+        "schema" => crate::sql_connections::SqlPermission::Schema,
         "delete" => crate::sql_connections::SqlPermission::Delete,
         "update" => crate::sql_connections::SqlPermission::Update,
         _ => crate::sql_connections::SqlPermission::Read,
     };
     let timeout = body.timeout_secs.map(std::time::Duration::from_secs);
+    let caller_username = username.clone();
     match crate::sql_connections::execute(
         &id, &body.query, perm,
         crate::sql_connections::Caller::Ui(username),
@@ -20470,9 +20477,108 @@ pub async fn sql_connections_query(
         timeout,
         Some(&state.cluster),
     ).await {
-        Ok(r) => HttpResponse::Ok().json(r),
+        Ok(r) => {
+            // Record in per-user history (non-blocking — failure just
+            // means the dropdown won't show this query later).
+            if caller_username != "cluster-node" {
+                let _ = crate::sql_connections::push_history(&caller_username, &id, &body.query);
+            }
+            HttpResponse::Ok().json(r)
+        }
         Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
     }
+}
+
+#[derive(Deserialize)]
+pub struct SavedQueryBody {
+    pub name: String,
+    pub sql: String,
+}
+
+/// GET /api/sql-connections/{id}/saved-queries — per-user saved queries.
+pub async fn sql_saved_queries_list(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    let username = match require_auth(&req, &state) {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+    if username == "cluster-node" {
+        // Inter-node traffic has no "user" — saved queries are a
+        // UI feature, return empty rather than silently exposing
+        // another user's list.
+        return HttpResponse::Ok().json(serde_json::json!({ "saved": [] }));
+    }
+    let id = path.into_inner();
+    let saved = crate::sql_connections::list_saved(&username, &id);
+    HttpResponse::Ok().json(serde_json::json!({ "saved": saved }))
+}
+
+/// POST /api/sql-connections/{id}/saved-queries — upsert by name.
+pub async fn sql_saved_queries_upsert(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<SavedQueryBody>,
+) -> HttpResponse {
+    let username = match require_auth(&req, &state) {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+    if username == "cluster-node" {
+        return HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "saved queries are user-scoped — session auth required"
+        }));
+    }
+    let id = path.into_inner();
+    match crate::sql_connections::upsert_saved(&username, &id, &body.name, &body.sql) {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "saved": true })),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// DELETE /api/sql-connections/{id}/saved-queries/{name}
+pub async fn sql_saved_queries_delete(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+) -> HttpResponse {
+    let username = match require_auth(&req, &state) {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+    if username == "cluster-node" {
+        return HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "saved queries are user-scoped — session auth required"
+        }));
+    }
+    let (id, name) = path.into_inner();
+    match crate::sql_connections::delete_saved(&username, &id, &name) {
+        Ok(true) => HttpResponse::Ok().json(serde_json::json!({ "deleted": name })),
+        Ok(false) => HttpResponse::NotFound().json(serde_json::json!({ "error": "not found" })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// GET /api/sql-connections/{id}/history — last 20 executed queries
+/// for this user+connection, most recent first.
+pub async fn sql_saved_queries_history(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    let username = match require_auth(&req, &state) {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+    if username == "cluster-node" {
+        return HttpResponse::Ok().json(serde_json::json!({ "history": [] }));
+    }
+    let id = path.into_inner();
+    let history = crate::sql_connections::list_history(&username, &id);
+    HttpResponse::Ok().json(serde_json::json!({ "history": history }))
 }
 
 /// GET /api/sql-connections/audit?n=200 — return the last N audit-log
@@ -20686,6 +20792,7 @@ pub async fn sql_connections_query_proxy(
 
     let id = path.into_inner();
     let perm = match body.permission.as_deref().unwrap_or("read") {
+        "schema" => crate::sql_connections::SqlPermission::Schema,
         "delete" => crate::sql_connections::SqlPermission::Delete,
         "update" => crate::sql_connections::SqlPermission::Update,
         _ => crate::sql_connections::SqlPermission::Read,

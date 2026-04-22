@@ -2290,6 +2290,11 @@ async fn tool_sql_query(
         P::Read => agent.sql_read || agent.sql_update || agent.sql_delete,
         P::Update => agent.sql_update,
         P::Delete => agent.sql_delete,
+        // DDL is not exposed as an agent tool — AI writing ALTER
+        // TABLE unsupervised is not a surface we want. Schema changes
+        // go through the Database Manager UI where an operator sees
+        // and confirms the exact statement.
+        P::Schema => false,
     };
     if !has_perm {
         return ToolResult::err(format!(

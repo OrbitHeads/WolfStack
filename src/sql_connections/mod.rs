@@ -162,6 +162,148 @@ pub struct SqlConnectionsConfig {
 fn config_path() -> String { crate::paths::get().sql_connections_config }
 fn audit_path() -> String { crate::paths::get().sql_audit_log }
 
+// ═══════════════════════════════════════════════════
+// ─── Saved queries & per-user history ───
+// ═══════════════════════════════════════════════════
+
+/// One saved query OR one history entry. When `name` is empty the
+/// entry is a history line (auto-appended on execution); otherwise
+/// it's a named saved query the operator pinned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedQueryEntry {
+    pub user: String,
+    pub connection_id: String,
+    #[serde(default)]
+    pub name: String,          // empty = history entry
+    pub sql: String,
+    #[serde(default)]
+    pub created_at: i64,       // unix seconds
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SavedQueriesFile {
+    #[serde(default)]
+    pub saved: Vec<SavedQueryEntry>,
+    #[serde(default)]
+    pub history: Vec<SavedQueryEntry>,
+}
+
+fn saved_queries_path() -> String {
+    // Lives alongside the other sql_connections state. Contains no
+    // credentials so 0o644 is fine, but we still write with 0o600 to
+    // keep its neighbours' perms consistent.
+    "/etc/wolfstack/sql-saved-queries.json".to_string()
+}
+
+pub fn load_saved_queries() -> SavedQueriesFile {
+    match std::fs::read_to_string(saved_queries_path()) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
+            tracing::warn!("sql_connections: saved-queries parse failed ({}) — starting empty", e);
+            SavedQueriesFile::default()
+        }),
+        Err(_) => SavedQueriesFile::default(),
+    }
+}
+
+fn save_saved_queries(f: &SavedQueriesFile) -> Result<(), String> {
+    let path = saved_queries_path();
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let json = serde_json::to_string_pretty(f)
+        .map_err(|e| format!("serialize saved-queries: {}", e))?;
+    std::fs::write(&path, json).map_err(|e| format!("write saved-queries: {}", e))?;
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    Ok(())
+}
+
+/// Saved queries the given user has pinned on the given connection,
+/// sorted alphabetically by name. Does not include history entries.
+pub fn list_saved(user: &str, connection_id: &str) -> Vec<SavedQueryEntry> {
+    let mut out: Vec<_> = load_saved_queries().saved.into_iter()
+        .filter(|e| e.user == user && e.connection_id == connection_id && !e.name.is_empty())
+        .collect();
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out
+}
+
+/// Upsert a named saved query for this user+connection. Saving twice
+/// with the same name overwrites the previous SQL.
+pub fn upsert_saved(user: &str, connection_id: &str, name: &str, sql: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("saved query name is required".into());
+    }
+    if sql.trim().is_empty() {
+        return Err("saved query body is required".into());
+    }
+    let mut f = load_saved_queries();
+    // Remove any existing entry with the same user+conn+name.
+    f.saved.retain(|e| !(e.user == user && e.connection_id == connection_id && e.name == name));
+    f.saved.push(SavedQueryEntry {
+        user: user.to_string(),
+        connection_id: connection_id.to_string(),
+        name: name.to_string(),
+        sql: sql.to_string(),
+        created_at: chrono::Utc::now().timestamp(),
+    });
+    save_saved_queries(&f)
+}
+
+/// Remove a saved query by name. Returns Ok(true) if something was
+/// removed, Ok(false) if not found.
+pub fn delete_saved(user: &str, connection_id: &str, name: &str) -> Result<bool, String> {
+    let mut f = load_saved_queries();
+    let before = f.saved.len();
+    f.saved.retain(|e| !(e.user == user && e.connection_id == connection_id && e.name == name));
+    if f.saved.len() == before { return Ok(false); }
+    save_saved_queries(&f)?;
+    Ok(true)
+}
+
+/// Most-recent-first history for this user+connection, capped at 20.
+pub fn list_history(user: &str, connection_id: &str) -> Vec<SavedQueryEntry> {
+    let mut out: Vec<_> = load_saved_queries().history.into_iter()
+        .filter(|e| e.user == user && e.connection_id == connection_id)
+        .collect();
+    out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    out.truncate(20);
+    out
+}
+
+/// Append to history (deduped against the most recent entry).
+pub fn push_history(user: &str, connection_id: &str, sql: &str) -> Result<(), String> {
+    if sql.trim().is_empty() { return Ok(()); }
+    let mut f = load_saved_queries();
+    // Skip if identical to the most recent entry for this user+conn.
+    let dup = f.history.iter()
+        .filter(|e| e.user == user && e.connection_id == connection_id)
+        .max_by_key(|e| e.created_at)
+        .map(|e| e.sql.as_str() == sql)
+        .unwrap_or(false);
+    if dup { return Ok(()); }
+    f.history.push(SavedQueryEntry {
+        user: user.to_string(),
+        connection_id: connection_id.to_string(),
+        name: String::new(),
+        sql: sql.to_string(),
+        created_at: chrono::Utc::now().timestamp(),
+    });
+    // Trim: keep the last 20 per (user, connection_id) tuple. Simpler
+    // to rebuild the vec than track per-key counts.
+    use std::collections::HashMap;
+    let mut by_key: HashMap<(String, String), Vec<SavedQueryEntry>> = HashMap::new();
+    for e in f.history.drain(..) {
+        by_key.entry((e.user.clone(), e.connection_id.clone())).or_default().push(e);
+    }
+    for v in by_key.values_mut() {
+        v.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        v.truncate(20);
+    }
+    f.history = by_key.into_values().flatten().collect();
+    save_saved_queries(&f)
+}
+
 /// Load config from disk. Missing file = empty config; corrupt file
 /// is logged and treated as empty so a malformed edit doesn't brick
 /// the server.
@@ -209,6 +351,12 @@ pub enum SqlPermission {
     Read,
     Update,
     Delete,
+    /// DDL — ALTER / CREATE / DROP / RENAME / TRUNCATE (structural).
+    /// Never granted to AI agents by default (requires an explicit
+    /// `sql_schema` flag on the per-agent config). The Database
+    /// Manager UI's Structure tab uses this tier when an operator
+    /// issues an ALTER TABLE / CREATE INDEX / ADD CONSTRAINT.
+    Schema,
 }
 
 /// Result shape returned to callers — mirrors what the MySQL editor
@@ -282,6 +430,7 @@ pub fn classify(query: &str, kind: SqlKind) -> Result<SqlPermission, String> {
 fn max_perm(a: SqlPermission, b: SqlPermission) -> SqlPermission {
     use SqlPermission::*;
     match (a, b) {
+        (Schema, _) | (_, Schema) => Schema,
         (Delete, _) | (_, Delete) => Delete,
         (Update, _) | (_, Update) => Update,
         _ => Read,
@@ -319,6 +468,18 @@ fn statement_tier(stmt: &sqlparser::ast::Statement) -> Result<SqlPermission, Str
             // across all sqlparser minor versions, so gate by name prefix.
             if lower.starts_with("show") || lower == "describe" || lower == "use" {
                 return Ok(SqlPermission::Read);
+            }
+            // DDL — gated at Schema tier. The UI's Structure tab uses
+            // this; AI agents need an explicit sql_schema flag that's
+            // off by default. Covers ALTER/CREATE/DROP across their
+            // many sqlparser variants (AlterTable, CreateTable,
+            // CreateIndex, DropFunction, RenameTable, …).
+            if lower.starts_with("alter")
+                || lower.starts_with("create")
+                || lower.starts_with("drop")
+                || lower.starts_with("rename")
+            {
+                return Ok(SqlPermission::Schema);
             }
             Err(format!(
                 "statement kind not permitted via this interface: {}",
@@ -645,6 +806,7 @@ async fn execute_proxied(
             SqlPermission::Read => "read",
             SqlPermission::Update => "update",
             SqlPermission::Delete => "delete",
+            SqlPermission::Schema => "schema",
         },
         "timeout_secs": exec_timeout.map(|d| d.as_secs()),
         "origin_caller": caller.as_tag(),
@@ -703,8 +865,9 @@ fn tier_within(required: SqlPermission, granted: SqlPermission) -> bool {
     use SqlPermission::*;
     match (required, granted) {
         (Read, _) => true,                                   // Read fits under any tier
-        (Update, Update) | (Update, Delete) => true,
-        (Delete, Delete) => true,
+        (Update, Update) | (Update, Delete) | (Update, Schema) => true,
+        (Delete, Delete) | (Delete, Schema) => true,
+        (Schema, Schema) => true,
         _ => false,
     }
 }

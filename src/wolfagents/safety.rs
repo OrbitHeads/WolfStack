@@ -112,6 +112,12 @@ const PATH_DENY_PREFIXES: &[&str] = &[
     // plaintext fields still expose topology an attacker could use
     // for lateral movement.
     "/etc/wolfstack/sql-connections.json",
+    // Per-user saved queries + per-user history. Contains raw SQL the
+    // operator has written which may include sensitive column names,
+    // schema details, and WHERE-clause values (e.g. user email domains,
+    // customer IDs). Agents have no business reading other operators'
+    // saved work.
+    "/etc/wolfstack/sql-saved-queries.json",
     // SQL audit log records every query ever run via the agent /
     // workflow / UI surfaces — recovering it gives the attacker a
     // read of historical DB access including row counts that leak
