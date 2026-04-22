@@ -20232,6 +20232,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/sql-connections/{id}", web::put().to(sql_connections_update))
         .route("/api/sql-connections/{id}", web::delete().to(sql_connections_delete))
         .route("/api/sql-connections/{id}/test", web::post().to(sql_connections_test))
+        .route("/api/sql-connections/{id}/validate", web::post().to(sql_connections_validate))
         .route("/api/sql-connections/{id}/query", web::post().to(sql_connections_query))
         .route("/api/sql-connections/{id}/query-proxy", web::post().to(sql_connections_query_proxy))
         .route("/api/sql-connections/receive", web::post().to(sql_connections_receive))
@@ -20385,6 +20386,40 @@ pub struct SqlQueryRequest {
     pub permission: Option<String>,  // "read" | "update" | "delete"
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+}
+
+/// POST /api/sql-connections/{id}/validate — parse-only check.
+///
+/// Runs the SQL through the same `sqlparser` classifier as the
+/// executor, but never dispatches to the database. Returns the
+/// detected permission tier (`read` / `update` / `delete`) so the
+/// UI can preview what tier a query will need before the operator
+/// clicks Run, or flag a parse error inline without round-tripping
+/// to a live database.
+pub async fn sql_connections_validate(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<SqlQueryRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let cfg = crate::sql_connections::load();
+    let conn = match cfg.connections.iter().find(|c| c.id == id) {
+        Some(c) => c.clone(),
+        None => return HttpResponse::NotFound().json(serde_json::json!({ "error": "not found" })),
+    };
+    match crate::sql_connections::classify(&body.query, conn.kind) {
+        Ok(tier) => {
+            let tier_str = match tier {
+                crate::sql_connections::SqlPermission::Read => "read",
+                crate::sql_connections::SqlPermission::Update => "update",
+                crate::sql_connections::SqlPermission::Delete => "delete",
+            };
+            HttpResponse::Ok().json(serde_json::json!({ "ok": true, "tier": tier_str }))
+        }
+        Err(e) => HttpResponse::Ok().json(serde_json::json!({ "ok": false, "error": e })),
+    }
 }
 
 /// POST /api/sql-connections/{id}/query — ad-hoc query from the

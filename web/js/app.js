@@ -41502,10 +41502,16 @@ function dbOpenConnection(id) {
         _dbMgrCurrentDb = conn.database;
         _dbMgrExpanded.add(conn.database);
     }
+    // Hide the connection list panel so the Manager takes the whole width.
+    const layout = document.getElementById('db-layout');
+    const panel = document.getElementById('db-conn-panel');
+    if (layout) layout.style.gridTemplateColumns = '1fr';
+    if (panel) panel.style.display = 'none';
     ws.innerHTML = `
         <!-- Compact connection strip -->
         <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:8px; padding:6px 10px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:6px;">
             <div style="display:flex; align-items:center; gap:10px; font-size:13px; min-width:0; flex:1;">
+                <button class="btn btn-sm" onclick="dbCloseConnection()" title="Back to connection list" style="padding:3px 8px; font-size:12px;">← Connections</button>
                 <span>${kindIcon} <strong>${escapeHtml(conn.label)}</strong></span>
                 <span style="color:var(--text-muted); font-size:11px;">${kindLabel}</span>
                 <code style="font-size:11px; color:var(--text-muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(conn.username)}@${escapeHtml(conn.host)}:${conn.port}${conn.database ? '/' + escapeHtml(conn.database) : ''}${conn.cluster ? ' · ' + escapeHtml(conn.cluster) + (nodeLabel ? '/' + escapeHtml(nodeLabel) : '') : ''}</code>
@@ -41748,12 +41754,56 @@ async function dbMgrRenderStructureTab(body) {
     }
 }
 
+function dbCloseConnection() {
+    _dbCurrentId = null;
+    _dbLastResult = null;
+    _dbMgrSchemas = null;
+    _dbMgrTablesCache = {};
+    _dbMgrExpanded = new Set();
+    _dbMgrCurrentDb = null;
+    _dbMgrCurrentTable = null;
+    const layout = document.getElementById('db-layout');
+    const panel = document.getElementById('db-conn-panel');
+    if (layout) layout.style.gridTemplateColumns = '280px 1fr';
+    if (panel) panel.style.display = '';
+    const ws = document.getElementById('db-workspace');
+    if (ws) ws.innerHTML = `
+        <div style="color:var(--text-muted); text-align:center; padding:60px 20px;">
+            <div style="font-size:36px; margin-bottom:8px;">🗄️</div>
+            <div style="font-size:14px;">Pick a connection on the left to start querying.</div>
+            <div style="font-size:12px; margin-top:4px;">Queries are executed on the node that owns the connection — cross-node access is proxied automatically.</div>
+        </div>
+    `;
+    dbRenderConnections();
+}
+
+// ─── Saved queries + query history (localStorage per connection) ───
+function dbSavedKey(connId) { return `dbmgr:saved:${connId}`; }
+function dbHistKey(connId)  { return `dbmgr:history:${connId}`; }
+function dbLoadSaved(connId) {
+    try { return JSON.parse(localStorage.getItem(dbSavedKey(connId)) || '[]'); } catch { return []; }
+}
+function dbStoreSaved(connId, arr) {
+    localStorage.setItem(dbSavedKey(connId), JSON.stringify(arr));
+}
+function dbLoadHistory(connId) {
+    try { return JSON.parse(localStorage.getItem(dbHistKey(connId)) || '[]'); } catch { return []; }
+}
+function dbPushHistory(connId, sql) {
+    const h = dbLoadHistory(connId);
+    // Skip consecutive duplicates, cap at 20 entries.
+    if (h.length && h[0].sql === sql) return;
+    h.unshift({ sql, when: Date.now() });
+    if (h.length > 20) h.length = 20;
+    localStorage.setItem(dbHistKey(connId), JSON.stringify(h));
+}
+
 function dbMgrRenderQueryTab(body) {
     const hint = _dbMgrCurrentTable
         ? `SELECT * FROM ${_dbMgrCurrentTable} LIMIT 100;`
         : 'SELECT 1;';
     body.innerHTML = `
-        <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap;">
+        <div style="display:flex; gap:8px; align-items:center; margin-bottom:6px; flex-wrap:wrap;">
             <label style="font-size:13px; margin:0;">Permission:
                 <select id="db-perm" class="form-control" style="display:inline-block; width:auto; margin-left:6px;">
                     <option value="read">Read (SELECT / SHOW / EXPLAIN)</option>
@@ -41764,23 +41814,217 @@ function dbMgrRenderQueryTab(body) {
             <label style="font-size:13px; margin:0;">Timeout (s):
                 <input id="db-timeout" type="number" min="1" max="300" value="30" class="form-control" style="display:inline-block; width:90px; margin-left:6px;">
             </label>
+            <span id="db-validate" style="font-size:12px; padding:3px 8px; border-radius:5px; background:var(--bg-tertiary); color:var(--text-muted); margin-left:auto;">type to validate…</span>
         </div>
-        <textarea id="db-query" class="form-control" rows="6" placeholder="${escapeHtml(hint)}" style="font-family:monospace; font-size:13px;"></textarea>
-        <div style="display:flex; gap:8px; margin-top:8px; align-items:center;">
-            <button class="btn btn-primary btn-sm" onclick="dbRunQuery()">▶ Run query</button>
-            <button class="btn btn-sm" id="db-copy-csv" onclick="dbCopyCsv()" disabled>📋 Copy CSV</button>
-            <button class="btn btn-sm" id="db-copy-md" onclick="dbCopyMarkdown()" disabled>📋 Copy Markdown</button>
-            <span style="font-size:11px; color:var(--text-muted);">Ctrl/Cmd + Enter runs the query.</span>
+        <textarea id="db-query" class="form-control" placeholder="${escapeHtml(hint)}"
+            style="font-family:var(--font-mono, ui-monospace, monospace); font-size:13px; min-height:240px; line-height:1.45; tab-size:4;"
+            spellcheck="false"></textarea>
+        <div style="display:flex; gap:6px; margin-top:8px; align-items:center; flex-wrap:wrap;">
+            <button class="btn btn-primary btn-sm" onclick="dbRunQuery()">▶ Run</button>
+            <button class="btn btn-sm" onclick="dbExplainQuery()" title="Prepend EXPLAIN and run">🔍 Explain</button>
+            <button class="btn btn-sm" onclick="dbFormatQuery()" title="Pretty-print SQL keywords">✨ Format</button>
+            <button class="btn btn-sm" onclick="dbSaveCurrentQuery()">💾 Save…</button>
+            <select id="db-saved-select" onchange="dbLoadSavedSelected()" class="form-control" style="display:inline-block; width:auto; font-size:12px; padding:4px 8px;">
+                <option value="">— Saved queries —</option>
+            </select>
+            <select id="db-hist-select" onchange="dbLoadHistSelected()" class="form-control" style="display:inline-block; width:auto; font-size:12px; padding:4px 8px;">
+                <option value="">— Recent —</option>
+            </select>
+            <div style="flex:1;"></div>
+            <button class="btn btn-sm" id="db-copy-csv" onclick="dbCopyCsv()" disabled>📋 CSV</button>
+            <button class="btn btn-sm" id="db-copy-md" onclick="dbCopyMarkdown()" disabled>📋 Markdown</button>
         </div>
+        <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">Ctrl/Cmd + Enter runs. Validate is live — the classifier runs server-side as you type.</div>
         <div id="db-result" style="margin-top:14px;"></div>
     `;
+    dbRefreshSavedDropdown();
+    dbRefreshHistoryDropdown();
     const ta = document.getElementById('db-query');
-    if (ta) ta.addEventListener('keydown', (e) => {
-        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-            e.preventDefault();
-            dbRunQuery();
+    if (ta) {
+        ta.addEventListener('keydown', (e) => {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+                e.preventDefault();
+                dbRunQuery();
+            }
+            // Tab should insert a tab instead of leaving the textarea.
+            if (e.key === 'Tab') {
+                e.preventDefault();
+                const s = ta.selectionStart, e2 = ta.selectionEnd;
+                ta.value = ta.value.slice(0, s) + '    ' + ta.value.slice(e2);
+                ta.selectionStart = ta.selectionEnd = s + 4;
+                dbScheduleValidate();
+            }
+        });
+        ta.addEventListener('input', dbScheduleValidate);
+    }
+    dbScheduleValidate();
+}
+
+let _dbValidateTimer = null;
+function dbScheduleValidate() {
+    if (_dbValidateTimer) clearTimeout(_dbValidateTimer);
+    const badge = document.getElementById('db-validate');
+    if (badge) {
+        badge.style.background = 'var(--bg-tertiary)';
+        badge.style.color = 'var(--text-muted)';
+        badge.textContent = 'validating…';
+    }
+    _dbValidateTimer = setTimeout(dbRunValidate, 450);
+}
+
+async function dbRunValidate() {
+    if (!_dbCurrentId) return;
+    const ta = document.getElementById('db-query');
+    const badge = document.getElementById('db-validate');
+    if (!ta || !badge) return;
+    const sql = ta.value.trim();
+    if (!sql) {
+        badge.style.background = 'var(--bg-tertiary)';
+        badge.style.color = 'var(--text-muted)';
+        badge.textContent = 'type to validate…';
+        return;
+    }
+    try {
+        const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_dbCurrentId)}/validate`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: sql }),
+        });
+        const data = await resp.json();
+        if (data.ok) {
+            const tierColor = data.tier === 'delete' ? '#ef4444'
+                : data.tier === 'update' ? '#eab308' : '#22c55e';
+            badge.style.background = `${tierColor}22`;
+            badge.style.color = tierColor;
+            badge.textContent = `✓ ${data.tier} tier`;
+            // Auto-advance the permission selector up to the detected
+            // tier — a DELETE query needs the Delete permission selected
+            // or the server will reject it even though the classifier
+            // said it's valid. Never downgrade though, respect operator choice.
+            const perm = document.getElementById('db-perm');
+            if (perm && data.tier === 'delete') perm.value = 'delete';
+            else if (perm && data.tier === 'update' && perm.value === 'read') perm.value = 'update';
+        } else {
+            badge.style.background = 'rgba(239,68,68,0.15)';
+            badge.style.color = '#ef4444';
+            badge.textContent = `✗ ${data.error}`;
         }
-    });
+    } catch (e) {
+        badge.style.background = 'var(--bg-tertiary)';
+        badge.style.color = 'var(--text-muted)';
+        badge.textContent = 'validate failed';
+    }
+}
+
+function dbExplainQuery() {
+    const ta = document.getElementById('db-query');
+    if (!ta) return;
+    const cur = ta.value.trim();
+    if (!cur) return;
+    // MariaDB/MySQL and Postgres both accept "EXPLAIN <stmt>".
+    if (!/^\s*explain\b/i.test(cur)) {
+        ta.value = 'EXPLAIN ' + cur;
+    }
+    dbRunQuery();
+}
+
+function dbFormatQuery() {
+    const ta = document.getElementById('db-query');
+    if (!ta) return;
+    // Lightweight pretty-printer: newline before top-level clauses.
+    // We don't pretend to be a full SQL formatter — sqlformatter-js
+    // is 80kB and this covers 90% of ad-hoc queries.
+    const keywords = [
+        'SELECT','FROM','WHERE','GROUP BY','ORDER BY','HAVING','LIMIT','OFFSET',
+        'LEFT JOIN','RIGHT JOIN','INNER JOIN','OUTER JOIN','JOIN','ON',
+        'UNION','UNION ALL','INSERT INTO','VALUES','UPDATE','SET','DELETE FROM',
+    ];
+    let sql = ta.value.replace(/\s+/g, ' ').trim();
+    for (const k of keywords) {
+        const re = new RegExp('\\s+' + k.replace(/ /g, '\\s+') + '\\b', 'gi');
+        sql = sql.replace(re, '\n' + k);
+    }
+    // Re-capitalise leading word if it starts the query.
+    sql = sql.replace(/^\s*(select|from|update|delete|insert|with|explain|show|describe)/i, m => m.toUpperCase());
+    ta.value = sql;
+    dbScheduleValidate();
+}
+
+function dbSaveCurrentQuery() {
+    if (!_dbCurrentId) return;
+    const sql = (document.getElementById('db-query') || {}).value || '';
+    if (!sql.trim()) { showToast('Nothing to save', 'warning'); return; }
+    const name = prompt('Name this saved query:');
+    if (!name) return;
+    const saved = dbLoadSaved(_dbCurrentId);
+    // Upsert by name — saving twice with the same name overwrites.
+    const existing = saved.findIndex(s => s.name === name);
+    if (existing >= 0) saved[existing] = { name, sql };
+    else saved.push({ name, sql });
+    saved.sort((a, b) => a.name.localeCompare(b.name));
+    dbStoreSaved(_dbCurrentId, saved);
+    dbRefreshSavedDropdown();
+    showToast(`Saved as "${name}"`, 'success');
+}
+
+function dbRefreshSavedDropdown() {
+    const sel = document.getElementById('db-saved-select');
+    if (!sel || !_dbCurrentId) return;
+    const saved = dbLoadSaved(_dbCurrentId);
+    let html = '<option value="">— Saved queries —</option>';
+    for (const s of saved) html += `<option value="${escapeHtml(s.name)}">${escapeHtml(s.name)}</option>`;
+    if (saved.length) html += '<option value="__manage">Manage saved…</option>';
+    sel.innerHTML = html;
+}
+
+function dbLoadSavedSelected() {
+    const sel = document.getElementById('db-saved-select');
+    if (!sel || !_dbCurrentId) return;
+    const val = sel.value;
+    sel.value = '';
+    if (!val) return;
+    if (val === '__manage') { dbManageSavedQueries(); return; }
+    const saved = dbLoadSaved(_dbCurrentId);
+    const s = saved.find(x => x.name === val);
+    if (!s) return;
+    const ta = document.getElementById('db-query');
+    if (ta) { ta.value = s.sql; dbScheduleValidate(); }
+}
+
+function dbManageSavedQueries() {
+    const saved = dbLoadSaved(_dbCurrentId);
+    if (!saved.length) return;
+    const names = saved.map(s => s.name).join('\n');
+    const toDelete = prompt(`Delete which saved query? (type the exact name)\n\nExisting:\n${names}`);
+    if (!toDelete) return;
+    const filtered = saved.filter(s => s.name !== toDelete);
+    if (filtered.length === saved.length) { showToast('No query by that name', 'warning'); return; }
+    dbStoreSaved(_dbCurrentId, filtered);
+    dbRefreshSavedDropdown();
+    showToast(`Deleted "${toDelete}"`, 'success');
+}
+
+function dbRefreshHistoryDropdown() {
+    const sel = document.getElementById('db-hist-select');
+    if (!sel || !_dbCurrentId) return;
+    const h = dbLoadHistory(_dbCurrentId);
+    let html = '<option value="">— Recent —</option>';
+    for (let i = 0; i < h.length; i++) {
+        const preview = h[i].sql.replace(/\s+/g, ' ').slice(0, 60);
+        html += `<option value="${i}">${escapeHtml(preview)}${h[i].sql.length > 60 ? '…' : ''}</option>`;
+    }
+    sel.innerHTML = html;
+}
+
+function dbLoadHistSelected() {
+    const sel = document.getElementById('db-hist-select');
+    if (!sel || !_dbCurrentId) return;
+    const idx = parseInt(sel.value, 10);
+    sel.value = '';
+    if (isNaN(idx)) return;
+    const h = dbLoadHistory(_dbCurrentId);
+    if (!h[idx]) return;
+    const ta = document.getElementById('db-query');
+    if (ta) { ta.value = h[idx].sql; dbScheduleValidate(); }
 }
 
 async function dbRunQuery() {
@@ -41789,6 +42033,7 @@ async function dbRunQuery() {
     const permission = document.getElementById('db-perm').value;
     const timeout_secs = parseInt(document.getElementById('db-timeout').value, 10) || 30;
     const resultEl = document.getElementById('db-result');
+    if (!query.trim()) return;
     resultEl.innerHTML = '<div style="color:var(--text-muted);">Running…</div>';
     try {
         const resp = await fetch(`/api/sql-connections/${encodeURIComponent(_dbCurrentId)}/query`, {
@@ -41806,7 +42051,11 @@ async function dbRunQuery() {
         _dbLastResult = data;
         document.getElementById('db-copy-csv').disabled = false;
         document.getElementById('db-copy-md').disabled = false;
-        sqlConnRenderResult(resultEl, data);  // reuse renderer from Settings tester
+        sqlConnRenderResult(resultEl, data);
+        // Ring-buffer history + refresh the dropdown so the operator can
+        // replay this query later.
+        dbPushHistory(_dbCurrentId, query);
+        dbRefreshHistoryDropdown();
     } catch (e) {
         resultEl.innerHTML = `<div style="color:var(--danger);">${escapeHtml(e.message)}</div>`;
     }

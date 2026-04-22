@@ -1987,9 +1987,9 @@
                 </div>
             </div>
 
-            <div style="display:grid; grid-template-columns: 280px 1fr; gap:16px;">
+            <div id="db-layout" style="display:grid; grid-template-columns: 280px 1fr; gap:16px;">
                 <!-- LEFT: connection list grouped by cluster → node -->
-                <div class="card" style="padding:0;">
+                <div id="db-conn-panel" class="card" style="padding:0;">
                     <div class="card-body" style="padding:12px;">
                         <input type="text" id="db-search" class="form-control" placeholder="🔍 Filter connections..." oninput="dbFilterConnections()" style="margin-bottom:10px; font-size:13px;">
                         <div id="db-conn-list" style="max-height: calc(100vh - 280px); overflow-y:auto;">
