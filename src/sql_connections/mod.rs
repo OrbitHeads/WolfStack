@@ -890,6 +890,24 @@ async fn execute_proxied(
             Ok(r) => {
                 let status = r.status();
                 let body_text = r.text().await.unwrap_or_default();
+                
+                // If the target node cleanly rejected the query (e.g. timeout, syntax error,
+                // connection refused), it returns {"error": "..."}. We unwrap this and
+                // return it directly so the caller gets the actual database error, rather
+                // than a confusing "proxy to X failed: HTTP 400..." message that makes it
+                // look like the proxy infrastructure is broken.
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_text) {
+                    if let Some(err_msg) = json.get("error").and_then(|v| v.as_str()) {
+                        let clean_err = err_msg.to_string();
+                        let elapsed_ms = start.elapsed().as_millis() as u64;
+                        write_audit(
+                            caller, &conn.id, query, false, 0, elapsed_ms,
+                            &format!("{} (via {})", clean_err, node_info.hostname),
+                        );
+                        return Err(clean_err);
+                    }
+                }
+                
                 last_err = format!("HTTP {} from {}: {}", status, url, body_text);
                 // Authentic HTTP errors don't retry with different
                 // URL schemes — a 403 on https is going to be 403 on
