@@ -212,28 +212,21 @@ pub async fn cluster_browser_proxy(
 }
 
 /// HTTP proxy leg — reissues the client's request against
-/// http://{host}:{port}/{tail}?{query} where {host} comes from
-/// the incoming request's Host header (supports both local and remote
-/// access). Selkies asset bundles are chunked/streaming, so we pipe
-/// the body rather than buffering.
+/// http://127.0.0.1:{port}/{tail}?{query}. Cluster browser runs
+/// locally on loopback; external hostnames would cause network loops.
+/// Selkies asset bundles are chunked/streaming, so we pipe the body
+/// rather than buffering.
 async fn proxy_http(
     req: HttpRequest,
     mut payload: web::Payload,
     port: u16,
     tail: String,
 ) -> Result<HttpResponse, Error> {
-    let host = req
-        .headers()
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .map(|h| h.split(':').next().unwrap_or(h))
-        .unwrap_or("127.0.0.1");
-
     let query = req.query_string();
     let target = if query.is_empty() {
-        format!("http://{}:{}/{}", host, port, tail)
+        format!("http://127.0.0.1:{}/{}", port, tail)
     } else {
-        format!("http://{}:{}/{}?{}", host, port, tail, query)
+        format!("http://127.0.0.1:{}/{}?{}", port, tail, query)
     };
 
     let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes())
@@ -290,18 +283,11 @@ async fn proxy_websocket(
     port: u16,
     tail: String,
 ) -> Result<HttpResponse, Error> {
-    let host = req
-        .headers()
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .map(|h| h.split(':').next().unwrap_or(h))
-        .unwrap_or("127.0.0.1");
-
     let query = req.query_string();
     let upstream_url = if query.is_empty() {
-        format!("ws://{}:{}/{}", host, port, tail)
+        format!("ws://127.0.0.1:{}/{}", port, tail)
     } else {
-        format!("ws://{}:{}/{}?{}", host, port, tail, query)
+        format!("ws://127.0.0.1:{}/{}?{}", port, tail, query)
     };
 
     let (upstream, _resp) = match tokio_tungstenite::connect_async(&upstream_url).await {

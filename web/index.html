@@ -6384,6 +6384,15 @@
                         </div>
                         <div id="wr-rack-canvas" style="width:100%; min-height:560px;"></div>
                         <div id="wr-rack-legend" style="margin-top:12px; display:flex; gap:16px; flex-wrap:wrap; font-size:11px; color:var(--text-muted);"></div>
+
+                        <!-- Diagnostics panel below topology graphic -->
+                        <div id="wr-diagnostics-panel" style="margin-top:24px; padding:16px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px; display:none;">
+                            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                                <h4 style="margin:0; font-size:14px; font-weight:600; color:var(--text);">🔍 Diagnostics</h4>
+                                <button style="background:none; border:none; color:var(--text-muted); font-size:18px; cursor:pointer;" onclick="document.getElementById('wr-diagnostics-panel').style.display='none';">&times;</button>
+                            </div>
+                            <div id="wr-diagnostics-content" style="font-size:13px; color:var(--text); max-height:300px; overflow-y:auto;"></div>
+                        </div>
                     </div>
 
                     <!-- Table view panels (hidden by default) -->
