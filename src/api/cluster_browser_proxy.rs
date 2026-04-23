@@ -59,14 +59,112 @@ fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
-/// Look up a session's local (127.0.0.1) port. Returns None if no
+/// Look up a session's local (127.0.0.1) port and node_id. Returns None if no
 /// matching session exists on this node — the caller turns that into
-/// a 404.
-fn session_port(id: &str) -> Option<u16> {
+/// a 404 or queries other nodes.
+fn session_port(id: &str) -> Option<(u16, String)> {
     crate::cluster_browser::list_sessions()
         .into_iter()
         .find(|s| s.id == id)
-        .map(|s| s.web_port)
+        .map(|s| (s.web_port, s.node_id))
+}
+
+/// Proxy a cluster browser request to a remote node. Makes a direct HTTP request to
+/// the remote node's cluster browser proxy endpoint, preserving the original request
+/// method, headers, and body.
+async fn node_proxy_request(
+    req: &HttpRequest,
+    state: web::Data<AppState>,
+    node_id: &str,
+    session_id: &str,
+    tail: String,
+    mut payload: web::Payload,
+) -> Result<HttpResponse, Error> {
+    use futures::StreamExt as _;
+
+    // Look up the node
+    let node = match state.cluster.get_node(node_id) {
+        Some(n) => n,
+        None => {
+            return Ok(HttpResponse::NotFound()
+                .json(serde_json::json!({"error": "Remote session node not found"})));
+        }
+    };
+
+    // Buffer the full request body
+    let method = req.method().clone();
+    let mut body_bytes = web::BytesMut::new();
+    while let Some(chunk) = payload.next().await {
+        let chunk = chunk.map_err(actix_web::error::ErrorBadRequest)?;
+        body_bytes.extend_from_slice(&chunk);
+    }
+
+    // Build target URL on remote node (same endpoint this handler provides)
+    let query_string = req.query_string();
+    let scheme = if node.tls { "https" } else { "http" };
+    let target = if query_string.is_empty() {
+        format!("{}://{}:{}/api/cluster-browser/session/{}/{}", scheme, node.address, node.port, session_id, tail)
+    } else {
+        format!("{}://{}:{}/api/cluster-browser/session/{}{}?{}", scheme, node.address, node.port, session_id, tail, query_string)
+    };
+
+    // Build the request using the shared browser proxy client
+    let mut builder = match method {
+        actix_web::http::Method::GET => BROWSER_PROXY_CLIENT.get(&target),
+        actix_web::http::Method::POST => BROWSER_PROXY_CLIENT.post(&target),
+        actix_web::http::Method::PUT => BROWSER_PROXY_CLIENT.put(&target),
+        _ => BROWSER_PROXY_CLIENT.get(&target),
+    };
+
+    // Copy headers (skip hop-by-hop)
+    for (name, val) in req.headers() {
+        if is_hop_by_hop(name.as_str()) {
+            continue;
+        }
+        if let Ok(v) = val.to_str() {
+            builder = builder.header(name.as_str(), v);
+        }
+    }
+
+    // Add inter-node auth
+    builder = builder.header("X-WolfStack-Secret", state.cluster_secret.clone());
+
+    // Add body if present
+    if !body_bytes.is_empty() {
+        builder = builder.body(body_bytes.freeze());
+    }
+
+    // Execute the request
+    match builder.send().await {
+        Ok(upstream) => {
+            let status = upstream.status().as_u16();
+            let resp_ct = upstream
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/octet-stream")
+                .to_string();
+
+            match upstream.bytes().await {
+                Ok(bytes) => {
+                    Ok(HttpResponse::build(
+                        actix_web::http::StatusCode::from_u16(status)
+                            .unwrap_or(actix_web::http::StatusCode::BAD_GATEWAY),
+                    )
+                    .content_type(resp_ct)
+                    .body(bytes.to_vec()))
+                }
+                Err(e) => {
+                    warn!("Failed to read remote proxy response: {}", e);
+                    Ok(HttpResponse::BadGateway().body(format!("Failed to read response: {}", e)))
+                }
+            }
+        }
+        Err(e) => {
+            warn!("cluster_browser remote proxy error to {}: {}", target, e);
+            Ok(HttpResponse::BadGateway().body(format!("Remote proxy error: {}", e)))
+        }
+    }
 }
 
 /// Unified entry point: same URL serves HTTP assets, SPA JS, and the
@@ -83,13 +181,21 @@ pub async fn cluster_browser_proxy(
     }
 
     let (id, tail) = path.into_inner();
-    let port = match session_port(&id) {
+    let (port, session_node_id) = match session_port(&id) {
         Some(p) => p,
         None => {
             return Ok(HttpResponse::NotFound()
                 .json(serde_json::json!({ "error": "Session not found on this node" })));
         }
     };
+
+    // Check if session is on a remote node. If so, proxy through that node's
+    // cluster browser endpoint directly.
+    let self_node_id = crate::agent::self_node_id();
+    if session_node_id != self_node_id {
+        // Session is on a remote node — proxy the request directly to that node
+        return node_proxy_request(&req, state, &session_node_id, &id, tail, payload).await;
+    }
 
     let upgrade_is_ws = req
         .headers()

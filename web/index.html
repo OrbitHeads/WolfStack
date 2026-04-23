@@ -275,11 +275,16 @@
             </div>
         </nav>
         <div class="sidebar-footer">
-            <div id="update-banner" style="display:none;margin-bottom:8px;padding:8px 12px;border-radius:8px;
-                 background:rgba(234,179,8,0.15);border:1px solid rgba(234,179,8,0.3);font-size:12px;
-                 color:var(--text);text-align:center;cursor:pointer;" onclick="triggerUpgrade()">
-                🔔 <span id="update-banner-text">Update available</span>
-            </div>
+            <button id="update-banner" type="button" onclick="triggerUpgrade()"
+                 style="display:none;margin-bottom:8px;padding:10px 14px;border-radius:8px;
+                 background:linear-gradient(180deg,#f59e0b,#d97706);border:1px solid #b45309;
+                 box-shadow:0 1px 0 rgba(255,255,255,0.2) inset,0 2px 6px rgba(0,0,0,0.25);
+                 font-size:12px;font-weight:600;color:#111;text-align:center;cursor:pointer;
+                 width:100%;letter-spacing:0.2px;transition:transform 0.08s ease,filter 0.12s ease;"
+                 onmouseover="this.style.filter='brightness(1.08)'" onmouseout="this.style.filter=''"
+                 onmousedown="this.style.transform='translateY(1px)'" onmouseup="this.style.transform=''">
+                ⬆️ <span id="update-banner-text">Update available</span> — click to upgrade
+            </button>
             <div class="sidebar-icon-buttons">
                 <button class="btn btn-icon" onclick="selectView('settings')" title="Settings">⚙️</button>
                 <button class="btn btn-icon" onclick="window.open('https://wolfscale.org', '_blank')"

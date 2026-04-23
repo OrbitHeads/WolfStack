@@ -19942,16 +19942,27 @@ function isNewerVersion(latest, current) {
 setTimeout(checkForUpdates, 5000);
 setInterval(checkForUpdates, 6 * 60 * 60 * 1000);
 
-function triggerUpgrade() {
-    // Navigate to the Issues page and auto-trigger a scan
-    // so the user can use "Upgrade All" to upgrade every node
+async function triggerUpgrade() {
+    // Navigate to the Issues page, run the scan, then open the Upgrade All
+    // confirm dialog so the user lands directly on the ready-to-go upgrade prompt.
     selectView('issues');
-    // Give the page a moment to render, then trigger the scan
-    setTimeout(function () {
-        if (typeof scanForIssues === 'function') {
-            scanForIssues();
-        }
-    }, 300);
+
+    // Wait for the issues view to render before kicking the scan off.
+    await new Promise(function (resolve) { setTimeout(resolve, 300); });
+
+    if (typeof scanForIssues !== 'function') return;
+    try {
+        await scanForIssues();
+    } catch (e) {
+        // scanForIssues surfaces its own errors; don't pop the upgrade dialog
+        // on a failed scan.
+        return;
+    }
+
+    if (typeof issuesUpgradeAll === 'function'
+        && Array.isArray(issuesScanResults) && issuesScanResults.length > 0) {
+        issuesUpgradeAll();
+    }
 }
 
 // ═══════════════════════════════════════════════════

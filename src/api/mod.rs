@@ -4466,10 +4466,49 @@ pub async fn cluster_services_delete(
 
 // ─── Cluster Browser Sessions ───────────────────────────────────────────
 
-/// GET /api/cluster-browser/sessions — active browser sessions on this node.
+/// GET /api/cluster-browser/sessions — active browser sessions from all nodes in the cluster.
 pub async fn cluster_browser_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    HttpResponse::Ok().json(crate::cluster_browser::list_sessions())
+    
+    let mut sessions = crate::cluster_browser::list_sessions();
+    
+    // Try to fetch sessions from all remote nodes (timeout per node)
+    let nodes: Vec<_> = state.cluster.nodes.read().unwrap()
+        .values()
+        .filter(|n| !n.is_self && n.online)
+        .cloned()
+        .collect();
+    
+    let client = &*API_HTTP_CLIENT;
+    for node in nodes {
+        let scheme = if node.tls { "https" } else { "http" };
+        let urls = vec![
+            format!("{}://{}:{}/api/cluster-browser/sessions", scheme, node.address, node.port),
+            format!("http://{}:{}/api/cluster-browser/sessions", node.address, node.port + 1),
+        ];
+        
+        for url in urls {
+            match client
+                .get(&url)
+                .header("X-WolfStack-Secret", state.cluster_secret.clone())
+                .timeout(std::time::Duration::from_secs(3))
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    if let Ok(bytes) = resp.bytes().await {
+                        if let Ok(remote_sessions) = serde_json::from_slice::<Vec<crate::cluster_browser::BrowserSession>>(&bytes) {
+                            sessions.extend(remote_sessions);
+                        }
+                    }
+                    break; // Got a response, don't try other URLs for this node
+                }
+                Err(_) => continue, // Try next URL
+            }
+        }
+    }
+    
+    HttpResponse::Ok().json(sessions)
 }
 
 #[derive(Deserialize)]

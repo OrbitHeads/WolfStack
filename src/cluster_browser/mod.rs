@@ -46,6 +46,11 @@ pub struct BrowserSession {
     pub user: String,
     /// Unix epoch seconds.
     pub started_at: u64,
+    /// The cluster node ID where this session is running. Used to route
+    /// remote cluster browser requests through the node proxy. Populated
+    /// on session creation, persisted in the JSON config.
+    #[serde(default)]
+    pub node_id: String,
 }
 
 fn default_scheme() -> String { "http".to_string() }
@@ -371,6 +376,7 @@ fn spawn_container(user: &str, homepage: &str, tls: bool) -> Result<BrowserSessi
         scheme: scheme.to_string(),
         user: user_safe,
         started_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+        node_id: crate::agent::self_node_id(),
     };
     SESSIONS.lock().unwrap().push(session.clone());
     save();
