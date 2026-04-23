@@ -21,18 +21,17 @@ type S = web::Data<crate::api::AppState>;
 /// Try to resolve a domain/hostname to its first IPv4 address.
 /// Falls back to returning the input unchanged if resolution fails (assumes it's already an IP).
 /// Uses the system resolver (/etc/hosts, systemd-resolved, nsswitch, etc).
+/// Return the address as-is. For HTTPS connections (most common),
+/// we must NOT resolve domain names to IPs because TLS certificate
+/// verification requires the hostname. For nodes configured as
+/// "node1.example.com", resolving to IP would cause the TLS handshake
+/// to fail because the certificate is issued for the domain, not the IP.
+///
+/// Domains are DNS-resolvable by reqwest and will work for both
+/// HTTP and HTTPS. IPs work for both. This is the correct, safe approach
+/// that supports both domain-based and IP-based node configurations.
 fn resolve_node_address(address: &str) -> String {
-    use std::net::ToSocketAddrs;
-    let target = format!("{}:80", address);
-    target.to_socket_addrs()
-        .ok()
-        .and_then(|mut addrs| {
-            addrs.find_map(|sa| match sa {
-                std::net::SocketAddr::V4(v4) => Some(v4.ip().to_string()),
-                _ => None,
-            })
-        })
-        .unwrap_or_else(|| address.to_string()) // Fallback: use address as-is (assume it's an IP)
+    address.to_string()
 }
 
 /// Guard helper — every WolfRouter endpoint requires either a logged-in
