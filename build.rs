@@ -98,6 +98,63 @@ fn main() {
     }
     out.push_str(&format!("\n*{} endpoints registered.*\n", all_routes.len()));
 
+    // ── Sibling product docs ────────────────────────────────────
+    // WolfStack is one tool in the Wolf Software Systems suite;
+    // operators regularly ask the AI about WolfNet (private mesh),
+    // WolfScale (DB replication + load-balancer), and WolfDisk
+    // (distributed filesystem) because they run alongside each
+    // other. Embedding each product's canonical doc in the KB
+    // stops the model hallucinating feature lists. Paths are
+    // resolved relative to CARGO_MANIFEST_DIR (= wolfstack/) so
+    // they work for any developer layout that matches the
+    // monorepo. Missing files are silently skipped so the KB
+    // still builds in standalone checkouts.
+    //
+    // We cap each doc at 60 KB — enough for every product's
+    // README / CLAUDE / DOCUMENTATION while keeping the full KB
+    // well inside Claude/Gemini/GPT context windows.
+    out.push_str("\n# Sibling products (Wolf Software Systems suite)\n\n");
+    out.push_str("WolfStack is one of several Wolf Software products operators commonly run side-by-side. Use the content below when answering questions about these tools — do not guess feature lists or commands.\n\n");
+    let siblings: &[(&str, &[&str])] = &[
+        ("WolfNet (private mesh / WireGuard overlay)", &[
+            "../wolfnet/CLAUDE.md",
+            "../wolfnet/README.md",
+        ]),
+        ("WolfScale (MySQL/MariaDB replication + load balancer — the monorepo this workspace lives in)", &[
+            "../README.md",
+            "../docs/DOCUMENTATION.md",
+        ]),
+        ("WolfDisk (distributed filesystem / object store)", &[
+            "../../wolfdisk/README.md",
+            "../../wolfdisk/CLAUDE.md",
+        ]),
+    ];
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    for (title, paths) in siblings {
+        out.push_str(&format!("## {}\n\n", title));
+        let mut appended = false;
+        for rel in *paths {
+            let full = Path::new(&manifest_dir).join(rel);
+            // Tell cargo to rebuild when the sibling doc changes.
+            println!("cargo:rerun-if-changed={}", full.display());
+            let Ok(text) = fs::read_to_string(&full) else { continue; };
+            out.push_str(&format!("### `{}`\n\n", rel));
+            // Size cap so one huge doc can't swamp the context.
+            if text.len() > 60 * 1024 {
+                out.push_str(&text[..60 * 1024]);
+                out.push_str("\n\n[…truncated at 60 KB…]\n\n");
+            } else {
+                out.push_str(&text);
+                if !text.ends_with('\n') { out.push('\n'); }
+                out.push('\n');
+            }
+            appended = true;
+        }
+        if !appended {
+            out.push_str("*(doc not present in this checkout)*\n\n");
+        }
+    }
+
     // ── Write ───────────────────────────────────────────────────
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set");
     let dest = Path::new(&out_dir).join("wolfstack-kb-generated.md");
