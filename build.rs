@@ -115,9 +115,12 @@ fn main() {
     // well inside Claude/Gemini/GPT context windows.
     out.push_str("\n# Sibling products (Wolf Software Systems suite)\n\n");
     out.push_str("WolfStack is one of several Wolf Software products operators commonly run side-by-side. Use the content below when answering questions about these tools — do not guess feature lists or commands.\n\n");
+    // CLAUDE.md files are intentionally NOT included — they're
+    // instructions for the Claude Code assistant, not user-facing
+    // product documentation; feeding them to the runtime AI is
+    // off-topic and noise.
     let siblings: &[(&str, &[&str])] = &[
         ("WolfNet (private mesh / WireGuard overlay)", &[
-            "../wolfnet/CLAUDE.md",
             "../wolfnet/README.md",
         ]),
         ("WolfScale (MySQL/MariaDB replication + load balancer — the monorepo this workspace lives in)", &[
@@ -126,7 +129,6 @@ fn main() {
         ]),
         ("WolfDisk (distributed filesystem / object store)", &[
             "../../wolfdisk/README.md",
-            "../../wolfdisk/CLAUDE.md",
         ]),
     ];
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
