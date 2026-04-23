@@ -336,31 +336,10 @@
                     return { ep, ok: false, error: 'Invalid JSON response', detail: String(e.message || e).slice(0, 240) };
                 }
             } catch (e) {
-                // Check if this is a TLS certificate error (ERR_CONNECTION_CLOSED, etc)
-                // If on HTTPS with cert issues, request redirect to HTTP fallback
-                if (window.location.protocol === 'https:' && e instanceof TypeError) {
-                    const isTlsError = e.message.includes('Failed to fetch') ||
-                                     e.message.includes('NetworkError') ||
-                                     e.message.toLowerCase().includes('connection');
-                    if (isTlsError && !window.location.search.includes('no_tls_redirect')) {
-                        // Signal to caller that a TLS redirect is needed
-                        return { ep, ok: false, error: 'TLS_REDIRECT_NEEDED', detail: '' };
-                    }
-                }
                 // Network-level failure (DNS, TLS, CORS, offline, etc.).
                 return { ep, ok: false, error: `Network error: ${e.message || e}`, detail: '' };
             }
         }));
-
-        // Check if any error is a TLS redirect signal
-        const tlsRedirectNeeded = outcomes.some(o => o.error === 'TLS_REDIRECT_NEEDED');
-        if (tlsRedirectNeeded && !window.location.search.includes('no_tls_redirect')) {
-            const httpPort = parseInt(window.location.port || '443') + 1;
-            console.warn(`TLS certificate error detected in WolfRouter. Redirecting from port ${window.location.port} to HTTP port ${httpPort}`);
-            window.location.href = 'http://' + window.location.hostname + ':' + httpPort +
-                window.location.pathname + '?no_tls_redirect=1';
-            return;
-        }
 
         // Apply every successful outcome so partially-loaded state is
         // still rendered; each fallback is used when the endpoint
@@ -373,11 +352,8 @@
                 if (o.ep.key === 'topology') topologyOk = true;
             } else {
                 if (o.ep.fallback !== undefined) wrState[o.ep.stateKey] = o.ep.fallback;
-                // Don't add TLS_REDIRECT_NEEDED to failures list (already handled above)
-                if (o.error !== 'TLS_REDIRECT_NEEDED') {
-                    failures.push(o);
-                    console.error(`wolfrouter: ${o.ep.label} (${o.ep.url}) — ${o.error}`, o.detail);
-                }
+                failures.push(o);
+                console.error(`wolfrouter: ${o.ep.label} (${o.ep.url}) — ${o.error}`, o.detail);
             }
         }
 
