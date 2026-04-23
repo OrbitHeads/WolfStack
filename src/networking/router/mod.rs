@@ -241,6 +241,24 @@ pub struct LanSegment {
     pub description: String,
 }
 
+/// A subnet route for reaching remote networks via WolfNet or other tunnels.
+/// Allows traffic destined for the subnet to be routed through a gateway.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubnetRoute {
+    pub id: String,
+    /// Destination subnet in CIDR form (e.g. "10.20.0.0/16").
+    pub subnet_cidr: String,
+    /// Gateway IP — the next-hop to reach this subnet (typically a WolfNet tunnel endpoint).
+    pub gateway: String,
+    /// Node that owns this route. If None, applied cluster-wide.
+    #[serde(default)]
+    pub node_id: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub description: String,
+}
+
 /// Firewall rule action.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -389,6 +407,10 @@ pub struct RouterConfig {
     /// owns it. See `proxy::apply_for_node` for the generator.
     #[serde(default)]
     pub proxies: Vec<proxy::ProxyEntry>,
+    /// Subnet routes for reaching remote networks via WolfNet or other tunnels.
+    /// Each entry defines a destination subnet and the gateway to reach it.
+    #[serde(default)]
+    pub subnet_routes: Vec<SubnetRoute>,
 }
 
 fn default_safe_mode_seconds() -> u32 { 30 }
@@ -550,6 +572,31 @@ pub fn apply_on_startup(state: std::sync::Arc<RouterState>, self_node_id: &str) 
             }
         }
     }
+
+    // Subnet routes — apply kernel routing entries for remote subnets
+    // accessible via WolfNet or other tunnels.
+    let subnet_routes: Vec<_> = cfg.subnet_routes.iter()
+        .filter(|r| r.enabled && (r.node_id.is_none() || r.node_id.as_deref() == Some(self_node_id)))
+        .collect();
+
+    if !subnet_routes.is_empty() {
+        for route in subnet_routes {
+            match apply_subnet_route(route) {
+                Ok(()) => {
+                    tracing::info!(
+                        "WolfRouter startup: subnet route applied: {} via {}",
+                        route.subnet_cidr, route.gateway
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "WolfRouter startup: subnet route failed: {} via {}: {}",
+                        route.subnet_cidr, route.gateway, e
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Background safe-mode tick — checks whether the rollback deadline has
@@ -604,4 +651,42 @@ pub fn parse_cidr(cidr: &str) -> Option<(String, u32)> {
         if n > 255 { return None; }
     }
     Some((ip.to_string(), prefix))
+}
+
+/// Apply a single subnet route using `ip route add`. If the route already
+/// exists, this is idempotent — ip route silently ignores duplicates.
+fn apply_subnet_route(route: &SubnetRoute) -> Result<(), String> {
+    use std::process::Command;
+
+    // Validate CIDR format before trying to apply
+    if parse_cidr(&route.subnet_cidr).is_none() {
+        return Err(format!("Invalid subnet CIDR: {}", route.subnet_cidr));
+    }
+
+    // Validate gateway is a valid IPv4 address
+    if route.gateway.parse::<std::net::Ipv4Addr>().is_err() {
+        return Err(format!("Invalid gateway IP: {}", route.gateway));
+    }
+
+    // Apply the route: ip route add <subnet> via <gateway>
+    let output = Command::new("ip")
+        .arg("route")
+        .arg("add")
+        .arg(&route.subnet_cidr)
+        .arg("via")
+        .arg(&route.gateway)
+        .output()
+        .map_err(|e| format!("Failed to execute ip command: {}", e))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // "File exists" errors are fine — route already applied
+        if stderr.contains("File exists") {
+            Ok(())
+        } else {
+            Err(format!("ip route add failed: {}", stderr.trim()))
+        }
+    }
 }

@@ -3245,6 +3245,29 @@ pub fn docker_get_wolfnet_ip(container: &str) -> Option<String> {
 }
 
 /// Get the effective WolfNet IP for a Docker container (override file first, then label)
+/// Validate that a Docker container is compatible with WolfNet assignment.
+/// Returns error if the container has incompatible network configuration.
+fn validate_docker_wolfnet_compatible(container: &str) -> Result<(), String> {
+    // For Docker, WolfNet is applied via macvlan on wolfnet0, which is generally
+    // compatible with most Docker network modes. However, we should check for
+    // host network mode which is incompatible.
+    if let Ok(output) = Command::new("docker")
+        .args(["inspect", "--format", "{{.HostConfig.NetworkMode}}", container])
+        .output()
+    {
+        let mode = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if mode == "host" {
+            return Err(
+                "Cannot assign WolfNet to container with host network mode. \
+                 Host networking shares the host's network stack, so WolfNet (which needs \
+                 its own network interface) cannot coexist with it. Use bridge or custom \
+                 Docker network mode instead.".to_string()
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn docker_effective_wolfnet_ip(container: &str) -> Option<String> {
     // Check override file first
     if let Some(ip) = docker_get_wolfnet_ip(container) {
@@ -3266,6 +3289,13 @@ pub fn docker_effective_wolfnet_ip(container: &str) -> Option<String> {
 /// Set or remove the WolfNet IP for a Docker container.
 /// Persists to config file and applies live if the container is running.
 pub fn docker_set_wolfnet_ip(container: &str, ip: Option<&str>) -> Result<String, String> {
+    // Validate that we're not setting WolfNet IP on a container with incompatible network config
+    if ip.is_some() && ip.map(|i| !i.trim().is_empty()).unwrap_or(false) {
+        if let Err(e) = validate_docker_wolfnet_compatible(container) {
+            return Err(e);
+        }
+    }
+
     // Read existing overrides
     let mut map: std::collections::HashMap<String, String> = std::fs::read_to_string(DOCKER_WOLFNET_CONFIG)
         .ok()
@@ -4190,11 +4220,51 @@ pub fn lxc_save_config(container: &str, content: &str) -> Result<String, String>
     if !std::path::Path::new(&path).exists() {
         return Err(format!("Container '{}' config not found", container));
     }
+
+    // Validate that this config doesn't have conflicting WolfNet + VLAN settings
+    if let Err(e) = validate_wolfnet_vlan_conflict(content) {
+        return Err(e);
+    }
+
     let backup = format!("{}.bak", path);
     let _ = std::fs::copy(&path, &backup);
     std::fs::write(&path, content)
         .map(|_| format!("Config saved for '{}'", container))
         .map_err(|e| format!("Failed to save config: {}", e))
+}
+
+/// Validate that a container config doesn't have conflicting WolfNet + VLAN settings.
+/// WolfNet (wolfnet0 tunnel) and VLAN tags are incompatible network configurations
+/// on Proxmox clusters — they cause routing conflicts that can break the container's
+/// networking and potentially affect cluster-wide routing.
+fn validate_wolfnet_vlan_conflict(config: &str) -> Result<(), String> {
+    let has_wolfnet_ip = config.lines().any(|line| {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') { return false; }
+        // Check for .wolfnet/ip marker file reference
+        trimmed.contains(".wolfnet/ip") ||
+        // Or check if this looks like a container being prepared for WolfNet
+        (trimmed.contains("wolfnet") && !trimmed.contains("#"))
+    });
+
+    let has_vlan_tag = config.lines().any(|line| {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') { return false; }
+        // Look for lines like: lxc.net.0.vlan.id = 10
+        trimmed.starts_with("lxc.net.") && trimmed.contains("vlan.id")
+    });
+
+    if has_wolfnet_ip && has_vlan_tag {
+        return Err(
+            "Configuration conflict: Cannot assign WolfNet to a container with VLAN tagging. \
+             WolfNet is a mesh overlay network (wolfnet0 tunnel) while VLAN uses tagged physical \
+             interfaces — they have incompatible routing models that cause networking to fail on \
+             Proxmox clusters. Choose one: either WolfNet mode (for mesh networking) or VLAN mode \
+             (for bridged networking), but not both.".to_string()
+        );
+    }
+
+    Ok(())
 }
 
 /// Structured representation of a single LXC network interface

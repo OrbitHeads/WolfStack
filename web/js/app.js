@@ -24788,12 +24788,12 @@ function appstoreShowComposeModal(installId, name, yaml, readOnly, nodeId) {
 // ═══════════════════════════════════════════════
 
 async function loadNodeSecurity() {
-    const container = document.getElementById('security-node-content');
+    const container = document.getElementById('security-content');
     if (!container) return;
 
     const node = allNodes.find(n => n.id === currentNodeId);
     if (!node) {
-        container.innerHTML = '<div style="padding:40px; text-align:center; color:var(--text-muted);">No node selected.</div>';
+        container.innerHTML = '<div style="padding:40px; text-align:center; color:var(--text-muted); grid-column:1/-1;">No node selected.</div>';
         return;
     }
 
@@ -24805,10 +24805,284 @@ async function loadNodeSecurity() {
         const res = await fetch(url);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        container.innerHTML = renderNodeSecurity(node, data);
+        window._securityData = { node, data };
+        container.innerHTML = renderSecurityComponents(node, data);
+        loadSecurityConfigFiles();
     } catch (e) {
-        container.innerHTML = `<div class="card" style="border-color:rgba(239,68,68,0.3);"><div class="card-body" style="padding:24px;"><div style="color:#ef4444; font-size:14px;">⚠️ Failed to retrieve security status: ${escapeHtml(e.message)}</div></div></div>`;
+        container.innerHTML = `<div class="card" style="border-color:rgba(239,68,68,0.3); grid-column:1/-1;"><div class="card-body" style="padding:24px;"><div style="color:#ef4444; font-size:14px;">⚠️ Failed to retrieve security status: ${escapeHtml(e.message)}</div></div></div>`;
     }
+}
+
+function renderSecurityComponents(node, data) {
+    const nodePrefix = node.is_self ? '' : `nodes/${node.id}/proxy/`;
+    const f2bCard = renderFail2banCard(node, data.fail2ban, nodePrefix);
+    const ufwCard = renderUfwCard(node, data.ufw, nodePrefix);
+    const updCard = renderUpdatesCard(node, data.updates, nodePrefix);
+    const iptCard = renderIptablesCard(data.iptables);
+    return f2bCard + ufwCard + updCard + iptCard;
+}
+
+function renderFail2banCard(node, f2b, nodePrefix) {
+    const installed = f2b.installed;
+    const jails = f2b.jails || 'none';
+    const banned = (f2b.banned || '').trim();
+    const bannedCount = banned ? banned.split('\n').filter(l => l.trim()).length : 0;
+    const statusColor = installed ? '#22c55e' : '#ef4444';
+    const statusLabel = installed ? 'Installed' : 'Not Installed';
+    let actions = '';
+    if (installed) {
+        actions = `
+            <button class="btn btn-sm" onclick="showFail2banSettings('${nodePrefix}')" style="flex:1;">⚙️ Settings</button>
+            <button class="btn btn-sm" onclick="showFail2banBanned('${nodePrefix}')" style="flex:1;">🚫 Banned (${bannedCount})</button>
+            <button class="btn btn-sm" onclick="showFail2banEditor('${nodePrefix}')" style="flex:1;">📝 jail.local</button>
+        `;
+    } else {
+        actions = `<button class="btn btn-sm btn-primary" onclick="securityAction('${nodePrefix}security/fail2ban/install', 'POST', {}, this)" style="flex:1;">📥 Install</button>`;
+    }
+    return `
+    <div class="card" style="background:linear-gradient(135deg, rgba(34,197,94,0.08), rgba(59,130,246,0.04)); border-color:rgba(34,197,94,0.2);">
+        <div class="card-body">
+            <div style="display:flex; align-items:flex-start; gap:16px;">
+                <div style="font-size:40px; line-height:1;">🛡️</div>
+                <div style="flex:1;">
+                    <div style="display:flex; align-items:center; gap:12px; margin-bottom:12px;">
+                        <h3 style="margin:0; font-size:16px; font-weight:700;">Fail2ban</h3>
+                        <span style="background:${statusColor}20; color:${statusColor}; padding:3px 10px; border-radius:6px; font-size:11px; font-weight:600;">${statusLabel}</span>
+                    </div>
+                    <p style="margin:0 0 12px; color:var(--text-secondary); font-size:13px;">Protects against brute-force SSH attacks by automatically banning IPs with repeated login failures.</p>
+                    ${installed ? `<div style="font-size:12px; color:var(--text-muted); margin-bottom:12px;">Active Jails: <strong>${escapeHtml(jails)}</strong></div>` : ''}
+                    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                        ${actions}
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>`;
+}
+
+function renderUfwCard(node, ufw, nodePrefix) {
+    const installed = ufw.installed;
+    const isActive = (ufw.status || '').toLowerCase().includes('active');
+    const statusColor = isActive ? '#22c55e' : (installed ? '#f59e0b' : '#ef4444');
+    const statusLabel = isActive ? 'Active' : (installed ? 'Inactive' : 'Not Installed');
+    let actions = '';
+    if (installed) {
+        actions = `
+            <button class="btn btn-sm" onclick="showUfwRules('${nodePrefix}')" style="flex:1;">📋 Manage Rules</button>
+            <button class="btn btn-sm" onclick="securityAction('${nodePrefix}security/ufw/toggle', 'POST', {enable: ${!isActive}}, this)" style="flex:1;">${isActive ? '⏸️ Disable' : '▶️ Enable'}</button>
+        `;
+    } else {
+        actions = `<button class="btn btn-sm btn-primary" onclick="securityAction('${nodePrefix}security/ufw/install', 'POST', {}, this)" style="flex:1;">📥 Install</button>`;
+    }
+    return `
+    <div class="card" style="background:linear-gradient(135deg, rgba(255,107,53,0.08), rgba(59,130,246,0.04)); border-color:rgba(255,107,53,0.2);">
+        <div class="card-body">
+            <div style="display:flex; align-items:flex-start; gap:16px;">
+                <div style="font-size:40px; line-height:1;">🔥</div>
+                <div style="flex:1;">
+                    <div style="display:flex; align-items:center; gap:12px; margin-bottom:12px;">
+                        <h3 style="margin:0; font-size:16px; font-weight:700;">UFW Firewall</h3>
+                        <span style="background:${statusColor}20; color:${statusColor}; padding:3px 10px; border-radius:6px; font-size:11px; font-weight:600;">${statusLabel}</span>
+                    </div>
+                    <p style="margin:0 0 12px; color:var(--text-secondary); font-size:13px;">Uncomplicated Firewall for managing ingress traffic with simple rules and port controls.</p>
+                    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                        ${actions}
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>`;
+}
+
+function renderUpdatesCard(node, updates, nodePrefix) {
+    const updCount = updates?.count || 0;
+    const pkgMgr = updates?.package_manager || 'unknown';
+    const hasUpdates = updCount > 0;
+    const statusColor = hasUpdates ? '#f59e0b' : '#22c55e';
+    const statusLabel = hasUpdates ? `${updCount} update${updCount !== 1 ? 's' : ''}` : 'Up to date';
+    return `
+    <div class="card" style="background:linear-gradient(135deg, rgba(34,197,94,0.08), rgba(59,130,246,0.04)); border-color:rgba(34,197,94,0.2);">
+        <div class="card-body">
+            <div style="display:flex; align-items:flex-start; gap:16px;">
+                <div style="font-size:40px; line-height:1;">📦</div>
+                <div style="flex:1;">
+                    <div style="display:flex; align-items:center; gap:12px; margin-bottom:12px;">
+                        <h3 style="margin:0; font-size:16px; font-weight:700;">System Updates</h3>
+                        <span style="background:${statusColor}20; color:${statusColor}; padding:3px 10px; border-radius:6px; font-size:11px; font-weight:600;">${statusLabel}</span>
+                        <span style="color:var(--text-muted); font-size:11px;">${pkgMgr}</span>
+                    </div>
+                    <p style="margin:0 0 12px; color:var(--text-secondary); font-size:13px;">Keep your system secure and stable by installing available security patches and updates.</p>
+                    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                        <button class="btn btn-sm" onclick="securityAction('${nodePrefix}security/updates/check', 'POST', {}, this)" style="flex:1;">🔍 Check</button>
+                        ${hasUpdates ? `<button class="btn btn-sm btn-primary" onclick="securityAction('${nodePrefix}security/updates/apply', 'POST', {}, this)" style="flex:1;">⬆️ Install All</button>` : ''}
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>`;
+}
+
+function renderIptablesCard(iptables) {
+    const rules = (iptables.rules || '').trim();
+    const ruleCount = rules ? rules.split('\n').filter(l => l.trim()).length : 0;
+    return `
+    <div class="card" style="background:linear-gradient(135deg, rgba(59,130,246,0.08), rgba(168,85,247,0.04)); border-color:rgba(59,130,246,0.2);">
+        <div class="card-body">
+            <div style="display:flex; align-items:flex-start; gap:16px;">
+                <div style="font-size:40px; line-height:1;">📋</div>
+                <div style="flex:1;">
+                    <div style="display:flex; align-items:center; gap:12px; margin-bottom:12px;">
+                        <h3 style="margin:0; font-size:16px; font-weight:700;">iptables Rules</h3>
+                        <span style="background:#3b82f620; color:#3b82f6; padding:3px 10px; border-radius:6px; font-size:11px; font-weight:600; cursor:pointer;" onclick="showIptablesDetail()">View (${ruleCount})</span>
+                    </div>
+                    <p style="margin:0; color:var(--text-secondary); font-size:13px;">System-level firewall rules currently active on this host.</p>
+                </div>
+            </div>
+        </div>
+    </div>`;
+}
+
+function toggleSecurityAdvanced() {
+    const el = document.getElementById('security-advanced');
+    if (!el) return;
+    const show = el.style.display === 'none';
+    el.style.display = show ? 'block' : 'none';
+}
+
+function showDialog(config) {
+    const modal = document.createElement('div');
+    modal.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.6); backdrop-filter:blur(4px); z-index:10000; display:flex; align-items:center; justify-content:center;';
+
+    const dlg = { close: () => modal.remove() };
+    const buttons = (config.buttons || []).map((btn, idx) => {
+        const isPrimary = btn.label.includes('Save') || btn.label.includes('Add') || btn.label.includes('Apply') ? 'btn-primary' : '';
+        const btnClass = `btn btn-sm ${isPrimary}`;
+        return `<button class="${btnClass}" onclick="(${btn.onclick.toString()})(window._currentDialog)" style="font-size:13px;">${btn.label}</button>`;
+    }).join('');
+
+    modal.innerHTML = `
+        <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:12px; width:640px; max-width:90vw; max-height:85vh; display:flex; flex-direction:column; box-shadow:0 20px 60px rgba(0,0,0,0.4); overflow:hidden;">
+            <div style="padding:20px 24px; border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between;">
+                <h3 style="margin:0; font-size:16px; font-weight:600;">${config.title || 'Dialog'}</h3>
+                <button onclick="this.closest('div[style*=fixed]').remove()" style="background:none; border:none; color:var(--text-muted); font-size:20px; cursor:pointer; padding:4px;">✕</button>
+            </div>
+            <div style="padding:20px 24px; flex:1; overflow-y:auto;">
+                ${config.html || ''}
+            </div>
+            <div style="padding:16px 24px; border-top:1px solid var(--border); display:flex; justify-content:flex-end; gap:8px; flex-wrap:wrap;">
+                ${buttons}
+            </div>
+        </div>`;
+
+    document.body.appendChild(modal);
+    modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+
+    window._currentDialog = dlg;
+    return dlg;
+}
+
+function showFail2banSettings(nodePrefix) {
+    showDialog({
+        title: '⚙️ Fail2ban Settings',
+        html: `<div style="display:grid; gap:16px; color:var(--text-secondary); font-size:13px;"><p>To modify fail2ban settings, edit the jail.local configuration file. Click the "📝 jail.local" button to open the editor.</p><p style="color:var(--text-muted); font-size:12px;">Common settings: bantime (how long to ban), findtime (failure window), maxretry (failures before ban), ignoreip (never ban).</p></div>`,
+        buttons: [{ label: 'Close', onclick: (dlg) => dlg.close() }]
+    });
+}
+
+function showFail2banBanned(nodePrefix) {
+    if (!window._securityData) return;
+    const { data } = window._securityData;
+    const banned = (data.fail2ban.banned || '').trim();
+    const lines = banned ? banned.split('\n').filter(l => l.trim()) : [];
+    showDialog({
+        title: '🚫 Banned IPs (' + lines.length + ')',
+        html: `<div style="font-size:13px; max-height:400px; overflow-y:auto;">${lines.length === 0 ? '<p style="color:var(--text-muted); text-align:center; padding:20px;">No IPs currently banned</p>' : ''} ${lines.map((ip) => `<div style="padding:10px 12px; background:var(--bg-primary); border:1px solid var(--border); border-radius:6px; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center;"><code style="color:#ef4444; font-weight:600;">${escapeHtml(ip)}</code><button class="btn btn-sm" onclick="unbanIp('${nodePrefix}', '${escapeHtml(ip)}', this)" style="font-size:11px;">Unban</button></div>`).join('')}</div>`,
+        buttons: [{ label: 'Close', onclick: (dlg) => dlg.close() }]
+    });
+}
+
+function showFail2banEditor(nodePrefix) {
+    editJailLocal(nodePrefix);
+}
+
+function showUfwRules(nodePrefix) {
+    if (!window._securityData) return;
+    const { data } = window._securityData;
+    const status = (data.ufw.status || '').trim();
+    showDialog({
+        title: '📋 UFW Rules',
+        html: `<div><div style="font-size:12px; max-height:400px; overflow-y:auto; background:var(--bg-primary); border:1px solid var(--border); border-radius:8px; padding:12px; font-family:monospace; white-space:pre-wrap; color:var(--text-secondary); margin-bottom:16px;">${escapeHtml(status) || 'No rules configured'}</div><input type="text" id="new-ufw-rule" placeholder="e.g., allow 443/tcp" class="form-control" style="padding:10px 12px; margin-bottom:8px;"><small style="color:var(--text-muted); display:block;">Examples: allow 22/tcp | deny 80/tcp | allow from 192.168.1.0/24</small></div>`,
+        buttons: [
+            { label: 'Add Rule', onclick: (dlg) => addUfwRuleModal(dlg, nodePrefix) },
+            { label: 'Close', onclick: (dlg) => dlg.close() }
+        ]
+    });
+}
+
+async function addUfwRuleModal(dlg, nodePrefix) {
+    const input = document.getElementById('new-ufw-rule');
+    const rule = (input?.value || '').trim();
+    if (!rule) { showToast('Please enter a UFW rule', 'error'); return; }
+    try {
+        const res = await fetch(`/api/${nodePrefix}security/ufw/rule`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rule }),
+        });
+        const data = await res.json();
+        if (res.ok) {
+            showToast('Rule added', 'success');
+            loadNodeSecurity();
+            dlg.close();
+        } else {
+            showToast(data.error || 'Failed', 'error');
+        }
+    } catch (e) {
+        showToast('Error: ' + e.message, 'error');
+    }
+}
+
+function showIptablesDetail() {
+    if (!window._securityData) return;
+    const { data } = window._securityData;
+    const rules = (data.iptables.rules || '').trim();
+    showDialog({
+        title: '📋 iptables Rules',
+        html: `<div style="font-size:11px; max-height:500px; overflow-y:auto; background:var(--bg-primary); border:1px solid var(--border); border-radius:8px; padding:12px; font-family:monospace; white-space:pre-wrap; color:var(--text-secondary);">${escapeHtml(rules) || 'No rules'}</div>`,
+        buttons: [{ label: 'Close', onclick: (dlg) => dlg.close() }]
+    });
+}
+
+async function unbanIp(nodePrefix, ip, btn) {
+    const orig = btn.textContent;
+    btn.textContent = '...';
+    btn.disabled = true;
+    try {
+        const res = await fetch(`/api/${nodePrefix}security/fail2ban/unban`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ip })
+        });
+        if (res.ok) {
+            showToast('IP unbanned', 'success');
+            loadNodeSecurity();
+        } else {
+            showToast('Error unbanning IP', 'error');
+        }
+    } catch (e) {
+        showToast('Error: ' + e.message, 'error');
+    } finally {
+        btn.textContent = orig;
+        btn.disabled = false;
+    }
+}
+
+async function loadSecurityConfigFiles() {
+    // Stub - config files handled by raw editor area
+}
+
+async function saveSecurityConfig() {
+    showToast('Raw config editor - edit files directly', 'info');
 }
 
 function renderNodeSecurity(node, data) {
@@ -35116,15 +35390,61 @@ let _topoNetworkCache = null;
 let _topoNetworkCacheAge = 0;
 
 async function topoFetchNetworkTopology() {
-    if (_topoNetworkCache && Date.now() - _topoNetworkCacheAge < 30000) return _topoNetworkCache;
+    if (_topoNetworkCache && Date.now() - _topoNetworkCacheAge < 30000) {
+        topoRenderDiagnostics(_topoNetworkCache);
+        return _topoNetworkCache;
+    }
     try {
         const r = await fetch('/api/router/topology');
         if (r.ok) {
             _topoNetworkCache = await r.json();
             _topoNetworkCacheAge = Date.now();
+            topoRenderDiagnostics(_topoNetworkCache);
         }
     } catch (e) {}
     return _topoNetworkCache;
+}
+
+function topoRenderDiagnostics(topoData) {
+    const diagnosticsDiv = document.getElementById('topology-diagnostics-content');
+    if (!diagnosticsDiv) return;
+
+    const diagnostics = topoData?.peer_diagnostics || [];
+    if (diagnostics.length === 0) {
+        diagnosticsDiv.innerHTML = '<div style="color:rgba(255,255,255,0.5);">All nodes connected successfully ✓</div>';
+        return;
+    }
+
+    let html = '';
+    const succeeded = diagnostics.filter(d => d.result === 'ok');
+    const failed = diagnostics.filter(d => d.result === 'failed');
+    const skipped = diagnostics.filter(d => d.result === 'skipped');
+
+    if (succeeded.length > 0) {
+        html += '<div style="margin-bottom:12px;"><div style="color:#22c55e;margin-bottom:6px;font-weight:600;">✓ Connected</div>';
+        succeeded.forEach(d => {
+            html += `<div style="margin-left:12px;color:rgba(255,255,255,0.6);">${d.node_id} (${d.hostname})</div>`;
+        });
+        html += '</div>';
+    }
+
+    if (failed.length > 0) {
+        html += '<div style="margin-bottom:12px;"><div style="color:#ef4444;margin-bottom:6px;font-weight:600;">✗ Connection Failed</div>';
+        failed.forEach(d => {
+            html += `<div style="margin-left:12px;color:rgba(255,255,255,0.6);"><div style="color:#ef4444;">• ${d.node_id}</div><div style="font-size:11px;color:rgba(255,255,255,0.4);margin-left:8px;">${d.reason || 'Unknown error'}</div></div>`;
+        });
+        html += '</div>';
+    }
+
+    if (skipped.length > 0) {
+        html += '<div><div style="color:#f59e0b;margin-bottom:6px;font-weight:600;">⊘ Skipped</div>';
+        skipped.forEach(d => {
+            html += `<div style="margin-left:12px;font-size:11px;color:rgba(255,255,255,0.5);">${d.node_id}: ${d.reason || 'N/A'}</div>`;
+        });
+        html += '</div>';
+    }
+
+    diagnosticsDiv.innerHTML = html;
 }
 
 function buildNetworkRack(clusterName, clusterNodes, color, topoData) {

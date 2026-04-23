@@ -319,6 +319,7 @@
             { key: 'snapshot',  url: '/api/router/host-snapshot',    label: 'Host snapshot',      stateKey: 'snapshot', fallback: null },
             { key: 'wan',       url: '/api/router/wan',              label: 'WAN connections',    stateKey: 'wan',      fallback: [] },
             { key: 'proxies',   url: '/api/router/proxies',          label: 'Reverse proxies',    stateKey: 'proxies',  fallback: [] },
+            { key: 'subnet_routes', url: '/api/router/subnet-routes', label: 'Subnet routes',     stateKey: 'subnet_routes', fallback: [] },
         ];
 
         // Launch all in parallel; track outcome per endpoint.
@@ -522,6 +523,7 @@
         if (tab === 'policy')       wrRenderPolicyMap();
         if (tab === 'wan')          wrRenderWan();
         if (tab === 'proxy')        wrRenderProxies();
+        if (tab === 'subnet-routes') wrRenderSubnetRoutes();
         if (tab === 'connections')  wrRenderConnections();
         if (tab === 'packets')      wrRenderPackets();
         if (tab === 'tools')        wrRenderDnsTools();
@@ -6976,5 +6978,199 @@
         const el = document.getElementById('wr-proxy-warnings');
         if (el) el.style.display = 'none';
     }
+
+    // ─── Subnet Routes ───
+
+    async function wrLoadSubnetRoutes() {
+        try {
+            const resp = await fetch(wrUrl('/api/router/subnet-routes'));
+            if (!resp.ok) {
+                console.error('Failed to load subnet routes');
+                wrState.subnet_routes = [];
+                return;
+            }
+            wrState.subnet_routes = await resp.json() || [];
+        } catch (e) {
+            console.error('Error loading subnet routes:', e);
+            wrState.subnet_routes = [];
+        }
+        wrRenderSubnetRoutes();
+    }
+
+    function wrRenderSubnetRoutes() {
+        const routes = wrState.subnet_routes || [];
+        const el = document.getElementById('wr-subnet-routes-list');
+        if (!el) return;
+
+        if (routes.length === 0) {
+            el.innerHTML = '<div style="padding:20px; text-align:center; color:var(--text-muted); background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px;">No subnet routes configured.</div>';
+            return;
+        }
+
+        el.innerHTML = routes.map(r => `
+            <div style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px; padding:14px; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
+                <div>
+                    <div style="font-weight:600; color:var(--text); font-size:14px; font-family:monospace;">
+                        ${escHtml(r.subnet_cidr)} <span style="color:var(--text-muted);">→</span> ${escHtml(r.gateway)}
+                    </div>
+                    <div style="font-size:12px; color:var(--text-muted); margin-top:4px;">
+                        ${r.description ? escHtml(r.description) : '<em>(no description)</em>'}
+                    </div>
+                    <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">
+                        ${r.node_id ? 'Node: ' + escHtml(r.node_id) : '🌐 Cluster-wide'}
+                    </div>
+                </div>
+                <div style="display:flex; gap:6px; flex-wrap:wrap;">
+                    <button class="btn btn-sm" onclick="wrToggleSubnetRoute('${escHtml(r.id)}')" title="${r.enabled ? 'Disable this route' : 'Enable this route'}" style="font-size:11px;">
+                        ${r.enabled ? '✓ Enabled' : '⊘ Disabled'}
+                    </button>
+                    <button class="btn btn-sm" onclick="wrEditSubnetRoute('${escHtml(r.id)}')" title="Edit route" style="font-size:11px;">✎ Edit</button>
+                    <button class="btn btn-sm btn-danger" onclick="wrDeleteSubnetRoute('${escHtml(r.id)}')" title="Delete route" style="font-size:11px;">🗑 Delete</button>
+                </div>
+            </div>
+        `).join('');
+    }
+
+    function wrShowSubnetRouteEditor(routeId) {
+        const route = routeId ? (wrState.subnet_routes || []).find(r => r.id === routeId) : null;
+
+        const dlg = showDialog({
+            title: routeId ? '✎ Edit Subnet Route' : '🛣 Add Subnet Route',
+            html: `
+                <div style="display:grid; gap:14px; color:var(--text);">
+                    <div>
+                        <label style="display:block; font-size:13px; font-weight:600; margin-bottom:6px; color:var(--text);">Destination Subnet</label>
+                        <input id="wr-sr-cidr" class="form-control" value="${route ? escHtml(route.subnet_cidr) : ''}" placeholder="e.g. 10.20.0.0/16" style="padding:10px 12px;" />
+                        <small style="color:var(--text-muted); display:block; margin-top:4px;">Remote subnet you want to reach (in CIDR notation)</small>
+                    </div>
+                    <div>
+                        <label style="display:block; font-size:13px; font-weight:600; margin-bottom:6px; color:var(--text);">Gateway IP</label>
+                        <input id="wr-sr-gateway" class="form-control" value="${route ? escHtml(route.gateway) : ''}" placeholder="e.g. 192.168.1.2" style="padding:10px 12px;" />
+                        <small style="color:var(--text-muted); display:block; margin-top:4px;">Next-hop IP to reach the subnet (WolfNet peer or tunnel endpoint)</small>
+                    </div>
+                    <div>
+                        <label style="display:block; font-size:13px; font-weight:600; margin-bottom:6px; color:var(--text);">Description</label>
+                        <input id="wr-sr-desc" class="form-control" value="${route ? escHtml(route.description) : ''}" placeholder="e.g. WolfNet peer datacenter A" style="padding:10px 12px;" />
+                        <small style="color:var(--text-muted); display:block; margin-top:4px;">Optional label for reference</small>
+                    </div>
+                    <div>
+                        <label style="display:block; font-size:13px; font-weight:600; margin-bottom:6px; color:var(--text);">Node Assignment</label>
+                        <input id="wr-sr-node" class="form-control" value="${route && route.node_id ? escHtml(route.node_id) : ''}" placeholder="Leave blank for all nodes" style="padding:10px 12px;" />
+                        <small style="color:var(--text-muted); display:block; margin-top:4px;">Leave empty to apply cluster-wide, or specify a node ID for single-node routes</small>
+                    </div>
+                </div>
+            `,
+            buttons: [
+                {
+                    label: 'Cancel',
+                    onclick: (dlg) => dlg.close(),
+                },
+                {
+                    label: routeId ? '💾 Save Changes' : '➕ Create Route',
+                    onclick: (dlg) => wrSaveSubnetRoute(dlg, routeId),
+                },
+            ],
+        });
+    }
+
+    function wrEditSubnetRoute(id) {
+        wrShowSubnetRouteEditor(id);
+    }
+
+    async function wrSaveSubnetRoute(dlg, routeId) {
+        const cidr = (document.getElementById('wr-sr-cidr') || {}).value.trim();
+        const gateway = (document.getElementById('wr-sr-gateway') || {}).value.trim();
+        const desc = (document.getElementById('wr-sr-desc') || {}).value.trim();
+        const node = (document.getElementById('wr-sr-node') || {}).value.trim();
+
+        if (!cidr) {
+            alert('Destination subnet is required');
+            return;
+        }
+        if (!gateway) {
+            alert('Gateway IP is required');
+            return;
+        }
+
+        const route = {
+            id: routeId || '',
+            subnet_cidr: cidr,
+            gateway: gateway,
+            description: desc,
+            node_id: node || null,
+            enabled: true,
+        };
+
+        try {
+            const method = routeId ? 'PUT' : 'POST';
+            const url = routeId
+                ? wrUrl('/api/router/subnet-routes/' + encodeURIComponent(routeId))
+                : wrUrl('/api/router/subnet-routes');
+
+            const resp = await fetch(url, {
+                method: method,
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(route),
+            });
+
+            if (!resp.ok) {
+                const text = await resp.text();
+                alert('Error: ' + text);
+                return;
+            }
+
+            dlg.close();
+            await wrLoadAll();
+        } catch (e) {
+            alert('Error: ' + (e.message || e));
+        }
+    }
+
+    async function wrDeleteSubnetRoute(id) {
+        if (!confirm('Delete this subnet route?')) return;
+
+        try {
+            const resp = await fetch(wrUrl('/api/router/subnet-routes/' + encodeURIComponent(id)), {
+                method: 'DELETE',
+            });
+
+            if (!resp.ok) {
+                const text = await resp.text();
+                alert('Delete failed: ' + text);
+                return;
+            }
+
+            await wrLoadAll();
+        } catch (e) {
+            alert('Delete failed: ' + (e.message || e));
+        }
+    }
+
+    async function wrToggleSubnetRoute(id) {
+        const route = (wrState.subnet_routes || []).find(r => r.id === id);
+        if (!route) return;
+        const updated = { ...route, enabled: !route.enabled };
+        try {
+            const resp = await fetch(wrUrl('/api/router/subnet-routes/' + encodeURIComponent(id)), {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(updated),
+            });
+            if (!resp.ok) {
+                const text = await resp.text();
+                alert('Toggle failed: ' + text);
+                return;
+            }
+            await wrLoadAll();
+        } catch (e) {
+            alert('Toggle failed: ' + (e.message || e));
+        }
+    }
+
+    // Expose subnet route functions
+    window.wrShowSubnetRouteEditor = wrShowSubnetRouteEditor;
+    window.wrEditSubnetRoute = wrEditSubnetRoute;
+    window.wrDeleteSubnetRoute = wrDeleteSubnetRoute;
+    window.wrToggleSubnetRoute = wrToggleSubnetRoute;
 
 })();

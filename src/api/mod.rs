@@ -6424,6 +6424,11 @@ pub async fn ai_save_config(
                 .collect();
         }
 
+        // Validate provider and model compatibility
+        if let Err(e) = config.validate() {
+            return HttpResponse::BadRequest().json(serde_json::json!({"error": e}));
+        }
+
         if let Err(e) = config.save() {
             return HttpResponse::InternalServerError().json(serde_json::json!({"error": e}));
         }

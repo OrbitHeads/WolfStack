@@ -53,6 +53,7 @@ pub enum SqlKind {
 }
 
 impl SqlKind {
+    #[allow(dead_code)]
     fn default_port(&self) -> u16 {
         match self { SqlKind::Mariadb | SqlKind::Mysql => 3306, SqlKind::Postgres => 5432 }
     }
@@ -385,7 +386,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub fn classify(query: &str, kind: SqlKind) -> Result<SqlPermission, String> {
     use sqlparser::dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect};
     use sqlparser::parser::Parser;
-    use sqlparser::ast::Statement;
+    
 
     // Empty / comment-only input is a misuse — we refuse instead of
     // silently succeeding, since "execute nothing" is never what an
@@ -1055,7 +1056,7 @@ async fn run_mysql(pool: mysql_async::Pool, query: &str, schema: Option<&str>) -
 /// the value out; we use `get_opt` + `as_sql` so we don't mutate the
 /// row (multiple columns need independent reads).
 fn mysql_row_index_to_json(row: &mysql_async::Row, i: usize) -> serde_json::Value {
-    use mysql_async::Value;
+    
     match row.as_ref(i) {
         Some(v) => mysql_value_to_json(v),
         None => serde_json::Value::Null,
@@ -1217,6 +1218,7 @@ pub fn prepare_for_save(
 
 /// Convenience: invalidate the pool for `id` after a mutating
 /// operation (update / delete). Next query rebuilds from scratch.
+#[allow(dead_code)]
 pub fn invalidate_pool(id: &str) {
     POOLS.lock().unwrap().remove(id);
 }

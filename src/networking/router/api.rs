@@ -18,6 +18,23 @@ use serde::Deserialize;
 
 type S = web::Data<crate::api::AppState>;
 
+/// Try to resolve a domain/hostname to its first IPv4 address.
+/// Falls back to returning the input unchanged if resolution fails (assumes it's already an IP).
+/// Uses the system resolver (/etc/hosts, systemd-resolved, nsswitch, etc).
+fn resolve_node_address(address: &str) -> String {
+    use std::net::ToSocketAddrs;
+    let target = format!("{}:80", address);
+    target.to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| {
+            addrs.find_map(|sa| match sa {
+                std::net::SocketAddr::V4(v4) => Some(v4.ip().to_string()),
+                _ => None,
+            })
+        })
+        .unwrap_or_else(|| address.to_string()) // Fallback: use address as-is (assume it's an IP)
+}
+
 /// Guard helper — every WolfRouter endpoint requires either a logged-in
 /// session cookie OR a valid cluster secret header. Without this, any
 /// HTTP client could spray firewall rules or lock users out.
@@ -90,7 +107,8 @@ fn replicate_config_to_cluster(state: S) {
             if node.is_self || node.id == self_id { continue; }
             if !node.online { continue; }
             if node.node_type != "wolfstack" { continue; }
-            let url = format!("https://{}:{}/api/router/config-receive", node.address, node.port);
+            let host = resolve_node_address(&node.address);
+            let url = format!("https://{}:{}/api/router/config-receive", host, node.port);
             let res = client.post(&url)
                 .header("X-WolfStack-Secret", &secret)
                 .header("Content-Type", "application/json")
@@ -147,10 +165,11 @@ async fn proxy_router_get_to_node(
 
     let qs = if query_string.is_empty() { String::new() } else { format!("?{}", query_string) };
     let internal_port = node.port + 1;
+    let host = resolve_node_address(&node.address);
     let urls = [
-        format!("https://{}:{}/api/{}{}", node.address, node.port, api_path, qs),
-        format!("http://{}:{}/api/{}{}", node.address, internal_port, api_path, qs),
-        format!("http://{}:{}/api/{}{}", node.address, node.port, api_path, qs),
+        format!("https://{}:{}/api/{}{}", host, node.port, api_path, qs),
+        format!("http://{}:{}/api/{}{}", host, internal_port, api_path, qs),
+        format!("http://{}:{}/api/{}{}", host, node.port, api_path, qs),
     ];
 
     // Process-wide pool — see ROUTER_RPC_CLIENT. Per-request timeout
@@ -506,7 +525,8 @@ pub async fn get_topology(
             // node still appears as a stub chassis so the user sees it
             // exists. Subsequent 3s polls fill it in once the peer
             // answers.
-            let host = node.address.clone();
+            // Resolve domain names to IPs to support both IP and domain-based node configs.
+            let host = resolve_node_address(&node.address);
             let port = node.port;
             let id = node.id.clone();
             let hostname = node.hostname.clone();
@@ -2022,9 +2042,10 @@ pub async fn packet_capture(
             let mut proxy_body = r.clone();
             proxy_body.node_id = None;
             // Try HTTPS first then HTTP, mirroring the topology fan-out.
+            let target_host = resolve_node_address(&target_node.address);
             let urls = [
-                format!("https://{}:{}/api/router/capture", target_node.address, target_node.port),
-                format!("http://{}:{}/api/router/capture",  target_node.address, target_node.port),
+                format!("https://{}:{}/api/router/capture", target_host, target_node.port),
+                format!("http://{}:{}/api/router/capture",  target_host, target_node.port),
             ];
             // Shared pool — see ROUTER_RPC_CLIENT. Per-request timeout
             // below (user-controlled capture window + 10s slack)
@@ -2443,9 +2464,10 @@ pub async fn interface_up(
             // Shared pool — see ROUTER_RPC_CLIENT. 10s total timeout
             // set per-request below replaces the old client-level one.
             let client = &*ROUTER_RPC_CLIENT;
+            let target_host = resolve_node_address(&target_node.address);
             let urls = [
-                format!("https://{}:{}/api/router/interface-up", target_node.address, target_node.port),
-                format!("http://{}:{}/api/router/interface-up", target_node.address, target_node.port),
+                format!("https://{}:{}/api/router/interface-up", target_host, target_node.port),
+                format!("http://{}:{}/api/router/interface-up", target_host, target_node.port),
             ];
             for url in &urls {
                 if let Ok(resp) = client.post(url)
@@ -3242,6 +3264,159 @@ pub async fn delete_proxy(req: HttpRequest, state: S, path: web::Path<String>) -
     }))
 }
 
+// ─── Subnet Routing ───
+
+pub async fn list_subnet_routes(req: HttpRequest, state: S) -> HttpResponse {
+    auth_or_return!(req, state);
+    let cfg = state.router.config.read().unwrap();
+    HttpResponse::Ok().json(&cfg.subnet_routes)
+}
+
+pub async fn create_subnet_route(req: HttpRequest, state: S, body: web::Json<SubnetRoute>) -> HttpResponse {
+    auth_or_return!(req, state);
+    let mut route = body.into_inner();
+
+    // Generate ID if not provided
+    if route.id.is_empty() {
+        route.id = gen_id("subnet-route");
+    }
+
+    // Basic validation
+    if route.subnet_cidr.trim().is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "ok": false,
+            "error": "subnet_cidr is required"
+        }));
+    }
+    if route.gateway.trim().is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "ok": false,
+            "error": "gateway is required"
+        }));
+    }
+
+    {
+        let mut cfg = state.router.config.write().unwrap();
+        cfg.subnet_routes.push(route.clone());
+
+        if let Err(e) = cfg.save() {
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "ok": false,
+                "error": format!("Failed to save config: {}", e)
+            }));
+        }
+    }
+
+    replicate_config_to_cluster(state);
+    HttpResponse::Ok().json(serde_json::json!({
+        "ok": true,
+        "route": route
+    }))
+}
+
+pub async fn update_subnet_route(
+    req: HttpRequest,
+    state: S,
+    path: web::Path<String>,
+    body: web::Json<SubnetRoute>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let id = path.into_inner();
+    let updated = body.into_inner();
+
+    if updated.subnet_cidr.trim().is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "ok": false,
+            "error": "subnet_cidr is required"
+        }));
+    }
+    if updated.gateway.trim().is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "ok": false,
+            "error": "gateway is required"
+        }));
+    }
+
+    {
+        let mut cfg = state.router.config.write().unwrap();
+        match cfg.subnet_routes.iter_mut().find(|r| r.id == id) {
+            Some(route) => *route = updated.clone(),
+            None => {
+                return HttpResponse::NotFound().json(serde_json::json!({
+                    "ok": false,
+                    "error": "Subnet route not found"
+                }));
+            }
+        }
+
+        if let Err(e) = cfg.save() {
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "ok": false,
+                "error": format!("Failed to save config: {}", e)
+            }));
+        }
+    }
+
+    replicate_config_to_cluster(state);
+    HttpResponse::Ok().json(serde_json::json!({
+        "ok": true,
+        "route": updated
+    }))
+}
+
+pub async fn delete_subnet_route(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
+    auth_or_return!(req, state);
+    let id = path.into_inner();
+
+    let deleted_route = {
+        let mut cfg = state.router.config.write().unwrap();
+        let initial_len = cfg.subnet_routes.len();
+        let deleted = cfg.subnet_routes.iter().find(|r| r.id == id).cloned();
+        cfg.subnet_routes.retain(|r| r.id != id);
+
+        if cfg.subnet_routes.len() == initial_len {
+            return HttpResponse::NotFound().json(serde_json::json!({
+                "ok": false,
+                "error": "Subnet route not found"
+            }));
+        }
+
+        if let Err(e) = cfg.save() {
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "ok": false,
+                "error": format!("Failed to save config: {}", e)
+            }));
+        }
+
+        deleted
+    };
+
+    // Try to remove the route from the kernel if it was a real route
+    if let Some(route) = deleted_route {
+        let self_id = crate::agent::self_node_id();
+        // Only remove if it applies to this node
+        if route.node_id.is_none() || route.node_id.as_deref() == Some(&self_id) {
+            // Use a blocking task so we don't block the API response
+            tokio::task::spawn_blocking(move || {
+                use std::process::Command;
+                let _ = Command::new("ip")
+                    .arg("route")
+                    .arg("del")
+                    .arg(&route.subnet_cidr)
+                    .arg("via")
+                    .arg(&route.gateway)
+                    .output();
+            });
+        }
+    }
+
+    replicate_config_to_cluster(state);
+    HttpResponse::Ok().json(serde_json::json!({
+        "ok": true,
+        "deleted": id
+    }))
+}
+
 // ─── Mount ───
 
 pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
@@ -3296,7 +3471,11 @@ pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
         .route("/api/router/proxies",          web::post().to(create_proxy))
         .route("/api/router/proxies/{id}",     web::put().to(update_proxy))
         .route("/api/router/proxies/{id}",     web::delete().to(delete_proxy))
-        .route("/api/router/proxy-backends",   web::get().to(list_proxy_backends));
+        .route("/api/router/proxy-backends",   web::get().to(list_proxy_backends))
+        .route("/api/router/subnet-routes",       web::get().to(list_subnet_routes))
+        .route("/api/router/subnet-routes",       web::post().to(create_subnet_route))
+        .route("/api/router/subnet-routes/{id}",  web::put().to(update_subnet_route))
+        .route("/api/router/subnet-routes/{id}",  web::delete().to(delete_subnet_route));
 }
 
 /// GET /api/router/host-dns — detect what's holding port 53 on this

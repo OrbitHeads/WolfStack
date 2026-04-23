@@ -2,6 +2,8 @@
 // (C)Copyright Wolf Software Systems Ltd
 // https://wolf.uk.com
 
+#![allow(dead_code)]
+
 //! Defensive primitives for outbound HTTP — stops cascading retry storms
 //! before they can exhaust fds or DNS the node to death.
 //!
@@ -43,7 +45,7 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio::sync::Semaphore;
 
 // ═══════════════════════════════════════════════════
 // ─── DNS cache ───

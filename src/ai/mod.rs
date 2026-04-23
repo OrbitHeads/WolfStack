@@ -180,6 +180,70 @@ impl AiConfig {
             _ => !self.active_key().is_empty(),
         }
     }
+
+    /// Validate provider and model compatibility, check required API keys
+    pub fn validate(&self) -> Result<(), String> {
+        // Validate provider exists
+        match self.provider.as_str() {
+            "claude" | "gemini" | "openai" | "openrouter" | "local" => {}
+            _ => return Err(format!("Invalid provider: {}", self.provider)),
+        }
+
+        // Validate model matches provider
+        let model_lower = self.model.to_lowercase();
+        match self.provider.as_str() {
+            "claude" => {
+                if !model_lower.contains("claude") {
+                    return Err(format!("Model '{}' is not a Claude model (expected claude-*)", self.model));
+                }
+            }
+            "gemini" => {
+                if !model_lower.contains("gemini") {
+                    return Err(format!("Model '{}' is not a Gemini model (expected gemini-*)", self.model));
+                }
+            }
+            "openai" => {
+                let valid_prefixes = ["gpt-4", "gpt-3.5", "o1", "o3", "chatgpt"];
+                if !valid_prefixes.iter().any(|p| model_lower.starts_with(p)) {
+                    return Err(format!("Model '{}' is not an OpenAI model (expected gpt-* or o*)", self.model));
+                }
+            }
+            "openrouter" => {
+                // OpenRouter accepts any model format, just needs the key
+                if self.openrouter_api_key.is_empty() {
+                    return Err("OpenRouter provider selected but API key is not set".to_string());
+                }
+            }
+            "local" => {
+                if self.local_url.is_empty() {
+                    return Err("Local provider selected but URL is not set".to_string());
+                }
+            }
+            _ => {}
+        }
+
+        // Validate required API keys
+        match self.provider.as_str() {
+            "claude" => {
+                if self.claude_api_key.is_empty() {
+                    return Err("Claude provider selected but API key is not set".to_string());
+                }
+            }
+            "gemini" => {
+                if self.gemini_api_key.is_empty() {
+                    return Err("Gemini provider selected but API key is not set".to_string());
+                }
+            }
+            "openai" => {
+                if self.openai_api_key.is_empty() {
+                    return Err("OpenAI provider selected but API key is not set".to_string());
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
 }
 
 fn mask_key(key: &str) -> String {
@@ -266,6 +330,79 @@ pub fn extract_findings(response: &str) -> Vec<String> {
         out.push(cleaned.to_string());
     }
     out
+}
+
+#[cfg(test)]
+mod config_validation_tests {
+    use super::*;
+
+    #[test]
+    fn claude_model_with_claude_provider_is_valid() {
+        let config = AiConfig {
+            provider: "claude".to_string(),
+            claude_api_key: "sk-test".to_string(),
+            model: "claude-sonnet-4-20250514".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn claude_model_with_openai_provider_fails() {
+        let config = AiConfig {
+            provider: "openai".to_string(),
+            openai_api_key: "sk-test".to_string(),
+            model: "claude-sonnet-4-20250514".to_string(),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("not an OpenAI model"));
+    }
+
+    #[test]
+    fn openai_model_with_openai_provider_is_valid() {
+        let config = AiConfig {
+            provider: "openai".to_string(),
+            openai_api_key: "sk-test".to_string(),
+            model: "gpt-4o".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn openai_provider_without_api_key_fails() {
+        let config = AiConfig {
+            provider: "openai".to_string(),
+            openai_api_key: String::new(),
+            model: "gpt-4o".to_string(),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("API key is not set"));
+    }
+
+    #[test]
+    fn gemini_model_with_gemini_provider_is_valid() {
+        let config = AiConfig {
+            provider: "gemini".to_string(),
+            gemini_api_key: "test-key".to_string(),
+            model: "gemini-2.0-flash".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn invalid_provider_fails() {
+        let config = AiConfig {
+            provider: "invalid-provider".to_string(),
+            model: "gpt-4o".to_string(),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("Invalid provider"));
+    }
 }
 
 #[cfg(test)]
