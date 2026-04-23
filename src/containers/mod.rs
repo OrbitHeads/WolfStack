@@ -24,7 +24,7 @@ use tracing::{error, info, warn};
 /// wired back up it doesn't regress.
 static CONTAINER_WOLFNET_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .timeout(std::time::Duration::from_secs(5))
             .danger_accept_invalid_certs(true)
             .build()
@@ -4120,10 +4120,21 @@ pub fn lxc_restart(container: &str) -> Result<String, String> {
     lxc_start(container)
 }
 
-/// Freeze (pause) an LXC container
+/// Freeze (pause) an LXC container.
+///
+/// On Proxmox we deliberately use `lxc-freeze` instead of `pct suspend`:
+/// `pct suspend` tries to serialise the container's state to disk (and
+/// is flagged experimental in the PVE docs — it routinely fails on
+/// ZFS/LVM-thin storage with a bare "suspend not supported" and leaves
+/// the container untouched, which is what customers were hitting when
+/// the Freeze button "did nothing"). `lxc-freeze` uses the cgroup
+/// freezer directly and pauses execution without touching disk — the
+/// operation the UI actually means by "Freeze". Proxmox ships the
+/// liblxc tools and its container runtime lives at the default LXC
+/// path (`/var/lib/lxc/<vmid>`), so no `-P` override is needed.
 pub fn lxc_freeze(container: &str) -> Result<String, String> {
     if is_proxmox() {
-        run_lxc_cmd(&["pct", "suspend", container])
+        run_lxc_cmd(&["lxc-freeze", "-n", container])
     } else {
         let base = lxc_base_dir(container);
         if base != LXC_DEFAULT_PATH {
@@ -4134,10 +4145,12 @@ pub fn lxc_freeze(container: &str) -> Result<String, String> {
     }
 }
 
-/// Unfreeze an LXC container
+/// Unfreeze an LXC container. Mirror of `lxc_freeze` — `lxc-unfreeze`
+/// on both Proxmox and plain LXC so a container frozen via our Freeze
+/// button can always be thawed the same way.
 pub fn lxc_unfreeze(container: &str) -> Result<String, String> {
     if is_proxmox() {
-        run_lxc_cmd(&["pct", "resume", container])
+        run_lxc_cmd(&["lxc-unfreeze", "-n", container])
     } else {
         let base = lxc_base_dir(container);
         if base != LXC_DEFAULT_PATH {

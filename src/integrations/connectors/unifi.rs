@@ -26,7 +26,7 @@ use std::time::Duration;
 /// we want to see that instead of following it.
 static UNIFI_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .danger_accept_invalid_certs(true)
             .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())

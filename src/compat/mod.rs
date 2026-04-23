@@ -210,7 +210,7 @@ pub async fn report_license_heartbeat(cluster: &crate::agent::ClusterState) {
 /// the lifetime of the process.
 static HEARTBEAT_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .timeout(std::time::Duration::from_secs(15))
             .danger_accept_invalid_certs(true)
             .build()

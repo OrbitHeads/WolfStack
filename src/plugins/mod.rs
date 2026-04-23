@@ -21,7 +21,7 @@ const PLUGINS_DIR: &str = "/etc/wolfstack/plugins";
 /// `reqwest::Client` — one leaked pool per UI click.
 static PLUGIN_PROXY_CLIENT: LazyLock<reqwest::Client> =
     LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())

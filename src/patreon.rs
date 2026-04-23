@@ -20,7 +20,7 @@ fn config_path() -> String { crate::paths::get().patreon_config }
 /// and periodically during membership sync.
 static PATREON_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())

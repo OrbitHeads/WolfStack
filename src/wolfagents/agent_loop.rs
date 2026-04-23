@@ -30,12 +30,12 @@
 use serde::{Deserialize, Serialize};
 
 /// Shared HTTP client for every agent tool-use turn (OpenAI-compat,
-/// Gemini, Claude). Per-turn `reqwest::Client::builder()` was
+/// Gemini, Claude). Per-turn `crate::api::ipv4_only_client_builder()` was
 /// leaking a connection pool on every round of every agent
 /// conversation. 180s timeout set per-request via RequestBuilder.
 static AGENT_LOOP_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     });
@@ -109,6 +109,13 @@ pub async fn run_turn(
             openai_tool_loop(
                 agent, &cfg, "https://openrouter.ai/api/v1",
                 &cfg.openrouter_api_key, &system_prompt, &history,
+                user_message, state,
+            ).await
+        }
+        "openai" => {
+            openai_tool_loop(
+                agent, &cfg, "https://api.openai.com/v1",
+                &cfg.openai_api_key, &system_prompt, &history,
                 user_message, state,
             ).await
         }

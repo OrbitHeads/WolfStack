@@ -41,7 +41,7 @@ macro_rules! auth_or_return {
 /// complete.
 static ROUTER_RPC_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .connect_timeout(std::time::Duration::from_secs(3))
             .danger_accept_invalid_certs(true)
             .pool_idle_timeout(std::time::Duration::from_secs(15))
@@ -651,6 +651,432 @@ pub async fn get_topology_local(
     let self_name = self_node_name();
     let t = topology::compute_local(&self_id, &self_name, &cfg);
     HttpResponse::Ok().json(t)
+}
+
+// ─── Preflight ───
+//
+// Lightweight network-config sanity check the frontend hits BEFORE
+// opening the WolfRouter page. The page fans out to half a dozen
+// endpoints and on a misconfigured host failures look like "Failed
+// to fetch" or "No nodes in topology" with no pointer at the cause.
+// Preflight runs the checks most likely to explain those failures
+// (hosts file, hostname resolution, interface UP state, cluster
+// membership, API reachability) and returns a structured report so
+// the UI can surface "what's wrong + how to fix it" instead of just
+// showing an empty rack.
+
+#[derive(serde::Serialize)]
+struct PreflightCheck {
+    id: &'static str,
+    name: &'static str,
+    ok: bool,
+    severity: &'static str, // "error" | "warning" | "info"
+    message: String,
+    fix: Option<String>,
+}
+
+pub async fn preflight(
+    req: HttpRequest,
+    state: S,
+    query: web::Query<TopologyQuery>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+
+    let mut checks: Vec<PreflightCheck> = Vec::new();
+
+    // 1) /etc/hosts — needed for hostname resolution on most distros.
+    // Allow for hosts files without an explicit entry for the local
+    // hostname (systemd-resolved / NetworkManager handle this on some
+    // setups), but flag the common broken case: a 127.0.1.1 mapping
+    // and nothing else, leaving peers unable to address this node.
+    match std::fs::read_to_string("/etc/hosts") {
+        Ok(contents) => {
+            let hostname_cmd = std::process::Command::new("hostname").output().ok();
+            let hostname = hostname_cmd
+                .and_then(|o| if o.status.success() {
+                    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                } else { None })
+                .unwrap_or_default();
+
+            let has_loopback = contents.lines().any(|l| {
+                let l = l.trim();
+                !l.starts_with('#') && (l.starts_with("127.0.0.1") || l.starts_with("::1"))
+            });
+            let hostname_on_real_ip = !hostname.is_empty() && contents.lines().any(|l| {
+                let l = l.trim();
+                if l.starts_with('#') || l.is_empty() { return false; }
+                let mut parts = l.split_whitespace();
+                let addr = parts.next().unwrap_or("");
+                if addr.is_empty() || addr.starts_with("127.") || addr == "::1" { return false; }
+                parts.any(|tok| tok == hostname)
+            });
+            let hostname_on_127_0_1_1 = !hostname.is_empty() && contents.lines().any(|l| {
+                let l = l.trim();
+                !l.starts_with('#') && l.starts_with("127.0.1.1")
+                    && l.split_whitespace().skip(1).any(|t| t == hostname)
+            });
+            let has_hostname_entry = hostname_on_real_ip || hostname_on_127_0_1_1
+                || (!hostname.is_empty() && contents.lines().any(|l| {
+                    let l = l.trim();
+                    if l.starts_with('#') || l.is_empty() { return false; }
+                    l.split_whitespace().skip(1).any(|tok| tok == hostname)
+                }));
+            // Flag the common Debian-leftover case: hostname ONLY on
+            // 127.0.1.1 with no real-IP mapping. Peers resolving by
+            // name will get a loopback address they can't route to.
+            let only_127_0_1_1 = hostname_on_127_0_1_1 && !hostname_on_real_ip;
+
+            if !has_loopback {
+                checks.push(PreflightCheck {
+                    id: "hosts_loopback",
+                    name: "/etc/hosts loopback entry",
+                    ok: false,
+                    severity: "error",
+                    message: "/etc/hosts has no `127.0.0.1 localhost` line. Local API calls through `localhost` will fail.".into(),
+                    fix: Some("Add this line to /etc/hosts:\n  127.0.0.1   localhost".into()),
+                });
+            } else {
+                checks.push(PreflightCheck {
+                    id: "hosts_loopback",
+                    name: "/etc/hosts loopback entry",
+                    ok: true,
+                    severity: "info",
+                    message: "Loopback entry present.".into(),
+                    fix: None,
+                });
+            }
+
+            if !hostname.is_empty() && !has_hostname_entry {
+                checks.push(PreflightCheck {
+                    id: "hosts_hostname",
+                    name: "/etc/hosts hostname entry",
+                    ok: false,
+                    severity: "warning",
+                    message: format!("/etc/hosts has no entry for hostname `{}`. Cluster peers reaching you by hostname may fail.", hostname),
+                    fix: Some(format!("Add a line like this to /etc/hosts (replace with your LAN IP):\n  192.168.x.y   {}", hostname)),
+                });
+            } else if !hostname.is_empty() && only_127_0_1_1 {
+                checks.push(PreflightCheck {
+                    id: "hosts_hostname",
+                    name: "/etc/hosts hostname entry",
+                    ok: false,
+                    severity: "warning",
+                    message: format!("Hostname `{}` is only mapped to 127.0.1.1. Peers can't reach this node by its hostname.", hostname),
+                    fix: Some(format!("Add a LAN-address entry to /etc/hosts:\n  192.168.x.y   {}\n(keep the 127.0.1.1 line if Debian/Ubuntu put it there.)", hostname)),
+                });
+            }
+        }
+        Err(e) => {
+            checks.push(PreflightCheck {
+                id: "hosts_file",
+                name: "/etc/hosts readable",
+                ok: false,
+                severity: "error",
+                message: format!("/etc/hosts could not be read: {}", e),
+                fix: Some("Check that /etc/hosts exists and wolfstack has permission to read it.".into()),
+            });
+        }
+    }
+
+    // 2) Hostname resolution.
+    let hn_out = std::process::Command::new("hostname").arg("-f").output();
+    let fqdn = hn_out.as_ref().ok()
+        .and_then(|o| if o.status.success() {
+            Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+        } else { None })
+        .filter(|s| !s.is_empty());
+    match &fqdn {
+        Some(h) => checks.push(PreflightCheck {
+            id: "hostname_fqdn",
+            name: "Fully-qualified hostname",
+            ok: true,
+            severity: "info",
+            message: format!("hostname -f: {}", h),
+            fix: None,
+        }),
+        None => checks.push(PreflightCheck {
+            id: "hostname_fqdn",
+            name: "Fully-qualified hostname",
+            ok: false,
+            severity: "warning",
+            message: "`hostname -f` returned nothing. Peers may have trouble resolving this node.".into(),
+            fix: Some("Set the hostname with:\n  sudo hostnamectl set-hostname your-host-name\nand add a matching entry to /etc/hosts.".into()),
+        }),
+    }
+
+    // 3) Network interfaces — at least one non-loopback UP with an IPv4.
+    let ip_addr_out = std::process::Command::new("ip")
+        .args(["-j", "-4", "addr"])
+        .output();
+    let mut ipv4_interface_count = 0;
+    let mut iface_list: Vec<String> = Vec::new();
+    if let Ok(o) = ip_addr_out {
+        if o.status.success() {
+            if let Ok(arr) = serde_json::from_slice::<Vec<serde_json::Value>>(&o.stdout) {
+                for i in arr {
+                    let ifname = i["ifname"].as_str().unwrap_or("");
+                    let is_up = i["operstate"].as_str() == Some("UP")
+                        || i["flags"].as_array()
+                            .map(|a| a.iter().any(|v| v.as_str() == Some("UP")))
+                            .unwrap_or(false);
+                    let has_ipv4 = i["addr_info"].as_array()
+                        .map(|a| a.iter().any(|ai| {
+                            ai["family"].as_str() == Some("inet")
+                                && ai["scope"].as_str() != Some("host")
+                        }))
+                        .unwrap_or(false);
+                    if ifname != "lo" && is_up && has_ipv4 {
+                        ipv4_interface_count += 1;
+                        iface_list.push(ifname.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if ipv4_interface_count == 0 {
+        checks.push(PreflightCheck {
+            id: "network_interfaces",
+            name: "IPv4 network interfaces",
+            ok: false,
+            severity: "error",
+            message: "No non-loopback interface has an IPv4 address. WolfRouter needs one to build the topology.".into(),
+            fix: Some("Bring a physical or virtual interface up and assign an IPv4 (DHCP or static).\nOn Debian/Ubuntu:\n  sudo ip link set eth0 up && sudo dhclient eth0\nOn RHEL/Fedora:\n  sudo nmcli device connect eth0".into()),
+        });
+    } else {
+        checks.push(PreflightCheck {
+            id: "network_interfaces",
+            name: "IPv4 network interfaces",
+            ok: true,
+            severity: "info",
+            message: format!("{} UP interface(s) with IPv4: {}", ipv4_interface_count, iface_list.join(", ")),
+            fix: None,
+        });
+    }
+
+    // 4) Cluster membership — most common cause of "No nodes in
+    // topology" is that the requested cluster contains only Proxmox
+    // peers (or only remote WolfStack peers that aren't responding).
+    let self_id = crate::agent::self_node_id();
+    let self_cluster = state.cluster.get_self_cluster_name();
+    let normalize = |n: Option<&str>| -> String {
+        match n {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => "WolfStack".into(),
+        }
+    };
+    let self_cluster_norm = normalize(
+        if self_cluster.is_empty() { None } else { Some(&self_cluster) }
+    );
+    let requested = query.cluster.clone();
+
+    let all_nodes = state.cluster.get_all_nodes();
+    let mut wolfstack_in_cluster = 0;
+    let mut proxmox_in_cluster = 0;
+    let mut other_in_cluster = 0;
+    let mut online_wolfstack = 0;
+    for n in &all_nodes {
+        // get_all_nodes() already includes self with is_self=true —
+        // iterate everything including self, don't double-count.
+        let node_cluster = normalize(n.cluster_name.as_deref());
+        let in_cluster = match &requested {
+            Some(w) => {
+                // For the self node, use the canonical self_cluster
+                // resolved above (gossip can leave a stale name on the
+                // map entry but ClusterState::get_self_cluster_name is
+                // authoritative).
+                if n.is_self || n.id == self_id {
+                    self_cluster_norm == *w
+                } else {
+                    node_cluster == *w
+                }
+            }
+            None => true,
+        };
+        if !in_cluster { continue; }
+        match n.node_type.as_str() {
+            "wolfstack" => {
+                wolfstack_in_cluster += 1;
+                // Self is always online from its own point of view; the
+                // cluster-state `online` flag is driven by *peer* gossip.
+                if n.is_self || n.id == self_id || n.online { online_wolfstack += 1; }
+            }
+            "proxmox"   => proxmox_in_cluster += 1,
+            _           => other_in_cluster += 1,
+        }
+    }
+
+    if wolfstack_in_cluster == 0 {
+        let label = requested.clone().unwrap_or_else(|| "(all)".into());
+        checks.push(PreflightCheck {
+            id: "cluster_membership",
+            name: "WolfStack nodes in cluster",
+            ok: false,
+            severity: "error",
+            message: format!(
+                "Cluster `{}` has 0 WolfStack nodes (this node is in cluster `{}`). WolfRouter can only render topology from WolfStack peers.",
+                label, self_cluster_norm
+            ),
+            fix: Some(format!(
+                "Either open WolfRouter for cluster `{}` from the sidebar, or join/install a WolfStack node into cluster `{}`.\nProxmox peers ({}) and other-type peers ({}) are intentionally skipped from topology — they're managed through the Proxmox cluster view.",
+                self_cluster_norm, label, proxmox_in_cluster, other_in_cluster
+            )),
+        });
+    } else if online_wolfstack == 0 {
+        let label = requested.clone().unwrap_or_else(|| "(all)".into());
+        checks.push(PreflightCheck {
+            id: "cluster_online",
+            name: "Online WolfStack nodes",
+            ok: false,
+            severity: "warning",
+            message: format!(
+                "Cluster `{}` has {} WolfStack node(s) but none are marked online. Topology will contain stubs until they respond.",
+                label, wolfstack_in_cluster
+            ),
+            fix: Some("Check that each WolfStack node is reachable on its configured port and the cluster secret matches.\n  • `sudo ss -tlnp | grep 8553`\n  • `curl -k https://<peer>:8553/api/nodes`".into()),
+        });
+    } else {
+        checks.push(PreflightCheck {
+            id: "cluster_membership",
+            name: "WolfStack nodes in cluster",
+            ok: true,
+            severity: "info",
+            message: format!(
+                "{} WolfStack node(s) in cluster (online: {}); {} Proxmox peer(s) shown but skipped from topology.",
+                wolfstack_in_cluster, online_wolfstack, proxmox_in_cluster
+            ),
+            fix: None,
+        });
+    }
+
+    // 5) If the requested cluster differs from self's cluster, surface
+    // that as an info hint so the user knows WHY topology looks thin.
+    if let Some(w) = &requested {
+        if &self_cluster_norm != w {
+            checks.push(PreflightCheck {
+                id: "cluster_scope",
+                name: "Viewing remote cluster",
+                ok: true,
+                severity: "info",
+                message: format!(
+                    "This node is in `{}`; you're viewing WolfRouter for `{}`. The local chassis will be omitted.",
+                    self_cluster_norm, w
+                ),
+                fix: None,
+            });
+        }
+    }
+
+    // 6) IPv6 — WolfStack is IPv4-only end-to-end. An IPv6 stack on
+    // the host doesn't strictly break us (all our reqwest clients
+    // bind to Ipv4Addr::UNSPECIFIED so AAAA candidates are skipped),
+    // but on Proxmox hosts with IPv6 fully enabled we've seen peer
+    // calls stall for seconds while the kernel tried IPv6 routes that
+    // the LAN didn't actually carry. Warn loudly, because "it works
+    // fine with IPv6" is the single most common customer-side symptom
+    // of "WolfRouter intermittently fails to fetch".
+    let ipv6_global_disabled = std::fs::read_to_string("/proc/sys/net/ipv6/conf/all/disable_ipv6")
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false);
+    // Look for non-loopback, non-link-local IPv6 addresses on any
+    // interface — those are the ones the kernel will actually try to
+    // route via (ULA/GUA). Link-local (fe80::) is always present when
+    // IPv6 isn't disabled and we don't care about it.
+    let ip6_addr_out = std::process::Command::new("ip")
+        .args(["-j", "-6", "addr"])
+        .output();
+    let mut ipv6_routable_ifaces: Vec<String> = Vec::new();
+    if let Ok(o) = ip6_addr_out {
+        if o.status.success() {
+            if let Ok(arr) = serde_json::from_slice::<Vec<serde_json::Value>>(&o.stdout) {
+                for i in arr {
+                    let ifname = i["ifname"].as_str().unwrap_or("").to_string();
+                    if ifname == "lo" { continue; }
+                    let has_routable = i["addr_info"].as_array()
+                        .map(|a| a.iter().any(|ai| {
+                            if ai["family"].as_str() != Some("inet6") { return false; }
+                            let scope = ai["scope"].as_str().unwrap_or("");
+                            // "link" = fe80::/10 (link-local, auto-assigned,
+                            // not routable off-link). Ignore. Anything else
+                            // ("global", "site", "host") is a real address.
+                            scope != "link" && scope != "host"
+                        }))
+                        .unwrap_or(false);
+                    if has_routable { ipv6_routable_ifaces.push(ifname); }
+                }
+            }
+        }
+    }
+    if ipv6_global_disabled {
+        checks.push(PreflightCheck {
+            id: "ipv6_stack",
+            name: "IPv6 stack disabled",
+            ok: true,
+            severity: "info",
+            message: "net.ipv6.conf.all.disable_ipv6 = 1. Good — WolfStack is IPv4-only end-to-end.".into(),
+            fix: None,
+        });
+    } else if !ipv6_routable_ifaces.is_empty() {
+        checks.push(PreflightCheck {
+            id: "ipv6_stack",
+            name: "IPv6 is enabled (WolfStack is IPv4-only)",
+            ok: false,
+            severity: "warning",
+            message: format!(
+                "{} interface(s) have routable IPv6 addresses: {}. On mixed-stack hosts we've seen cluster RPCs stall while the kernel tries IPv6 routes the LAN doesn't carry. WolfStack pins every outbound connection to IPv4, but your AI / Proxmox / external API calls can still try AAAA first.",
+                ipv6_routable_ifaces.len(),
+                ipv6_routable_ifaces.join(", ")
+            ),
+            fix: Some("Disable IPv6 system-wide (recommended on Proxmox):\n  # /etc/sysctl.d/99-wolfstack-no-ipv6.conf\n  net.ipv6.conf.all.disable_ipv6   = 1\n  net.ipv6.conf.default.disable_ipv6 = 1\n  net.ipv6.conf.lo.disable_ipv6    = 1\n  sudo sysctl --system\n\nOr disable per-interface via your network manager. Reboot is NOT required — sysctl --system applies immediately.".into()),
+        });
+    } else {
+        checks.push(PreflightCheck {
+            id: "ipv6_stack",
+            name: "IPv6 status",
+            ok: true,
+            severity: "info",
+            message: "IPv6 is enabled in the kernel but no interface has a routable IPv6 address. No risk to WolfRouter.".into(),
+            fix: None,
+        });
+    }
+
+    // 7) IP forwarding — WolfRouter doesn't require it for viewing,
+    // but warn if it's off because most firewall/router features won't
+    // do anything without it.
+    let forward = std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false);
+    if !forward {
+        checks.push(PreflightCheck {
+            id: "ip_forward",
+            name: "IPv4 forwarding",
+            ok: false,
+            severity: "warning",
+            message: "net.ipv4.ip_forward = 0. Firewall rules and LAN segments won't actually route traffic until this is enabled.".into(),
+            fix: Some("Enable persistently with:\n  echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-wolfrouter.conf\n  sudo sysctl --system".into()),
+        });
+    } else {
+        checks.push(PreflightCheck {
+            id: "ip_forward",
+            name: "IPv4 forwarding",
+            ok: true,
+            severity: "info",
+            message: "Enabled.".into(),
+            fix: None,
+        });
+    }
+
+    // self_id resolved earlier for future checks; silence unused lint.
+    let _ = self_id;
+
+    let has_error = checks.iter().any(|c| !c.ok && c.severity == "error");
+    let has_warning = checks.iter().any(|c| !c.ok && c.severity == "warning");
+    let status = if has_error { "error" } else if has_warning { "warning" } else { "ok" };
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "ok": !has_error,
+        "status": status,
+        "checks": checks,
+    }))
 }
 
 // ─── Zones ───
@@ -2822,6 +3248,7 @@ pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
     cfg
         .route("/api/router/topology", web::get().to(get_topology))
         .route("/api/router/topology-local", web::get().to(get_topology_local))
+        .route("/api/router/preflight", web::get().to(preflight))
         .route("/api/router/config-receive", web::post().to(config_receive))
         .route("/api/router/zones", web::get().to(get_zones))
         .route("/api/router/zones", web::post().to(assign_zone))

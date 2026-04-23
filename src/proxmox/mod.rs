@@ -12,7 +12,7 @@ use std::time::Duration;
 /// the upload/preflight/sync sites did the same per call.
 static PVE_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .timeout(Duration::from_secs(10))
             .danger_accept_invalid_certs(true) // PVE often uses self-signed certs
             .build()

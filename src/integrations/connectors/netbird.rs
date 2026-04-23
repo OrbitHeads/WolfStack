@@ -16,11 +16,11 @@ use std::time::Duration;
 /// Shared HTTP client for every NetBird API call. Auth token travels
 /// per-request in the Authorization header (see `auth_header`), so
 /// one shared pool works across all instances. Replaces the per-call
-/// `reqwest::Client::builder()` that leaked a connection pool on
+/// `crate::api::ipv4_only_client_builder()` that leaked a connection pool on
 /// every api_get / api_post / api_put.
 static NETBIRD_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .danger_accept_invalid_certs(true)
             .timeout(Duration::from_secs(30))
             .build()

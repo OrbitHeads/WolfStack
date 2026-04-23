@@ -49,7 +49,7 @@ use crate::agent::ClusterState;
 //   and tear them down before they need app-level cleanup.
 static RPC_CLIENT_SHORT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .timeout(std::time::Duration::from_secs(10))
             .danger_accept_invalid_certs(true)
             .pool_idle_timeout(std::time::Duration::from_secs(15))
@@ -61,7 +61,7 @@ static RPC_CLIENT_SHORT: std::sync::LazyLock<reqwest::Client> =
 
 static RPC_CLIENT_LONG: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .timeout(std::time::Duration::from_secs(120))
             .danger_accept_invalid_certs(true)
             .pool_idle_timeout(std::time::Duration::from_secs(15))
@@ -73,7 +73,7 @@ static RPC_CLIENT_LONG: std::sync::LazyLock<reqwest::Client> =
 
 static RPC_CLIENT_MIGRATE: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .timeout(std::time::Duration::from_secs(600))
             .danger_accept_invalid_certs(true)
             .pool_idle_timeout(std::time::Duration::from_secs(30))

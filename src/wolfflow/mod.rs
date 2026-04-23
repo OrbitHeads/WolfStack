@@ -21,7 +21,7 @@ use crate::agent::ClusterState;
 /// Shared HTTP clients for WolfFlow action execution. Two flavors
 /// because the `HttpRequest` action exposes a `verify_tls` toggle to
 /// the user — we honour it by dispatching to the appropriate pool.
-/// Per-call `reqwest::Client::builder()` was leaking one connection
+/// Per-call `crate::api::ipv4_only_client_builder()` was leaking one connection
 /// pool per workflow step; on a scheduled workflow with many HTTP
 /// actions, that compounded per run.
 ///
@@ -31,13 +31,13 @@ use crate::agent::ClusterState;
 /// `danger_accept_invalid_certs(true)`.
 static WOLFFLOW_CLIENT_STRICT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     });
 static WOLFFLOW_CLIENT_INSECURE: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .danger_accept_invalid_certs(true)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
@@ -1222,7 +1222,7 @@ pub async fn execute_action_local(action: &ActionType) -> Result<StepOutput, Str
         ActionType::UnifiAction { api_url, username, password, endpoint, method, body: body_str } => {
             // Unifi requires cookie-based login. We use a jar to manage session cookies.
             let jar = std::sync::Arc::new(reqwest::cookie::Jar::default());
-            let client = reqwest::Client::builder()
+            let client = crate::api::ipv4_only_client_builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .danger_accept_invalid_certs(true)
                 .cookie_provider(jar)

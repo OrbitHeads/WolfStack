@@ -386,7 +386,7 @@ pub async fn test_credentials() -> Result<serde_json::Value, String> {
 /// process lifetime. User-Agent and timeout are baked in here.
 static GITHUB_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .user_agent(USER_AGENT)
             .build()

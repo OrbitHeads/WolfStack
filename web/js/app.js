@@ -8015,13 +8015,8 @@ async function loadNodeVersionInfo(node) {
         installedEl.style.color = '#ef4444';
     }
 
-    // 2. Get latest version from GitHub
-    try {
-        const resp = await fetch('https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfStack/master/Cargo.toml');
-        const text = await resp.text();
-        const match = text.match(/^version\s*=\s*"([^"]+)"/m);
-        if (match) latestVersion = match[1];
-    } catch (e) { }
+    // 2. Get latest version from GitHub Releases (binary-backed, not raw Cargo.toml)
+    latestVersion = await fetchLatestWolfStackVersion() || '';
 
     if (latestVersion) {
         latestEl.textContent = 'v' + latestVersion;
@@ -8239,7 +8234,59 @@ async function saveNodeSettings() {
 let _wolfDialogResolve = null;
 let _wolfDialogMode = 'confirm'; // 'confirm' or 'prompt'
 
+// Prepare the shared dialog element before showing it. Defends against
+// the real-world failure modes we've seen on the Nginx / Apache
+// configurator pages and the Databases page:
+//
+//  (a) The fullscreenchange handler in this file moves the dialog
+//      into document.fullscreenElement when the Databases page goes
+//      fullscreen. If the user leaves that page WITHOUT exiting
+//      fullscreen (or exits fullscreen in a way that doesn't fire
+//      the event cleanly), the dialog is left stranded inside
+//      #page-databases, which other pages hide with display:none —
+//      so the next wolfConfirm on a different page never becomes
+//      visible. Fix: always reparent to <body> before showing.
+//
+//  (b) A previous wolfConfirm call whose promise never resolved (the
+//      caller navigated away mid-prompt) leaves `_wolfDialogResolve`
+//      pointing at an orphaned resolver. The next call overwrites
+//      the resolver, and the modal's OK/Cancel fire the NEW resolver
+//      — fine — but if a stale `.active` class is still on the modal
+//      from that first attempt, the modal thinks it's already open
+//      and the transitions don't re-run, occasionally leaving it
+//      invisible on Chromium. Fix: clear `.active` + stale resolver
+//      before re-opening.
+function _wolfDialogPrepare() {
+    const modal = document.getElementById('wolf-dialog-modal');
+    if (!modal) {
+        console.error('wolfConfirm/Prompt: #wolf-dialog-modal missing from DOM');
+        return null;
+    }
+    if (!document.body.contains(modal) || modal.parentElement !== document.body) {
+        document.body.appendChild(modal);
+    }
+    if (_wolfDialogResolve) {
+        // Previous caller's promise is orphaned — resolve it false/null
+        // so it doesn't hang forever, then clear so our OK handler
+        // doesn't fire the wrong resolver.
+        try { _wolfDialogResolve(_wolfDialogMode === 'prompt' ? null : false); } catch (_) {}
+        _wolfDialogResolve = null;
+    }
+    modal.classList.remove('active');
+    // Force a reflow so that the next `classList.add('active')` is
+    // treated as a fresh transition start, not a no-op. Without this
+    // some Chromium builds batch the remove/add pair and the opacity
+    // transition never fires.
+    void modal.offsetWidth;
+    return modal;
+}
+
 function wolfConfirm(message, title = 'Confirm', { okText = 'Confirm', cancelText = 'Cancel', danger = false } = {}) {
+    const modal = _wolfDialogPrepare();
+    if (!modal) {
+        if (typeof showToast === 'function') showToast('Confirmation dialog missing — reload the page.', 'error');
+        return Promise.resolve(false);
+    }
     return new Promise(resolve => {
         _wolfDialogResolve = resolve;
         _wolfDialogMode = 'confirm';
@@ -8250,11 +8297,16 @@ function wolfConfirm(message, title = 'Confirm', { okText = 'Confirm', cancelTex
         okBtn.textContent = okText;
         okBtn.className = danger ? 'btn btn-danger' : 'btn btn-primary';
         document.getElementById('wolf-dialog-cancel-btn').textContent = cancelText;
-        document.getElementById('wolf-dialog-modal').classList.add('active');
+        modal.classList.add('active');
     });
 }
 
 function wolfPrompt(message, defaultValue = '', title = 'Input', { okText = 'OK', cancelText = 'Cancel', placeholder = '' } = {}) {
+    const modal = _wolfDialogPrepare();
+    if (!modal) {
+        if (typeof showToast === 'function') showToast('Prompt dialog missing — reload the page.', 'error');
+        return Promise.resolve(null);
+    }
     return new Promise(resolve => {
         _wolfDialogResolve = resolve;
         _wolfDialogMode = 'prompt';
@@ -8268,7 +8320,7 @@ function wolfPrompt(message, defaultValue = '', title = 'Input', { okText = 'OK'
         document.getElementById('wolf-dialog-ok-btn').textContent = okText;
         document.getElementById('wolf-dialog-ok-btn').className = 'btn btn-primary';
         document.getElementById('wolf-dialog-cancel-btn').textContent = cancelText;
-        document.getElementById('wolf-dialog-modal').classList.add('active');
+        modal.classList.add('active');
         setTimeout(() => input.focus(), 100);
     });
 }
@@ -13424,6 +13476,9 @@ function renderLxcContainers(containers, stats) {
 
 async function lxcAction(container, action, btn) {
     if (action === 'destroy' && !(await showConfirm(`Destroy LXC container '${container}'? This cannot be undone.`))) return;
+    if (action === 'freeze' && !(await showConfirm(
+        `Freeze LXC container '${container}'?\n\nFreezing pauses every process inside the container. Network connections, DB writes, and anything holding a lock will stall until you Unfreeze. Click Confirm only if that's what you intended.`,
+        'Freeze container'))) return;
 
     activityStart();
     const row = btn?.closest('tr');
@@ -19833,28 +19888,41 @@ async function pullPbsFromNode(nodeId) {
 // Version Check
 // ═══════════════════════════════════════════════════
 
-function checkForUpdates() {
+// Query GitHub Releases API for the latest published WolfStack release.
+// Deliberately NOT reading Cargo.toml on master — that would report a new
+// version the instant the bump lands, before CI has actually produced a
+// binary, so every WolfStack would light up "Update available" for a
+// release that can't be downloaded yet.
+async function fetchLatestWolfStackVersion() {
+    try {
+        var r = await fetch('https://api.github.com/repos/wolfsoftwaresystemsltd/WolfStack/releases/latest', {
+            headers: { 'Accept': 'application/vnd.github+json' }
+        });
+        if (!r.ok) return null;
+        var data = await r.json();
+        var tag = data && data.tag_name ? String(data.tag_name).replace(/^v/i, '') : null;
+        return tag || null;
+    } catch (e) {
+        return null;
+    }
+}
+
+async function checkForUpdates() {
     var currentVersion = '';
     var versionEl = document.querySelector('.version');
     if (versionEl) currentVersion = versionEl.textContent.replace(/^v/i, '').trim();
     if (!currentVersion) return;
 
-    fetch('https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfStack/master/Cargo.toml')
-        .then(function (r) { return r.text(); })
-        .then(function (text) {
-            var match = text.match(/^version\s*=\s*"([^"]+)"/m);
-            if (!match) return;
-            var latestVersion = match[1];
-            if (isNewerVersion(latestVersion, currentVersion)) {
-                var banner = document.getElementById('update-banner');
-                var bannerText = document.getElementById('update-banner-text');
-                if (banner) {
-                    banner.style.display = 'block';
-                    if (bannerText) bannerText.textContent = 'Update available: v' + latestVersion + ' (current: v' + currentVersion + ')';
-                }
-            }
-        })
-        .catch(function () { /* silently ignore — no internet or private repo */ });
+    var latestVersion = await fetchLatestWolfStackVersion();
+    if (!latestVersion) return;
+    if (isNewerVersion(latestVersion, currentVersion)) {
+        var banner = document.getElementById('update-banner');
+        var bannerText = document.getElementById('update-banner-text');
+        if (banner) {
+            banner.style.display = 'block';
+            if (bannerText) bannerText.textContent = 'Update available: v' + latestVersion + ' (current: v' + currentVersion + ')';
+        }
+    }
 }
 
 // Returns true if 'latest' is strictly newer than 'current' (semver comparison)
@@ -20336,6 +20404,7 @@ async function loadAiConfig() {
         if ((el = document.getElementById('ai-claude-key'))) el.value = cfg.has_claude_key ? cfg.claude_api_key : '';
         if ((el = document.getElementById('ai-gemini-key'))) el.value = cfg.has_gemini_key ? cfg.gemini_api_key : '';
         if ((el = document.getElementById('ai-openrouter-key'))) el.value = cfg.has_openrouter_key ? cfg.openrouter_api_key : '';
+        if ((el = document.getElementById('ai-openai-key'))) el.value = cfg.has_openai_key ? cfg.openai_api_key : '';
         if ((el = document.getElementById('ai-local-url'))) el.value = cfg.local_url || '';
         if ((el = document.getElementById('ai-local-key'))) el.value = cfg.has_local_url ? (cfg.local_api_key || '') : '';
         // Show/hide provider-specific fields
@@ -20343,6 +20412,8 @@ async function loadAiConfig() {
         if (localFields) localFields.style.display = (cfg.provider === 'local') ? '' : 'none';
         const orFields = document.getElementById('ai-openrouter-fields');
         if (orFields) orFields.style.display = (cfg.provider === 'openrouter') ? '' : 'none';
+        const oaFields = document.getElementById('ai-openai-fields');
+        if (oaFields) oaFields.style.display = (cfg.provider === 'openai') ? '' : 'none';
         if ((el = document.getElementById('ai-email-enabled'))) el.checked = cfg.email_enabled || false;
         if ((el = document.getElementById('ai-email-to'))) el.value = cfg.email_to || '';
         if ((el = document.getElementById('ai-smtp-host'))) el.value = cfg.smtp_host || '';
@@ -20405,6 +20476,7 @@ async function saveAiConfig() {
         claude_api_key: (document.getElementById('ai-claude-key') || {}).value || '',
         gemini_api_key: (document.getElementById('ai-gemini-key') || {}).value || '',
         openrouter_api_key: (document.getElementById('ai-openrouter-key') || {}).value || '',
+        openai_api_key: (document.getElementById('ai-openai-key') || {}).value || '',
         local_url: (document.getElementById('ai-local-url') || {}).value || '',
         local_api_key: (document.getElementById('ai-local-key') || {}).value || '',
         model: (document.getElementById('ai-model') || {}).value || '',
@@ -20499,6 +20571,7 @@ async function testAiConnection() {
         claude_api_key: (document.getElementById('ai-claude-key') || {}).value || '',
         gemini_api_key: (document.getElementById('ai-gemini-key') || {}).value || '',
         openrouter_api_key: (document.getElementById('ai-openrouter-key') || {}).value || '',
+        openai_api_key: (document.getElementById('ai-openai-key') || {}).value || '',
         local_url: (document.getElementById('ai-local-url') || {}).value || '',
         local_api_key: (document.getElementById('ai-local-key') || {}).value || '',
         model: (document.getElementById('ai-model') || {}).value || '',
@@ -20556,6 +20629,8 @@ function onAiProviderChange() {
     if (localFields) localFields.style.display = provider === 'local' ? '' : 'none';
     const orFields = document.getElementById('ai-openrouter-fields');
     if (orFields) orFields.style.display = provider === 'openrouter' ? '' : 'none';
+    const oaFields = document.getElementById('ai-openai-fields');
+    if (oaFields) oaFields.style.display = provider === 'openai' ? '' : 'none';
     fetchAiModels(provider, '');
 }
 
@@ -22638,15 +22713,11 @@ async function scanForIssues() {
         if (r.version && r.version !== '?' && compareVersions(r.version, latestVersion) > 0) latestVersion = r.version;
     });
 
-    // Also check GitHub for the actual latest release version
-    try {
-        var ghResp = await fetch('https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfStack/master/Cargo.toml');
-        var ghText = await ghResp.text();
-        var ghMatch = ghText.match(/^version\s*=\s*"([^"]+)"/m);
-        if (ghMatch && ghMatch[1] && compareVersions(ghMatch[1], latestVersion) > 0) {
-            latestVersion = ghMatch[1];
-        }
-    } catch (e) { /* GitHub unreachable, fall back to cluster comparison */ }
+    // Also check GitHub Releases for the actual latest published version
+    var ghLatest = await fetchLatestWolfStackVersion();
+    if (ghLatest && compareVersions(ghLatest, latestVersion) > 0) {
+        latestVersion = ghLatest;
+    }
 
     renderIssueResults(results, latestVersion, clusters, clusterKeys);
 
@@ -23396,6 +23467,9 @@ async function fleetDeleteVm(nodeId, name) {
 
 async function fleetAction(nodeId, runtime, container, action, btn) {
     if ((action === 'remove' || action === 'destroy') && !(await showConfirm((runtime === 'docker' ? 'Remove' : 'Destroy') + " '" + container + "'? This cannot be undone."))) return;
+    if (runtime === 'lxc' && action === 'freeze' && !(await showConfirm(
+        "Freeze LXC container '" + container + "'?\n\nFreezing pauses every process inside the container. Network connections, DB writes, and anything holding a lock will stall until you Unfreeze. Click Confirm only if that's what you intended.",
+        'Freeze container'))) return;
 
     activityStart();
     var endpoint = fleetApiUrl(nodeId, runtime === 'vm' ? ('/api/vms/' + encodeURIComponent(container) + '/action') : ('/api/containers/' + runtime + '/' + encodeURIComponent(container) + '/action'));

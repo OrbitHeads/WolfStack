@@ -35,7 +35,7 @@ fn uptime_file() -> String { crate::paths::get().statuspage_uptime }
 
 static SP_RPC_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .timeout(std::time::Duration::from_secs(10))
             .danger_accept_invalid_certs(true)
             .pool_idle_timeout(std::time::Duration::from_secs(15))
@@ -47,7 +47,7 @@ static SP_RPC_CLIENT: std::sync::LazyLock<reqwest::Client> =
 
 static SP_HTTP_CHECK_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .danger_accept_invalid_certs(true)
             // Monitors hit user-configured external URLs — each
             // target probably answers once per tick and stays idle

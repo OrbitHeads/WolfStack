@@ -17,7 +17,7 @@ use std::collections::HashMap;
 /// discovery and each token exchange built its own Client.
 static OIDC_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     });

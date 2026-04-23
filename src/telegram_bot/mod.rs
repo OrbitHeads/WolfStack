@@ -35,7 +35,7 @@ use tracing::{info, warn};
 /// deadline + slack), send_message uses the default 30s.
 pub(crate) static TELEGRAM_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .timeout(Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())

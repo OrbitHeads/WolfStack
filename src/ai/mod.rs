@@ -26,7 +26,7 @@ pub mod baseline;
 /// budget the AI paths expect.
 static AI_SIMPLE_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .timeout(std::time::Duration::from_secs(120))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
@@ -51,9 +51,12 @@ fn ai_config_path() -> String { crate::paths::get().ai_config }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiConfig {
-    pub provider: String,         // "claude", "gemini", "openrouter", or "local"
+    pub provider: String,         // "claude", "gemini", "openai", "openrouter", or "local"
     pub claude_api_key: String,
     pub gemini_api_key: String,
+    /// OpenAI (ChatGPT) API key — https://platform.openai.com/api-keys
+    #[serde(default)]
+    pub openai_api_key: String,
     /// OpenRouter API key (https://openrouter.ai — access hundreds of models via one API)
     #[serde(default)]
     pub openrouter_api_key: String,
@@ -93,6 +96,7 @@ impl Default for AiConfig {
             provider: "claude".to_string(),
             claude_api_key: String::new(),
             gemini_api_key: String::new(),
+            openai_api_key: String::new(),
             openrouter_api_key: String::new(),
             local_url: String::new(),
             local_api_key: String::new(),
@@ -135,6 +139,7 @@ impl AiConfig {
             "provider": self.provider,
             "claude_api_key": mask_key(&self.claude_api_key),
             "gemini_api_key": mask_key(&self.gemini_api_key),
+            "openai_api_key": mask_key(&self.openai_api_key),
             "openrouter_api_key": mask_key(&self.openrouter_api_key),
             "local_url": self.local_url,
             "local_api_key": mask_key(&self.local_api_key),
@@ -150,6 +155,7 @@ impl AiConfig {
             "accepted_risks": self.accepted_risks,
             "has_claude_key": !self.claude_api_key.is_empty(),
             "has_gemini_key": !self.gemini_api_key.is_empty(),
+            "has_openai_key": !self.openai_api_key.is_empty(),
             "has_openrouter_key": !self.openrouter_api_key.is_empty(),
             "has_local_url": !self.local_url.is_empty(),
             "has_smtp_pass": !self.smtp_pass.is_empty(),
@@ -160,6 +166,7 @@ impl AiConfig {
         match self.provider.as_str() {
             "local" => if self.local_api_key.is_empty() { "local" } else { &self.local_api_key },
             "openrouter" => &self.openrouter_api_key,
+            "openai" => &self.openai_api_key,
             "gemini" => &self.gemini_api_key,
             _ => &self.claude_api_key,
         }
@@ -169,6 +176,7 @@ impl AiConfig {
         match self.provider.as_str() {
             "local" => !self.local_url.is_empty(),
             "openrouter" => !self.openrouter_api_key.is_empty(),
+            "openai" => !self.openai_api_key.is_empty(),
             _ => !self.active_key().is_empty(),
         }
     }
@@ -364,7 +372,10 @@ impl AiAgent {
             last_health_check: Mutex::new(None),
             alerting_hosts: Mutex::new(std::collections::HashSet::new()),
             knowledge_base,
-            client: reqwest::Client::new(),
+            client: crate::api::ipv4_only_client_builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
@@ -404,6 +415,9 @@ impl AiAgent {
                 }
                 "openrouter" => {
                     call_local(&self.client, "https://openrouter.ai/api/v1", &config.openrouter_api_key, &config.model, &system_prompt, &history, &current_msg).await?
+                }
+                "openai" => {
+                    call_local(&self.client, "https://api.openai.com/v1", &config.openai_api_key, &config.model, &system_prompt, &history, &current_msg).await?
                 }
                 "local" => {
                     call_local(&self.client, &config.local_url, &config.local_api_key, &config.model, &system_prompt, &history, &current_msg).await?
@@ -834,6 +848,32 @@ impl AiAgent {
                     .unwrap_or_default();
                 Ok(models)
             }
+            "openai" => {
+                // OpenAI /v1/models — same shape as OpenRouter.
+                let resp = self.client.get("https://api.openai.com/v1/models")
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .send().await
+                    .map_err(|e| format!("OpenAI API error: {}", e))?;
+                let status = resp.status();
+                let text = resp.text().await.map_err(|e| format!("OpenAI response error: {}", e))?;
+                if !status.is_success() {
+                    return Err(format!("OpenAI API {} — {}", status, text));
+                }
+                let json: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|e| format!("OpenAI JSON error: {}", e))?;
+                // Filter to chat-capable models (gpt-*, o*). OpenAI's list
+                // mixes in embeddings / TTS / whisper / image models; we
+                // only want ones usable with chat completions.
+                let mut models: Vec<String> = json["data"].as_array()
+                    .map(|arr| arr.iter().filter_map(|m| {
+                        let id = m["id"].as_str()?;
+                        let is_chat = id.starts_with("gpt-") || id.starts_with("o1") || id.starts_with("o3") || id.starts_with("o4") || id.starts_with("chatgpt-");
+                        if is_chat { Some(id.to_string()) } else { None }
+                    }).collect())
+                    .unwrap_or_default();
+                models.sort();
+                Ok(models)
+            }
             "gemini" => {
                 let url = format!(
                     "https://generativelanguage.googleapis.com/v1beta/models?key={}",
@@ -980,6 +1020,7 @@ impl AiAgent {
         let result = match config.provider.as_str() {
             "gemini" => call_gemini(&self.client, &config.gemini_api_key, &config.model, system, &[], &prompt).await,
             "openrouter" => call_local(&self.client, "https://openrouter.ai/api/v1", &config.openrouter_api_key, &config.model, system, &[], &prompt).await,
+            "openai" => call_local(&self.client, "https://api.openai.com/v1", &config.openai_api_key, &config.model, system, &[], &prompt).await,
             "local" => call_local(&self.client, &config.local_url, &config.local_api_key, &config.model, system, &[], &prompt).await,
             _ => call_claude(&self.client, &config.claude_api_key, &config.model, system, &[], &prompt).await,
         };
@@ -1198,6 +1239,7 @@ impl AiAgent {
         let result = match config.provider.as_str() {
             "gemini" => call_gemini(&self.client, &config.gemini_api_key, &config.model, system, &[], issue_description).await,
             "openrouter" => call_local(&self.client, "https://openrouter.ai/api/v1", &config.openrouter_api_key, &config.model, system, &[], issue_description).await,
+            "openai" => call_local(&self.client, "https://api.openai.com/v1", &config.openai_api_key, &config.model, system, &[], issue_description).await,
             "local" => call_local(&self.client, &config.local_url, &config.local_api_key, &config.model, system, &[], issue_description).await,
             _ => call_claude(&self.client, &config.claude_api_key, &config.model, system, &[], issue_description).await,
         };
@@ -1822,6 +1864,7 @@ pub async fn simple_chat(
     match config.provider.as_str() {
         "gemini" => call_gemini(client, &config.gemini_api_key, &config.model, system_prompt, history, user_message).await,
         "openrouter" => call_local(client, "https://openrouter.ai/api/v1", &config.openrouter_api_key, &config.model, system_prompt, history, user_message).await,
+        "openai" => call_local(client, "https://api.openai.com/v1", &config.openai_api_key, &config.model, system_prompt, history, user_message).await,
         "local" => call_local(client, &config.local_url, &config.local_api_key, &config.model, system_prompt, history, user_message).await,
         // Default to Claude (also covers empty/default provider string).
         _ => call_claude(client, &config.claude_api_key, &config.model, system_prompt, history, user_message).await,

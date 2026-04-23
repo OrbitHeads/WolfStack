@@ -247,7 +247,7 @@ async fn main() -> std::io::Result<()> {
             "https://checkip.amazonaws.com",
         ];
         let mut detected: Option<String> = None;
-        if let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(3)).build() {
+        if let Ok(client) = crate::api::ipv4_only_client_builder().timeout(Duration::from_secs(3)).build() {
             for url in &services {
                 if let Ok(resp) = client.get(*url).send().await {
                     if resp.status().is_success() {
@@ -798,7 +798,7 @@ async fn main() -> std::io::Result<()> {
             let mut last_scan_time = std::time::Instant::now();
             // Run first scan immediately after startup delay
             let mut should_scan_now = true;
-            let http_client = reqwest::Client::builder()
+            let http_client = crate::api::ipv4_only_client_builder()
                 .danger_accept_invalid_certs(true)
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
@@ -1520,7 +1520,7 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
         let alert_cluster = cluster.clone();
         let alert_secret = cluster_secret.clone();
         let alert_ai = ai_agent.clone();
-        let alert_http = reqwest::Client::builder()
+        let alert_http = crate::api::ipv4_only_client_builder()
             .timeout(Duration::from_secs(10))
             .danger_accept_invalid_certs(true)
             .build()

@@ -15,7 +15,7 @@ fn alerts_config_file() -> String { crate::paths::get().alerts_config }
 /// same CLOSE_WAIT pile-up still applied.
 static ALERT_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())

@@ -34,7 +34,7 @@ mod cluster_browser_proxy;
 /// without burning the full per-request budget on TCP handshake.
 pub(crate) static API_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        ipv4_only_client_builder()
             .connect_timeout(std::time::Duration::from_secs(3))
             .danger_accept_invalid_certs(true)
             // Aggressively trim the idle-connection pool so orphaned
@@ -50,6 +50,18 @@ pub(crate) static API_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     });
+
+/// Start a reqwest ClientBuilder pinned to IPv4. Wolfstacks run on
+/// mixed-stack hosts where AAAA records exist but the peer's :8553
+/// is only bound to 0.0.0.0 — without this, hyper will happily try
+/// the v6 address first, time out, and only then try the v4 one,
+/// adding seconds of latency per call. `local_address` bound to
+/// `Ipv4Addr::UNSPECIFIED` forces the outgoing socket into the IPv4
+/// stack so v6 candidates are skipped.
+pub(crate) fn ipv4_only_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .local_address(Some(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)))
+}
 
 /// Drain a response body before discarding so the socket returns to
 /// the keep-alive pool. Used by handlers that only care about
@@ -6321,6 +6333,19 @@ pub async fn ai_save_config(
                 config.openrouter_api_key = v.to_string();
             }
         }
+        if let Some(v) = body.get("openai_api_key").and_then(|v| v.as_str()) {
+            if !v.contains("••••") && !v.is_empty() {
+                config.openai_api_key = v.to_string();
+            }
+        }
+        if let Some(v) = body.get("local_url").and_then(|v| v.as_str()) {
+            config.local_url = v.to_string();
+        }
+        if let Some(v) = body.get("local_api_key").and_then(|v| v.as_str()) {
+            if !v.contains("••••") && !v.is_empty() {
+                config.local_api_key = v.to_string();
+            }
+        }
         if let Some(v) = body.get("model").and_then(|v| v.as_str()) {
             config.model = v.to_string();
         }
@@ -6371,7 +6396,7 @@ pub async fn ai_save_config(
     // Broadcast to all online cluster nodes in the background
     let cluster_secret = state.cluster_secret.clone();
     let nodes = state.cluster.get_all_nodes();
-    let client = reqwest::Client::new();
+    let client = API_HTTP_CLIENT.clone();
     for node in nodes.iter().filter(|n| !n.is_self && n.online) {
         let url = format!("http://{}:{}/api/ai/config/sync", node.address, node.port);
         let secret = cluster_secret.clone();
@@ -7105,6 +7130,7 @@ pub async fn ai_models(
         let api_key = match provider {
             "gemini" => &config.gemini_api_key,
             "openrouter" => &config.openrouter_api_key,
+            "openai" => &config.openai_api_key,
             _ => &config.claude_api_key,
         };
         if api_key.is_empty() {
@@ -10932,7 +10958,7 @@ async fn sync_mount_to_cluster(
     for node in &nodes {
         if node.is_self { continue; }
         let url = format!("http://{}:{}/api/agent/storage/apply", node.address, node.port);
-        let client = reqwest::Client::new();
+        let client = API_HTTP_CLIENT.clone();
         match client.post(&url)
             .header("X-WolfStack-Secret", state.cluster_secret.clone())
             .json(mount)
@@ -11653,7 +11679,7 @@ fn wolfusb_broadcast_sync(state: &web::Data<AppState>) {
     let config = crate::wolfusb::WolfUsbConfig::load();
     let cluster_secret = state.cluster_secret.clone();
     let nodes = state.cluster.get_all_nodes();
-    let client = reqwest::Client::new();
+    let client = API_HTTP_CLIENT.clone();
     let payload = serde_json::json!({ "assignments": config.assignments });
 
     for node in nodes.iter().filter(|n| !n.is_self && n.online) {
@@ -11751,7 +11777,7 @@ pub async fn wolfusb_cluster_devices(
         .collect();
     let config = crate::wolfusb::WolfUsbConfig::load();
     let secret = state.cluster_secret.clone();
-    let client = reqwest::Client::new();
+    let client = API_HTTP_CLIENT.clone();
 
     // Collect the local node's devices first.
     let (local_devices, local_ok) =
@@ -11920,7 +11946,7 @@ pub async fn wolfusb_assign(req: HttpRequest, state: web::Data<AppState>, body: 
                 if let Some(target_node) = nodes.iter().find(|n| n.id == target_node_id) {
                     let urls = crate::api::build_node_urls(&target_node.address, target_node.port, "/api/wolfusb/attach");
                     let secret = state.cluster_secret.clone();
-                    let client = reqwest::Client::new();
+                    let client = API_HTTP_CLIENT.clone();
                     let body = serde_json::json!({
                         "source_address": effective_address,
                         "busid": busid,

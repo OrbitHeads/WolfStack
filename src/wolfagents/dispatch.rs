@@ -36,14 +36,14 @@ use super::{Agent, safety, tools::{self, AuthDecision, ToolId}};
 
 /// Shared HTTP client for every inter-node dispatch call in this
 /// module. Previously every tool-fan-out site built its own Client
-/// (`reqwest::Client::builder()...build()`) — thirteen separate
+/// (`crate::api::ipv4_only_client_builder()...build()`) — thirteen separate
 /// pools, each leaked at function exit. One shared pool reuses
 /// connections across all tool invocations. Timeout is set per
 /// request via `RequestBuilder::timeout` because each tool picks
 /// its own deadline (5s–30s).
 static DISPATCH_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .danger_accept_invalid_certs(true)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())

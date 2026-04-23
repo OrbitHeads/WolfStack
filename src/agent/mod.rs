@@ -763,7 +763,7 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
         let client = {
             // Reuse a single client across all poll cycles for connection pooling & keep-alive
             static POLL_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
-                reqwest::Client::builder()
+                crate::api::ipv4_only_client_builder()
                     .timeout(Duration::from_secs(10))
                     .danger_accept_invalid_certs(true)
                     // Aggressive pool tuning so cluster polling doesn't

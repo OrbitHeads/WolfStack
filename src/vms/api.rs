@@ -14,7 +14,7 @@ use std::time::Duration;
 /// were leaking connection pools for every VM transfer attempt.
 static VM_MIGRATION_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .connect_timeout(Duration::from_secs(5))
             .danger_accept_invalid_certs(true)
             .build()

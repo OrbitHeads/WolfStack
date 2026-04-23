@@ -20,7 +20,7 @@ const CONFIG_FILE: &str = "/etc/wolfstack/image-watcher.json";
 /// `check_interval_secs`).
 static IMG_WATCH_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())

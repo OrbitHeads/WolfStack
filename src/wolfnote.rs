@@ -19,7 +19,7 @@ fn wolfnote_config_path() -> String { crate::paths::get().wolfnote_config }
 /// leaking a connection pool on every note/folder list/create.
 static WOLFNOTE_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::api::ipv4_only_client_builder()
             .timeout(std::time::Duration::from_secs(15))
             .use_rustls_tls()
             .build()
