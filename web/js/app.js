@@ -23192,11 +23192,20 @@ async function scanGlobalWolfNet() {
             tr.innerHTML = '<td>' + escapeHtml(r.cluster || '') + '</td><td>' + escapeHtml(r.server) + '</td><td>' + typeIcon + ' ' + escapeHtml(r.type) + '</td><td>' + escapeHtml(r.name) + '</td><td><code>' + escapeHtml(r.ip || '\u2014') + '</code></td><td style="font-size:11px;">' + escapeHtml(r.peers || '') + '</td><td>' + escapeHtml(r.state) + '</td>';
             tbody.appendChild(tr);
         });
+    }
+
+    // Summary cards need the REAL workload count per type, not just
+    // the rows that ended up in the table — the table hides LXC /
+    // Docker / VMs that have no discoverable IP (or only loopback),
+    // which was making the VM card show 0 while the fleet list
+    // below showed 6. Track totals separately from rows.
+    var gwnTotals = { peers: 0, lxc: 0, docker: 0, vms: 0 };
+    function gwnUpdateCounts() {
         var el;
-        el = document.getElementById('gwn-count-peers'); if (el) el.textContent = gwnScanData.filter(function (r) { return r.type === 'WolfNet'; }).length;
-        el = document.getElementById('gwn-count-lxc'); if (el) el.textContent = gwnScanData.filter(function (r) { return r.type === 'LXC'; }).length;
-        el = document.getElementById('gwn-count-docker'); if (el) el.textContent = gwnScanData.filter(function (r) { return r.type === 'Docker'; }).length;
-        el = document.getElementById('gwn-count-vms'); if (el) el.textContent = gwnScanData.filter(function (r) { return r.type === 'VM'; }).length;
+        el = document.getElementById('gwn-count-peers');  if (el) el.textContent = gwnTotals.peers;
+        el = document.getElementById('gwn-count-lxc');    if (el) el.textContent = gwnTotals.lxc;
+        el = document.getElementById('gwn-count-docker'); if (el) el.textContent = gwnTotals.docker;
+        el = document.getElementById('gwn-count-vms');    if (el) el.textContent = gwnTotals.vms;
     }
 
     async function scanNode(node) {
@@ -23212,6 +23221,7 @@ async function scanGlobalWolfNet() {
                 if (selfIp) {
                     var peerList = (wn.peers || []).map(function (p) { return (p.name || '') + ':' + ((p.ip || '').split('/')[0]); }).join(', ');
                     rows.push({ cluster: clusterName, server: serverName, type: 'WolfNet', name: serverName, ip: selfIp, peers: peerList, state: wn.running ? 'Running' : 'Stopped' });
+                    gwnTotals.peers++;
                 }
             }
         } catch (e) { }
@@ -23219,6 +23229,9 @@ async function scanGlobalWolfNet() {
             var lxcData = await fetch(urlBase + 'containers/lxc', { credentials: 'include' }).then(function (r) { return r.ok ? r.json() : null; });
             if (lxcData) {
                 var list = Array.isArray(lxcData) ? lxcData : (lxcData.containers || []);
+                // Count every LXC regardless of whether its IP resolved —
+                // the stat card should match fleet's actual count.
+                gwnTotals.lxc += list.length;
                 list.forEach(function (c) {
                     var ip = String(c.ip || c.ipv4 || '').split('/')[0];
                     if (ip) rows.push({ cluster: clusterName, server: serverName, type: 'LXC', name: c.name || c.id || '?', ip: ip, peers: '', state: c.state || c.status || '?' });
@@ -23229,6 +23242,7 @@ async function scanGlobalWolfNet() {
             var dockerData = await fetch(urlBase + 'containers/docker', { credentials: 'include' }).then(function (r) { return r.ok ? r.json() : null; });
             if (dockerData) {
                 var list = Array.isArray(dockerData) ? dockerData : (dockerData.containers || []);
+                gwnTotals.docker += list.length;
                 list.forEach(function (c) {
                     var name = ((c.names && c.names[0]) || c.name || c.id || '?').replace(/^\//, '');
                     var state = c.state || c.status || '?';
@@ -23250,6 +23264,10 @@ async function scanGlobalWolfNet() {
             var vmData = await fetch(urlBase + 'vms', { credentials: 'include' }).then(function (r) { return r.ok ? r.json() : null; });
             if (vmData) {
                 var list = Array.isArray(vmData) ? vmData : (vmData.vms || []);
+                // Same fix as LXC/Docker — the card used to only count
+                // VMs that had a routable IP, so the summary showed 0
+                // while the fleet table below listed all 6.
+                gwnTotals.vms += list.length;
                 list.forEach(function (v) {
                     var raw = v.ips || v.ip_addresses || (v.ip ? [v.ip] : []);
                     var ips = Array.isArray(raw) ? raw : [raw];
@@ -23261,6 +23279,7 @@ async function scanGlobalWolfNet() {
         } catch (e) { }
         if (rows.length === 0) rows.push({ cluster: clusterName, server: serverName, type: '-', name: '-', ip: '-', peers: '', state: 'No data' });
         addRowsForNode(node.id, rows);
+        gwnUpdateCounts();
     }
 
     // Fire ALL node scans in parallel
