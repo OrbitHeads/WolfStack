@@ -204,44 +204,142 @@
     }
 
     async function wrLoadAll() {
-        // Surface fetch failures directly in the rack canvas — silent
-        // "Loading topology…" forever is the worst possible UX.
-        const showErr = (msg) => {
-            const c = document.getElementById('wr-rack-canvas');
-            if (c) c.innerHTML = `<div style="color:#ef4444; text-align:center; padding:40px; font-size:13px;">
-                ${msg}<br><br><span style="color:var(--text-muted); font-size:11px;">Check the browser console + WolfStack server log for details.</span>
-            </div>`;
-        };
-        try {
-            const [topoR, rulesR, lansR, zonesR, managedR, snapR, wanR, proxyR] = await Promise.all([
-                fetch(wrUrl('/api/router/topology')),
-                fetch(wrUrl('/api/router/rules')),
-                fetch(wrUrl('/api/router/segments')),
-                fetch(wrUrl('/api/router/zones')),
-                fetch(wrUrl('/api/router/managed-overview')),
-                fetch(wrUrl('/api/router/host-snapshot')),
-                fetch(wrUrl('/api/router/wan')),
-                fetch(wrUrl('/api/router/proxies')),
-            ]);
-            if (!topoR.ok) {
-                const body = await topoR.text().catch(() => '');
-                console.error('wolfrouter: topology fetch failed', topoR.status, body);
-                showErr(`Topology fetch failed: HTTP ${topoR.status} ${topoR.statusText}<br><code>${escHtml(body.slice(0,200))}</code>`);
-                return;
+        // Fetch every endpoint independently so one failure doesn't
+        // black-hole the whole page. Customers were seeing a bare
+        // "failed to fetch" with no clue which endpoint was broken or
+        // what data HAD loaded — we now render whatever came back and
+        // list the specific endpoints that failed in a banner above
+        // the rack canvas.
+        const endpoints = [
+            { key: 'topology',  url: '/api/router/topology',         label: 'Topology',           critical: true,  stateKey: 'topology' },
+            { key: 'rules',     url: '/api/router/rules',            label: 'Firewall rules',     stateKey: 'rules',    fallback: [] },
+            { key: 'lans',      url: '/api/router/segments',         label: 'LAN segments',       stateKey: 'lans',     fallback: [] },
+            { key: 'zones',     url: '/api/router/zones',            label: 'Security zones',     stateKey: 'zones',    fallback: { assignments: {} } },
+            { key: 'managed',   url: '/api/router/managed-overview', label: 'Managed overview',   stateKey: 'managed',  fallback: null },
+            { key: 'snapshot',  url: '/api/router/host-snapshot',    label: 'Host snapshot',      stateKey: 'snapshot', fallback: null },
+            { key: 'wan',       url: '/api/router/wan',              label: 'WAN connections',    stateKey: 'wan',      fallback: [] },
+            { key: 'proxies',   url: '/api/router/proxies',          label: 'Reverse proxies',    stateKey: 'proxies',  fallback: [] },
+        ];
+
+        // Launch all in parallel; track outcome per endpoint.
+        const outcomes = await Promise.all(endpoints.map(async (ep) => {
+            try {
+                const r = await fetch(wrUrl(ep.url));
+                if (!r.ok) {
+                    const body = await r.text().catch(() => '');
+                    return { ep, ok: false, error: `HTTP ${r.status} ${r.statusText}`, detail: body.slice(0, 240) };
+                }
+                try {
+                    const data = await r.json();
+                    return { ep, ok: true, data };
+                } catch (e) {
+                    return { ep, ok: false, error: 'Invalid JSON response', detail: String(e.message || e).slice(0, 240) };
+                }
+            } catch (e) {
+                // Network-level failure (DNS, TLS, CORS, offline, etc.).
+                return { ep, ok: false, error: `Network error: ${e.message || e}`, detail: '' };
             }
-            wrState.topology = await topoR.json();
-            if (rulesR.ok) wrState.rules = await rulesR.json();
-            if (lansR.ok)  wrState.lans = await lansR.json();
-            if (zonesR.ok) wrState.zones = await zonesR.json();
-            if (managedR.ok) wrState.managed = await managedR.json();
-            if (snapR.ok) wrState.snapshot = await snapR.json();
-            if (wanR.ok)  wrState.wan = await wanR.json();
-            if (proxyR.ok) wrState.proxies = await proxyR.json();
-            wrRenderAll();
-        } catch (e) {
-            console.error('wolfrouter load:', e);
-            showErr(`Network error: ${e.message || e}`);
+        }));
+
+        // Apply every successful outcome so partially-loaded state is
+        // still rendered; each fallback is used when the endpoint
+        // failed, so downstream code never sees undefined.
+        const failures = [];
+        let topologyOk = false;
+        for (const o of outcomes) {
+            if (o.ok) {
+                wrState[o.ep.stateKey] = o.data;
+                if (o.ep.key === 'topology') topologyOk = true;
+            } else {
+                if (o.ep.fallback !== undefined) wrState[o.ep.stateKey] = o.ep.fallback;
+                failures.push(o);
+                console.error(`wolfrouter: ${o.ep.label} (${o.ep.url}) — ${o.error}`, o.detail);
+            }
         }
+
+        // If topology failed we can't draw the rack, but we can still
+        // show the Firewall / LANs / Zones tables from whatever DID
+        // load. Put a full error panel in the canvas and still render
+        // the rest of the page.
+        if (!topologyOk) {
+            const topoFail = failures.find(f => f.ep.key === 'topology');
+            wrShowFetchReport(failures, topoFail);
+            // Render what we can in the table tabs.
+            try { wrRenderAll(); } catch (_) { /* rack renderer may bail; fine */ }
+            return;
+        }
+
+        wrRenderAll();
+        if (failures.length) wrShowPartialFailureBanner(failures);
+        else wrClearPartialFailureBanner();
+    }
+
+    // Banner shown above the rack canvas when topology loaded but
+    // some other endpoints failed. Non-blocking — the UI is usable.
+    function wrShowPartialFailureBanner(failures) {
+        const canvas = document.getElementById('wr-rack-canvas');
+        if (!canvas) return;
+        let banner = document.getElementById('wr-partial-banner');
+        if (!banner) {
+            banner = document.createElement('div');
+            banner.id = 'wr-partial-banner';
+            banner.style.cssText = 'background:rgba(234,179,8,0.12); border:1px solid rgba(234,179,8,0.4); color:#eab308; padding:10px 14px; border-radius:6px; margin-bottom:10px; font-size:12px;';
+            canvas.parentElement && canvas.parentElement.insertBefore(banner, canvas);
+        }
+        const rows = failures.map(f => `<li><strong>${escHtml(f.ep.label)}</strong> <code style="color:var(--text-muted);">${escHtml(f.ep.url)}</code> — ${escHtml(f.error)}${f.detail ? `<br><code style="display:block; margin-top:2px; font-size:11px; color:var(--text-muted);">${escHtml(f.detail)}</code>` : ''}</li>`).join('');
+        banner.innerHTML = `
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:6px;">
+                <strong>⚠️ ${failures.length} section${failures.length === 1 ? '' : 's'} failed to load</strong>
+                <button onclick="wrLoadAll()" style="background:transparent; color:#eab308; border:1px solid rgba(234,179,8,0.4); padding:3px 10px; border-radius:4px; cursor:pointer; font-size:11px;">Retry</button>
+            </div>
+            <div style="color:var(--text-muted); font-size:11px; margin-bottom:6px;">The rack is rendered from topology which did load. The panels below may be missing data from these endpoints:</div>
+            <ul style="margin:0; padding-left:20px;">${rows}</ul>
+        `;
+    }
+
+    function wrClearPartialFailureBanner() {
+        const b = document.getElementById('wr-partial-banner');
+        if (b) b.remove();
+    }
+
+    // Full-canvas error panel — only used when topology itself
+    // failed. Lists every broken endpoint with its HTTP status /
+    // response body so the operator can diagnose, plus a retry
+    // button. Doesn't hide the tables tabs (they still render from
+    // whatever did load).
+    function wrShowFetchReport(failures, topoFail) {
+        wrClearPartialFailureBanner();
+        const canvas = document.getElementById('wr-rack-canvas');
+        if (!canvas) return;
+        const rows = failures.map(f => `<tr>
+            <td style="padding:6px 10px; border-bottom:1px solid var(--border);"><strong>${escHtml(f.ep.label)}</strong></td>
+            <td style="padding:6px 10px; border-bottom:1px solid var(--border); font-family:monospace; font-size:11px;">${escHtml(f.ep.url)}</td>
+            <td style="padding:6px 10px; border-bottom:1px solid var(--border); color:#ef4444;">${escHtml(f.error)}</td>
+            <td style="padding:6px 10px; border-bottom:1px solid var(--border); font-family:monospace; font-size:11px; color:var(--text-muted); max-width:380px; word-break:break-all;">${escHtml(f.detail || '—')}</td>
+        </tr>`).join('');
+        canvas.innerHTML = `
+            <div style="padding:24px;">
+                <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;">
+                    <span style="font-size:28px;">🛑</span>
+                    <div>
+                        <div style="color:#ef4444; font-weight:700; font-size:16px;">WolfRouter: topology could not be loaded</div>
+                        <div style="color:var(--text-muted); font-size:12px;">Rack view is hidden because it depends on the topology endpoint. Whatever else loaded is still rendered in the Firewall / LANs / Zones tabs below.</div>
+                    </div>
+                </div>
+                <div style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:6px; padding:12px; margin-bottom:14px;">
+                    <strong style="font-size:13px;">Topology endpoint</strong><br>
+                    <code style="font-size:11px;">${escHtml(topoFail ? topoFail.ep.url : '/api/router/topology')}</code><br>
+                    <span style="color:#ef4444;">${escHtml(topoFail ? topoFail.error : 'unknown')}</span>
+                    ${topoFail && topoFail.detail ? `<pre style="margin-top:8px; padding:8px; background:var(--bg-primary); border-radius:4px; font-size:11px; white-space:pre-wrap;">${escHtml(topoFail.detail)}</pre>` : ''}
+                </div>
+                ${failures.length > 1 ? `<div style="font-size:12px; margin-bottom:6px;">Other endpoints that failed:</div>
+                <table style="width:100%; font-size:12px; border-collapse:collapse; border:1px solid var(--border); border-radius:6px; overflow:hidden;"><thead><tr style="background:var(--bg-tertiary);"><th style="padding:8px 10px; text-align:left;">Section</th><th style="padding:8px 10px; text-align:left;">Endpoint</th><th style="padding:8px 10px; text-align:left;">Error</th><th style="padding:8px 10px; text-align:left;">Detail</th></tr></thead><tbody>${rows}</tbody></table>` : ''}
+                <div style="margin-top:14px; display:flex; gap:10px; align-items:center;">
+                    <button onclick="wrLoadAll()" class="btn btn-primary btn-sm">🔄 Retry</button>
+                    <span style="color:var(--text-muted); font-size:11px;">Full details with response bodies are in the browser console (F12) and the server log.</span>
+                </div>
+            </div>
+        `;
     }
 
     function wrStartPolling() {
