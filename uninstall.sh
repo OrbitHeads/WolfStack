@@ -5,11 +5,17 @@
 #
 #
 # WolfStack Uninstall Script
-# Removes WolfStack server management dashboard and optionally WolfNet
+# Removes WolfStack server management dashboard and optionally other Wolf suite components
 #
-# Usage: sudo bash uninstall.sh
-#        sudo bash uninstall.sh --purge          # Also remove config and data
-#        sudo bash uninstall.sh --purge --wolfnet # Also remove WolfNet
+# Usage: sudo bash uninstall.sh                         # Remove WolfStack only
+#        sudo bash uninstall.sh --purge                 # Also remove config and data
+#        sudo bash uninstall.sh --wolfnet               # Also remove WolfNet
+#        sudo bash uninstall.sh --wolfproxy             # Also remove WolfProxy
+#        sudo bash uninstall.sh --wolfserve             # Also remove WolfServe
+#        sudo bash uninstall.sh --wolfdisk              # Also remove WolfDisk
+#        sudo bash uninstall.sh --wolfscale             # Also remove WolfScale
+#        sudo bash uninstall.sh --all                   # Remove WolfStack + every Wolf component
+#        sudo bash uninstall.sh --all --purge           # Full wipe of everything
 #
 
 set -e
@@ -17,11 +23,26 @@ set -e
 # ─── Parse arguments ─────────────────────────────────────────────────────────
 PURGE=false
 REMOVE_WOLFNET=false
+REMOVE_WOLFPROXY=false
+REMOVE_WOLFSERVE=false
+REMOVE_WOLFDISK=false
+REMOVE_WOLFSCALE=false
 FORCE=false
 for arg in "$@"; do
     case "$arg" in
-        --purge)   PURGE=true ;;
-        --wolfnet) REMOVE_WOLFNET=true ;;
+        --purge)     PURGE=true ;;
+        --wolfnet)   REMOVE_WOLFNET=true ;;
+        --wolfproxy) REMOVE_WOLFPROXY=true ;;
+        --wolfserve) REMOVE_WOLFSERVE=true ;;
+        --wolfdisk)  REMOVE_WOLFDISK=true ;;
+        --wolfscale) REMOVE_WOLFSCALE=true ;;
+        --all)
+            REMOVE_WOLFNET=true
+            REMOVE_WOLFPROXY=true
+            REMOVE_WOLFSERVE=true
+            REMOVE_WOLFDISK=true
+            REMOVE_WOLFSCALE=true
+            ;;
         --force)   FORCE=true ;;
     esac
 done
@@ -34,9 +55,11 @@ if [ "$PURGE" = true ]; then
 else
     echo "  Mode: Standard (config + data preserved)"
 fi
-if [ "$REMOVE_WOLFNET" = true ]; then
-    echo "  WolfNet: Will also be removed"
-fi
+[ "$REMOVE_WOLFNET"   = true ] && echo "  WolfNet:   Will also be removed"
+[ "$REMOVE_WOLFPROXY" = true ] && echo "  WolfProxy: Will also be removed"
+[ "$REMOVE_WOLFSERVE" = true ] && echo "  WolfServe: Will also be removed"
+[ "$REMOVE_WOLFDISK"  = true ] && echo "  WolfDisk:  Will also be removed"
+[ "$REMOVE_WOLFSCALE" = true ] && echo "  WolfScale: Will also be removed"
 echo ""
 
 # ─── Must run as root ────────────────────────────────────────────────────────
@@ -65,6 +88,45 @@ if [ "$FORCE" != true ]; then
         if [ "$PURGE" = true ]; then
             echo "     • /etc/wolfnet/ (config and keys)"
             echo "     • /opt/wolfnet-src/ (source code)"
+        fi
+    fi
+    if [ "$REMOVE_WOLFPROXY" = true ]; then
+        echo ""
+        echo "  ⚠  WARNING: --wolfproxy will also remove WolfProxy:"
+        echo "     • wolfproxy systemd service"
+        if [ "$PURGE" = true ]; then
+            echo "     • /opt/wolfproxy/ (binary, source, wolfproxy.toml config)"
+        fi
+    fi
+    if [ "$REMOVE_WOLFSERVE" = true ]; then
+        echo ""
+        echo "  ⚠  WARNING: --wolfserve will also remove WolfServe:"
+        echo "     • wolfserve systemd service"
+        if [ "$PURGE" = true ]; then
+            echo "     • /opt/wolfserve/ (binary, config, public/ docroot)"
+        fi
+    fi
+    if [ "$REMOVE_WOLFDISK" = true ]; then
+        echo ""
+        echo "  ⚠  WARNING: --wolfdisk will also remove WolfDisk:"
+        echo "     • wolfdisk binary and systemd service"
+        if [ "$PURGE" = true ]; then
+            echo "     • /etc/wolfdisk/ (config)"
+            echo "     • /var/lib/wolfdisk/ (chunks, index, wal)"
+            echo "     • /mnt/wolfdisk/ (mount point)"
+            echo "     • /opt/wolfdisk-src/ (source code)"
+        fi
+    fi
+    if [ "$REMOVE_WOLFSCALE" = true ]; then
+        echo ""
+        echo "  ⚠  WARNING: --wolfscale will also remove WolfScale:"
+        echo "     • wolfscale + wolfscale-lb systemd services"
+        echo "     • wolfctl CLI tool"
+        if [ "$PURGE" = true ]; then
+            echo "     • /opt/wolfscale/ (binary, wolfscale.toml config)"
+            echo "     • /var/lib/wolfscale/ (data)"
+            echo "     • /var/log/wolfscale/ (logs)"
+            echo "     • /opt/wolfscale-src/ (source code)"
         fi
     fi
     echo ""
@@ -242,6 +304,126 @@ if [ "$REMOVE_WOLFNET" = true ]; then
     fi
 fi
 
+# ─── Helper: stop, disable and remove a systemd unit ────────────────────────
+remove_service() {
+    local svc="$1"
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        systemctl stop "$svc" 2>/dev/null || true
+        echo "✓ ${svc} service stopped"
+    fi
+    if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+        systemctl disable "$svc" 2>/dev/null || true
+        echo "✓ ${svc} service disabled"
+    fi
+    if [ -f "/etc/systemd/system/${svc}.service" ]; then
+        rm -f "/etc/systemd/system/${svc}.service"
+        systemctl daemon-reload
+        echo "✓ ${svc} systemd unit removed"
+    fi
+}
+
+# ─── Remove WolfProxy (optional) ────────────────────────────────────────────
+if [ "$REMOVE_WOLFPROXY" = true ]; then
+    echo ""
+    echo "Removing WolfProxy..."
+
+    remove_service wolfproxy
+
+    if [ "$PURGE" = true ]; then
+        if [ -d "/opt/wolfproxy" ]; then
+            rm -rf /opt/wolfproxy
+            echo "✓ Removed /opt/wolfproxy/"
+        fi
+    else
+        echo "  ℹ  WolfProxy files preserved at /opt/wolfproxy/"
+        echo "     To remove all data, re-run with: sudo bash uninstall.sh --purge --wolfproxy"
+    fi
+
+    # WolfProxy's setup.sh stops and disables nginx on install — restore it if present
+    if systemctl cat nginx &>/dev/null; then
+        systemctl enable nginx 2>/dev/null || true
+        systemctl start nginx 2>/dev/null || true
+        if systemctl is-active --quiet nginx; then
+            echo "✓ nginx re-enabled and started"
+        else
+            echo "  ⚠ nginx unit exists but failed to start — check: journalctl -u nginx -n 20"
+        fi
+    fi
+fi
+
+# ─── Remove WolfServe (optional) ────────────────────────────────────────────
+if [ "$REMOVE_WOLFSERVE" = true ]; then
+    echo ""
+    echo "Removing WolfServe..."
+
+    remove_service wolfserve
+
+    if [ "$PURGE" = true ]; then
+        if [ -d "/opt/wolfserve" ]; then
+            rm -rf /opt/wolfserve
+            echo "✓ Removed /opt/wolfserve/"
+        fi
+    else
+        echo "  ℹ  WolfServe files preserved at /opt/wolfserve/"
+        echo "     To remove all data, re-run with: sudo bash uninstall.sh --purge --wolfserve"
+    fi
+fi
+
+# ─── Remove WolfDisk (optional) ─────────────────────────────────────────────
+if [ "$REMOVE_WOLFDISK" = true ]; then
+    echo ""
+    echo "Removing WolfDisk..."
+
+    # Unmount any active WolfDisk mounts before tearing down the service
+    if [ -d "/mnt/wolfdisk" ]; then
+        if mountpoint -q /mnt/wolfdisk 2>/dev/null; then
+            umount -l /mnt/wolfdisk 2>/dev/null || true
+            echo "✓ Unmounted /mnt/wolfdisk"
+        fi
+    fi
+
+    remove_service wolfdisk
+
+    if [ -f "/usr/local/bin/wolfdisk" ]; then
+        rm -f /usr/local/bin/wolfdisk
+        echo "✓ Removed /usr/local/bin/wolfdisk"
+    fi
+
+    if [ "$PURGE" = true ]; then
+        [ -d "/etc/wolfdisk"     ] && rm -rf /etc/wolfdisk     && echo "✓ Removed /etc/wolfdisk/"
+        [ -d "/var/lib/wolfdisk" ] && rm -rf /var/lib/wolfdisk && echo "✓ Removed /var/lib/wolfdisk/"
+        [ -d "/mnt/wolfdisk"     ] && rm -rf /mnt/wolfdisk     && echo "✓ Removed /mnt/wolfdisk/"
+        [ -d "/opt/wolfdisk-src" ] && rm -rf /opt/wolfdisk-src && echo "✓ Removed /opt/wolfdisk-src/"
+    else
+        echo "  ℹ  WolfDisk config preserved at /etc/wolfdisk/ and data at /var/lib/wolfdisk/"
+        echo "     To remove all data, re-run with: sudo bash uninstall.sh --purge --wolfdisk"
+    fi
+fi
+
+# ─── Remove WolfScale (optional) ────────────────────────────────────────────
+if [ "$REMOVE_WOLFSCALE" = true ]; then
+    echo ""
+    echo "Removing WolfScale..."
+
+    remove_service wolfscale
+    remove_service wolfscale-lb
+
+    if [ -f "/usr/local/bin/wolfctl" ]; then
+        rm -f /usr/local/bin/wolfctl
+        echo "✓ Removed /usr/local/bin/wolfctl"
+    fi
+
+    if [ "$PURGE" = true ]; then
+        [ -d "/opt/wolfscale"     ] && rm -rf /opt/wolfscale     && echo "✓ Removed /opt/wolfscale/"
+        [ -d "/var/lib/wolfscale" ] && rm -rf /var/lib/wolfscale && echo "✓ Removed /var/lib/wolfscale/"
+        [ -d "/var/log/wolfscale" ] && rm -rf /var/log/wolfscale && echo "✓ Removed /var/log/wolfscale/"
+        [ -d "/opt/wolfscale-src" ] && rm -rf /opt/wolfscale-src && echo "✓ Removed /opt/wolfscale-src/"
+    else
+        echo "  ℹ  WolfScale config preserved at /opt/wolfscale/ and data at /var/lib/wolfscale/"
+        echo "     To remove all data, re-run with: sudo bash uninstall.sh --purge --wolfscale"
+    fi
+fi
+
 # ─── Done ────────────────────────────────────────────────────────────────────
 echo ""
 echo "  🐺 Uninstall Complete!"
@@ -249,9 +431,20 @@ echo "  ────────────────────────
 if [ "$PURGE" != true ]; then
     echo "  Config files preserved — reinstall with setup.sh to restore."
 fi
-if [ "$REMOVE_WOLFNET" != true ] && command -v wolfnet &>/dev/null; then
-    echo "  WolfNet was NOT removed. To remove it:"
-    echo "    sudo bash uninstall.sh --wolfnet"
+if [ "$REMOVE_WOLFNET"   != true ] && command -v wolfnet   &>/dev/null; then
+    echo "  WolfNet was NOT removed. Remove with:   sudo bash uninstall.sh --wolfnet"
+fi
+if [ "$REMOVE_WOLFPROXY" != true ] && systemctl cat wolfproxy &>/dev/null; then
+    echo "  WolfProxy was NOT removed. Remove with: sudo bash uninstall.sh --wolfproxy"
+fi
+if [ "$REMOVE_WOLFSERVE" != true ] && systemctl cat wolfserve &>/dev/null; then
+    echo "  WolfServe was NOT removed. Remove with: sudo bash uninstall.sh --wolfserve"
+fi
+if [ "$REMOVE_WOLFDISK"  != true ] && command -v wolfdisk  &>/dev/null; then
+    echo "  WolfDisk was NOT removed. Remove with:  sudo bash uninstall.sh --wolfdisk"
+fi
+if [ "$REMOVE_WOLFSCALE" != true ] && systemctl cat wolfscale &>/dev/null; then
+    echo "  WolfScale was NOT removed. Remove with: sudo bash uninstall.sh --wolfscale"
 fi
 echo ""
 echo "  Note: System packages installed by setup.sh (git, curl, Docker,"

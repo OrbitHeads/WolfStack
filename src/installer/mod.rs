@@ -69,10 +69,10 @@ impl Component {
     pub fn config_path(&self) -> Option<&'static str> {
         match self {
             Component::WolfNet => Some("/etc/wolfnet/config.toml"),
-            Component::WolfProxy => Some("/etc/wolfproxy/config.toml"),
-            Component::WolfServe => Some("/etc/wolfserve/config.toml"),
+            Component::WolfProxy => Some("/opt/wolfproxy/wolfproxy.toml"),
+            Component::WolfServe => Some("/opt/wolfserve/wolfserve.toml"),
             Component::WolfDisk => Some("/etc/wolfdisk/config.toml"),
-            Component::WolfScale => Some("/etc/wolfscale/config.toml"),
+            Component::WolfScale => Some("/opt/wolfscale/wolfscale.toml"),
             Component::MariaDB => Some(mariadb_config_path()),
             Component::PostgreSQL => Some(postgresql_config_path()),
             Component::Certbot => None,
