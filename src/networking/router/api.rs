@@ -426,20 +426,13 @@ fn self_node_name() -> String {
 
 // ─── Topology ───
 
-/// Optional query filter — when set, the topology only includes nodes
-/// belonging to that cluster. WolfRouter is per-cluster so the UI passes
-/// this on every fetch.
-///
-/// `cluster_id` is the preferred form: a stable sha256-based identifier
-/// that survives cluster renames. `cluster` (the old name-based form) is
-/// still accepted so an older frontend on a partly-upgraded deployment
-/// doesn't regress. When both are present, `cluster_id` wins.
+/// Optional `?cluster=<name>` query filter — when set, the topology
+/// only includes nodes belonging to that cluster. WolfRouter is
+/// per-cluster so the UI passes this on every fetch.
 #[derive(Deserialize)]
 pub struct TopologyQuery {
     #[serde(default)]
     pub cluster: Option<String>,
-    #[serde(default)]
-    pub cluster_id: Option<String>,
 }
 
 pub async fn get_topology(
@@ -452,48 +445,26 @@ pub async fn get_topology(
     let self_id = crate::agent::self_node_id();
     let self_name = self_node_name();
     let cluster_filter = query.cluster.clone();
-    let cluster_id_filter = query.cluster_id.clone();
 
-    // Filter match rule per node:
-    //   1. If the peer reports a cluster_id, match by cluster_id (stable
-    //      across renames — this is the whole reason cluster_id exists).
-    //   2. Else fall back to the legacy cluster_name comparison so peers
-    //      mid-upgrade aren't dropped from the view.
-    //   3. If neither filter is set, everything matches (no scoping).
-    // Normaliser collapses `None` / empty to "WolfStack" to match the
-    // sidebar tree's `n.cluster_name || "WolfStack"` grouping.
+    // Find self's cluster name. If a filter is set and self isn't in
+    // that cluster, omit self from the result and only fan out to peers
+    // in the requested cluster.
+    // Cluster name normaliser — a node with no explicit cluster_name
+    // is grouped as "WolfStack" in the sidebar tree (see app.js
+    // `n.cluster_name || "WolfStack"`). Backend filtering must use
+    // the same alias or nameless nodes leak into named-cluster views.
     let normalize = |n: Option<&str>| -> String {
         match n {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => "WolfStack".into(),
         }
     };
-    let matches_filter = |node_cluster_id: Option<&str>, node_cluster_name: Option<&str>| -> bool {
-        match (&cluster_id_filter, &cluster_filter) {
-            (Some(want_id), _) => {
-                match node_cluster_id {
-                    Some(have_id) => have_id == want_id,
-                    None => {
-                        // Peer hasn't sent cluster_id yet — fall back to
-                        // name if the caller provided one, otherwise reject.
-                        match &cluster_filter {
-                            Some(want_name) => normalize(node_cluster_name) == *want_name,
-                            None => false,
-                        }
-                    }
-                }
-            }
-            (None, Some(want_name)) => normalize(node_cluster_name) == *want_name,
-            (None, None) => true,
-        }
-    };
-
     let self_cluster = state.cluster.get_self_cluster_name();
-    let self_cluster_id = state.cluster.get_self_cluster_id();
-    let include_self = matches_filter(
-        self_cluster_id.as_deref(),
-        if self_cluster.is_empty() { None } else { Some(self_cluster.as_str()) },
-    );
+    let self_cluster_norm = normalize(if self_cluster.is_empty() { None } else { Some(&self_cluster) });
+    let include_self = match &cluster_filter {
+        Some(want) => self_cluster_norm == *want,
+        None => true,
+    };
 
     let mut nodes = Vec::new();
     if include_self {
@@ -532,33 +503,16 @@ pub async fn get_topology(
                 }));
                 continue;
             }
-            // Cluster scoping — prefer cluster_id (stable), fall back to
-            // cluster_name for peers mid-upgrade.
-            if cluster_id_filter.is_some() || cluster_filter.is_some() {
-                let ok = matches_filter(
-                    node.cluster_id.as_deref(),
-                    node.cluster_name.as_deref(),
-                );
-                if !ok {
-                    let reason = if let Some(ref want_id) = cluster_id_filter {
-                        format!(
-                            "cluster_id='{:?}' / cluster_name='{}' doesn't match filter id='{}'",
-                            node.cluster_id,
-                            normalize(node.cluster_name.as_deref()),
-                            want_id
-                        )
-                    } else if let Some(ref want_name) = cluster_filter {
-                        format!(
-                            "cluster_name='{}' doesn't match filter '{}'",
-                            normalize(node.cluster_name.as_deref()), want_name
-                        )
-                    } else {
-                        "no match".to_string()
-                    };
+            // Cluster scoping — strict, but uses the same None→"WolfStack"
+            // alias the sidebar tree uses so nameless nodes show up where
+            // the user expects (the WolfStack group, not every cluster).
+            if let Some(ref want) = cluster_filter {
+                let node_cluster = normalize(node.cluster_name.as_deref());
+                if &node_cluster != want {
                     peer_diagnostics.push(serde_json::json!({
                         "node_id": node.id, "hostname": node.hostname,
                         "result": "skipped",
-                        "reason": reason,
+                        "reason": format!("cluster_name='{}' doesn't match filter '{}'", node_cluster, want)
                     }));
                     continue;
                 }
@@ -696,7 +650,6 @@ pub async fn get_topology(
         "generated_at": generated_at,
         "peer_diagnostics": peer_diagnostics,
         "cluster_filter": cluster_filter,
-        "cluster_id_filter": cluster_id_filter,
     }))
 }
 
@@ -924,7 +877,6 @@ pub async fn preflight(
     // peers (or only remote WolfStack peers that aren't responding).
     let self_id = crate::agent::self_node_id();
     let self_cluster = state.cluster.get_self_cluster_name();
-    let self_cluster_id = state.cluster.get_self_cluster_id();
     let normalize = |n: Option<&str>| -> String {
         match n {
             Some(s) if !s.is_empty() => s.to_string(),
@@ -935,22 +887,6 @@ pub async fn preflight(
         if self_cluster.is_empty() { None } else { Some(&self_cluster) }
     );
     let requested = query.cluster.clone();
-    let requested_id = query.cluster_id.clone();
-    // Same cluster-id-preferred matcher as get_topology — keep the two
-    // in sync so "preflight says OK" and "topology returns nodes" agree.
-    let matches_filter = |node_cluster_id: Option<&str>, node_cluster_name: Option<&str>| -> bool {
-        match (&requested_id, &requested) {
-            (Some(want_id), _) => match node_cluster_id {
-                Some(have_id) => have_id == want_id,
-                None => match &requested {
-                    Some(want_name) => normalize(node_cluster_name) == *want_name,
-                    None => false,
-                },
-            },
-            (None, Some(want_name)) => normalize(node_cluster_name) == *want_name,
-            (None, None) => true,
-        }
-    };
 
     let all_nodes = state.cluster.get_all_nodes();
     let mut wolfstack_in_cluster = 0;
@@ -960,16 +896,20 @@ pub async fn preflight(
     for n in &all_nodes {
         // get_all_nodes() already includes self with is_self=true —
         // iterate everything including self, don't double-count.
-        let in_cluster = if n.is_self || n.id == self_id {
-            // For self, use the canonical cluster_id/cluster_name resolved
-            // above — gossip can leave a stale entry on the map but
-            // get_self_cluster_* are authoritative.
-            matches_filter(
-                self_cluster_id.as_deref(),
-                if self_cluster.is_empty() { None } else { Some(self_cluster.as_str()) },
-            )
-        } else {
-            matches_filter(n.cluster_id.as_deref(), n.cluster_name.as_deref())
+        let node_cluster = normalize(n.cluster_name.as_deref());
+        let in_cluster = match &requested {
+            Some(w) => {
+                // For the self node, use the canonical self_cluster
+                // resolved above (gossip can leave a stale name on the
+                // map entry but ClusterState::get_self_cluster_name is
+                // authoritative).
+                if n.is_self || n.id == self_id {
+                    self_cluster_norm == *w
+                } else {
+                    node_cluster == *w
+                }
+            }
+            None => true,
         };
         if !in_cluster { continue; }
         match n.node_type.as_str() {
@@ -985,9 +925,7 @@ pub async fn preflight(
     }
 
     if wolfstack_in_cluster == 0 {
-        let label = requested.clone()
-            .or_else(|| requested_id.clone())
-            .unwrap_or_else(|| "(all)".into());
+        let label = requested.clone().unwrap_or_else(|| "(all)".into());
         checks.push(PreflightCheck {
             id: "cluster_membership",
             name: "WolfStack nodes in cluster",
@@ -1003,9 +941,7 @@ pub async fn preflight(
             )),
         });
     } else if online_wolfstack == 0 {
-        let label = requested.clone()
-            .or_else(|| requested_id.clone())
-            .unwrap_or_else(|| "(all)".into());
+        let label = requested.clone().unwrap_or_else(|| "(all)".into());
         checks.push(PreflightCheck {
             id: "cluster_online",
             name: "Online WolfStack nodes",
@@ -1033,17 +969,8 @@ pub async fn preflight(
 
     // 5) If the requested cluster differs from self's cluster, surface
     // that as an info hint so the user knows WHY topology looks thin.
-    // Uses the same cluster_id-preferred matcher — a rename would make
-    // the old name-only check falsely report "viewing remote cluster".
-    if requested.is_some() || requested_id.is_some() {
-        let self_in_scope = matches_filter(
-            self_cluster_id.as_deref(),
-            if self_cluster.is_empty() { None } else { Some(self_cluster.as_str()) },
-        );
-        if !self_in_scope {
-            let want_label = requested_id.as_deref()
-                .or(requested.as_deref())
-                .unwrap_or("(unknown)");
+    if let Some(w) = &requested {
+        if &self_cluster_norm != w {
             checks.push(PreflightCheck {
                 id: "cluster_scope",
                 name: "Viewing remote cluster",
@@ -1051,7 +978,7 @@ pub async fn preflight(
                 severity: "info",
                 message: format!(
                     "This node is in `{}`; you're viewing WolfRouter for `{}`. The local chassis will be omitted.",
-                    self_cluster_norm, want_label
+                    self_cluster_norm, w
                 ),
                 fix: None,
             });

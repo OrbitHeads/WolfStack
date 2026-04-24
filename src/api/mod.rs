@@ -1726,115 +1726,6 @@ pub async fn update_node_settings(req: HttpRequest, state: web::Data<AppState>, 
     }
 }
 
-/// POST /api/nodes/{id}/move-to-cluster — move a single node into a
-/// different WolfStack cluster. Takes the TARGET cluster's stable
-/// `cluster_id` and its display `cluster_name`. Unlike the PATCH
-/// /settings endpoint (which, when cluster_name changes, cascades a
-/// rename across every node with the old name), this touches exactly
-/// one node. That's the intent distinction: renaming a cluster keeps
-/// all its members together under a new label; moving a node changes
-/// which cluster it belongs to.
-#[derive(Deserialize)]
-pub struct MoveNodeToClusterRequest {
-    pub cluster_id: String,
-    pub cluster_name: String,
-}
-
-pub async fn move_node_to_cluster(
-    req: HttpRequest,
-    state: web::Data<AppState>,
-    path: web::Path<String>,
-    body: web::Json<MoveNodeToClusterRequest>,
-) -> HttpResponse {
-    if let Err(resp) = require_auth(&req, &state) { return resp; }
-    let id = path.into_inner();
-    if body.cluster_id.trim().is_empty() || body.cluster_name.trim().is_empty() {
-        return HttpResponse::BadRequest().json(serde_json::json!({
-            "error": "cluster_id and cluster_name are both required"
-        }));
-    }
-    let cid = body.cluster_id.trim().to_string();
-    let cname = body.cluster_name.trim().to_string();
-
-    // 1) Update our local view immediately so the admin's sidebar
-    //    reflects the move on the very next fetchNodes — no waiting on
-    //    gossip convergence for UI feedback.
-    let node = state.cluster.get_node(&id);
-    if !state.cluster.move_node_to_cluster(&id, &cid, &cname) {
-        return HttpResponse::NotFound().json(serde_json::json!({ "error": "Node not found" }));
-    }
-
-    // 2) If we're moving a REMOTE WolfStack node, forward the move to
-    //    its own backend. Without this, the remote's self-gossip guard
-    //    (which now refuses to adopt cluster_name from a peer whose
-    //    cluster_id disagrees with ours) would reject our gossip-based
-    //    claim that it's moved, and its next poll would revert our
-    //    local record to the stale data. Having the target write its
-    //    own state closes that loop cleanly.
-    if let Some(node) = node {
-        if !node.is_self && node.node_type == "wolfstack" {
-            let secret = state.cluster_secret.clone();
-            let address = node.address.clone();
-            let port = node.port;
-            let cid2 = cid.clone();
-            let cname2 = cname.clone();
-            tokio::spawn(async move {
-                let client = &*API_HTTP_CLIENT;
-                let urls = build_node_urls(&address, port, "/api/agent/move-self-to-cluster");
-                let payload = serde_json::json!({ "cluster_id": cid2, "cluster_name": cname2 });
-                for url in &urls {
-                    if let Ok(resp) = client.post(url)
-                        .timeout(std::time::Duration::from_secs(5))
-                        .header("X-WolfStack-Secret", &secret)
-                        .json(&payload)
-                        .send()
-                        .await
-                    {
-                        let _ = resp.bytes().await;
-                        break;
-                    }
-                }
-            });
-        }
-    }
-
-    HttpResponse::Ok().json(serde_json::json!({
-        "moved": true,
-        "cluster_id": cid,
-        "cluster_name": cname,
-    }))
-}
-
-/// POST /api/agent/move-self-to-cluster — inter-node call that tells
-/// the receiving node to move ITSELF to a different cluster. Authenticated
-/// via cluster_secret (not session cookie), so only peers with the shared
-/// secret can trigger a move. Used by `move_node_to_cluster` when the
-/// target node is remote — the admin's node updates its own record for
-/// instant UI feedback, then fires this at the target so the target
-/// writes its own canonical state and gossip converges.
-pub async fn agent_move_self_to_cluster(
-    req: HttpRequest,
-    state: web::Data<AppState>,
-    body: web::Json<MoveNodeToClusterRequest>,
-) -> HttpResponse {
-    if let Err(e) = require_cluster_auth(&req, &state) { return e; }
-    if body.cluster_id.trim().is_empty() || body.cluster_name.trim().is_empty() {
-        return HttpResponse::BadRequest().json(serde_json::json!({
-            "error": "cluster_id and cluster_name are both required"
-        }));
-    }
-    let self_id = state.cluster.self_id.clone();
-    if state.cluster.move_node_to_cluster(&self_id, body.cluster_id.trim(), body.cluster_name.trim()) {
-        HttpResponse::Ok().json(serde_json::json!({
-            "moved": true,
-            "cluster_id": body.cluster_id,
-            "cluster_name": body.cluster_name,
-        }))
-    } else {
-        HttpResponse::InternalServerError().json(serde_json::json!({ "error": "Move failed" }))
-    }
-}
-
 /// POST /api/agent/cluster-name — accept cluster name update from admin node
 pub async fn agent_set_cluster_name(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     if let Err(e) = require_cluster_auth(&req, &state) { return e; }
@@ -3073,7 +2964,6 @@ pub async fn agent_status(req: HttpRequest, state: web::Data<AppState>) -> HttpR
         license_key: if crate::compat::platform_ready() {
             std::fs::read_to_string(crate::compat::dm_path()).ok().map(|s| s.trim().to_string())
         } else { None },
-        cluster_id: state.cluster.get_self_cluster_id(),
     };
     HttpResponse::Ok().json(msg)
 }
@@ -5194,7 +5084,6 @@ async fn lxc_remote_clone(
                     pve_node_name: None,
                     pve_cluster_name: None,
                     cluster_name: None,
-                    cluster_id: None,
                     join_verified: false,
                     has_docker: false,
                     has_lxc: false,
@@ -20037,8 +19926,6 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/nodes/{id}", web::get().to(get_node))
         .route("/api/nodes/{id}", web::delete().to(remove_node))
         .route("/api/nodes/{id}/settings", web::patch().to(update_node_settings))
-        .route("/api/nodes/{id}/move-to-cluster", web::post().to(move_node_to_cluster))
-        .route("/api/agent/move-self-to-cluster", web::post().to(agent_move_self_to_cluster))
         // Proxmox integration
         .route("/api/nodes/{id}/pve/resources", web::get().to(get_pve_resources))
         .route("/api/nodes/{id}/pve/test", web::post().to(pve_test_connection))

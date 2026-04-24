@@ -70,8 +70,7 @@
     let wrState = {
         view: 'rack',          // 'rack' | 'table'
         activeTab: 'firewall', // firewall | lans | leases | zones | connections | logs
-        cluster: null,         // active cluster display name — used for labels
-        clusterId: null,       // active cluster id (stable across renames) — used for backend filter
+        cluster: null,         // active cluster name — scopes every fetch
         topology: null,
         rules: [],
         lans: [],
@@ -83,16 +82,11 @@
     };
 
     // Builds an /api/router/* URL with the active cluster as a query
-    // parameter. Sends both cluster_id (preferred, stable across renames)
-    // and cluster (legacy fallback so older backends still filter
-    // correctly during rollout).
+    // parameter. Backend uses it to filter nodes by cluster_name.
     function wrUrl(path) {
-        if (!wrState.cluster && !wrState.clusterId) return path;
-        const params = [];
-        if (wrState.clusterId) params.push('cluster_id=' + encodeURIComponent(wrState.clusterId));
-        if (wrState.cluster)   params.push('cluster='    + encodeURIComponent(wrState.cluster));
+        if (!wrState.cluster) return path;
         const sep = path.includes('?') ? '&' : '?';
-        return path + sep + params.join('&');
+        return path + sep + 'cluster=' + encodeURIComponent(wrState.cluster);
     }
 
     // Expose hooks the HTML and app.js call directly.
@@ -133,15 +127,11 @@
     // ─── Data loading ───
 
     // Entry point used by the cluster-scoped sidebar item. Sets the
-    // active cluster (id + display name), switches the page, then loads.
-    // clusterId may be empty on legacy deployments where no peer has
-    // upgraded yet — in that case the backend falls back to cluster-name
-    // matching via the `cluster` query parameter.
-    async function showWolfRouterForCluster(clusterName, clusterId) {
+    // active cluster, switches the page, then loads.
+    async function showWolfRouterForCluster(clusterName) {
         if (typeof closeSidebarMobile === 'function') closeSidebarMobile();
         const previousCluster = wrState.cluster;
         wrState.cluster = clusterName;
-        wrState.clusterId = clusterId || null;
         if (typeof currentPage !== 'undefined') window.currentPage = 'wolfrouter-cluster';
         if (typeof currentNodeId !== 'undefined') window.currentNodeId = null;
 

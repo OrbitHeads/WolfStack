@@ -577,7 +577,6 @@ async fn main() -> std::io::Result<()> {
                     license_key: if crate::compat::platform_ready() {
                         std::fs::read_to_string(crate::compat::dm_path()).ok().map(|s| s.trim().to_string())
                     } else { None },
-                    cluster_id: cluster_clone.get_self_cluster_id(),
                 };
                 if let Ok(json) = serde_json::to_value(&msg) {
                     if let Ok(mut cache) = cached_status_bg.write() {

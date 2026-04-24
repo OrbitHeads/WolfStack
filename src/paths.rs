@@ -43,8 +43,6 @@ pub struct FileLocations {
     pub deleted_nodes_config: String,
     #[serde(default = "default_self_cluster_config")]
     pub self_cluster_config: String,
-    #[serde(default = "default_self_cluster_id_config")]
-    pub self_cluster_id_config: String,
     #[serde(default = "default_node_id_file")]
     pub node_id_file: String,
 
@@ -171,7 +169,6 @@ fn default_s3_cache_dir() -> String { "/var/cache/wolfstack/s3".into() }
 fn default_nodes_config() -> String { "/etc/wolfstack/nodes.json".into() }
 fn default_deleted_nodes_config() -> String { "/etc/wolfstack/deleted_nodes.json".into() }
 fn default_self_cluster_config() -> String { "/etc/wolfstack/self_cluster.json".into() }
-fn default_self_cluster_id_config() -> String { "/etc/wolfstack/self_cluster_id.json".into() }
 fn default_node_id_file() -> String { "/etc/wolfstack/node_id".into() }
 
 fn default_alerts_config() -> String { "/etc/wolfstack/alerts.json".into() }

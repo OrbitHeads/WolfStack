@@ -75,14 +75,7 @@ pub struct Node {
     #[serde(default)]
     pub pve_cluster_name: Option<String>, // User-friendly cluster name for sidebar grouping
     #[serde(default)]
-    pub cluster_name: Option<String>,     // Display label — user-editable, safe to rename
-    /// Stable cluster identifier — sha256 hex of the cluster_name at first
-    /// bootstrap, then frozen. Survives renames; used for filtering features
-    /// that must live-match nodes against a chosen cluster (e.g. WolfRouter
-    /// topology). `None` on older nodes that haven't upgraded yet —
-    /// consumers fall back to matching on cluster_name.
-    #[serde(default)]
-    pub cluster_id: Option<String>,
+    pub cluster_name: Option<String>,     // Generic cluster name for WolfStack nodes
     #[serde(default)]
     pub join_verified: bool,              // Whether this node was added with a valid join token
     #[serde(default)]
@@ -132,7 +125,6 @@ impl ClusterState {
     fn nodes_file() -> String { crate::paths::get().nodes_config }
     fn deleted_file() -> String { crate::paths::get().deleted_nodes_config }
     fn self_cluster_file() -> String { crate::paths::get().self_cluster_config }
-    fn self_cluster_id_file() -> String { crate::paths::get().self_cluster_id_config }
     const SELF_LOGIN_DISABLED_FILE: &'static str = "/etc/wolfstack/login_disabled";
 
     pub fn new(self_id: String, self_address: String, port: u16) -> Self {
@@ -251,39 +243,6 @@ impl ClusterState {
             .or_else(|| Self::load_self_cluster_name())
             .or_else(|| Some("WolfStack".to_string()));
 
-        // Resolve cluster_id. Priority:
-        //   1. Already set in memory (normal steady state).
-        //   2. Persisted on disk from a previous boot.
-        //   3. Any online peer in the same cluster_name has one — adopt it.
-        //      This handles "peer upgraded first, we upgrade second" so the
-        //      cluster converges on the peer's ID instead of generating a
-        //      fresh hash of a possibly-renamed cluster_name.
-        //   4. Fallback: sha256(cluster_name). Deterministic — every node
-        //      upgrading from the old version without peers present will
-        //      arrive at the same ID for the same name, no coordination.
-        // Once chosen, persist so subsequent boots skip straight to step 2.
-        let cluster_id: Option<String> = {
-            let existing = nodes.get(&self.self_id).and_then(|n| n.cluster_id.clone());
-            if existing.is_some() {
-                existing
-            } else if let Some(persisted) = Self::load_self_cluster_id() {
-                Some(persisted)
-            } else {
-                let want_name = cluster_name.as_deref().unwrap_or("WolfStack");
-                let peer_id = nodes.values().find_map(|n| {
-                    if n.is_self || n.id == self.self_id { return None; }
-                    if n.node_type != "wolfstack" { return None; }
-                    if !n.online { return None; }
-                    let n_name = n.cluster_name.as_deref().unwrap_or("WolfStack");
-                    if n_name != want_name { return None; }
-                    n.cluster_id.clone()
-                });
-                let chosen = peer_id.unwrap_or_else(|| Self::compute_cluster_id(want_name));
-                Self::save_self_cluster_id(&chosen);
-                Some(chosen)
-            }
-        };
-
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let prev_login_disabled = nodes.get(&self.self_id).map(|n| n.login_disabled);
         let prev_update_script = nodes.get(&self.self_id).and_then(|n| n.update_script.clone());
@@ -308,7 +267,6 @@ impl ClusterState {
 
             pve_cluster_name: None,
             cluster_name,
-            cluster_id,
             join_verified: true, // self is always verified
             has_docker,
             has_lxc,
@@ -434,12 +392,6 @@ impl ClusterState {
             pve_node_name,
             pve_cluster_name,
             cluster_name,
-            // cluster_id is populated on first successful poll when the peer
-            // reports it. Leaving None here means filter code that matches by
-            // cluster_id falls back to cluster_name — exactly the behaviour
-            // older nodes (which never send a cluster_id) get, so this path
-            // costs nothing.
-            cluster_id: None,
             join_verified: false, // will be set true by add_node after token validation
             has_docker: false,
             has_lxc: false,
@@ -581,31 +533,6 @@ impl ClusterState {
         }
     }
 
-    /// Move a single node to a different cluster. Unlike
-    /// `update_node_settings` with a new `cluster_name` — which is treated
-    /// as a cluster-wide RENAME by the caller — this writes a new
-    /// `cluster_id` + `cluster_name` pair onto this node alone. Used by
-    /// the "Move to cluster" UI. Persists the new id to disk when the
-    /// node being moved is self so the change survives a restart.
-    pub fn move_node_to_cluster(&self, id: &str, new_cluster_id: &str, new_cluster_name: &str) -> bool {
-        let is_self = {
-            let mut nodes = self.nodes.write().unwrap();
-            let Some(node) = nodes.get_mut(id) else { return false; };
-            node.cluster_id = Some(new_cluster_id.to_string());
-            node.cluster_name = Some(new_cluster_name.to_string());
-            if node.node_type == "proxmox" {
-                node.pve_cluster_name = Some(new_cluster_name.to_string());
-            }
-            node.is_self
-        };
-        self.save_nodes();
-        if is_self {
-            Self::save_self_cluster_id(new_cluster_id);
-            Self::save_self_cluster_name(new_cluster_name);
-        }
-        true
-    }
-
     /// Load persisted self cluster_name from disk
     fn load_self_cluster_name() -> Option<String> {
         if let Ok(data) = std::fs::read_to_string(&Self::self_cluster_file()) {
@@ -629,52 +556,6 @@ impl ClusterState {
                 warn!("Failed to save self cluster name: {}", e);
             }
         }
-    }
-
-    /// Compute a deterministic cluster_id from a cluster name. Full sha256
-    /// hex (64 chars) so every node in an existing cluster converges on
-    /// the same ID on first upgrade with zero coordination — no UUID race.
-    /// Once persisted, the ID is frozen; renaming cluster_name does NOT
-    /// recompute it, which is the whole point.
-    pub fn compute_cluster_id(cluster_name: &str) -> String {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(cluster_name.as_bytes());
-        let digest = hasher.finalize();
-        hex::encode(digest)
-    }
-
-    /// Load persisted self cluster_id from disk
-    fn load_self_cluster_id() -> Option<String> {
-        if let Ok(data) = std::fs::read_to_string(&Self::self_cluster_id_file()) {
-            if let Ok(id) = serde_json::from_str::<String>(&data) {
-                if !id.is_empty() {
-                    return Some(id);
-                }
-            }
-        }
-        None
-    }
-
-    /// Persist self cluster_id to disk (survives reinstalls, frozen for life)
-    pub fn save_self_cluster_id(id: &str) {
-        let path = Self::self_cluster_id_file();
-        if let Some(dir) = std::path::Path::new(&path).parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Ok(json) = serde_json::to_string(id) {
-            if let Err(e) = std::fs::write(&path, json) {
-                warn!("Failed to save self cluster id: {}", e);
-            }
-        }
-    }
-
-    /// Get this node's cluster_id. Returns None if bootstrap hasn't run
-    /// yet (first poll cycle) — callers should fall back to cluster_name
-    /// comparison in that window.
-    pub fn get_self_cluster_id(&self) -> Option<String> {
-        let nodes = self.nodes.read().unwrap();
-        nodes.get(&self.self_id).and_then(|n| n.cluster_id.clone())
     }
 
     /// Load persisted login_disabled for self node
@@ -733,12 +614,6 @@ pub enum AgentMessage {
         /// Enterprise license key — propagated to cluster nodes that don't have one
         #[serde(default)]
         license_key: Option<String>,
-        /// The sending node's stable cluster identifier. `None` from peers
-        /// that haven't upgraded yet; consumers fall back to cluster_name
-        /// matching in that case. `#[serde(default)]` keeps the wire format
-        /// backward compatible both ways.
-        #[serde(default)]
-        cluster_id: Option<String>,
     },
     /// "Give me your status"
     StatusRequest,
@@ -840,11 +715,6 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                         pve_node_name: node.pve_node_name.clone(),
                         pve_cluster_name: final_cluster_name.clone(),
                         cluster_name: final_cluster_name,
-                        // Proxmox peers aren't in a WolfStack cluster — they
-                        // live in a PVE cluster, which has its own identity.
-                        // Leave cluster_id None; nothing live-filters PVE
-                        // nodes by WolfStack cluster_id.
-                        cluster_id: None,
                         join_verified: node.join_verified,
                         has_docker: true,  // Proxmox always has container/VM support
                         has_lxc: true,
@@ -916,7 +786,7 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
             {
                 Ok(resp) => {
                     if let Ok(msg) = resp.json::<AgentMessage>().await {
-                        if let AgentMessage::StatusReport { node_id: peer_self_id, hostname, metrics, components, docker_count, lxc_count, vm_count, public_ip, known_nodes, deleted_ids, wolfnet_ips, has_docker, has_lxc, has_kvm, license_key, cluster_id: peer_cluster_id } = msg {
+                        if let AgentMessage::StatusReport { node_id: peer_self_id, hostname, metrics, components, docker_count, lxc_count, vm_count, public_ip, known_nodes, deleted_ids, wolfnet_ips, has_docker, has_lxc, has_kvm, license_key } = msg {
                             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                             // Detect TLS: HTTP on port+1 means TLS is on the main port,
                             // HTTPS on main port also means TLS. Only plain HTTP on the
@@ -942,12 +812,6 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                                 pve_node_name: None,
                                 pve_cluster_name: None,
                                 cluster_name: node.cluster_name.clone(),
-                                // Capture the peer's cluster_id from its
-                                // status report. If the peer is on an older
-                                // version it sends None; preserve whatever
-                                // we already had (from an earlier successful
-                                // poll) rather than wiping it.
-                                cluster_id: peer_cluster_id.clone().or_else(|| node.cluster_id.clone()),
                                 join_verified: node.join_verified,
                                 has_docker,
                                 has_lxc,
@@ -1003,70 +867,20 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                                 .unwrap_or_default();
                             for known in known_nodes {
                                 if known.id == cluster.self_id {
-                                    // Snapshot our current self-record once so the
-                                    // cluster_name and cluster_id gossip branches agree
-                                    // on what "local state" means.
-                                    let (current_name, current_id) = {
-                                        let nodes_r = cluster.nodes.read().unwrap();
-                                        let n = nodes_r.get(&cluster.self_id);
-                                        (
-                                            n.and_then(|x| x.cluster_name.clone()),
-                                            n.and_then(|x| x.cluster_id.clone()),
-                                        )
-                                    };
+                                    // Accept cluster_name updates from gossip (admin may have changed it on another node)
+                                    if let Some(ref gossiped_cluster) = known.cluster_name {
+                                        let current_cluster = {
+                                            let nodes_r = cluster.nodes.read().unwrap();
+                                            nodes_r.get(&cluster.self_id).and_then(|n| n.cluster_name.clone())
+                                        };
+                                        if current_cluster.as_deref() != Some(gossiped_cluster) {
 
-                                    // Block cluster_name adoption when our cluster_id
-                                    // and the peer's cluster_id disagree — the peer is
-                                    // looking at a stale snapshot of us (e.g. we just
-                                    // moved to a different cluster via the Move UI but
-                                    // the peer hasn't re-polled yet). Without this
-                                    // guard, the stale gossip would silently revert our
-                                    // move on the next poll cycle. If either side lacks
-                                    // a cluster_id (mid-rollout / pre-upgrade peer),
-                                    // fall through to the original adoption behaviour.
-                                    let name_gossip_trusted = match (&current_id, &known.cluster_id) {
-                                        (Some(a), Some(b)) => a == b,
-                                        _ => true,
-                                    };
-                                    if name_gossip_trusted {
-                                        if let Some(ref gossiped_cluster) = known.cluster_name {
-                                            if current_name.as_deref() != Some(gossiped_cluster.as_str()) {
-
-                                                let mut nodes_w = cluster.nodes.write().unwrap();
-                                                if let Some(n) = nodes_w.get_mut(&cluster.self_id) {
-                                                    n.cluster_name = Some(gossiped_cluster.clone());
-                                                }
-                                                drop(nodes_w);
-                                                ClusterState::save_self_cluster_name(gossiped_cluster);
+                                            let mut nodes_w = cluster.nodes.write().unwrap();
+                                            if let Some(n) = nodes_w.get_mut(&cluster.self_id) {
+                                                n.cluster_name = Some(gossiped_cluster.clone());
                                             }
-                                        }
-                                    }
-
-                                    // Adopt cluster_id from gossip only when we don't have
-                                    // one yet — this is the "peer upgraded first, we
-                                    // upgrade second" migration path. Once we have an ID
-                                    // it's frozen; if gossip reports a DIFFERENT id, that
-                                    // means an admin has manually forked the cluster or a
-                                    // peer has a stale record, and we log a warning rather
-                                    // than silently following.
-                                    if let Some(ref gossiped_id) = known.cluster_id {
-                                        match current_id.as_deref() {
-                                            None => {
-                                                let mut nodes_w = cluster.nodes.write().unwrap();
-                                                if let Some(n) = nodes_w.get_mut(&cluster.self_id) {
-                                                    n.cluster_id = Some(gossiped_id.clone());
-                                                }
-                                                drop(nodes_w);
-                                                ClusterState::save_self_cluster_id(gossiped_id);
-                                                tracing::info!("Adopted cluster_id from peer gossip: {}", gossiped_id);
-                                            }
-                                            Some(existing) if existing != gossiped_id => {
-                                                tracing::warn!(
-                                                    "cluster_id mismatch with peer — keeping local '{}', peer says '{}'. Possible cluster fork or stale peer; investigate.",
-                                                    existing, gossiped_id
-                                                );
-                                            }
-                                            Some(_) => {} // match — nothing to do
+                                            drop(nodes_w);
+                                            ClusterState::save_self_cluster_name(gossiped_cluster);
                                         }
                                     }
                                     continue;
@@ -1092,7 +906,6 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                                         || existing.pve_token != known.pve_token
                                         || existing.pve_fingerprint != known.pve_fingerprint
                                         || existing.cluster_name != known.cluster_name
-                                        || existing.cluster_id != known.cluster_id
                                     {
 
 
@@ -1111,17 +924,6 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                                             None,  // don't propagate login_disabled via gossip
                                             None,  // don't propagate update_script via gossip
                                         );
-                                        // Propagate cluster_id alongside cluster_name.
-                                        // update_node_settings doesn't take it (keeps
-                                        // backward compat for callers), so set it
-                                        // directly. Once set, subsequent gossip with the
-                                        // same id is a no-op via the == check above.
-                                        if known.cluster_id.is_some() {
-                                            let mut nodes_w = cluster.nodes.write().unwrap();
-                                            if let Some(n) = nodes_w.get_mut(&known.id) {
-                                                n.cluster_id = known.cluster_id.clone();
-                                            }
-                                        }
                                     }
                                 } else {
                                     // Check by address+port or hostname+port to prevent ghost duplicates
