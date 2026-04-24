@@ -1446,22 +1446,46 @@ function buildServerTree(nodes) {
     let html = '';
 
     // 2. Render WolfStack Clusters
+    //
+    // Grouping key = cluster_id when the node has one, falling back to
+    // cluster_name. This is deliberate: the cluster_id is stable across
+    // renames, so if an admin renames a cluster mid-rollout the group
+    // stays together instead of splitting in two. Legacy nodes that
+    // haven't upgraded yet still group by cluster_name under the same
+    // key-space because they lack a cluster_id.
+    //
+    // Each group carries a display label (cluster_name) and the
+    // cluster_id (if known) so WolfRouter can filter by the stable id.
     const wsClusters = {};
     wsNodes.forEach(n => {
-        const key = n.cluster_name || "WolfStack";
-        if (!wsClusters[key]) wsClusters[key] = [];
-        wsClusters[key].push(n);
+        const name = n.cluster_name || "WolfStack";
+        const key = n.cluster_id || name;
+        if (!wsClusters[key]) {
+            wsClusters[key] = { displayName: name, clusterId: n.cluster_id || null, nodes: [] };
+        }
+        wsClusters[key].nodes.push(n);
+        // If any node in this group has a cluster_id, remember it — even
+        // if earlier nodes in the iteration didn't report one yet.
+        if (!wsClusters[key].clusterId && n.cluster_id) {
+            wsClusters[key].clusterId = n.cluster_id;
+        }
     });
 
-    // Sort WolfStack clusters: "WolfStack" first, then alphabetical
+    // Sort WolfStack clusters: "WolfStack" first, then alphabetical by display name
     const wsKeys = Object.keys(wsClusters).sort((a, b) => {
-        if (a === 'WolfStack') return -1;
-        if (b === 'WolfStack') return 1;
-        return a.localeCompare(b);
+        const an = wsClusters[a].displayName;
+        const bn = wsClusters[b].displayName;
+        if (an === 'WolfStack') return -1;
+        if (bn === 'WolfStack') return 1;
+        return an.localeCompare(bn);
     });
 
-    wsKeys.forEach(clusterName => {
-        const clusterNodes = wsClusters[clusterName];
+    wsKeys.forEach(groupKey => {
+        const group = wsClusters[groupKey];
+        const clusterName = group.displayName;
+        const clusterNodes = group.nodes;
+        const wsClusterId = group.clusterId || '';
+        const escapedClusterId = wsClusterId.replace(/'/g, "\\'");
         const clusterId = 'cluster-' + clusterName.replace(/[^a-z0-9]/gi, '-');
         const shouldExpandCluster = isFirstBuild ? true : (expandedNodes.has(clusterId) || clusterNodes.some(n => n.id === currentNodeId || expandedNodes.has(n.id)));
         const anyOnline = clusterNodes.some(n => n.online);
@@ -1495,7 +1519,7 @@ function buildServerTree(nodes) {
                 <a class="nav-item server-child-item wolfdisk-cluster-item" data-cluster="${escapedName}" data-view="wolfdisk-cluster" onclick="showWolfDiskPage('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
                     <span class="icon" style="font-size:15px;">🐺</span> <span style="font-weight:600;">WolfDisk</span>
                 </a>
-                <a class="nav-item server-child-item wolfrouter-cluster-item" data-cluster="${escapedName}" data-view="wolfrouter-cluster" onclick="showWolfRouterForCluster('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
+                <a class="nav-item server-child-item wolfrouter-cluster-item" data-cluster="${escapedName}" data-cluster-id="${escapedClusterId}" data-view="wolfrouter-cluster" onclick="showWolfRouterForCluster('${escapedName}', '${escapedClusterId}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
                     <span class="icon" style="font-size:15px;">🧩</span> <span style="font-weight:600;">WolfRouter</span>
                 </a>`;
 
@@ -7034,11 +7058,11 @@ async function addServer() {
         if (pveFingerprint) payload.pve_fingerprint = pveFingerprint;
         if (pveClusterName) payload.pve_cluster_name = pveClusterName;
     } else {
-        // Standard WolfStack node
-        var wsClusterName = (document.getElementById('new-server-cluster-name') || {}).value.trim();
+        // Standard WolfStack node — cluster_name left empty means "no group
+        // override"; the backend will hash whatever gossip converges on,
+        // so the new node joins the existing cluster without the user
+        // having to re-type its name.
         var joinToken = (document.getElementById('new-server-join-token') || {}).value.trim();
-        // Default to "WolfStack" if empty, as requested
-        payload.cluster_name = wsClusterName || "WolfStack";
         if (!joinToken) {
             showToast('Join token is required. Get it from the remote server.', 'error');
             return;
@@ -7089,6 +7113,12 @@ function updateServerForm() {
     var portLabel = document.getElementById('new-server-port-label');
     var portInput = document.getElementById('new-server-port');
 
+    // The "own join token" panel belongs to this server regardless of
+    // which node type you're adding — an admin may copy it to paste
+    // into another dashboard later. Keep it always visible.
+    var ownTokenDisplay = document.getElementById('ws-own-token-display');
+    if (ownTokenDisplay) ownTokenDisplay.style.display = 'block';
+
     if (sel === 'proxmox') {
         if (pveFields) pveFields.style.display = 'block';
         if (wsClusterField) wsClusterField.style.display = 'none';
@@ -7096,9 +7126,7 @@ function updateServerForm() {
         if (portLabel) portLabel.textContent = 'Port (default: 8006)';
         if (portInput) portInput.value = '8006';
         var joinField = document.getElementById('ws-join-token-field');
-        var ownTokenDisplay = document.getElementById('ws-own-token-display');
         if (joinField) joinField.style.display = 'none';
-        if (ownTokenDisplay) ownTokenDisplay.style.display = 'none';
     } else {
         if (pveFields) pveFields.style.display = 'none';
         if (wsClusterField) wsClusterField.style.display = 'block';
@@ -7106,9 +7134,7 @@ function updateServerForm() {
         if (portLabel) portLabel.textContent = 'Port (default: 8553)';
         if (portInput) portInput.value = '8553';
         var joinField = document.getElementById('ws-join-token-field');
-        var ownTokenDisplay = document.getElementById('ws-own-token-display');
         if (joinField) joinField.style.display = 'block';
-        if (ownTokenDisplay) ownTokenDisplay.style.display = 'block';
     }
 }
 
@@ -7817,6 +7843,7 @@ function openNodeSettings(nodeId) {
     if (existing) existing.remove();
 
     const clusterName = node.cluster_name || 'WolfStack';
+    const clusterIdShort = node.cluster_id ? node.cluster_id.slice(0, 12) + '…' : 'not yet assigned';
     const isPve = node.node_type === 'proxmox';
     const isSelf = node.is_self;
 
@@ -7867,9 +7894,18 @@ function openNodeSettings(nodeId) {
 
                 <hr style="border-color:var(--border);margin:16px 0;">
                 <div class="form-group">
-                    <label>Cluster Name</label>
-                    <input type="text" class="form-control" id="node-settings-cluster-name" value="${clusterName}">
-                    <small style="color: var(--text-muted);">Change to move this node to a different cluster group</small>
+                    <label>Cluster</label>
+                    <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+                        <span id="node-settings-cluster-display" style="font-weight:600; font-size:14px;">${clusterName}</span>
+                        <button type="button" class="btn btn-sm" onclick="openMoveNodeClusterPicker('${nodeId}')"
+                            style="background:var(--bg-tertiary); border:1px solid var(--border); padding:4px 10px; font-size:12px;">
+                            ↪ Move to different cluster…
+                        </button>
+                    </div>
+                    <small style="color: var(--text-muted); font-family:'JetBrains Mono',monospace; font-size:11px;">cluster_id: ${clusterIdShort}</small><br>
+                    <small style="color: var(--text-muted);">
+                        To rename the whole cluster instead, use the ⚙ next to the cluster in the sidebar.
+                    </small>
                 </div>
                 <div class="form-group">
                     <label>Update Script</label>
@@ -8151,15 +8187,167 @@ async function upgradeNode(nodeId) {
     if (modal) modal.remove();
 }
 
+// ─── Move Node to Cluster — picker modal ───
+//
+// Renaming a cluster keeps every member together under a new label;
+// MOVING a single node into a different cluster changes which group it
+// belongs to. The picker forces the admin to choose an existing cluster
+// (or explicitly create a new one) so we always write a known
+// cluster_id — no free-text mismatches, no filter-by-name surprises.
+function openMoveNodeClusterPicker(nodeId) {
+    const node = allNodes.find(n => n.id === nodeId);
+    if (!node) return;
+
+    // Build a deduped list of existing WolfStack clusters from the
+    // node list. Key by cluster_id when available, falling back to
+    // cluster_name so legacy (not-yet-upgraded) clusters still show.
+    const wsNodes = (allNodes || []).filter(n => n.node_type !== 'proxmox');
+    const clusters = {};
+    wsNodes.forEach(n => {
+        const name = n.cluster_name || 'WolfStack';
+        const key = n.cluster_id || name;
+        if (!clusters[key]) {
+            clusters[key] = { id: n.cluster_id || '', name, count: 0 };
+        }
+        clusters[key].count++;
+        if (!clusters[key].id && n.cluster_id) clusters[key].id = n.cluster_id;
+    });
+    const clusterList = Object.values(clusters).sort((a, b) => a.name.localeCompare(b.name));
+
+    const currentKey = node.cluster_id || (node.cluster_name || 'WolfStack');
+
+    let existing = document.getElementById('move-node-cluster-modal');
+    if (existing) existing.remove();
+
+    const rows = clusterList.map((c, idx) => {
+        const isCurrent = (c.id || c.name) === currentKey;
+        const disabled = isCurrent ? 'disabled' : '';
+        const marker = isCurrent ? '<span style="color:var(--text-muted); font-size:11px; margin-left:6px;">(current)</span>' : '';
+        const idHint = c.id ? c.id.slice(0, 12) + '…' : 'legacy — will hash on first upgrade';
+        // Index-based dispatch: keeps hostile cluster names (quotes,
+        // angle brackets, script content) from breaking the onclick
+        // attribute. The picker modal stashes the list on itself; the
+        // button just says "item N".
+        return `
+            <button type="button" class="btn" data-move-cluster-idx="${idx}" ${disabled}
+                style="width:100%; text-align:left; padding:10px 12px; margin-bottom:6px; background:var(--bg-tertiary); border:1px solid var(--border); ${isCurrent ? 'opacity:0.5; cursor:not-allowed;' : ''}">
+                <div style="font-weight:600; font-size:13px;">${escapeHtml(c.name)}${marker}</div>
+                <div style="font-size:11px; color:var(--text-muted); font-family:'JetBrains Mono',monospace;">${c.count} node${c.count === 1 ? '' : 's'} · ${idHint}</div>
+            </button>`;
+    }).join('');
+
+    const modal = document.createElement('div');
+    modal.id = 'move-node-cluster-modal';
+    modal.className = 'modal-overlay active';
+    modal.innerHTML = `
+        <div class="modal" style="max-width:520px;">
+            <div class="modal-header">
+                <h3>↪ Move <strong>${escapeHtml(node.hostname)}</strong> to cluster</h3>
+                <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">×</button>
+            </div>
+            <div class="modal-body">
+                <p style="color:var(--text-muted); font-size:12px; margin-bottom:12px;">
+                    Pick an existing cluster, or create a new one. The node will adopt
+                    the chosen cluster's stable identifier immediately.
+                </p>
+                <div id="move-node-cluster-list" style="margin-bottom:16px;">${rows || '<div style="color:var(--text-muted); text-align:center; padding:12px;">No other WolfStack clusters yet.</div>'}</div>
+                <hr style="border-color:var(--border); margin:16px 0;">
+                <div style="font-weight:600; font-size:13px; margin-bottom:6px;">Create a new cluster</div>
+                <div style="display:flex; gap:8px;">
+                    <input type="text" class="form-control" id="move-node-new-cluster-name"
+                        placeholder="New cluster name" style="flex:1;">
+                    <button type="button" class="btn btn-primary" id="move-node-create-btn">Create & Move</button>
+                </div>
+                <small style="color:var(--text-muted); font-size:11px;">A fresh cluster_id will be derived from the name.</small>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+            </div>
+        </div>`;
+    // Stash the list on the modal element so index-dispatch can look up
+    // the real (unescaped) id/name values without round-tripping through
+    // HTML attributes.
+    modal._clusterList = clusterList;
+    modal._nodeId = nodeId;
+    document.body.appendChild(modal);
+
+    modal.querySelectorAll('[data-move-cluster-idx]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            if (btn.disabled) return;
+            const idx = parseInt(btn.dataset.moveClusterIdx, 10);
+            const c = modal._clusterList[idx];
+            if (!c) return;
+            confirmMoveNodeToCluster(nodeId, c.id, c.name);
+        });
+    });
+    modal.querySelector('#move-node-create-btn')?.addEventListener('click', () => {
+        createAndMoveNodeToCluster(nodeId);
+    });
+}
+
+async function confirmMoveNodeToCluster(nodeId, targetClusterId, targetClusterName) {
+    if (!targetClusterName) {
+        showToast('Target cluster missing a name', 'error');
+        return;
+    }
+    // Legacy cluster with no cluster_id yet (peer hasn't upgraded) —
+    // derive one from the name so the move isn't blocked. All peers
+    // converge on the same hash deterministically, so this matches what
+    // they'll compute on their own upgrade.
+    if (!targetClusterId) {
+        targetClusterId = await sha256Hex(targetClusterName);
+    }
+    try {
+        const resp = await fetch(`/api/nodes/${nodeId}/move-to-cluster`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cluster_id: targetClusterId, cluster_name: targetClusterName })
+        });
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            showToast(err.error || 'Failed to move node', 'error');
+            return;
+        }
+        showToast(`Moved to cluster "${targetClusterName}"`, 'success');
+        document.getElementById('move-node-cluster-modal')?.remove();
+        document.getElementById('node-settings-modal')?.remove();
+        fetchNodes();
+    } catch (e) {
+        showToast('Failed to move: ' + e.message, 'error');
+    }
+}
+
+async function createAndMoveNodeToCluster(nodeId) {
+    const input = document.getElementById('move-node-new-cluster-name');
+    const name = input?.value.trim();
+    if (!name) {
+        showToast('Enter a cluster name', 'error');
+        return;
+    }
+    const id = await sha256Hex(name);
+    await confirmMoveNodeToCluster(nodeId, id, name);
+}
+
+// Compute sha256 hex of a string — browser-native via SubtleCrypto. Matches
+// the backend's compute_cluster_id() so both sides agree on the id for the
+// same cluster name.
+async function sha256Hex(input) {
+    const enc = new TextEncoder().encode(input);
+    const buf = await crypto.subtle.digest('SHA-256', enc);
+    const arr = Array.from(new Uint8Array(buf));
+    return arr.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
 async function saveNodeSettings() {
     const modal = document.getElementById('node-settings-modal');
     if (!modal) return;
     const nodeId = modal._nodeId;
-    const originalName = modal._originalClusterName || '';
-    const newName = document.getElementById('node-settings-cluster-name')?.value.trim();
-
+    // Cluster membership is no longer edited inline here — it has its
+    // own "Move to different cluster" flow (openMoveNodeClusterPicker)
+    // which hits the /move-to-cluster endpoint and writes both
+    // cluster_id and cluster_name atomically. Whole-cluster rename is
+    // in the sidebar ⚙ (openWsClusterSettings).
     const updates = {};
-    if (newName && newName !== originalName) updates.cluster_name = newName;
 
     // Hostname, address, port (only present for non-self nodes)
     const hostnameEl = document.getElementById('node-settings-hostname');

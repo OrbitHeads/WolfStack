@@ -775,6 +775,7 @@ async fn vm_migrate(
                     pve_node_name: None,
                     pve_cluster_name: None,
                     cluster_name: None,
+                    cluster_id: None,
                     join_verified: false,
                     has_docker: false,
                     has_lxc: false,
