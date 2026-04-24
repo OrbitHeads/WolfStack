@@ -9802,11 +9802,15 @@ fn sanitize_file_path(path: &str) -> Result<std::path::PathBuf, String> {
 /// Check if a path is sensitive and should not be accessible via the file manager
 fn is_sensitive_path(path: &std::path::Path) -> bool {
     let s = path.to_string_lossy();
-    s.starts_with("/etc/wolfstack/")
+    s == "/etc/wolfstack"
+        || s.starts_with("/etc/wolfstack/")
         || s == "/etc/shadow"
         || s == "/etc/gshadow"
+        || s == "/proc"
         || s.starts_with("/proc/")
+        || s == "/sys"
         || s.starts_with("/sys/")
+        || s == "/root/.ssh"
         || s.starts_with("/root/.ssh/")
 }
 
@@ -10025,6 +10029,10 @@ pub async fn files_upload(
         Ok(p) => p,
         Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
     };
+
+    if is_sensitive_path(&canonical_dir) {
+        return HttpResponse::Forbidden().json(serde_json::json!({ "error": "Access denied: protected path" }));
+    }
 
     if !canonical_dir.is_dir() {
         return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Target is not a directory" }));
@@ -10263,6 +10271,9 @@ pub async fn files_read(
         Ok(p) => p,
         Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
     };
+    if is_sensitive_path(&canonical) {
+        return HttpResponse::Forbidden().json(serde_json::json!({ "error": "Access denied: protected path" }));
+    }
     if canonical.is_dir() {
         return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Cannot edit a directory" }));
     }
