@@ -93,6 +93,7 @@
     window.wrLoadAll = wrLoadAll;
     window.wrStartPolling = wrStartPolling;
     window.showWolfRouterForCluster = showWolfRouterForCluster;
+    window.wrClearDiagnosticsPanel = () => wrClearDiagnosticsPanel();
     window.wrSwitchView = wrSwitchView;
     window.wrSelectTab = wrSelectTab;
     window.wrShowRuleEditor = wrShowRuleEditor;
@@ -163,21 +164,18 @@
         wrShowClusterLoading(clusterName);
 
         try {
-            // Preflight scans hosts file / hostname / interfaces /
-            // cluster membership before fanning out to the topology
-            // endpoint. If anything is seriously wrong the fetches that
-            // follow would fail with a generic "Failed to fetch" and
-            // the rack would end up showing "No nodes in topology".
-            // Show a structured diagnostic first so the customer sees
-            // *what* is wrong and *how* to fix it, rather than an
-            // empty canvas with no clues.
+            // Always try to load the topology + config first so the rack
+            // renders whatever data IS reachable. Preflight results are
+            // informational and get shown in the below-rack diagnostics
+            // panel afterwards — they no longer replace the diagram.
+            // This is the shift the user asked for: the diagram is king,
+            // diagnostics support it rather than shoving it aside.
+            wrClearDiagnosticsPanel();
             const pf = await wrRunPreflight();
+            await wrLoadAll();
             if (pf && pf.status === 'error') {
                 wrRenderPreflight(pf, clusterName);
-                return;  // don't call wrLoadAll — rack can't be built
-            }
-            await wrLoadAll();
-            if (pf && pf.status === 'warning') {
+            } else if (pf && pf.status === 'warning') {
                 wrRenderPreflightBanner(pf);
             }
         } finally {
@@ -206,68 +204,108 @@
 
     // Diagnostic panel shown in the canvas when one or more preflight
     // checks failed with severity=error. Blocks the normal load path.
+    // Renders preflight output (error or warning) into the diagnostics
+    // panel underneath the rack canvas — never into the canvas itself.
+    // Keeping the rack visible even when preflight says "broken" means
+    // the user can still see whatever topology data DID come back, which
+    // is the usual case for the domain-name-based clusters this UI gets
+    // used to triage: the rack mostly works, but ONE peer failed and
+    // they want to know why without losing the diagram.
     function wrRenderPreflight(pf, clusterName) {
-        const canvas = document.getElementById('wr-rack-canvas');
-        if (!canvas) return;
-        const rows = (pf.checks || []).map(c => {
+        const safeName = (clusterName || '').replace(/'/g, "\\'");
+        wrShowDiagnosticsPanel({
+            severity: 'error',
+            title: 'WolfRouter preflight found blocking issues',
+            subtitle: `Cluster: <code>${escHtml(clusterName || '')}</code>. Items marked 🛑 must be fixed before the rack view can render reliably; the diagram above shows whatever topology data is currently reachable.`,
+            checks: pf.checks || [],
+            actions: `
+                <button onclick="(async () => { wrClearDiagnosticsPanel(); const pf = await (window.wrRunPreflight ? window.wrRunPreflight() : null); await wrLoadAll(); if (pf && pf.status === 'error') { wrRenderPreflight(pf, '${safeName}'); } else if (pf && pf.status === 'warning') { wrRenderPreflightBanner(pf); } })()" class="btn btn-primary btn-sm">🔄 Re-run preflight</button>
+            `,
+        });
+        // Make the functions reachable by inline buttons.
+        window.wrRunPreflight = wrRunPreflight;
+        window.wrRenderPreflight = wrRenderPreflight;
+        window.wrRenderPreflightBanner = wrRenderPreflightBanner;
+        window.wrClearDiagnosticsPanel = wrClearDiagnosticsPanel;
+    }
+
+    // Shared renderer for the below-rack diagnostics panel. Accepts a
+    // severity ('error' | 'warning' | 'info'), a title/subtitle header,
+    // a list of preflight `checks`, optional raw `failures` (fetch-fail
+    // rows, same shape wrShowFetchReport used to build), and an optional
+    // trailing actions row. Multiple calls in one render pass are
+    // additive — later blocks append so the user sees preflight + fetch
+    // diagnostics together without one wiping the other out.
+    function wrShowDiagnosticsPanel({ severity, title, subtitle, checks, failures, actions, replace }) {
+        const panel = document.getElementById('wr-diagnostics-panel');
+        const content = document.getElementById('wr-diagnostics-content');
+        if (!panel || !content) return;
+        const accent = severity === 'error' ? '#ef4444' : severity === 'warning' ? '#eab308' : '#60a5fa';
+        const checkRows = (checks || []).map(c => {
             const icon  = c.ok ? '✅' : (c.severity === 'error' ? '🛑' : c.severity === 'warning' ? '⚠️' : 'ℹ️');
             const color = c.ok ? '#10b981' : (c.severity === 'error' ? '#ef4444' : '#eab308');
             return `
                 <tr>
-                    <td style="padding:10px 12px; border-bottom:1px solid var(--border); vertical-align:top;">${icon} <strong style="color:${color};">${escHtml(c.name)}</strong></td>
+                    <td style="padding:10px 12px; border-bottom:1px solid var(--border); vertical-align:top; width:220px;">${icon} <strong style="color:${color};">${escHtml(c.name)}</strong></td>
                     <td style="padding:10px 12px; border-bottom:1px solid var(--border); vertical-align:top;">
                         <div>${escHtml(c.message || '')}</div>
                         ${c.fix ? `<pre style="margin:8px 0 0 0; padding:8px 10px; background:var(--bg-primary); border:1px solid var(--border); border-radius:4px; font-size:11px; white-space:pre-wrap;">${escHtml(c.fix)}</pre>` : ''}
                     </td>
                 </tr>`;
         }).join('');
-        canvas.innerHTML = `
-            <div style="padding:24px;">
-                <div style="display:flex; align-items:center; gap:12px; margin-bottom:14px;">
-                    <span style="font-size:30px;">🔧</span>
-                    <div>
-                        <div style="color:#ef4444; font-weight:700; font-size:16px;">WolfRouter preflight found blocking issues</div>
-                        <div style="color:var(--text-muted); font-size:12px;">Cluster: <code>${escHtml(clusterName || '')}</code>. The rack view won't load reliably until the error-severity checks below are fixed.</div>
-                    </div>
-                </div>
-                <table style="width:100%; font-size:13px; border-collapse:collapse; border:1px solid var(--border); border-radius:6px; overflow:hidden;">
+        const failureRows = (failures || []).map(f => `<tr>
+            <td style="padding:6px 10px; border-bottom:1px solid var(--border);"><strong>${escHtml(f.ep.label)}</strong></td>
+            <td style="padding:6px 10px; border-bottom:1px solid var(--border); font-family:monospace; font-size:11px;">${escHtml(f.ep.url)}</td>
+            <td style="padding:6px 10px; border-bottom:1px solid var(--border); color:#ef4444;">${escHtml(f.error)}</td>
+            <td style="padding:6px 10px; border-bottom:1px solid var(--border); font-family:monospace; font-size:11px; color:var(--text-muted); max-width:380px; word-break:break-all;">${escHtml(f.detail || '—')}</td>
+        </tr>`).join('');
+
+        const block = `
+            <div style="margin-bottom:14px; border-left:3px solid ${accent}; padding-left:12px;">
+                <div style="color:${accent}; font-weight:700; font-size:14px; margin-bottom:4px;">${escHtml(title || '')}</div>
+                ${subtitle ? `<div style="color:var(--text-muted); font-size:12px; margin-bottom:10px;">${subtitle}</div>` : ''}
+                ${checkRows ? `<table style="width:100%; font-size:13px; border-collapse:collapse; border:1px solid var(--border); border-radius:6px; overflow:hidden; margin-bottom:${failureRows || actions ? '10px' : '0'};">
                     <thead><tr style="background:var(--bg-tertiary);"><th style="padding:8px 12px; text-align:left; width:220px;">Check</th><th style="padding:8px 12px; text-align:left;">Result / Fix</th></tr></thead>
-                    <tbody>${rows}</tbody>
-                </table>
-                <div style="margin-top:14px; display:flex; gap:10px; align-items:center;">
-                    <button onclick="(async () => { const pf = await (window.wrRunPreflight ? window.wrRunPreflight() : null); if (pf && pf.status !== 'error') { wrLoadAll(); } else if (pf) { wrRenderPreflight(pf, '${escHtml(clusterName || '').replace(/'/g, "\\'")}'); } })()" class="btn btn-primary btn-sm">🔄 Re-run preflight</button>
-                    <button onclick="wrLoadAll()" class="btn btn-sm">Load anyway</button>
-                    <span style="color:var(--text-muted); font-size:11px;">Click "Load anyway" if you want to see whatever partial data is reachable; errors will still appear above the rack.</span>
-                </div>
+                    <tbody>${checkRows}</tbody>
+                </table>` : ''}
+                ${failureRows ? `<table style="width:100%; font-size:12px; border-collapse:collapse; border:1px solid var(--border); border-radius:6px; overflow:hidden;">
+                    <thead><tr style="background:var(--bg-tertiary);"><th style="padding:8px 10px; text-align:left;">Section</th><th style="padding:8px 10px; text-align:left;">Endpoint</th><th style="padding:8px 10px; text-align:left;">Error</th><th style="padding:8px 10px; text-align:left;">Detail</th></tr></thead>
+                    <tbody>${failureRows}</tbody>
+                </table>` : ''}
+                ${actions ? `<div style="margin-top:12px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">${actions}</div>` : ''}
             </div>
         `;
-        // Make the functions reachable by inline buttons.
-        window.wrRunPreflight = wrRunPreflight;
-        window.wrRenderPreflight = wrRenderPreflight;
+        if (replace) {
+            content.innerHTML = block;
+        } else {
+            content.innerHTML += block;
+        }
+        panel.style.display = 'block';
     }
 
-    // Yellow banner above the rack for warning-only preflight results.
-    // Non-blocking — the page is usable; we just let the user know.
+    // Clear whatever is in the diagnostics panel and hide it. Called on
+    // clean re-renders so stale issues don't persist across cluster
+    // switches.
+    function wrClearDiagnosticsPanel() {
+        const panel = document.getElementById('wr-diagnostics-panel');
+        const content = document.getElementById('wr-diagnostics-content');
+        if (content) content.innerHTML = '';
+        if (panel) panel.style.display = 'none';
+    }
+
+    // Warning-only preflight results go into the same below-rack panel
+    // as errors — same location, different severity accent. Non-blocking
+    // by nature; the rack renders normally and the user sees the panel
+    // underneath if they scroll.
     function wrRenderPreflightBanner(pf) {
-        const canvas = document.getElementById('wr-rack-canvas');
-        if (!canvas) return;
         const warnings = (pf.checks || []).filter(c => !c.ok && c.severity === 'warning');
         if (!warnings.length) return;
-        let banner = document.getElementById('wr-preflight-banner');
-        if (!banner) {
-            banner = document.createElement('div');
-            banner.id = 'wr-preflight-banner';
-            banner.style.cssText = 'background:rgba(234,179,8,0.10); border:1px solid rgba(234,179,8,0.35); color:#eab308; padding:10px 14px; border-radius:6px; margin-bottom:10px; font-size:12px;';
-            canvas.parentElement && canvas.parentElement.insertBefore(banner, canvas);
-        }
-        const rows = warnings.map(w => `<li><strong>${escHtml(w.name)}</strong> — ${escHtml(w.message)}${w.fix ? `<br><code style="display:block; margin-top:2px; font-size:11px; color:var(--text-muted); white-space:pre-wrap;">${escHtml(w.fix)}</code>` : ''}</li>`).join('');
-        banner.innerHTML = `
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-                <strong>⚠️ Preflight warnings</strong>
-                <button onclick="document.getElementById('wr-preflight-banner').remove()" style="background:transparent; color:#eab308; border:1px solid rgba(234,179,8,0.4); padding:3px 10px; border-radius:4px; cursor:pointer; font-size:11px;">Dismiss</button>
-            </div>
-            <ul style="margin:0; padding-left:20px;">${rows}</ul>
-        `;
+        wrShowDiagnosticsPanel({
+            severity: 'warning',
+            title: 'Preflight warnings',
+            subtitle: 'The rack view loaded, but these checks flagged issues that may affect reliability.',
+            checks: warnings,
+        });
     }
 
     /// Full-card loading overlay shown while a cluster switch is in flight.
@@ -371,76 +409,53 @@
         }
 
         wrRenderAll();
+        // Fetch failures append to whatever diagnostics are already
+        // showing (preflight warnings, for example). The entry-point
+        // flow — showWolfRouterForCluster, polling retry — is responsible
+        // for clearing the panel before a fresh cycle.
         if (failures.length) wrShowPartialFailureBanner(failures);
-        else wrClearPartialFailureBanner();
     }
 
-    // Banner shown above the rack canvas when topology loaded but
-    // some other endpoints failed. Non-blocking — the UI is usable.
+    // Partial-fetch failures go into the below-rack diagnostics panel.
+    // The rack is unaffected — it rendered from topology which loaded
+    // fine, so we don't need to swap its contents or prepend a banner.
     function wrShowPartialFailureBanner(failures) {
-        const canvas = document.getElementById('wr-rack-canvas');
-        if (!canvas) return;
-        let banner = document.getElementById('wr-partial-banner');
-        if (!banner) {
-            banner = document.createElement('div');
-            banner.id = 'wr-partial-banner';
-            banner.style.cssText = 'background:rgba(234,179,8,0.12); border:1px solid rgba(234,179,8,0.4); color:#eab308; padding:10px 14px; border-radius:6px; margin-bottom:10px; font-size:12px;';
-            canvas.parentElement && canvas.parentElement.insertBefore(banner, canvas);
-        }
-        const rows = failures.map(f => `<li><strong>${escHtml(f.ep.label)}</strong> <code style="color:var(--text-muted);">${escHtml(f.ep.url)}</code> — ${escHtml(f.error)}${f.detail ? `<br><code style="display:block; margin-top:2px; font-size:11px; color:var(--text-muted);">${escHtml(f.detail)}</code>` : ''}</li>`).join('');
-        banner.innerHTML = `
-            <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:6px;">
-                <strong>⚠️ ${failures.length} section${failures.length === 1 ? '' : 's'} failed to load</strong>
-                <button onclick="wrLoadAll()" style="background:transparent; color:#eab308; border:1px solid rgba(234,179,8,0.4); padding:3px 10px; border-radius:4px; cursor:pointer; font-size:11px;">Retry</button>
-            </div>
-            <div style="color:var(--text-muted); font-size:11px; margin-bottom:6px;">The rack is rendered from topology which did load. The panels below may be missing data from these endpoints:</div>
-            <ul style="margin:0; padding-left:20px;">${rows}</ul>
-        `;
+        wrShowDiagnosticsPanel({
+            severity: 'warning',
+            title: `${failures.length} section${failures.length === 1 ? '' : 's'} failed to load`,
+            subtitle: 'The rack rendered from topology (which loaded), but the table panels below may be missing data from these endpoints.',
+            failures,
+            actions: `<button onclick="wrLoadAll()" class="btn btn-sm">🔄 Retry</button>`,
+        });
     }
 
+    // Alias kept for callers that still reference the old name — now
+    // just clears the whole diagnostics panel. Safe to call on every
+    // successful render.
     function wrClearPartialFailureBanner() {
-        const b = document.getElementById('wr-partial-banner');
-        if (b) b.remove();
+        wrClearDiagnosticsPanel();
     }
 
-    // Full-canvas error panel — only used when topology itself
-    // failed. Lists every broken endpoint with its HTTP status /
-    // response body so the operator can diagnose, plus a retry
-    // button. Doesn't hide the tables tabs (they still render from
-    // whatever did load).
+    // Topology endpoint failed — render a full diagnostics block below
+    // the rack. The rack itself shows its existing empty state (or a
+    // message from the topology renderer) rather than being overwritten.
     function wrShowFetchReport(failures, topoFail) {
-        wrClearPartialFailureBanner();
-        const canvas = document.getElementById('wr-rack-canvas');
-        if (!canvas) return;
-        const rows = failures.map(f => `<tr>
-            <td style="padding:6px 10px; border-bottom:1px solid var(--border);"><strong>${escHtml(f.ep.label)}</strong></td>
-            <td style="padding:6px 10px; border-bottom:1px solid var(--border); font-family:monospace; font-size:11px;">${escHtml(f.ep.url)}</td>
-            <td style="padding:6px 10px; border-bottom:1px solid var(--border); color:#ef4444;">${escHtml(f.error)}</td>
-            <td style="padding:6px 10px; border-bottom:1px solid var(--border); font-family:monospace; font-size:11px; color:var(--text-muted); max-width:380px; word-break:break-all;">${escHtml(f.detail || '—')}</td>
-        </tr>`).join('');
-        canvas.innerHTML = `
-            <div style="padding:24px;">
-                <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;">
-                    <span style="font-size:28px;">🛑</span>
-                    <div>
-                        <div style="color:#ef4444; font-weight:700; font-size:16px;">WolfRouter: topology could not be loaded</div>
-                        <div style="color:var(--text-muted); font-size:12px;">Rack view is hidden because it depends on the topology endpoint. Whatever else loaded is still rendered in the Firewall / LANs / Zones tabs below.</div>
-                    </div>
-                </div>
-                <div style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:6px; padding:12px; margin-bottom:14px;">
-                    <strong style="font-size:13px;">Topology endpoint</strong><br>
-                    <code style="font-size:11px;">${escHtml(topoFail ? topoFail.ep.url : '/api/router/topology')}</code><br>
-                    <span style="color:#ef4444;">${escHtml(topoFail ? topoFail.error : 'unknown')}</span>
-                    ${topoFail && topoFail.detail ? `<pre style="margin-top:8px; padding:8px; background:var(--bg-primary); border-radius:4px; font-size:11px; white-space:pre-wrap;">${escHtml(topoFail.detail)}</pre>` : ''}
-                </div>
-                ${failures.length > 1 ? `<div style="font-size:12px; margin-bottom:6px;">Other endpoints that failed:</div>
-                <table style="width:100%; font-size:12px; border-collapse:collapse; border:1px solid var(--border); border-radius:6px; overflow:hidden;"><thead><tr style="background:var(--bg-tertiary);"><th style="padding:8px 10px; text-align:left;">Section</th><th style="padding:8px 10px; text-align:left;">Endpoint</th><th style="padding:8px 10px; text-align:left;">Error</th><th style="padding:8px 10px; text-align:left;">Detail</th></tr></thead><tbody>${rows}</tbody></table>` : ''}
-                <div style="margin-top:14px; display:flex; gap:10px; align-items:center;">
-                    <button onclick="wrLoadAll()" class="btn btn-primary btn-sm">🔄 Retry</button>
-                    <span style="color:var(--text-muted); font-size:11px;">Full details with response bodies are in the browser console (F12) and the server log.</span>
-                </div>
-            </div>
-        `;
+        const others = failures.filter(f => f.ep.key !== 'topology');
+        const topoBlock = topoFail ? `
+            <div style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:6px; padding:12px; margin-bottom:${others.length ? '12px' : '0'};">
+                <strong style="font-size:13px;">Topology endpoint</strong><br>
+                <code style="font-size:11px;">${escHtml(topoFail.ep.url)}</code><br>
+                <span style="color:#ef4444;">${escHtml(topoFail.error)}</span>
+                ${topoFail.detail ? `<pre style="margin-top:8px; padding:8px; background:var(--bg-primary); border-radius:4px; font-size:11px; white-space:pre-wrap;">${escHtml(topoFail.detail)}</pre>` : ''}
+            </div>` : '';
+        wrShowDiagnosticsPanel({
+            severity: 'error',
+            title: 'WolfRouter: topology could not be loaded',
+            subtitle: `${topoBlock}${others.length ? 'Other endpoints that failed:' : ''}`,
+            failures: others,
+            actions: `<button onclick="wrLoadAll()" class="btn btn-primary btn-sm">🔄 Retry</button>
+                <span style="color:var(--text-muted); font-size:11px;">Full details with response bodies are in the browser console (F12) and the server log.</span>`,
+        });
     }
 
     function wrStartPolling() {

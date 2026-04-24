@@ -107,28 +107,47 @@ fn replicate_config_to_cluster(state: S) {
             if !node.online { continue; }
             if node.node_type != "wolfstack" { continue; }
             let host = resolve_node_address(&node.address);
-            let url = format!("https://{}:{}/api/router/config-receive", host, node.port);
-            let res = client.post(&url)
-                .header("X-WolfStack-Secret", &secret)
-                .header("Content-Type", "application/json")
-                .timeout(std::time::Duration::from_secs(10))
-                .body(body.clone())
-                .send().await;
-            match res {
-                Ok(r) if r.status().is_success() => {
-                    tracing::debug!("router config replicated to {}", node.id);
-                    // Drain ack body so the socket returns to the pool.
-                    drain_response(r).await;
+            // Try the same 3-URL fallback chain the agent poll and
+            // proxy_router_get_to_node use: internal HTTP on port+1
+            // first (this is the cluster-private channel and is the
+            // URL that keeps working when 8553 is firewalled off at
+            // the edge), then HTTPS on the main port, then plain HTTP
+            // on the main port. Previously this path only tried HTTPS
+            // on the main port, which silently failed for any customer
+            // whose domain routes through a public-facing firewall
+            // that restricts 8553.
+            let urls = [
+                format!("http://{}:{}/api/router/config-receive",  host, node.port + 1),
+                format!("https://{}:{}/api/router/config-receive", host, node.port),
+                format!("http://{}:{}/api/router/config-receive",  host, node.port),
+            ];
+            let mut replicated = false;
+            let mut last_err = String::new();
+            for url in &urls {
+                match client.post(url)
+                    .header("X-WolfStack-Secret", &secret)
+                    .header("Content-Type", "application/json")
+                    .timeout(std::time::Duration::from_secs(10))
+                    .body(body.clone())
+                    .send().await
+                {
+                    Ok(r) if r.status().is_success() => {
+                        tracing::debug!("router config replicated to {} via {}", node.id, url);
+                        drain_response(r).await;
+                        replicated = true;
+                        break;
+                    }
+                    Ok(r) => {
+                        last_err = format!("HTTP {} from {}", r.status(), url);
+                        drain_response(r).await;
+                    }
+                    Err(e) => {
+                        last_err = format!("{} ({})", e, url);
+                    }
                 }
-                Ok(r) => {
-                    let status = r.status();
-                    tracing::warn!("router config replicate to {} returned {}", node.id, status);
-                    // Non-success still has an (error) body to drain.
-                    drain_response(r).await;
-                }
-                Err(e) => {
-                    tracing::warn!("router config replicate to {} failed: {}", node.id, e);
-                }
+            }
+            if !replicated {
+                tracing::warn!("router config replicate to {} failed — last error: {}", node.id, last_err);
             }
         }
     });
@@ -540,7 +559,15 @@ pub async fn get_topology(
             // is cheap — Client is internally refcounted.
             let client_c: reqwest::Client = reqwest::Client::clone(client);
             futures.push(async move {
+                // URL order matches the agent poll path (src/agent/mod.rs):
+                // internal HTTP on port+1 FIRST. That's the cluster-
+                // private channel; it keeps working when the customer's
+                // edge firewall restricts 8553 to admin IPs, which is
+                // the common setup for nodes addressed by public domain.
+                // Fall through to HTTPS and plain HTTP on the main port
+                // for clusters that don't have a port+1 listener.
                 let urls = [
+                    format!("http://{}:{}/api/router/topology-local",  host, port + 1),
                     format!("https://{}:{}/api/router/topology-local", host, port),
                     format!("http://{}:{}/api/router/topology-local",  host, port),
                 ];
@@ -2040,9 +2067,13 @@ pub async fn packet_capture(
             // self_id mismatch happens.
             let mut proxy_body = r.clone();
             proxy_body.node_id = None;
-            // Try HTTPS first then HTTP, mirroring the topology fan-out.
+            // Internal HTTP on port+1 first (matches topology + poll
+            // fan-out), then HTTPS on the main port, then plain HTTP.
+            // Firewalls that restrict 8553 to admin IPs will pass 8554
+            // for cluster traffic.
             let target_host = resolve_node_address(&target_node.address);
             let urls = [
+                format!("http://{}:{}/api/router/capture",  target_host, target_node.port + 1),
                 format!("https://{}:{}/api/router/capture", target_host, target_node.port),
                 format!("http://{}:{}/api/router/capture",  target_host, target_node.port),
             ];
@@ -2464,9 +2495,13 @@ pub async fn interface_up(
             // set per-request below replaces the old client-level one.
             let client = &*ROUTER_RPC_CLIENT;
             let target_host = resolve_node_address(&target_node.address);
+            // Internal HTTP on port+1 first — same reasoning as the
+            // other router fan-outs: firewalls that restrict 8553
+            // typically still allow 8554 between cluster nodes.
             let urls = [
+                format!("http://{}:{}/api/router/interface-up",  target_host, target_node.port + 1),
                 format!("https://{}:{}/api/router/interface-up", target_host, target_node.port),
-                format!("http://{}:{}/api/router/interface-up", target_host, target_node.port),
+                format!("http://{}:{}/api/router/interface-up",  target_host, target_node.port),
             ];
             for url in &urls {
                 if let Ok(resp) = client.post(url)
