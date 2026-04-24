@@ -12416,57 +12416,57 @@ function renderDockerCards(containers) {
     const grid = document.getElementById('docker-card-grid');
     if (!grid) return;
     if (containers.length === 0) { grid.innerHTML = ''; return; }
+    grid.innerHTML = containers.map(c => dockerCardHtml(c)).join('');
+}
 
+function dockerCardHtml(c) {
     const bs = 'margin:1px;font-size:16px;line-height:1;padding:3px 5px;background:none;border:1px solid var(--border);border-radius:4px;cursor:pointer;';
     const bd = bs + 'opacity:0.3;cursor:not-allowed;pointer-events:none;';
+    const s = dockerStats[c.name] || {};
+    const isRunning = c.state === 'running';
+    const isPaused = c.state === 'paused';
+    const borderColor = isRunning ? '#10b981' : isPaused ? '#f59e0b' : '#6b7280';
+    const cpuPct = s.cpu_percent !== undefined ? Math.min(s.cpu_percent, 100) : -1;
+    const cpuColor = cpuPct > 80 ? '#ef4444' : cpuPct > 50 ? '#f59e0b' : '#10b981';
+    const memPct = (s.memory_usage && s.memory_limit) ? Math.min(Math.round((s.memory_usage / s.memory_limit) * 100), 100) : -1;
+    const memColor = memPct > 90 ? '#ef4444' : memPct > 70 ? '#f59e0b' : '#10b981';
+    const hasStorage = c.disk_usage !== undefined && c.disk_total;
+    const diskPct = hasStorage ? Math.round((c.disk_usage / c.disk_total) * 100) : 0;
+    const diskColor = diskPct > 90 ? '#ef4444' : diskPct > 70 ? '#f59e0b' : '#10b981';
+    const ports = c.ports.length > 0 ? c.ports.slice(0, 3).map(p => escapeHtml(p)).join(', ') : '-';
+    const svcItems = (c.services && c.services.length > 0) ? c.services.map(sv => {
+        const sColor = sv.status === 'running' ? '#10b981' : '#ef4444';
+        return `<span style="font-size:9px;padding:1px 4px;border-radius:2px;background:${sColor}22;color:${sColor};">${sv.name}</span>`;
+    }).join(' ') : '';
 
-    grid.innerHTML = containers.map(c => {
-        const s = dockerStats[c.name] || {};
-        const isRunning = c.state === 'running';
-        const isPaused = c.state === 'paused';
-        const borderColor = isRunning ? '#10b981' : isPaused ? '#f59e0b' : '#6b7280';
-        const cpuPct = s.cpu_percent !== undefined ? Math.min(s.cpu_percent, 100) : -1;
-        const cpuColor = cpuPct > 80 ? '#ef4444' : cpuPct > 50 ? '#f59e0b' : '#10b981';
-        const memPct = (s.memory_usage && s.memory_limit) ? Math.min(Math.round((s.memory_usage / s.memory_limit) * 100), 100) : -1;
-        const memColor = memPct > 90 ? '#ef4444' : memPct > 70 ? '#f59e0b' : '#10b981';
-        const hasStorage = c.disk_usage !== undefined && c.disk_total;
-        const diskPct = hasStorage ? Math.round((c.disk_usage / c.disk_total) * 100) : 0;
-        const diskColor = diskPct > 90 ? '#ef4444' : diskPct > 70 ? '#f59e0b' : '#10b981';
-        const ports = c.ports.length > 0 ? c.ports.slice(0, 3).map(p => escapeHtml(p)).join(', ') : '-';
-        const svcItems = (c.services && c.services.length > 0) ? c.services.map(sv => {
-            const sColor = sv.status === 'running' ? '#10b981' : '#ef4444';
-            return `<span style="font-size:9px;padding:1px 4px;border-radius:2px;background:${sColor}22;color:${sColor};">${sv.name}</span>`;
-        }).join(' ') : '';
+    const pies = [];
+    if (cpuPct >= 0) pies.push(`<div style="text-align:center;flex:1;">${svgPie(cpuPct, cpuColor, 64)}<div style="font-size:9px;color:var(--text-muted);">CPU</div></div>`);
+    if (memPct >= 0) pies.push(`<div style="text-align:center;flex:1;">${svgPie(memPct, memColor, 64)}<div style="font-size:9px;color:var(--text-muted);">RAM</div></div>`);
+    if (hasStorage) pies.push(`<div style="text-align:center;flex:1;">${svgPie(diskPct, diskColor, 64)}<div style="font-size:9px;color:var(--text-muted);">Disk</div></div>`);
 
-        const pies = [];
-        if (cpuPct >= 0) pies.push(`<div style="text-align:center;flex:1;">${svgPie(cpuPct, cpuColor, 64)}<div style="font-size:9px;color:var(--text-muted);">CPU</div></div>`);
-        if (memPct >= 0) pies.push(`<div style="text-align:center;flex:1;">${svgPie(memPct, memColor, 64)}<div style="font-size:9px;color:var(--text-muted);">RAM</div></div>`);
-        if (hasStorage) pies.push(`<div style="text-align:center;flex:1;">${svgPie(diskPct, diskColor, 64)}<div style="font-size:9px;color:var(--text-muted);">Disk</div></div>`);
-
-        return `<div style="background:var(--bg-card);border:1px solid var(--border);border-left:4px solid ${borderColor};border-radius:10px;overflow:hidden;">
-            <div style="display:flex;flex-wrap:wrap;padding:6px 8px;background:var(--bg-secondary);border-bottom:1px solid var(--border);gap:1px;">
-                ${isRunning ? `<button class="btn btn-sm" style="${bd}" disabled>▶️</button><button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','stop',this)" title="Stop">⏹️</button><button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','restart',this)" title="Restart">🔄</button><button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','pause',this)" title="Pause">⏸️</button><button class="btn btn-sm" style="${bs}" onclick="openConsole('docker','${c.name}')" title="Console">💻</button>` : isPaused ? `<button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','unpause',this)">▶️</button>` : `<button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','start',this)">▶️</button><button class="btn btn-sm" style="${bd}" disabled>⏹️</button><button class="btn btn-sm" style="${bd}" disabled>🔄</button>`}
-                <button class="btn btn-sm" style="${bs}" onclick="viewContainerLogs('docker','${c.name}')" title="Logs">📜</button><button class="btn btn-sm" style="${bs}" onclick="viewDockerVolumes('${c.name}')" title="Volumes">📁</button><button class="btn btn-sm" style="${bs}" onclick="browseContainerFiles('docker','${c.name}')" title="Files">📂</button><button class="btn btn-sm" style="${bs}" onclick="openDockerSettings('${c.name}')" title="Settings">⚙️</button><button class="btn btn-sm" style="${bs}" onclick="openContainerConfigurator('docker','${c.name}')" title="Configure">🔧</button><button class="btn btn-sm" style="${bs}" onclick="openContainerUpdates('docker','${c.name}')" title="Updates">📦</button><button class="btn btn-sm" style="${bs}" onclick="openContainerCron('docker','${c.name}')" title="Cron">⏰</button><button class="btn btn-sm" style="${bs}" onclick="cloneDockerContainer('${c.name}')" title="Clone">📋</button><button class="btn btn-sm" style="${bs}" onclick="migrateDockerContainer('${c.name}')" title="Migrate">🚀</button>${!isRunning ? `<button class="btn btn-sm" style="${bs}color:#ef4444;" onclick="dockerAction('${c.name}','remove',this)" title="Remove">🗑️</button>` : ''}
+    return `<div style="background:var(--bg-card);border:1px solid var(--border);border-left:4px solid ${borderColor};border-radius:10px;overflow:hidden;">
+        <div style="display:flex;flex-wrap:wrap;padding:6px 8px;background:var(--bg-secondary);border-bottom:1px solid var(--border);gap:1px;">
+            ${isRunning ? `<button class="btn btn-sm" style="${bd}" disabled>▶️</button><button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','stop',this)" title="Stop">⏹️</button><button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','restart',this)" title="Restart">🔄</button><button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','pause',this)" title="Pause">⏸️</button><button class="btn btn-sm" style="${bs}" onclick="openConsole('docker','${c.name}')" title="Console">💻</button>` : isPaused ? `<button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','unpause',this)">▶️</button>` : `<button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','start',this)">▶️</button><button class="btn btn-sm" style="${bd}" disabled>⏹️</button><button class="btn btn-sm" style="${bd}" disabled>🔄</button>`}
+            <button class="btn btn-sm" style="${bs}" onclick="viewContainerLogs('docker','${c.name}')" title="Logs">📜</button><button class="btn btn-sm" style="${bs}" onclick="viewDockerVolumes('${c.name}')" title="Volumes">📁</button><button class="btn btn-sm" style="${bs}" onclick="browseContainerFiles('docker','${c.name}')" title="Files">📂</button><button class="btn btn-sm" style="${bs}" onclick="openDockerSettings('${c.name}')" title="Settings">⚙️</button><button class="btn btn-sm" style="${bs}" onclick="openContainerConfigurator('docker','${c.name}')" title="Configure">🔧</button><button class="btn btn-sm" style="${bs}" onclick="openContainerUpdates('docker','${c.name}')" title="Updates">📦</button><button class="btn btn-sm" style="${bs}" onclick="openContainerCron('docker','${c.name}')" title="Cron">⏰</button><button class="btn btn-sm" style="${bs}" onclick="cloneDockerContainer('${c.name}')" title="Clone">📋</button><button class="btn btn-sm" style="${bs}" onclick="migrateDockerContainer('${c.name}')" title="Migrate">🚀</button>${!isRunning ? `<button class="btn btn-sm" style="${bs}color:#ef4444;" onclick="dockerAction('${c.name}','remove',this)" title="Remove">🗑️</button>` : ''}
+        </div>
+        ${pies.length > 0 ? `<div style="display:flex;justify-content:space-evenly;padding:12px 8px;border-bottom:1px solid var(--border);">${pies.join('')}</div>` : ''}
+        <div style="padding:10px 12px;">
+            <div style="display:flex;justify-content:space-between;align-items:start;">
+                <div><div style="font-weight:700;font-size:14px;">${escapeHtml(c.name)}</div><div style="font-size:11px;color:var(--text-muted);">${escapeHtml(c.image)}</div></div>
+                <span style="font-size:10px;padding:2px 8px;border-radius:4px;background:${borderColor}22;color:${borderColor};font-weight:600;">${c.state}</span>
             </div>
-            ${pies.length > 0 ? `<div style="display:flex;justify-content:space-evenly;padding:12px 8px;border-bottom:1px solid var(--border);">${pies.join('')}</div>` : ''}
-            <div style="padding:10px 12px;">
-                <div style="display:flex;justify-content:space-between;align-items:start;">
-                    <div><div style="font-weight:700;font-size:14px;">${escapeHtml(c.name)}</div><div style="font-size:11px;color:var(--text-muted);">${escapeHtml(c.image)}</div></div>
-                    <span style="font-size:10px;padding:2px 8px;border-radius:4px;background:${borderColor}22;color:${borderColor};font-weight:600;">${c.state}</span>
-                </div>
-                ${svcItems ? `<div style="margin-top:4px;">${svcItems}</div>` : ''}
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:2px;margin-top:8px;font-size:11px;color:var(--text-muted);">
-                    <span>🌐 ${c.ip_address || '-'}</span><span>🔌 ${ports}</span>
-                    ${c.gateway ? `<span>GW: ${escapeHtml(c.gateway)}</span>` : ''}${c.mac_address ? `<span>MAC: ${escapeHtml(c.mac_address)}</span>` : ''}
-                    <span>🔄 ${c.autostart ? 'Autostart' : 'Manual'}</span>
-                    ${hasStorage ? `<span>💾 ${formatBytes(c.disk_usage)}/${formatBytes(c.disk_total)}</span>` : ''}
-                    ${memPct >= 0 ? `<span>🧠 ${formatBytes(s.memory_usage)}/${formatBytes(s.memory_limit)}</span>` : ''}
-                    ${cpuPct >= 0 ? `<span>⚡ ${s.cpu_percent.toFixed(1)}%</span>` : ''}
-                </div>
-                <span data-update-badge="docker:${c.name}"></span>
+            ${svcItems ? `<div style="margin-top:4px;">${svcItems}</div>` : ''}
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:2px;margin-top:8px;font-size:11px;color:var(--text-muted);">
+                <span>🌐 ${c.ip_address || '-'}</span><span>🔌 ${ports}</span>
+                ${c.gateway ? `<span>GW: ${escapeHtml(c.gateway)}</span>` : ''}${c.mac_address ? `<span>MAC: ${escapeHtml(c.mac_address)}</span>` : ''}
+                <span>🔄 ${c.autostart ? 'Autostart' : 'Manual'}</span>
+                ${hasStorage ? `<span>💾 ${formatBytes(c.disk_usage)}/${formatBytes(c.disk_total)}</span>` : ''}
+                ${memPct >= 0 ? `<span>🧠 ${formatBytes(s.memory_usage)}/${formatBytes(s.memory_limit)}</span>` : ''}
+                ${cpuPct >= 0 ? `<span>⚡ ${s.cpu_percent.toFixed(1)}%</span>` : ''}
             </div>
-        </div>`;
-    }).join('');
+            <span data-update-badge="docker:${c.name}"></span>
+        </div>
+    </div>`;
 }
 
 function renderLxcCards(containers, stats) {
@@ -12474,13 +12474,14 @@ function renderLxcCards(containers, stats) {
     if (!grid) return;
     if (containers.length === 0) { grid.innerHTML = ''; return; }
     if (!stats) stats = {};
+    grid.innerHTML = containers.map(c => lxcCardHtml(c, stats[c.name] || {})).join('');
+}
 
+function lxcCardHtml(c, s) {
     const bs = 'margin:1px;font-size:16px;line-height:1;padding:3px 5px;background:none;border:1px solid var(--border);border-radius:4px;cursor:pointer;';
     const bd = bs + 'opacity:0.3;cursor:not-allowed;pointer-events:none;';
-
-    grid.innerHTML = containers.map(c => {
-        const s = stats[c.name] || {};
-        const isRunning = c.state === 'running';
+    if (!s) s = {};
+    const isRunning = c.state === 'running';
         const isFrozen = c.state === 'frozen';
         const borderColor = isRunning ? '#10b981' : isFrozen ? '#f59e0b' : '#6b7280';
         const cpuPct = s.cpu_percent !== undefined ? Math.min(s.cpu_percent, 100) : -1;
@@ -12541,63 +12542,60 @@ function renderLxcCards(containers, stats) {
                 <span data-update-badge="lxc:${c.name}"></span>
             </div>
         </div>`;
-    }).join('');
 }
 
 function renderVmCards(vms) {
     const grid = document.getElementById('vms-card-grid');
     if (!grid) return;
     if (vms.length === 0) { grid.innerHTML = ''; return; }
+    grid.innerHTML = vms.map(vm => vmCardHtml(vm)).join('');
+}
 
+function vmCardHtml(vm) {
     const bs = 'margin:1px;font-size:16px;line-height:1;padding:3px 5px;background:none;border:1px solid var(--border);border-radius:4px;cursor:pointer;';
     const bd = bs + 'opacity:0.3;cursor:not-allowed;pointer-events:none;';
+    const isRunning = vm.running;
+    const borderColor = isRunning ? '#10b981' : '#6b7280';
+    let vncHost = window.location.hostname;
+    if (currentNodeId) {
+        const node = allNodes.find(n => n.id === currentNodeId);
+        if (node && !node.is_self) vncHost = node.address;
+    }
+    const vncBridgePort2 = vm.vnc_ws_port || vm.vnc_port;
+    const vncLink = (vm.running && vncBridgePort2) ? `/vnc.html?name=${encodeURIComponent(vm.name)}&port=${vncBridgePort2}&host=${encodeURIComponent(vncHost)}` : '';
 
-    grid.innerHTML = vms.map(vm => {
-        const isRunning = vm.running;
-        const borderColor = isRunning ? '#10b981' : '#6b7280';
-        let vncHost = window.location.hostname;
-        if (currentNodeId) {
-            const node = allNodes.find(n => n.id === currentNodeId);
-            if (node && !node.is_self) vncHost = node.address;
-        }
-        // Bridge works with either port — native QEMU's ws port or
-        // libvirt's raw-TCP vnc port (bridged server-side).
-        const vncBridgePort2 = vm.vnc_ws_port || vm.vnc_port;
-        const vncLink = (vm.running && vncBridgePort2) ? `/vnc.html?name=${encodeURIComponent(vm.name)}&port=${vncBridgePort2}&host=${encodeURIComponent(vncHost)}` : '';
-
-        return `<div style="background:var(--bg-card);border:1px solid var(--border);border-left:4px solid ${borderColor};border-radius:10px;overflow:hidden;">
-            <div style="display:flex;flex-wrap:wrap;padding:6px 8px;background:var(--bg-secondary);border-bottom:1px solid var(--border);gap:1px;">
-                <button class="btn btn-sm" style="${isRunning ? bd : bs}" ${isRunning ? 'disabled' : `onclick="vmAction('${vm.name}','start',this)"`} title="Start">▶️</button>
-                <button class="btn btn-sm" style="${!isRunning ? bd : bs}" ${!isRunning ? 'disabled' : `onclick="vmAction('${vm.name}','stop',this)"`} title="Stop (graceful ACPI shutdown)">⏹️</button>
-                <button class="btn btn-sm" style="${!isRunning ? bd : bs}color:#b91c1c;" ${!isRunning ? 'disabled' : `onclick="if (confirm('Force-stop ${vm.name}? The guest will not shut down cleanly — unsaved data may be lost.')) vmAction('${vm.name}','force-stop',this)"`} title="Force Stop (power off immediately)">⛔</button>
-                ${vncLink ? `<button class="btn btn-sm" style="${bs}" onclick="window.open('${vncLink}')" title="VNC">🖥️</button>` : ''}
-                <button class="btn btn-sm" style="${!isRunning ? bd : bs}" ${!isRunning ? 'disabled' : `onclick="openVmConsole('${vm.name}')"`} title="Serial terminal (guest must have serial console enabled)">💻</button>
-                <button class="btn btn-sm" style="${bs}" onclick="showVmSettings('${vm.name}')" title="Settings">⚙️</button>
-                <button class="btn btn-sm" style="${bs}" onclick="showVmLogs('${vm.name}')" title="Logs">📜</button>
-                <button class="btn btn-sm" style="${bs}" onclick="migrateVm('${vm.name}')" title="Migrate to another node">🚀</button>
-                <button class="btn btn-sm" style="${bs}" onclick="migrateVmDiskStorage('${vm.name}')" title="Move disk to different storage (same node)">💾</button>
-                ${!isRunning ? `<button class="btn btn-sm" style="${bs}color:#ef4444;" onclick="deleteVm('${vm.name}')" title="Delete">🗑️</button>` : ''}
+    return `<div style="background:var(--bg-card);border:1px solid var(--border);border-left:4px solid ${borderColor};border-radius:10px;overflow:hidden;">
+        <div style="display:flex;flex-wrap:wrap;padding:6px 8px;background:var(--bg-secondary);border-bottom:1px solid var(--border);gap:1px;">
+            <button class="btn btn-sm" style="${isRunning ? bd : bs}" ${isRunning ? 'disabled' : `onclick="vmAction('${vm.name}','start',this)"`} title="Start">▶️</button>
+            <button class="btn btn-sm" style="${!isRunning ? bd : bs}" ${!isRunning ? 'disabled' : `onclick="vmAction('${vm.name}','stop',this)"`} title="Stop (graceful ACPI shutdown)">⏹️</button>
+            <button class="btn btn-sm" style="${!isRunning ? bd : bs}color:#b91c1c;" ${!isRunning ? 'disabled' : `onclick="if (confirm('Force-stop ${vm.name}? The guest will not shut down cleanly — unsaved data may be lost.')) vmAction('${vm.name}','force-stop',this)"`} title="Force Stop (power off immediately)">⛔</button>
+            ${vncLink ? `<button class="btn btn-sm" style="${bs}" onclick="window.open('${vncLink}')" title="VNC">🖥️</button>` : ''}
+            <button class="btn btn-sm" style="${!isRunning ? bd : bs}" ${!isRunning ? 'disabled' : `onclick="openVmConsole('${vm.name}')"`} title="Serial terminal (guest must have serial console enabled)">💻</button>
+            <button class="btn btn-sm" style="${bs}" onclick="showVmSettings('${vm.name}')" title="Settings">⚙️</button>
+            <button class="btn btn-sm" style="${bs}" onclick="showVmLogs('${vm.name}')" title="Logs">📜</button>
+            <button class="btn btn-sm" style="${bs}" onclick="migrateVm('${vm.name}')" title="Migrate to another node">🚀</button>
+            <button class="btn btn-sm" style="${bs}" onclick="migrateVmDiskStorage('${vm.name}')" title="Move disk to different storage (same node)">💾</button>
+            ${!isRunning ? `<button class="btn btn-sm" style="${bs}color:#ef4444;" onclick="deleteVm('${vm.name}')" title="Delete">🗑️</button>` : ''}
+        </div>
+        <div style="padding:10px 12px;">
+            <div style="display:flex;justify-content:space-between;align-items:start;">
+                <div><div style="font-weight:700;font-size:14px;">${escapeHtml(vm.name)}</div><div style="font-size:11px;color:var(--text-muted);">${vm.bios_type === 'ovmf' ? 'UEFI' : 'BIOS'} · ${vm.os_disk_bus} · ${vm.net_model || 'virtio'}</div></div>
+                <span style="font-size:10px;padding:2px 8px;border-radius:4px;background:${borderColor}22;color:${borderColor};font-weight:600;">${isRunning ? 'Running' : 'Stopped'}</span>
             </div>
-            <div style="padding:10px 12px;">
-                <div style="display:flex;justify-content:space-between;align-items:start;">
-                    <div><div style="font-weight:700;font-size:14px;">${escapeHtml(vm.name)}</div><div style="font-size:11px;color:var(--text-muted);">${vm.bios_type === 'ovmf' ? 'UEFI' : 'BIOS'} · ${vm.os_disk_bus} · ${vm.net_model || 'virtio'}</div></div>
-                    <span style="font-size:10px;padding:2px 8px;border-radius:4px;background:${borderColor}22;color:${borderColor};font-weight:600;">${isRunning ? 'Running' : 'Stopped'}</span>
-                </div>
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:2px;margin-top:8px;font-size:11px;color:var(--text-muted);">
-                    <span>⚡ ${vm.cpus} vCPU</span>
-                    <span>🧠 ${vm.memory_mb} MB</span>
-                    <span>💾 ${vm.disk_size_gb} GB</span>
-                    <span>🌐 ${vm.wolfnet_ip || '-'}</span>
-                    <span>🔄 ${vm.auto_start ? 'Autostart' : 'Manual'}</span>
-                    <span>📡 ${vm.mac_address || '-'}</span>
-                    ${vm.iso_path ? `<span>💿 ${escapeHtml(vm.iso_path.split('/').pop())}</span>` : ''}
-                    ${vm.extra_nics && vm.extra_nics.length > 0 ? `<span>🔌 ${vm.extra_nics.length} extra NIC${vm.extra_nics.length > 1 ? 's' : ''}</span>` : ''}
-                    ${vm.usb_devices && vm.usb_devices.length > 0 ? `<span>🔌 ${vm.usb_devices.length} USB</span>` : ''}
-                    ${vm.pci_devices && vm.pci_devices.length > 0 ? `<span>🎮 ${vm.pci_devices.length} PCI</span>` : ''}
-                </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:2px;margin-top:8px;font-size:11px;color:var(--text-muted);">
+                <span>⚡ ${vm.cpus} vCPU</span>
+                <span>🧠 ${vm.memory_mb} MB</span>
+                <span>💾 ${vm.disk_size_gb} GB</span>
+                <span>🌐 ${vm.wolfnet_ip || '-'}</span>
+                <span>🔄 ${vm.auto_start ? 'Autostart' : 'Manual'}</span>
+                <span>📡 ${vm.mac_address || '-'}</span>
+                ${vm.iso_path ? `<span>💿 ${escapeHtml(vm.iso_path.split('/').pop())}</span>` : ''}
+                ${vm.extra_nics && vm.extra_nics.length > 0 ? `<span>🔌 ${vm.extra_nics.length} extra NIC${vm.extra_nics.length > 1 ? 's' : ''}</span>` : ''}
+                ${vm.usb_devices && vm.usb_devices.length > 0 ? `<span>🔌 ${vm.usb_devices.length} USB</span>` : ''}
+                ${vm.pci_devices && vm.pci_devices.length > 0 ? `<span>🎮 ${vm.pci_devices.length} PCI</span>` : ''}
             </div>
-        </div>`;
-    }).join('');
+        </div>
+    </div>`;
 }
 
 function renderDockerContainers(containers) {
@@ -40805,12 +40803,14 @@ function cpRenderTile(it, rowId, mode) {
     return `
         <div class="cp-tile" ${dragAttrs} data-key="${escapeHtml(cpKey(it))}"
              title="${escapeHtml(it.name)}${it.node_hostname ? ' · ' + escapeHtml(it.node_hostname) : ''} — ${escapeHtml(it.status)}"
+             onclick="cpOpenItemModal('${cpKey(it)}')"
              oncontextmenu="cpContextMenu(event, '${cpKey(it)}'); return false;"
              style="position:relative;flex:0 0 100px;display:flex;flex-direction:column;align-items:center;gap:4px;padding:12px 6px 10px;border-radius:10px;
                     background:${tintBg};backdrop-filter:blur(6px);
                     border:1px solid ${tintBorder};
                     box-shadow:${glow};
-                    ${draggable ? 'cursor:grab;' : ''}">
+                    cursor:pointer;
+                    ${draggable ? '' : ''}">
             <div style="position:relative;font-size:34px;line-height:1;">
                 ${kindBadge}
                 <span style="position:absolute;right:-6px;top:-3px;width:10px;height:10px;border-radius:50%;background:${statusColour};box-shadow:0 0 6px ${statusColour};border:1.5px solid rgba(15,23,42,0.8);"></span>
@@ -40967,6 +40967,132 @@ function cpGoToNode(it) {
                : it.kind === 'lxc'    ? 'lxc'
                : 'vms';
     if (typeof selectServerView === 'function') selectServerView(it.node_id, view);
+}
+
+// ─── Control Panel: single-item control modal ───
+//
+// Left-click on a tile opens a modal with the SAME card as the per-node
+// view's card mode — every action button in that card is wired to the
+// right node because we route currentNodeId to the item's node while
+// the modal is open. Fresh data is fetched once on open, then polled
+// every 10s so status/stats stay current after actions.
+
+let _cpModalState = null; // { savedNodeId, pollTimer, it }
+
+async function cpOpenItemModal(key) {
+    const it = _cpInventory.find(x => cpKey(x) === key);
+    if (!it) return;
+    if (it.pve) {
+        // Proxmox VMs aren't managed through the native vms API; direct
+        // the user to the node view where PVE has its own UI.
+        cpGoToNode(it);
+        return;
+    }
+    if (it._stale) {
+        showToast('Item is stale — no live actions available', 'warn');
+        return;
+    }
+
+    // Save outer state; route API calls to the item's node while open.
+    const savedNodeId = currentNodeId;
+    currentNodeId = it.node_id;
+
+    // Unique grid id avoids clashes with per-node renderers — if a user
+    // clicks an action here, dockerAction/lxcAction schedule a reload
+    // that would otherwise overwrite our single card with the full
+    // list.
+    const gridId = 'cp-modal-grid';
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay active';
+    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:100000;display:flex;align-items:center;justify-content:center;';
+    overlay.innerHTML = `
+        <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;width:min(720px,95vw);max-height:90vh;overflow:auto;box-shadow:0 20px 60px rgba(0,0,0,0.5);">
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid var(--border);">
+                <div>
+                    <div style="font-size:15px;font-weight:600;">${escapeHtml(it.name)}</div>
+                    <div style="font-size:11px;color:var(--text-muted);margin-top:2px;">${it.kind.toUpperCase()} · ${escapeHtml(it.node_hostname || it.node_id)}</div>
+                </div>
+                <div style="display:flex;gap:8px;align-items:center;">
+                    <button class="btn btn-sm" title="Refresh" onclick="cpModalRefresh()">🔄</button>
+                    <button class="btn btn-sm" title="Open full node view" onclick="cpModalGoToNode()">↗</button>
+                    <button class="btn btn-sm" title="Close" onclick="cpCloseItemModal()">✕</button>
+                </div>
+            </div>
+            <div id="cp-modal-status" style="font-size:11px;color:var(--text-muted);padding:6px 18px;border-bottom:1px solid var(--border);">Loading…</div>
+            <div id="${gridId}" style="padding:14px 18px;"></div>
+        </div>
+    `;
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) cpCloseItemModal(); });
+    document.body.appendChild(overlay);
+
+    _cpModalState = { savedNodeId, pollTimer: null, it, overlay, gridId };
+
+    await cpModalRefresh();
+
+    // Tight poll keeps the card fresh after action button clicks
+    // (start/stop/etc.) — a 10s gap was too sluggish for feedback.
+    _cpModalState.pollTimer = setInterval(cpModalRefresh, 3000);
+}
+
+async function cpModalRefresh() {
+    const st = _cpModalState;
+    if (!st) return;
+    const { it, gridId } = st;
+    const statusEl = document.getElementById('cp-modal-status');
+
+    try {
+        if (it.kind === 'docker') {
+            const [cResp, sResp] = await Promise.all([
+                fetch(apiUrl('/api/containers/docker')),
+                fetch(apiUrl('/api/containers/docker/stats')),
+            ]);
+            const containers = await cResp.json();
+            const stats = await sResp.json();
+            dockerStats = {};
+            (Array.isArray(stats) ? stats : []).forEach(s => { dockerStats[s.name] = s; });
+            const c = (Array.isArray(containers) ? containers : []).find(x => x.name === it.name);
+            const grid = document.getElementById(gridId);
+            if (grid) grid.innerHTML = c ? dockerCardHtml(c) : '<div style="color:var(--text-muted);text-align:center;padding:20px;">Container no longer exists on this node.</div>';
+        } else if (it.kind === 'lxc') {
+            const [cResp, sResp] = await Promise.all([
+                fetch(apiUrl('/api/containers/lxc')),
+                fetch(apiUrl('/api/containers/lxc/stats')),
+            ]);
+            const containers = await cResp.json();
+            const statsArr = sResp.ok ? await sResp.json() : [];
+            const stats = {};
+            (Array.isArray(statsArr) ? statsArr : []).forEach(s => { stats[s.name] = s; });
+            const c = (Array.isArray(containers) ? containers : []).find(x => x.name === it.name);
+            const grid = document.getElementById(gridId);
+            if (grid) grid.innerHTML = c ? lxcCardHtml(c, stats[c.name] || {}) : '<div style="color:var(--text-muted);text-align:center;padding:20px;">Container no longer exists on this node.</div>';
+        } else if (it.kind === 'vm') {
+            const resp = await fetch(apiUrl('/api/vms'));
+            const vms = await resp.json();
+            const vm = (Array.isArray(vms) ? vms : []).find(x => x.name === it.name);
+            const grid = document.getElementById(gridId);
+            if (grid) grid.innerHTML = vm ? vmCardHtml(vm) : '<div style="color:var(--text-muted);text-align:center;padding:20px;">VM no longer exists on this node.</div>';
+        }
+        if (statusEl) statusEl.textContent = `Last refreshed ${new Date().toLocaleTimeString()}`;
+    } catch (e) {
+        if (statusEl) statusEl.textContent = 'Failed to refresh: ' + e.message;
+    }
+}
+
+function cpCloseItemModal() {
+    const st = _cpModalState;
+    if (!st) return;
+    if (st.pollTimer) clearInterval(st.pollTimer);
+    if (st.overlay && st.overlay.parentNode) st.overlay.parentNode.removeChild(st.overlay);
+    currentNodeId = st.savedNodeId;
+    _cpModalState = null;
+}
+
+function cpModalGoToNode() {
+    const st = _cpModalState;
+    if (!st) return;
+    const it = st.it;
+    cpCloseItemModal();
+    cpGoToNode(it);
 }
 
 // ─── Drag & drop (Custom mode only) ───
