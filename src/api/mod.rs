@@ -287,12 +287,11 @@ pub fn require_auth(req: &HttpRequest, state: &web::Data<AppState>) -> Result<St
     // Accept internal requests from other WolfStack nodes if they provide the cluster secret
     if let Some(val) = req.headers().get("X-WolfStack-Secret") {
         let provided = val.to_str().unwrap_or("");
-        // Accept: the in-memory secret OR the on-disk secret
+        // Accept: the in-memory secret, the hardcoded default, OR the on-disk secret
         // (covers the window between secret propagation and node restart)
-        // Do NOT accept the hardcoded default as a permanent fallback
-        let on_disk = crate::auth::load_cluster_secret();
         if crate::auth::validate_cluster_secret(provided, &state.cluster_secret)
-            || crate::auth::validate_cluster_secret(provided, &on_disk)
+            || crate::auth::validate_cluster_secret(provided, crate::auth::default_cluster_secret())
+            || crate::auth::validate_cluster_secret(provided, &crate::auth::load_cluster_secret())
         {
             return Ok("cluster-node".to_string());
         }
@@ -365,11 +364,9 @@ pub fn require_cluster_auth(req: &HttpRequest, state: &web::Data<AppState>) -> R
     match req.headers().get("X-WolfStack-Secret") {
         Some(val) => {
             let provided = val.to_str().unwrap_or("");
-            // Accept: the in-memory secret OR the on-disk secret
-            // Do NOT accept the hardcoded default as a permanent fallback
-            let on_disk = crate::auth::load_cluster_secret();
             if crate::auth::validate_cluster_secret(provided, &state.cluster_secret)
-                || crate::auth::validate_cluster_secret(provided, &on_disk)
+                || crate::auth::validate_cluster_secret(provided, crate::auth::default_cluster_secret())
+                || crate::auth::validate_cluster_secret(provided, &crate::auth::load_cluster_secret())
             {
                 Ok(())
             } else {
@@ -1178,60 +1175,6 @@ pub async fn cluster_secret_status(req: HttpRequest, state: web::Data<AppState>)
     }))
 }
 
-/// Try to push a secret to a node via one of its URLs with a specific auth secret.
-/// First attempts with the primary auth secret; if all URLs fail, retries with fallback.
-async fn push_secret_to_node(
-    client: &reqwest::Client,
-    urls: &[String],
-    secret_to_push: &str,
-    primary_auth: &str,
-    fallback_auth: &str,
-) -> (bool, String) {
-    // Try with primary auth secret first
-    for url in urls {
-        match client.post(url)
-            .timeout(std::time::Duration::from_secs(10))
-            .header("X-WolfStack-Secret", primary_auth)
-            .json(&serde_json::json!({ "secret": secret_to_push }))
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                let _ = resp.bytes().await;
-                return (true, String::new());
-            }
-            Ok(resp) => { let _ = resp.bytes().await; }
-            Err(_) => {}
-        }
-    }
-
-    // If primary auth failed on all URLs, retry with fallback (for new/fresh nodes)
-    let mut last_err = String::new();
-    for url in urls {
-        match client.post(url)
-            .timeout(std::time::Duration::from_secs(10))
-            .header("X-WolfStack-Secret", fallback_auth)
-            .json(&serde_json::json!({ "secret": secret_to_push }))
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                let _ = resp.bytes().await;
-                return (true, String::new());
-            }
-            Ok(resp) => {
-                last_err = format!("HTTP {}", resp.status());
-                let _ = resp.bytes().await;
-            }
-            Err(e) => {
-                last_err = format!("{}", e);
-            }
-        }
-    }
-
-    (false, last_err)
-}
-
 /// POST /api/cluster/secret/generate — generate a new cluster secret and propagate to all nodes
 pub async fn cluster_secret_generate(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
@@ -1251,13 +1194,21 @@ pub async fn cluster_secret_generate(req: HttpRequest, state: web::Data<AppState
             continue;
         }
         let urls = build_node_urls(&node.address, node.port, "/api/cluster/secret/receive");
-        let (pushed, err) = push_secret_to_node(
-            client,
-            &urls,
-            &new_secret,
-            &state.cluster_secret,  // Try with current cluster secret first
-            crate::auth::default_cluster_secret(),  // Fallback to default for new nodes
-        ).await;
+        let mut pushed = false;
+        let mut err = String::new();
+        for url in &urls {
+            match client.post(url)
+                .timeout(std::time::Duration::from_secs(10))
+                .header("X-WolfStack-Secret", crate::auth::default_cluster_secret())
+                .json(&serde_json::json!({ "secret": new_secret }))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => { pushed = true; let _ = resp.bytes().await; break; }
+                Ok(resp) => { err = format!("HTTP {}", resp.status()); let _ = resp.bytes().await; }
+                Err(e) => { err = format!("{}", e); }
+            }
+        }
         results.push(serde_json::json!({
             "node": if node.hostname.is_empty() { &node.address } else { &node.hostname },
             "address": node.address,
@@ -1292,13 +1243,21 @@ pub async fn cluster_secret_repush(req: HttpRequest, state: web::Data<AppState>)
             continue;
         }
         let urls = build_node_urls(&node.address, node.port, "/api/cluster/secret/receive");
-        let (pushed, err) = push_secret_to_node(
-            client,
-            &urls,
-            &active,
-            &active,  // Try with current custom secret
-            crate::auth::default_cluster_secret(),  // Fallback to default for new nodes
-        ).await;
+        let mut pushed = false;
+        let mut err = String::new();
+        for url in &urls {
+            match client.post(url)
+                .timeout(std::time::Duration::from_secs(10))
+                .header("X-WolfStack-Secret", crate::auth::default_cluster_secret())
+                .json(&serde_json::json!({ "secret": active }))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => { pushed = true; let _ = resp.bytes().await; break; }
+                Ok(resp) => { err = format!("HTTP {}", resp.status()); let _ = resp.bytes().await; }
+                Err(e) => { err = format!("{}", e); }
+            }
+        }
         results.push(serde_json::json!({
             "node": if node.hostname.is_empty() { &node.address } else { &node.hostname },
             "address": node.address,
