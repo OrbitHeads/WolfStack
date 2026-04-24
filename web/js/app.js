@@ -41004,7 +41004,10 @@ async function cpOpenItemModal(key) {
     const gridId = 'cp-modal-grid';
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay active';
-    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:100000;display:flex;align-items:center;justify-content:center;';
+    // z-index kept below the default .modal-overlay (200) so sub-modals
+    // opened from action buttons (Settings, Logs, etc.) sit above this
+    // instead of behind it.
+    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:150;display:flex;align-items:center;justify-content:center;';
     overlay.innerHTML = `
         <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;width:min(720px,95vw);max-height:90vh;overflow:auto;box-shadow:0 20px 60px rgba(0,0,0,0.5);">
             <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid var(--border);">
