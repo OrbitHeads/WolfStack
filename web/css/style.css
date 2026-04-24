@@ -273,6 +273,41 @@
     --shadow-glow: 0 0 30px rgba(240, 160, 0, 0.15);
 }
 
+/* ─── Obe 1 (Jedi Mentor) Theme ───
+   Obi-Wan's palette: lightsaber blue as the accent against a deep-space
+   background, Jedi-robe parchment for text, Tatooine sand for warnings,
+   Mustafar ember for danger. Calm, balanced, mentor's-eye-view. */
+[data-theme="obe1"] {
+    --bg-primary: #0a0e14;
+    --bg-secondary: #111821;
+    --bg-card: #182330;
+    --bg-card-hover: #1f2d3d;
+    --bg-input: #0b1018;
+    --border: #2a3a52;
+    --border-light: #3f537a;
+    --text-primary: #eae5d3;
+    --text-secondary: #a8b4c8;
+    --text-muted: #6a7890;
+    --accent: #4fa3ff;
+    --accent-light: #7ec0ff;
+    --accent-glow: rgba(79, 163, 255, 0.22);
+    --success: #9be8a8;
+    --success-bg: rgba(155, 232, 168, 0.1);
+    --warning: #f0c060;
+    --warning-bg: rgba(240, 192, 96, 0.1);
+    --danger: #e0503a;
+    --danger-bg: rgba(224, 80, 58, 0.1);
+    --info: #4fa3ff;
+    --info-bg: rgba(79, 163, 255, 0.1);
+    --gradient-main: linear-gradient(135deg, #4fa3ff 0%, #7ec0ff 50%, #c9e4ff 100%);
+    --gradient-success: linear-gradient(135deg, #9be8a8 0%, #c0f0cb 100%);
+    --gradient-danger: linear-gradient(135deg, #e0503a 0%, #f07a5f 100%);
+    --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 4px 20px rgba(0, 0, 0, 0.5);
+    --shadow-lg: 0 10px 40px rgba(0, 0, 0, 0.6);
+    --shadow-glow: 0 0 30px rgba(79, 163, 255, 0.28);
+}
+
 /* ─── Light theme overrides for specific elements ─── */
 [data-theme="light"] .top-bar {
     background: rgba(245, 246, 250, 0.9);
