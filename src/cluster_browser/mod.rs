@@ -14,7 +14,7 @@
 //! Sessions are 1:1 with Docker containers. The container image is
 //! `lscr.io/linuxserver/firefox:latest` (multi-arch, KasmVNC bundled).
 //!
-//! Per-session port: allocated from 33000-33999 so we don't collide
+//! Per-session port: allocated from 33234-33999 so we don't collide
 //! with anything else on the host.
 
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,7 @@ use tracing::{info, warn};
 
 const SESSIONS_FILE: &str = "/etc/wolfstack/cluster-browser-sessions.json";
 const IMAGE: &str = "lscr.io/linuxserver/firefox:latest";
-const PORT_RANGE: std::ops::Range<u16> = 33000..34000;
+const PORT_RANGE: std::ops::Range<u16> = 33234..34000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserSession {
@@ -287,7 +287,7 @@ pub fn start_session(user: &str, homepage: &str, tls: bool) -> Result<BrowserSes
 fn spawn_container(user: &str, homepage: &str, tls: bool) -> Result<BrowserSession, String> {
     let id = random_id();
     let container_name = format!("wolfstack-browser-{}", id);
-    let web_port = allocate_port().ok_or("No free port in 33000-33999 range")?;
+    let web_port = allocate_port().ok_or("No free port in 33234-33999 range")?;
 
     // Per-user persistent profile volume so bookmarks/history/cookies
     // survive across sessions. Sanitise the username for Docker volume
@@ -366,6 +366,24 @@ fn spawn_container(user: &str, homepage: &str, tls: bool) -> Result<BrowserSessi
             "docker run failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
+    }
+
+    // Verify the port is actually reachable on 127.0.0.1 (not blocked by network policies like kube-proxy)
+    // Try a few times since the container might still be starting
+    let mut reachable = false;
+    for attempt in 0..5 {
+        std::thread::sleep(std::time::Duration::from_millis(100 * (attempt + 1)));
+        if std::net::TcpStream::connect(("127.0.0.1", web_port)).is_ok() {
+            reachable = true;
+            break;
+        }
+    }
+    if !reachable {
+        // Port is not reachable — clean up the container and fail
+        let _ = Command::new("docker")
+            .args(&["rm", "-f", &container_name])
+            .output();
+        return Err(format!("Port {} is not reachable on 127.0.0.1 (possible network policy blocking)", web_port));
     }
 
     // The session's scheme follows WolfStack's own — the browser
