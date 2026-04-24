@@ -1206,6 +1206,7 @@ async fn push_secret_to_node(
     }
 
     // If primary auth failed on all URLs, retry with fallback (for new/fresh nodes)
+    let mut last_err = String::new();
     for url in urls {
         match client.post(url)
             .timeout(std::time::Duration::from_secs(10))
@@ -1219,17 +1220,16 @@ async fn push_secret_to_node(
                 return (true, String::new());
             }
             Ok(resp) => {
-                let err = format!("HTTP {}", resp.status());
+                last_err = format!("HTTP {}", resp.status());
                 let _ = resp.bytes().await;
-                return (false, err);
             }
             Err(e) => {
-                return (false, format!("{}", e));
+                last_err = format!("{}", e);
             }
         }
     }
 
-    (false, "All URLs failed".to_string())
+    (false, last_err)
 }
 
 /// POST /api/cluster/secret/generate — generate a new cluster secret and propagate to all nodes
