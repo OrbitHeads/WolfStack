@@ -119,7 +119,11 @@ fn allocate_port() -> Option<u16> {
         .collect();
     for p in PORT_RANGE {
         if used.contains(&p) { continue; }
-        if std::net::TcpListener::bind(("0.0.0.0", p)).is_ok() {
+        // Test both 0.0.0.0 and 127.0.0.1 — on Kubernetes nodes, 0.0.0.0
+        // may bind but 127.0.0.1 is blocked by kube-proxy. We need localhost
+        // to work since the proxy connects via 127.0.0.1 to reach the container.
+        if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok()
+            && std::net::TcpListener::bind(("0.0.0.0", p)).is_ok() {
             return Some(p);
         }
     }

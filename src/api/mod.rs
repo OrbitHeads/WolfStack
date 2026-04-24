@@ -14940,20 +14940,181 @@ pub async fn security_fail2ban_rebuild(
 }
 
 
-/// GET /api/security/fail2ban/config — read jail.local
+/// Parse jail config file into sections and their key-value pairs
+fn parse_jail_config(content: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut sections = serde_json::Map::new();
+    let mut current_section = String::new();
+    let mut current_settings = serde_json::Map::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            // Save previous section if it exists
+            if !current_section.is_empty() && !current_settings.is_empty() {
+                sections.insert(current_section.clone(), serde_json::Value::Object(current_settings.clone()));
+            }
+            current_section = trimmed[1..trimmed.len()-1].to_string();
+            current_settings = serde_json::Map::new();
+        } else if let Some(eq_pos) = trimmed.find('=') {
+            let key = trimmed[..eq_pos].trim().to_string();
+            let value = trimmed[eq_pos+1..].trim().to_string();
+            current_settings.insert(key, serde_json::Value::String(value));
+        }
+    }
+
+    // Save last section
+    if !current_section.is_empty() && !current_settings.is_empty() {
+        sections.insert(current_section, serde_json::Value::Object(current_settings));
+    }
+
+    sections
+}
+
+/// GET /api/security/fail2ban/config — read jail.local with parsed sections
 pub async fn security_fail2ban_config_get(
     _req: HttpRequest,
     state: web::Data<AppState>,
 ) -> HttpResponse {
     if let Err(resp) = require_auth(&_req, &state) { return resp; }
-    let exists = std::path::Path::new("/etc/fail2ban/jail.local").exists();
-    let content = if exists {
+
+    // Read local config
+    let local_exists = std::path::Path::new("/etc/fail2ban/jail.local").exists();
+    let local_content = if local_exists {
         std::fs::read_to_string("/etc/fail2ban/jail.local").unwrap_or_default()
     } else { String::new() };
+    let local_sections = parse_jail_config(&local_content);
+
+    // Read default config for available jails
+    let default_content = std::fs::read_to_string("/etc/fail2ban/jail.conf").unwrap_or_default();
+    let default_sections = parse_jail_config(&default_content);
+
     HttpResponse::Ok().json(serde_json::json!({
-        "exists": exists,
-        "content": content,
+        "exists": local_exists,
+        "content": local_content,
+        "local_sections": local_sections,
+        "default_sections": default_sections,
     }))
+}
+
+/// POST /api/security/fail2ban/section — save a single jail section
+pub async fn security_fail2ban_section_save(
+    _req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<serde_json::Value>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&_req, &state) { return resp; }
+    let section_name = body.get("section").and_then(|v| v.as_str()).unwrap_or("");
+    let settings = body.get("settings").and_then(|v| v.as_object());
+
+    if section_name.is_empty() || settings.is_none() {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Section name and settings required" }));
+    }
+
+    // Read existing jail.local
+    let content = std::fs::read_to_string("/etc/fail2ban/jail.local").unwrap_or_default();
+
+    // Parse into sections
+    let mut current_section = String::new();
+    let mut section_lines: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut section_order = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            if !current_section.is_empty() {
+                section_lines.entry(current_section.clone()).or_insert_with(Vec::new).push(line.to_string());
+            }
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            current_section = trimmed[1..trimmed.len()-1].to_string();
+            if !section_order.contains(&current_section) {
+                section_order.push(current_section.clone());
+            }
+            section_lines.entry(current_section.clone()).or_insert_with(Vec::new).push(line.to_string());
+        } else if !current_section.is_empty() {
+            section_lines.entry(current_section.clone()).or_insert_with(Vec::new).push(line.to_string());
+        }
+    }
+
+    // Update or create section
+    if !section_order.contains(&section_name.to_string()) {
+        section_order.push(section_name.to_string());
+    }
+    let settings_map = settings.unwrap();
+    let mut new_lines = vec![format!("[{}]", section_name)];
+    for (key, val) in settings_map.iter() {
+        if let Some(s) = val.as_str() {
+            new_lines.push(format!("{} = {}", key, s));
+        }
+    }
+    section_lines.insert(section_name.to_string(), new_lines);
+
+    // Reconstruct config
+    let mut new_content = String::new();
+    for section in &section_order {
+        if let Some(lines) = section_lines.get(section) {
+            for line in lines {
+                new_content.push_str(line);
+                new_content.push('\n');
+            }
+            new_content.push('\n');
+        }
+    }
+
+    if let Err(e) = std::fs::write("/etc/fail2ban/jail.local", &new_content) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Failed to write: {}", e) }));
+    }
+
+    match run_shell("systemctl restart fail2ban") {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Err(e) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "warning": format!("Saved but restart failed: {}", e) })),
+    }
+}
+
+/// POST /api/security/fail2ban/section/delete — delete a jail section
+pub async fn security_fail2ban_section_delete(
+    _req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<serde_json::Value>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&_req, &state) { return resp; }
+    let section_name = body.get("section").and_then(|v| v.as_str()).unwrap_or("");
+
+    if section_name.is_empty() || section_name == "DEFAULT" {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Cannot delete DEFAULT section" }));
+    }
+
+    let content = std::fs::read_to_string("/etc/fail2ban/jail.local").unwrap_or_default();
+    let mut new_content = String::new();
+    let mut skip = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            let current = &trimmed[1..trimmed.len()-1];
+            skip = current == section_name;
+            if !skip {
+                new_content.push_str(line);
+                new_content.push('\n');
+            }
+        } else if !skip {
+            new_content.push_str(line);
+            new_content.push('\n');
+        }
+    }
+
+    if let Err(e) = std::fs::write("/etc/fail2ban/jail.local", new_content.trim()) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Failed to write: {}", e) }));
+    }
+
+    match run_shell("systemctl restart fail2ban") {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Err(e) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "warning": format!("Deleted but restart failed: {}", e) })),
+    }
 }
 
 /// POST /api/security/fail2ban/config — save jail.local and restart fail2ban
@@ -20110,6 +20271,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/security/fail2ban/rebuild", web::post().to(security_fail2ban_rebuild))
         .route("/api/security/fail2ban/config", web::get().to(security_fail2ban_config_get))
         .route("/api/security/fail2ban/config", web::post().to(security_fail2ban_config_save))
+        .route("/api/security/fail2ban/section", web::post().to(security_fail2ban_section_save))
+        .route("/api/security/fail2ban/section", web::delete().to(security_fail2ban_section_delete))
         .route("/api/security/fail2ban/unban", web::post().to(security_fail2ban_unban))
         .route("/api/security/ufw/install", web::post().to(security_ufw_install))
         .route("/api/security/ufw/rule", web::post().to(security_ufw_add_rule))
