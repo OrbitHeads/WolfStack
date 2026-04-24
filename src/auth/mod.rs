@@ -231,7 +231,8 @@ pub fn authenticate_user(username: &str, password: &str) -> bool {
 fn verify_password(password: &str, stored_hash: &str) -> bool {
     // Try native C crypt() first — handles all formats
     if let Some(result) = native_crypt(password, stored_hash) {
-        return result == stored_hash;
+        use subtle::ConstantTimeEq;
+        return result.as_bytes().ct_eq(stored_hash.as_bytes()).into();
     }
     // Fallback: pure Rust (needed for statically-linked / musl builds)
     if stored_hash.starts_with("$y$") {

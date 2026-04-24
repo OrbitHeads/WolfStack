@@ -1825,12 +1825,12 @@ fn install_vm(
 
 // ─── Helpers ───
 
-/// Replace ${VAR} placeholders with user input values
+/// Replace ${VAR} placeholders with user input values (shell-escaped for safety)
 fn substitute_inputs(templates: &[String], inputs: &HashMap<String, String>) -> Vec<String> {
     templates.iter().map(|t| {
         let mut result = t.clone();
         for (key, value) in inputs {
-            result = result.replace(&format!("${{{}}}", key), value);
+            result = result.replace(&format!("${{{}}}", key), &shell_escape(value));
         }
         result
     }).collect()

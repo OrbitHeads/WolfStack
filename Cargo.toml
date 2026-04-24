@@ -60,6 +60,7 @@ base64 = "0.22"
 regex = "1"
 urlencoding = "2"
 rand = "0.8"
+subtle = "2"
 sha-crypt = "0.5"
 yescrypt = { version = "0.1.0-rc.5", features = ["password-hash"] }
 lettre = { version = "0.11", features = ["tokio1-rustls-tls", "smtp-transport", "builder"], default-features = false }

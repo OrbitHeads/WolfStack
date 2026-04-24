@@ -72,6 +72,19 @@ async fn drain_response(resp: reqwest::Response) {
 }
 
 /// Build ordered URLs to try for inter-node communication.
+/// Check if an address is blocked for SSRF prevention (loopback, link-local, localhost)
+fn is_ssrf_blocked_address(addr: &str) -> bool {
+    use std::net::IpAddr;
+    // Only block if it parses as a bare IP — hostnames are legitimate
+    if let Ok(ip) = addr.parse::<IpAddr>() {
+        return ip.is_loopback()
+            || matches!(ip, IpAddr::V4(a) if a.octets()[0] == 169 && a.octets()[1] == 254)
+            || matches!(ip, IpAddr::V6(a) if a.is_loopback());
+    }
+    // Reject "localhost" by name too
+    addr.eq_ignore_ascii_case("localhost")
+}
+
 /// Tries: HTTPS on main port, HTTP on internal port (port+1), HTTP on main port.
 /// This ensures both TLS-enabled and HTTP-only nodes are reachable.
 pub fn build_node_urls(address: &str, port: u16, path: &str) -> Vec<String> {
@@ -108,6 +121,11 @@ pub fn build_external_urls(target_url: &str, path: &str) -> Vec<String> {
         }
         None => (host_port, None),
     };
+
+    // SSRF prevention: block loopback and link-local addresses
+    if is_ssrf_blocked_address(host) {
+        return Vec::new();
+    }
 
     let mut urls = Vec::new();
 
@@ -269,11 +287,12 @@ pub fn require_auth(req: &HttpRequest, state: &web::Data<AppState>) -> Result<St
     // Accept internal requests from other WolfStack nodes if they provide the cluster secret
     if let Some(val) = req.headers().get("X-WolfStack-Secret") {
         let provided = val.to_str().unwrap_or("");
-        // Accept: the in-memory secret, the hardcoded default, OR the on-disk secret
+        // Accept: the in-memory secret OR the on-disk secret
         // (covers the window between secret propagation and node restart)
+        // Do NOT accept the hardcoded default as a permanent fallback
+        let on_disk = crate::auth::load_cluster_secret();
         if crate::auth::validate_cluster_secret(provided, &state.cluster_secret)
-            || crate::auth::validate_cluster_secret(provided, crate::auth::default_cluster_secret())
-            || crate::auth::validate_cluster_secret(provided, &crate::auth::load_cluster_secret())
+            || crate::auth::validate_cluster_secret(provided, &on_disk)
         {
             return Ok("cluster-node".to_string());
         }
@@ -346,9 +365,11 @@ pub fn require_cluster_auth(req: &HttpRequest, state: &web::Data<AppState>) -> R
     match req.headers().get("X-WolfStack-Secret") {
         Some(val) => {
             let provided = val.to_str().unwrap_or("");
+            // Accept: the in-memory secret OR the on-disk secret
+            // Do NOT accept the hardcoded default as a permanent fallback
+            let on_disk = crate::auth::load_cluster_secret();
             if crate::auth::validate_cluster_secret(provided, &state.cluster_secret)
-                || crate::auth::validate_cluster_secret(provided, crate::auth::default_cluster_secret())
-                || crate::auth::validate_cluster_secret(provided, &crate::auth::load_cluster_secret())
+                || crate::auth::validate_cluster_secret(provided, &on_disk)
             {
                 Ok(())
             } else {
@@ -1157,6 +1178,60 @@ pub async fn cluster_secret_status(req: HttpRequest, state: web::Data<AppState>)
     }))
 }
 
+/// Try to push a secret to a node via one of its URLs with a specific auth secret.
+/// First attempts with the primary auth secret; if all URLs fail, retries with fallback.
+async fn push_secret_to_node(
+    client: &reqwest::Client,
+    urls: &[String],
+    secret_to_push: &str,
+    primary_auth: &str,
+    fallback_auth: &str,
+) -> (bool, String) {
+    // Try with primary auth secret first
+    for url in urls {
+        match client.post(url)
+            .timeout(std::time::Duration::from_secs(10))
+            .header("X-WolfStack-Secret", primary_auth)
+            .json(&serde_json::json!({ "secret": secret_to_push }))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                let _ = resp.bytes().await;
+                return (true, String::new());
+            }
+            Ok(resp) => { let _ = resp.bytes().await; }
+            Err(_) => {}
+        }
+    }
+
+    // If primary auth failed on all URLs, retry with fallback (for new/fresh nodes)
+    for url in urls {
+        match client.post(url)
+            .timeout(std::time::Duration::from_secs(10))
+            .header("X-WolfStack-Secret", fallback_auth)
+            .json(&serde_json::json!({ "secret": secret_to_push }))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                let _ = resp.bytes().await;
+                return (true, String::new());
+            }
+            Ok(resp) => {
+                let err = format!("HTTP {}", resp.status());
+                let _ = resp.bytes().await;
+                return (false, err);
+            }
+            Err(e) => {
+                return (false, format!("{}", e));
+            }
+        }
+    }
+
+    (false, "All URLs failed".to_string())
+}
+
 /// POST /api/cluster/secret/generate — generate a new cluster secret and propagate to all nodes
 pub async fn cluster_secret_generate(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
@@ -1176,21 +1251,13 @@ pub async fn cluster_secret_generate(req: HttpRequest, state: web::Data<AppState
             continue;
         }
         let urls = build_node_urls(&node.address, node.port, "/api/cluster/secret/receive");
-        let mut pushed = false;
-        let mut err = String::new();
-        for url in &urls {
-            match client.post(url)
-                .timeout(std::time::Duration::from_secs(10))
-                .header("X-WolfStack-Secret", crate::auth::default_cluster_secret())
-                .json(&serde_json::json!({ "secret": new_secret }))
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => { pushed = true; let _ = resp.bytes().await; break; }
-                Ok(resp) => { err = format!("HTTP {}", resp.status()); let _ = resp.bytes().await; }
-                Err(e) => { err = format!("{}", e); }
-            }
-        }
+        let (pushed, err) = push_secret_to_node(
+            client,
+            &urls,
+            &new_secret,
+            &state.cluster_secret,  // Try with current cluster secret first
+            crate::auth::default_cluster_secret(),  // Fallback to default for new nodes
+        ).await;
         results.push(serde_json::json!({
             "node": if node.hostname.is_empty() { &node.address } else { &node.hostname },
             "address": node.address,
@@ -1225,21 +1292,13 @@ pub async fn cluster_secret_repush(req: HttpRequest, state: web::Data<AppState>)
             continue;
         }
         let urls = build_node_urls(&node.address, node.port, "/api/cluster/secret/receive");
-        let mut pushed = false;
-        let mut err = String::new();
-        for url in &urls {
-            match client.post(url)
-                .timeout(std::time::Duration::from_secs(10))
-                .header("X-WolfStack-Secret", crate::auth::default_cluster_secret())
-                .json(&serde_json::json!({ "secret": active }))
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => { pushed = true; let _ = resp.bytes().await; break; }
-                Ok(resp) => { err = format!("HTTP {}", resp.status()); let _ = resp.bytes().await; }
-                Err(e) => { err = format!("{}", e); }
-            }
-        }
+        let (pushed, err) = push_secret_to_node(
+            client,
+            &urls,
+            &active,
+            &active,  // Try with current custom secret
+            crate::auth::default_cluster_secret(),  // Fallback to default for new nodes
+        ).await;
         results.push(serde_json::json!({
             "node": if node.hostname.is_empty() { &node.address } else { &node.hostname },
             "address": node.address,
@@ -1290,6 +1349,13 @@ pub struct AddServerRequest {
 
 pub async fn add_node(req: HttpRequest, state: web::Data<AppState>, body: web::Json<AddServerRequest>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    // SSRF prevention: block loopback and link-local addresses
+    if is_ssrf_blocked_address(&body.address) {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "Node address is not allowed (loopback/link-local)"
+        }));
+    }
 
     let node_type = body.node_type.as_deref().unwrap_or("wolfstack");
 
@@ -9774,6 +9840,17 @@ fn sanitize_file_path(path: &str) -> Result<std::path::PathBuf, String> {
     }
 }
 
+/// Check if a path is sensitive and should not be accessible via the file manager
+fn is_sensitive_path(path: &std::path::Path) -> bool {
+    let s = path.to_string_lossy();
+    s.starts_with("/etc/wolfstack/")
+        || s == "/etc/shadow"
+        || s == "/etc/gshadow"
+        || s.starts_with("/proc/")
+        || s.starts_with("/sys/")
+        || s.starts_with("/root/.ssh/")
+}
+
 /// GET /api/files/browse?path=/some/path — list directory contents
 pub async fn files_browse(
     req: HttpRequest,
@@ -9787,6 +9864,12 @@ pub async fn files_browse(
         Ok(p) => p,
         Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
     };
+
+    if is_sensitive_path(&canonical) {
+        return HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "Access to this path is restricted"
+        }));
+    }
 
     if !canonical.is_dir() {
         return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Not a directory" }));
@@ -9870,6 +9953,12 @@ pub async fn files_mkdir(
         Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
     };
 
+    if is_sensitive_path(&canonical) {
+        return HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "Access to this path is restricted"
+        }));
+    }
+
     match std::fs::create_dir_all(&canonical) {
         Ok(()) => HttpResponse::Ok().json(serde_json::json!({
             "message": format!("Directory created: {}", canonical.display())
@@ -9896,6 +9985,12 @@ pub async fn files_delete(
         Ok(p) => p,
         Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
     };
+
+    if is_sensitive_path(&canonical) {
+        return HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "Access to this path is restricted"
+        }));
+    }
 
     // Prevent deleting critical system paths
     let critical = ["/", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/proc", "/sys", "/dev", "/var", "/root"];
@@ -9941,6 +10036,12 @@ pub async fn files_rename(
         Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
     };
 
+    if is_sensitive_path(&from_path) || is_sensitive_path(&to_path) {
+        return HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "Access to this path is restricted"
+        }));
+    }
+
     match std::fs::rename(&from_path, &to_path) {
         Ok(()) => HttpResponse::Ok().json(serde_json::json!({
             "message": format!("Renamed to {}", to_path.display())
@@ -9978,9 +10079,13 @@ pub async fn files_upload(
             .and_then(|cd| cd.get_filename().map(|s| s.to_string()))
             .unwrap_or_else(|| "upload".to_string());
 
-        // Sanitize filename
-        let safe_name = filename.replace("..", "").replace("/", "").replace("\\", "");
-        if safe_name.is_empty() { continue; }
+        // Sanitize filename — extract only the terminal component (immune to traversal)
+        let safe_name = std::path::Path::new(&filename)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("upload")
+            .to_string();
+        if safe_name.is_empty() || safe_name == "." { continue; }
 
         let file_path = canonical_dir.join(&safe_name);
         let mut file = match std::fs::File::create(&file_path) {
@@ -10025,6 +10130,12 @@ pub async fn files_download(
         Ok(p) => p,
         Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
     };
+
+    if is_sensitive_path(&canonical) {
+        return HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "Access to this path is restricted"
+        }));
+    }
 
     if !canonical.is_file() {
         return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Not a file" }));
@@ -10232,6 +10343,13 @@ pub async fn files_write(
         Ok(p) => p,
         Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
     };
+
+    if is_sensitive_path(&canonical) {
+        return HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "Access to this path is restricted"
+        }));
+    }
+
     if canonical.is_dir() {
         return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Cannot write to a directory" }));
     }
@@ -10468,8 +10586,12 @@ pub async fn files_docker_upload(
             .and_then(|cd| cd.get_filename().map(|s| s.to_string()))
             .unwrap_or_else(|| "upload".to_string());
 
-        let safe_name = filename.replace("..", "").replace("/", "").replace("\\", "");
-        if safe_name.is_empty() { continue; }
+        let safe_name = std::path::Path::new(&filename)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("upload")
+            .to_string();
+        if safe_name.is_empty() || safe_name == "." { continue; }
 
         // Write to a temp file, then docker cp into container
         let tmp = format!("/tmp/wolfstack-docker-ul-{}-{}", std::process::id(), safe_name);
@@ -10822,8 +10944,12 @@ pub async fn files_lxc_upload(
             .and_then(|cd| cd.get_filename().map(|s| s.to_string()))
             .unwrap_or_else(|| "upload".to_string());
 
-        let safe_name = filename.replace("..", "").replace("/", "").replace("\\", "");
-        if safe_name.is_empty() { continue; }
+        let safe_name = std::path::Path::new(&filename)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("upload")
+            .to_string();
+        if safe_name.is_empty() || safe_name == "." { continue; }
 
         // Write to temp file first (avoids buffering large files in memory)
         let tmp = format!("/tmp/wolfstack-lxc-ul-{}-{}", std::process::id(), safe_name);
