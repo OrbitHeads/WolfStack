@@ -376,6 +376,128 @@ fn build_install_script(
         format!("{probe_lines}\n# Last-resort fallback so the user gets *something* on screen\nexec xterm -geometry 120x40")
     };
 
+    // Body of /usr/local/bin/wolfstack-vnc-start. Kept as a separate raw
+    // string and substituted into the install script as a single
+    // placeholder so format!()'s brace-counting doesn't choke on the
+    // shell's `${VAR}` expansions and `function() { … }` bodies.
+    let starter_body = r#"#!/bin/sh
+# Already running?
+if pgrep -f 'Xvnc.*:1|Xtigervnc.*:1' >/dev/null 2>&1; then
+    exit 0
+fi
+export USER=root HOME=/root
+export XDG_RUNTIME_DIR=/run/user/0
+mkdir -p /tmp/.X11-unix /run/user/0 /root/.vnc
+chmod 1777 /tmp/.X11-unix
+chmod 700 /run/user/0
+chown root:root /run/user/0 2>/dev/null || true
+
+# Prefer /var/log when writable, otherwise /tmp.
+if mkdir -p /var/log 2>/dev/null && [ -w /var/log ]; then
+    LOG=/var/log/wolfstack-vnc.log
+else
+    LOG=/tmp/wolfstack-vnc.log
+fi
+HOSTNAME=$(hostname 2>/dev/null || echo localhost)
+echo "--- $(date '+%F %T') wolfstack-vnc-start ---" >>"$LOG"
+
+wait_for_port() {
+    i=0
+    while [ $i -lt 16 ]; do
+        if socat -T 1 /dev/null TCP:127.0.0.1:5901 >/dev/null 2>&1; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 0.3
+    done
+    return 1
+}
+
+cleanup_x1() {
+    rm -f /tmp/.X11-unix/X1 /tmp/.X1-lock 2>/dev/null
+    pkill -f 'Xvnc.*:1|Xtigervnc.*:1' 2>/dev/null
+    sleep 0.3
+}
+
+# The wrapper reads /root/.vnc/config when no CLI flags are given —
+# avoids the version-dependent flag-name churn (-localhost, -localhost yes,
+# -PasswordFile vs -PasswordFile=) that bites different distros.
+cat > /root/.vnc/config <<'CFG_EOF'
+geometry=1280x800
+depth=24
+localhost=yes
+SecurityTypes=VncAuth
+PasswordFile=/root/.vnc/passwd
+session=
+CFG_EOF
+chmod 600 /root/.vnc/config
+
+cleanup_x1
+
+# Strategy 1: TigerVNC Perl wrapper.
+if command -v tigervncserver >/dev/null 2>&1; then
+    echo "[wolfstack-vnc] strategy 1: tigervncserver :1 (config-driven)" >>"$LOG"
+    tigervncserver :1 >>"$LOG" 2>&1
+    if wait_for_port; then exit 0; fi
+    echo "[wolfstack-vnc] strategy 1 failed - tearing down" >>"$LOG"
+    tigervncserver -kill :1 >>"$LOG" 2>&1
+    cleanup_x1
+fi
+if command -v vncserver >/dev/null 2>&1 && ! command -v tigervncserver >/dev/null 2>&1; then
+    echo "[wolfstack-vnc] strategy 1b: vncserver :1 (config-driven)" >>"$LOG"
+    vncserver :1 >>"$LOG" 2>&1
+    if wait_for_port; then exit 0; fi
+    vncserver -kill :1 >>"$LOG" 2>&1
+    cleanup_x1
+fi
+
+# Strategy 2: direct Xvnc + manual xstartup. Bypasses the Perl wrapper
+# entirely - no xauth/cookie shenanigans, no per-distro flag quirks.
+if command -v Xvnc >/dev/null 2>&1; then
+    echo "[wolfstack-vnc] strategy 2: Xvnc direct" >>"$LOG"
+    cleanup_x1
+    Xvnc :1 \
+        -geometry 1280x800 -depth 24 \
+        -rfbport 5901 \
+        -rfbauth /root/.vnc/passwd \
+        -localhost \
+        -SecurityTypes VncAuth \
+        -auth /root/.Xauthority \
+        >>"$LOG" 2>&1 &
+    XVNC_PID=$!
+    sleep 0.5
+    if kill -0 "$XVNC_PID" 2>/dev/null; then
+        # Spawn xstartup against the new display. Detach so it doesn't
+        # block this script; Xvnc keeps running independently.
+        DISPLAY=:1 nohup /root/.vnc/xstartup >>"$LOG" 2>&1 </dev/null &
+        if wait_for_port; then exit 0; fi
+        echo "[wolfstack-vnc] strategy 2: port still not up, killing Xvnc $XVNC_PID" >>"$LOG"
+        kill "$XVNC_PID" 2>/dev/null
+    else
+        echo "[wolfstack-vnc] strategy 2: Xvnc died immediately" >>"$LOG"
+    fi
+fi
+
+# Both strategies failed - dump everything we know to stderr so the
+# operator sees it in the install / connect console.
+echo "wolfstack-vnc-start: FAILED to start VNC on :1" >&2
+echo "--- last 80 lines of $LOG ---" >&2
+tail -n 80 "$LOG" 2>/dev/null >&2 || true
+for f in /root/.vnc/${HOSTNAME}:1.log /root/.vnc/*:1.log; do
+    [ -f "$f" ] || continue
+    echo "--- $f ---" >&2
+    tail -n 80 "$f" >&2
+done
+echo "--- environment ---" >&2
+echo "USER=$USER HOME=$HOME XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >&2
+echo "tigervncserver: $(command -v tigervncserver || echo MISSING)" >&2
+echo "Xvnc:           $(command -v Xvnc || echo MISSING)" >&2
+echo "vncpasswd:      $(command -v vncpasswd || echo MISSING)" >&2
+echo "xauth:          $(command -v xauth || echo MISSING)" >&2
+echo "startxfce4:     $(command -v startxfce4 || echo MISSING)" >&2
+exit 1
+"#;
+
     let common_tail = format!(r#"
 set -e
 export DEBIAN_FRONTEND=noninteractive
@@ -398,43 +520,14 @@ fi
 XSTART_EOF
 chmod 700 /root/.vnc/xstartup
 
-# wolfstack-vnc-start: idempotent VNC :1 starter, used by the bridge
+# wolfstack-vnc-start: idempotent VNC :1 starter, used by the bridge.
+# Two strategies — the TigerVNC Perl wrapper (preferred, runs xstartup
+# automatically) with a config file we wrote so it doesn't need any
+# CLI flags, and a fallback that drives Xvnc directly + spawns xstartup
+# ourselves. The fallback covers the case where the Perl wrapper
+# refuses to start because of distro-specific defaults / xauth quirks.
 cat > /usr/local/bin/wolfstack-vnc-start <<'STARTER_EOF'
-#!/bin/sh
-# Already running?
-if pgrep -f 'Xvnc.*:1|Xtigervnc.*:1' >/dev/null 2>&1; then
-    exit 0
-fi
-export USER=root HOME=/root
-mkdir -p /tmp/.X11-unix
-chmod 1777 /tmp/.X11-unix
-# Prefer /var/log when writable, otherwise /tmp.
-if mkdir -p /var/log 2>/dev/null && [ -w /var/log ]; then
-    LOG=/var/log/wolfstack-vnc.log
-else
-    LOG=/tmp/wolfstack-vnc.log
-fi
-if command -v tigervncserver >/dev/null 2>&1; then
-    tigervncserver :1 -geometry 1280x800 -depth 24 -localhost yes \
-        -SecurityTypes VncAuth -PasswordFile /root/.vnc/passwd >>"$LOG" 2>&1
-elif command -v vncserver >/dev/null 2>&1; then
-    vncserver :1 -geometry 1280x800 -depth 24 -localhost yes \
-        -SecurityTypes VncAuth -PasswordFile /root/.vnc/passwd >>"$LOG" 2>&1
-else
-    echo "wolfstack-vnc-start: no VNC server binary found" >&2
-    exit 1
-fi
-# Wait up to ~3s for port 5901 to accept connections
-i=0
-while [ $i -lt 10 ]; do
-    if socat -T 1 /dev/null TCP:127.0.0.1:5901 >/dev/null 2>&1; then
-        exit 0
-    fi
-    i=$((i + 1))
-    sleep 0.3
-done
-echo "wolfstack-vnc-start: 127.0.0.1:5901 did not come up" >&2
-exit 1
+{starter_body}
 STARTER_EOF
 chmod 755 /usr/local/bin/wolfstack-vnc-start
 

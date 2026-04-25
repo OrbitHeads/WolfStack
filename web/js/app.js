@@ -17538,9 +17538,17 @@ function _showVncInstallModal(runtime, name, displayName, status) {
     // If a desktop is already there, default to VNC-only — otherwise full desktop.
     const recommended = detectedBin ? 'vnc-only' : 'full';
 
+    // LXC images from images.linuxcontainers.org never ship with a
+    // desktop — only "default" (CLI) or "cloud" (cloud-init) variants.
+    // VMs are different: the OS install can put a desktop in there,
+    // and the user reasonably expects it. Tailor the modal copy to
+    // whichever case applies.
+    const isLxc = (runtime === 'lxc' || runtime === 'pct');
     const detectedHtml = detectedBin
         ? `<div style="margin-bottom:6px;color:#10b981;"><strong>✓ Existing desktop detected:</strong> ${escapeHtml(detectedLabel || detectedBin)} <span style="color:var(--text-muted);">(${escapeHtml(detectedBin)})</span></div>`
-        : `<div style="margin-bottom:6px;color:var(--text-muted);">No existing desktop detected — pick "Full Desktop" unless you'll install one yourself.</div>`;
+        : (isLxc
+            ? `<div style="margin-bottom:6px;color:var(--text-muted);">No desktop detected. <strong>LXC template images don't ship with desktops</strong> — only "Full Desktop" gives you one out of the box.</div>`
+            : `<div style="margin-bottom:6px;color:var(--text-muted);">No desktop detected — pick "Full Desktop" unless you'll install one yourself.</div>`);
 
     const cardStyle = (active) =>
         `flex:1;padding:14px;border-radius:8px;cursor:pointer;border:2px solid ${active ? 'var(--accent, #3b82f6)' : 'var(--border)'};background:${active ? 'rgba(59,130,246,0.08)' : 'var(--bg-secondary)'};transition:border-color 0.15s, background 0.15s;`;
