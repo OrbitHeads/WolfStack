@@ -6825,6 +6825,49 @@ pub fn lxc_create(name: &str, distribution: &str, release: &str, architecture: &
         // omits hwaddr, bridge, etc., leaving the container without networking)
         lxc_ensure_network_config(name);
 
+        // Auto-apply systemd compatibility settings for systemd-based images
+        // (Debian Bookworm+, Ubuntu, Linux Mint, Fedora, Rocky, AlmaLinux,
+        // openSUSE, Arch — basically everything except Alpine and Void).
+        // Without these, lxc-start daemonises, then systemd hits an AppArmor
+        // block / missing cgroup mount and the container dies — surfacing
+        // as "did not reach RUNNING (state: STOPPED)" through v20.9.2's
+        // start verifier. The same toggles a user would apply manually
+        // (Settings → Nesting + lxc.apparmor.profile = unconfined).
+        let rootfs = format!("{}/{}/rootfs", base, name);
+        let is_systemd = std::path::Path::new(&format!("{}/lib/systemd/systemd", rootfs)).exists()
+            || std::path::Path::new(&format!("{}/usr/lib/systemd/systemd", rootfs)).exists()
+            || std::fs::read_link(format!("{}/sbin/init", rootfs))
+                .map(|p| p.to_string_lossy().contains("systemd"))
+                .unwrap_or(false);
+        if is_systemd {
+            if let Ok(mut cfg) = std::fs::read_to_string(&cfg_path) {
+                let mut additions: Vec<&str> = Vec::new();
+                if !cfg.contains("nesting.conf") {
+                    additions.push("lxc.include = /usr/share/lxc/config/nesting.conf");
+                }
+                if !cfg.contains("lxc.apparmor.profile") {
+                    // Unconfined is what users converge on after fighting
+                    // the default AppArmor profile with systemd. Container
+                    // isolation still rests on user namespacing + cgroups
+                    // when running unprivileged; AppArmor inside the LXC
+                    // is defence-in-depth.
+                    additions.push("lxc.apparmor.profile = unconfined");
+                }
+                if !cfg.contains("lxc.mount.auto") {
+                    additions.push("lxc.mount.auto = proc:rw sys:rw cgroup:rw");
+                }
+                if !additions.is_empty() {
+                    cfg.push_str("\n# Systemd init compatibility — auto-applied by WolfStack\n");
+                    for line in additions {
+                        cfg.push_str(line);
+                        cfg.push('\n');
+                    }
+                    let _ = std::fs::write(&cfg_path, cfg);
+                    info!("LXC '{}': detected systemd init, applied nesting + apparmor unconfined", name);
+                }
+            }
+        }
+
         let storage_info = storage_path.filter(|p| !p.is_empty() && *p != LXC_DEFAULT_PATH)
             .map(|p| format!(" on {}", p))
             .unwrap_or_default();
