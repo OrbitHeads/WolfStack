@@ -169,11 +169,66 @@ pub struct OsInfo {
     pub version_id: String,    // /etc/os-release VERSION_ID
     pub family: String,        // "debian" | "alpine" | "rhel" | "unknown"
     pub supported: bool,
-    pub packages: Vec<String>, // packages we'd install
-    pub size_estimate_mb: u32, // rough on-disk size
+    pub packages: Vec<String>, // packages we'd install (full-desktop variant)
+    pub size_estimate_mb: u32, // full-desktop install size, rough
+    /// Existing desktop session detected inside the container — drives the
+    /// modal's recommendation (VNC-only when present). Value is the session
+    /// binary command, e.g. "cinnamon-session", or "xfce4-session".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detected_desktop: Option<String>,
+    /// Friendly label for `detected_desktop` (e.g. "Cinnamon").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detected_desktop_label: Option<String>,
+    /// Packages we'd install on the VNC-only path (no DE).
+    pub packages_vnc_only: Vec<String>,
+    /// VNC-only install size.
+    pub size_estimate_mb_vnc_only: u32,
 }
 
-fn classify_os(id: &str, id_like: &str) -> (String, bool, Vec<String>, u32) {
+/// Probe binaries — order matters (Mint defaults first, then Ubuntu, then KDE/etc).
+/// Each tuple is (binary on PATH, friendly label, optional override for the
+/// xstartup exec line — falls back to the binary itself when None).
+const DE_PROBES: &[(&str, &str, Option<&str>)] = &[
+    ("cinnamon-session",   "Cinnamon",  None),
+    ("mate-session",       "MATE",      None),
+    ("gnome-session",      "GNOME",     None),
+    ("startplasma-x11",    "KDE Plasma", None),
+    ("startkde",           "KDE",       None),
+    ("startxfce4",         "XFCE",      None),
+    ("startlxqt",          "LXQt",      None),
+    ("lxsession",          "LXDE",      None),
+    ("openbox-session",    "Openbox",   None),
+    ("fluxbox",            "Fluxbox",   None),
+    ("icewm-session",      "IceWM",     None),
+    ("i3",                 "i3",        Some("i3 --shmlog-size 0")),
+];
+
+/// Inside-container probe — for each candidate session binary, ask `command -v`
+/// and return the first hit with its friendly label.
+fn detect_desktop(runtime: &str, name: &str) -> (Option<String>, Option<String>) {
+    let probe = DE_PROBES.iter()
+        .map(|(bin, _, _)| format!("if command -v {bin} >/dev/null 2>&1; then echo {bin}; exit 0; fi"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    match container_exec(runtime, name, &probe) {
+        Ok((_, stdout, _)) => {
+            let bin = stdout.trim().to_string();
+            if bin.is_empty() {
+                (None, None)
+            } else {
+                let label = DE_PROBES.iter()
+                    .find(|(b, _, _)| *b == bin.as_str())
+                    .map(|(_, l, _)| l.to_string());
+                (Some(bin), label)
+            }
+        }
+        Err(_) => (None, None),
+    }
+}
+
+/// Returns (family, supported, full_desktop_packages, full_size_mb,
+/// vnc_only_packages, vnc_only_size_mb).
+fn classify_os(id: &str, id_like: &str) -> (String, bool, Vec<String>, u32, Vec<String>, u32) {
     let id_l = id.to_lowercase();
     let like_l = id_like.to_lowercase();
     let in_like = |needle: &str| like_l.split_whitespace().any(|w| w == needle);
@@ -192,6 +247,14 @@ fn classify_os(id: &str, id_like: &str) -> (String, bool, Vec<String>, u32) {
                 "fonts-dejavu".into(),
             ],
             450,
+            vec![
+                "tigervnc-standalone-server".into(),
+                "tigervnc-common".into(),
+                "dbus-x11".into(),
+                "socat".into(),
+                "xterm".into(),
+            ],
+            40,
         )
     } else if id_l == "alpine" || in_like("alpine") {
         (
@@ -207,6 +270,13 @@ fn classify_os(id: &str, id_like: &str) -> (String, bool, Vec<String>, u32) {
                 // Alpine ships pgrep via busybox — no separate procps package needed.
             ],
             250,
+            vec![
+                "tigervnc".into(),
+                "dbus-x11".into(),
+                "socat".into(),
+                "xterm".into(),
+            ],
+            30,
         )
     } else if id_l == "rocky" || id_l == "almalinux" || id_l == "rhel"
         || id_l == "centos" || id_l == "fedora"
@@ -227,9 +297,16 @@ fn classify_os(id: &str, id_like: &str) -> (String, bool, Vec<String>, u32) {
                 "dejavu-sans-fonts".into(),
             ],
             500,
+            vec![
+                "tigervnc-server".into(),
+                "dbus-x11".into(),
+                "socat".into(),
+                "xterm".into(),
+            ],
+            45,
         )
     } else {
-        ("unknown".into(), false, Vec::new(), 0)
+        ("unknown".into(), false, Vec::new(), 0, Vec::new(), 0)
     }
 }
 
@@ -246,15 +323,55 @@ fn detect_os(runtime: &str, name: &str) -> Result<OsInfo, String> {
     let id = lines.next().unwrap_or("unknown").trim().to_string();
     let id_like = lines.next().unwrap_or("").trim().to_string();
     let version_id = lines.next().unwrap_or("").trim().to_string();
-    let (family, supported, packages, size_estimate_mb) = classify_os(&id, &id_like);
-    Ok(OsInfo { id, id_like, version_id, family, supported, packages, size_estimate_mb })
+    let (family, supported, packages, size_estimate_mb, packages_vnc_only, size_estimate_mb_vnc_only)
+        = classify_os(&id, &id_like);
+    let (detected_desktop, detected_desktop_label) = detect_desktop(runtime, name);
+    Ok(OsInfo {
+        id, id_like, version_id, family, supported,
+        packages, size_estimate_mb,
+        detected_desktop, detected_desktop_label,
+        packages_vnc_only, size_estimate_mb_vnc_only,
+    })
 }
 
 /// Build the install script. The VNC password is baked into the script
 /// via `vncpasswd -f`. Idempotent: re-running re-installs cleanly.
-fn build_install_script(family: &str, password: &str) -> String {
-    // Common tail — set up xstartup, write vnc password, install start wrapper.
-    // Note: xstartup runs as the VNC user (root here). dbus-launch is best-effort.
+///
+/// `with_desktop = true` installs TigerVNC + XFCE4 and points xstartup at
+/// `startxfce4`. `with_desktop = false` installs TigerVNC + xterm only and
+/// xstartup walks a list of session binaries (cinnamon, mate, gnome, kde,
+/// xfce, lxqt, lxde, openbox, fluxbox, icewm, i3) — falling back to xterm
+/// when none are installed. `detected_desktop` (when present) is preferred
+/// at the head of that list so an existing Cinnamon/MATE/GNOME container
+/// just uses what it has.
+fn build_install_script(
+    family: &str,
+    password: &str,
+    with_desktop: bool,
+    detected_desktop: Option<&str>,
+) -> String {
+    // xstartup body — either always-XFCE4 (with_desktop) or detect-existing.
+    let xstartup_body = if with_desktop {
+        "exec startxfce4".to_string()
+    } else {
+        // List of session binaries to try, in order. Detected one (if any)
+        // goes first so it always wins.
+        let mut probes: Vec<&str> = Vec::new();
+        if let Some(b) = detected_desktop {
+            probes.push(b);
+        }
+        for (bin, _, _) in DE_PROBES {
+            if Some(*bin) != detected_desktop {
+                probes.push(bin);
+            }
+        }
+        let probe_lines = probes.iter()
+            .map(|b| format!("if command -v {b} >/dev/null 2>&1; then exec {b}; fi"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{probe_lines}\n# Last-resort fallback so the user gets *something* on screen\nexec xterm -geometry 120x40")
+    };
+
     let common_tail = format!(r#"
 set -e
 export DEBIAN_FRONTEND=noninteractive
@@ -273,7 +390,7 @@ unset DBUS_SESSION_BUS_ADDRESS
 if command -v dbus-launch >/dev/null 2>&1; then
     eval "$(dbus-launch --sh-syntax)"
 fi
-exec startxfce4
+{xstartup_body}
 XSTART_EOF
 chmod 700 /root/.vnc/xstartup
 
@@ -325,8 +442,8 @@ echo "VNC server is running on display :1 (port 5901, localhost-only)."
 echo "Click the VNC icon on the container card to connect."
 "#);
 
-    let head = match family {
-        "debian" => r#"
+    let head = match (family, with_desktop) {
+        ("debian", true) => r#"
 echo "[wolfstack] Installing TigerVNC + XFCE4 on Debian/Ubuntu container..."
 apt-get update -qq
 apt-get install -y --no-install-recommends \
@@ -335,7 +452,15 @@ apt-get install -y --no-install-recommends \
     dbus-x11 socat fonts-dejavu \
     procps
 "#.to_string(),
-        "alpine" => r#"
+        ("debian", false) => r#"
+echo "[wolfstack] Installing TigerVNC (no desktop) on Debian/Ubuntu container..."
+apt-get update -qq
+apt-get install -y --no-install-recommends \
+    tigervnc-standalone-server tigervnc-common \
+    dbus-x11 socat xterm fonts-dejavu \
+    procps
+"#.to_string(),
+        ("alpine", true) => r#"
 echo "[wolfstack] Installing TigerVNC + XFCE4 on Alpine container..."
 apk update
 # Alpine: busybox already provides pgrep, so no procps needed.
@@ -345,7 +470,14 @@ apk add --no-cache \
     xfce4 xfce4-terminal \
     dbus-x11 socat ttf-dejavu
 "#.to_string(),
-        "rhel" => r#"
+        ("alpine", false) => r#"
+echo "[wolfstack] Installing TigerVNC (no desktop) on Alpine container..."
+apk update
+apk add --no-cache \
+    tigervnc \
+    dbus-x11 socat xterm ttf-dejavu
+"#.to_string(),
+        ("rhel", true) => r#"
 echo "[wolfstack] Installing TigerVNC + XFCE4 on RHEL-family container..."
 if command -v dnf >/dev/null 2>&1; then
     PKG="dnf -y install"
@@ -358,6 +490,19 @@ else
 fi
 $PKG tigervnc-server xfce4-session xfwm4 xfce4-panel xfce4-terminal thunar \
      dbus-x11 socat dejavu-sans-fonts procps-ng
+"#.to_string(),
+        ("rhel", false) => r#"
+echo "[wolfstack] Installing TigerVNC (no desktop) on RHEL-family container..."
+if command -v dnf >/dev/null 2>&1; then
+    PKG="dnf -y install"
+    dnf -y install epel-release 2>/dev/null || true
+elif command -v yum >/dev/null 2>&1; then
+    PKG="yum -y install"
+    yum -y install epel-release 2>/dev/null || true
+else
+    echo "No dnf or yum found"; exit 1
+fi
+$PKG tigervnc-server dbus-x11 socat xterm dejavu-sans-fonts procps-ng
 "#.to_string(),
         _ => return String::new(),
     };
@@ -476,6 +621,15 @@ pub async fn vnc_status(
     })))
 }
 
+/// Body for POST /api/container-vnc/{runtime}/{name}/prepare-install.
+/// `mode` is "full" (install XFCE4) or "vnc-only" (skip the desktop and
+/// reuse whatever's already in the container).
+#[derive(Deserialize, Default)]
+pub struct PrepareInstallRequest {
+    #[serde(default)]
+    pub mode: Option<String>,
+}
+
 /// POST /api/container-vnc/{runtime}/{name}/prepare-install
 ///
 /// Generates+stores a VNC password, writes the install script to /tmp,
@@ -485,10 +639,25 @@ pub async fn vnc_prepare_install(
     req: HttpRequest,
     state: web::Data<AppState>,
     path: web::Path<(String, String)>,
+    body: Option<web::Json<PrepareInstallRequest>>,
 ) -> Result<HttpResponse, Error> {
     if let Err(resp) = super::require_auth(&req, &state) { return Ok(resp); }
     let (runtime, name) = path.into_inner();
     if let Err(resp) = validate_target(&runtime, &name) { return Ok(resp); }
+
+    let mode = body
+        .as_ref()
+        .and_then(|b| b.mode.clone())
+        .unwrap_or_else(|| "full".to_string());
+    let with_desktop = match mode.as_str() {
+        "full" => true,
+        "vnc-only" => false,
+        _ => {
+            return Ok(HttpResponse::BadRequest().json(serde_json::json!({
+                "error": "mode must be 'full' or 'vnc-only'",
+            })));
+        }
+    };
 
     let os = match detect_os(&runtime, &name) {
         Ok(o) => o,
@@ -513,7 +682,12 @@ pub async fn vnc_prepare_install(
         }
     };
 
-    let script = build_install_script(&os.family, &password);
+    let script = build_install_script(
+        &os.family,
+        &password,
+        with_desktop,
+        os.detected_desktop.as_deref(),
+    );
     if script.is_empty() {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({
             "error": "Internal: empty install script for supported OS",

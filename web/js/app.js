@@ -17527,26 +17527,52 @@ function _showVncInstallModal(runtime, name, displayName, status) {
         showToast(`VNC install does not support OS "${os.id || 'unknown'}". Supported: Debian/Ubuntu, Alpine, RHEL/Rocky/Fedora.`, 'error');
         return;
     }
-    const pkgs = (os.packages || []).map(p => `<code style="background:var(--bg-tertiary);padding:1px 6px;border-radius:3px;font-size:12px;margin:2px;display:inline-block;">${escapeHtml(p)}</code>`).join(' ');
-    const sizeMb = os.size_estimate_mb || '?';
+    const pkgsFull = (os.packages || []).map(p =>
+        `<code style="background:var(--bg-tertiary);padding:1px 6px;border-radius:3px;font-size:12px;margin:2px;display:inline-block;">${escapeHtml(p)}</code>`).join(' ');
+    const pkgsVnc = (os.packages_vnc_only || []).map(p =>
+        `<code style="background:var(--bg-tertiary);padding:1px 6px;border-radius:3px;font-size:12px;margin:2px;display:inline-block;">${escapeHtml(p)}</code>`).join(' ');
+    const sizeFull = os.size_estimate_mb || '?';
+    const sizeVnc = os.size_estimate_mb_vnc_only || '?';
+    const detectedLabel = os.detected_desktop_label || null;
+    const detectedBin = os.detected_desktop || null;
+    // If a desktop is already there, default to VNC-only — otherwise full desktop.
+    const recommended = detectedBin ? 'vnc-only' : 'full';
 
-    // Modal markup (self-contained, no shared modal component dependency)
+    const detectedHtml = detectedBin
+        ? `<div style="margin-bottom:6px;color:#10b981;"><strong>✓ Existing desktop detected:</strong> ${escapeHtml(detectedLabel || detectedBin)} <span style="color:var(--text-muted);">(${escapeHtml(detectedBin)})</span></div>`
+        : `<div style="margin-bottom:6px;color:var(--text-muted);">No existing desktop detected — pick "Full Desktop" unless you'll install one yourself.</div>`;
+
+    const cardStyle = (active) =>
+        `flex:1;padding:14px;border-radius:8px;cursor:pointer;border:2px solid ${active ? 'var(--accent, #3b82f6)' : 'var(--border)'};background:${active ? 'rgba(59,130,246,0.08)' : 'var(--bg-secondary)'};transition:border-color 0.15s, background 0.15s;`;
+
     const overlay = document.createElement('div');
     overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:10000;display:flex;align-items:center;justify-content:center;';
     overlay.innerHTML = `
-        <div style="background:var(--bg-primary);border:1px solid var(--border);border-radius:10px;max-width:640px;width:90%;padding:20px;color:var(--text);">
-            <h3 style="margin:0 0 12px;">Install VNC desktop in ${escapeHtml(displayName || name)}</h3>
-            <p style="margin:0 0 12px;color:var(--text-secondary);font-size:14px;">
-                A VNC server isn't installed in this ${runtime === 'docker' ? 'container' : (runtime === 'pct' ? 'Proxmox LXC' : 'LXC container')} yet.
+        <div style="background:var(--bg-primary);border:1px solid var(--border);border-radius:10px;max-width:720px;width:92%;padding:20px;color:var(--text);">
+            <h3 style="margin:0 0 8px;">Install VNC into ${escapeHtml(displayName || name)}</h3>
+            <p style="margin:0 0 14px;color:var(--text-secondary);font-size:13px;">
                 A console will open and run the install live so you can watch.
             </p>
-            <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:10px 12px;margin-bottom:12px;font-size:13px;">
-                <div style="margin-bottom:6px;"><strong>Detected OS:</strong> ${escapeHtml(os.id || 'unknown')}${os.version_id ? ' ' + escapeHtml(os.version_id) : ''} <span style="color:var(--text-muted);">(family: ${escapeHtml(os.family || '?')})</span></div>
-                <div style="margin-bottom:6px;"><strong>Estimated install size:</strong> ~${sizeMb} MB</div>
-                <div><strong>Packages:</strong><br><div style="margin-top:4px;">${pkgs}</div></div>
+            <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:10px 12px;margin-bottom:14px;font-size:13px;">
+                <div style="margin-bottom:6px;"><strong>OS:</strong> ${escapeHtml(os.id || 'unknown')}${os.version_id ? ' ' + escapeHtml(os.version_id) : ''} <span style="color:var(--text-muted);">(${escapeHtml(os.family || '?')})</span></div>
+                ${detectedHtml}
             </div>
-            <p style="font-size:12px;color:var(--text-muted);margin:0 0 16px;">
-                Includes TigerVNC + XFCE4 desktop + socat. A random 8-char password is generated and stored locally.
+            <div style="display:flex;gap:10px;margin-bottom:14px;" id="vnc-mode-row">
+                <div data-mode="full" style="${cardStyle(recommended === 'full')}">
+                    <div style="font-weight:700;font-size:14px;margin-bottom:4px;">Full Desktop</div>
+                    <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">TigerVNC + XFCE4 — for containers without a desktop. ~${sizeFull} MB.</div>
+                    <div style="font-size:11px;">${pkgsFull}</div>
+                    ${recommended === 'full' ? '<div style="margin-top:8px;color:#3b82f6;font-size:11px;font-weight:700;">RECOMMENDED</div>' : ''}
+                </div>
+                <div data-mode="vnc-only" style="${cardStyle(recommended === 'vnc-only')}">
+                    <div style="font-weight:700;font-size:14px;margin-bottom:4px;">VNC Only</div>
+                    <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">${detectedBin ? `Use the existing <strong>${escapeHtml(detectedLabel || detectedBin)}</strong> desktop` : 'Skip the desktop install — bring your own'}. ~${sizeVnc} MB.</div>
+                    <div style="font-size:11px;">${pkgsVnc}</div>
+                    ${recommended === 'vnc-only' ? '<div style="margin-top:8px;color:#3b82f6;font-size:11px;font-weight:700;">RECOMMENDED</div>' : ''}
+                </div>
+            </div>
+            <p style="font-size:11px;color:var(--text-muted);margin:0 0 14px;">
+                A random 8-char VNC password is generated and stored locally on the WolfStack node.
             </p>
             <div style="display:flex;gap:8px;justify-content:flex-end;">
                 <button class="btn" id="vnc-install-cancel" style="background:var(--bg-tertiary);">Cancel</button>
@@ -17554,18 +17580,32 @@ function _showVncInstallModal(runtime, name, displayName, status) {
             </div>
         </div>`;
     document.body.appendChild(overlay);
+
+    let chosen = recommended;
+    const cards = overlay.querySelectorAll('#vnc-mode-row > [data-mode]');
+    cards.forEach(card => {
+        card.onclick = () => {
+            chosen = card.getAttribute('data-mode');
+            cards.forEach(c => c.style.cssText = cardStyle(c.getAttribute('data-mode') === chosen));
+        };
+    });
+
     overlay.querySelector('#vnc-install-cancel').onclick = () => overlay.remove();
     overlay.querySelector('#vnc-install-go').onclick = async () => {
         overlay.remove();
-        await _runVncInstall(runtime, name, displayName);
+        await _runVncInstall(runtime, name, displayName, chosen);
     };
 }
 
-async function _runVncInstall(runtime, name, displayName) {
+async function _runVncInstall(runtime, name, displayName, mode) {
     activityStart();
     try {
         const prepUrl = apiUrl(`/api/container-vnc/${runtime}/${encodeURIComponent(name)}/prepare-install`);
-        const r = await fetch(prepUrl, { method: 'POST' });
+        const r = await fetch(prepUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode: mode || 'full' }),
+        });
         const data = await r.json();
         if (!r.ok) {
             showToast(data.error || 'Failed to prepare VNC install', 'error');
