@@ -7,7 +7,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WolfStack — VM Console</title>
+    <title>WolfStack — VNC Console</title>
     <script src="https://esm.sh/@novnc/novnc@1.4.0/lib/rfb.js" type="module"></script>
     <style>
         * {
@@ -117,7 +117,7 @@
 
 <body>
     <div class="toolbar">
-        <h3 id="vm-name">VM Console</h3>
+        <h3 id="vm-name">VNC Console</h3>
         <span id="status-badge" class="badge disconnected">Connecting...</span>
         <div class="spacer"></div>
         <button onclick="sendCtrlAltDel()" class="ctrl-alt-del" title="Send Ctrl+Alt+Del">Ctrl+Alt+Del</button>
@@ -130,7 +130,7 @@
     <div id="vnc-container" style="position: relative;">
         <div class="status-overlay" id="status-overlay">
             <div class="spinner"></div>
-            <p>Connecting to VM console...</p>
+            <p>Connecting to VNC console...</p>
         </div>
     </div>
 
@@ -145,7 +145,7 @@
         const vncTicket = params.get('ticket') || '';
 
         document.getElementById('vm-name').textContent = vmName;
-        document.title = `${vmName} — VM Console`;
+        document.title = `${vmName} — VNC Console`;
 
         let rfb = null;
         window.rfb = null; // expose for VR terminal access

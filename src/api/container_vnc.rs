@@ -161,6 +161,16 @@ fn container_exec(runtime: &str, name: &str, shell_cmd: &str) -> Result<(i32, St
     ))
 }
 
+/// One desktop environment offering for the install-modal dropdown.
+#[derive(Debug, Clone, Serialize)]
+pub struct DesktopChoice {
+    pub id: String,             // "xfce", "mate", "lxqt", "kde", "gnome", "cinnamon"
+    pub label: String,          // human-friendly name shown in the dropdown
+    pub size_mb: u32,           // rough on-disk install footprint
+    pub session_binary: String, // command run by xstartup
+    pub packages: Vec<String>,  // packages installed on top of the VNC base
+}
+
 /// Detected OS family and the package manager / install commands we'll use.
 #[derive(Debug, Clone, Serialize)]
 pub struct OsInfo {
@@ -169,8 +179,8 @@ pub struct OsInfo {
     pub version_id: String,    // /etc/os-release VERSION_ID
     pub family: String,        // "debian" | "alpine" | "rhel" | "unknown"
     pub supported: bool,
-    pub packages: Vec<String>, // packages we'd install (full-desktop variant)
-    pub size_estimate_mb: u32, // full-desktop install size, rough
+    pub packages: Vec<String>, // packages we'd install (default = XFCE full-desktop)
+    pub size_estimate_mb: u32, // full-desktop install size, rough (XFCE)
     /// Existing desktop session detected inside the container — drives the
     /// modal's recommendation (VNC-only when present). Value is the session
     /// binary command, e.g. "cinnamon-session", or "xfce4-session".
@@ -183,6 +193,100 @@ pub struct OsInfo {
     pub packages_vnc_only: Vec<String>,
     /// VNC-only install size.
     pub size_estimate_mb_vnc_only: u32,
+    /// Per-OS-family desktop catalogue for the install modal dropdown.
+    /// First entry is the default (XFCE — lightest, most reliable in LXC).
+    pub available_desktops: Vec<DesktopChoice>,
+}
+
+/// Catalogue of desktop options per OS family. First entry is the default.
+/// Sizes are rough — actual install size depends on what's already there.
+fn available_desktops(family: &str) -> Vec<DesktopChoice> {
+    match family {
+        "debian" => vec![
+            DesktopChoice {
+                id: "xfce".into(), label: "XFCE 4 (lightweight, recommended)".into(),
+                size_mb: 450, session_binary: "startxfce4".into(),
+                packages: vec!["xfce4".into(), "xfce4-terminal".into()],
+            },
+            DesktopChoice {
+                id: "mate".into(), label: "MATE".into(),
+                size_mb: 600, session_binary: "mate-session".into(),
+                packages: vec!["mate-desktop-environment-core".into(), "mate-terminal".into()],
+            },
+            DesktopChoice {
+                id: "lxqt".into(), label: "LXQt (very lightweight)".into(),
+                size_mb: 350, session_binary: "startlxqt".into(),
+                packages: vec!["lxqt-core".into(), "qterminal".into()],
+            },
+            DesktopChoice {
+                id: "cinnamon".into(), label: "Cinnamon".into(),
+                size_mb: 700, session_binary: "cinnamon-session".into(),
+                packages: vec!["cinnamon-desktop-environment".into()],
+            },
+            DesktopChoice {
+                id: "kde".into(), label: "KDE Plasma".into(),
+                size_mb: 1500, session_binary: "startplasma-x11".into(),
+                packages: vec!["kde-plasma-desktop".into(), "konsole".into()],
+            },
+            DesktopChoice {
+                id: "gnome".into(), label: "GNOME".into(),
+                size_mb: 1800, session_binary: "gnome-session".into(),
+                packages: vec!["gnome-session".into(), "gnome-terminal".into()],
+            },
+        ],
+        "alpine" => vec![
+            DesktopChoice {
+                id: "xfce".into(), label: "XFCE 4 (lightweight, recommended)".into(),
+                size_mb: 250, session_binary: "startxfce4".into(),
+                packages: vec!["xfce4".into(), "xfce4-terminal".into()],
+            },
+            DesktopChoice {
+                id: "mate".into(), label: "MATE".into(),
+                size_mb: 400, session_binary: "mate-session".into(),
+                packages: vec!["mate-desktop".into(), "mate-terminal".into()],
+            },
+            DesktopChoice {
+                id: "lxqt".into(), label: "LXQt (very lightweight)".into(),
+                size_mb: 300, session_binary: "startlxqt".into(),
+                packages: vec!["lxqt".into()],
+            },
+            DesktopChoice {
+                id: "kde".into(), label: "KDE Plasma".into(),
+                size_mb: 1000, session_binary: "startplasma-x11".into(),
+                packages: vec!["plasma-desktop".into()],
+            },
+        ],
+        "rhel" => vec![
+            DesktopChoice {
+                id: "xfce".into(), label: "XFCE 4 (lightweight, recommended)".into(),
+                size_mb: 500, session_binary: "startxfce4".into(),
+                packages: vec![
+                    "xfce4-session".into(), "xfwm4".into(), "xfce4-panel".into(),
+                    "xfce4-terminal".into(), "thunar".into(),
+                ],
+            },
+            DesktopChoice {
+                id: "mate".into(), label: "MATE".into(),
+                size_mb: 700, session_binary: "mate-session".into(),
+                packages: vec!["mate-session-manager".into(), "mate-panel".into(), "mate-terminal".into(), "caja".into()],
+            },
+            DesktopChoice {
+                id: "kde".into(), label: "KDE Plasma".into(),
+                size_mb: 1200, session_binary: "startplasma-x11".into(),
+                packages: vec!["plasma-workspace".into(), "konsole".into()],
+            },
+            DesktopChoice {
+                id: "gnome".into(), label: "GNOME".into(),
+                size_mb: 2000, session_binary: "gnome-session".into(),
+                packages: vec!["gnome-session".into(), "gnome-terminal".into()],
+            },
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn lookup_desktop(family: &str, id: &str) -> Option<DesktopChoice> {
+    available_desktops(family).into_iter().find(|d| d.id == id)
 }
 
 /// Probe binaries — order matters (Mint defaults first, then Ubuntu, then KDE/etc).
@@ -330,11 +434,13 @@ fn detect_os(runtime: &str, name: &str) -> Result<OsInfo, String> {
     let (family, supported, packages, size_estimate_mb, packages_vnc_only, size_estimate_mb_vnc_only)
         = classify_os(&id, &id_like);
     let (detected_desktop, detected_desktop_label) = detect_desktop(runtime, name);
+    let desktops = available_desktops(&family);
     Ok(OsInfo {
         id, id_like, version_id, family, supported,
         packages, size_estimate_mb,
         detected_desktop, detected_desktop_label,
         packages_vnc_only, size_estimate_mb_vnc_only,
+        available_desktops: desktops,
     })
 }
 
@@ -353,10 +459,39 @@ fn build_install_script(
     password: &str,
     with_desktop: bool,
     detected_desktop: Option<&str>,
+    desktop_id: Option<&str>,
 ) -> String {
-    // xstartup body — either always-XFCE4 (with_desktop) or detect-existing.
-    let xstartup_body = if with_desktop {
-        "exec startxfce4".to_string()
+    // Resolve the chosen desktop (when full-desktop mode). Default to "xfce".
+    let chosen = if with_desktop {
+        let id = desktop_id.unwrap_or("xfce");
+        lookup_desktop(family, id).or_else(|| lookup_desktop(family, "xfce"))
+    } else {
+        None
+    };
+
+    // xstartup body — chosen desktop's session binary (with_desktop), or
+    // detect-existing fallback list (vnc-only).
+    //
+    // GNOME / KDE refuse to run as root. xstartup is invoked by Xvnc as
+    // root (LXC containers' init), so for those desktops we su to the
+    // admin user we created earlier. XFCE / MATE / LXQt / Cinnamon /
+    // Openbox / Fluxbox / IceWM all run fine as root, so the cheap
+    // session_binary path is fine.
+    let needs_drop_privs = chosen.as_ref()
+        .map(|d| matches!(d.id.as_str(), "gnome" | "kde"))
+        .unwrap_or(false);
+    let xstartup_body = if let Some(ref d) = chosen {
+        if needs_drop_privs {
+            format!(
+                "if [ \"$(id -u)\" = \"0\" ] && id admin >/dev/null 2>&1; then\n    \
+                    exec su - admin -c 'DISPLAY=:1 dbus-launch --exit-with-session {}'\n\
+                fi\n\
+                exec {}",
+                d.session_binary, d.session_binary
+            )
+        } else {
+            format!("exec {}", d.session_binary)
+        }
     } else {
         // List of session binaries to try, in order. Detected one (if any)
         // goes first so it always wins.
@@ -531,66 +666,93 @@ cat > /usr/local/bin/wolfstack-vnc-start <<'STARTER_EOF'
 STARTER_EOF
 chmod 755 /usr/local/bin/wolfstack-vnc-start
 
+# Create an 'admin' user with password 'admin' so the user has somewhere to
+# log in (SSH, su from the VNC terminal, or for desktops that refuse to run
+# as root like Chromium and modern GNOME). Idempotent — skipped if already
+# exists. Added to sudo (Debian/Ubuntu) / wheel (RHEL) / nothing (Alpine).
+if ! id admin >/dev/null 2>&1; then
+    # Alpine ships only busybox adduser by default; useradd / chpasswd /
+    # usermod live in the 'shadow' package. Pull it in transparently.
+    if [ -f /etc/alpine-release ] && ! command -v useradd >/dev/null 2>&1; then
+        apk add --no-cache shadow >/dev/null 2>&1 || true
+    fi
+    if command -v useradd >/dev/null 2>&1; then
+        useradd -m -s /bin/bash admin 2>/dev/null \
+            || useradd -m admin 2>/dev/null \
+            || true
+    elif command -v adduser >/dev/null 2>&1; then
+        adduser -D -s /bin/sh admin 2>/dev/null || true
+    fi
+    # Best-effort sudo membership — sudo group on Debian/Ubuntu, wheel on RHEL.
+    usermod -aG sudo admin 2>/dev/null \
+        || usermod -aG wheel admin 2>/dev/null \
+        || true
+    if command -v chpasswd >/dev/null 2>&1; then
+        echo 'admin:admin' | chpasswd 2>/dev/null || true
+    fi
+fi
+
 echo
-echo "=== VNC desktop installed. ==="
+echo "================================================================"
+echo "  VNC install complete."
+echo "================================================================"
 echo "Starting VNC server now to verify..."
-/usr/local/bin/wolfstack-vnc-start
-echo "VNC server is running on display :1 (port 5901, localhost-only)."
-echo "Click the VNC icon on the container card to connect."
+echo
+if /usr/local/bin/wolfstack-vnc-start; then
+    echo "VNC server is running on display :1 (port 5901, localhost-only)."
+fi
+echo
+echo "================================================================"
+echo "  >>> RESTART THIS CONTAINER NOW <<<"
+echo "================================================================"
+echo "  Stop and Start the container in WolfStack, then click the VNC"
+echo "  icon. Newly-installed desktop packages register dbus services"
+echo "  and users that the running systemd hasn't picked up — a clean"
+echo "  boot wires everything together properly."
+echo "================================================================"
+echo
+echo "After restart:"
+echo "  - Click the green VNC icon on this container's card."
+echo "  - Login on the desktop with:  admin / admin"
+echo "    (change anytime with:  passwd admin)"
+echo
 "#);
 
-    let head = match (family, with_desktop) {
-        ("debian", true) => r#"
-echo "[wolfstack] Installing TigerVNC + XFCE4 on Debian/Ubuntu container..."
+    // Extra packages line: chosen desktop's packages OR xterm (vnc-only).
+    let extra_pkgs = if let Some(ref d) = chosen {
+        d.packages.join(" ")
+    } else {
+        // VNC-only: just give the user a fallback terminal.
+        "xterm".into()
+    };
+    let label_suffix = chosen.as_ref()
+        .map(|d| format!(" + {}", d.label))
+        .unwrap_or_else(|| " (no desktop)".to_string());
+
+    let head = match family {
+        "debian" => format!(r#"
+echo "[wolfstack] Installing TigerVNC{label_suffix} on Debian/Ubuntu container..."
 apt-get update -qq
 # tigervnc-tools provides vncpasswd (separate package on Debian/Ubuntu).
 apt-get install -y --no-install-recommends \
     tigervnc-standalone-server tigervnc-common tigervnc-tools \
-    xfce4 xfce4-terminal \
-    dbus-x11 socat fonts-dejavu \
-    procps
-"#.to_string(),
-        ("debian", false) => r#"
-echo "[wolfstack] Installing TigerVNC (no desktop) on Debian/Ubuntu container..."
-apt-get update -qq
-apt-get install -y --no-install-recommends \
-    tigervnc-standalone-server tigervnc-common tigervnc-tools \
+    {extra_pkgs} \
     dbus-x11 socat xterm fonts-dejavu \
     procps
-"#.to_string(),
-        ("alpine", true) => r#"
-echo "[wolfstack] Installing TigerVNC + XFCE4 on Alpine container..."
+"#, label_suffix = label_suffix, extra_pkgs = extra_pkgs),
+
+        "alpine" => format!(r#"
+echo "[wolfstack] Installing TigerVNC{label_suffix} on Alpine container..."
 apk update
 # Alpine: busybox already provides pgrep, so no procps needed.
-# 'xfce4' is the metapackage on community repo; xfce4-terminal is separate.
 apk add --no-cache \
     tigervnc \
-    xfce4 xfce4-terminal \
-    dbus-x11 socat ttf-dejavu
-"#.to_string(),
-        ("alpine", false) => r#"
-echo "[wolfstack] Installing TigerVNC (no desktop) on Alpine container..."
-apk update
-apk add --no-cache \
-    tigervnc \
+    {extra_pkgs} \
     dbus-x11 socat xterm ttf-dejavu
-"#.to_string(),
-        ("rhel", true) => r#"
-echo "[wolfstack] Installing TigerVNC + XFCE4 on RHEL-family container..."
-if command -v dnf >/dev/null 2>&1; then
-    PKG="dnf -y install"
-    dnf -y install epel-release 2>/dev/null || true
-elif command -v yum >/dev/null 2>&1; then
-    PKG="yum -y install"
-    yum -y install epel-release 2>/dev/null || true
-else
-    echo "No dnf or yum found"; exit 1
-fi
-$PKG tigervnc-server tigervnc xfce4-session xfwm4 xfce4-panel xfce4-terminal thunar \
-     dbus-x11 socat dejavu-sans-fonts procps-ng
-"#.to_string(),
-        ("rhel", false) => r#"
-echo "[wolfstack] Installing TigerVNC (no desktop) on RHEL-family container..."
+"#, label_suffix = label_suffix, extra_pkgs = extra_pkgs),
+
+        "rhel" => format!(r#"
+echo "[wolfstack] Installing TigerVNC{label_suffix} on RHEL-family container..."
 if command -v dnf >/dev/null 2>&1; then
     PKG="dnf -y install"
     dnf -y install epel-release 2>/dev/null || true
@@ -601,8 +763,11 @@ else
     echo "No dnf or yum found"; exit 1
 fi
 # tigervnc client package provides vncpasswd on RHEL family.
-$PKG tigervnc-server tigervnc dbus-x11 socat xterm dejavu-sans-fonts procps-ng
-"#.to_string(),
+$PKG tigervnc-server tigervnc \
+     {extra_pkgs} \
+     dbus-x11 socat xterm dejavu-sans-fonts procps-ng
+"#, label_suffix = label_suffix, extra_pkgs = extra_pkgs),
+
         _ => return String::new(),
     };
 
@@ -721,12 +886,17 @@ pub async fn vnc_status(
 }
 
 /// Body for POST /api/container-vnc/{runtime}/{name}/prepare-install.
-/// `mode` is "full" (install XFCE4) or "vnc-only" (skip the desktop and
-/// reuse whatever's already in the container).
+/// `mode` is "full" (install a desktop) or "vnc-only" (no desktop —
+/// reuse whatever's in the container, fall back to xterm). `desktop`
+/// picks which DE to install when mode == "full"; one of the ids in
+/// `OsInfo.available_desktops` (xfce / mate / lxqt / cinnamon / kde /
+/// gnome). Defaults to "xfce" — lightest, most reliable in LXC.
 #[derive(Deserialize, Default)]
 pub struct PrepareInstallRequest {
     #[serde(default)]
     pub mode: Option<String>,
+    #[serde(default)]
+    pub desktop: Option<String>,
 }
 
 /// POST /api/container-vnc/{runtime}/{name}/prepare-install
@@ -781,11 +951,13 @@ pub async fn vnc_prepare_install(
         }
     };
 
+    let desktop_id = body.as_ref().and_then(|b| b.desktop.clone());
     let script = build_install_script(
         &os.family,
         &password,
         with_desktop,
         os.detected_desktop.as_deref(),
+        desktop_id.as_deref(),
     );
     if script.is_empty() {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({
@@ -874,11 +1046,36 @@ pub async fn container_vnc_ws(
         })));
     }
 
-    // Bridge command: ensure server is up, then socat stdio ↔ TCP 127.0.0.1:5901
-    // exec so socat replaces the shell — clean process tree, signals propagate.
-    const BRIDGE_CMD: &str = "/usr/local/bin/wolfstack-vnc-start >/dev/null 2>&1 || \
-                              { echo 'wolfstack-vnc-start failed' >&2; exit 1; }; \
-                              exec socat STDIO TCP:127.0.0.1:5901";
+    // Pre-flight: run wolfstack-vnc-start synchronously so we can
+    // capture its full diagnostic output and surface it to the user as
+    // an HTTP 502 instead of a hung WebSocket. Previously the bridge
+    // command swallowed stderr to /dev/null; if Strategy 1 + Strategy 2
+    // both failed inside the container, the WS connected and just sat
+    // there with no bytes flowing — the user saw "Connecting..." forever.
+    let pre_cmd = "/usr/local/bin/wolfstack-vnc-start 2>&1";
+    match container_exec(&runtime, &name, pre_cmd) {
+        Ok((0, _, _)) => { /* up — proceed to bridge */ }
+        Ok((rc, stdout, stderr)) => {
+            let mut detail = stdout;
+            if !stderr.is_empty() {
+                if !detail.is_empty() { detail.push('\n'); }
+                detail.push_str(&stderr);
+            }
+            return Ok(HttpResponse::BadGateway().json(serde_json::json!({
+                "error": format!("Could not start VNC server inside container (exit {}). See diagnostic below.", rc),
+                "diagnostic": detail,
+            })));
+        }
+        Err(e) => {
+            return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("Failed to invoke VNC start in container: {}", e),
+            })));
+        }
+    }
+
+    // Bridge command: socat stdio ↔ TCP 127.0.0.1:5901. exec so socat
+    // replaces the shell — clean process tree, signals propagate.
+    const BRIDGE_CMD: &str = "exec socat STDIO TCP:127.0.0.1:5901";
 
     let argv = match build_exec_argv(&runtime, &name, BRIDGE_CMD) {
         Ok(a) => a,

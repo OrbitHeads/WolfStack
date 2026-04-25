@@ -17568,8 +17568,8 @@ function _showVncInstallModal(runtime, name, displayName, status) {
             <div style="display:flex;gap:10px;margin-bottom:14px;" id="vnc-mode-row">
                 <div data-mode="full" style="${cardStyle(recommended === 'full')}">
                     <div style="font-weight:700;font-size:14px;margin-bottom:4px;">Full Desktop</div>
-                    <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">TigerVNC + XFCE4 — for containers without a desktop. ~${sizeFull} MB.</div>
-                    <div style="font-size:11px;">${pkgsFull}</div>
+                    <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">TigerVNC + the desktop you pick below. For containers without one.</div>
+                    <div style="font-size:11px;color:var(--text-muted);" id="vnc-desktop-summary">~${sizeFull} MB</div>
                     ${recommended === 'full' ? '<div style="margin-top:8px;color:#3b82f6;font-size:11px;font-weight:700;">RECOMMENDED</div>' : ''}
                 </div>
                 <div data-mode="vnc-only" style="${cardStyle(recommended === 'vnc-only')}">
@@ -17577,6 +17577,24 @@ function _showVncInstallModal(runtime, name, displayName, status) {
                     <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">${detectedBin ? `Use the existing <strong>${escapeHtml(detectedLabel || detectedBin)}</strong> desktop` : 'Skip the desktop install — bring your own'}. ~${sizeVnc} MB.</div>
                     <div style="font-size:11px;">${pkgsVnc}</div>
                     ${recommended === 'vnc-only' ? '<div style="margin-top:8px;color:#3b82f6;font-size:11px;font-weight:700;">RECOMMENDED</div>' : ''}
+                </div>
+            </div>
+            <div id="vnc-desktop-picker" style="margin-bottom:14px;${recommended === 'full' ? '' : 'display:none;'}">
+                <label style="font-size:12px;color:var(--text-secondary);font-weight:600;display:block;margin-bottom:6px;">Desktop environment</label>
+                <select id="vnc-desktop-select" class="form-control" style="width:100%;padding:8px 12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;">
+                    ${(os.available_desktops || []).map(d => `<option value="${escapeHtml(d.id)}" data-size="${d.size_mb}" data-pkgs="${escapeHtml((d.packages || []).join(' '))}">${escapeHtml(d.label)} (~${d.size_mb} MB)</option>`).join('')}
+                </select>
+                <div style="font-size:11px;color:var(--text-muted);margin-top:6px;" id="vnc-desktop-pkgs"></div>
+            </div>
+            <div style="background:rgba(245,158,11,0.10);border:1px solid rgba(245,158,11,0.4);border-radius:6px;padding:10px 12px;margin-bottom:14px;font-size:12px;color:var(--text-secondary);line-height:1.5;">
+                <div style="font-weight:700;color:#f59e0b;margin-bottom:4px;">After install finishes — restart the container.</div>
+                Stop → Start in WolfStack, then click the VNC icon. Desktop packages register
+                dbus services / users that the container's running systemd needs a clean boot
+                to wire up.
+                <div style="margin-top:6px;color:var(--text-muted);">
+                    A user <code style="background:var(--bg-tertiary);padding:1px 5px;border-radius:3px;">admin</code> /
+                    <code style="background:var(--bg-tertiary);padding:1px 5px;border-radius:3px;">admin</code> is created
+                    inside the container — change it with <code style="background:var(--bg-tertiary);padding:1px 5px;border-radius:3px;">passwd admin</code>.
                 </div>
             </div>
             <p style="font-size:11px;color:var(--text-muted);margin:0 0 14px;">
@@ -17591,28 +17609,53 @@ function _showVncInstallModal(runtime, name, displayName, status) {
 
     let chosen = recommended;
     const cards = overlay.querySelectorAll('#vnc-mode-row > [data-mode]');
+    const picker = overlay.querySelector('#vnc-desktop-picker');
+    const select = overlay.querySelector('#vnc-desktop-select');
+    const pkgsLine = overlay.querySelector('#vnc-desktop-pkgs');
+    const sizeLine = overlay.querySelector('#vnc-desktop-summary');
+
+    function refreshDesktopRow() {
+        if (!select) return;
+        const opt = select.selectedOptions[0];
+        if (!opt) return;
+        const pkgs = (opt.dataset.pkgs || '').split(/\s+/).filter(Boolean);
+        if (pkgsLine) {
+            pkgsLine.innerHTML = pkgs.map(p =>
+                `<code style="background:var(--bg-tertiary);padding:1px 5px;border-radius:3px;font-size:11px;margin:1px;display:inline-block;">${escapeHtml(p)}</code>`).join(' ');
+        }
+        if (sizeLine) {
+            sizeLine.textContent = `~${opt.dataset.size} MB`;
+        }
+    }
+    refreshDesktopRow();
+    if (select) select.addEventListener('change', refreshDesktopRow);
+
     cards.forEach(card => {
         card.onclick = () => {
             chosen = card.getAttribute('data-mode');
             cards.forEach(c => c.style.cssText = cardStyle(c.getAttribute('data-mode') === chosen));
+            if (picker) picker.style.display = (chosen === 'full') ? '' : 'none';
         };
     });
 
     overlay.querySelector('#vnc-install-cancel').onclick = () => overlay.remove();
     overlay.querySelector('#vnc-install-go').onclick = async () => {
+        const desktop = (select && chosen === 'full') ? select.value : null;
         overlay.remove();
-        await _runVncInstall(runtime, name, displayName, chosen);
+        await _runVncInstall(runtime, name, displayName, chosen, desktop);
     };
 }
 
-async function _runVncInstall(runtime, name, displayName, mode) {
+async function _runVncInstall(runtime, name, displayName, mode, desktop) {
     activityStart();
     try {
         const prepUrl = apiUrl(`/api/container-vnc/${runtime}/${encodeURIComponent(name)}/prepare-install`);
+        const body = { mode: mode || 'full' };
+        if (desktop) body.desktop = desktop;
         const r = await fetch(prepUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ mode: mode || 'full' }),
+            body: JSON.stringify(body),
         });
         const data = await r.json();
         if (!r.ok) {
