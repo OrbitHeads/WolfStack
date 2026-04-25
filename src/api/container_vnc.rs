@@ -444,22 +444,82 @@ fn detect_os(runtime: &str, name: &str) -> Result<OsInfo, String> {
     })
 }
 
+/// Common-utilities bundle installed alongside a Full Desktop when the
+/// user keeps the "extras" checkbox on (default). Returns the package
+/// list for the chosen distro family + selected DE — the DE-specific
+/// polish package (xfce4-goodies / gnome-tweaks) is appended when
+/// applicable.
+fn extras_packages(family: &str, desktop_id: &str) -> Vec<String> {
+    let mut pkgs: Vec<String> = match family {
+        "debian" => vec![
+            "firefox-esr".into(),
+            "flatpak".into(),
+            "gvfs".into(),
+            "gvfs-backends".into(),
+            "xdg-utils".into(),
+            "network-manager-gnome".into(),
+            "file-roller".into(),
+        ],
+        "alpine" => vec![
+            "firefox".into(),
+            "flatpak".into(),
+            "xdg-utils".into(),
+            "gvfs".into(),
+        ],
+        "rhel" => vec![
+            "firefox".into(),
+            "flatpak".into(),
+            "xdg-utils".into(),
+            "gvfs".into(),
+            "gvfs-fuse".into(),
+            "network-manager-applet".into(),
+            "file-roller".into(),
+        ],
+        _ => Vec::new(),
+    };
+
+    // DE-specific polish — turns the bare metapackage into something
+    // pleasant. xfce4-goodies adds notifyd, screenshooter, mousepad,
+    // panel plugins. gnome-tweaks adds the standard GNOME tuning UI.
+    match (family, desktop_id) {
+        ("debian", "xfce") => pkgs.push("xfce4-goodies".into()),
+        ("debian", "gnome") => pkgs.push("gnome-tweaks".into()),
+        ("rhel", "gnome") => pkgs.push("gnome-tweaks".into()),
+        _ => {}
+    }
+
+    pkgs
+}
+
+/// Shell commands to register Flathub as a Flatpak remote — same line
+/// recommended by the Flatpak docs. Idempotent (`--if-not-exists`).
+fn flatpak_setup_snippet() -> &'static str {
+    "if command -v flatpak >/dev/null 2>&1; then \
+         flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo 2>/dev/null || true; \
+     fi"
+}
+
 /// Build the install script. The VNC password is baked into the script
 /// via `vncpasswd -f`. Idempotent: re-running re-installs cleanly.
 ///
-/// `with_desktop = true` installs TigerVNC + XFCE4 and points xstartup at
-/// `startxfce4`. `with_desktop = false` installs TigerVNC + xterm only and
-/// xstartup walks a list of session binaries (cinnamon, mate, gnome, kde,
-/// xfce, lxqt, lxde, openbox, fluxbox, icewm, i3) — falling back to xterm
-/// when none are installed. `detected_desktop` (when present) is preferred
-/// at the head of that list so an existing Cinnamon/MATE/GNOME container
-/// just uses what it has.
+/// `with_desktop = true` installs TigerVNC + the chosen `desktop_id`
+/// (defaults to "xfce") and points xstartup at that DE's session
+/// binary. `with_desktop = false` installs TigerVNC + xterm only and
+/// xstartup walks a list of session binaries — falling back to xterm
+/// when none are installed. `detected_desktop` (when present) goes at
+/// the head of that probe list so an existing Cinnamon/MATE/GNOME
+/// container reuses what it has.
+///
+/// `extras = true` adds the common-utilities bundle (browser, Flatpak +
+/// Flathub, file/archive helpers, network applet, DE polish) on top of
+/// the chosen DE — turns a bare metapackage into a usable desktop.
 fn build_install_script(
     family: &str,
     password: &str,
     with_desktop: bool,
     detected_desktop: Option<&str>,
     desktop_id: Option<&str>,
+    extras: bool,
 ) -> String {
     // Resolve the chosen desktop (when full-desktop mode). Default to "xfce".
     let chosen = if with_desktop {
@@ -633,6 +693,16 @@ echo "startxfce4:     $(command -v startxfce4 || echo MISSING)" >&2
 exit 1
 "#;
 
+    // Flatpak setup runs only when the extras bundle was installed —
+    // otherwise the `flatpak` binary won't exist and the snippet's
+    // `command -v` guard makes it a no-op anyway, but skipping it
+    // entirely keeps the install script tidy.
+    let flatpak_setup = if extras && chosen.is_some() {
+        flatpak_setup_snippet()
+    } else {
+        ":"  // shell no-op
+    };
+
     let common_tail = format!(r#"
 set -e
 export DEBIAN_FRONTEND=noninteractive
@@ -665,6 +735,11 @@ cat > /usr/local/bin/wolfstack-vnc-start <<'STARTER_EOF'
 {starter_body}
 STARTER_EOF
 chmod 755 /usr/local/bin/wolfstack-vnc-start
+
+# When the extras bundle was installed, register Flathub as a Flatpak
+# remote so the user has an app store ready to use. Best-effort — won't
+# abort the install if the network's offline or flatpak isn't there.
+{flatpak_setup}
 
 # Create an 'admin' user with password 'admin' so the user has somewhere to
 # log in (SSH, su from the VNC terminal, or for desktops that refuse to run
@@ -718,15 +793,19 @@ echo "    (change anytime with:  passwd admin)"
 echo
 "#);
 
-    // Extra packages line: chosen desktop's packages OR xterm (vnc-only).
+    // Extra packages line: chosen desktop's packages PLUS optional
+    // common-utilities bundle, OR xterm only (vnc-only mode).
     let extra_pkgs = if let Some(ref d) = chosen {
-        d.packages.join(" ")
+        let mut pkgs: Vec<String> = d.packages.clone();
+        if extras {
+            pkgs.extend(extras_packages(family, &d.id));
+        }
+        pkgs.join(" ")
     } else {
-        // VNC-only: just give the user a fallback terminal.
         "xterm".into()
     };
     let label_suffix = chosen.as_ref()
-        .map(|d| format!(" + {}", d.label))
+        .map(|d| format!(" + {}{}", d.label, if extras { " + utilities" } else { "" }))
         .unwrap_or_else(|| " (no desktop)".to_string());
 
     let head = match family {
@@ -891,12 +970,18 @@ pub async fn vnc_status(
 /// picks which DE to install when mode == "full"; one of the ids in
 /// `OsInfo.available_desktops` (xfce / mate / lxqt / cinnamon / kde /
 /// gnome). Defaults to "xfce" — lightest, most reliable in LXC.
+/// `extras` controls whether to also install the common-utilities bundle
+/// (browser, Flatpak + Flathub, file/archive helpers, network applet,
+/// DE polish). Defaults to true — turns a bare metapackage desktop into
+/// a usable one. Ignored for mode == "vnc-only".
 #[derive(Deserialize, Default)]
 pub struct PrepareInstallRequest {
     #[serde(default)]
     pub mode: Option<String>,
     #[serde(default)]
     pub desktop: Option<String>,
+    #[serde(default)]
+    pub extras: Option<bool>,
 }
 
 /// POST /api/container-vnc/{runtime}/{name}/prepare-install
@@ -952,12 +1037,16 @@ pub async fn vnc_prepare_install(
     };
 
     let desktop_id = body.as_ref().and_then(|b| b.desktop.clone());
+    // Default extras = true: a bare metapackage desktop feels broken
+    // without a browser, file utilities, network applet, or Flatpak.
+    let extras = body.as_ref().and_then(|b| b.extras).unwrap_or(true);
     let script = build_install_script(
         &os.family,
         &password,
         with_desktop,
         os.detected_desktop.as_deref(),
         desktop_id.as_deref(),
+        extras,
     );
     if script.is_empty() {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({

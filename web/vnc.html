@@ -151,12 +151,21 @@
         window.rfb = null; // expose for VR terminal access
 
         if (wsPath) {
-            // WolfStack-proxied VNC (Proxmox VMs via WS bridge)
-            // Disable resizeSession for Proxmox VMs — Windows 11 applies display
-            // scaling (125%+) after a resize, causing mouse coordinate mismatch.
+            // WolfStack-proxied VNC. resizeSession asks the server to
+            // resize its display to match our viewport — desirable for
+            // container VNC (TigerVNC honours it), avoids the
+            // scale-down + centre-and-clip dance that hides the top
+            // edge of the desktop. Disabled for Proxmox VMs because
+            // Windows 11 applies 125%+ display scaling after a resize,
+            // mangling mouse coordinates.
+            //
+            // Heuristic: container VNC paths (/ws/container-vnc/... or
+            // remote-console with -vnc ctype) want resize; everything
+            // else (Proxmox /ws/pve-vnc/...) does not.
+            const isContainerVnc = /\/(container-vnc|lxc-vnc|docker-vnc|pct-vnc)\//.test(wsPath);
             const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
             const wsUrl = `${wsProtocol}://${window.location.host}${wsPath}`;
-            connectProxiedVNC(wsUrl, vncTicket, false);
+            connectProxiedVNC(wsUrl, vncTicket, isContainerVnc);
         } else if (wsPort) {
             // Native QEMU VMs — proxy through WolfStack to avoid mixed-content issues
             const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';

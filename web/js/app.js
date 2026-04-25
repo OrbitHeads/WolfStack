@@ -17585,6 +17585,14 @@ function _showVncInstallModal(runtime, name, displayName, status) {
                     ${(os.available_desktops || []).map(d => `<option value="${escapeHtml(d.id)}" data-size="${d.size_mb}" data-pkgs="${escapeHtml((d.packages || []).join(' '))}">${escapeHtml(d.label)} (~${d.size_mb} MB)</option>`).join('')}
                 </select>
                 <div style="font-size:11px;color:var(--text-muted);margin-top:6px;" id="vnc-desktop-pkgs"></div>
+                <label style="display:flex;align-items:flex-start;gap:8px;margin-top:10px;font-size:12px;color:var(--text-secondary);cursor:pointer;">
+                    <input type="checkbox" id="vnc-extras" checked style="margin-top:3px;flex-shrink:0;">
+                    <span>
+                        <strong style="color:var(--text);">Include browser, Flatpak, and common utilities</strong>
+                        <span style="color:var(--text-muted);">(~280 MB extra)</span><br>
+                        <span style="color:var(--text-muted);">Firefox, Flathub-enabled Flatpak, file/archive helpers, network applet, and DE polish (xfce4-goodies for XFCE, gnome-tweaks for GNOME). Recommended unless you want a minimal install.</span>
+                    </span>
+                </label>
             </div>
             <div style="background:rgba(245,158,11,0.10);border:1px solid rgba(245,158,11,0.4);border-radius:6px;padding:10px 12px;margin-bottom:14px;font-size:12px;color:var(--text-secondary);line-height:1.5;">
                 <div style="font-weight:700;color:#f59e0b;margin-bottom:4px;">After install finishes — restart the container.</div>
@@ -17641,17 +17649,20 @@ function _showVncInstallModal(runtime, name, displayName, status) {
     overlay.querySelector('#vnc-install-cancel').onclick = () => overlay.remove();
     overlay.querySelector('#vnc-install-go').onclick = async () => {
         const desktop = (select && chosen === 'full') ? select.value : null;
+        const extrasCheckbox = overlay.querySelector('#vnc-extras');
+        const extras = (chosen === 'full') ? !!(extrasCheckbox && extrasCheckbox.checked) : false;
         overlay.remove();
-        await _runVncInstall(runtime, name, displayName, chosen, desktop);
+        await _runVncInstall(runtime, name, displayName, chosen, desktop, extras);
     };
 }
 
-async function _runVncInstall(runtime, name, displayName, mode, desktop) {
+async function _runVncInstall(runtime, name, displayName, mode, desktop, extras) {
     activityStart();
     try {
         const prepUrl = apiUrl(`/api/container-vnc/${runtime}/${encodeURIComponent(name)}/prepare-install`);
         const body = { mode: mode || 'full' };
         if (desktop) body.desktop = desktop;
+        if (typeof extras === 'boolean') body.extras = extras;
         const r = await fetch(prepUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },

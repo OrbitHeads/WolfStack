@@ -6812,10 +6812,11 @@ pub fn lxc_create(name: &str, distribution: &str, release: &str, architecture: &
                 cfg_content.push_str("\nlxc.cgroup2.memory.swap.max = 0\n");
                 modified = true;
             }
-            if !cfg_content.contains("cpu.weight") {
-                cfg_content.push_str("lxc.cgroup2.cpu.weight = 100\n");
-                modified = true;
-            }
+            // NB: do NOT inject a default `lxc.cgroup2.cpu.weight = 100` here.
+            // It used to confuse lxc_set_resource_limits's "if line missing,
+            // append" check — the user's chosen core count would get silently
+            // dropped at creation time. CPU pinning now goes via
+            // `cpuset.cpus` from lxc_set_resource_limits / Settings UI.
             if modified {
                 let _ = std::fs::write(&cfg_path, cfg_content);
             }
@@ -7144,50 +7145,89 @@ pub fn docker_create_with_cmd(name: &str, image: &str, ports: &[String], env: &[
 }
 
 /// Set resource limits for an LXC container
+/// Replace (or append) an `lxc.<key> = <value>` line in the given config
+/// text. Matches by stripping whitespace + the `=`-prefix, so it catches
+/// both `lxc.cgroup2.cpuset.cpus = 0-3` and `lxc.cgroup2.cpuset.cpus=0-3`.
+fn lxc_replace_or_append(config: &mut String, key: &str, value: &str) -> bool {
+    let new_line = format!("{} = {}", key, value);
+    let mut found = false;
+    let lines: Vec<String> = config.lines().map(|l| {
+        let trimmed = l.trim_start();
+        if trimmed.starts_with(key) {
+            // accept both "key = …" and "key=…"
+            let rest = trimmed[key.len()..].trim_start();
+            if rest.starts_with('=') {
+                found = true;
+                return new_line.clone();
+            }
+        }
+        l.to_string()
+    }).collect();
+    let mut joined = lines.join("\n");
+    if !found {
+        if !joined.ends_with('\n') { joined.push('\n'); }
+        joined.push_str(&new_line);
+    }
+    if !joined.ends_with('\n') { joined.push('\n'); }
+    let changed = joined != *config;
+    *config = joined;
+    changed
+}
+
+/// Persist memory + CPU limits in the container's lxc.config. CPU is
+/// expressed as `lxc.cgroup2.cpuset.cpus = 0-(N-1)` so an integer "4"
+/// pins the container to 4 host CPUs — same convention the Settings →
+/// Resources UI uses (lxc_update_settings). Previously this used
+/// cpu.weight (relative scheduler weight) AND skipped writing if the
+/// line already existed, so the default `cpu.weight = 100` added at
+/// create time silently swallowed every user-specified value.
 pub fn lxc_set_resource_limits(container: &str, memory: Option<&str>, cpus: Option<&str>) -> Result<Option<String>, String> {
     let mut messages = Vec::new();
-    
-    // Limits are applied via lxc-cgroup but only work if container is running.
-    // However, we want them persistent. Persistent config is in <base>/NAME/config
+
     let config_path = format!("{}/{}/config", lxc_base_dir(container), container);
-    if let Ok(mut config) = std::fs::read_to_string(&config_path) {
-        let mut modified = false;
-        
-        if let Some(mem) = memory {
-            if !mem.is_empty() {
-                let mb = parse_mem_to_mb(mem);
-                if mb > 0 {
-                    let bytes = mb * 1024 * 1024;
-                    // Use cgroup2 key (cgroup v1 is legacy and fails on modern systems)
-                    let limit_line = format!("\nlxc.cgroup2.memory.max = {}\n", bytes);
-                    if !config.contains("memory.max") && !config.contains("memory.limit_in_bytes") {
-                       config.push_str(&limit_line);
-                       modified = true;
-                       messages.push(format!("Memory limit set to {} MB", mb));
-                    }
+    let mut config = match std::fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
+    let mut modified = false;
+
+    if let Some(mem) = memory {
+        if !mem.is_empty() {
+            let mb = parse_mem_to_mb(mem);
+            if mb > 0 {
+                let bytes = mb * 1024 * 1024;
+                if lxc_replace_or_append(&mut config, "lxc.cgroup2.memory.max", &bytes.to_string()) {
+                    modified = true;
+                    messages.push(format!("Memory limit set to {} MB", mb));
                 }
             }
         }
+    }
 
-        if let Some(cpu) = cpus {
-            if !cpu.is_empty() {
-                 if let Ok(cores) = cpu.parse::<u32>() {
-                     // cgroup v2: cpu.weight range is 1-10000, default 100
-                     let weight = (cores * 100).min(10000);
-                     let limit_line = format!("\nlxc.cgroup2.cpu.weight = {}\n", weight);
-                     if !config.contains("cpu.weight") {
-                        config.push_str(&limit_line);
-                        modified = true;
-                         messages.push(format!("CPU weight set to {}", weight));
-                     }
-                 }
+    if let Some(cpu) = cpus {
+        let cpu = cpu.trim();
+        if !cpu.is_empty() {
+            // Accept either an integer ("4") or a cpuset spec ("0-3", "0,2,4").
+            // Integer N is expanded to "0-(N-1)".
+            let cpuset = if let Ok(n) = cpu.parse::<u32>() {
+                if n == 0 { String::new() }
+                else if n == 1 { "0".to_string() }
+                else { format!("0-{}", n - 1) }
+            } else {
+                cpu.to_string()
+            };
+            if !cpuset.is_empty() {
+                if lxc_replace_or_append(&mut config, "lxc.cgroup2.cpuset.cpus", &cpuset) {
+                    modified = true;
+                    messages.push(format!("CPU pinning set to {}", cpuset));
+                }
             }
         }
+    }
 
-        if modified {
-            if let Err(e) = std::fs::write(&config_path, config) {
-                return Err(format!("Failed to write config: {}", e));
-            }
+    if modified {
+        if let Err(e) = std::fs::write(&config_path, config) {
+            return Err(format!("Failed to write config: {}", e));
         }
     }
 
