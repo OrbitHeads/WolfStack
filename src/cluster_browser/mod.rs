@@ -118,7 +118,7 @@ fn container_exists(name: &str) -> bool {
 /// path. Limited to known LOCAL paths — `~/.kube/config` is intentionally
 /// skipped because it's commonly a remote cluster, which would steer
 /// us off-host. Supported here: k3s, RKE2, microk8s, kubeadm, k0s.
-fn detect_local_kube() -> Option<String> {
+pub fn detect_local_kube() -> Option<String> {
     use std::path::Path;
     for path in [
         "/etc/rancher/k3s/k3s.yaml",

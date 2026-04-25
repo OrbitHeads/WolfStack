@@ -4556,19 +4556,34 @@ pub async fn cluster_browser_start(
         Err(resp) => return resp,
     };
     // Default homepage = our /cluster-home reachable from inside the
-    // browser container. Docker bridge containers can't reach the
-    // host's wolfnet0 IP or 127.0.0.1, so we use host.docker.internal
-    // (wired up via --add-host in spawn_container) which resolves to
-    // the bridge gateway — the host listens there for any 0.0.0.0
-    // bound service. Use plain HTTP regardless of WolfStack's TLS
-    // mode: a fresh Firefox profile rejects self-signed certs, and
-    // the inter_node port is always plain HTTP on TLS installs.
+    // browser container. Two cases:
+    //
+    // - Docker backend: bridge containers can't reach 127.0.0.1 / the
+    //   host's wolfnet0 IP, so we use `host.docker.internal` — wired
+    //   up via `--add-host=host.docker.internal:host-gateway` in
+    //   spawn_container. Resolves to the bridge gateway; the host
+    //   listens there for any 0.0.0.0-bound service.
+    //
+    // - Kubernetes backend: pods have no host-gateway alias and
+    //   `host.docker.internal` doesn't resolve. Pods CAN reach the
+    //   node's IP directly via the cluster network, so we use
+    //   self_address (this WolfStack daemon's own IP).
+    //
+    // Plain HTTP regardless of WolfStack's TLS mode: a fresh Firefox
+    // profile rejects self-signed certs, and the inter_node port is
+    // always plain HTTP on TLS installs.
     let port_cfg = crate::ports::PortConfig::load();
     let homepage_port = if state.tls_enabled { port_cfg.inter_node } else { port_cfg.api };
+    let homepage_host = if crate::cluster_browser::detect_local_kube().is_some() {
+        state.cluster.self_address.clone()
+    } else {
+        "host.docker.internal".to_string()
+    };
     // Embed the user as a query param so /cluster-home renders that
     // user's pinned URLs alongside the cluster-wide discovered list.
     let default_homepage = format!(
-        "http://host.docker.internal:{}/cluster-home?user={}",
+        "http://{}:{}/cluster-home?user={}",
+        homepage_host,
         homepage_port,
         urlencoding_simple(&user)
     );
@@ -4624,14 +4639,22 @@ pub async fn cluster_browser_start_stream(
         Err(resp) => return resp,
     };
 
-    // Firefox runs inside a Docker container that can't reach the
-    // host's wolfnet0 IP — see cluster_browser_start for full comment.
+    // Homepage host: host.docker.internal for the Docker backend
+    // (wired up via --add-host), self_address for the Kubernetes
+    // backend (pods can reach the node's IP directly). See
+    // cluster_browser_start for the full rationale.
     let port_cfg = crate::ports::PortConfig::load();
     let homepage_port = if state.tls_enabled { port_cfg.inter_node } else { port_cfg.api };
+    let homepage_host = if crate::cluster_browser::detect_local_kube().is_some() {
+        state.cluster.self_address.clone()
+    } else {
+        "host.docker.internal".to_string()
+    };
     // Embed the user as a query param so /cluster-home renders that
     // user's pinned URLs alongside the cluster-wide discovered list.
     let default_homepage = format!(
-        "http://host.docker.internal:{}/cluster-home?user={}",
+        "http://{}:{}/cluster-home?user={}",
+        homepage_host,
         homepage_port,
         urlencoding_simple(&user)
     );
