@@ -22,6 +22,7 @@ use crate::appstore;
 
 
 mod pve_console;
+pub mod container_vnc;
 mod cluster_browser_proxy;
 
 /// Shared HTTP client for every cluster-peer / external / self-loop
@@ -20196,6 +20197,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/ws/pve-vnc/{vmid}", web::get().to(pve_console::pve_vnc_ws))
         // Native VM VNC — WebSocket proxy for QEMU VM graphical consoles
         .route("/ws/vm-vnc/{name}", web::get().to(pve_console::vm_vnc_ws))
+        // Container VNC desktops — install/status REST + WS bridge for lxc/docker/pct
+        .route("/api/container-vnc/list", web::get().to(container_vnc::vnc_list))
+        .route("/api/container-vnc/{runtime}/{name}/status", web::get().to(container_vnc::vnc_status))
+        .route("/api/container-vnc/{runtime}/{name}/prepare-install", web::post().to(container_vnc::vnc_prepare_install))
+        .route("/api/container-vnc/{runtime}/{name}/uninstall", web::post().to(container_vnc::vnc_uninstall))
+        .route("/ws/container-vnc/{runtime}/{name}", web::get().to(container_vnc::container_vnc_ws))
         // VR Terminal — HTTP polling (avoids WebSocket port restrictions in VR headsets)
         // WolfFlow — workflow automation
         .route("/api/wolfflow/workflows", web::get().to(wolfflow_list))

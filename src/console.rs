@@ -39,7 +39,7 @@ pub async fn console_ws(
             }
         }
     } else if container_type != "install" && container_type != "appstore-install" && container_type != "k8s-provision"
-        && container_type != "pkg-install"
+        && container_type != "pkg-install" && container_type != "vnc-install"
         && !crate::auth::is_safe_name(&container_name)
     {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({
@@ -399,6 +399,63 @@ async fn console_session(
                 }
             }
         }
+        "vnc-install" => {
+            // name is the session_id from /api/container-vnc/.../prepare-install.
+            // The host has a script at /tmp/wolfstack-vnc-install-{session}.sh
+            // that we pipe into the container via the appropriate runtime exec.
+            let prep = match crate::api::container_vnc::take_prepared_install(&name) {
+                Some(p) => p,
+                None => {
+                    let _ = session.text(
+                        "\r\n\x1b[31mInstall session not found or already used. \
+                         Refresh the page and click VNC again.\x1b[0m\r\n"
+                    ).await;
+                    let _ = session.close(None).await;
+                    return;
+                }
+            };
+
+            // Build the runtime-specific exec-shell command. Container names
+            // and VMIDs were validated by container_vnc::validate_target before
+            // the script was prepared, so they're safe to interpolate here.
+            let runtime_exec = match prep.runtime.as_str() {
+                "docker" => format!("docker exec -i {} sh", prep.name),
+                "lxc" => {
+                    let base = crate::containers::lxc_base_dir(&prep.name);
+                    let p = if base != crate::containers::LXC_DEFAULT_PATH {
+                        format!("-P {} ", base)
+                    } else {
+                        String::new()
+                    };
+                    format!("lxc-attach {}-n {} -- sh", p, prep.name)
+                }
+                "pct" => format!("pct exec {} -- sh", prep.name),
+                other => {
+                    let _ = session.text(format!(
+                        "\r\n\x1b[31mUnsupported runtime: {}\x1b[0m\r\n", other
+                    )).await;
+                    let _ = session.close(None).await;
+                    return;
+                }
+            };
+
+            cmd.arg(format!(
+                "printf '\\033[1;36m[wolfstack] Installing VNC desktop in %s container %s...\\033[0m\\n' '{rt}' '{nm}'; \
+                 cat {sp} | {rx}; \
+                 EC=$?; \
+                 rm -f {sp}; \
+                 if [ $EC -eq 0 ]; then \
+                    printf '\\n\\033[1;32m[wolfstack] Install complete — close this tab and click the VNC icon.\\033[0m\\n'; \
+                 else \
+                    printf '\\n\\033[1;31m[wolfstack] Install failed (exit %s).\\033[0m\\n' \"$EC\"; \
+                 fi; \
+                 exit $EC",
+                rt = prep.runtime,
+                nm = prep.name,
+                sp = prep.host_script_path,
+                rx = runtime_exec,
+            ));
+        }
         "appstore-install" | "k8s-provision" | "pkg-install" => {
             // Script-based install — name is the session ID from
             // prepare-install / prepare-provision / prepare-install-package
@@ -495,7 +552,7 @@ async fn console_session(
     // PTY file descriptors, which prevents the PTY reader from getting EOF even
     // after the main script finishes. By watching the child directly, we can close
     // the session promptly when the script completes.
-    let is_script_session = ctype == "install" || ctype == "appstore-install" || ctype == "k8s-provision" || ctype == "pkg-install";
+    let is_script_session = ctype == "install" || ctype == "appstore-install" || ctype == "k8s-provision" || ctype == "pkg-install" || ctype == "vnc-install";
     let (child_exit_tx, mut child_exit_rx) = tokio::sync::oneshot::channel::<()>();
     let mut child_opt = Some(child);
     let child_exit_handle = if is_script_session {
@@ -598,9 +655,16 @@ pub async fn remote_console_ws(
 
     let (node_id, ctype, name) = path.into_inner();
 
-    // Validate name to prevent command injection
-    if ctype != "install" && ctype != "appstore-install" && ctype != "k8s-provision" && ctype != "pve-vnc"
-        && ctype != "pkg-install"
+    // Validate name to prevent command injection. lxc-vnc / docker-vnc use container names
+    // (validated by is_safe_name); pct-vnc uses a numeric VMID — handled below.
+    if ctype == "pct-vnc" {
+        if name.parse::<u64>().is_err() {
+            return Ok(HttpResponse::BadRequest().json(serde_json::json!({
+                "error": "Invalid VMID"
+            })));
+        }
+    } else if ctype != "install" && ctype != "appstore-install" && ctype != "k8s-provision" && ctype != "pve-vnc"
+        && ctype != "pkg-install" && ctype != "vnc-install"
         && !crate::auth::is_safe_name(&name)
     {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({
@@ -643,11 +707,13 @@ async fn remote_console_bridge(
         }
     }).collect();
 
-    // PVE VNC uses a dedicated endpoint, not the generic console handler
-    let ws_path = if ctype == "pve-vnc" {
-        format!("/ws/pve-vnc/{}", encoded_name)
-    } else {
-        format!("/ws/console/{}/{}", ctype, encoded_name)
+    // Some ctypes use dedicated endpoints rather than the generic console handler.
+    let ws_path = match ctype.as_str() {
+        "pve-vnc" => format!("/ws/pve-vnc/{}", encoded_name),
+        "lxc-vnc" => format!("/ws/container-vnc/lxc/{}", encoded_name),
+        "docker-vnc" => format!("/ws/container-vnc/docker/{}", encoded_name),
+        "pct-vnc" => format!("/ws/container-vnc/pct/{}", encoded_name),
+        _ => format!("/ws/console/{}/{}", ctype, encoded_name),
     };
     let internal_port = remote_port + 1;
 

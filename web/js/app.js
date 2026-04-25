@@ -12300,6 +12300,8 @@ async function loadDockerContainers() {
 
     // Fetch runtime status first
     fetchContainerStatus();
+    // Pull the set of containers that already have VNC installed (drives the icon colour)
+    loadContainerVncKeys();
 
     try {
         // Fetch containers and stats in parallel (images fetched separately on tab click)
@@ -12446,7 +12448,7 @@ function dockerCardHtml(c) {
 
     return `<div style="background:var(--bg-card);border:1px solid var(--border);border-left:4px solid ${borderColor};border-radius:10px;overflow:hidden;">
         <div style="display:flex;flex-wrap:wrap;padding:6px 8px;background:var(--bg-secondary);border-bottom:1px solid var(--border);gap:1px;">
-            ${isRunning ? `<button class="btn btn-sm" style="${bd}" disabled>▶️</button><button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','stop',this)" title="Stop">⏹️</button><button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','restart',this)" title="Restart">🔄</button><button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','pause',this)" title="Pause">⏸️</button><button class="btn btn-sm" style="${bs}" onclick="openConsole('docker','${c.name}')" title="Console">💻</button>` : isPaused ? `<button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','unpause',this)">▶️</button>` : `<button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','start',this)">▶️</button><button class="btn btn-sm" style="${bd}" disabled>⏹️</button><button class="btn btn-sm" style="${bd}" disabled>🔄</button>`}
+            ${isRunning ? `<button class="btn btn-sm" style="${bd}" disabled>▶️</button><button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','stop',this)" title="Stop">⏹️</button><button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','restart',this)" title="Restart">🔄</button><button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','pause',this)" title="Pause">⏸️</button><button class="btn btn-sm" style="${bs}" onclick="openConsole('docker','${c.name}')" title="Console">💻</button>${_containerVncBtnHtml('docker', c.name, c.name, bs, true)}` : isPaused ? `<button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','unpause',this)">▶️</button>` : `<button class="btn btn-sm" style="${bs}" onclick="dockerAction('${c.name}','start',this)">▶️</button><button class="btn btn-sm" style="${bd}" disabled>⏹️</button><button class="btn btn-sm" style="${bd}" disabled>🔄</button>`}
             <button class="btn btn-sm" style="${bs}" onclick="viewContainerLogs('docker','${c.name}')" title="Logs">📜</button><button class="btn btn-sm" style="${bs}" onclick="viewDockerVolumes('${c.name}')" title="Volumes">📁</button><button class="btn btn-sm" style="${bs}" onclick="browseContainerFiles('docker','${c.name}')" title="Files">📂</button><button class="btn btn-sm" style="${bs}" onclick="openDockerSettings('${c.name}')" title="Settings">⚙️</button><button class="btn btn-sm" style="${bs}" onclick="openContainerConfigurator('docker','${c.name}')" title="Configure">🔧</button><button class="btn btn-sm" style="${bs}" onclick="openContainerUpdates('docker','${c.name}')" title="Updates">📦</button><button class="btn btn-sm" style="${bs}" onclick="openContainerCron('docker','${c.name}')" title="Cron">⏰</button><button class="btn btn-sm" style="${bs}" onclick="cloneDockerContainer('${c.name}')" title="Clone">📋</button><button class="btn btn-sm" style="${bs}" onclick="migrateDockerContainer('${c.name}')" title="Migrate">🚀</button>${!isRunning ? `<button class="btn btn-sm" style="${bs}color:#ef4444;" onclick="dockerAction('${c.name}','remove',this)" title="Remove">🗑️</button>` : ''}
         </div>
         ${pies.length > 0 ? `<div style="display:flex;justify-content:space-evenly;padding:12px 8px;border-bottom:1px solid var(--border);">${pies.join('')}</div>` : ''}
@@ -12509,6 +12511,7 @@ function lxcCardHtml(c, s) {
                 <button class="btn btn-sm" style="${!isRunning ? bd : bs}" ${!isRunning ? 'disabled' : ''} ${isRunning ? `onclick="lxcAction('${c.name}','restart',this)"` : ''} title="Restart">🔄</button>
                 <button class="btn btn-sm" style="${!isRunning ? bd : bs}" ${!isRunning ? 'disabled' : ''} ${isRunning ? `onclick="lxcAction('${c.name}','freeze',this)"` : ''} title="Freeze">⏸️</button>
                 <button class="btn btn-sm" style="${!isRunning ? bd : bs}" ${!isRunning ? 'disabled' : ''} ${isRunning ? `onclick="openLxcConsole('${c.name}','${c.hostname || c.name}')"` : ''} title="Console">💻</button>
+                ${_containerVncBtnHtml('lxc', c.name, c.hostname || c.name, bs, isRunning)}
                 <button class="btn btn-sm" style="${isRunning ? bd : bs}" ${isRunning ? 'disabled' : ''} ${!isRunning ? `onclick="lxcAction('${c.name}','destroy',this)"` : ''} title="Destroy">🗑️</button>
                 <button class="btn btn-sm" style="${bs}" onclick="viewContainerLogs('lxc','${c.name}')" title="Logs">📜</button>
                 <button class="btn btn-sm" style="${bs}" onclick="browseContainerFiles('lxc','${c.name}','${(c.storage_path||'').replace(/'/g,"\\'")}')" title="Files">📂</button>
@@ -12663,6 +12666,7 @@ function renderDockerContainers(containers) {
                     <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="dockerAction('${c.name}', 'restart', this)" title="Restart">🔄</button>
                     <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="dockerAction('${c.name}', 'pause', this)" title="Pause">⏸️</button>
                     <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="openConsole('docker', '${c.name}')" title="Console">💻</button>
+                    ${_containerVncBtnHtml('docker', c.name, c.name, 'margin:2px;font-size:20px;line-height:1;padding:4px 6px;', true)}
                     <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;opacity:0.4;cursor:not-allowed;pointer-events:none;" disabled title="Remove">🗑️</button>
                 ` : isPaused ? `
                     <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="dockerAction('${c.name}', 'unpause', this)" title="Unpause">▶️</button>
@@ -13347,6 +13351,9 @@ async function loadLxcContainers() {
     // Cancel any existing poll timer immediately
     if (lxcPollTimer) { clearInterval(lxcPollTimer); lxcPollTimer = null; }
 
+    // Pull the set of containers that already have VNC installed (drives the icon colour)
+    loadContainerVncKeys();
+
     // Capture generation and node to detect stale responses
     const gen = ++_lxcLoadGeneration;
     const loadNodeId = currentNodeId;
@@ -13455,6 +13462,7 @@ function renderLxcContainers(containers, stats) {
                 <button class="btn btn-sm" style="${!isRunning ? disStyle : btnStyle}" ${!isRunning ? 'disabled' : ''} ${isRunning ? `onclick="lxcAction('${c.name}', 'restart', this)"` : ''} title="Restart">🔄</button>
                 <button class="btn btn-sm" style="${!isRunning ? disStyle : btnStyle}" ${!isRunning ? 'disabled' : ''} ${isRunning ? `onclick="lxcAction('${c.name}', 'freeze', this)"` : ''} title="Freeze">⏸️</button>
                 <button class="btn btn-sm" style="${!isRunning ? disStyle : btnStyle}" ${!isRunning ? 'disabled' : ''} ${isRunning ? `onclick="openLxcConsole('${c.name}', '${c.hostname || c.name}')"` : ''} title="Console">💻</button>
+                ${_containerVncBtnHtml('lxc', c.name, c.hostname || c.name, btnStyle, isRunning)}
                 <button class="btn btn-sm" style="${isRunning ? disStyle : btnStyle}" ${isRunning ? 'disabled' : ''} ${!isRunning ? `onclick="lxcAction('${c.name}', 'destroy', this)"` : ''} title="Destroy">🗑️</button>
                 <button class="btn btn-sm" style="${btnStyle}" onclick="viewContainerLogs('lxc', '${c.name}')" title="Logs">📜</button>
                 <button class="btn btn-sm" style="${btnStyle}" onclick="browseContainerFiles('lxc', '${c.name}', '${(c.storage_path || '').replace(/'/g, "\\'")}')" title="Browse Files">📂</button>
@@ -17438,6 +17446,172 @@ function openPveConsole(nodeId, vmid, displayName) {
         + '&pve_node_id=' + encodeURIComponent(nodeId)
         + '&pve_vmid=' + encodeURIComponent(vmid);
     window.open(url, 'pve_console_' + vmid, 'width=960,height=600,menubar=no,toolbar=no');
+}
+
+// ===========================================================================
+// Container VNC desktop access (LXC / Docker / Proxmox-LXC)
+// ===========================================================================
+
+// Set of "<runtime>:<name>" keys that have VNC installed. Refreshed at boot
+// and after every install. Used to colour the VNC icon on container rows.
+window.vncKeys = window.vncKeys || new Set();
+
+async function loadContainerVncKeys() {
+    try {
+        const r = await fetch(apiUrl('/api/container-vnc/list'));
+        if (!r.ok) return;
+        const d = await r.json();
+        window.vncKeys = new Set(d.keys || []);
+    } catch (e) { /* tolerate — endpoint may be unreachable on remote node */ }
+}
+
+// Choose the backend runtime for VNC. The LXC list mixes native LXC and
+// Proxmox-managed LXC (pct); pct entries always have a numeric VMID as name.
+function _containerVncRuntime(uiRuntime, name) {
+    if (uiRuntime === 'docker') return 'docker';
+    return /^[0-9]+$/.test(String(name)) ? 'pct' : 'lxc';
+}
+
+function _containerVncBtnHtml(uiRuntime, name, displayName, style, isRunning) {
+    if (!isRunning) return '';
+    const rt = _containerVncRuntime(uiRuntime, name);
+    const installed = window.vncKeys && window.vncKeys.has(rt + ':' + name);
+    const colour = installed ? 'color:#10b981;' : 'color:var(--text-muted);';
+    const safeDn = String(displayName || name).replace(/'/g, "\\'");
+    const title = installed ? 'VNC desktop' : 'Install VNC desktop';
+    return `<button class="btn btn-sm" style="${style}${colour}" onclick="openContainerVnc('${uiRuntime}','${name}','${safeDn}')" title="${title}">🖥️</button>`;
+}
+
+async function openContainerVnc(uiRuntime, name, displayName) {
+    const runtime = _containerVncRuntime(uiRuntime, name);
+    const statusUrl = apiUrl(`/api/container-vnc/${runtime}/${encodeURIComponent(name)}/status`);
+    let status;
+    try {
+        const r = await fetch(statusUrl);
+        status = await r.json();
+        if (!r.ok) {
+            showToast(status.error || 'VNC status check failed', 'error');
+            return;
+        }
+    } catch (e) {
+        showToast('VNC status check failed: ' + e.message, 'error');
+        return;
+    }
+    if (!status.container_running) {
+        showToast('Container is not running', 'error');
+        return;
+    }
+    if (status.installed && status.password) {
+        _openContainerVncWindow(runtime, name, displayName, status.password);
+        return;
+    }
+    _showVncInstallModal(runtime, name, displayName, status);
+}
+
+function _openContainerVncWindow(runtime, name, displayName, password) {
+    const ctypeMap = { lxc: 'lxc-vnc', docker: 'docker-vnc', pct: 'pct-vnc' };
+    let wsPath = `/ws/container-vnc/${runtime}/${encodeURIComponent(name)}`;
+    if (currentNodeId) {
+        const node = allNodes.find(n => n.id === currentNodeId);
+        if (node && !node.is_self) {
+            wsPath = `/ws/remote-console/${currentNodeId}/${ctypeMap[runtime]}/${encodeURIComponent(name)}`;
+        }
+    }
+    const url = `/vnc.html?ws_path=${encodeURIComponent(wsPath)}&ticket=${encodeURIComponent(password || '')}&name=${encodeURIComponent(displayName || name)}`;
+    window.open(url, 'vnc_' + runtime + '_' + name, 'width=1280,height=820,menubar=no,toolbar=no');
+}
+
+function _showVncInstallModal(runtime, name, displayName, status) {
+    const os = status.os || {};
+    if (!os.supported) {
+        showToast(`VNC install does not support OS "${os.id || 'unknown'}". Supported: Debian/Ubuntu, Alpine, RHEL/Rocky/Fedora.`, 'error');
+        return;
+    }
+    const pkgs = (os.packages || []).map(p => `<code style="background:var(--bg-tertiary);padding:1px 6px;border-radius:3px;font-size:12px;margin:2px;display:inline-block;">${escapeHtml(p)}</code>`).join(' ');
+    const sizeMb = os.size_estimate_mb || '?';
+
+    // Modal markup (self-contained, no shared modal component dependency)
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:10000;display:flex;align-items:center;justify-content:center;';
+    overlay.innerHTML = `
+        <div style="background:var(--bg-primary);border:1px solid var(--border);border-radius:10px;max-width:640px;width:90%;padding:20px;color:var(--text);">
+            <h3 style="margin:0 0 12px;">Install VNC desktop in ${escapeHtml(displayName || name)}</h3>
+            <p style="margin:0 0 12px;color:var(--text-secondary);font-size:14px;">
+                A VNC server isn't installed in this ${runtime === 'docker' ? 'container' : (runtime === 'pct' ? 'Proxmox LXC' : 'LXC container')} yet.
+                A console will open and run the install live so you can watch.
+            </p>
+            <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:10px 12px;margin-bottom:12px;font-size:13px;">
+                <div style="margin-bottom:6px;"><strong>Detected OS:</strong> ${escapeHtml(os.id || 'unknown')}${os.version_id ? ' ' + escapeHtml(os.version_id) : ''} <span style="color:var(--text-muted);">(family: ${escapeHtml(os.family || '?')})</span></div>
+                <div style="margin-bottom:6px;"><strong>Estimated install size:</strong> ~${sizeMb} MB</div>
+                <div><strong>Packages:</strong><br><div style="margin-top:4px;">${pkgs}</div></div>
+            </div>
+            <p style="font-size:12px;color:var(--text-muted);margin:0 0 16px;">
+                Includes TigerVNC + XFCE4 desktop + socat. A random 8-char password is generated and stored locally.
+            </p>
+            <div style="display:flex;gap:8px;justify-content:flex-end;">
+                <button class="btn" id="vnc-install-cancel" style="background:var(--bg-tertiary);">Cancel</button>
+                <button class="btn btn-primary" id="vnc-install-go">Install</button>
+            </div>
+        </div>`;
+    document.body.appendChild(overlay);
+    overlay.querySelector('#vnc-install-cancel').onclick = () => overlay.remove();
+    overlay.querySelector('#vnc-install-go').onclick = async () => {
+        overlay.remove();
+        await _runVncInstall(runtime, name, displayName);
+    };
+}
+
+async function _runVncInstall(runtime, name, displayName) {
+    activityStart();
+    try {
+        const prepUrl = apiUrl(`/api/container-vnc/${runtime}/${encodeURIComponent(name)}/prepare-install`);
+        const r = await fetch(prepUrl, { method: 'POST' });
+        const data = await r.json();
+        if (!r.ok) {
+            showToast(data.error || 'Failed to prepare VNC install', 'error');
+            return;
+        }
+        const sessionId = data.session_id;
+
+        // Open the install console — same path mapping as other ctype consoles.
+        const consoleType = 'vnc-install';
+        const dn = `${displayName || name} — VNC install`;
+        const consoleUrl = '/console.html?type=' + encodeURIComponent(consoleType)
+            + '&name=' + encodeURIComponent(sessionId)
+            + '&display=' + encodeURIComponent(dn)
+            + (currentNodeId ? '&node_id=' + encodeURIComponent(currentNodeId) : '');
+        const consoleWin = window.open(consoleUrl, 'vnc_install_' + sessionId, 'width=900,height=600,menubar=no,toolbar=no');
+        if (!consoleWin) {
+            showToast('Pop-up blocked — allow pop-ups for the install console', 'error');
+            return;
+        }
+
+        // Poll status until VNC shows installed, then auto-open the desktop.
+        const statusUrl = apiUrl(`/api/container-vnc/${runtime}/${encodeURIComponent(name)}/status`);
+        let attempts = 0;
+        const maxAttempts = 120; // ~10 minutes at 5s intervals
+        const poll = async () => {
+            attempts++;
+            try {
+                const sr = await fetch(statusUrl);
+                if (sr.ok) {
+                    const sd = await sr.json();
+                    if (sd.installed && sd.password) {
+                        await loadContainerVncKeys();
+                        // Refresh the visible container view so the icon turns green.
+                        if (runtime === 'docker' && typeof loadDockerContainers === 'function') loadDockerContainers();
+                        else if (typeof loadLxcContainers === 'function') loadLxcContainers();
+                        _openContainerVncWindow(runtime, name, displayName, sd.password);
+                        return;
+                    }
+                }
+            } catch (e) { /* poll again */ }
+            if (attempts < maxAttempts) setTimeout(poll, 5000);
+        };
+        setTimeout(poll, 5000);
+    } finally {
+        activityStop();
+    }
 }
 
 function openVmVnc(name, wsPort) {

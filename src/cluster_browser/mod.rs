@@ -27,15 +27,18 @@ const SESSIONS_FILE: &str = "/etc/wolfstack/cluster-browser-sessions.json";
 const IMAGE: &str = "lscr.io/linuxserver/firefox:latest";
 const PORT_RANGE: std::ops::Range<u16> = 33234..34000;
 
+/// Namespace where every cluster-browser Pod + Service lives when the
+/// node runs Kubernetes. Created on demand by spawn_kube().
+const KUBE_NAMESPACE: &str = "wolfstack-browser";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserSession {
-    /// 8-char random id, used in the container name and as session handle.
+    /// 8-char random id, used in the container/pod name and as session handle.
     pub id: String,
-    /// Docker container name: wolfstack-browser-<id>.
+    /// Docker container name OR k8s pod/service name: wolfstack-browser-<id>.
     pub container_name: String,
-    /// Host port mapped to the container's web UI port (either 3000 for
-    /// HTTP or 3001 for HTTPS — chosen at start to match WolfStack's
-    /// own TLS mode so the popup scheme doesn't fight the parent page).
+    /// Port to reach the session's web UI. Docker: host loopback port we
+    /// chose at start time. Kubernetes: the ClusterIP service port (3000).
     pub web_port: u16,
     /// "http" or "https". Persisted so the UI builds the right URL
     /// even when listing sessions after a restart.
@@ -51,9 +54,25 @@ pub struct BrowserSession {
     /// on session creation, persisted in the JSON config.
     #[serde(default)]
     pub node_id: String,
+    /// Host the proxy connects to. "127.0.0.1" for docker; the Service
+    /// ClusterIP for kubernetes. Defaulted for backwards compatibility
+    /// with sessions persisted by older WolfStack versions.
+    #[serde(default = "default_target_host")]
+    pub target_host: String,
+    /// "docker" | "kubernetes". Selects which cleanup/probe path is used
+    /// in stop_session() and reconcile().
+    #[serde(default = "default_backend")]
+    pub backend: String,
+    /// Path to the kubeconfig used when backend == "kubernetes".
+    /// Stored so reconcile()/stop_session() can call kubectl with the
+    /// right credentials even after a daemon restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubeconfig: Option<String>,
 }
 
 fn default_scheme() -> String { "http".to_string() }
+fn default_target_host() -> String { "127.0.0.1".to_string() }
+fn default_backend() -> String { "docker".to_string() }
 
 static SESSIONS: Mutex<Vec<BrowserSession>> = Mutex::new(Vec::new());
 
@@ -79,7 +98,7 @@ pub fn load_persisted() {
         .unwrap_or_default();
     let mut alive = Vec::new();
     for s in on_disk {
-        if container_exists(&s.container_name) {
+        if session_alive(&s) {
             alive.push(s);
         }
     }
@@ -93,6 +112,89 @@ fn container_exists(name: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Detect a locally-installed Kubernetes flavour. Returns the kubeconfig
+/// path. Limited to known LOCAL paths — `~/.kube/config` is intentionally
+/// skipped because it's commonly a remote cluster, which would steer
+/// us off-host. Supported here: k3s, RKE2, microk8s, kubeadm, k0s.
+fn detect_local_kube() -> Option<String> {
+    use std::path::Path;
+    for path in [
+        "/etc/rancher/k3s/k3s.yaml",
+        "/etc/rancher/rke2/rke2.yaml",
+        "/var/snap/microk8s/current/credentials/client.config",
+        "/etc/kubernetes/admin.conf",
+    ] {
+        if Path::new(path).exists() {
+            return Some(path.to_string());
+        }
+    }
+    // k0s — kubeconfig isn't on disk by default, generate it once.
+    if Path::new("/var/lib/k0s").exists() {
+        let path = "/etc/k0s/kubeconfig";
+        if Path::new(path).exists() {
+            return Some(path.to_string());
+        }
+        if let Ok(out) = Command::new("k0s").args(["kubeconfig", "admin"]).output() {
+            if out.status.success() {
+                let _ = std::fs::create_dir_all("/etc/k0s");
+                if std::fs::write(path, &out.stdout).is_ok() {
+                    return Some(path.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Run `kubectl <args>` with the given kubeconfig; capture stdout.
+fn kubectl_run(kubeconfig: &str, args: &[&str]) -> Result<String, String> {
+    let (binary, prefix_args) = crate::kubernetes::find_kubectl_pub();
+    let mut full: Vec<&str> = prefix_args.to_vec();
+    full.extend(["--kubeconfig", kubeconfig]);
+    full.extend(args);
+    let out = Command::new(binary)
+        .args(&full)
+        .output()
+        .map_err(|e| format!("spawn kubectl: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "kubectl {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// `kubectl apply -f -` with `manifest` piped on stdin.
+fn kubectl_apply_stdin(kubeconfig: &str, manifest: &str) -> Result<(), String> {
+    use std::io::Write;
+    let (binary, prefix_args) = crate::kubernetes::find_kubectl_pub();
+    let mut full: Vec<&str> = prefix_args.to_vec();
+    full.extend(["--kubeconfig", kubeconfig, "apply", "-f", "-"]);
+    let mut child = Command::new(binary)
+        .args(&full)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn kubectl apply: {}", e))?;
+    {
+        let stdin = child.stdin.as_mut().ok_or("kubectl stdin missing")?;
+        stdin.write_all(manifest.as_bytes())
+            .map_err(|e| format!("write manifest: {}", e))?;
+    }
+    let out = child.wait_with_output()
+        .map_err(|e| format!("kubectl apply wait: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "kubectl apply failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 fn random_id() -> String {
@@ -132,8 +234,14 @@ fn allocate_port() -> Option<u16> {
 
 /// Whether the image is already cached locally. Cheap pre-flight so
 /// callers can decide whether to surface a "downloading, please wait"
-/// state vs. a quick start.
+/// state vs. a quick start. On Kubernetes hosts the cluster pulls the
+/// image on pod schedule, so there's no host-side pull to wait for —
+/// we report "present" so the UI doesn't display a misleading docker
+/// download progress message.
 pub fn image_present() -> bool {
+    if detect_local_kube().is_some() {
+        return true;
+    }
     Command::new("docker")
         .args(["image", "inspect", IMAGE])
         .output()
@@ -254,16 +362,22 @@ fn pull_image_with_progress(tx: &std::sync::mpsc::Sender<String>) -> Result<(), 
     Ok(())
 }
 
-/// Streaming variant of start_session — emits docker pull progress
-/// (layers downloaded, heartbeat) plus container start status into the
-/// supplied channel. The non-streaming `start_session` below calls this
-/// with a discard channel so both paths share one implementation.
+/// Streaming variant of start_session — emits progress events (docker
+/// pull layers / k8s pod scheduling) plus start status into the supplied
+/// channel. The non-streaming `start_session` below calls this with a
+/// discard channel so both paths share one implementation.
 pub fn start_session_streamed(
     user: &str,
     homepage: &str,
     tls: bool,
     tx: std::sync::mpsc::Sender<String>,
 ) -> Result<BrowserSession, String> {
+    if let Some(kc) = detect_local_kube() {
+        let _ = tx.send("Local Kubernetes detected — deploying browser as a Pod...".into());
+        let session = spawn_kube(user, homepage, tls, &kc, &tx)?;
+        let _ = tx.send(format!("Pod running, ClusterIP {}", session.target_host));
+        return Ok(session);
+    }
     pull_image_with_progress(&tx)?;
     let _ = tx.send("Starting browser container...".into());
     let session = spawn_container(user, homepage, tls)?;
@@ -277,6 +391,10 @@ pub fn start_session_streamed(
 /// HTTPS session (one-time self-signed cert accept), an HTTP-hosted
 /// one gets plain HTTP.
 pub fn start_session(user: &str, homepage: &str, tls: bool) -> Result<BrowserSession, String> {
+    if let Some(kc) = detect_local_kube() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        return spawn_kube(user, homepage, tls, &kc, &tx);
+    }
     ensure_image()?;
     spawn_container(user, homepage, tls)
 }
@@ -399,6 +517,203 @@ fn spawn_container(user: &str, homepage: &str, tls: bool) -> Result<BrowserSessi
         user: user_safe,
         started_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
         node_id: crate::agent::self_node_id(),
+        target_host: "127.0.0.1".to_string(),
+        backend: "docker".to_string(),
+        kubeconfig: None,
+    };
+    SESSIONS.lock().unwrap().push(session.clone());
+    save();
+    Ok(session)
+}
+
+/// Kubernetes session backend — deploys a Pod + ClusterIP Service via
+/// `kubectl apply`, waits for the Pod to reach Ready, then verifies the
+/// ClusterIP:3000 endpoint is reachable from the host. Cluster-IP routing
+/// works on every supported flavour because kube-proxy programs DNAT
+/// rules into the host's iptables, so the WolfStack daemon (which runs
+/// on the host network namespace) can hit the Service IP directly.
+fn spawn_kube(
+    user: &str,
+    homepage: &str,
+    tls: bool,
+    kubeconfig: &str,
+    tx: &std::sync::mpsc::Sender<String>,
+) -> Result<BrowserSession, String> {
+    let id = random_id();
+    let resource_name = format!("wolfstack-browser-{}", id);
+
+    let user_safe: String = user.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+
+    // Escape values that go into double-quoted YAML strings. The id and
+    // user_safe are already constrained to safe characters; the homepage
+    // is operator-supplied so quote-escape it defensively.
+    let homepage_yaml = homepage.replace('\\', "\\\\").replace('"', "\\\"");
+
+    let manifest = format!(r#"apiVersion: v1
+kind: Namespace
+metadata:
+  name: {ns}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {name}
+  namespace: {ns}
+  labels:
+    app: wolfstack-browser
+    wolfstack-browser-session: "{id}"
+    wolfstack-browser-user: "{user_safe}"
+spec:
+  restartPolicy: Always
+  containers:
+  - name: browser
+    image: {image}
+    imagePullPolicy: IfNotPresent
+    env:
+    - name: PUID
+      value: "0"
+    - name: PGID
+      value: "0"
+    - name: TZ
+      value: "UTC"
+    - name: FIREFOX_CLI
+      value: "--new-window {homepage}"
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "1Gi"
+      limits:
+        cpu: "2"
+        memory: "2Gi"
+    ports:
+    - name: web
+      containerPort: 3000
+    volumeMounts:
+    - name: config
+      mountPath: /config
+    - name: dshm
+      mountPath: /dev/shm
+  volumes:
+  - name: config
+    emptyDir: {{}}
+  - name: dshm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {name}
+  namespace: {ns}
+  labels:
+    app: wolfstack-browser
+    wolfstack-browser-session: "{id}"
+spec:
+  type: ClusterIP
+  selector:
+    wolfstack-browser-session: "{id}"
+  ports:
+  - port: 3000
+    targetPort: 3000
+    name: web
+"#,
+        ns = KUBE_NAMESPACE,
+        name = resource_name,
+        id = id,
+        user_safe = user_safe,
+        image = IMAGE,
+        homepage = homepage_yaml,
+    );
+
+    info!("cluster_browser: deploying pod {} via kubectl ({})", resource_name, kubeconfig);
+    let _ = tx.send("Applying Pod + Service manifest...".into());
+    kubectl_apply_stdin(kubeconfig, &manifest)?;
+
+    // Wait for the pod to reach Running (image pull on first run can
+    // take a minute or two). 180 × 500 ms = 90 s upper bound.
+    let _ = tx.send("Waiting for Pod to start (image pull may take a minute on first run)...".into());
+    let mut last_phase = String::new();
+    let mut running = false;
+    for i in 0..180 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let phase = kubectl_run(kubeconfig, &[
+            "get", "pod", &resource_name, "-n", KUBE_NAMESPACE,
+            "-o", "jsonpath={.status.phase}",
+        ]).unwrap_or_default().trim().to_string();
+        if phase != last_phase && !phase.is_empty() {
+            let _ = tx.send(format!("Pod phase: {} (after {}s)", phase, i / 2));
+            last_phase = phase.clone();
+        }
+        if phase == "Running" { running = true; break; }
+        if phase == "Failed" || phase == "Unknown" {
+            let _ = kubectl_run(kubeconfig, &[
+                "delete", "pod", &resource_name, "-n", KUBE_NAMESPACE, "--ignore-not-found", "--grace-period=0",
+            ]);
+            let _ = kubectl_run(kubeconfig, &[
+                "delete", "svc", &resource_name, "-n", KUBE_NAMESPACE, "--ignore-not-found",
+            ]);
+            return Err(format!("Pod entered phase {}", phase));
+        }
+    }
+    if !running {
+        let _ = kubectl_run(kubeconfig, &[
+            "delete", "pod", &resource_name, "-n", KUBE_NAMESPACE, "--ignore-not-found", "--grace-period=0",
+        ]);
+        let _ = kubectl_run(kubeconfig, &[
+            "delete", "svc", &resource_name, "-n", KUBE_NAMESPACE, "--ignore-not-found",
+        ]);
+        return Err("Pod did not reach Running within 90s".into());
+    }
+
+    // Read the Service's ClusterIP — that's what the proxy will dial.
+    let cluster_ip = kubectl_run(kubeconfig, &[
+        "get", "svc", &resource_name, "-n", KUBE_NAMESPACE,
+        "-o", "jsonpath={.spec.clusterIP}",
+    ])?.trim().to_string();
+    if cluster_ip.is_empty() || cluster_ip == "None" {
+        return Err("Service has no ClusterIP".into());
+    }
+
+    // Verify reachability from the host. kube-proxy needs a moment after
+    // the pod becomes Ready before its endpoint is published.
+    let _ = tx.send(format!("Verifying reachability to {}:3000...", cluster_ip));
+    let target: std::net::SocketAddr = match format!("{}:3000", cluster_ip).parse() {
+        Ok(a) => a,
+        Err(e) => return Err(format!("Bad ClusterIP {}: {}", cluster_ip, e)),
+    };
+    let mut reachable = false;
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if std::net::TcpStream::connect_timeout(&target, std::time::Duration::from_secs(2)).is_ok() {
+            reachable = true;
+            break;
+        }
+    }
+    if !reachable {
+        let _ = kubectl_run(kubeconfig, &[
+            "delete", "pod", &resource_name, "-n", KUBE_NAMESPACE, "--ignore-not-found", "--grace-period=0",
+        ]);
+        let _ = kubectl_run(kubeconfig, &[
+            "delete", "svc", &resource_name, "-n", KUBE_NAMESPACE, "--ignore-not-found",
+        ]);
+        return Err(format!("ClusterIP {}:3000 not reachable from host (kube-proxy / network policy?)", cluster_ip));
+    }
+
+    let scheme = if tls { "https" } else { "http" };
+    let session = BrowserSession {
+        id,
+        container_name: resource_name,
+        web_port: 3000,
+        scheme: scheme.to_string(),
+        user: user_safe,
+        started_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+        node_id: crate::agent::self_node_id(),
+        target_host: cluster_ip,
+        backend: "kubernetes".to_string(),
+        kubeconfig: Some(kubeconfig.to_string()),
     };
     SESSIONS.lock().unwrap().push(session.clone());
     save();
@@ -412,33 +727,65 @@ pub fn stop_session(id: &str) -> Result<(), String> {
     };
     let session = session.ok_or_else(|| format!("Session '{}' not found", id))?;
 
-    // Stop with a 5 s grace then force-remove. The browser session
-    // doesn't need to flush anything to disk that the container can't
-    // checkpoint between requests.
-    let _ = Command::new("docker")
-        .args(["stop", "-t", "5", &session.container_name])
-        .output();
-    let _ = Command::new("docker")
-        .args(["rm", "-f", &session.container_name])
-        .output();
+    match session.backend.as_str() {
+        "kubernetes" => {
+            if let Some(kc) = &session.kubeconfig {
+                // Delete pod + service. --ignore-not-found so a stale
+                // session entry doesn't error if the resources were
+                // already cleaned up out of band.
+                let _ = kubectl_run(kc, &[
+                    "delete", "pod", &session.container_name,
+                    "-n", KUBE_NAMESPACE, "--ignore-not-found", "--grace-period=5",
+                ]);
+                let _ = kubectl_run(kc, &[
+                    "delete", "svc", &session.container_name,
+                    "-n", KUBE_NAMESPACE, "--ignore-not-found",
+                ]);
+            }
+        }
+        _ => {
+            // Stop with a 5 s grace then force-remove.
+            let _ = Command::new("docker")
+                .args(["stop", "-t", "5", &session.container_name])
+                .output();
+            let _ = Command::new("docker")
+                .args(["rm", "-f", &session.container_name])
+                .output();
+        }
+    }
 
     SESSIONS.lock().unwrap().retain(|s| s.id != id);
     save();
-    info!("cluster_browser: stopped session {}", id);
+    info!("cluster_browser: stopped session {} ({})", id, session.backend);
     Ok(())
 }
 
-/// Sweep for sessions whose container has died or vanished. Called by
-/// a periodic background task so the UI doesn't show ghost sessions
-/// after a docker daemon restart or crash.
+/// Probe whether a session's underlying resource (docker container or
+/// k8s pod) still exists. Used by reconcile / load_persisted to evict
+/// stale entries.
+fn session_alive(s: &BrowserSession) -> bool {
+    match s.backend.as_str() {
+        "kubernetes" => match &s.kubeconfig {
+            Some(kc) => kubectl_run(kc, &[
+                "get", "pod", &s.container_name, "-n", KUBE_NAMESPACE, "-o", "name",
+            ]).is_ok(),
+            None => false,
+        },
+        _ => container_exists(&s.container_name),
+    }
+}
+
+/// Sweep for sessions whose underlying container/pod has died or
+/// vanished. Called by a periodic background task so the UI doesn't
+/// show ghost sessions after a docker daemon or pod crash.
 pub fn reconcile() {
     let snapshot = SESSIONS.lock().unwrap().clone();
     let mut alive = Vec::new();
     for s in snapshot {
-        if container_exists(&s.container_name) {
+        if session_alive(&s) {
             alive.push(s);
         } else {
-            warn!("cluster_browser: pruning dead session {}", s.id);
+            warn!("cluster_browser: pruning dead session {} ({})", s.id, s.backend);
         }
     }
     *SESSIONS.lock().unwrap() = alive;

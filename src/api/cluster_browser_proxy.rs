@@ -59,14 +59,18 @@ fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
-/// Look up a session's local (127.0.0.1) port and node_id. Returns None if no
+/// Look up a session's upstream target (host + port) and node_id. The
+/// host is "127.0.0.1" for docker-backed sessions and the Service
+/// ClusterIP for kubernetes-backed sessions — kube-proxy programs DNAT
+/// rules into the host's iptables, so the daemon (in the host's net
+/// namespace) can dial the ClusterIP directly. Returns None if no
 /// matching session exists on this node — the caller turns that into
 /// a 404 or queries other nodes.
-fn session_port(id: &str) -> Option<(u16, String)> {
+fn session_target(id: &str) -> Option<(String, u16, String)> {
     crate::cluster_browser::list_sessions()
         .into_iter()
         .find(|s| s.id == id)
-        .map(|s| (s.web_port, s.node_id))
+        .map(|s| (s.target_host, s.web_port, s.node_id))
 }
 
 /// Proxy a cluster browser request to a remote node. Makes a direct HTTP request to
@@ -181,7 +185,7 @@ pub async fn cluster_browser_proxy(
     }
 
     let (id, tail) = path.into_inner();
-    let (port, session_node_id) = match session_port(&id) {
+    let (host, port, session_node_id) = match session_target(&id) {
         Some(p) => p,
         None => {
             return Ok(HttpResponse::NotFound()
@@ -205,28 +209,31 @@ pub async fn cluster_browser_proxy(
         .unwrap_or(false);
 
     if upgrade_is_ws {
-        proxy_websocket(req, payload, port, tail).await
+        proxy_websocket(req, payload, &host, port, tail).await
     } else {
-        proxy_http(req, payload, port, tail).await
+        proxy_http(req, payload, &host, port, tail).await
     }
 }
 
 /// HTTP proxy leg — reissues the client's request against
-/// http://127.0.0.1:{port}/{tail}?{query}. Cluster browser runs
-/// locally on loopback; external hostnames would cause network loops.
-/// Selkies asset bundles are chunked/streaming, so we pipe the body
-/// rather than buffering.
+/// http://{host}:{port}/{tail}?{query}. `host` is "127.0.0.1" for
+/// docker-backed sessions or the Service ClusterIP for kubernetes-
+/// backed sessions; in both cases it's reachable from the WolfStack
+/// daemon's namespace so we don't punch out of the host. Selkies asset
+/// bundles are chunked/streaming, so we pipe the body rather than
+/// buffering.
 async fn proxy_http(
     req: HttpRequest,
     mut payload: web::Payload,
+    host: &str,
     port: u16,
     tail: String,
 ) -> Result<HttpResponse, Error> {
     let query = req.query_string();
     let target = if query.is_empty() {
-        format!("http://127.0.0.1:{}/{}", port, tail)
+        format!("http://{}:{}/{}", host, port, tail)
     } else {
-        format!("http://127.0.0.1:{}/{}?{}", port, tail, query)
+        format!("http://{}:{}/{}?{}", host, port, tail, query)
     };
 
     let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes())
@@ -280,14 +287,15 @@ async fn proxy_http(
 async fn proxy_websocket(
     req: HttpRequest,
     payload: web::Payload,
+    host: &str,
     port: u16,
     tail: String,
 ) -> Result<HttpResponse, Error> {
     let query = req.query_string();
     let upstream_url = if query.is_empty() {
-        format!("ws://127.0.0.1:{}/{}", port, tail)
+        format!("ws://{}:{}/{}", host, port, tail)
     } else {
-        format!("ws://127.0.0.1:{}/{}?{}", port, tail, query)
+        format!("ws://{}:{}/{}?{}", host, port, tail, query)
     };
 
     let (upstream, _resp) = match tokio_tungstenite::connect_async(&upstream_url).await {
