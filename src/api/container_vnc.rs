@@ -240,6 +240,7 @@ fn classify_os(id: &str, id_like: &str) -> (String, bool, Vec<String>, u32, Vec<
             vec![
                 "tigervnc-standalone-server".into(),
                 "tigervnc-common".into(),
+                "tigervnc-tools".into(), // provides vncpasswd
                 "xfce4".into(),
                 "xfce4-terminal".into(),
                 "dbus-x11".into(),
@@ -250,6 +251,7 @@ fn classify_os(id: &str, id_like: &str) -> (String, bool, Vec<String>, u32, Vec<
             vec![
                 "tigervnc-standalone-server".into(),
                 "tigervnc-common".into(),
+                "tigervnc-tools".into(), // provides vncpasswd
                 "dbus-x11".into(),
                 "socat".into(),
                 "xterm".into(),
@@ -287,6 +289,7 @@ fn classify_os(id: &str, id_like: &str) -> (String, bool, Vec<String>, u32, Vec<
             true,
             vec![
                 "tigervnc-server".into(),
+                "tigervnc".into(), // provides vncpasswd
                 "xfce4-session".into(),
                 "xfwm4".into(),
                 "xfce4-panel".into(),
@@ -299,6 +302,7 @@ fn classify_os(id: &str, id_like: &str) -> (String, bool, Vec<String>, u32, Vec<
             500,
             vec![
                 "tigervnc-server".into(),
+                "tigervnc".into(), // provides vncpasswd
                 "dbus-x11".into(),
                 "socat".into(),
                 "xterm".into(),
@@ -446,8 +450,9 @@ echo "Click the VNC icon on the container card to connect."
         ("debian", true) => r#"
 echo "[wolfstack] Installing TigerVNC + XFCE4 on Debian/Ubuntu container..."
 apt-get update -qq
+# tigervnc-tools provides vncpasswd (separate package on Debian/Ubuntu).
 apt-get install -y --no-install-recommends \
-    tigervnc-standalone-server tigervnc-common \
+    tigervnc-standalone-server tigervnc-common tigervnc-tools \
     xfce4 xfce4-terminal \
     dbus-x11 socat fonts-dejavu \
     procps
@@ -456,7 +461,7 @@ apt-get install -y --no-install-recommends \
 echo "[wolfstack] Installing TigerVNC (no desktop) on Debian/Ubuntu container..."
 apt-get update -qq
 apt-get install -y --no-install-recommends \
-    tigervnc-standalone-server tigervnc-common \
+    tigervnc-standalone-server tigervnc-common tigervnc-tools \
     dbus-x11 socat xterm fonts-dejavu \
     procps
 "#.to_string(),
@@ -488,7 +493,7 @@ elif command -v yum >/dev/null 2>&1; then
 else
     echo "No dnf or yum found"; exit 1
 fi
-$PKG tigervnc-server xfce4-session xfwm4 xfce4-panel xfce4-terminal thunar \
+$PKG tigervnc-server tigervnc xfce4-session xfwm4 xfce4-panel xfce4-terminal thunar \
      dbus-x11 socat dejavu-sans-fonts procps-ng
 "#.to_string(),
         ("rhel", false) => r#"
@@ -502,7 +507,8 @@ elif command -v yum >/dev/null 2>&1; then
 else
     echo "No dnf or yum found"; exit 1
 fi
-$PKG tigervnc-server dbus-x11 socat xterm dejavu-sans-fonts procps-ng
+# tigervnc client package provides vncpasswd on RHEL family.
+$PKG tigervnc-server tigervnc dbus-x11 socat xterm dejavu-sans-fonts procps-ng
 "#.to_string(),
         _ => return String::new(),
     };
