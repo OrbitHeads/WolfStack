@@ -2087,43 +2087,87 @@ fn assign_container_bridge_ip(container: &str) -> String {
     // Try to derive from wolfnet IP (deterministic — no allocation needed)
     let base = lxc_base_dir(container);
     let wolfnet_ip_file = format!("{}/{}/.wolfnet/ip", base, container);
-    if let Ok(wolfnet_ip) = std::fs::read_to_string(&wolfnet_ip_file) {
-        let wolfnet_ip = wolfnet_ip.trim();
-        if let Some(last_octet) = wolfnet_ip.rsplit('.').next() {
-            let ip = format!("10.0.3.{}", last_octet);
-            write_container_network_config(container, &ip);
-            return ip;
-        }
-    }
+    let wolfnet_ip = std::fs::read_to_string(&wolfnet_ip_file)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
-    // Fallback: allocate next free bridge IP (for containers without WolfNet)
-    let last = find_free_bridge_ip();
-    let ip = format!("10.0.3.{}", last);
-    write_container_network_config(container, &ip);
-    ip
+    let bridge_ip = match wolfnet_ip.as_deref().and_then(|w| w.rsplit('.').next()) {
+        Some(last_octet) => format!("10.0.3.{}", last_octet),
+        None => {
+            let last = find_free_bridge_ip();
+            format!("10.0.3.{}", last)
+        }
+    };
+
+    write_container_network_config(container, &bridge_ip, wolfnet_ip.as_deref());
+    bridge_ip
 }
 
-/// Write network config to container rootfs — supports systemd-networkd, Netplan,
-/// and /etc/network/interfaces for maximum distro compatibility
-fn write_container_network_config(container: &str, bridge_ip: &str) {
+/// Build the WolfNet /24 subnet from a /32 WolfNet IP — `10.10.20.5` → `10.10.20.0/24`.
+fn wolfnet_subnet_from_ip(ip: &str) -> Option<String> {
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() != 4 { return None; }
+    Some(format!("{}.{}.{}.0/24", parts[0], parts[1], parts[2]))
+}
+
+/// Write persistent network config into the container's rootfs, covering
+/// every renderer we support (NM, systemd-networkd, netplan, ifupdown).
+///
+/// `bridge_ip` is the lxcbr0 IP used for host↔container routing.
+/// `wolfnet_ip`, when present, is added as a secondary /32 on the same
+/// interface and routed via the bridge gateway with `src=wolfnet_ip` so
+/// the container uses its WolfNet IP as the source for WolfNet traffic.
+///
+/// Critical for distros that ship NetworkManager (Linux Mint, Ubuntu
+/// Desktop, Fedora): if the WolfNet IP is only added at runtime via
+/// `lxc-attach ip addr add`, NM rewrites the interface and drops it.
+/// Persisting both addresses in the keyfile makes NM apply them on every
+/// boot.
+fn write_container_network_config(container: &str, bridge_ip: &str, wolfnet_ip: Option<&str>) {
     let rootfs = format!("{}/{}/rootfs", lxc_base_dir(container), container);
+    let wn_subnet = wolfnet_ip.and_then(wolfnet_subnet_from_ip);
 
     // Method 1: systemd-networkd (Debian Trixie, Arch, etc.)
     let networkd_dir = format!("{}/etc/systemd/network", rootfs);
     if std::path::Path::new(&networkd_dir).exists() {
-        let conf = format!(
-            "[Match]\nName=eth0\n\n[Network]\nAddress={}/24\nGateway=10.0.3.1\nDNS=10.0.3.1\nDNS=8.8.8.8\n",
+        let mut conf = format!(
+            "[Match]\nName=eth0\n\n[Network]\nAddress={}/24\n",
             bridge_ip
         );
+        if let Some(wip) = wolfnet_ip {
+            conf.push_str(&format!("Address={}/32\n", wip));
+        }
+        conf.push_str("Gateway=10.0.3.1\nDNS=10.0.3.1\nDNS=8.8.8.8\n");
+        if let (Some(wip), Some(subnet)) = (wolfnet_ip, &wn_subnet) {
+            // Source-pinned route so reply traffic uses the WolfNet IP, not the bridge IP.
+            conf.push_str(&format!(
+                "\n[Route]\nDestination={}\nGateway=10.0.3.1\nPreferredSource={}\n",
+                subnet, wip
+            ));
+        }
         let _ = std::fs::write(format!("{}/eth0.network", networkd_dir), &conf);
     }
 
-    // Method 2: Netplan (Ubuntu 18.04+)
+    // Method 2: Netplan (Ubuntu 18.04+, Linux Mint based on Ubuntu)
     let netplan_dir = format!("{}/etc/netplan", rootfs);
     if std::path::Path::new(&netplan_dir).exists() {
+        let mut addresses = format!("        - {}/24\n", bridge_ip);
+        if let Some(wip) = wolfnet_ip {
+            addresses.push_str(&format!("        - {}/32\n", wip));
+        }
+        let mut routes = String::from(
+            "      routes:\n        - to: default\n          via: 10.0.3.1\n",
+        );
+        if let (Some(wip), Some(subnet)) = (wolfnet_ip, &wn_subnet) {
+            routes.push_str(&format!(
+                "        - to: {}\n          via: 10.0.3.1\n          from: {}\n",
+                subnet, wip
+            ));
+        }
         let conf = format!(
-            "network:\n  version: 2\n  ethernets:\n    eth0:\n      addresses:\n        - {}/24\n      routes:\n        - to: default\n          via: 10.0.3.1\n      nameservers:\n        addresses: [10.0.3.1, 8.8.8.8]\n",
-            bridge_ip
+            "network:\n  version: 2\n  ethernets:\n    eth0:\n      addresses:\n{}{}      nameservers:\n        addresses: [10.0.3.1, 8.8.8.8]\n",
+            addresses, routes
         );
         // Remove conflicting configs
         if let Ok(entries) = std::fs::read_dir(&netplan_dir) {
@@ -2137,29 +2181,48 @@ fn write_container_network_config(container: &str, bridge_ip: &str) {
     // Method 3: /etc/network/interfaces (Debian Bullseye/Bookworm, Alpine)
     let ifaces_path = format!("{}/etc/network/interfaces", rootfs);
     if std::path::Path::new(&ifaces_path).exists() {
-        let conf = format!(
+        let mut conf = format!(
             "auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet static\n    address {}\n    netmask 255.255.255.0\n    gateway 10.0.3.1\n    dns-nameservers 10.0.3.1 8.8.8.8\n",
             bridge_ip
         );
+        if let (Some(wip), Some(subnet)) = (wolfnet_ip, &wn_subnet) {
+            // post-up adds the WolfNet IP as a secondary + the source-pinned subnet route
+            conf.push_str(&format!(
+                "    post-up ip addr add {}/32 dev eth0 || true\n    post-up ip route replace {} via 10.0.3.1 dev eth0 src {} || true\n",
+                wip, subnet, wip
+            ));
+        }
         let _ = std::fs::write(&ifaces_path, &conf);
     }
 
-    // Method 4: NetworkManager keyfile (RHEL, AlmaLinux, Rocky, Fedora, CentOS)
+    // Method 4: NetworkManager keyfile (RHEL, AlmaLinux, Rocky, Fedora,
+    // CentOS, Linux Mint, Ubuntu Desktop, anything with NM enabled).
+    // NM uses `address1`/`address2` for primary/secondary addresses and
+    // `route1` for explicit routes with `route1_options=src=…`.
     let nm_dir = format!("{}/etc/NetworkManager/system-connections", rootfs);
     if std::path::Path::new(&nm_dir).exists() || std::path::Path::new(&format!("{}/etc/NetworkManager", rootfs)).exists() {
         let _ = std::fs::create_dir_all(&nm_dir);
+        let mut ipv4 = String::from("[ipv4]\nmethod=manual\n");
+        ipv4.push_str(&format!("address1={}/24,10.0.3.1\n", bridge_ip));
+        if let Some(wip) = wolfnet_ip {
+            ipv4.push_str(&format!("address2={}/32\n", wip));
+        }
+        if let (Some(wip), Some(subnet)) = (wolfnet_ip, &wn_subnet) {
+            ipv4.push_str(&format!("route1={},10.0.3.1\n", subnet));
+            ipv4.push_str(&format!("route1_options=src={}\n", wip));
+        }
+        ipv4.push_str("dns=10.0.3.1;8.8.8.8;\n");
+
         let conf = format!(
             "[connection]\nid=eth0\ntype=ethernet\ninterface-name=eth0\nautoconnect=true\n\n\
-             [ipv4]\nmethod=manual\naddresses={}/24\ngateway=10.0.3.1\ndns=10.0.3.1;8.8.8.8;\n\n\
+             {}\n\
              [ipv6]\nmethod=disabled\n",
-            bridge_ip
+            ipv4
         );
-        let _ = std::fs::write(format!("{}/eth0.nmconnection", nm_dir), &conf);
-        // Set permissions (NM requires 600)
-        let _ = std::fs::set_permissions(
-            format!("{}/eth0.nmconnection", nm_dir),
-            std::fs::Permissions::from_mode(0o600),
-        );
+        let nm_path = format!("{}/eth0.nmconnection", nm_dir);
+        let _ = std::fs::write(&nm_path, &conf);
+        // NM refuses to load keyfiles that aren't 0600.
+        let _ = std::fs::set_permissions(&nm_path, std::fs::Permissions::from_mode(0o600));
         // Remove legacy ifcfg files that might conflict
         let ifcfg_path = format!("{}/etc/sysconfig/network-scripts/ifcfg-eth0", rootfs);
         let _ = std::fs::remove_file(&ifcfg_path);
@@ -4013,30 +4076,109 @@ pub fn lxc_set_root_password(container: &str, password: &str) -> Result<String, 
     }
 }
 
-/// Start an LXC container
+/// Start an LXC container.
+///
+/// `lxc-start` daemonises and exits 0 *as soon as the fork completes* — it
+/// does not wait for the container to actually reach RUNNING. So a
+/// container that fails during init (missing kernel modules, AppArmor
+/// blocks systemd, broken init binary, cgroup mismatch — common on Linux
+/// Mint / Ubuntu Desktop LXC images) would otherwise return success and
+/// silently die. We poll `lxc-info -s` until the state reaches RUNNING
+/// or a short timeout, then surface the LXC log tail as the error so the
+/// user can act on it.
 pub fn lxc_start(container: &str) -> Result<String, String> {
     ensure_lxc_bridge();
-    let result = if is_proxmox() {
-        run_lxc_cmd(&["pct", "start", container])
-    } else {
-        let base = lxc_base_dir(container);
-        if base != LXC_DEFAULT_PATH {
-            run_lxc_cmd(&["lxc-start", "-P", &base, "-n", container])
-        } else {
-            run_lxc_cmd(&["lxc-start", "-n", container])
-        }
-    };
-    
-    // Apply WolfNet IP if configured
-    if result.is_ok() {
+    if is_proxmox() {
+        // pct start waits internally — its own exit code is authoritative.
+        let msg = run_lxc_cmd(&["pct", "start", container])?;
         lxc_apply_wolfnet(container);
         lxc_post_start_setup(container);
-        // WolfUSB: re-attach any USB devices assigned to this container
         let self_id = crate::agent::self_node_id();
         crate::wolfusb::on_container_started(container, "lxc", &self_id);
+        return Ok(msg);
     }
 
-    result
+    let base = lxc_base_dir(container);
+    let p_flag_args: Vec<String> = if base != LXC_DEFAULT_PATH {
+        vec!["-P".into(), base.clone()]
+    } else {
+        Vec::new()
+    };
+
+    // Kick off the start. lxc-start exits 0 once the daemon has forked.
+    {
+        let mut argv: Vec<String> = vec!["lxc-start".into()];
+        argv.extend(p_flag_args.iter().cloned());
+        argv.extend(["-n".into(), container.into()]);
+        let argv_ref: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+        run_lxc_cmd(&argv_ref)?;
+    }
+
+    // Poll lxc-info until state == RUNNING, up to ~8 s. Most healthy
+    // containers reach RUNNING within 1–2 s; a misbehaving one stays
+    // STOPPED or oscillates STARTING -> STOPPED.
+    let mut last_state = String::new();
+    for _ in 0..16 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let mut argv: Vec<String> = vec!["lxc-info".into()];
+        argv.extend(p_flag_args.iter().cloned());
+        argv.extend(["-n".into(), container.into(), "-s".into()]);
+        let argv_ref: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+        if let Ok(o) = Command::new(argv_ref[0]).args(&argv_ref[1..]).output() {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            // Output: "State:          RUNNING\n"
+            if let Some(state) = stdout.split(':').nth(1) {
+                last_state = state.trim().to_string();
+                if last_state == "RUNNING" { break; }
+            }
+        }
+    }
+
+    if last_state != "RUNNING" {
+        // Surface the lxc log tail so the operator can diagnose. lxc-start
+        // writes to {base}/{container}/{container}.log on most installs;
+        // some distros use /var/log/lxc/{container}.log.
+        let log_paths = [
+            format!("{}/{}/{}.log", base, container, container),
+            format!("/var/log/lxc/{}.log", container),
+        ];
+        let mut tail = String::new();
+        for p in &log_paths {
+            if let Ok(text) = std::fs::read_to_string(p) {
+                let lines: Vec<&str> = text.lines().rev().take(20).collect();
+                if !lines.is_empty() {
+                    let mut rev: Vec<&str> = lines;
+                    rev.reverse();
+                    tail = rev.join("\n");
+                    break;
+                }
+            }
+        }
+
+        let observed = if last_state.is_empty() { "(no state reported)".to_string() } else { last_state };
+        let mut msg = format!(
+            "lxc-start returned 0 but container did not reach RUNNING (state: {}). \
+             Common causes on systemd-based containers (Linux Mint, Ubuntu Desktop): \
+             AppArmor blocking init, missing kernel modules (overlay, loop), or \
+             cgroup v1/v2 mismatch. Try `security.nesting = 1` and \
+             `lxc.apparmor.profile = unconfined` in the container config.",
+            observed
+        );
+        if !tail.is_empty() {
+            msg.push_str("\n\n--- last lxc log lines ---\n");
+            msg.push_str(&tail);
+        }
+        return Err(msg);
+    }
+
+    // Apply WolfNet IP if configured
+    lxc_apply_wolfnet(container);
+    lxc_post_start_setup(container);
+    // WolfUSB: re-attach any USB devices assigned to this container
+    let self_id = crate::agent::self_node_id();
+    crate::wolfusb::on_container_started(container, "lxc", &self_id);
+
+    Ok("Container started".to_string())
 }
 
 /// First-boot setup for LXC containers (runs once)
@@ -7262,12 +7404,13 @@ pub fn lxc_clone_fixup_ip(new_name: &str) {
     let new_ip = format!("10.0.3.{}", new_last);
     let base = lxc_base_dir(new_name);
 
-    // Write multi-distro network config inside rootfs
-    write_container_network_config(new_name, &new_ip);
-
     // Remove WolfNet IP marker from clone (it shouldn't inherit the original's WolfNet IP)
     let wolfnet_dir = format!("{}/{}/.wolfnet", base, new_name);
     let _ = std::fs::remove_dir_all(&wolfnet_dir);
+
+    // Write multi-distro network config inside rootfs (no WolfNet IP — clone gets a fresh
+    // bridge IP only; the user adds a WolfNet IP through the settings UI if desired)
+    write_container_network_config(new_name, &new_ip, None);
 
     // Update the LXC config: rootfs path, hostname, hwaddr, ipv4.address, and ensure
     // all required networking fields are present

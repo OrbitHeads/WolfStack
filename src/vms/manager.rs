@@ -626,6 +626,28 @@ impl VmManager {
             "--serial0".to_string(), "socket".to_string(), // Serial console for qm terminal
         ];
 
+        // When a WolfNet IP is configured, set up a per-VM bridge with a
+        // pinned-IP dnsmasq, then add `--net1 virtio,bridge=wnbr-{vmid}`.
+        // PVE attaches its own tap to the bridge when the VM starts; the
+        // VM gets its WolfNet IP via DHCP automatically. Same UX as the
+        // standalone QEMU path.
+        //
+        // Note on VLANs: on Proxmox, a VLAN tag on the same NIC as WolfNet
+        // mangles the routing model (we hit this with LXC — see
+        // validate_wolfnet_vlan_conflict). Here we sidestep that entirely:
+        // net0 stays on vmbr0 (with whatever VLAN tag the user wants),
+        // net1 lives on its own dedicated bridge with no VLAN. The two
+        // NICs never share a broadcast domain, so VLAN + WolfNet coexist.
+        if let Some(ref wip) = config.wolfnet_ip {
+            self.ensure_dnsmasq_installed();
+            let bridge = Self::wn_bridge_name(&vmid.to_string());
+            if let Err(e) = self.setup_wolfnet_bridge(&bridge, wip) {
+                warn!("WolfNet bridge setup for VMID {} failed (VM will still be created): {}", vmid, e);
+            }
+            args.push("--net1".to_string());
+            args.push(format!("virtio,bridge={}", bridge));
+        }
+
         // Boot media (ISO as CD-ROM, .img not supported as USB on Proxmox)
         if let Some(ref iso) = config.iso_path {
             if !iso.is_empty() {
@@ -1171,9 +1193,148 @@ impl VmManager {
 
         let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
         fs::write(&config_path, json).map_err(|e| e.to_string())?;
-        
+
+        // If the user added or changed the WolfNet IP, make sure the per-VM
+        // WolfNet bridge + dnsmasq exist (so adding-WolfNet-after-creation
+        // works the same as setting it at create time) and ensure libvirt /
+        // PVE actually have a NIC on that bridge.
+        if config.wolfnet_ip != old_wolfnet_ip {
+            self.reconcile_wolfnet_for_vm(name, &config, old_wolfnet_ip.as_deref());
+        }
 
         Ok(())
+    }
+
+    /// Bring the libvirt / PVE VM's WolfNet attachment in line with
+    /// `config.wolfnet_ip`. Idempotent — safe to call from update_vm
+    /// regardless of whether the VM already has a NIC on the WolfNet
+    /// bridge. Standalone QEMU VMs ignore this (their TAP is rebuilt
+    /// fresh on every start_vm).
+    fn reconcile_wolfnet_for_vm(&self, name: &str, config: &VmConfig, old_ip: Option<&str>) {
+        // When the IP changes value (not just absent→present), drop the
+        // old /32 host route so packets for the old address don't end up
+        // black-holed at the now-unused bridge entry. setup_wolfnet_bridge
+        // will install the route for the new IP. Also strip the matching
+        // NAT MASQUERADE rule so it doesn't accumulate one per re-IP.
+        if let (Some(old), Some(new)) = (old_ip, config.wolfnet_ip.as_deref()) {
+            if old != new {
+                let _ = Command::new("ip")
+                    .args(["route", "del", &format!("{}/32", old)])
+                    .output();
+                let parts: Vec<&str> = old.split('.').collect();
+                if parts.len() == 4 {
+                    let wn_subnet = format!("{}.{}.{}.0/24", parts[0], parts[1], parts[2]);
+                    let _ = Command::new("iptables")
+                        .args(["-t", "nat", "-D", "POSTROUTING", "-s", &format!("{}/32", old),
+                               "!", "-d", &wn_subnet, "-j", "MASQUERADE"]).output();
+                }
+            }
+        }
+
+        // Proxmox path
+        if containers::is_proxmox() {
+            let vmid = match self.qm_vmid_by_name(name) {
+                Some(v) => v.to_string(),
+                None => return, // nothing we can do without a vmid
+            };
+            let bridge = Self::wn_bridge_name(&vmid);
+            match config.wolfnet_ip.as_deref() {
+                Some(wip) => {
+                    self.ensure_dnsmasq_installed();
+                    if let Err(e) = self.setup_wolfnet_bridge(&bridge, wip) {
+                        warn!("WolfNet bridge reconcile (qm) for VMID {} failed: {}", vmid, e);
+                        return;
+                    }
+                    // Idempotent: qm set succeeds if --net1 doesn't exist OR if it
+                    // already points at the same bridge. If the user previously
+                    // configured net1 manually, this overwrites — acceptable
+                    // because they explicitly asked for WolfNet.
+                    let out = Command::new("qm")
+                        .args(["set", &vmid, "--net1", &format!("virtio,bridge={}", bridge)])
+                        .output();
+                    match out {
+                        Ok(o) if o.status.success() => {
+                            info!("Attached WolfNet NIC (net1 on {}) to VMID {}", bridge, vmid);
+                        }
+                        Ok(o) => warn!("qm set --net1 failed for VMID {}: {}", vmid, String::from_utf8_lossy(&o.stderr).trim()),
+                        Err(e) => warn!("qm set --net1 spawn failed for VMID {}: {}", vmid, e),
+                    }
+                }
+                None => {
+                    // WolfNet IP cleared — drop net1 + cleanup the bridge
+                    let _ = Command::new("qm").args(["set", &vmid, "--delete", "net1"]).output();
+                    self.cleanup_wolfnet_bridge(&bridge, old_ip);
+                }
+            }
+            return;
+        }
+        // Libvirt path
+        if containers::is_libvirt() && self.virsh_has_domain(name) {
+            let bridge = Self::wn_bridge_name(name);
+            match config.wolfnet_ip.as_deref() {
+                Some(wip) => {
+                    self.ensure_dnsmasq_installed();
+                    if let Err(e) = self.setup_wolfnet_bridge(&bridge, wip) {
+                        warn!("WolfNet bridge reconcile (virsh) for VM '{}' failed: {}", name, e);
+                        return;
+                    }
+                    // Check if a NIC on this bridge is already attached. virsh
+                    // domiflist prints all interfaces; grep for the bridge name.
+                    let already_attached = Command::new("virsh")
+                        .args(["domiflist", name]).output()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&bridge))
+                        .unwrap_or(false);
+                    if already_attached { return; }
+
+                    // virsh flag semantics: `--config` persists across reboots,
+                    // `--live` applies to a running domain. Combine when the VM
+                    // is up so the user gets the NIC immediately AND on reboot;
+                    // only `--config` for a stopped VM (libvirt rejects --live
+                    // on a defined-but-not-running domain).
+                    let mut flags: Vec<&str> = vec!["--config"];
+                    if self.check_running(name) { flags.push("--live"); }
+                    let mut argv: Vec<&str> = vec![
+                        "attach-interface", "--domain", name,
+                        "--type", "bridge", "--source", &bridge,
+                        "--model", "virtio",
+                    ];
+                    argv.extend_from_slice(&flags);
+                    let out = Command::new("virsh").args(&argv).output();
+                    match out {
+                        Ok(o) if o.status.success() => {
+                            info!("Attached WolfNet NIC ({}) to libvirt VM '{}'", bridge, name);
+                        }
+                        Ok(o) => warn!("virsh attach-interface failed for VM '{}': {}", name, String::from_utf8_lossy(&o.stderr).trim()),
+                        Err(e) => warn!("virsh attach-interface spawn failed for VM '{}': {}", name, e),
+                    }
+                }
+                None => {
+                    // WolfNet IP cleared — detach the bridge NIC + cleanup.
+                    // virsh domiflist columns: Interface Type Source Model MAC.
+                    // We grab the MAC from the row whose Source is our bridge.
+                    let mac = Command::new("virsh")
+                        .args(["domiflist", name]).output().ok()
+                        .and_then(|o| {
+                            let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+                            stdout.lines()
+                                .find(|l| l.split_whitespace().nth(2) == Some(&bridge))
+                                .and_then(|l| l.split_whitespace().last().map(|s| s.to_string()))
+                        });
+                    if let Some(m) = mac {
+                        let mut flags: Vec<&str> = vec!["--config"];
+                        if self.check_running(name) { flags.push("--live"); }
+                        let mut argv: Vec<&str> = vec![
+                            "detach-interface", name, "bridge", "--mac", &m,
+                        ];
+                        argv.extend_from_slice(&flags);
+                        let _ = Command::new("virsh").args(&argv).output();
+                    }
+                    self.cleanup_wolfnet_bridge(&bridge, old_ip);
+                }
+            }
+        }
+        // Standalone QEMU: the TAP is rebuilt by start_vm()'s setup_wolfnet_routing,
+        // so nothing to reconcile here.
     }
 
     pub fn start_vm(&self, name: &str) -> Result<(), String> {
@@ -1192,6 +1353,18 @@ impl VmManager {
             }
         }
 
+        // Look up the WolfStack-side config so we can re-arm the WolfNet
+        // bridge + dnsmasq before delegating to PVE/libvirt. The bridge
+        // is a kernel device that vanishes on host reboot, and dnsmasq
+        // can be killed; this makes start_vm self-healing for both.
+        let wolfstack_cfg: Option<VmConfig> = {
+            let cfg_path = self.vm_config_path(name);
+            fs::read_to_string(&cfg_path).ok().and_then(|t| serde_json::from_str(&t).ok())
+        };
+        let wn_ip_for_bridge: Option<String> = wolfstack_cfg
+            .as_ref()
+            .and_then(|c| c.wolfnet_ip.clone());
+
         // On Proxmox, delegate to qm start
         if containers::is_proxmox() {
             let vmid = self.qm_vmid_by_name(name)
@@ -1206,6 +1379,15 @@ impl VmManager {
                 return Err(format!("VM '{}' (vmid {}) config is invalid: {}", name, vmid, e));
             }
 
+            // Re-arm the per-VM WolfNet bridge + dnsmasq. PVE will hook
+            // its own tap into this bridge as part of qm start.
+            if let Some(ref wip) = wn_ip_for_bridge {
+                let bridge = Self::wn_bridge_name(&vmid.to_string());
+                if let Err(e) = self.setup_wolfnet_bridge(&bridge, wip) {
+                    warn!("WolfNet bridge re-arm for VMID {} failed: {}", vmid, e);
+                }
+            }
+
             let output = Command::new("qm").args(["start", &vmid.to_string()]).output()
                 .map_err(|e| format!("Failed to run qm start: {}", e))?;
             if output.status.success() {
@@ -1218,6 +1400,15 @@ impl VmManager {
         // libvirt actually owns. Pre-libvirt native VMs with a JSON
         // config fall through to the qemu path below.
         if containers::is_libvirt() && self.virsh_has_domain(name) {
+            // Re-arm the per-VM WolfNet bridge + dnsmasq before virsh start
+            // so the VM sees a working DHCP server on its WolfNet NIC.
+            if let Some(ref wip) = wn_ip_for_bridge {
+                let bridge = Self::wn_bridge_name(name);
+                if let Err(e) = self.setup_wolfnet_bridge(&bridge, wip) {
+                    warn!("WolfNet bridge re-arm for VM '{}' failed: {}", name, e);
+                }
+            }
+
             let output = Command::new("virsh").args(["start", name]).output()
                 .map_err(|e| format!("Failed to run virsh start: {}", e))?;
             if output.status.success() {
@@ -1738,7 +1929,95 @@ impl VmManager {
         }
     }
 
-    /// Create and configure a TAP interface
+    /// Per-VM WolfNet bridge name for libvirt / PVE VMs. Linux bridge names
+    /// are limited to 15 chars (IFNAMSIZ-1).
+    pub fn wn_bridge_name(vmid_or_name: &str) -> String {
+        // Sanitise: only [a-z0-9-] survives; truncate.
+        let safe: String = vmid_or_name.chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c.to_ascii_lowercase() } else { '-' })
+            .collect();
+        let s = format!("wnbr-{}", safe);
+        if s.len() > 15 { s[..15].to_string() } else { s }
+    }
+
+    /// Idempotently set up a per-VM Linux bridge with dnsmasq pinned to a
+    /// single WolfNet IP — the libvirt/PVE equivalent of standalone QEMU's
+    /// per-VM TAP. The hypervisor (libvirt / PVE) creates its own tap on
+    /// this bridge when the VM starts; the bridge gives us a stable
+    /// interface to run dnsmasq + host routing on. Layout matches
+    /// setup_wolfnet_routing exactly so the host iptables/forwarding/NAT
+    /// rules are identical.
+    pub fn setup_wolfnet_bridge(&self, bridge: &str, wolfnet_ip: &str) -> Result<(), String> {
+        // Create the bridge if missing.
+        let exists = Command::new("ip").args(["link", "show", bridge]).output()
+            .map(|o| o.status.success()).unwrap_or(false);
+        if !exists {
+            let out = Command::new("ip")
+                .args(["link", "add", bridge, "type", "bridge"])
+                .output()
+                .map_err(|e| format!("Failed to create bridge {}: {}", bridge, e))?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if !stderr.contains("File exists") {
+                    return Err(format!("Bridge creation failed: {}", stderr));
+                }
+            }
+        }
+        // Bring it up — required before dnsmasq can bind, and before
+        // the hypervisor attaches a tap.
+        let _ = Command::new("ip").args(["link", "set", bridge, "up"]).output();
+        // Disable bridge's internal forwarding restrictions — STP off, no
+        // multicast snooping confusion, fast failover.
+        let _ = Command::new("ip").args(["link", "set", bridge, "type", "bridge", "stp_state", "0"]).output();
+
+        // Reuse the TAP/bridge-agnostic routing+dnsmasq setup. Inside,
+        // it `ip addr flush`es the iface and assigns the gateway IP, runs
+        // dnsmasq on `--interface={iface}` — works identically for a TAP
+        // or a bridge (both are L3 interfaces from the host's POV).
+        self.setup_wolfnet_routing(bridge, wolfnet_ip)
+    }
+
+    /// Tear down a per-VM WolfNet bridge: kill dnsmasq, drop iptables
+    /// rules, delete the bridge. Mirrors cleanup_tap but for our bridges.
+    fn cleanup_wolfnet_bridge(&self, bridge: &str, wolfnet_ip: Option<&str>) {
+        // Kill the per-bridge dnsmasq using the pid file we set in
+        // setup_wolfnet_routing — falls back to pkill on the iface name.
+        let _ = Command::new("pkill")
+            .args(["-f", &format!("dnsmasq.*--interface={}", bridge)])
+            .output();
+        let pid_path = format!("/run/dnsmasq-{}.pid", bridge);
+        let _ = std::fs::remove_file(&pid_path);
+        let lease_path = format!("/run/dnsmasq-{}.leases", bridge);
+        let _ = std::fs::remove_file(&lease_path);
+
+        if let Some(ip) = wolfnet_ip {
+            // Remove the host /32 route for this VM's WolfNet IP.
+            let _ = Command::new("ip")
+                .args(["route", "del", &format!("{}/32", ip)])
+                .output();
+            // Remove the NAT MASQUERADE rule we added.
+            let parts: Vec<&str> = ip.split('.').collect();
+            if parts.len() == 4 {
+                let wn_subnet = format!("{}.{}.{}.0/24", parts[0], parts[1], parts[2]);
+                let _ = Command::new("iptables")
+                    .args(["-t", "nat", "-D", "POSTROUTING", "-s", &format!("{}/32", ip),
+                           "!", "-d", &wn_subnet, "-j", "MASQUERADE"]).output();
+            }
+        }
+
+        // Drop iptables FORWARD rules for the bridge — best effort.
+        let _ = Command::new("iptables")
+            .args(["-D", "FORWARD", "-i", bridge, "-j", "ACCEPT"]).output();
+        let _ = Command::new("iptables")
+            .args(["-D", "FORWARD", "-o", bridge, "-j", "ACCEPT"]).output();
+
+        // Bring down + delete the bridge. Note: libvirt/PVE may still be
+        // holding a tap on it; deleting the bridge unhooks them, which is
+        // fine because the VM is being destroyed.
+        let _ = Command::new("ip").args(["link", "set", bridge, "down"]).output();
+        let _ = Command::new("ip").args(["link", "del", bridge]).output();
+    }
+
     fn setup_tap(&self, tap: &str) -> Result<(), String> {
         // Clean up any stale TAP from a previous crash or host restart first,
         // otherwise `ip tuntap add` can fail with EBUSY if the interface exists
@@ -2483,6 +2762,9 @@ impl VmManager {
             if output.status.success() {
                 // Also clean up any WolfStack tracking config
                 let _ = fs::remove_file(self.vm_config_path(name));
+                // Tear down the per-VM WolfNet bridge + dnsmasq if any.
+                let bridge = Self::wn_bridge_name(&vmid.to_string());
+                self.cleanup_wolfnet_bridge(&bridge, released_ip.as_deref());
                 if let Some(ip) = released_ip { containers::release_wolfnet_ip(&ip); }
                 return Ok(());
             }
@@ -2499,6 +2781,8 @@ impl VmManager {
             let output = Command::new("virsh").args(["undefine", name, "--nvram"]).output()
                 .map_err(|e| format!("Failed to run virsh undefine: {}", e))?;
             if output.status.success() {
+                let bridge = Self::wn_bridge_name(name);
+                self.cleanup_wolfnet_bridge(&bridge, released_ip.as_deref());
                 if let Some(ip) = released_ip { containers::release_wolfnet_ip(&ip); }
                 return Ok(());
             }
@@ -2506,6 +2790,8 @@ impl VmManager {
             let output2 = Command::new("virsh").args(["undefine", name]).output()
                 .map_err(|e| format!("Failed to run virsh undefine: {}", e))?;
             if output2.status.success() {
+                let bridge = Self::wn_bridge_name(name);
+                self.cleanup_wolfnet_bridge(&bridge, released_ip.as_deref());
                 if let Some(ip) = released_ip { containers::release_wolfnet_ip(&ip); }
                 return Ok(());
             }
@@ -2814,8 +3100,28 @@ impl VmManager {
             "--noautoconsole".to_string(),
         ];
 
-        // Network: use default network
+        // Network: use libvirt's default NAT network for primary connectivity
+        // (gives the VM internet access via 192.168.122.x).
         args.extend(["--network".to_string(), "default".to_string()]);
+
+        // When a WolfNet IP is configured, attach a SECOND NIC to a per-VM
+        // bridge. WolfStack runs a one-IP dnsmasq on that bridge so the VM
+        // gets its WolfNet IP automatically via DHCP — same UX as the
+        // standalone QEMU path. dnsmasq is started here (idempotent) and
+        // again at start_vm() time in case the host rebooted or dnsmasq
+        // was killed.
+        let wn_bridge = if let Some(ref wip) = config.wolfnet_ip {
+            self.ensure_dnsmasq_installed();
+            let bridge = Self::wn_bridge_name(&config.name);
+            if let Err(e) = self.setup_wolfnet_bridge(&bridge, wip) {
+                warn!("WolfNet bridge setup for VM '{}' failed (VM will still be created): {}", config.name, e);
+            }
+            args.extend(["--network".to_string(), format!("bridge={},model=virtio", bridge)]);
+            Some(bridge)
+        } else {
+            None
+        };
+        let _ = wn_bridge; // silence unused warning when no WolfNet IP set
 
         // Import image or ISO — one of these is required for virt-install
         if let Some(ref import) = config.import_image {
