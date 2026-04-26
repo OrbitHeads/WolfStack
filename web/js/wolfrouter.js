@@ -542,6 +542,7 @@
         if (tab === 'connections')  wrRenderConnections();
         if (tab === 'packets')      wrRenderPackets();
         if (tab === 'tools')        wrRenderDnsTools();
+        if (tab === 'traceroute')   wrRenderTraceroute();
         if (tab === 'logs')         wrRenderLogs();
     }
 
@@ -3869,6 +3870,173 @@
             pre.textContent = lines.length ? lines.join('\n') : '(no firewall log lines — enable "Log this match" on a rule to populate)';
         } catch (e) {}
     }
+
+    // ─── Visual TraceRoute ───
+    //
+    // GET /api/traceroute?target=… returns the parsed hops (ip, rtt_ms),
+    // we then geolocate each non-private hop via /api/geolocate (already
+    // used by the home-page world map), and render a Leaflet map with a
+    // marker per hop and a polyline tying them together. RFC1918 and
+    // loopback IPs are kept in the table but not plotted (no useful
+    // geolocation — they're the user's LAN / the ISP's near edge).
+    let wrTrMap = null;
+    let wrTrLayer = null;
+
+    function wrIsPrivateIp(ip) {
+        if (!ip) return true;
+        return /^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|127\.|169\.254\.|::1$|fc[0-9a-f]{2}:|fd[0-9a-f]{2}:|fe80:)/i.test(ip);
+    }
+
+    // Escape user-influenced text before embedding in innerHTML / Leaflet
+    // popups. ip-api.com is third-party data we proxy through — a spoofed
+    // reverse-DNS / WHOIS field would otherwise XSS into the dashboard.
+    function wrEsc(s) {
+        if (s == null) return '';
+        return String(s)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    function wrEnsureTracerouteMap() {
+        const el = document.getElementById('wr-tr-map');
+        if (!el) return null;
+        if (!wrTrMap) {
+            wrTrMap = L.map(el, { worldCopyJump: true, zoomControl: true })
+                .setView([20, 0], 2);
+            // Same dark CartoDB tiles the home-page world map uses, so the
+            // traceroute view feels like part of the same UI.
+            L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', {
+                attribution: '© OpenStreetMap, © CARTO',
+                maxZoom: 18,
+            }).addTo(wrTrMap);
+            wrTrLayer = L.layerGroup().addTo(wrTrMap);
+        }
+        // Fix sizing in case the tab was display:none when the map was created.
+        setTimeout(() => { try { wrTrMap.invalidateSize(); } catch (_) {} }, 50);
+        return wrTrMap;
+    }
+
+    async function wrRenderTraceroute() {
+        // Just init the map. Real work happens on click of Trace.
+        wrEnsureTracerouteMap();
+    }
+
+    async function wrTracerouteGo() {
+        const input = document.getElementById('wr-tr-target');
+        const status = document.getElementById('wr-tr-status');
+        const tbody = document.getElementById('wr-tr-hops');
+        const goBtn = document.getElementById('wr-tr-go');
+        const target = (input?.value || '').trim();
+        if (!target) {
+            status.textContent = 'Enter an IP address or hostname.';
+            input?.focus();
+            return;
+        }
+        if (tbody) tbody.innerHTML = '';
+        if (status) status.textContent = '⏳ Tracing route to ' + target + '… (up to ~30s)';
+        if (goBtn) { goBtn.disabled = true; goBtn.textContent = '⏳ Tracing…'; }
+
+        const map = wrEnsureTracerouteMap();
+        if (wrTrLayer) wrTrLayer.clearLayers();
+
+        let resp, data;
+        try {
+            resp = await fetch(apiUrl('/api/traceroute?target=' + encodeURIComponent(target)));
+            data = await resp.json();
+        } catch (e) {
+            if (status) status.textContent = '❌ Trace failed: ' + e.message;
+            if (goBtn) { goBtn.disabled = false; goBtn.textContent = '🛰 Trace'; }
+            return;
+        }
+        if (!resp.ok) {
+            if (status) status.textContent = '❌ ' + (data.error || resp.statusText);
+            if (goBtn) { goBtn.disabled = false; goBtn.textContent = '🛰 Trace'; }
+            return;
+        }
+        const hops = data.hops || [];
+        if (!hops.length) {
+            if (status) status.textContent = '❌ traceroute returned no hops' + (data.error ? ' — ' + data.error : '');
+            if (goBtn) { goBtn.disabled = false; goBtn.textContent = '🛰 Trace'; }
+            return;
+        }
+
+        if (status) status.textContent = `✓ ${hops.length} hops to ${target}${data.resolved_ip && data.resolved_ip !== target ? ' (' + data.resolved_ip + ')' : ''} — geolocating…`;
+
+        // Render the table immediately; fill location cells as geo lookups complete.
+        if (tbody) {
+            tbody.innerHTML = hops.map(h => {
+                const ip = h.ip ? wrEsc(h.ip) : '*';
+                const rtt = (h.rtt_ms != null) ? `${h.rtt_ms.toFixed(1)} ms` : '<span style="color:var(--text-muted);">timeout</span>';
+                const isPriv = wrIsPrivateIp(h.ip);
+                const locId = `wr-tr-loc-${h.hop}`;
+                const placeholder = h.ip
+                    ? (isPriv ? '<span style="color:var(--text-muted);">private</span>' : '<span style="color:var(--text-muted);">…</span>')
+                    : '';
+                return `<tr><td>${h.hop}</td><td style="font-family:var(--font-mono);">${ip}</td><td>${rtt}</td><td id="${locId}">${placeholder}</td></tr>`;
+            }).join('');
+        }
+
+        // Sequentially geolocate each public hop. Sequential (not parallel)
+        // because ip-api.com's free tier throttles to ~45 req/min and
+        // bursting all hops at once gets rate-limited; we'd rather take a
+        // few seconds longer than show "*" for hops we could have plotted.
+        const points = [];
+        for (const h of hops) {
+            if (!h.ip || wrIsPrivateIp(h.ip)) continue;
+            try {
+                const gr = await fetch(apiUrl('/api/geolocate?ip=' + encodeURIComponent(h.ip)));
+                const gd = await gr.json();
+                if (gd.status === 'success' && gd.lat != null && gd.lon != null) {
+                    points.push({ hop: h.hop, ip: h.ip, lat: gd.lat, lon: gd.lon, rtt_ms: h.rtt_ms, label: gd });
+                    const cell = document.getElementById('wr-tr-loc-' + h.hop);
+                    if (cell) {
+                        const place = wrEsc([gd.city, gd.country].filter(Boolean).join(', ') || gd.regionName || '');
+                        const isp = wrEsc(gd.isp || gd.as || '');
+                        cell.innerHTML = `${place}${isp ? ' <span style="color:var(--text-muted);font-size:11px;">(' + isp + ')</span>' : ''}`;
+                    }
+                } else {
+                    const cell = document.getElementById('wr-tr-loc-' + h.hop);
+                    if (cell) cell.innerHTML = '<span style="color:var(--text-muted);">unknown</span>';
+                }
+            } catch (e) {
+                const cell = document.getElementById('wr-tr-loc-' + h.hop);
+                if (cell) cell.innerHTML = '<span style="color:var(--text-muted);">lookup failed</span>';
+            }
+        }
+
+        // Plot. Each hop = a circle marker, polyline ties the path
+        // together. Final hop in red so the destination is visible.
+        if (wrTrLayer) wrTrLayer.clearLayers();
+        const latlngs = points.map(p => [p.lat, p.lon]);
+        points.forEach((p, idx) => {
+            const isFinal = idx === points.length - 1;
+            const colour = isFinal ? '#ef4444' : '#3b82f6';
+            const radius = isFinal ? 8 : 5;
+            const m = L.circleMarker([p.lat, p.lon], {
+                radius, color: '#fff', weight: 2, fillColor: colour, fillOpacity: 0.9,
+            }).addTo(wrTrLayer);
+            const place = wrEsc([p.label.city, p.label.country].filter(Boolean).join(', '));
+            const isp = wrEsc(p.label.isp || p.label.as || '');
+            const rtt = (p.rtt_ms != null) ? `${p.rtt_ms.toFixed(1)} ms` : '?';
+            m.bindPopup(`<strong>Hop ${p.hop}</strong> — ${wrEsc(p.ip)}<br>${place}<br>${isp}<br>RTT: ${rtt}`);
+        });
+        if (latlngs.length >= 2) {
+            L.polyline(latlngs, { color: '#3b82f6', weight: 2, opacity: 0.7, dashArray: '4 4' })
+                .addTo(wrTrLayer);
+        }
+        if (latlngs.length === 1) {
+            wrTrMap.setView(latlngs[0], 5);
+        } else if (latlngs.length > 1) {
+            wrTrMap.fitBounds(latlngs, { padding: [30, 30] });
+        }
+        if (status) {
+            const plotted = points.length;
+            status.textContent = `✓ ${hops.length} hops — ${plotted} plotted (private/unresolved hops are listed but not on the map).`;
+        }
+        if (goBtn) { goBtn.disabled = false; goBtn.textContent = '🛰 Trace'; }
+    }
+    window.wrRenderTraceroute = wrRenderTraceroute;
+    window.wrTracerouteGo = wrTracerouteGo;
 
     // ─── Rack view SVG (the real-rack version) ───
     //

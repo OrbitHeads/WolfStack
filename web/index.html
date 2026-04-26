@@ -6382,6 +6382,7 @@
                         <button class="wr-tab" data-tab="connections" onclick="wrSelectTab('connections')">🔗 Connections</button>
                         <button class="wr-tab" data-tab="packets" onclick="wrSelectTab('packets')">📡 Packets</button>
                         <button class="wr-tab" data-tab="tools" onclick="wrSelectTab('tools')">🛠 DNS Tools</button>
+                        <button class="wr-tab" data-tab="traceroute" onclick="wrSelectTab('traceroute')">🛰 Visual TraceRoute</button>
                         <button class="wr-tab" data-tab="logs" onclick="wrSelectTab('logs')">📜 Logs</button>
                     </div>
 
@@ -6629,6 +6630,27 @@
 
                     <div id="wr-tab-tools" class="wr-tab-panel" style="padding:16px; display:none;">
                         <div id="wr-tools-root"></div>
+                    </div>
+
+                    <div id="wr-tab-traceroute" class="wr-tab-panel" style="padding:16px; display:none;">
+                        <div style="font-size:12px; color:var(--text-muted); margin-bottom:12px;">
+                            Visualise the internet path to any IP or hostname. Each hop's location is geolocated via ip-api.com and drawn on the world map. Private/RFC1918 IPs (your LAN, ISP near-edge) are listed but not plotted.
+                        </div>
+                        <div style="display:flex; gap:8px; margin-bottom:12px; flex-wrap:wrap;">
+                            <input type="text" id="wr-tr-target" class="form-control" placeholder="e.g. 8.8.8.8 or wolf.uk.com" style="flex:1; min-width:240px; padding:8px 12px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:6px; color:var(--text);">
+                            <button class="btn btn-primary" id="wr-tr-go" onclick="wrTracerouteGo()">🛰 Trace</button>
+                        </div>
+                        <div id="wr-tr-status" style="font-size:12px; color:var(--text-muted); margin-bottom:12px;"></div>
+                        <div style="display:grid; grid-template-columns:minmax(0, 1fr) minmax(0, 360px); gap:12px;">
+                            <div id="wr-tr-map" style="height:520px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px;"></div>
+                            <div style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px; padding:8px; max-height:520px; overflow:auto;">
+                                <div style="font-size:11px; color:var(--text-muted); padding:4px 8px;">Hops</div>
+                                <table class="data-table" style="font-size:12px; width:100%;">
+                                    <thead><tr><th style="width:32px;">#</th><th>IP</th><th>RTT</th><th>Location</th></tr></thead>
+                                    <tbody id="wr-tr-hops"></tbody>
+                                </table>
+                            </div>
+                        </div>
                     </div>
 
                     <div id="wr-tab-logs" class="wr-tab-panel" style="padding:16px; display:none;">

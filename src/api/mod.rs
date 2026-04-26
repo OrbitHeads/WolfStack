@@ -3156,6 +3156,145 @@ pub async fn geolocate(req: HttpRequest, state: web::Data<AppState>, query: web:
     }
 }
 
+/// GET /api/traceroute?target=<ip-or-host>
+///
+/// Runs `traceroute -n -w 1 -q 1 -m 20 <target>` and returns the parsed
+/// hops as JSON. Used by WolfRouter's Visual TraceRoute tab to draw the
+/// internet path on a map (each hop's IP is then geolocated client-side
+/// via the existing /api/geolocate proxy).
+///
+/// Returns: { target, resolved_ip, hops: [{hop, ip, rtt_ms}, ...] }
+/// Hops with `ip == null` are timeouts (rendered as "* * *" by traceroute).
+pub async fn traceroute_handler(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    let target = match query.get("target") {
+        Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "Missing target parameter (IP or hostname)"
+        })),
+    };
+
+    // Validate the target — only allow chars that can appear in a host
+    // or IP. Stops shell-injection via the target arg even though we
+    // pass it as an argv element (defence in depth).
+    let valid = !target.is_empty()
+        && target.len() <= 253
+        && target.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':');
+    if !valid {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "Invalid target — only alphanumeric, dot, dash, and colon are allowed"
+        }));
+    }
+
+    // Resolve to an IP up front (so the response carries it for the
+    // map's destination marker). We still pass the original target to
+    // traceroute so the user sees the same hostname in their result.
+    let resolved_ip = match tokio::net::lookup_host(format!("{}:0", target)).await {
+        Ok(mut addrs) => addrs.next().map(|a| a.ip().to_string()).unwrap_or_default(),
+        Err(_) => String::new(),
+    };
+
+    // -n: numeric output (skip reverse DNS, much faster)
+    // -w 1: 1s wait per probe
+    // -q 1: one query per hop (default 3 — slows things down)
+    // -m 20: 20-hop max (most paths are <15)
+    let target_for_cmd = target.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("traceroute")
+            .args(["-n", "-w", "1", "-q", "1", "-m", "20", &target_for_cmd])
+            .output()
+    }).await;
+
+    let output = match output {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("Failed to run traceroute: {}. Install with: apt install traceroute (Debian/Ubuntu) or dnf install traceroute (RHEL).", e)
+            }));
+        }
+        Err(e) => {
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("traceroute task panicked: {}", e),
+            }));
+        }
+    };
+
+    // traceroute prints the header line "traceroute to ..." then one
+    // line per hop. Numeric (-n) format:
+    //    1  192.168.1.1  0.500 ms
+    //    2  10.0.0.1  5.234 ms
+    //    3  *
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let mut hops: Vec<serde_json::Value> = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim_start();
+        // Skip header
+        if trimmed.starts_with("traceroute") || trimmed.is_empty() { continue; }
+
+        let mut fields = trimmed.split_whitespace();
+        let hop_num: u32 = match fields.next().and_then(|s| s.parse().ok()) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        // Next field is either an IP or "*"
+        let second = fields.next().unwrap_or("");
+        if second == "*" {
+            hops.push(serde_json::json!({
+                "hop": hop_num, "ip": null, "rtt_ms": null,
+            }));
+            continue;
+        }
+
+        // Validate it really looks like an IP — anything else is a
+        // weird traceroute quirk, skip the line rather than misrender.
+        let ip_ok = second.parse::<std::net::IpAddr>().is_ok();
+        if !ip_ok {
+            continue;
+        }
+
+        // Find the rtt — last numeric token before "ms".
+        let mut rtt_ms: Option<f64> = None;
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        for window in tokens.windows(2) {
+            if window[1] == "ms" {
+                if let Ok(v) = window[0].parse::<f64>() {
+                    rtt_ms = Some(v);
+                    break;
+                }
+            }
+        }
+
+        hops.push(serde_json::json!({
+            "hop": hop_num,
+            "ip": second,
+            "rtt_ms": rtt_ms,
+        }));
+    }
+
+    if hops.is_empty() && !output.status.success() {
+        return HttpResponse::Ok().json(serde_json::json!({
+            "target": target,
+            "resolved_ip": resolved_ip,
+            "hops": [],
+            "error": format!("traceroute failed: {}", stderr.trim()),
+        }));
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "target": target,
+        "resolved_ip": resolved_ip,
+        "hops": hops,
+    }))
+}
+
 /// GET/POST /api/nodes/{id}/proxy/{path:.*} — proxy API calls to a remote node
 pub async fn node_proxy(
     req: HttpRequest,
@@ -20362,6 +20501,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/wolfnet/routes", web::get().to(wolfnet_routes_debug))
         // Geolocation proxy (ip-api.com is HTTP-only, browsers block mixed content on HTTPS pages)
         .route("/api/geolocate", web::get().to(geolocate))
+        .route("/api/traceroute", web::get().to(traceroute_handler))
         // Kubernetes
         .route("/api/kubernetes/detect", web::get().to(k8s_detect))
         .route("/api/kubernetes/run-script", web::post().to(k8s_run_script))
