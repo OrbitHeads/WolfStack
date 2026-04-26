@@ -86,14 +86,53 @@ fn is_ssrf_blocked_address(addr: &str) -> bool {
     addr.eq_ignore_ascii_case("localhost")
 }
 
-/// Tries: HTTPS on main port, HTTP on internal port (port+1), HTTP on main port.
-/// This ensures both TLS-enabled and HTTP-only nodes are reachable.
+/// Address-keyed cache of each peer's host WolfNet IP. Populated from
+/// StatusReport (`wolfnet_ips[0]` is the host's own WolfNet address).
+/// Read by `build_node_urls` to insert a WolfNet-routed HTTP attempt
+/// between the HTTPS and the plain-HTTP fallbacks — encrypted at the
+/// WolfNet overlay layer instead of riding plaintext across the LAN.
+///
+/// Empty until the first peer reports — in that window `build_node_urls`
+/// behaves identically to the pre-v20.9.9 3-URL chain. Stale entries are
+/// harmless: a fail on the WolfNet URL falls through to the existing
+/// HTTP fallbacks.
+static NODE_WOLFNET_IPS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Record the given peer's host WolfNet IP. Called from agent::poll_peers
+/// when a StatusReport comes back. Empty `wolfnet_ip` clears the entry.
+pub fn record_node_wolfnet_ip(address: &str, wolfnet_ip: &str) {
+    if let Ok(mut map) = NODE_WOLFNET_IPS.lock() {
+        if wolfnet_ip.is_empty() {
+            map.remove(address);
+        } else {
+            map.insert(address.to_string(), wolfnet_ip.to_string());
+        }
+    }
+}
+
+fn lookup_node_wolfnet_ip(address: &str) -> Option<String> {
+    NODE_WOLFNET_IPS.lock().ok().and_then(|m| m.get(address).cloned())
+}
+
+/// Build the URLs to try for an inter-node API call, in preference order:
+/// 1. HTTPS on the main port (TLS — secure)
+/// 2. HTTP on the peer's WolfNet IP, internal port (HTTP-over-encrypted-overlay)
+/// 3. HTTP on the main address, internal port (plain — LAN trust)
+/// 4. HTTP on the main address, main port (plain — last resort, legacy)
+///
+/// Step 2 only appears once we've heard a StatusReport from the peer
+/// containing its `wolfnet_ips`. Empty cache or non-WolfNet peer = the
+/// classic 3-URL chain, identical to behaviour pre-v20.9.9.
 pub fn build_node_urls(address: &str, port: u16, path: &str) -> Vec<String> {
-    vec![
-        format!("https://{}:{}{}", address, port, path),
-        format!("http://{}:{}{}", address, port + 1, path),
-        format!("http://{}:{}{}", address, port, path),
-    ]
+    let mut urls = Vec::with_capacity(4);
+    urls.push(format!("https://{}:{}{}", address, port, path));
+    if let Some(wn) = lookup_node_wolfnet_ip(address) {
+        urls.push(format!("http://{}:{}{}", wn, port + 1, path));
+    }
+    urls.push(format!("http://{}:{}{}", address, port + 1, path));
+    urls.push(format!("http://{}:{}{}", address, port, path));
+    urls
 }
 
 /// Build ordered URLs to try for external (cross-cluster) communication.

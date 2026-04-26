@@ -961,6 +961,15 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                             } else if !wolfnet_ips.is_empty() {
 
                             }
+                            // Cache the peer's host WolfNet IP so future
+                            // build_node_urls calls can insert a
+                            // HTTP-over-WolfNet attempt before falling
+                            // back to plaintext on the public address.
+                            if let Some(host_wn_ip) = wolfnet_ips.first() {
+                                if !host_wn_ip.is_empty() {
+                                    crate::api::record_node_wolfnet_ip(&node.address, host_wn_ip);
+                                }
+                            }
                         }
                     }
                     poll_ok = true;
