@@ -90,6 +90,29 @@ struct DiscordUser {
     id: String,
     #[serde(default)]
     bot: bool,
+    /// Legacy Discord handle (e.g. "paulc"). Always present on real
+    /// users, sometimes empty on bots / webhooks.
+    #[serde(default)]
+    username: String,
+    /// Modern display name (Discord moved away from #discriminators).
+    /// Optional — falls back to `username` when not set.
+    #[serde(default)]
+    global_name: Option<String>,
+}
+
+impl DiscordUser {
+    /// Best display name for the user — global_name when set (modern
+    /// Discord display), else falls back to the legacy username, else
+    /// the numeric ID. Used to tell agents who they're talking to.
+    fn display_name(&self) -> String {
+        if let Some(g) = self.global_name.as_ref().filter(|s| !s.is_empty()) {
+            return g.clone();
+        }
+        if !self.username.is_empty() {
+            return self.username.clone();
+        }
+        self.id.clone()
+    }
 }
 
 /// Where to connect the gateway. Discord will route us to the nearest
@@ -325,11 +348,22 @@ async fn handle_discord_chat(
     let content = msg.content.trim();
     if content.is_empty() { return; }
 
+    // Tell the agent who's asking. Without this the agent has no way
+    // to address users by name or distinguish between people in a
+    // shared channel. Format chosen so the LLM treats it as metadata
+    // about the speaker rather than part of the question.
+    let display = msg.author.display_name();
+    let with_speaker = if display.is_empty() {
+        content.to_string()
+    } else {
+        format!("[from Discord user \"{}\"] {}", display, content)
+    };
+
     // Full tool-use loop, same as the dashboard path — lets Discord
     // callers invoke tools the agent has granted instead of silently
     // falling back to simple_chat.
     let reply = match crate::wolfagents::chat_with_agent_full(
-        &agent.id, content, state.get_ref(),
+        &agent.id, &with_speaker, state.get_ref(),
         crate::wolfagents::ChatSurface::Discord,
     ).await {
         Ok(r) => r,
