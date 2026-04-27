@@ -450,9 +450,14 @@ fn detect_os(runtime: &str, name: &str) -> Result<OsInfo, String> {
 /// polish package (xfce4-goodies / gnome-tweaks) is appended when
 /// applicable.
 fn extras_packages(family: &str, desktop_id: &str) -> Vec<String> {
+    // NOTE: browser package intentionally omitted on the debian family —
+    // Debian ships `firefox-esr` while Ubuntu / Linux Mint ship `firefox`
+    // (no `firefox-esr` candidate). Picking either statically broke
+    // installs on the other. The install script picks one at runtime
+    // (see install_browser snippet in build_install_script) so we get
+    // Firefox on every distro without failing the apt transaction.
     let mut pkgs: Vec<String> = match family {
         "debian" => vec![
-            "firefox-esr".into(),
             "flatpak".into(),
             "gvfs".into(),
             "gvfs-backends".into(),
@@ -793,44 +798,113 @@ echo "    (change anytime with:  passwd admin)"
 echo
 "#);
 
-    // Extra packages line: chosen desktop's packages PLUS optional
-    // common-utilities bundle, OR xterm only (vnc-only mode).
-    let extra_pkgs = if let Some(ref d) = chosen {
-        let mut pkgs: Vec<String> = d.packages.clone();
-        if extras {
-            pkgs.extend(extras_packages(family, &d.id));
-        }
-        pkgs.join(" ")
+    // Required packages: TigerVNC + chosen desktop's metapackages + base
+    // utilities. These MUST install successfully — if any are missing the
+    // VNC server itself can't run, so we want apt/apk/dnf to fail loudly.
+    //
+    // Extras packages (browser, flatpak, gvfs, applets) are installed in a
+    // SEPARATE best-effort pass below. Splitting the calls means a single
+    // distro that's missing one extra (e.g. Linux Mint has no firefox-esr
+    // candidate) doesn't break the whole transaction and leave the user
+    // with no vncpasswd — which was the v20.11.3 install bug.
+    let required_pkgs = if let Some(ref d) = chosen {
+        d.packages.join(" ")
     } else {
         "xterm".into()
     };
+    let extras_pkgs_list = if extras && chosen.is_some() {
+        extras_packages(family, &chosen.as_ref().unwrap().id)
+    } else {
+        Vec::new()
+    };
+    let extras_pkgs = extras_pkgs_list.join(" ");
+    let has_extras = !extras_pkgs_list.is_empty();
     let label_suffix = chosen.as_ref()
         .map(|d| format!(" + {}{}", d.label, if extras { " + utilities" } else { "" }))
         .unwrap_or_else(|| " (no desktop)".to_string());
 
     let head = match family {
-        "debian" => format!(r#"
+        "debian" => {
+            // Best-effort extras pass: try the bundle in one shot first
+            // (fast path), and if apt rejects it (a single missing
+            // candidate fails the whole transaction) fall back to
+            // installing each extra one-by-one so we keep what's available.
+            //
+            // Browser is special: Debian ships `firefox-esr`, Ubuntu /
+            // Linux Mint ship `firefox`. Try ESR first, then plain
+            // firefox. Either is fine — neither is fatal if absent.
+            let extras_block = if has_extras {
+                format!(r#"
+echo "[wolfstack] Installing extras (best-effort)..."
+if ! apt-get install -y --no-install-recommends {extras_pkgs}; then
+    echo "[wolfstack] extras bundle failed atomic install — retrying per-package"
+    for pkg in {extras_pkgs}; do
+        apt-get install -y --no-install-recommends "$pkg" \
+            || echo "[wolfstack] skipped extra: $pkg (no candidate)"
+    done
+fi
+echo "[wolfstack] Installing browser (firefox-esr on Debian / firefox on Ubuntu/Mint)..."
+apt-get install -y --no-install-recommends firefox-esr 2>/dev/null \
+    || apt-get install -y --no-install-recommends firefox 2>/dev/null \
+    || echo "[wolfstack] no firefox package available — skipping browser"
+"#, extras_pkgs = extras_pkgs)
+            } else {
+                String::new()
+            };
+            format!(r#"
 echo "[wolfstack] Installing TigerVNC{label_suffix} on Debian/Ubuntu container..."
 apt-get update -qq
 # tigervnc-tools provides vncpasswd (separate package on Debian/Ubuntu).
 apt-get install -y --no-install-recommends \
     tigervnc-standalone-server tigervnc-common tigervnc-tools \
-    {extra_pkgs} \
+    {required_pkgs} \
     dbus-x11 socat xterm fonts-dejavu \
     procps
-"#, label_suffix = label_suffix, extra_pkgs = extra_pkgs),
+{extras_block}
+"#, label_suffix = label_suffix, required_pkgs = required_pkgs, extras_block = extras_block)
+        }
 
-        "alpine" => format!(r#"
+        "alpine" => {
+            let extras_block = if has_extras {
+                format!(r#"
+echo "[wolfstack] Installing extras (best-effort)..."
+if ! apk add --no-cache {extras_pkgs}; then
+    for pkg in {extras_pkgs}; do
+        apk add --no-cache "$pkg" \
+            || echo "[wolfstack] skipped extra: $pkg (not in repo)"
+    done
+fi
+"#, extras_pkgs = extras_pkgs)
+            } else {
+                String::new()
+            };
+            format!(r#"
 echo "[wolfstack] Installing TigerVNC{label_suffix} on Alpine container..."
 apk update
 # Alpine: busybox already provides pgrep, so no procps needed.
 apk add --no-cache \
     tigervnc \
-    {extra_pkgs} \
+    {required_pkgs} \
     dbus-x11 socat xterm ttf-dejavu
-"#, label_suffix = label_suffix, extra_pkgs = extra_pkgs),
+{extras_block}
+"#, label_suffix = label_suffix, required_pkgs = required_pkgs, extras_block = extras_block)
+        }
 
-        "rhel" => format!(r#"
+        "rhel" => {
+            let extras_block = if has_extras {
+                format!(r#"
+echo "[wolfstack] Installing extras (best-effort)..."
+if ! $PKG {extras_pkgs}; then
+    for pkg in {extras_pkgs}; do
+        $PKG "$pkg" \
+            || echo "[wolfstack] skipped extra: $pkg (no candidate)"
+    done
+fi
+"#, extras_pkgs = extras_pkgs)
+            } else {
+                String::new()
+            };
+            format!(r#"
 echo "[wolfstack] Installing TigerVNC{label_suffix} on RHEL-family container..."
 if command -v dnf >/dev/null 2>&1; then
     PKG="dnf -y install"
@@ -843,9 +917,11 @@ else
 fi
 # tigervnc client package provides vncpasswd on RHEL family.
 $PKG tigervnc-server tigervnc \
-     {extra_pkgs} \
+     {required_pkgs} \
      dbus-x11 socat xterm dejavu-sans-fonts procps-ng
-"#, label_suffix = label_suffix, extra_pkgs = extra_pkgs),
+{extras_block}
+"#, label_suffix = label_suffix, required_pkgs = required_pkgs, extras_block = extras_block)
+        }
 
         _ => return String::new(),
     };
