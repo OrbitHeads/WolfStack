@@ -188,6 +188,30 @@ fi
 echo ""
 echo "Installing system dependencies..."
 
+# Snapshot dnsmasq.service state BEFORE we run the package install.
+# Several distros (Fedora/RHEL/CentOS/openSUSE/Arch) ship the full
+# dnsmasq package with a systemd unit that auto-starts and binds
+# 0.0.0.0:53 — which collides with systemd-resolved's stub listener
+# on 127.0.0.53:53 and breaks host DNS resolution. We need the dnsmasq
+# BINARY for LXC's lxcbr0 (lxc-net launches its own scoped dnsmasq),
+# but we don't want the global service stomping on port 53.
+#
+# We only auto-disable the service when WE caused it to exist — i.e.
+# when the unit wasn't on disk at all before we started. If the user
+# had already installed and configured dnsmasq as their system
+# resolver before running setup.sh, that state is recorded here and
+# we leave it strictly alone.
+DNSMASQ_PRE_STATE=""
+if systemctl list-unit-files dnsmasq.service >/dev/null 2>&1; then
+    if systemctl is-enabled --quiet dnsmasq.service 2>/dev/null; then
+        DNSMASQ_PRE_STATE="enabled"
+    elif systemctl is-active --quiet dnsmasq.service 2>/dev/null; then
+        DNSMASQ_PRE_STATE="active"
+    else
+        DNSMASQ_PRE_STATE="installed-disabled"
+    fi
+fi
+
 if [ "$PKG_MANAGER" = "apt" ]; then
     apt update -qq 2>/dev/null || true
     # On Proxmox hosts, QEMU and LXC are already provided by pve-qemu-kvm and lxc-pve.
@@ -263,6 +287,34 @@ elif [ "$PKG_MANAGER" = "pacman" ]; then
         QEMU_PAC="qemu-full"
     fi
     pacman -Sy --noconfirm --needed git curl base-devel openssl pkg-config lxc dnsmasq $QEMU_PAC socat s3fs-fuse nfs-utils fuse3 rustup
+fi
+
+# Decide whether to disable the freshly-installed dnsmasq.service.
+# We act only when ALL of these are true:
+#   1. The unit didn't exist before we ran (DNSMASQ_PRE_STATE empty)
+#      — i.e. we caused it to come into existence. If the user had
+#      dnsmasq pre-installed/configured as their system resolver, we
+#      leave it alone.
+#   2. The unit exists now (the package install actually placed it).
+#   3. systemd-resolved is active. Without it, there's no port-53
+#      conflict to worry about — the user may be relying on dnsmasq
+#      or another resolver and we shouldn't second-guess.
+#   4. The unit is now active (auto-started by the install).
+# When all four hold, the install just created a port-53 collision
+# that breaks host DNS — disable the service to clear it. The dnsmasq
+# binary stays installed so LXC's lxcbr0 can launch its own scoped
+# dnsmasq via lxc-net (--bind-interfaces --interface=lxcbr0).
+if [ -z "$DNSMASQ_PRE_STATE" ] \
+   && systemctl list-unit-files dnsmasq.service >/dev/null 2>&1 \
+   && systemctl is-active --quiet systemd-resolved 2>/dev/null \
+   && systemctl is-active --quiet dnsmasq.service 2>/dev/null; then
+    echo "  Package install auto-started dnsmasq.service (binds 0.0.0.0:53)"
+    echo "  systemd-resolved is also active (binds 127.0.0.53:53) — these will conflict and break host DNS."
+    echo "  Disabling dnsmasq.service. LXC's lxcbr0 gets its own scoped dnsmasq via lxc-net (unaffected)."
+    echo "  If you intended to use dnsmasq as your system resolver, run:"
+    echo "    sudo systemctl disable --now systemd-resolved"
+    echo "    sudo systemctl enable --now dnsmasq"
+    systemctl disable --now dnsmasq.service 2>/dev/null || true
 fi
 
 echo "✓ System dependencies installed"
