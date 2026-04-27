@@ -812,10 +812,9 @@ echo
     } else {
         "xterm".into()
     };
-    let extras_pkgs_list = if extras && chosen.is_some() {
-        extras_packages(family, &chosen.as_ref().unwrap().id)
-    } else {
-        Vec::new()
+    let extras_pkgs_list = match (extras, chosen.as_ref()) {
+        (true, Some(d)) => extras_packages(family, &d.id),
+        _ => Vec::new(),
     };
     let extras_pkgs = extras_pkgs_list.join(" ");
     let has_extras = !extras_pkgs_list.is_empty();

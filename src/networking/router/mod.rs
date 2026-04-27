@@ -692,7 +692,7 @@ pub fn apply_subnet_route(route: &SubnetRoute, previous_gateway: Option<&str>) -
     let existing = read_kernel_route_gateway(&route.subnet_cidr)
         .map_err(|e| format!("Failed to inspect existing route: {}", e))?;
 
-    match existing {
+    let route_result: Result<(), String> = match existing {
         // No route currently — install ours.
         None => {
             let output = Command::new("ip")
@@ -742,7 +742,245 @@ pub fn apply_subnet_route(route: &SubnetRoute, previous_gateway: Option<&str>) -
             "Route to {} already exists via {} (installed outside WolfStack). Refusing to overwrite — remove the existing route first if you want WolfStack to manage it.",
             route.subnet_cidr, gw
         )),
+    };
+
+    // Route is in the kernel — but a routing entry alone doesn't move
+    // packets. Sponsor klasSponsor (2026-04-27): "ip route shows the
+    // route, health says OK, but ping doesn't work." That was because
+    // v20.11.2/.3 stopped at `ip route add` and skipped the forwarding
+    // plumbing every transit node needs:
+    //
+    //   • net.ipv4.ip_forward=1 — kernel won't forward at all otherwise.
+    //   • rp_filter relaxed on wolfnet0 — strict-mode reverse-path drops
+    //     packets whose source (the WolfNet peer) doesn't route back via
+    //     the ingress iface in some topologies.
+    //   • iptables FORWARD ACCEPT — Docker / firewalld flip the default
+    //     to DROP, silently blackholing transit.
+    //   • POSTROUTING MASQUERADE on the subnet — without it, the LAN host
+    //     receives a packet from a 100.x.x.x WolfNet peer it has no route
+    //     to, replies via its default gateway, and the reply never comes
+    //     back. MASQUERADE rewrites the source to the router's egress IP
+    //     so the LAN host replies normally to its own gateway.
+    //
+    // Best-effort: failures are logged but don't fail the route install
+    // (the route itself is fine; the user can inspect via diagnostics).
+    if route_result.is_ok() {
+        if let Err(e) = enable_subnet_route_forwarding(route) {
+            tracing::warn!(
+                "apply_subnet_route: route {} via {} installed but forwarding plumbing failed: {} — traffic may not flow until fixed (see /api/router/subnet-routes/diagnostics)",
+                route.subnet_cidr, route.gateway, e
+            );
+        }
     }
+    route_result
+}
+
+/// Install the kernel-forwarding plumbing required for a subnet route to
+/// actually pass traffic. Idempotent: every step checks for the existing
+/// state before mutating, so calling this on every `apply_subnet_route`
+/// is safe.
+///
+/// Steps:
+///   1. sysctl ip_forward=1 (global) — kernel won't forward without it.
+///   2. sysctl rp_filter=0 on wolfnet iface + all — loose mode so
+///      WolfNet-sourced packets aren't dropped by reverse-path checks.
+///   3. iptables FORWARD ACCEPT both ways between wolfnet iface and the
+///      subnet — Docker/firewalld DROP defaults are otherwise fatal.
+///   4. iptables NAT POSTROUTING MASQUERADE for traffic destined to the
+///      subnet — so LAN hosts reply via their normal gateway instead of
+///      trying to route back to a WolfNet peer they can't reach.
+pub fn enable_subnet_route_forwarding(route: &SubnetRoute) -> Result<(), String> {
+    use std::process::Command;
+
+    let wn_iface = crate::networking::detect_wolfnet_iface()
+        .unwrap_or_else(|| "wolfnet0".to_string());
+
+    // 1. ip_forward — fire-and-forget; sysctl returns non-zero in some
+    //    locked-down containers, but if it's already 1 we don't care.
+    let _ = std::fs::write("/proc/sys/net/ipv4/ip_forward", "1");
+
+    // 2. rp_filter loose mode on wolfnet + all. /proc writes don't error
+    //    if the file is already at the target value.
+    let _ = std::fs::write(
+        format!("/proc/sys/net/ipv4/conf/{}/rp_filter", wn_iface),
+        "0",
+    );
+    let _ = std::fs::write("/proc/sys/net/ipv4/conf/all/rp_filter", "0");
+    // Per-iface forwarding flag — global ip_forward implies all but some
+    // distros gate per-iface via /proc/sys/net/ipv4/conf/<iface>/forwarding.
+    let _ = std::fs::write(
+        format!("/proc/sys/net/ipv4/conf/{}/forwarding", wn_iface),
+        "1",
+    );
+
+    // 3. FORWARD ACCEPT both ways. We use -C to test for an existing
+    //    rule before -I, so we don't duplicate on every reconcile. Errors
+    //    on the -I are reported back to the caller (which logs them).
+    let mut errors: Vec<String> = Vec::new();
+    let forward_rules: [&[&str]; 2] = [
+        &["-i", &wn_iface, "-d", &route.subnet_cidr, "-j", "ACCEPT"],
+        &["-s", &route.subnet_cidr, "-o", &wn_iface, "-j", "ACCEPT"],
+    ];
+    for rule in &forward_rules {
+        let mut check_args: Vec<&str> = vec!["-C", "FORWARD"];
+        check_args.extend_from_slice(rule);
+        let exists = Command::new("iptables")
+            .args(&check_args)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !exists {
+            let mut add_args: Vec<&str> = vec!["-I", "FORWARD"];
+            add_args.extend_from_slice(rule);
+            let out = Command::new("iptables")
+                .args(&add_args)
+                .output()
+                .map_err(|e| format!("iptables FORWARD insert exec failed: {}", e))?;
+            if !out.status.success() {
+                errors.push(format!(
+                    "FORWARD {}: {}",
+                    rule.join(" "),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+        }
+    }
+
+    // 4. POSTROUTING MASQUERADE for traffic destined into the subnet.
+    //    We deliberately don't pin -o <egress>: the kernel routes the
+    //    packet first, MASQUERADE then picks the egress iface's primary
+    //    IP for the new source. -d <subnet> scopes the rule so we never
+    //    masquerade unrelated traffic.
+    let masq_check = Command::new("iptables")
+        .args(["-t", "nat", "-C", "POSTROUTING", "-d", &route.subnet_cidr, "-j", "MASQUERADE"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !masq_check {
+        let out = Command::new("iptables")
+            .args(["-t", "nat", "-A", "POSTROUTING", "-d", &route.subnet_cidr, "-j", "MASQUERADE"])
+            .output()
+            .map_err(|e| format!("iptables MASQUERADE exec failed: {}", e))?;
+        if !out.status.success() {
+            errors.push(format!(
+                "POSTROUTING -d {} MASQUERADE: {}",
+                route.subnet_cidr,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// Snapshot of the kernel forwarding plumbing for a single subnet route —
+/// inspected by the diagnostics endpoint so the operator can see WHY a
+/// route is in the table but traffic isn't passing. Sponsor klasSponsor
+/// (2026-04-27) reported "health says OK but ping doesn't work" because
+/// pre-v20.11.4 we only checked the route entry, not the forwarding
+/// plumbing it depends on.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ForwardingState {
+    /// Global net.ipv4.ip_forward value as a string ("1" / "0").
+    pub ip_forward: Option<String>,
+    /// rp_filter on the wolfnet iface (and on `all`); strict mode (1)
+    /// silently drops WolfNet-sourced traffic in some topologies.
+    pub rp_filter_wolfnet: Option<String>,
+    pub rp_filter_all: Option<String>,
+    /// True when iptables FORWARD has an ACCEPT rule for traffic from
+    /// the wolfnet iface destined to the subnet.
+    pub forward_in: bool,
+    /// True when iptables FORWARD has an ACCEPT rule for return traffic
+    /// from the subnet going back out the wolfnet iface.
+    pub forward_out: bool,
+    /// True when iptables NAT POSTROUTING has the MASQUERADE rule that
+    /// rewrites WolfNet source IPs so the LAN host can reply normally.
+    pub masquerade: bool,
+    /// Wolfnet iface name we inspected against (for the operator to
+    /// double-check the right interface was probed).
+    pub wolfnet_iface: String,
+}
+
+/// Inspect the kernel forwarding state for a given subnet route. Pure
+/// read — never mutates. Each field corresponds to one of the four
+/// plumbing requirements `enable_subnet_route_forwarding` installs.
+pub fn read_forwarding_state(route: &SubnetRoute) -> ForwardingState {
+    use std::process::Command;
+    let wn_iface = crate::networking::detect_wolfnet_iface()
+        .unwrap_or_else(|| "wolfnet0".to_string());
+
+    let read = |path: &str| std::fs::read_to_string(path).ok().map(|s| s.trim().to_string());
+    let ip_forward = read("/proc/sys/net/ipv4/ip_forward");
+    let rp_filter_all = read("/proc/sys/net/ipv4/conf/all/rp_filter");
+    let rp_filter_wolfnet = read(&format!("/proc/sys/net/ipv4/conf/{}/rp_filter", wn_iface));
+
+    let check = |args: &[&str]| -> bool {
+        Command::new("iptables")
+            .args(args)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    let forward_in = check(&["-C", "FORWARD", "-i", &wn_iface, "-d", &route.subnet_cidr, "-j", "ACCEPT"]);
+    let forward_out = check(&["-C", "FORWARD", "-s", &route.subnet_cidr, "-o", &wn_iface, "-j", "ACCEPT"]);
+    let masquerade = check(&["-t", "nat", "-C", "POSTROUTING", "-d", &route.subnet_cidr, "-j", "MASQUERADE"]);
+
+    ForwardingState {
+        ip_forward,
+        rp_filter_wolfnet,
+        rp_filter_all,
+        forward_in,
+        forward_out,
+        masquerade,
+        wolfnet_iface: wn_iface,
+    }
+}
+
+/// Tear down the iptables rules that `enable_subnet_route_forwarding`
+/// installed. Idempotent: missing rules are not an error. We deliberately
+/// leave sysctl knobs (ip_forward, rp_filter) alone — other WolfStack
+/// features (wolfrun, WolfNet proxies, VM bridges) depend on them and
+/// flipping them back to defaults would break unrelated traffic.
+pub fn disable_subnet_route_forwarding(route: &SubnetRoute) -> Result<(), String> {
+    use std::process::Command;
+
+    let wn_iface = crate::networking::detect_wolfnet_iface()
+        .unwrap_or_else(|| "wolfnet0".to_string());
+
+    // Loop on -D for each rule so duplicates (from older buggy versions
+    // that lacked the -C guard) all get cleaned up. Cap the loop so a
+    // pathological state can't spin forever.
+    let forward_rules: [&[&str]; 2] = [
+        &["-i", &wn_iface, "-d", &route.subnet_cidr, "-j", "ACCEPT"],
+        &["-s", &route.subnet_cidr, "-o", &wn_iface, "-j", "ACCEPT"],
+    ];
+    for rule in &forward_rules {
+        for _ in 0..16 {
+            let mut args: Vec<&str> = vec!["-D", "FORWARD"];
+            args.extend_from_slice(rule);
+            let out = Command::new("iptables").args(&args).output();
+            match out {
+                Ok(o) if o.status.success() => continue, // try again — may be a duplicate
+                _ => break,
+            }
+        }
+    }
+
+    for _ in 0..16 {
+        let out = Command::new("iptables")
+            .args(["-t", "nat", "-D", "POSTROUTING", "-d", &route.subnet_cidr, "-j", "MASQUERADE"])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => continue,
+            _ => break,
+        }
+    }
+
+    Ok(())
 }
 
 /// Read the gateway of an existing kernel route for the given CIDR, if any.
@@ -829,15 +1067,33 @@ fn parse_route_gateway(raw: &str) -> Option<String> {
 pub fn remove_subnet_route(route: &SubnetRoute) -> Result<(), String> {
     use std::process::Command;
 
+    // Helper closure — strip our iptables forwarding rules. We call it on
+    // every removal path (early returns included) so that no leftover
+    // MASQUERADE/FORWARD rule survives for a subnet WolfStack no longer
+    // manages. Idempotent: missing rules are not an error.
+    let cleanup_plumbing = || {
+        if let Err(e) = disable_subnet_route_forwarding(route) {
+            tracing::warn!(
+                "remove_subnet_route: forwarding rule cleanup for {} failed: {}",
+                route.subnet_cidr, e
+            );
+        }
+    };
+
     // Inspect first. If the kernel has a different (or no) gateway for this
-    // CIDR, we have nothing to remove that's safely ours.
+    // CIDR, we won't touch the route entry — but our iptables rules might
+    // still be in place from a previous lifetime, so clean those regardless.
     match read_kernel_route_gateway(&route.subnet_cidr) {
-        Ok(None) => return Ok(()),                       // already absent
+        Ok(None) => {
+            cleanup_plumbing();
+            return Ok(());
+        }
         Ok(Some(gw)) if gw != route.gateway => {
             tracing::warn!(
                 "remove_subnet_route: kernel route for {} now uses gateway {} (we expected {}); leaving it in place",
                 route.subnet_cidr, gw, route.gateway
             );
+            cleanup_plumbing();
             return Ok(());
         }
         Ok(Some(_)) => { /* matches — proceed with del */ }
@@ -856,6 +1112,9 @@ pub fn remove_subnet_route(route: &SubnetRoute) -> Result<(), String> {
         .arg(&route.gateway)
         .output()
         .map_err(|e| format!("Failed to execute ip command: {}", e))?;
+
+    cleanup_plumbing();
+
     if output.status.success() {
         return Ok(());
     }

@@ -3830,13 +3830,52 @@ pub async fn diagnostics_subnet_routes(req: HttpRequest, state: S) -> HttpRespon
                 ),
             )
         } else if kernel_matches {
-            (
-                "ok",
-                format!(
-                    "Working — this node has the route `{} via {}` installed exactly as configured. Traffic to this subnet will go through the gateway.",
-                    r.subnet_cidr, r.gateway
-                ),
-            )
+            // Route is in the kernel — but routing alone doesn't move
+            // packets. Inspect ip_forward, rp_filter, FORWARD chain and
+            // POSTROUTING MASQUERADE before declaring "ok". Sponsor
+            // klasSponsor (2026-04-27) hit a green health check but
+            // ping still failed because the plumbing wasn't installed.
+            let fwd = super::read_forwarding_state(r);
+            let mut missing: Vec<&str> = Vec::new();
+            if fwd.ip_forward.as_deref() != Some("1") {
+                missing.push("ip_forward (kernel forwarding disabled)");
+            }
+            if !fwd.forward_in {
+                missing.push("FORWARD ACCEPT (incoming on WolfNet)");
+            }
+            if !fwd.forward_out {
+                missing.push("FORWARD ACCEPT (return via WolfNet)");
+            }
+            if !fwd.masquerade {
+                missing.push("POSTROUTING MASQUERADE (LAN reply path)");
+            }
+            // rp_filter strict (1) is sometimes fine in simple flat
+            // topologies — flag as advisory only, don't block "ok".
+            let rp_strict = fwd.rp_filter_wolfnet.as_deref() == Some("1")
+                || fwd.rp_filter_all.as_deref() == Some("1");
+
+            if missing.is_empty() {
+                let advisory = if rp_strict {
+                    format!(" Note: rp_filter is in strict mode on `{}` — usually fine, but switch to loose (0) if pings still fail.", fwd.wolfnet_iface)
+                } else {
+                    String::new()
+                };
+                (
+                    "ok",
+                    format!(
+                        "Working — route `{} via {}` is installed and the kernel forwarding plumbing (ip_forward, FORWARD ACCEPT, MASQUERADE) is in place.{}",
+                        r.subnet_cidr, r.gateway, advisory
+                    ),
+                )
+            } else {
+                (
+                    "forwarding_misconfigured",
+                    format!(
+                        "Half-broken — the route `{} via {}` is in the kernel, but traffic still won't pass because the following forwarding pieces are missing: {}. WolfStack v20.11.4+ installs all four automatically; older versions only added the route. Fix: edit the route → save (re-applies plumbing), or restart WolfStack on this node so apply_subnet_route() runs again.",
+                        r.subnet_cidr, r.gateway, missing.join(", ")
+                    ),
+                )
+            }
         } else if let Some(gw) = &kernel_gw {
             (
                 "wrong_gateway",
@@ -3855,6 +3894,16 @@ pub async fn diagnostics_subnet_routes(req: HttpRequest, state: S) -> HttpRespon
             )
         };
 
+        // Inspect forwarding plumbing once for the JSON payload (the
+        // status branch above only inspects when the route is present;
+        // running it again here keeps the frontend-visible state
+        // consistent with the status code we just computed).
+        let fwd_state = if targets_here && r.enabled && kernel_matches {
+            Some(super::read_forwarding_state(r))
+        } else {
+            None
+        };
+
         entries.push(serde_json::json!({
             "id": r.id,
             "subnet_cidr": r.subnet_cidr,
@@ -3868,6 +3917,7 @@ pub async fn diagnostics_subnet_routes(req: HttpRequest, state: S) -> HttpRespon
             "kernel_matches_config": kernel_matches,
             "kernel_raw": kernel_raw,
             "kernel_error": kernel_error,
+            "forwarding": fwd_state,
             "status": status,
             "status_detail": detail,
         }));
