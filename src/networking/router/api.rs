@@ -3760,6 +3760,143 @@ pub async fn delete_subnet_route(req: HttpRequest, state: S, path: web::Path<Str
     }))
 }
 
+/// Per-node diagnostics for subnet routes. The handler runs on whichever
+/// node receives the request, so the "kernel state" fields describe THIS
+/// node only — the frontend fans the call out to every node in the
+/// cluster (via /api/nodes/{id}/proxy/...) to compose a full picture.
+///
+/// Sponsor report 2026-04-27: a configured subnet route was reported as
+/// missing from `ip route show` on the targeted VPS. Without per-node
+/// kernel introspection the operator had no way to tell the difference
+/// between (a) the config didn't replicate, (b) the apply failed silently,
+/// (c) the config is on a different node than they expected. This handler
+/// exposes all three.
+pub async fn diagnostics_subnet_routes(req: HttpRequest, state: S) -> HttpResponse {
+    auth_or_return!(req, state);
+    let self_id = crate::agent::self_node_id();
+    let routes: Vec<crate::networking::router::SubnetRoute> = {
+        let cfg = state.router.config.read().unwrap();
+        cfg.subnet_routes.clone()
+    };
+
+    let mut entries: Vec<serde_json::Value> = Vec::with_capacity(routes.len());
+    for r in &routes {
+        let targets_here = super::route_targets_self(r, &self_id);
+
+        // Read raw `ip route show <cidr>` so we can report both the
+        // present/absent answer and let the operator see exotic forms
+        // (dev/blackhole/multipath) that don't fit the parsed shape.
+        let (kernel_raw, kernel_error) = match super::read_kernel_route_raw(&r.subnet_cidr) {
+            Ok(s) => (s, None),
+            Err(e) => (String::new(), Some(e)),
+        };
+        let kernel_gw = super::parse_kernel_route_gateway_for_diagnostics(&kernel_raw);
+        let kernel_present = !kernel_raw.trim().is_empty();
+        let kernel_matches = kernel_present
+            && kernel_gw.as_deref() == Some(r.gateway.as_str());
+
+        // Map the (config × kernel) cross-product to a single status code
+        // the frontend can colour-code without re-deriving the rules.
+        // Detail messages are written for beginners — plain English, with
+        // the exact command to fix and why it's broken in one sentence.
+        let (status, detail) = if !r.enabled {
+            (
+                "disabled",
+                "This route is switched off, so we don't expect it on any node. Re-enable it from the route list to install it.".to_string(),
+            )
+        } else if !targets_here {
+            let owner = r.node_id.clone().unwrap_or_else(|| "(cluster-wide)".into());
+            (
+                "not_targeted_here",
+                format!(
+                    "Not relevant — you asked for this route to live on `{}`, not this node. That's fine. (We're showing this row so you can see it didn't accidentally end up here too.)",
+                    owner
+                ),
+            )
+        } else if let Some(err) = &kernel_error {
+            (
+                "kernel_query_failed",
+                format!(
+                    "We couldn't ask the Linux kernel about this route on this node — the `ip` command failed: {}. Usually means WolfStack isn't running with enough permissions. Check the service logs.",
+                    err
+                ),
+            )
+        } else if !kernel_present {
+            (
+                "missing",
+                format!(
+                    "Broken — this node was supposed to install `{} via {}` into Linux, but the route is not there. The most common cause is that the route's Node Assignment doesn't match a real node in this cluster (look at the route's settings — if it shows a hostname like `myserver` instead of a `ws-…` ID, edit the route and pick the node from the dropdown). Other possible causes: the WolfStack service restarted at the wrong moment, or another program holds a conflicting route. Try: edit the route → save (re-applies on save), or restart WolfStack on this node.",
+                    r.subnet_cidr, r.gateway
+                ),
+            )
+        } else if kernel_matches {
+            (
+                "ok",
+                format!(
+                    "Working — this node has the route `{} via {}` installed exactly as configured. Traffic to this subnet will go through the gateway.",
+                    r.subnet_cidr, r.gateway
+                ),
+            )
+        } else if let Some(gw) = &kernel_gw {
+            (
+                "wrong_gateway",
+                format!(
+                    "Conflict — Linux already has a route to `{}` but it points to `{}`, not your configured gateway `{}`. Something else (a VPN client, a manual `ip route add`, or another routing tool) installed it first. WolfStack will NOT silently overwrite that. To fix: SSH into this node and run `sudo ip route del {}` to remove the conflicting route, then come back here and click Re-run.",
+                    r.subnet_cidr, gw, r.gateway, r.subnet_cidr
+                ),
+            )
+        } else {
+            (
+                "unsupported_form",
+                format!(
+                    "Special route — Linux has a route to `{}` but in a shape WolfStack doesn't know how to manage (for example a route bound directly to a network card, a `blackhole` or `unreachable` route, or a load-balanced route). SSH into this node and run `ip route show {}` to see what's there, then either delete it or pick a different destination subnet.",
+                    r.subnet_cidr, r.subnet_cidr
+                ),
+            )
+        };
+
+        entries.push(serde_json::json!({
+            "id": r.id,
+            "subnet_cidr": r.subnet_cidr,
+            "configured_gateway": r.gateway,
+            "configured_node_id": r.node_id,
+            "enabled": r.enabled,
+            "description": r.description,
+            "targets_this_node": targets_here,
+            "kernel_present": kernel_present,
+            "kernel_gateway": kernel_gw,
+            "kernel_matches_config": kernel_matches,
+            "kernel_raw": kernel_raw,
+            "kernel_error": kernel_error,
+            "status": status,
+            "status_detail": detail,
+        }));
+    }
+
+    // Full IPv4 routing table — useful when a route appears missing but
+    // the destination is actually covered by something broader (e.g. a
+    // default route or a /16 that subsumes a /24).
+    let (ip_route_dump, ip_route_error) = match super::read_kernel_route_table() {
+        Ok(s) => (s, None),
+        Err(e) => (String::new(), Some(e)),
+    };
+
+    // IPv4 forwarding state. Routes on a transit node are useless if
+    // /proc/sys/net/ipv4/ip_forward is 0 — the kernel will accept the
+    // route but drop traffic that needs to traverse it.
+    let ip_forward = std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+        .ok()
+        .map(|s| s.trim().to_string());
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "node_id": self_id,
+        "routes": entries,
+        "ip_route_dump": ip_route_dump,
+        "ip_route_error": ip_route_error,
+        "ip_forward": ip_forward,
+    }))
+}
+
 // ─── Mount ───
 
 pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
@@ -3815,10 +3952,11 @@ pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
         .route("/api/router/proxies/{id}",     web::put().to(update_proxy))
         .route("/api/router/proxies/{id}",     web::delete().to(delete_proxy))
         .route("/api/router/proxy-backends",   web::get().to(list_proxy_backends))
-        .route("/api/router/subnet-routes",       web::get().to(list_subnet_routes))
-        .route("/api/router/subnet-routes",       web::post().to(create_subnet_route))
-        .route("/api/router/subnet-routes/{id}",  web::put().to(update_subnet_route))
-        .route("/api/router/subnet-routes/{id}",  web::delete().to(delete_subnet_route));
+        .route("/api/router/subnet-routes",             web::get().to(list_subnet_routes))
+        .route("/api/router/subnet-routes",             web::post().to(create_subnet_route))
+        .route("/api/router/subnet-routes/diagnostics", web::get().to(diagnostics_subnet_routes))
+        .route("/api/router/subnet-routes/{id}",        web::put().to(update_subnet_route))
+        .route("/api/router/subnet-routes/{id}",        web::delete().to(delete_subnet_route));
 }
 
 /// GET /api/router/host-dns — detect what's holding port 53 on this

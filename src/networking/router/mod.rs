@@ -752,6 +752,16 @@ pub fn apply_subnet_route(route: &SubnetRoute, previous_gateway: Option<&str>) -
 /// (multi-path routes, blackhole, unreachable, etc. — caller treats the
 /// unparseable case conservatively).
 fn read_kernel_route_gateway(cidr: &str) -> Result<Option<String>, String> {
+    let raw = read_kernel_route_raw(cidr)?;
+    Ok(parse_route_gateway(&raw))
+}
+
+/// Capture the raw stdout of `ip route show <cidr>`. Used both by the
+/// gateway-extracting helper above and by the diagnostics endpoint, which
+/// shows operators the unparsed output so they can reason about routes
+/// that don't fit our `<dest> via <gw>` shape (dev-only, blackhole,
+/// multipath).
+pub fn read_kernel_route_raw(cidr: &str) -> Result<String, String> {
     use std::process::Command;
     let out = Command::new("ip")
         .arg("route")
@@ -763,22 +773,48 @@ fn read_kernel_route_gateway(cidr: &str) -> Result<Option<String>, String> {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(format!("ip route show failed: {}", stderr.trim()));
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let line = match stdout.lines().find(|l| !l.trim().is_empty()) {
-        Some(l) => l,
-        None => return Ok(None), // no route present
-    };
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Capture the entire IPv4 routing table — what `ip route` prints with
+/// no arguments. Used by diagnostics so operators can see the full
+/// kernel state when a configured route is missing.
+pub fn read_kernel_route_table() -> Result<String, String> {
+    use std::process::Command;
+    let out = Command::new("ip")
+        .arg("route")
+        .output()
+        .map_err(|e| format!("ip route: {}", e))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("ip route failed: {}", stderr.trim()));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Public alias for the parser so the diagnostics API can compose the
+/// raw `ip route show` capture with our gateway-extraction logic without
+/// re-running the command.
+pub fn parse_kernel_route_gateway_for_diagnostics(raw: &str) -> Option<String> {
+    parse_route_gateway(raw)
+}
+
+/// Extract the `via <gw>` from the first non-empty line of an `ip route
+/// show` capture. Returns None when the format is not our simple `<dest>
+/// via <ip> ...` shape (dev-only, blackhole, multipath).
+fn parse_route_gateway(raw: &str) -> Option<String> {
+    let line = raw.lines().find(|l| !l.trim().is_empty())?;
     let mut tokens = line.split_whitespace();
     while let Some(t) = tokens.next() {
         if t == "via" {
             if let Some(gw) = tokens.next() {
                 if gw.parse::<std::net::Ipv4Addr>().is_ok() {
-                    return Ok(Some(gw.to_string()));
+                    return Some(gw.to_string());
                 }
             }
         }
     }
-    Ok(None)
+    None
 }
 
 /// Remove a subnet route from the kernel via `ip route del`.

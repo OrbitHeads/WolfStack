@@ -7190,7 +7190,35 @@
             return;
         }
 
-        el.innerHTML = routes.map(r => `
+        // Pre-compute the set of node_ids the cluster currently knows
+        // about so we can flag any route whose Node Assignment doesn't
+        // match a real cluster member — that makes the route silently
+        // unreachable (no node ever runs the apply path) and is the
+        // single most common configuration mistake.
+        const knownNodeIds = new Set(
+            (wrState.topology?.nodes || []).map(n => n.node_id).filter(Boolean)
+        );
+        const nodeNameById = new Map(
+            (wrState.topology?.nodes || []).map(n => [n.node_id, n.node_name || n.node_id])
+        );
+
+        el.innerHTML = routes.map(r => {
+            // Node line: cluster-wide, real-node-with-friendly-name, or
+            // a red "not in cluster" warning that points the user at
+            // the fix.
+            let nodeLine;
+            if (!r.node_id) {
+                nodeLine = `<span style="color:var(--text-muted);">🌐 Cluster-wide (every node)</span>`;
+            } else if (knownNodeIds.size === 0) {
+                // Topology not loaded yet — don't false-alarm. Just show the id.
+                nodeLine = `<span style="color:var(--text-muted);">Node: ${escHtml(r.node_id)}</span>`;
+            } else if (knownNodeIds.has(r.node_id)) {
+                const friendly = nodeNameById.get(r.node_id) || r.node_id;
+                nodeLine = `<span style="color:var(--text-muted);">Node: <strong style="color:var(--text);">${escHtml(friendly)}</strong> <code style="font-size:10px;">(${escHtml(r.node_id)})</code></span>`;
+            } else {
+                nodeLine = `<span style="color:#fca5a5;">⚠ Assigned to <code>${escHtml(r.node_id)}</code> — no such node in this cluster. Click ✎ Edit and pick a node from the dropdown to fix.</span>`;
+            }
+            return `
             <div style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px; padding:14px; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
                 <div>
                     <div style="font-weight:600; color:var(--text); font-size:14px; font-family:monospace;">
@@ -7199,8 +7227,8 @@
                     <div style="font-size:12px; color:var(--text-muted); margin-top:4px;">
                         ${r.description ? escHtml(r.description) : '<em>(no description)</em>'}
                     </div>
-                    <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">
-                        ${r.node_id ? 'Node: ' + escHtml(r.node_id) : '🌐 Cluster-wide'}
+                    <div style="font-size:11px; margin-top:4px;">
+                        ${nodeLine}
                     </div>
                 </div>
                 <div style="display:flex; gap:6px; flex-wrap:wrap;">
@@ -7211,11 +7239,44 @@
                     <button class="btn btn-sm btn-danger" onclick="wrDeleteSubnetRoute('${escHtml(r.id)}')" title="Delete route" style="font-size:11px;">🗑 Delete</button>
                 </div>
             </div>
-        `).join('');
+            `;
+        }).join('');
     }
 
     function wrShowSubnetRouteEditor(routeId) {
         const route = routeId ? (wrState.subnet_routes || []).find(r => r.id === routeId) : null;
+
+        // Build a node-id dropdown from live topology — same pattern as the
+        // LAN segment editor. Free-text used to be the input here, which let
+        // operators type a hostname or display name (e.g. "klnet-12gb"). The
+        // backend stores `node_id` as `ws-<hex>` (see src/main.rs node_id
+        // generation), so a hostname-typed value matched NO node in the
+        // cluster and `route_targets_self()` returned false everywhere —
+        // resulting in the route being saved + replicated but never applied
+        // to any kernel routing table. (Sponsor report 2026-04-27.)
+        const nodes = wrState.topology?.nodes || [];
+        const currentNodeId = route && route.node_id ? route.node_id : '';
+        // Show node_name to humans, store node_id. If editing a route whose
+        // node_id no longer matches any topology entry, surface that as a
+        // tagged "not in cluster" option so the operator can SEE the
+        // mismatch and pick a real node.
+        // <option> renders content as plain text in every browser, so we
+        // build the label as a single text string ("name — id") rather
+        // than nesting a <span>.
+        const nodeOptionsHtml = (() => {
+            const opts = [`<option value="">🌐 Cluster-wide (install on every node)</option>`];
+            for (const n of nodes) {
+                const sel = n.node_id === currentNodeId ? 'selected' : '';
+                const friendly = n.node_name || n.node_id;
+                const label = friendly === n.node_id ? n.node_id : `${friendly} — ${n.node_id}`;
+                opts.push(`<option value="${escHtml(n.node_id)}" ${sel}>${escHtml(label)}</option>`);
+            }
+            const inCluster = nodes.some(n => n.node_id === currentNodeId);
+            if (currentNodeId && !inCluster) {
+                opts.push(`<option value="${escHtml(currentNodeId)}" selected>⚠ ${escHtml(currentNodeId)} (NOT in this cluster — pick a real node)</option>`);
+            }
+            return opts.join('');
+        })();
 
         const dlg = showDialog({
             title: routeId ? '✎ Edit Subnet Route' : '🛣 Add Subnet Route',
@@ -7238,8 +7299,8 @@
                     </div>
                     <div>
                         <label style="display:block; font-size:13px; font-weight:600; margin-bottom:6px; color:var(--text);">Node Assignment</label>
-                        <input id="wr-sr-node" class="form-control" value="${route && route.node_id ? escHtml(route.node_id) : ''}" placeholder="Leave blank for all nodes" style="padding:10px 12px;" />
-                        <small style="color:var(--text-muted); display:block; margin-top:4px;">Leave empty to apply cluster-wide, or specify a node ID for single-node routes</small>
+                        <select id="wr-sr-node" class="form-control" style="padding:10px 12px;">${nodeOptionsHtml}</select>
+                        <small style="color:var(--text-muted); display:block; margin-top:4px;">Pick the node that should hold the kernel route. Cluster-wide installs the route on every node.</small>
                     </div>
                 </div>
             `,
@@ -7350,10 +7411,285 @@
         }
     }
 
+    // ─── Subnet Route Diagnostics ───
+    //
+    // Sponsor report 2026-04-27: a configured route was reported missing
+    // from `ip route` on the targeted VPS. Operator had no way to tell
+    // whether the config didn't replicate, the apply silently failed, or
+    // the config targets a different node than they expected. Diagnostics
+    // calls /api/router/subnet-routes/diagnostics on every cluster node
+    // and lays the kernel state side-by-side with the configured intent.
+
+    async function wrRunSubnetRouteDiagnostics() {
+        const panel = document.getElementById('wr-subnet-routes-diagnostics');
+        if (!panel) return;
+        panel.style.display = 'block';
+        panel.innerHTML = `
+            <div style="padding:14px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px; font-size:12px; color:var(--text-muted);">
+                ⏳ Querying every cluster node for kernel routing state…
+            </div>
+        `;
+
+        // Walk the topology so we cover every node — routes can target
+        // any node, not just the one the browser is connected to.
+        const topoNodes = (wrState.topology?.nodes || [])
+            .filter(n => n && n.node_id);
+        if (topoNodes.length === 0) {
+            // Fall back to a single self-call when topology hasn't loaded
+            // (can happen if preflight failed). Better than no answer.
+            topoNodes.push({ node_id: '', node_name: 'this node' });
+        }
+
+        const results = await Promise.all(topoNodes.map(async (n) => {
+            try {
+                // wrNodeUrl picks the local path (current node) or the
+                // /api/nodes/<id>/proxy/... wrapper (remote node). We do
+                // NOT wrap with wrUrl: the cluster query param is only
+                // used by topology/preflight filtering and would just be
+                // passed through to a node that knows its own cluster.
+                const url = await wrNodeUrl(n.node_id, '/api/router/subnet-routes/diagnostics');
+                const r = await fetch(url);
+                if (!r.ok) {
+                    return { node: n, error: `HTTP ${r.status}: ${(await r.text()).slice(0, 200)}` };
+                }
+                const j = await r.json();
+                return { node: n, data: j };
+            } catch (e) {
+                return { node: n, error: (e && e.message) || String(e) };
+            }
+        }));
+
+        wrRenderSubnetRouteDiagnostics(results);
+    }
+
+    function wrRenderSubnetRouteDiagnostics(results) {
+        const panel = document.getElementById('wr-subnet-routes-diagnostics');
+        if (!panel) return;
+
+        // Aggregate every (node, route) pair so we can group by route id
+        // and show per-node status side-by-side. A route entry on a node
+        // that doesn't host it is informational ("not_targeted_here") but
+        // still useful — it confirms the config replicated.
+        const routeIndex = new Map(); // route_id -> { config, byNode: Map<node_id, entry> }
+        const nodeErrors = []; // { node, error }
+        for (const r of results) {
+            if (r.error) {
+                nodeErrors.push({ node: r.node, error: r.error });
+                continue;
+            }
+            const data = r.data || {};
+            const responderId = data.node_id || r.node?.node_id || '(unknown)';
+            for (const e of (data.routes || [])) {
+                if (!routeIndex.has(e.id)) {
+                    routeIndex.set(e.id, {
+                        config: {
+                            id: e.id,
+                            subnet_cidr: e.subnet_cidr,
+                            gateway: e.configured_gateway,
+                            node_id: e.configured_node_id,
+                            enabled: e.enabled,
+                            description: e.description,
+                        },
+                        byNode: new Map(),
+                    });
+                }
+                routeIndex.get(e.id).byNode.set(responderId, {
+                    ...e,
+                    ip_forward: data.ip_forward,
+                });
+            }
+        }
+
+        const sevColour = {
+            ok:                 { bg: 'rgba(34,197,94,0.15)',  fg: '#4ade80', border: 'rgba(34,197,94,0.5)',  label: '✓ Working' },
+            missing:            { bg: 'rgba(239,68,68,0.15)',  fg: '#fca5a5', border: 'rgba(239,68,68,0.5)',  label: '✗ Broken — route not in Linux' },
+            wrong_gateway:      { bg: 'rgba(234,179,8,0.15)',  fg: '#fde047', border: 'rgba(234,179,8,0.5)',  label: '⚠ Conflict — different route already there' },
+            unsupported_form:   { bg: 'rgba(234,179,8,0.15)',  fg: '#fde047', border: 'rgba(234,179,8,0.5)',  label: '⚠ Special route — needs manual fix' },
+            kernel_query_failed:{ bg: 'rgba(239,68,68,0.15)',  fg: '#fca5a5', border: 'rgba(239,68,68,0.5)',  label: '✗ Could not check' },
+            disabled:           { bg: 'rgba(148,163,184,0.15)',fg: '#94a3b8', border: 'rgba(148,163,184,0.5)',label: '⊘ Switched off' },
+            not_targeted_here:  { bg: 'rgba(148,163,184,0.15)',fg: '#94a3b8', border: 'rgba(148,163,184,0.5)',label: '— Not for this node' },
+        };
+
+        // Pre-flight: detect routes whose Node Assignment matches NO node
+        // in the cluster. This is the sponsor's actual case (typed a
+        // hostname like "klnet-12gb" into a free-text field that wanted
+        // a node_id like "ws-1a2b3c4d"). When this happens, every node
+        // says "not for this node" — looks deceptively like the route is
+        // just configured for a different node, but really it's
+        // configured for a node that doesn't exist. We check directly
+        // against the topology rather than against diagnostics responses
+        // so an offline target node doesn't false-positive as orphan.
+        const knownNodeIds = new Set(
+            (wrState.topology?.nodes || []).map(n => n.node_id).filter(Boolean)
+        );
+        const orphanedRoutes = [];
+        if (knownNodeIds.size > 0) {
+            for (const r of routeIndex.values()) {
+                const c = r.config;
+                if (!c.enabled || !c.node_id) continue; // disabled or cluster-wide → can't be orphaned
+                if (!knownNodeIds.has(c.node_id)) orphanedRoutes.push(c);
+            }
+        }
+
+        const parts = [];
+        parts.push(`
+            <div style="padding:14px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; flex-wrap:wrap; gap:8px;">
+                    <div style="font-weight:600; font-size:13px; color:var(--text);">🩺 Subnet route diagnostics</div>
+                    <div style="display:flex; gap:6px;">
+                        <button class="btn btn-sm" onclick="wrRunSubnetRouteDiagnostics()">🔄 Re-run</button>
+                        <button class="btn btn-sm" onclick="document.getElementById('wr-subnet-routes-diagnostics').style.display='none'">✕ Close</button>
+                    </div>
+                </div>
+                <div style="padding:10px 12px; background:var(--bg); border:1px solid var(--border); border-radius:6px; margin-bottom:10px; font-size:12px; color:var(--text-muted); line-height:1.6;">
+                    <strong style="color:var(--text);">What this does:</strong> for every subnet route you've configured, we go to the node that's supposed to host it and look at Linux's actual routing table. Then we tell you whether the route is actually there, and if not, why.
+                    <br><br>
+                    <strong style="color:var(--text);">How to read it:</strong> each route gets its own block below. Each row inside the block is one node. Look for the "★ target node" star — that's the node that <em>must</em> have the route installed. If the star says <span style="color:#4ade80;">✓ Working</span> you're good. Anything red or yellow needs your attention; the explanation tells you exactly what to do.
+                </div>
+        `);
+
+        if (orphanedRoutes.length) {
+            parts.push(`
+                <div style="margin-bottom:14px; padding:14px; background:rgba(239,68,68,0.12); border:1px solid rgba(239,68,68,0.5); border-radius:8px; color:var(--text);">
+                    <div style="font-weight:600; font-size:13px; color:#fca5a5; margin-bottom:6px;">🚨 Found ${orphanedRoutes.length} route${orphanedRoutes.length === 1 ? '' : 's'} pointing at a node that doesn't exist in this cluster</div>
+                    <div style="font-size:12px; color:var(--text-muted); line-height:1.6;">
+                        These routes have a Node Assignment that doesn't match any of the <code>ws-…</code> node IDs your cluster knows about. That means <strong>no node ever installs the route</strong> — it just sits in config doing nothing. This usually happens when the route was created with a hostname (e.g. <code>klnet-12gb</code>) typed into the Node Assignment field instead of being picked from the dropdown.
+                        <br><br>
+                        <strong style="color:var(--text);">Fix:</strong> click ✎ Edit on each route below, then pick the right node from the <strong>Node Assignment</strong> dropdown (which now shows the friendly name plus the <code>ws-…</code> ID), then Save.
+                    </div>
+                    <ul style="margin:10px 0 0; padding-left:20px; font-size:12px; font-family:monospace;">
+                        ${orphanedRoutes.map(c => `<li><strong>${escHtml(c.subnet_cidr)} → ${escHtml(c.gateway)}</strong> — assigned to <code>${escHtml(c.node_id)}</code> (no such node)</li>`).join('')}
+                    </ul>
+                </div>
+            `);
+        }
+
+        if (nodeErrors.length) {
+            parts.push(`
+                <div style="margin-bottom:10px; padding:10px 12px; background:rgba(239,68,68,0.1); border:1px solid rgba(239,68,68,0.4); border-radius:6px; font-size:12px; color:#fca5a5;">
+                    Could not collect diagnostics from <strong>${nodeErrors.length}</strong> node(s):
+                    <ul style="margin:6px 0 0; padding-left:18px;">
+                        ${nodeErrors.map(e => `<li><code>${escHtml(e.node?.node_name || e.node?.node_id || 'node')}</code>: ${escHtml(e.error)}</li>`).join('')}
+                    </ul>
+                </div>
+            `);
+        }
+
+        if (routeIndex.size === 0 && nodeErrors.length === 0) {
+            parts.push(`<div style="padding:10px 12px; color:var(--text-muted); font-size:12px;">No subnet routes configured.</div>`);
+        }
+
+        // Per-route block: configured intent on the left, per-node kernel
+        // state on the right. We sort target node first (so the targeted
+        // node — where it MUST be in the kernel — leads).
+        const routes = Array.from(routeIndex.values()).sort((a, b) =>
+            (a.config.subnet_cidr || '').localeCompare(b.config.subnet_cidr || ''));
+
+        const nodeNameById = new Map(
+            (wrState.topology?.nodes || []).map(n => [n.node_id, n.node_name || n.node_id])
+        );
+
+        for (const r of routes) {
+            const c = r.config;
+            const isOrphan = !!c.node_id && knownNodeIds.size > 0 && !knownNodeIds.has(c.node_id);
+            // Friendly target label: show the node's hostname plus its
+            // node_id when we can resolve it; show the cluster-wide
+            // marker for cluster-scoped routes; flag orphans loudly so
+            // beginners aren't fooled by per-row "Not for this node"
+            // messages further down (orphans are NOT fine).
+            let targetLabel;
+            if (isOrphan) {
+                targetLabel = `🚨 <code>${escHtml(c.node_id)}</code> — not a real node in this cluster`;
+            } else if (c.node_id) {
+                const friendly = nodeNameById.get(c.node_id);
+                targetLabel = friendly && friendly !== c.node_id
+                    ? `<strong>${escHtml(friendly)}</strong> <code style="font-size:10px;">(${escHtml(c.node_id)})</code>`
+                    : `<code>${escHtml(c.node_id)}</code>`;
+            } else {
+                targetLabel = '🌐 Cluster-wide (every node)';
+            }
+            // The "target" node is the one that MUST hold the kernel
+            // entry. For cluster-wide routes, every node is a target.
+            // For orphaned routes, no node is a target.
+            const isTarget = (nodeId) => !isOrphan && (!c.node_id || c.node_id === nodeId);
+
+            const nodeRows = [];
+            const sortedEntries = Array.from(r.byNode.entries()).sort(([a], [b]) => {
+                const at = isTarget(a) ? 0 : 1;
+                const bt = isTarget(b) ? 0 : 1;
+                if (at !== bt) return at - bt;
+                return a.localeCompare(b);
+            });
+            for (const [nodeId, e] of sortedEntries) {
+                const sev = sevColour[e.status] || sevColour.unsupported_form;
+                const nodeName = (topoNodeName(nodeId)) || nodeId;
+                const kernelLine = e.kernel_present
+                    ? `<code style="font-size:11px;">${escHtml((e.kernel_raw || '').trim().split('\n')[0] || '(empty)')}</code>`
+                    : '<span style="color:var(--text-muted); font-size:11px;">(no entry — kernel does not have this CIDR)</span>';
+                const fwd = e.ip_forward;
+                const fwdHint = (isTarget(nodeId) && fwd === '0' && e.enabled)
+                    ? `<div style="margin-top:6px; font-size:11px; color:#fde047;">⚠ <code>net.ipv4.ip_forward = 0</code> on this node — packets that need to traverse this route will be dropped. Enable forwarding with <code>sysctl -w net.ipv4.ip_forward=1</code> and persist via <code>/etc/sysctl.conf</code>.</div>`
+                    : '';
+                nodeRows.push(`
+                    <tr>
+                        <td style="padding:8px; border-bottom:1px solid var(--border); vertical-align:top;">
+                            <div style="font-weight:600; font-size:12px;">${escHtml(nodeName)}</div>
+                            <div style="font-size:11px; color:var(--text-muted); font-family:monospace;">${escHtml(nodeId)}</div>
+                            ${isTarget(nodeId) ? '<div style="font-size:10px; color:var(--success); margin-top:2px;">★ target node</div>' : ''}
+                        </td>
+                        <td style="padding:8px; border-bottom:1px solid var(--border); vertical-align:top;">
+                            <span style="display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; background:${sev.bg}; color:${sev.fg}; border:1px solid ${sev.border};">${sev.label}</span>
+                        </td>
+                        <td style="padding:8px; border-bottom:1px solid var(--border); vertical-align:top;">
+                            ${kernelLine}
+                            <div style="margin-top:4px; font-size:11px; color:var(--text-muted);">${escHtml(e.status_detail || '')}</div>
+                            ${fwdHint}
+                        </td>
+                    </tr>
+                `);
+            }
+
+            parts.push(`
+                <div style="margin-bottom:14px; border:1px solid var(--border); border-radius:8px; overflow:hidden;">
+                    <div style="padding:10px 12px; background:var(--bg);">
+                        <div style="font-size:13px; font-weight:600; font-family:monospace;">
+                            ${escHtml(c.subnet_cidr)} <span style="color:var(--text-muted);">→</span> ${escHtml(c.gateway)}
+                            ${c.enabled ? '' : '<span style="margin-left:8px; padding:1px 6px; background:rgba(148,163,184,0.2); color:#94a3b8; font-size:10px; border-radius:8px; font-family:inherit;">disabled</span>'}
+                        </div>
+                        <div style="font-size:11px; color:var(--text-muted); margin-top:3px;">
+                            Target: ${targetLabel}${c.description ? ' · ' + escHtml(c.description) : ''}
+                        </div>
+                    </div>
+                    <table style="width:100%; border-collapse:collapse; font-size:12px;">
+                        <thead>
+                            <tr style="background:var(--bg-secondary);">
+                                <th style="padding:6px 8px; text-align:left; font-size:11px; color:var(--text-muted); border-bottom:1px solid var(--border);">Node</th>
+                                <th style="padding:6px 8px; text-align:left; font-size:11px; color:var(--text-muted); border-bottom:1px solid var(--border);">Status</th>
+                                <th style="padding:6px 8px; text-align:left; font-size:11px; color:var(--text-muted); border-bottom:1px solid var(--border);">Kernel state on that node · explanation</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${nodeRows.join('')}
+                        </tbody>
+                    </table>
+                </div>
+            `);
+        }
+
+        parts.push(`</div>`);
+        panel.innerHTML = parts.join('');
+    }
+
+    function topoNodeName(nodeId) {
+        const n = (wrState.topology?.nodes || []).find(x => x.node_id === nodeId);
+        return n ? n.node_name : '';
+    }
+
     // Expose subnet route functions
     window.wrShowSubnetRouteEditor = wrShowSubnetRouteEditor;
     window.wrEditSubnetRoute = wrEditSubnetRoute;
     window.wrDeleteSubnetRoute = wrDeleteSubnetRoute;
     window.wrToggleSubnetRoute = wrToggleSubnetRoute;
+    window.wrRunSubnetRouteDiagnostics = wrRunSubnetRouteDiagnostics;
 
 })();

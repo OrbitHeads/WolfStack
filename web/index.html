@@ -6573,8 +6573,12 @@
                                 Define routes to remote subnets via WolfNet mesh or other tunnels. Each route specifies a destination subnet and the gateway (next-hop) to reach it.
                                 The router will install these routes in the kernel so traffic destined for the remote subnet gets forwarded via the specified gateway.
                             </div>
-                            <button class="btn btn-sm btn-primary" onclick="wrShowSubnetRouteEditor()">+ Route</button>
+                            <div style="display:flex; gap:6px;">
+                                <button class="btn btn-sm" onclick="wrRunSubnetRouteDiagnostics()" title="Compare config against the kernel routing table on every node">🩺 Run diagnostics</button>
+                                <button class="btn btn-sm btn-primary" onclick="wrShowSubnetRouteEditor()">+ Route</button>
+                            </div>
                         </div>
+                        <div id="wr-subnet-routes-diagnostics" style="display:none; margin-bottom:12px;"></div>
                         <div id="wr-subnet-routes-list" style="display:grid; gap:12px;"></div>
                     </div>
 
