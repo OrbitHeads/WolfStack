@@ -575,8 +575,15 @@ pub fn apply_on_startup(state: std::sync::Arc<RouterState>, self_node_id: &str) 
 
     // Subnet routes — apply kernel routing entries for remote subnets
     // accessible via WolfNet or other tunnels.
+    //
+    // Filter through node_handles_route so the gateway node is included
+    // even when the user pinned the route to a specific consumer node:
+    // apply_subnet_route inspects each role internally and installs only
+    // what's needed (kernel route on the consumer, forwarding plumbing
+    // on the gateway). v20.11.6 fix — pre-fix the gateway was excluded
+    // and never got the iptables/sysctl rules required for forwarding.
     let subnet_routes: Vec<_> = cfg.subnet_routes.iter()
-        .filter(|r| r.enabled && route_targets_self(r, self_node_id))
+        .filter(|r| r.enabled && node_handles_route(r, self_node_id))
         .collect();
 
     if !subnet_routes.is_empty() {
@@ -689,6 +696,24 @@ pub fn apply_subnet_route(route: &SubnetRoute, previous_gateway: Option<&str>) -
         return Err(format!("Invalid gateway IP: {}", route.gateway));
     }
 
+    // Gateway-side dispatch (sponsor klasSponsor 2026-04-27, v20.11.6):
+    // when this node OWNS the route's gateway IP, it's the forwarder —
+    // packets arrive on its wolfnet0 from peers and need to be NAT'd out
+    // to the LAN. Installing the route entry on this node would mean
+    // `ip route add 10.10.0.0/16 via <my-own-wolfnet0-ip>`, which the
+    // kernel rejects (and even if it accepted it, the route would loop
+    // back into the same interface). All this node needs is the
+    // forwarding plumbing — ip_forward, FORWARD ACCEPT, MASQUERADE.
+    //
+    // The previous version installed plumbing only on the configured
+    // node (route_targets_self) — which is the consumer, where the
+    // plumbing is a no-op. The gateway never got it, so packets reached
+    // the LAN host but replies couldn't make it back. That's why
+    // klasSponsor saw a green health check but `ping 10.10.10.10` failed.
+    if node_is_route_gateway(route) {
+        return enable_subnet_route_forwarding(route);
+    }
+
     let existing = read_kernel_route_gateway(&route.subnet_cidr)
         .map_err(|e| format!("Failed to inspect existing route: {}", e))?;
 
@@ -744,34 +769,14 @@ pub fn apply_subnet_route(route: &SubnetRoute, previous_gateway: Option<&str>) -
         )),
     };
 
-    // Route is in the kernel — but a routing entry alone doesn't move
-    // packets. Sponsor klasSponsor (2026-04-27): "ip route shows the
-    // route, health says OK, but ping doesn't work." That was because
-    // v20.11.2/.3 stopped at `ip route add` and skipped the forwarding
-    // plumbing every transit node needs:
-    //
-    //   • net.ipv4.ip_forward=1 — kernel won't forward at all otherwise.
-    //   • rp_filter relaxed on wolfnet0 — strict-mode reverse-path drops
-    //     packets whose source (the WolfNet peer) doesn't route back via
-    //     the ingress iface in some topologies.
-    //   • iptables FORWARD ACCEPT — Docker / firewalld flip the default
-    //     to DROP, silently blackholing transit.
-    //   • POSTROUTING MASQUERADE on the subnet — without it, the LAN host
-    //     receives a packet from a 100.x.x.x WolfNet peer it has no route
-    //     to, replies via its default gateway, and the reply never comes
-    //     back. MASQUERADE rewrites the source to the router's egress IP
-    //     so the LAN host replies normally to its own gateway.
-    //
-    // Best-effort: failures are logged but don't fail the route install
-    // (the route itself is fine; the user can inspect via diagnostics).
-    if route_result.is_ok() {
-        if let Err(e) = enable_subnet_route_forwarding(route) {
-            tracing::warn!(
-                "apply_subnet_route: route {} via {} installed but forwarding plumbing failed: {} — traffic may not flow until fixed (see /api/router/subnet-routes/diagnostics)",
-                route.subnet_cidr, route.gateway, e
-            );
-        }
-    }
+    // Consumer role only here (gateway role short-circuited at top of
+    // function). The consumer doesn't forward — it's just the source —
+    // so it needs the kernel route entry but NO iptables/sysctl
+    // plumbing. v20.11.5 installed plumbing on consumers too: it was
+    // a harmless no-op (consumer's egress src IP is already wolfnet0's
+    // IP, so MASQUERADE rewrites src to itself) but it caused a race on
+    // gateway-changed updates where remove(old) would strip rules that
+    // apply(new) had just put back. Plumbing belongs only on the gateway.
     route_result
 }
 
@@ -1067,33 +1072,26 @@ fn parse_route_gateway(raw: &str) -> Option<String> {
 pub fn remove_subnet_route(route: &SubnetRoute) -> Result<(), String> {
     use std::process::Command;
 
-    // Helper closure — strip our iptables forwarding rules. We call it on
-    // every removal path (early returns included) so that no leftover
-    // MASQUERADE/FORWARD rule survives for a subnet WolfStack no longer
-    // manages. Idempotent: missing rules are not an error.
-    let cleanup_plumbing = || {
-        if let Err(e) = disable_subnet_route_forwarding(route) {
-            tracing::warn!(
-                "remove_subnet_route: forwarding rule cleanup for {} failed: {}",
-                route.subnet_cidr, e
-            );
-        }
-    };
+    // Gateway-side dispatch (mirrors apply_subnet_route, v20.11.6): if
+    // this node OWNS the gateway IP we never installed a kernel route
+    // entry — only the forwarding plumbing. Strip that and we're done.
+    if node_is_route_gateway(route) {
+        return disable_subnet_route_forwarding(route);
+    }
 
-    // Inspect first. If the kernel has a different (or no) gateway for this
-    // CIDR, we won't touch the route entry — but our iptables rules might
-    // still be in place from a previous lifetime, so clean those regardless.
+    // Consumer role: only a kernel route entry to remove. We never
+    // installed plumbing on the consumer (post-v20.11.6) so there's
+    // nothing to clean on the iptables side. Older versions (v20.11.5)
+    // did install plumbing here — the next gateway-side apply will
+    // replace those rules and any leftover consumer rules are harmless
+    // (MASQUERADE -d <subnet> on a non-forwarding node is a no-op).
     match read_kernel_route_gateway(&route.subnet_cidr) {
-        Ok(None) => {
-            cleanup_plumbing();
-            return Ok(());
-        }
+        Ok(None) => return Ok(()),
         Ok(Some(gw)) if gw != route.gateway => {
             tracing::warn!(
                 "remove_subnet_route: kernel route for {} now uses gateway {} (we expected {}); leaving it in place",
                 route.subnet_cidr, gw, route.gateway
             );
-            cleanup_plumbing();
             return Ok(());
         }
         Ok(Some(_)) => { /* matches — proceed with del */ }
@@ -1113,8 +1111,6 @@ pub fn remove_subnet_route(route: &SubnetRoute) -> Result<(), String> {
         .output()
         .map_err(|e| format!("Failed to execute ip command: {}", e))?;
 
-    cleanup_plumbing();
-
     if output.status.success() {
         return Ok(());
     }
@@ -1123,6 +1119,55 @@ pub fn remove_subnet_route(route: &SubnetRoute) -> Result<(), String> {
         return Ok(());
     }
     Err(format!("ip route del failed: {}", stderr.trim()))
+}
+
+/// True when this node owns the wolfnet0 address listed as the route's
+/// gateway. The gateway-owning node is the forwarder — its wolfnet0
+/// receives packets from peers, and its LAN interface delivers them to
+/// the destination subnet. We install iptables/sysctl plumbing on the
+/// forwarder rather than a kernel route entry (an `ip route add ... via
+/// <my-own-ip>` is rejected by the kernel and would loop anyway).
+///
+/// Implementation: shells out to `ip -4 addr show <wolfnet-iface>` and
+/// scans for `inet <addr>/...` lines. We don't cache because wolfnet0
+/// addresses can change at runtime when WolfNet reconfigures, and this
+/// is called only from apply/remove paths and the diagnostics endpoint.
+pub fn node_is_route_gateway(route: &SubnetRoute) -> bool {
+    use std::process::Command;
+    let wn_iface = crate::networking::detect_wolfnet_iface()
+        .unwrap_or_else(|| "wolfnet0".to_string());
+    let out = match Command::new("ip")
+        .args(["-4", "addr", "show", &wn_iface])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let rest = match trimmed.strip_prefix("inet ") {
+            Some(r) => r,
+            None => continue,
+        };
+        let addr_with_prefix = match rest.split_whitespace().next() {
+            Some(a) => a,
+            None => continue,
+        };
+        let addr = addr_with_prefix.split('/').next().unwrap_or("");
+        if addr == route.gateway {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when this node has any role to play in installing a subnet route
+/// — either as a configured target (it gets the kernel route entry) or
+/// as the gateway (it gets the forwarding plumbing). All apply/remove
+/// call sites filter through this so the gateway never gets skipped.
+pub fn node_handles_route(route: &SubnetRoute, self_node_id: &str) -> bool {
+    route_targets_self(route, self_node_id) || node_is_route_gateway(route)
 }
 
 /// True when the route should be installed on the node identified by

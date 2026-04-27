@@ -350,14 +350,18 @@ pub async fn config_receive(
     use crate::networking::router::{
         apply_subnet_route as ws_apply_route,
         remove_subnet_route as ws_remove_route,
-        route_targets_self as ws_route_targets_self,
+        node_handles_route as ws_node_handles_route,
         SubnetRoute,
     };
+    // node_handles_route (v20.11.6) widens the filter to also include
+    // routes where THIS node is the gateway — apply_subnet_route then
+    // installs forwarding plumbing there even if the user pinned the
+    // route's node_id to a different (consumer) node.
     let old_here: Vec<&SubnetRoute> = old_routes.iter()
-        .filter(|r| r.enabled && ws_route_targets_self(r, &self_id))
+        .filter(|r| r.enabled && ws_node_handles_route(r, &self_id))
         .collect();
     let new_here: Vec<&SubnetRoute> = new_cfg.subnet_routes.iter()
-        .filter(|r| r.enabled && ws_route_targets_self(r, &self_id))
+        .filter(|r| r.enabled && ws_node_handles_route(r, &self_id))
         .collect();
 
     // Helper: do two routes install the SAME kernel entry?
@@ -3542,7 +3546,11 @@ pub async fn create_subnet_route(req: HttpRequest, state: S, body: web::Json<Sub
     // the next service restart.
     let self_id = crate::agent::self_node_id();
     let mut apply_warning: Option<String> = None;
-    if route.enabled && super::route_targets_self(&route, &self_id) {
+    // v20.11.6: node_handles_route widens the filter so the gateway node
+    // also runs apply (and installs forwarding plumbing) — pre-fix the
+    // gateway was excluded and packets reached the LAN but couldn't
+    // return.
+    if route.enabled && super::node_handles_route(&route, &self_id) {
         // Fresh create — no previous gateway to authorize a swap with.
         if let Err(e) = super::apply_subnet_route(&route, None) {
             tracing::warn!("create_subnet_route: apply failed on this node: {}", e);
@@ -3663,9 +3671,15 @@ pub async fn update_subnet_route(
     // working route.
     let self_id = crate::agent::self_node_id();
     let mut apply_warning: Option<String> = None;
-    let new_should_apply = updated.enabled && super::route_targets_self(&updated, &self_id);
+    // v20.11.6: node_handles_route covers both "configured target" and
+    // "gateway" roles so the gateway re-installs plumbing on update.
+    let new_should_apply = updated.enabled && super::node_handles_route(&updated, &self_id);
     // For an update, pass the OLD gateway so apply_subnet_route can tell
     // "this is our route, swap it" from "this is someone else's, leave it".
+    // We only carry the OLD gateway when the OLD route was a *consumer*
+    // role on this node (route_targets_self) — that's the only role that
+    // installed an `ip route` entry. Gateway-role on this node never
+    // installed a route entry, so there's nothing to authorise a swap of.
     let prev_gw_for_apply = old_route.as_ref().and_then(|o| {
         if o.enabled && super::route_targets_self(o, &self_id)
             && o.subnet_cidr == updated.subnet_cidr {
@@ -3688,13 +3702,18 @@ pub async fn update_subnet_route(
     };
 
     if let Some(old) = &old_route {
-        let old_was_applied_here = old.enabled && super::route_targets_self(old, &self_id);
+        // v20.11.6: include the gateway role here too — if this node was
+        // the gateway for the OLD route, plumbing was installed and must
+        // be cleaned when the route is removed/disabled/moved.
+        let old_was_applied_here = old.enabled && super::node_handles_route(old, &self_id);
         if old_was_applied_here {
             let cidr_changed = updated.subnet_cidr != old.subnet_cidr;
-            // Remove the old entry only if it represents a different kernel
-            // destination than the new one and the new apply succeeded (or
-            // there is no new apply).
-            if (cidr_changed || !new_should_apply) && new_apply_ok {
+            let gateway_changed = updated.gateway != old.gateway;
+            // Remove the old entry/plumbing when the destination CIDR
+            // changed, the gateway IP changed (which can shift the
+            // gateway role onto a different node), or the new route
+            // doesn't apply here at all.
+            if (cidr_changed || gateway_changed || !new_should_apply) && new_apply_ok {
                 if let Err(e) = super::remove_subnet_route(old) {
                     tracing::warn!("update_subnet_route: remove old failed: {}", e);
                 }
@@ -3782,6 +3801,13 @@ pub async fn diagnostics_subnet_routes(req: HttpRequest, state: S) -> HttpRespon
     let mut entries: Vec<serde_json::Value> = Vec::with_capacity(routes.len());
     for r in &routes {
         let targets_here = super::route_targets_self(r, &self_id);
+        // v20.11.6: a node can also have a "gateway" role for a route —
+        // when its wolfnet0 IP equals route.gateway it forwards traffic
+        // INTO the subnet (and never installs an `ip route` entry of its
+        // own). Diagnostics must distinguish so we don't report
+        // "kernel route missing" on a node that's correctly acting as
+        // the gateway — there's no kernel route to find there.
+        let is_gateway_here = super::node_is_route_gateway(r);
 
         // Read raw `ip route show <cidr>` so we can report both the
         // present/absent answer and let the operator see exotic forms
@@ -3804,6 +3830,43 @@ pub async fn diagnostics_subnet_routes(req: HttpRequest, state: S) -> HttpRespon
                 "disabled",
                 "This route is switched off, so we don't expect it on any node. Re-enable it from the route list to install it.".to_string(),
             )
+        } else if is_gateway_here {
+            // Gateway role: this node owns the route's gateway IP and is
+            // responsible for forwarding packets INTO the subnet. It
+            // installs iptables/sysctl plumbing instead of a kernel
+            // route entry. Status here is determined ENTIRELY by the
+            // forwarding plumbing — no kernel route is expected.
+            let fwd = super::read_forwarding_state(r);
+            let mut missing: Vec<&str> = Vec::new();
+            if fwd.ip_forward.as_deref() != Some("1") {
+                missing.push("ip_forward (kernel forwarding disabled)");
+            }
+            if !fwd.forward_in {
+                missing.push("FORWARD ACCEPT (incoming on WolfNet)");
+            }
+            if !fwd.forward_out {
+                missing.push("FORWARD ACCEPT (return via WolfNet)");
+            }
+            if !fwd.masquerade {
+                missing.push("POSTROUTING MASQUERADE (LAN reply path)");
+            }
+            if missing.is_empty() {
+                (
+                    "gateway_ok",
+                    format!(
+                        "Working — this node is the gateway for `{}` (wolfnet0 owns `{}`). All forwarding plumbing (ip_forward, FORWARD ACCEPT, MASQUERADE) is in place. Packets from peers will be forwarded into the LAN and replies routed back.",
+                        r.subnet_cidr, r.gateway
+                    ),
+                )
+            } else {
+                (
+                    "gateway_misconfigured",
+                    format!(
+                        "Gateway role broken — this node owns `{}` (the route's gateway) and should be forwarding peer traffic into `{}`, but the following forwarding pieces are missing: {}. Fix: edit the route → save (re-applies plumbing), or restart WolfStack on this node.",
+                        r.gateway, r.subnet_cidr, missing.join(", ")
+                    ),
+                )
+            }
         } else if !targets_here {
             let owner = r.node_id.clone().unwrap_or_else(|| "(cluster-wide)".into());
             (
@@ -3894,11 +3957,11 @@ pub async fn diagnostics_subnet_routes(req: HttpRequest, state: S) -> HttpRespon
             )
         };
 
-        // Inspect forwarding plumbing once for the JSON payload (the
-        // status branch above only inspects when the route is present;
-        // running it again here keeps the frontend-visible state
-        // consistent with the status code we just computed).
-        let fwd_state = if targets_here && r.enabled && kernel_matches {
+        // Inspect forwarding plumbing for the JSON payload whenever this
+        // node has a role to play in the route: it's a configured target
+        // with a kernel route in place, OR it's the gateway. Both roles
+        // depend on the plumbing.
+        let fwd_state = if r.enabled && (is_gateway_here || (targets_here && kernel_matches)) {
             Some(super::read_forwarding_state(r))
         } else {
             None
@@ -3912,6 +3975,7 @@ pub async fn diagnostics_subnet_routes(req: HttpRequest, state: S) -> HttpRespon
             "enabled": r.enabled,
             "description": r.description,
             "targets_this_node": targets_here,
+            "is_gateway_here": is_gateway_here,
             "kernel_present": kernel_present,
             "kernel_gateway": kernel_gw,
             "kernel_matches_config": kernel_matches,
