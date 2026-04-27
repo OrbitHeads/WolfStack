@@ -283,6 +283,33 @@ pub enum BackupStatus {
     InProgress,
 }
 
+/// One Docker mount captured into a backup. Lets the UI show what's in
+/// each backup ("3 volumes, 2 binds") without re-reading the tarball,
+/// and the restore path knows where to put each piece back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MountInfo {
+    /// "volume" | "bind" | "tmpfs" (tmpfs is recorded for visibility but
+    /// never actually backed up — it's by definition ephemeral).
+    #[serde(rename = "type")]
+    pub mount_type: String,
+    /// For volume: the named-volume name. For bind: the host source path.
+    pub source: String,
+    /// Where the container sees this mounted (e.g. "/var/lib/postgresql/data").
+    pub destination: String,
+    /// Filename inside the wrapper tarball (`volumes/vol-foo.tar.gz` or
+    /// `binds/bind-0.tar.gz`). Empty when this mount was skipped (tmpfs,
+    /// missing source, or refused by the safety deny-list).
+    #[serde(default)]
+    pub archive_path: String,
+    /// On-disk size of the tarball (uncompressed source size hint).
+    #[serde(default)]
+    pub size_bytes: u64,
+    /// Reason this mount was skipped, if any (deny-list, missing source,
+    /// tmpfs, etc.). Empty when the mount was successfully archived.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub skipped_reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupEntry {
     pub id: String,
@@ -306,6 +333,47 @@ pub struct BackupEntry {
     /// Docker container config (docker inspect JSON) for restoring with original settings
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub docker_config: String,
+    /// Mounts captured into this backup (Docker only). Empty for non-
+    /// Docker entries and for legacy backups created before v20.11.0
+    /// (those used a flat `docker save | gzip` with no volume capture).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<MountInfo>,
+}
+
+/// Permissive deny-list of host paths we refuse to back up via bind
+/// mounts. Backing these up is either catastrophic (root, /var/lib/docker
+/// recursion, kernel virtual filesystems) or pointlessly dangerous —
+/// the user almost certainly did not mean to capture these into a user-
+/// accessible tarball. Subpaths of /etc, /sys, /proc, /dev, /boot are
+/// blocked too (their content is system state, not application data).
+/// Everything else is allowed — admins binding /opt/myapp, /srv/data,
+/// /home/x/stuff, /var/www, /var/log/myapp, /mnt/disk, etc. all work.
+fn bind_source_safe(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("source path is empty".into());
+    }
+    let canonical = path.trim_end_matches('/');
+    if canonical.is_empty() || canonical == "" {
+        return Err("refusing to back up the host root filesystem '/'".into());
+    }
+    let exact_deny: &[&str] = &[
+        "/", "/usr", "/lib", "/lib64", "/bin", "/sbin", "/var", "/run", "/tmp",
+    ];
+    if exact_deny.iter().any(|d| *d == canonical) {
+        return Err(format!("refusing to back up system path '{}' — bind a specific subdirectory instead", canonical));
+    }
+    let prefix_deny: &[&str] = &[
+        "/etc", "/sys", "/proc", "/dev", "/boot", "/var/lib/docker",
+    ];
+    for p in prefix_deny {
+        if canonical == *p || canonical.starts_with(&format!("{}/", p)) {
+            return Err(format!(
+                "refusing to back up '{}' — paths under {} are system state and not safe to archive",
+                canonical, p
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -355,15 +423,38 @@ fn ensure_staging_dir() -> Result<PathBuf, String> {
 
 /// Backup a Docker container — commit + save + gzip
 /// Returns (path, size, docker_inspect_json)
-pub fn backup_docker(name: &str) -> Result<(PathBuf, u64, String), String> {
-
+/// Back up a Docker container including its volumes and bind mounts.
+///
+/// The output tarball is a *wrapper* containing:
+///   inspect.json              ← `docker inspect` output (the original docker_config)
+///   mounts.json               ← list of MountInfo, telling restore where each archive goes
+///   image.tar.gz              ← `docker commit` + `docker save | gzip` (existing v20.10.x behaviour)
+///   volumes/vol-{name}.tar.gz ← per named volume, content of /var/lib/docker/volumes/{name}/_data
+///   binds/bind-{idx}.tar.gz   ← per bind mount, content of the host source path
+///
+/// Legacy v20.10.x backups (just `docker save | gzip`) are still
+/// restorable — `restore_docker` detects the format by looking for
+/// `inspect.json` inside the outer tarball.
+///
+/// Bind mounts to system paths (/, /etc, /var/lib/docker, etc.) are
+/// refused with a recorded skipped_reason so the user can tell from the
+/// backup metadata what was excluded and why.
+pub fn backup_docker(name: &str) -> Result<(PathBuf, u64, String, Vec<MountInfo>), String> {
     let staging = ensure_staging_dir()?;
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
     let filename = format!("docker-{}-{}.tar.gz", name, timestamp);
-    let tar_path = staging.join(&filename);
+    let final_path = staging.join(&filename);
     let temp_image = format!("wolfstack-backup/{}", name);
 
-    // Save container config (docker inspect) for restore
+    // Per-backup work area we'll tar up at the end.
+    let work_id = Uuid::new_v4().to_string();
+    let work_dir = staging.join(format!("docker-work-{}", work_id));
+    fs::create_dir_all(work_dir.join("volumes"))
+        .map_err(|e| format!("Failed to create work dir: {}", e))?;
+    fs::create_dir_all(work_dir.join("binds"))
+        .map_err(|e| format!("Failed to create binds dir: {}", e))?;
+
+    // Save container config (docker inspect) for restore.
     let docker_config = Command::new("docker")
         .args(["inspect", name])
         .output()
@@ -372,33 +463,236 @@ pub fn backup_docker(name: &str) -> Result<(PathBuf, u64, String), String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default();
 
-    // Commit the container to a temp image (disable content trust — committed images have no signatures)
-    let output = Command::new("docker")
+    // Parse the Mounts[] array — populated by docker for every
+    // -v / --mount on the container, regardless of whether the source
+    // is a named volume or a host bind.
+    let inspect_val: serde_json::Value = serde_json::from_str(&docker_config)
+        .unwrap_or(serde_json::Value::Null);
+    let mounts_arr = inspect_val.get(0)
+        .and_then(|c| c.get("Mounts"))
+        .and_then(|m| m.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut mounts: Vec<MountInfo> = Vec::new();
+    for (idx, m) in mounts_arr.iter().enumerate() {
+        let mtype = m.get("Type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let source = m.get("Source").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let destination = m.get("Destination").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let vol_name = m.get("Name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+        match mtype.as_str() {
+            "volume" => {
+                // Named volume — find its data dir on the host. Source
+                // is usually /var/lib/docker/volumes/{name}/_data already.
+                let data_dir = if !source.is_empty() && Path::new(&source).is_dir() {
+                    source.clone()
+                } else if !vol_name.is_empty() {
+                    format!("/var/lib/docker/volumes/{}/_data", vol_name)
+                } else {
+                    String::new()
+                };
+                let label = if !vol_name.is_empty() { vol_name.clone() } else { format!("idx{}", idx) };
+                let archive_rel = format!("volumes/vol-{}.tar.gz", sanitize_archive_name(&label));
+                let archive_abs = work_dir.join(&archive_rel);
+
+                if data_dir.is_empty() || !Path::new(&data_dir).is_dir() {
+                    mounts.push(MountInfo {
+                        mount_type: "volume".into(),
+                        source: vol_name.clone(),
+                        destination: destination.clone(),
+                        archive_path: String::new(),
+                        size_bytes: 0,
+                        skipped_reason: format!("volume data directory not found ({})", data_dir),
+                    });
+                    continue;
+                }
+                match tar_dir_to_gz(&data_dir, &archive_abs) {
+                    Ok(size) => {
+                        mounts.push(MountInfo {
+                            mount_type: "volume".into(),
+                            source: vol_name,
+                            destination,
+                            archive_path: archive_rel,
+                            size_bytes: size,
+                            skipped_reason: String::new(),
+                        });
+                    }
+                    Err(e) => {
+                        mounts.push(MountInfo {
+                            mount_type: "volume".into(),
+                            source: vol_name,
+                            destination,
+                            archive_path: String::new(),
+                            size_bytes: 0,
+                            skipped_reason: format!("tar failed: {}", e),
+                        });
+                    }
+                }
+            }
+            "bind" => {
+                if let Err(reason) = bind_source_safe(&source) {
+                    warn!("backup_docker: skipping bind mount {} -> {}: {}", source, destination, reason);
+                    mounts.push(MountInfo {
+                        mount_type: "bind".into(),
+                        source,
+                        destination,
+                        archive_path: String::new(),
+                        size_bytes: 0,
+                        skipped_reason: reason,
+                    });
+                    continue;
+                }
+                if !Path::new(&source).exists() {
+                    mounts.push(MountInfo {
+                        mount_type: "bind".into(),
+                        source,
+                        destination,
+                        archive_path: String::new(),
+                        size_bytes: 0,
+                        skipped_reason: "host source path does not exist".into(),
+                    });
+                    continue;
+                }
+                let archive_rel = format!("binds/bind-{}.tar.gz", idx);
+                let archive_abs = work_dir.join(&archive_rel);
+                match tar_path_to_gz(&source, &archive_abs) {
+                    Ok(size) => {
+                        mounts.push(MountInfo {
+                            mount_type: "bind".into(),
+                            source,
+                            destination,
+                            archive_path: archive_rel,
+                            size_bytes: size,
+                            skipped_reason: String::new(),
+                        });
+                    }
+                    Err(e) => {
+                        mounts.push(MountInfo {
+                            mount_type: "bind".into(),
+                            source,
+                            destination,
+                            archive_path: String::new(),
+                            size_bytes: 0,
+                            skipped_reason: format!("tar failed: {}", e),
+                        });
+                    }
+                }
+            }
+            _ => {
+                // tmpfs / npipe / unknown — record but don't archive.
+                mounts.push(MountInfo {
+                    mount_type: mtype,
+                    source,
+                    destination,
+                    archive_path: String::new(),
+                    size_bytes: 0,
+                    skipped_reason: "tmpfs/unsupported mount type — not archived".into(),
+                });
+            }
+        }
+    }
+
+    // Commit + save the image into work_dir/image.tar.gz. Same as
+    // pre-v20.11.0 behaviour, just in a subdirectory now.
+    let image_path = work_dir.join("image.tar.gz");
+    let commit = Command::new("docker")
         .env("DOCKER_CONTENT_TRUST", "0")
         .args(["commit", name, &temp_image])
         .output()
         .map_err(|e| format!("Failed to commit container: {}", e))?;
-
-    if !output.status.success() {
-        return Err(format!("Docker commit failed: {}", String::from_utf8_lossy(&output.stderr)));
+    if !commit.status.success() {
+        let _ = fs::remove_dir_all(&work_dir);
+        return Err(format!("Docker commit failed: {}", String::from_utf8_lossy(&commit.stderr)));
     }
-
-    // Save the image to tar, pipe through gzip
-    let output = Command::new("sh")
-        .args(["-c", &format!("docker save '{}' | gzip > '{}'", temp_image, tar_path.display())])
+    let save = Command::new("sh")
+        .args(["-c", &format!("docker save '{}' | gzip > '{}'", temp_image, image_path.display())])
         .output()
         .map_err(|e| format!("Failed to save image: {}", e))?;
-
-    // Clean up temp image
     let _ = Command::new("docker").args(["rmi", &temp_image]).output();
-
-    if !output.status.success() {
-        return Err(format!("Docker save failed: {}", String::from_utf8_lossy(&output.stderr)));
+    if !save.status.success() {
+        let _ = fs::remove_dir_all(&work_dir);
+        return Err(format!("Docker save failed: {}", String::from_utf8_lossy(&save.stderr)));
     }
 
-    let size = fs::metadata(&tar_path).map(|m| m.len()).unwrap_or(0);
+    // inspect.json + mounts.json — the metadata restore will read.
+    fs::write(work_dir.join("inspect.json"), &docker_config)
+        .map_err(|e| format!("Failed to write inspect.json: {}", e))?;
+    let mounts_json = serde_json::to_string_pretty(&mounts)
+        .map_err(|e| format!("Failed to serialise mounts: {}", e))?;
+    fs::write(work_dir.join("mounts.json"), &mounts_json)
+        .map_err(|e| format!("Failed to write mounts.json: {}", e))?;
 
-    Ok((tar_path, size, docker_config))
+    // Wrap the whole work_dir into the final backup tarball.
+    let wrap = Command::new("tar")
+        .arg("czf")
+        .arg(&final_path)
+        .arg("-C")
+        .arg(&work_dir)
+        .arg(".")
+        .output()
+        .map_err(|e| format!("Failed to wrap backup tarball: {}", e))?;
+    let _ = fs::remove_dir_all(&work_dir);
+    if !wrap.status.success() {
+        return Err(format!("tar wrap failed: {}", String::from_utf8_lossy(&wrap.stderr)));
+    }
+
+    let size = fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
+    Ok((final_path, size, docker_config, mounts))
+}
+
+/// Sanitize a string for use as a filename component. Volume names are
+/// usually fine but compose can produce `myproject_data` which is OK,
+/// while user-supplied names could contain slashes / spaces.
+fn sanitize_archive_name(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .collect()
+}
+
+/// tar.gz a directory's contents (NOT the directory itself) into the
+/// given archive path. Returns the resulting archive size in bytes.
+fn tar_dir_to_gz(src_dir: &str, archive: &Path) -> Result<u64, String> {
+    let out = Command::new("tar")
+        .arg("czf")
+        .arg(archive)
+        .arg("-C")
+        .arg(src_dir)
+        .arg(".")
+        .output()
+        .map_err(|e| format!("tar spawn failed: {}", e))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(fs::metadata(archive).map(|m| m.len()).unwrap_or(0))
+}
+
+/// tar.gz an arbitrary path (file or dir). Used for bind mounts where
+/// `Source` may be a file (e.g. a single config) or a directory.
+fn tar_path_to_gz(src: &str, archive: &Path) -> Result<u64, String> {
+    let p = Path::new(src);
+    let (parent, name) = if p.is_dir() {
+        // tar -C parent name → archive contains a "name" entry at the root.
+        let parent = p.parent().map(|x| x.to_string_lossy().to_string()).unwrap_or_else(|| "/".into());
+        let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| ".".into());
+        (parent, name)
+    } else {
+        let parent = p.parent().map(|x| x.to_string_lossy().to_string()).unwrap_or_else(|| ".".into());
+        let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        (parent, name)
+    };
+    let out = Command::new("tar")
+        .arg("czf")
+        .arg(archive)
+        .arg("-C")
+        .arg(&parent)
+        .arg(&name)
+        .output()
+        .map_err(|e| format!("tar spawn failed: {}", e))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(fs::metadata(archive).map(|m| m.len()).unwrap_or(0))
 }
 
 /// Backup an LXC container — tar rootfs + config
@@ -850,16 +1144,16 @@ fn create_backup_entry(target: BackupTarget, storage: &BackupStorage) -> BackupE
     let hostname = local_hostname();
     let comments = backup_comments(&target);
 
-    let (result, docker_config) = match target.target_type {
+    let (result, docker_config, mounts) = match target.target_type {
         BackupTargetType::Docker => {
             match backup_docker(&target.name) {
-                Ok((path, size, config)) => (Ok((path, size)), config),
-                Err(e) => (Err(e), String::new()),
+                Ok((path, size, config, m)) => (Ok((path, size)), config, m),
+                Err(e) => (Err(e), String::new(), Vec::new()),
             }
         }
-        BackupTargetType::Lxc => (backup_lxc(&target.name), String::new()),
-        BackupTargetType::Vm => (backup_vm(&target.name), String::new()),
-        BackupTargetType::Config => (backup_config(), String::new()),
+        BackupTargetType::Lxc => (backup_lxc(&target.name), String::new(), Vec::new()),
+        BackupTargetType::Vm => (backup_vm(&target.name), String::new(), Vec::new()),
+        BackupTargetType::Config => (backup_config(), String::new(), Vec::new()),
     };
 
     match result {
@@ -888,6 +1182,7 @@ fn create_backup_entry(target: BackupTarget, storage: &BackupStorage) -> BackupE
                         comments,
                         node_hostname: hostname,
                         docker_config,
+                        mounts,
                     }
                 },
                 Err(e) => {
@@ -906,6 +1201,7 @@ fn create_backup_entry(target: BackupTarget, storage: &BackupStorage) -> BackupE
                         comments,
                         node_hostname: hostname,
                         docker_config: String::new(),
+                        mounts: Vec::new(),
                     }
                 }
             }
@@ -925,6 +1221,7 @@ fn create_backup_entry(target: BackupTarget, storage: &BackupStorage) -> BackupE
                 comments,
                 node_hostname: hostname,
                 docker_config: String::new(),
+                mounts: Vec::new(),
             }
         }
     }
@@ -1633,10 +1930,9 @@ fn docker_run_args_from_inspect(inspect: &serde_json::Value) -> Vec<String> {
 }
 
 pub fn restore_docker(entry: &BackupEntry, overwrite: bool) -> Result<String, String> {
-
     let container_name = &entry.target.name;
 
-    // Check if a container with this name already exists before downloading
+    // Check if a container with this name already exists before downloading.
     let check = Command::new("docker")
         .args(["container", "inspect", container_name])
         .output();
@@ -1646,43 +1942,161 @@ pub fn restore_docker(entry: &BackupEntry, overwrite: bool) -> Result<String, St
         return Err(format!("CONTAINER_EXISTS:{}", container_name));
     }
 
-    // Use saved docker inspect config from the backup entry
-    let inspect_json = if !entry.docker_config.is_empty() {
-        serde_json::from_str::<serde_json::Value>(&entry.docker_config).ok()
+    // Saved docker inspect from the backup entry — used for restoring the
+    // original `docker run` flags. New-format backups also embed an
+    // inspect.json inside the wrapper tarball; either source works.
+    let mut inspect_json: Option<serde_json::Value> = if !entry.docker_config.is_empty() {
+        serde_json::from_str(&entry.docker_config).ok()
     } else {
         None
     };
 
     let local_path = retrieve_backup(entry)?;
 
-    // Load the image from the tar.gz
-    let output = Command::new("sh")
-        .args(["-c", &format!("gunzip -c '{}' | docker load", local_path.display())])
-        .output()
-        .map_err(|e| format!("Failed to load Docker image: {}", e))?;
+    // Detect format. New v20.11.0+ backups are a wrapper tarball that
+    // contains `inspect.json` + `image.tar.gz` + per-mount tarballs.
+    // Pre-v20.11.0 backups are a flat `docker save | gzip`. Detect by
+    // extracting the outer archive to a temp dir and checking what's
+    // there. If `inspect.json` is present, new format; else fall back
+    // to the legacy `docker load` path so old backups still restore.
+    let work_dir = ensure_staging_dir()?.join(format!("docker-restore-{}", Uuid::new_v4()));
+    fs::create_dir_all(&work_dir).map_err(|e| format!("Failed to create restore work dir: {}", e))?;
 
+    let xt = Command::new("tar")
+        .arg("xzf").arg(&local_path)
+        .arg("-C").arg(&work_dir)
+        .output();
+    let extracted_ok = xt.as_ref().map(|o| o.status.success()).unwrap_or(false);
+
+    let new_format = extracted_ok && work_dir.join("inspect.json").exists();
+    let mut restored_mounts: Vec<String> = Vec::new();
+    let mut skipped_mounts: Vec<String> = Vec::new();
+
+    let image_load_path: PathBuf = if new_format {
+        // Read the wrapper's inspect.json (overrides entry.docker_config
+        // if entry didn't have it for some reason).
+        if inspect_json.is_none() {
+            if let Ok(text) = fs::read_to_string(work_dir.join("inspect.json")) {
+                inspect_json = serde_json::from_str(&text).ok();
+            }
+        }
+
+        // Restore each mount BEFORE creating the container — so when
+        // docker run mounts them, the data's already in place.
+        let mounts_text = fs::read_to_string(work_dir.join("mounts.json")).unwrap_or_default();
+        let mounts: Vec<MountInfo> = serde_json::from_str(&mounts_text).unwrap_or_default();
+        for m in &mounts {
+            if m.archive_path.is_empty() {
+                if !m.skipped_reason.is_empty() {
+                    skipped_mounts.push(format!("{} {} ({})", m.mount_type, m.destination, m.skipped_reason));
+                }
+                continue;
+            }
+            let archive_abs = work_dir.join(&m.archive_path);
+            if !archive_abs.exists() {
+                skipped_mounts.push(format!("{} {} (archive missing inside backup)", m.mount_type, m.destination));
+                continue;
+            }
+            match m.mount_type.as_str() {
+                "volume" => {
+                    if m.source.is_empty() {
+                        skipped_mounts.push(format!("volume {} (no name)", m.destination));
+                        continue;
+                    }
+                    // Idempotent — if the volume already exists docker
+                    // returns its name and we just write into it.
+                    let _ = Command::new("docker").args(["volume", "create", &m.source]).output();
+                    let data_dir = format!("/var/lib/docker/volumes/{}/_data", m.source);
+                    if !Path::new(&data_dir).is_dir() {
+                        skipped_mounts.push(format!("volume {} (data dir not created: {})", m.source, data_dir));
+                        continue;
+                    }
+                    let xv = Command::new("tar")
+                        .arg("xzf").arg(&archive_abs)
+                        .arg("-C").arg(&data_dir)
+                        .output();
+                    match xv {
+                        Ok(o) if o.status.success() => {
+                            restored_mounts.push(format!("volume {}", m.source));
+                        }
+                        Ok(o) => {
+                            skipped_mounts.push(format!("volume {} (extract failed: {})", m.source, String::from_utf8_lossy(&o.stderr).trim()));
+                        }
+                        Err(e) => skipped_mounts.push(format!("volume {} (tar spawn: {})", m.source, e)),
+                    }
+                }
+                "bind" => {
+                    // Ensure parent dir exists; tar can extract into it.
+                    let target = Path::new(&m.source);
+                    if let Some(parent) = target.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    // tar archive_path was created with `tar -C {parent}
+                    // {basename}`, so it contains an entry at the root
+                    // named after the basename. Extract into the parent
+                    // dir so it lands at the original Source path.
+                    let parent = target.parent().map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "/".into());
+                    let xb = Command::new("tar")
+                        .arg("xzf").arg(&archive_abs)
+                        .arg("-C").arg(&parent)
+                        .output();
+                    match xb {
+                        Ok(o) if o.status.success() => {
+                            restored_mounts.push(format!("bind {}", m.source));
+                        }
+                        Ok(o) => {
+                            skipped_mounts.push(format!("bind {} (extract failed: {})", m.source, String::from_utf8_lossy(&o.stderr).trim()));
+                        }
+                        Err(e) => skipped_mounts.push(format!("bind {} (tar spawn: {})", m.source, e)),
+                    }
+                }
+                _ => {
+                    // tmpfs etc. — not archived, nothing to restore.
+                }
+            }
+        }
+
+        work_dir.join("image.tar.gz")
+    } else {
+        // Legacy backup — the file at `local_path` IS the `docker save |
+        // gzip` output. docker load reads it directly.
+        local_path.clone()
+    };
+
+    // Load the image from the (legacy or new-format) tarball.
+    let output = Command::new("sh")
+        .args(["-c", &format!("gunzip -c '{}' | docker load", image_load_path.display())])
+        .output()
+        .map_err(|e| {
+            let _ = fs::remove_dir_all(&work_dir);
+            let _ = fs::remove_file(&local_path);
+            format!("Failed to load Docker image: {}", e)
+        })?;
+
+    // Tarball + work dir done. Clean up.
+    let _ = fs::remove_dir_all(&work_dir);
     let _ = fs::remove_file(&local_path);
 
     if !output.status.success() {
         return Err(format!("Docker load failed: {}", String::from_utf8_lossy(&output.stderr)));
     }
-
     let load_result = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-    // Extract the loaded image name from "Loaded image: <name>"
+    // Extract the loaded image name from "Loaded image: <name>".
     let image_name = load_result
         .lines()
         .find_map(|line| line.strip_prefix("Loaded image: "))
         .unwrap_or(&format!("wolfstack-backup/{}", entry.target.name))
         .to_string();
 
-    // If overwriting, stop and remove the existing container
+    // If overwriting, stop and remove the existing container.
     if exists {
         let _ = Command::new("docker").args(["stop", container_name]).output();
         let _ = Command::new("docker").args(["rm", "-f", container_name]).output();
     }
 
-    // Build docker run args from inspect config, or use defaults
+    // Build docker run args from inspect config, or use defaults.
     let extra_args = inspect_json.as_ref()
         .map(|j| docker_run_args_from_inspect(j))
         .unwrap_or_else(|| vec!["--restart".to_string(), "unless-stopped".to_string()]);
@@ -1703,7 +2117,14 @@ pub fn restore_docker(entry: &BackupEntry, overwrite: bool) -> Result<String, St
     }
 
     let config_note = if inspect_json.is_some() { " (with original config)" } else { " (default config)" };
-    Ok(format!("Docker container '{}' restored and started{}", container_name, config_note))
+    let mut msg = format!("Docker container '{}' restored and started{}", container_name, config_note);
+    if !restored_mounts.is_empty() {
+        msg.push_str(&format!(" — restored data: {}", restored_mounts.join(", ")));
+    }
+    if !skipped_mounts.is_empty() {
+        msg.push_str(&format!(" (skipped: {})", skipped_mounts.join(", ")));
+    }
+    Ok(msg)
 }
 
 /// Restore an LXC container from backup
@@ -1924,12 +2345,22 @@ pub fn create_backup_with_log(
         let comments = backup_comments_with_cluster(t, &cluster);
 
         // Run the backup with line-by-line output for vzdump
-        let (result, docker_config) = match t.target_type {
+        let (result, docker_config, mounts) = match t.target_type {
             BackupTargetType::Docker => {
                 let _ = log.send(format!("  Exporting Docker container '{}'...", t.name));
                 match backup_docker(&t.name) {
-                    Ok((path, size, config)) => (Ok((path, size)), config),
-                    Err(e) => (Err(e), String::new()),
+                    Ok((path, size, config, m)) => {
+                        if !m.is_empty() {
+                            let archived = m.iter().filter(|x| !x.archive_path.is_empty()).count();
+                            let skipped  = m.iter().filter(|x|  x.archive_path.is_empty()).count();
+                            let _ = log.send(format!("  + {} mount(s) captured ({} archived, {} skipped)", m.len(), archived, skipped));
+                            for x in m.iter().filter(|x| !x.skipped_reason.is_empty()) {
+                                let _ = log.send(format!("    skipped {} {}: {}", x.mount_type, x.destination, x.skipped_reason));
+                            }
+                        }
+                        (Ok((path, size)), config, m)
+                    },
+                    Err(e) => (Err(e), String::new(), Vec::new()),
                 }
             }
             BackupTargetType::Lxc => {
@@ -1940,15 +2371,15 @@ pub fn create_backup_with_log(
                     let _ = log.send(format!("  Tarring LXC rootfs for '{}'...", t.name));
                     backup_lxc(&t.name)
                 };
-                (r, String::new())
+                (r, String::new(), Vec::new())
             }
             BackupTargetType::Vm => {
                 let _ = log.send(format!("  Backing up VM '{}'...", t.name));
-                (backup_vm(&t.name), String::new())
+                (backup_vm(&t.name), String::new(), Vec::new())
             }
             BackupTargetType::Config => {
                 let _ = log.send("  Archiving WolfStack config files...".to_string());
-                (backup_config(), String::new())
+                (backup_config(), String::new(), Vec::new())
             }
         };
 
@@ -1983,6 +2414,7 @@ pub fn create_backup_with_log(
                             size_bytes: size, created_at: now, status: BackupStatus::Completed,
                             error: String::new(), schedule_id: String::new(),
                             comments, node_hostname: hostname, docker_config,
+                            mounts: mounts.clone(),
                         }
                     }
                     Err(e) => {
@@ -1993,6 +2425,7 @@ pub fn create_backup_with_log(
                             size_bytes: size, created_at: now, status: BackupStatus::Failed,
                             error: e, schedule_id: String::new(),
                             comments, node_hostname: hostname, docker_config: String::new(),
+                            mounts: Vec::new(),
                         }
                     }
                 }
@@ -2005,6 +2438,7 @@ pub fn create_backup_with_log(
                     status: BackupStatus::Failed, error: e,
                     schedule_id: String::new(), comments, node_hostname: hostname,
                     docker_config: String::new(),
+                    mounts: Vec::new(),
                 }
             }
         };
@@ -2652,6 +3086,7 @@ pub fn import_backup(data: &[u8], filename: &str) -> Result<String, String> {
         comments: format!("[{}] Imported backup: {}", local_cluster_name(), filename),
         node_hostname: local_hostname(),
         docker_config: String::new(),
+        mounts: Vec::new(),
     });
     let _ = save_config(&config);
 

@@ -18652,6 +18652,26 @@ function renderBackupHistory(backups) {
                 ? `<span class="badge" style="background:#ef4444; color:#fff; cursor:help;"${errTitle}>✗ Failed</span>`
                 : '<span class="badge" style="background:#f59e0b; color:#000;">⏳ In Progress</span>';
         const comments = b.comments ? `<div style="font-size:11px; color:var(--text-muted); margin-top:2px;">${escapeHtml(b.comments)}</div>` : '';
+        // Volume / bind-mount summary for Docker backups (v20.11.0+).
+        // Shows what's actually in this backup beyond the container image.
+        let mountsBadge = '';
+        if (Array.isArray(b.mounts) && b.mounts.length > 0) {
+            const archived = b.mounts.filter(m => m.archive_path);
+            const skipped  = b.mounts.filter(m => !m.archive_path);
+            const vols  = archived.filter(m => m.mount_type === 'volume').length;
+            const binds = archived.filter(m => m.mount_type === 'bind').length;
+            const parts = [];
+            if (vols)  parts.push(`${vols} volume${vols === 1 ? '' : 's'}`);
+            if (binds) parts.push(`${binds} bind${binds === 1 ? '' : 's'}`);
+            if (parts.length) {
+                const tip = archived.map(m => `${m.mount_type}: ${m.source} → ${m.destination}`).join('\n');
+                mountsBadge += `<span class="badge" title="${escapeHtml(tip)}" style="background:rgba(59,130,246,0.15); color:#60a5fa; font-size:10px; margin-left:6px;">📦 ${parts.join(' + ')}</span>`;
+            }
+            if (skipped.length) {
+                const tip = skipped.map(m => `${m.mount_type} ${m.destination}: ${m.skipped_reason}`).join('\n');
+                mountsBadge += `<span class="badge" title="${escapeHtml(tip)}" style="background:rgba(245,158,11,0.15); color:#f59e0b; font-size:10px; margin-left:4px;">⚠ ${skipped.length} skipped</span>`;
+            }
+        }
         const nodeLabel = b.node_hostname ? `<span style="font-size:11px; color:var(--text-muted);">${escapeHtml(b.node_hostname)}</span>` : '';
         // Failed rows expose the error inline so operators don't have
         // to read backups.json to know what went wrong. Long errors
@@ -18667,7 +18687,7 @@ function renderBackupHistory(backups) {
             : '';
 
         return `<tr>
-            <td>${typeEmoji} ${escapeHtml(targetName)}${specsNote}${comments}${errCell}</td>
+            <td>${typeEmoji} ${escapeHtml(targetName)}${mountsBadge}${specsNote}${comments}${errCell}</td>
             <td>${typeName}</td>
             <td>${nodeLabel}</td>
             <td>${escapeHtml(storageLabel)}</td>
