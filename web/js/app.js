@@ -581,7 +581,7 @@ async function installAllIconPacks() {
 
 /// Remove a custom-installed icon pack
 async function removeIconPack(packId) {
-    if (!confirm(`Remove icon pack "${packId}"?`)) return;
+    if (!(await showConfirm(`Remove icon pack "${packId}"?`, 'Remove icon pack'))) return;
     try {
         const resp = await fetch(`/api/icon-packs/${encodeURIComponent(packId)}`, { method: 'DELETE' });
         const data = await resp.json();
@@ -620,7 +620,12 @@ function renderBookmarks() {
     if (!el) return;
     const bookmarks = loadBookmarks();
     if (bookmarks.length === 0) {
-        el.innerHTML = '<div style="color:var(--text-muted); font-size:13px; padding:20px; text-align:center; width:100%;">No bookmarks yet. Click <b>+ Add</b> to save your favourite links.</div>';
+        el.innerHTML = renderEmptyState({
+            icon: '🔖',
+            title: 'No bookmarks yet',
+            body: 'Save the URLs you visit most so they land one click from the dashboard.',
+            action: { label: '+ Add bookmark', onclick: 'showAddBookmarkModal()' },
+        });
         return;
     }
     el.innerHTML = bookmarks.map((b, i) => {
@@ -1160,6 +1165,396 @@ function hidePageLoadingOverlay(pageEl) {
     }
 }
 
+// ─── Skeleton loaders — replace "Loading..." text screens ───
+//
+// Skeletons mirror the eventual layout so there's no jump on hydration.
+// Pulse animation is keyframe-injected once on first call so we don't depend
+// on stylesheet load order. Theme-safe — uses --bg-card-hover & --border-color.
+//
+// Use renderTableSkeleton(rows, cols) for tables; renderBlockSkeleton(opts)
+// for cards, lists, paragraphs.
+function _ensureSkeletonStyles() {
+    if (document.getElementById('wolfstack-skel-style')) return;
+    const s = document.createElement('style');
+    s.id = 'wolfstack-skel-style';
+    s.textContent = '@keyframes wsSkelPulse{0%,100%{opacity:0.55}50%{opacity:1}}'
+        + '.ws-skel{background:var(--bg-card-hover,#1f2545);border-radius:6px;'
+        + 'animation:wsSkelPulse 1.4s ease-in-out infinite}';
+    document.head.appendChild(s);
+}
+
+function renderTableSkeleton(rows, cols) {
+    _ensureSkeletonStyles();
+    rows = Math.max(1, parseInt(rows, 10) || 5);
+    cols = Math.max(1, parseInt(cols, 10) || 4);
+    let html = '';
+    for (let r = 0; r < rows; r++) {
+        html += '<tr>';
+        for (let c = 0; c < cols; c++) {
+            const w = 40 + Math.floor(Math.random() * 50);
+            html += '<td style="padding:10px 12px"><div class="ws-skel" style="height:14px;width:' + w + '%"></div></td>';
+        }
+        html += '</tr>';
+    }
+    return html;
+}
+
+function renderBlockSkeleton(opts) {
+    _ensureSkeletonStyles();
+    opts = opts || {};
+    const lines = Math.max(1, parseInt(opts.lines, 10) || 3);
+    const padding = opts.padding || '16px';
+    let html = '<div style="padding:' + padding + '">';
+    for (let i = 0; i < lines; i++) {
+        const w = 40 + Math.floor(Math.random() * 50);
+        const mb = (i === lines - 1) ? '0' : '10px';
+        html += '<div class="ws-skel" style="height:14px;width:' + w + '%;margin-bottom:' + mb + '"></div>';
+    }
+    html += '</div>';
+    return html;
+}
+
+// Convenience for the very common "centred loading text in a div" pattern.
+// Drop-in replacement for: el.innerHTML = renderBlockSkeleton({lines:3});
+function renderLoadingBlock(message, lines) {
+    return renderBlockSkeleton({ lines: lines || 3 });
+}
+
+// ─── Empty state — documentation with a CTA ───
+//
+// Three tones:
+//   default  — first-use ("you haven't created any X yet")
+//   filtered — search/filter returned nothing ("no matches for ...")
+//   error    — couldn't load
+//
+// Usage:
+//   el.innerHTML = renderEmptyState({
+//       icon: '📦', title: 'No backup jobs configured',
+//       body: 'Backups protect your VMs against host failure.',
+//       action: { label: 'Create your first backup', onclick: 'showBackupCreate()' },
+//   });
+function renderEmptyState(opts) {
+    opts = opts || {};
+    const tone = opts.tone || 'default';
+    const icon = opts.icon || (tone === 'error' ? '⚠️' : tone === 'filtered' ? '🔍' : '📭');
+    const title = opts.title || (tone === 'error' ? 'Couldn’t load' : tone === 'filtered' ? 'No matches' : 'Nothing here yet');
+    const body = opts.body || '';
+    const action = opts.action; // {label, onclick} or {label, href}
+    const accent = tone === 'error' ? '#f87171' : tone === 'filtered' ? '#60a5fa' : 'var(--text-secondary,#a1a1aa)';
+    let actionHtml = '';
+    if (action && action.label) {
+        const click = action.onclick ? ' onclick="' + action.onclick.replace(/"/g, '&quot;') + '"' : '';
+        const href = action.href ? ' href="' + action.href.replace(/"/g, '&quot;') + '"' : '';
+        const tag = action.href ? 'a' : 'button';
+        actionHtml = '<' + tag + ' class="btn btn-primary" style="margin-top:14px;padding:8px 18px"' + click + href + '>'
+            + escapeHtmlSafe(action.label) + '</' + tag + '>';
+    }
+    return '<div style="text-align:center;padding:36px 18px;color:var(--text-muted,#9ca3af)">'
+        + '<div style="font-size:42px;margin-bottom:10px;line-height:1">' + icon + '</div>'
+        + '<div style="font-size:15px;font-weight:600;color:' + accent + ';margin-bottom:6px">' + escapeHtmlSafe(title) + '</div>'
+        + (body ? '<div style="font-size:13px;line-height:1.55;max-width:420px;margin:0 auto">' + escapeHtmlSafe(body) + '</div>' : '')
+        + actionHtml
+        + '</div>';
+}
+
+// Local escape — uses page's escapeHtml() if present, falls back otherwise.
+// Kept in one place so renderEmptyState/renderEquivalentCli are self-sufficient
+// even if loaded before the rest of the file.
+function escapeHtmlSafe(s) {
+    if (typeof escapeHtml === 'function') return escapeHtml(String(s == null ? '' : s));
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', '\'': '&#39;' }[c];
+    });
+}
+
+// ─── Last-updated freshness badge ───
+//
+// Wraps a panel and shows "Updated 32s ago". Pauses ticking when the tab is
+// backgrounded (saves CPU). On hard failure call markLastUpdatedStale(el)
+// which dims the data and shows a banner.
+//
+// Usage:
+//   const tick = attachLastUpdated(panelEl);  // returns a function
+//   tick();   // call after every successful refresh
+//   markLastUpdatedStale(panelEl, 'Connection lost');
+function attachLastUpdated(el) {
+    if (!el) return function () {};
+    let badge = el.querySelector(':scope > .ws-last-updated');
+    if (!badge) {
+        badge = document.createElement('div');
+        badge.className = 'ws-last-updated';
+        badge.style.cssText = 'position:absolute;top:6px;right:10px;font-size:11px;color:var(--text-muted,#9ca3af);z-index:5;pointer-events:none;';
+        if (getComputedStyle(el).position === 'static') el.style.position = 'relative';
+        el.appendChild(badge);
+    }
+    // Store the "last updated" timestamp ON the element rather than in a closure.
+    // Prior version put lastTs in closure scope, which broke when callers
+    // re-invoked attachLastUpdated() — the existing interval kept reading the
+    // first call's lastTs (always 0) instead of the latest call's, so the badge
+    // oscillated between "just now" and blank. Element-storage fixes that.
+    function paint() {
+        const ts = el._wsLastUpdatedTs || 0;
+        if (!ts) { badge.textContent = ''; return; }
+        const secs = Math.floor((Date.now() - ts) / 1000);
+        if (secs < 5) badge.textContent = 'just now';
+        else if (secs < 60) badge.textContent = secs + 's ago';
+        else if (secs < 3600) badge.textContent = Math.floor(secs / 60) + 'm ago';
+        else badge.textContent = Math.floor(secs / 3600) + 'h ago';
+    }
+    function tick() {
+        el._wsLastUpdatedTs = Date.now();
+        el.classList.remove('ws-stale');
+        paint();
+    }
+    el._wsLastUpdatedPaint = paint;
+    if (!el._wsLastUpdatedTimer) {
+        el._wsLastUpdatedTimer = setInterval(function () {
+            if (document.visibilityState === 'hidden') return;
+            // Always read the freshest paint — supports any future replacement.
+            (el._wsLastUpdatedPaint || paint)();
+        }, 1000);
+    }
+    return tick;
+}
+
+function markLastUpdatedStale(el, reason) {
+    if (!el) return;
+    el.classList.add('ws-stale');
+    let banner = el.querySelector(':scope > .ws-stale-banner');
+    if (!banner) {
+        banner = document.createElement('div');
+        banner.className = 'ws-stale-banner';
+        banner.style.cssText = 'position:absolute;top:0;left:0;right:0;background:rgba(251,191,36,0.15);border-bottom:1px solid rgba(251,191,36,0.4);color:#fbbf24;font-size:12px;padding:6px 12px;z-index:6;text-align:center;';
+        if (getComputedStyle(el).position === 'static') el.style.position = 'relative';
+        el.insertBefore(banner, el.firstChild);
+    }
+    banner.textContent = reason || 'Connection lost — showing last known data';
+}
+
+function clearLastUpdatedStale(el) {
+    if (!el) return;
+    el.classList.remove('ws-stale');
+    const banner = el.querySelector(':scope > .ws-stale-banner');
+    if (banner) banner.remove();
+}
+
+// ─── Equivalent CLI / API panel — collapsible "show me the curl" ───
+//
+// Sysadmins want to script later. Drop this near a create-form so they can
+// see and copy the equivalent curl/CLI command. Doesn't try to be smart —
+// you pass the command as a string.
+//
+// Usage:
+//   container.insertAdjacentHTML('beforeend',
+//       renderEquivalentCli({ curl: 'curl -X POST ...', cli: 'wolfstack vm create ...' }));
+function renderEquivalentCli(opts) {
+    opts = opts || {};
+    const blocks = [];
+    if (opts.curl)  blocks.push({ label: 'curl', code: opts.curl });
+    if (opts.cli)   blocks.push({ label: 'CLI',  code: opts.cli });
+    if (opts.api)   blocks.push({ label: 'API',  code: opts.api });
+    if (opts.yaml)  blocks.push({ label: 'YAML', code: opts.yaml });
+    if (!blocks.length) return '';
+    const id = 'eqcli-' + Math.random().toString(36).slice(2, 8);
+    let inner = '';
+    for (let i = 0; i < blocks.length; i++) {
+        const b = blocks[i];
+        inner += '<div style="margin-top:' + (i ? '10px' : '0') + '">'
+            + '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">'
+            + '<div style="font-size:11px;font-weight:600;color:var(--text-muted,#9ca3af);text-transform:uppercase;letter-spacing:0.5px">' + escapeHtmlSafe(b.label) + '</div>'
+            + '<button type="button" class="btn btn-sm" style="padding:2px 8px;font-size:11px" onclick="(function(b){navigator.clipboard.writeText(b.dataset.code).then(function(){if(typeof showToast===\'function\')showToast(\'Copied to clipboard\',\'success\',1500)})})(this.parentElement.nextElementSibling)">Copy</button>'
+            + '</div>'
+            + '<pre data-code="' + escapeHtmlSafe(b.code) + '" style="background:var(--bg-input,#0d1225);border:1px solid var(--border-color,#2d2f3a);border-radius:6px;padding:10px 12px;font-family:ui-monospace,Menlo,monospace;font-size:12px;line-height:1.5;color:var(--text-secondary,#a1a1aa);white-space:pre-wrap;word-break:break-all;margin:0;overflow-x:auto">' + escapeHtmlSafe(b.code) + '</pre>'
+            + '</div>';
+    }
+    return '<details id="' + id + '" style="margin-top:14px;border:1px solid var(--border-color,#2d2f3a);border-radius:8px;background:var(--bg-card,#1a1f35)">'
+        + '<summary style="padding:10px 14px;cursor:pointer;user-select:none;font-size:13px;font-weight:500;color:var(--text-secondary,#a1a1aa);list-style:none">'
+        + '<span style="margin-right:6px">▶</span>Show equivalent ' + blocks.map(function (b) { return b.label; }).join(' / ') + '</summary>'
+        + '<div style="padding:12px 14px;border-top:1px solid var(--border-color,#2d2f3a)">' + inner + '</div>'
+        + '</details>';
+}
+
+// ─── Status pill — colour + icon + label, never colour-only (WCAG 1.4.1) ───
+//
+// Tones (operations-UI convention):
+//   ok        — green   — running, healthy, online, paid
+//   warn      — amber   — degraded, needs review (still working)
+//   danger    — red     — down, failed, errored, overdue
+//   info      — blue    — in-progress, busy, pending action (NEVER amber for in-progress)
+//   neutral   — grey    — unknown, unreachable, paused, draft
+//
+// Usage:
+//   renderStatusPill({ tone: 'ok', label: 'Running' })
+//   renderStatusPill({ tone: 'danger', label: 'Failed', icon: '✗' })
+//
+// Helper renderRunningStatusPill() picks tone from a common status string.
+function renderStatusPill(opts) {
+    opts = opts || {};
+    const tone = opts.tone || 'neutral';
+    const palette = {
+        ok:      { bg: 'rgba(34,197,94,0.15)',  fg: '#22c55e', icon: '●' },
+        warn:    { bg: 'rgba(251,191,36,0.15)', fg: '#fbbf24', icon: '▲' },
+        danger:  { bg: 'rgba(239,68,68,0.15)',  fg: '#ef4444', icon: '✗' },
+        info:    { bg: 'rgba(59,130,246,0.15)', fg: '#60a5fa', icon: '◔' },
+        neutral: { bg: 'rgba(156,163,175,0.15)', fg: '#9ca3af', icon: '○' },
+    };
+    const p = palette[tone] || palette.neutral;
+    const icon = opts.icon != null ? opts.icon : p.icon;
+    const label = opts.label || tone;
+    return '<span class="ws-status-pill ws-status-' + tone + '" '
+        + 'style="display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;'
+        + 'background:' + p.bg + ';color:' + p.fg + ';font-size:11px;font-weight:600;line-height:1.4;">'
+        + '<span aria-hidden="true" style="font-size:9px;line-height:1;">' + icon + '</span>'
+        + '<span>' + escapeHtmlSafe(label) + '</span>'
+        + '</span>';
+}
+
+// Convenience — common "running/stopped/failed/..." string → pill
+function renderRunningStatusPill(status) {
+    const s = String(status || '').toLowerCase();
+    if (s === 'running' || s === 'active' || s === 'healthy' || s === 'online' || s === 'up' || s === 'ok' || s === 'ready')
+        return renderStatusPill({ tone: 'ok', label: status || 'Running' });
+    if (s === 'stopped' || s === 'inactive' || s === 'offline' || s === 'down' || s === 'paused' || s === 'exited')
+        return renderStatusPill({ tone: 'neutral', label: status || 'Stopped' });
+    if (s === 'failed' || s === 'error' || s === 'errored' || s === 'crashed' || s === 'dead')
+        return renderStatusPill({ tone: 'danger', label: status || 'Failed' });
+    if (s === 'degraded' || s === 'warning' || s === 'unhealthy' || s === 'limited' || s === 'partial')
+        return renderStatusPill({ tone: 'warn', label: status || 'Degraded' });
+    if (s === 'starting' || s === 'restarting' || s === 'pending' || s === 'creating' || s === 'migrating' || s === 'busy')
+        return renderStatusPill({ tone: 'info', label: status || 'In progress' });
+    if (s === 'unknown' || s === 'unreachable' || !s)
+        return renderStatusPill({ tone: 'neutral', label: status || 'Unknown' });
+    return renderStatusPill({ tone: 'neutral', label: status });
+}
+
+// ─── Cluster-scope pill in the top bar ───
+//
+// Sits next to the page title and shows the current scope. Updates whenever
+// currentNodeId changes (call updateClusterPill() from selectServerView etc.).
+// Defends against cross-cluster mistakes — the user can always see whose
+// resources they're about to act on.
+function mountClusterPill() {
+    if (document.getElementById('ws-cluster-pill')) return;
+    const title = document.getElementById('page-title');
+    if (!title || !title.parentElement) return;
+    const pill = document.createElement('span');
+    pill.id = 'ws-cluster-pill';
+    pill.style.cssText = 'display:none;align-items:center;gap:6px;margin-left:14px;padding:4px 12px;border-radius:999px;'
+        + 'font-size:11px;font-weight:600;letter-spacing:0.2px;'
+        + 'background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.35);color:#a5b4fc;cursor:default;';
+    pill.title = 'Current scope — actions on this page apply here';
+    title.parentElement.appendChild(pill);
+    updateClusterPill();
+}
+
+function updateClusterPill() {
+    const pill = document.getElementById('ws-cluster-pill');
+    if (!pill) return;
+    let cluster = '', node = '';
+    try {
+        if (typeof currentNodeId !== 'undefined' && currentNodeId
+            && typeof allNodes !== 'undefined' && Array.isArray(allNodes)) {
+            const n = allNodes.find(x => x.id === currentNodeId);
+            if (n) {
+                cluster = n.cluster_name || n.pve_cluster_name || '';
+                node = n.hostname || n.address || '';
+            }
+        }
+    } catch (_) {}
+    if (!cluster && !node) {
+        pill.style.display = 'none';
+        return;
+    }
+    pill.style.display = 'inline-flex';
+    pill.innerHTML = '<span aria-hidden="true" style="opacity:0.8;">⌂</span>'
+        + (cluster ? '<span>' + escapeHtmlSafe(cluster) + '</span>' : '')
+        + (cluster && node ? '<span style="opacity:0.5;">›</span>' : '')
+        + (node ? '<span style="opacity:0.85;">' + escapeHtmlSafe(node) + '</span>' : '');
+}
+
+// ─── Trust-signal footer — version, identity, last-checked ───
+//
+// Permanent thin strip at the bottom of the page. Surfaces the things ops
+// people want to see without going hunting:
+//   • WolfStack version
+//   • Logged-in user
+//   • Last update-check timestamp
+//
+// Only mounted on the main app pages — login.html etc. don't need it.
+let _wsTrustFooterEl = null;
+function mountTrustFooter() {
+    if (_wsTrustFooterEl) return;
+    const f = document.createElement('div');
+    f.id = 'ws-trust-footer';
+    f.style.cssText = 'position:fixed;bottom:0;left:0;right:0;z-index:90;'
+        + 'background:var(--bg-secondary,#111827);border-top:1px solid var(--border-color,#2d2f3a);'
+        + 'color:var(--text-muted,#9ca3af);font-size:11px;line-height:1.4;'
+        + 'padding:4px 14px;display:flex;align-items:center;gap:14px;justify-content:space-between;'
+        + 'pointer-events:auto;font-family:inherit;';
+    f.innerHTML = '<div id="ws-trust-left" style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">'
+        + '<span><strong style="color:var(--text-secondary,#cbd5e1);">WolfStack</strong> '
+        + '<span id="ws-trust-version">…</span></span>'
+        + '<span id="ws-trust-user" style="display:none;">as <strong style="color:var(--text-secondary,#cbd5e1);" id="ws-trust-user-name"></strong></span>'
+        + '</div>'
+        + '<div id="ws-trust-right" style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">'
+        + '<span id="ws-trust-checked" style="display:none;">checked <span id="ws-trust-checked-time">…</span></span>'
+        + '</div>';
+    document.body.appendChild(f);
+    _wsTrustFooterEl = f;
+    // Make sure the existing task-log footer doesn't sit ON the trust footer.
+    // The task log sits at bottom:0 with z-index 150 — push the trust footer
+    // when the task log is open. Simplest: leave the trust footer at z-index:90
+    // and bottom:0; when task log opens, hide the trust footer.
+    document.body.style.paddingBottom = '24px';
+    refreshTrustFooter();
+}
+
+async function refreshTrustFooter() {
+    if (!_wsTrustFooterEl) return;
+    try {
+        const r = await fetch('/api/auth/smtp-configured');
+        if (r.ok) {
+            const d = await r.json();
+            if (d.version) {
+                const v = document.getElementById('ws-trust-version');
+                if (v) v.textContent = 'v' + d.version;
+            }
+        }
+    } catch (_) {}
+    try {
+        const r = await fetch('/api/auth/check');
+        if (r.ok) {
+            const d = await r.json();
+            if (d.authenticated && d.username) {
+                const wrap = document.getElementById('ws-trust-user');
+                const name = document.getElementById('ws-trust-user-name');
+                if (wrap && name) {
+                    name.textContent = d.username;
+                    wrap.style.display = '';
+                }
+            }
+        }
+    } catch (_) {}
+}
+
+function setTrustFooterChecked(label) {
+    const wrap = document.getElementById('ws-trust-checked');
+    const t = document.getElementById('ws-trust-checked-time');
+    if (wrap && t) {
+        t.textContent = label || 'just now';
+        wrap.style.display = '';
+    }
+}
+
+// Hide trust footer when the task log is open (avoid double-stacking footers).
+function _wsSyncTrustFooterVisibility() {
+    if (!_wsTrustFooterEl) return;
+    const tl = document.getElementById('task-log-footer');
+    const tlVisible = tl && tl.style.display !== 'none' && getComputedStyle(tl).display !== 'none';
+    _wsTrustFooterEl.style.display = tlVisible ? 'none' : 'flex';
+    document.body.style.paddingBottom = tlVisible ? '0' : '24px';
+}
+
 // ─── API URL helper — route through proxy for remote nodes ───
 function apiUrl(path) {
     if (!currentNodeId) return path; // datacenter view
@@ -1203,6 +1598,7 @@ function selectView(page) {
     closeSidebarMobile();
     currentPage = page;
     currentNodeId = null;
+    try { updateClusterPill(); } catch (_) {}
 
     document.querySelectorAll('.page-view').forEach(p => p.style.display = 'none');
     const el = document.getElementById(`page-${page}`);
@@ -1268,6 +1664,7 @@ function selectServerView(nodeId, view) {
     if (nodeId !== currentNodeId) _physicalInterfacesCache = null; // reset NIC cache on node switch
     currentNodeId = nodeId;
     currentPage = view;
+    try { updateClusterPill(); } catch (_) {}
 
     const node = allNodes.find(n => n.id === nodeId);
     const hostname = node ? node.hostname : nodeId;
@@ -1410,7 +1807,7 @@ function buildServerTree(nodes) {
     if (!tree) return;
 
     if (nodes.length === 0) {
-        tree.innerHTML = '<div style="padding: 8px 16px; color: var(--text-muted); font-size: 12px;">No servers yet. Click + Add Server.</div>';
+        tree.innerHTML = renderEmptyState({ title: 'No servers yet', body: 'Click + Add Server.' });
         return;
     }
 
@@ -1741,7 +2138,12 @@ function renderDatacenterOverview() {
 
     const container = document.getElementById('datacenter-servers');
     if (nodes.length === 0) {
-        container.innerHTML = '<div style="text-align:center; color:var(--text-muted); padding:40px; grid-column:1/-1;">No servers added yet. Click <strong>+ Add Server</strong> in the sidebar.</div>';
+        container.innerHTML = '<div style="grid-column:1/-1;">' + renderEmptyState({
+            icon: '🖥️',
+            title: 'No servers in this datacenter yet',
+            body: 'A server is any Linux host running WolfStack — local or remote. Add one to start managing it from here.',
+            action: { label: '+ Add server', onclick: 'openAddServerModal()' },
+        }) + '</div>';
         return;
     }
 
@@ -1924,6 +2326,15 @@ function renderDatacenterOverview() {
 
     // Initialize Map + Bookmarks
     setTimeout(() => { updateMap(nodes); applyMapCollapse(); renderBookmarks(); }, 100);
+
+    // Surface freshness — sysadmins want to know if the dashboard is current.
+    // attachLastUpdated paints "Updated 32s ago" in the corner and self-ticks
+    // until visibility changes. tick() resets the clock on every successful
+    // render. On poll failure, callers should hit markLastUpdatedStale().
+    try {
+        const tick = attachLastUpdated(container);
+        tick();
+    } catch (_) {}
 }
 
 // ─── Sparkline mini-charts for datacenter cards ───
@@ -2589,7 +3000,13 @@ function renderProcessTable(tableId, procs, type) {
 }
 
 async function killProcess(pid, name) {
-    if (!confirm('Kill process ' + name + ' (PID ' + pid + ')?')) return;
+    if (!(await showDangerConfirm({
+        title: 'Kill process ' + name + '?',
+        danger: 'PID ' + pid + ' will be sent SIGKILL — it cannot save state or shut down cleanly.',
+        detail: 'If this is a system service, killing it may affect dependent processes. Use the service manager for graceful stops.',
+        countdown: 3,
+        confirmLabel: 'Kill process',
+    }))) return;
     try {
         const resp = await fetch(apiUrl('/api/metrics/processes/' + pid + '/kill'), { method: 'POST' });
         const data = await resp.json();
@@ -2597,10 +3014,10 @@ async function killProcess(pid, name) {
             taskLog('Killed process ' + name + ' (PID ' + pid + ')');
             fetchTopProcesses();
         } else {
-            alert('Failed to kill process: ' + (data.error || 'Unknown error'));
+            showToast('Failed to kill process: ' + (data.error || 'Unknown error'), 'error');
         }
     } catch(e) {
-        alert('Failed to kill process: ' + e.message);
+        showToast('Failed to kill process: ' + e.message, 'error');
     }
 }
 
@@ -2684,7 +3101,7 @@ function renderSystemdServices(tbody, services) {
 }
 
 async function serviceAction(name, action, btn) {
-    if (action === 'stop' && !confirm('Stop service ' + name + '?')) return;
+    if (action === 'stop' && !(await showConfirm('Stop service ' + name + '?', 'Stop service'))) return;
 
     // Show spinner on button
     const origHtml = btn.innerHTML;
@@ -3570,7 +3987,7 @@ function renderVms(vms) {
                     : ((vm.vnc_ws_port || vm.vnc_port) ? `<button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="openVmVnc('${vm.name}', ${vm.vnc_ws_port || vm.vnc_port})" title="VNC Console">🖥️</button>` : '')}
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="openVmConsole('${vm.name}')" title="Serial terminal (guest must have serial console enabled)">💻</button>
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#ef4444;" onclick="vmAction('${vm.name}', 'stop', this)" title="Stop (graceful ACPI shutdown)">⏹️</button>
-                         <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#b91c1c;" onclick="if (confirm('Force-stop ${vm.name}? The guest will not shut down cleanly — unsaved data may be lost.')) vmAction('${vm.name}', 'force-stop', this)" title="Force Stop (power off immediately)">⛔</button>` :
+                         <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#b91c1c;" onclick="vmForceStopConfirm('${vm.name}', this)" title="Force Stop (power off immediately)">⛔</button>` :
                 `<button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="showVmSettings('${vm.name}')" title="Settings">⚙️</button>
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#3b82f6;" onclick="migrateVm('${vm.name}')" title="Migrate to another node">🚀</button>
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#8b5cf6;" onclick="migrateVmDiskStorage('${vm.name}')" title="Move disk to different storage (same node)">💾</button>
@@ -5172,7 +5589,7 @@ async function bulkDeleteFiles() {
 async function bulkChmod() {
     const paths = getSelectedFiles();
     if (paths.length === 0) return;
-    const mode = prompt(`Set permissions for ${paths.length} item(s):\n\nExamples: 755, 644, u+x, go-w`, '644');
+    const mode = await showPrompt(`Set permissions for ${paths.length} item(s):\n\nExamples: 755, 644, u+x, go-w`, 'Change permissions', '644');
     if (!mode) return;
     try {
         const resp = await fetch(apiUrl('/api/files/chmod'), {
@@ -5196,7 +5613,7 @@ async function bulkChmod() {
 }
 
 async function changePermissions(path) {
-    const mode = prompt(`Set permissions for this item:\n\nExamples: 755, 644, u+x, go-w`, '644');
+    const mode = await showPrompt(`Set permissions for this item:\n\nExamples: 755, 644, u+x, go-w`, 'Change permissions', '644');
     if (!mode) return;
     try {
         const resp = await fetch(apiUrl('/api/files/chmod'), {
@@ -5319,7 +5736,7 @@ async function deleteFile(path, name) {
 }
 
 async function renameFile(path, oldName) {
-    const newName = prompt(`Rename '${oldName}' to:`, oldName);
+    const newName = await showPrompt(`Rename '${oldName}' to:`, 'Rename', oldName);
     if (!newName || newName === oldName) return;
     const parentDir = path.substring(0, path.lastIndexOf('/'));
     const newPath = parentDir + '/' + newName;
@@ -5354,8 +5771,8 @@ async function renameFile(path, oldName) {
     } catch (e) { showToast(`Failed: ${e.message}`, 'error'); }
 }
 
-function showNewFolderModal() {
-    const name = prompt('Enter folder name:');
+async function showNewFolderModal() {
+    const name = await showPrompt('Enter folder name:', 'New folder', '');
     if (!name) return;
     createNewFolder(name);
 }
@@ -5578,14 +5995,14 @@ async function expandZfsPool(pool) {
     const detailSection = document.getElementById('zfs-detail-section');
     if (!detailSection) return;
 
-    detailSection.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">Loading datasets...</div>';
+    detailSection.innerHTML = renderBlockSkeleton({lines:3});
 
     try {
         const resp = await fetch(apiUrl(`/api/storage/zfs/datasets?pool=${encodeURIComponent(pool)}`));
         const datasets = await resp.json();
 
         if (!Array.isArray(datasets) || datasets.length === 0) {
-            detailSection.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">No datasets found</div>';
+            detailSection.innerHTML = renderEmptyState({ title: 'No datasets found' });
             return;
         }
 
@@ -5622,7 +6039,7 @@ async function showZfsSnapshots(pool) {
     const detailSection = document.getElementById('zfs-detail-section');
     if (!detailSection) return;
 
-    detailSection.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">Loading snapshots...</div>';
+    detailSection.innerHTML = renderBlockSkeleton({lines:3});
 
     try {
         const resp = await fetch(apiUrl(`/api/storage/zfs/snapshots?dataset=${encodeURIComponent(pool)}`));
@@ -5738,7 +6155,7 @@ async function showZfsPoolStatus(pool) {
     const detailSection = document.getElementById('zfs-detail-section');
     if (!detailSection) return;
 
-    detailSection.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">Loading pool status...</div>';
+    detailSection.innerHTML = renderBlockSkeleton({lines:3});
 
     try {
         const resp = await fetch(apiUrl(`/api/storage/zfs/pool/status?pool=${encodeURIComponent(pool)}`));
@@ -5768,7 +6185,7 @@ async function showZfsPoolIostat(pool) {
     const detailSection = document.getElementById('zfs-detail-section');
     if (!detailSection) return;
 
-    detailSection.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">Loading IO stats...</div>';
+    detailSection.innerHTML = renderBlockSkeleton({lines:3});
 
     try {
         const resp = await fetch(apiUrl(`/api/storage/zfs/pool/iostat?pool=${encodeURIComponent(pool)}`));
@@ -5799,7 +6216,7 @@ async function showZfsPoolIostat(pool) {
 async function loadDiskInfo() {
     const tbody = document.getElementById('disk-info-tbody');
     if (!tbody) return;
-    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center; color:var(--text-muted); padding:20px;">Loading…</td></tr>';
+    tbody.innerHTML = renderTableSkeleton(5, 9);
     try {
         const resp = await fetch(apiUrl('/api/storage/disk-info'));
         if (!resp.ok) throw new Error(await resp.text());
@@ -6417,7 +6834,68 @@ async function showVmCreate() {
     }
     // Reset to tab 1
     switchVmTab(1);
+    // Inject (once) the "Show equivalent curl" panel into the modal footer.
+    // Sysadmins want to see and copy the API call so they can script it
+    // later — Lens and Google Cloud Console both do this.
+    try { _injectNewVmEquivalentCli(); } catch (_) {}
     document.getElementById('create-vm-modal').classList.add('active');
+}
+
+// Inject the equivalent-CLI <details> panel inside the create-vm modal.
+// Idempotent — only mounts once per page lifetime; updates on expand.
+function _injectNewVmEquivalentCli() {
+    const modal = document.getElementById('create-vm-modal');
+    if (!modal) return;
+    if (modal.querySelector('#new-vm-equivalent-cli')) return;
+    const footer = modal.querySelector('.modal-footer');
+    if (!footer) return;
+    const wrap = document.createElement('div');
+    wrap.id = 'new-vm-equivalent-cli';
+    wrap.style.cssText = 'padding:0 24px 12px 24px;';
+    footer.parentElement.insertBefore(wrap, footer);
+
+    // Refresh strategy: rewriting wrap.innerHTML on every input would collapse
+    // the <details> panel (since the new <details> defaults to closed). To
+    // preserve user intent we render once, then on subsequent calls only
+    // update the <pre> contents and the open state — never rewrite the shell.
+    function render() {
+        wrap.innerHTML = renderEquivalentCli({ curl: _buildNewVmCurl() });
+    }
+    function update() {
+        const pre = wrap.querySelector('pre[data-code]');
+        if (!pre) { render(); return; }
+        const curl = _buildNewVmCurl();
+        pre.dataset.code = curl;
+        pre.textContent = curl;
+    }
+    render();
+    modal.addEventListener('change', update);
+    modal.addEventListener('input', update);
+}
+
+// Build the curl command equivalent of the current "Create VM" form state.
+// Mirrors createVm()'s POST to /api/vms/create.
+function _buildNewVmCurl() {
+    const v = (id) => (document.getElementById(id) || {}).value || '';
+    const name = v('new-vm-name').trim() || '<vm-name>';
+    const body = {
+        name: name,
+        cpus: parseInt(v('new-vm-cpus'), 10) || 2,
+        memory_mb: parseInt(v('new-vm-memory'), 10) || 2048,
+        disk_size_gb: parseInt(v('new-vm-disk'), 10) || 20,
+        iso_path: v('new-vm-iso').trim() || null,
+        wolfnet_ip: v('new-vm-wolfnet-ip').trim() || null,
+        storage_path: v('new-vm-storage') || null,
+        os_disk_bus: v('new-vm-os-bus') || 'virtio',
+        net_model: v('new-vm-net-model') || 'virtio',
+        bios_type: v('new-vm-bios-type') || 'seabios',
+    };
+    const json = JSON.stringify(body, null, 2)
+        .split('\n').map((l, i) => i === 0 ? l : '       ' + l).join('\n');
+    return "curl -sS -X POST 'https://localhost:8553/api/vms/create' \\\n"
+        + "  -H 'Content-Type: application/json' \\\n"
+        + "  --cookie wolfstack_session=YOUR_SESSION \\\n"
+        + "  -d '" + json + "'";
 }
 
 // Auto-detect Windows ISO and set disk bus to IDE + net model to e1000
@@ -6686,6 +7164,20 @@ async function createVm() {
     }
 }
 
+// Wrapper used by force-stop buttons: prompts via showDangerConfirm before
+// calling vmAction. Replaces inline `onclick="if (confirm(...)) vmAction(...)"`
+// strings, which otherwise embed a native browser dialog.
+async function vmForceStopConfirm(name, btn) {
+    if (!(await showDangerConfirm({
+        title: 'Force-stop VM "' + name + '"?',
+        danger: 'The guest will be powered off immediately — it will not shut down cleanly.',
+        detail: 'Unsaved data inside the VM may be lost. Filesystems may need to fsck on next boot. Use this only when a clean stop is unresponsive.',
+        countdown: 3,
+        confirmLabel: 'Force stop',
+    }))) return;
+    return vmAction(name, 'force-stop', btn);
+}
+
 async function vmAction(name, action, btn) {
     activityStart();
     const row = btn?.closest('tr');
@@ -6824,7 +7316,7 @@ async function loadCertificates() {
 async function loadCronJobs() {
     var container = document.getElementById('cron-entries-container');
     if (!container) return;
-    container.innerHTML = '<div style="color:var(--text-muted);">Loading cron jobs...</div>';
+    container.innerHTML = renderBlockSkeleton({lines:3});
     try {
         var resp = await fetch(apiUrl('/api/cron'));
         var data = await resp.json();
@@ -6836,7 +7328,7 @@ async function loadCronJobs() {
         if (rawEl) rawEl.textContent = raw || '(empty crontab)';
 
         if (entries.length === 0) {
-            container.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-muted);font-size:14px;">No cron jobs found. Add one above or use a Quick Action.</div>';
+            container.innerHTML = renderEmptyState({ title: 'No cron jobs found', body: 'Add one above or use a Quick Action.' });
             return;
         }
 
@@ -6851,8 +7343,8 @@ async function loadCronJobs() {
 
         entries.forEach(function (e) {
             var statusBadge = e.enabled
-                ? '<span style="display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600;background:rgba(34,197,94,0.15);color:#22c55e;">Active</span>'
-                : '<span style="display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600;background:rgba(239,68,68,0.15);color:#ef4444;">Disabled</span>';
+                ? renderStatusPill({ tone: 'ok', label: 'Active' })
+                : renderStatusPill({ tone: 'danger', label: 'Disabled' });
 
             html += '<tr style="border-bottom:1px solid var(--border,#333);">' +
                 '<td style="padding:10px 12px;">' + statusBadge + '</td>' +
@@ -7145,7 +7637,7 @@ async function loadPveResources(nodeId) {
 async function renderPveResourcesView(nodeId) {
     const container = document.getElementById('pve-resources-content');
     if (!container) return;
-    container.innerHTML = '<div style="text-align:center; padding:40px; color:var(--text-muted);">Loading PVE resources...</div>';
+    container.innerHTML = renderBlockSkeleton({lines:3});
 
     // Find the node to get address for console links
     const node = allNodes.find(n => n.id === nodeId);
@@ -8441,6 +8933,7 @@ function showTaskLog() {
     updateTaskLogToggleBtn();
     updateContentPadding();
     repositionAiBubble();
+    try { _wsSyncTrustFooterVisibility(); } catch (_) {}
 }
 
 function hideTaskLog() {
@@ -8449,6 +8942,7 @@ function hideTaskLog() {
     updateTaskLogToggleBtn();
     updateContentPadding();
     repositionAiBubble();
+    try { _wsSyncTrustFooterVisibility(); } catch (_) {}
 }
 
 function toggleTaskLogVisible() {
@@ -8905,7 +9399,7 @@ async function refreshComponentDetail(name) {
             }).join('');
             logsEl.scrollTop = logsEl.scrollHeight;
         } else {
-            logsEl.innerHTML = '<div style="color: var(--text-muted); text-align: center; padding: 20px;">No logs available</div>';
+            logsEl.innerHTML = renderEmptyState({ title: 'No logs available' });
         }
         // Load configurator if this component has one
         const cfgSection = document.getElementById('detail-configurator-section');
@@ -9481,7 +9975,7 @@ async function loadNginxConfigurator() {
     `;
 
     const body = document.getElementById('configurator-body');
-    body.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">Loading sites...</div>';
+    body.innerHTML = renderBlockSkeleton({lines:3});
 
     try {
         const resp = await fetch(configuratorApiUrl('/api/configurator/nginx/sites'));
@@ -9576,7 +10070,7 @@ async function nginxToggleSite(name, enable) {
 
 async function nginxEditSite(name) {
     const body = document.getElementById('configurator-body');
-    body.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">Loading...</div>';
+    body.innerHTML = renderBlockSkeleton({lines:3});
 
     try {
         const resp = await fetch(configuratorApiUrl(`/api/configurator/nginx/sites/${encodeURIComponent(name)}`));
@@ -9807,7 +10301,7 @@ async function loadCertManager() {
         <button class="btn btn-sm" onclick="loadNginxConfigurator()">← Back to sites</button>
     `;
     const body = document.getElementById('configurator-body');
-    body.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">Loading certificates…</div>';
+    body.innerHTML = renderBlockSkeleton({lines:3});
     try {
         const resp = await fetch('/api/certs');
         if (handleAuthError(resp)) return;
@@ -10021,7 +10515,7 @@ async function loadApacheConfigurator() {
     `;
 
     const body = document.getElementById('configurator-body');
-    body.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">Loading virtual hosts...</div>';
+    body.innerHTML = renderBlockSkeleton({lines:3});
 
     try {
         const resp = await fetch(configuratorApiUrl('/api/configurator/apache/sites'));
@@ -10116,7 +10610,7 @@ async function apacheToggleSite(name, enable) {
 
 async function apacheEditSite(name) {
     const body = document.getElementById('configurator-body');
-    body.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">Loading...</div>';
+    body.innerHTML = renderBlockSkeleton({lines:3});
 
     try {
         const resp = await fetch(configuratorApiUrl(`/api/configurator/apache/sites/${encodeURIComponent(name)}`));
@@ -10338,7 +10832,7 @@ async function apacheReloadService() {
 
 async function apacheShowModules() {
     const body = document.getElementById('configurator-body');
-    body.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">Loading modules...</div>';
+    body.innerHTML = renderBlockSkeleton({lines:3});
 
     document.getElementById('configurator-title').textContent = 'Apache Modules';
     document.getElementById('configurator-header-actions').innerHTML = `
@@ -10353,7 +10847,7 @@ async function apacheShowModules() {
 
         const mods = data.modules || [];
         if (mods.length === 0) {
-            body.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">No modules found</div>';
+            body.innerHTML = renderEmptyState({ title: 'No modules found' });
             return;
         }
 
@@ -10516,7 +11010,7 @@ async function loadTomlConfigurator(component, displayName) {
     `;
 
     const body = document.getElementById('configurator-body');
-    body.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">Loading configuration...</div>';
+    body.innerHTML = renderBlockSkeleton({lines:3});
 
     try {
         const resp = await fetch(configuratorApiUrl(`/api/configurator/toml/${component}/structured`));
@@ -10559,7 +11053,7 @@ function renderTomlForm(component, config) {
     const sections = getTomlSchema(component);
 
     if (sections.length === 0) {
-        body.innerHTML = '<div style="color:var(--text-muted);">No schema defined for this component</div>';
+        body.innerHTML = renderEmptyState({ title: 'No schema defined for this component' });
         return;
     }
 
@@ -11359,8 +11853,8 @@ function renderIpMappings(mappings) {
 
     for (const m of mappings) {
         const statusBadge = m.enabled
-            ? '<span class="badge" style="background:rgba(34,197,94,0.15); color:#22c55e; font-size:10px;">Active</span>'
-            : '<span class="badge" style="background:rgba(107,114,128,0.2); color:#6b7280; font-size:10px;">Disabled</span>';
+            ? renderStatusPill({ tone: 'ok', label: 'Active' })
+            : renderStatusPill({ tone: 'neutral', label: 'Disabled' });
 
         const srcPorts = m.ports || '<span style="color:var(--text-muted);">all</span>';
         const destPorts = m.dest_ports || srcPorts;
@@ -11662,7 +12156,7 @@ async function wgLoadBridgeDetails(cluster) {
         if (!wrap) return;
 
         if (!bridge.clients || bridge.clients.length === 0) {
-            wrap.innerHTML = '<p style="text-align:center; padding:12px; color:var(--text-muted); font-size:12px;">No clients configured.</p>';
+            wrap.innerHTML = renderEmptyState({ title: 'No clients configured.' });
             return;
         }
 
@@ -12571,7 +13065,7 @@ function vmCardHtml(vm) {
         <div style="display:flex;flex-wrap:wrap;padding:6px 8px;background:var(--bg-secondary);border-bottom:1px solid var(--border);gap:1px;">
             <button class="btn btn-sm" style="${isRunning ? bd : bs}" ${isRunning ? 'disabled' : `onclick="vmAction('${vm.name}','start',this)"`} title="Start">▶️</button>
             <button class="btn btn-sm" style="${!isRunning ? bd : bs}" ${!isRunning ? 'disabled' : `onclick="vmAction('${vm.name}','stop',this)"`} title="Stop (graceful ACPI shutdown)">⏹️</button>
-            <button class="btn btn-sm" style="${!isRunning ? bd : bs}color:#b91c1c;" ${!isRunning ? 'disabled' : `onclick="if (confirm('Force-stop ${vm.name}? The guest will not shut down cleanly — unsaved data may be lost.')) vmAction('${vm.name}','force-stop',this)"`} title="Force Stop (power off immediately)">⛔</button>
+            <button class="btn btn-sm" style="${!isRunning ? bd : bs}color:#b91c1c;" ${!isRunning ? 'disabled' : `onclick="vmForceStopConfirm('${vm.name}', this)"`} title="Force Stop (power off immediately)">⛔</button>
             ${vncLink ? `<button class="btn btn-sm" style="${bs}" onclick="window.open('${vncLink}')" title="VNC">🖥️</button>` : ''}
             <button class="btn btn-sm" style="${!isRunning ? bd : bs}" ${!isRunning ? 'disabled' : `onclick="openVmConsole('${vm.name}')"`} title="Serial terminal (guest must have serial console enabled)">💻</button>
             <button class="btn btn-sm" style="${bs}" onclick="showVmSettings('${vm.name}')" title="Settings">⚙️</button>
@@ -12691,6 +13185,13 @@ function renderDockerContainers(containers) {
             </div></td>
         </tr>${statsSubRow}`;
     }).join('');
+
+    // Surface freshness — Docker stats poll every few seconds; show
+    // "Updated Xs ago" so operators can tell live from stale data.
+    try {
+        const wrap = table.closest('.card') || table.parentElement;
+        if (wrap) attachLastUpdated(wrap)();
+    } catch (_) {}
 }
 
 function renderDockerStats(stats) {
@@ -12820,7 +13321,7 @@ async function viewDockerVolumes(container) {
     const body = document.getElementById('container-detail-body');
 
     title.textContent = `${container} — Volumes`;
-    body.innerHTML = '<p style="color:var(--text-muted);">Loading volumes...</p>';
+    body.innerHTML = renderBlockSkeleton({lines:3});
     modal.classList.add('active');
 
     try {
@@ -12885,7 +13386,7 @@ async function openDockerSettings(name) {
     const body = document.getElementById('container-detail-body');
 
     title.textContent = `${name} — Settings`;
-    body.innerHTML = '<p style="color:var(--text-muted);text-align:center;padding:40px;">Loading config...</p>';
+    body.innerHTML = renderBlockSkeleton({lines:3});
     modal.classList.add('active');
     _dockerSettingsTab = 1;
     window._dockerSystemEnv = []; // Clear stale system env from previous modal open
@@ -13525,7 +14026,7 @@ async function viewContainerLogs(runtime, container) {
     const body = document.getElementById('container-detail-body');
 
     title.textContent = `${container} — Logs`;
-    body.innerHTML = '<p style="color:var(--text-muted);">Loading logs...</p>';
+    body.innerHTML = renderBlockSkeleton({lines:3});
     modal.classList.add('active');
 
     try {
@@ -13707,8 +14208,8 @@ async function openContainerCron(runtime, container) {
 
             entries.forEach(function (e) {
                 var statusBadge = e.enabled
-                    ? '<span style="display:inline-block;padding:2px 6px;border-radius:6px;font-size:10px;font-weight:600;background:rgba(34,197,94,0.15);color:#22c55e;">Active</span>'
-                    : '<span style="display:inline-block;padding:2px 6px;border-radius:6px;font-size:10px;font-weight:600;background:rgba(239,68,68,0.15);color:#ef4444;">Disabled</span>';
+                    ? renderStatusPill({ tone: 'ok', label: 'Active' })
+                    : renderStatusPill({ tone: 'danger', label: 'Disabled' });
 
                 html += '<tr style="border-bottom:1px solid var(--border);">' +
                     '<td style="padding:8px 10px;">' + statusBadge + '</td>' +
@@ -14053,7 +14554,7 @@ async function openLxcSettings(name) {
     const body = document.getElementById('container-detail-body');
 
     title.textContent = `${name} — Settings`;
-    body.innerHTML = '<p style="color:var(--text-muted);text-align:center;padding:40px;">Loading config...</p>';
+    body.innerHTML = renderBlockSkeleton({lines:3});
     modal.classList.add('active');
     _lxcSettingsTab = 1;
 
@@ -14690,7 +15191,7 @@ function escapeHtml(text) {
 // ─── Clone & Migrate Functions ───
 
 async function cloneDockerContainer(name) {
-    const newName = prompt(`Clone Docker container '${name}' — enter a name for the clone:`, name + '-clone');
+    const newName = await showPrompt(`Clone Docker container '${name}' — enter a name for the clone:`, 'Clone container', name + '-clone');
     if (!newName) return;
 
     showToast(`Cloning ${name}...`, 'info');
@@ -14719,7 +15220,7 @@ async function migrateDockerContainer(name) {
     const body = document.getElementById('container-detail-body');
 
     title.textContent = `Migrate Container: ${name}`;
-    body.innerHTML = '<p style="color:var(--text-muted);">Loading cluster nodes...</p>';
+    body.innerHTML = renderBlockSkeleton({lines:3});
     modal.classList.add('active');
 
     try {
@@ -15903,7 +16404,7 @@ async function lxcStorageResize(btn, name) {
     const overlay = btn?.closest?.('.modal-overlay') || document;
     const sizeEl = overlay.querySelector('#lxc-storage-size');
     const sizeGb = parseInt(sizeEl?.value, 10);
-    if (!sizeGb || sizeGb < 1) { alert('Enter a size in GB'); return; }
+    if (!sizeGb || sizeGb < 1) { showToast('Enter a size in GB', 'warning'); return; }
     if (!(await showConfirm(`Resize ${name}'s disk to ${sizeGb} GB?`))) return;
     try {
         const r = await fetch(apiUrl(`/api/containers/lxc/${encodeURIComponent(name)}/disk/resize`), {
@@ -15933,7 +16434,7 @@ async function lxcStorageMigrate(btn, name) {
     const removeEl = overlay.querySelector('#lxc-storage-remove');
     const target = (targetEl?.value || '').trim();
     const removeSource = !!removeEl?.checked;
-    if (!target) { alert('Pick or enter a target storage'); return; }
+    if (!target) { showToast('Pick or enter a target storage', 'warning'); return; }
     if (!(await showConfirm(`Migrate ${name} to ${target}? ${removeSource ? '(source will be removed after copy)' : '(source will be kept)'}`))) return;
     try {
         const r = await fetch(apiUrl(`/api/containers/lxc/${encodeURIComponent(name)}/disk/migrate`), {
@@ -16052,7 +16553,7 @@ async function searchDockerHub() {
         const data = await resp.json();
 
         if (!data.length) {
-            results.innerHTML = '<p style="color:var(--text-muted); text-align:center; padding:12px;">No images found.</p>';
+            results.innerHTML = renderEmptyState({ title: 'No images found.' });
             return;
         }
 
@@ -16442,7 +16943,7 @@ function showLxcCreate() {
     const body = document.getElementById('container-detail-body');
 
     title.textContent = 'Create LXC Container — Step 1: Select Template';
-    body.innerHTML = '<p style="color:var(--text-muted); text-align:center; padding:2rem;">Loading available templates...</p>';
+    body.innerHTML = renderBlockSkeleton({lines:3});
     modal.classList.add('active');
 
     loadLxcTemplates();
@@ -17735,7 +18236,7 @@ async function showVmLogs(name) {
     const body = document.getElementById('container-detail-body');
 
     title.textContent = `VM Logs: ${name}`;
-    body.innerHTML = '<p style="color:var(--text-muted);">Loading...</p>';
+    body.innerHTML = renderBlockSkeleton({lines:3});
     modal.classList.add('active');
 
     try {
@@ -17767,7 +18268,7 @@ async function showVmSettings(name) {
     const body = document.getElementById('container-detail-body');
 
     title.textContent = `VM Settings: ${name}`;
-    body.innerHTML = '<p style="color:var(--text-muted);">Loading...</p>';
+    body.innerHTML = renderBlockSkeleton({lines:3});
     modal.classList.add('active');
 
     try {
@@ -18042,8 +18543,8 @@ async function loadHostDevicesForEdit(vmName) {
 async function reloadHostDevices(vmName) {
     const usbList = document.getElementById('edit-vm-usb-list');
     const pciList = document.getElementById('edit-vm-pci-list');
-    if (usbList) usbList.innerHTML = '<div style="color:var(--text-muted); font-size:12px; padding:8px;">Loading...</div>';
-    if (pciList) pciList.innerHTML = '<div style="color:var(--text-muted); font-size:12px; padding:8px;">Loading...</div>';
+    if (usbList) usbList.innerHTML = renderBlockSkeleton({lines:3});
+    if (pciList) pciList.innerHTML = renderBlockSkeleton({lines:3});
     await loadHostDevicesForEdit(vmName);
 }
 
@@ -18067,7 +18568,7 @@ function renderUsbList(vmName, usbs) {
     const container = document.getElementById('edit-vm-usb-list');
     if (!container) return;
     if (usbs.length === 0) {
-        container.innerHTML = '<div style="color:var(--text-muted); font-size:12px; padding:8px;">No USB devices detected on host</div>';
+        container.innerHTML = renderEmptyState({ title: 'No USB devices detected on host' });
         return;
     }
     const state = window._editVmPassthrough || { selectedUsb: [] };
@@ -18097,7 +18598,7 @@ function renderPciList(vmName, pcis) {
     const container = document.getElementById('edit-vm-pci-list');
     if (!container) return;
     if (pcis.length === 0) {
-        container.innerHTML = '<div style="color:var(--text-muted); font-size:12px; padding:8px;">No PCI devices eligible for passthrough</div>';
+        container.innerHTML = renderEmptyState({ title: 'No PCI devices eligible for passthrough' });
         return;
     }
     // Group by IOMMU group for display
@@ -18231,7 +18732,7 @@ async function removeVmVolume(vmName, volName) {
 }
 
 async function resizeVmVolume(vmName, volName, currentSize) {
-    const newSize = prompt(`Resize volume '${volName}' (currently ${currentSize}G).\nEnter new size in GiB (must be larger):`, currentSize + 10);
+    const newSize = await showPrompt(`Resize volume '${volName}' (currently ${currentSize}G).\nEnter new size in GiB (must be larger):`, 'Resize volume', String(currentSize + 10));
     if (!newSize) return;
     const size = parseInt(newSize);
     if (isNaN(size) || size <= currentSize) {
@@ -18514,7 +19015,7 @@ function renderBackupTargets(targets) {
     if (!container) return;
 
     if (!targets || targets.length === 0) {
-        container.innerHTML = '<p style="text-align:center; padding:20px; color:var(--text-muted); grid-column:1/-1;">No containers, VMs, or configs found to backup.</p>';
+        container.innerHTML = renderEmptyState({ title: 'No containers, VMs, or configs found to backup.' });
         return;
     }
 
@@ -20852,7 +21353,7 @@ async function loadAiAlerts() {
         var container = document.getElementById('ai-alerts-list');
         if (!container) return;
         if (!alerts.length) {
-            container.innerHTML = '<div style="color:var(--text-muted);padding:12px;">No alerts yet — the AI will check your servers periodically</div>';
+            container.innerHTML = renderEmptyState({ title: 'No alerts yet', body: 'the AI will check your servers periodically' });
             return;
         }
         container.innerHTML = alerts.slice(-20).reverse().map(function (a) {
@@ -21223,7 +21724,7 @@ async function mysqlLoadDatabases() {
     if (!mysqlCreds) return;
 
     const tree = document.getElementById('mysql-db-tree');
-    tree.innerHTML = '<div style="padding:16px; text-align:center; color:var(--text-muted); font-size:12px;">Loading...</div>';
+    tree.innerHTML = renderBlockSkeleton({lines:3});
 
     try {
         const baseUrl = getNodeApiBase(mysqlConnectedNodeId);
@@ -21290,7 +21791,7 @@ async function mysqlToggleDb(db) {
 
     arrow.style.transform = 'rotate(90deg)';
     container.style.display = 'block';
-    container.innerHTML = '<div style="padding:6px 0; font-size:11px; color:var(--text-muted);">Loading tables...</div>';
+    container.innerHTML = renderBlockSkeleton({lines:3});
 
     try {
         const baseUrl = getNodeApiBase(mysqlConnectedNodeId);
@@ -21433,7 +21934,7 @@ function mysqlRenderGrid(columns, rows, container) {
     _mysqlGridRows = rows;
 
     if (columns.length === 0) {
-        container.innerHTML = '<div style="padding:40px; text-align:center; color:var(--text-muted);">No data</div>';
+        container.innerHTML = renderEmptyState({ title: 'No data' });
         return;
     }
 
@@ -22343,9 +22844,9 @@ async function mysqlDropColumn(colName) {
     }
 }
 
-function mysqlRenameTableDialog() {
+async function mysqlRenameTableDialog() {
     const db = mysqlCurrentDb, tbl = mysqlCurrentTable;
-    const newName = prompt(`Rename table '${tbl}' to:`, tbl);
+    const newName = await showPrompt(`Rename table '${tbl}' to:`, 'Rename table', tbl);
     if (!newName || newName === tbl) return;
 
     mysqlConfirmDestructive(
@@ -23718,7 +24219,7 @@ async function fleetViewLogs(nodeId, runtime, name) {
     var body = document.getElementById('container-detail-body');
     if (!modal) return;
     title.textContent = name + ' — Logs';
-    body.innerHTML = '<p style="color:var(--text-muted);">Loading logs...</p>';
+    body.innerHTML = renderBlockSkeleton({lines:3});
     modal.classList.add('active');
     try {
         var resp = await fetch(fleetApiUrl(nodeId, '/api/containers/' + runtime + '/' + encodeURIComponent(name) + '/logs'), { credentials: 'include' });
@@ -23737,7 +24238,7 @@ async function fleetShowVmLogs(nodeId, name) {
     var body = document.getElementById('container-detail-body');
     if (!modal) return;
     title.textContent = 'VM Logs: ' + name;
-    body.innerHTML = '<p style="color:var(--text-muted);">Loading...</p>';
+    body.innerHTML = renderBlockSkeleton({lines:3});
     modal.classList.add('active');
     try {
         var resp = await fetch(fleetApiUrl(nodeId, '/api/vms/' + encodeURIComponent(name) + '/logs'), { credentials: 'include' });
@@ -24105,7 +24606,7 @@ function renderAppStoreGrid() {
     });
 
     if (filtered.length === 0) {
-        grid.innerHTML = '<div style="padding:40px; text-align:center; color:var(--text-muted); grid-column:1/-1;">No apps match your search.</div>';
+        grid.innerHTML = renderEmptyState({ title: 'No apps match your search.', tone: 'filtered' });
         return;
     }
 
@@ -24183,7 +24684,7 @@ function renderAppStoreTable() {
     });
 
     if (filtered.length === 0) {
-        grid.innerHTML = '<div style="padding:40px; text-align:center; color:var(--text-muted);">No apps match your search.</div>';
+        grid.innerHTML = renderEmptyState({ title: 'No apps match your search.', tone: 'filtered' });
         return;
     }
 
@@ -24897,7 +25398,7 @@ async function loadInstalledApps() {
         installed.sort((a, b) => (b.installed_at || '').localeCompare(a.installed_at || ''));
 
         if (installed.length === 0) {
-            listEl.innerHTML = '<div style="padding:40px; text-align:center; color:var(--text-muted);">No apps installed yet. Browse the store and install your first app!</div>';
+            listEl.innerHTML = renderEmptyState({ title: 'No apps installed yet', body: 'Browse the store and install your first app!' });
             return;
         }
 
@@ -25087,7 +25588,7 @@ async function loadNodeSecurity() {
 
     const node = allNodes.find(n => n.id === currentNodeId);
     if (!node) {
-        container.innerHTML = '<div style="padding:40px; text-align:center; color:var(--text-muted); grid-column:1/-1;">No node selected.</div>';
+        container.innerHTML = renderEmptyState({ title: 'No node selected.' });
         return;
     }
 
@@ -25248,25 +25749,55 @@ function showDialog(config) {
     modal.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.6); backdrop-filter:blur(4px); z-index:10000; display:flex; align-items:center; justify-content:center;';
 
     const dlg = { close: () => modal.remove() };
-    const buttons = (config.buttons || []).map((btn, idx) => {
-        const isPrimary = btn.label.includes('Save') || btn.label.includes('Add') || btn.label.includes('Apply') ? 'btn-primary' : '';
-        const btnClass = `btn btn-sm ${isPrimary}`;
-        return `<button class="${btnClass}" onclick="(${btn.onclick.toString()})(window._currentDialog)" style="font-size:13px;">${btn.label}</button>`;
-    }).join('');
 
+    // BUG FIX (sponsor report 2026-04-27): the previous implementation
+    // stringified each button's onclick via `btn.onclick.toString()` and
+    // embedded it as an inline HTML `onclick=` attribute. That destroyed
+    // closures (so handlers like `(dlg) => wrSaveSubnetRoute(dlg, routeId)`
+    // lost the captured `routeId`) AND moved execution to the global scope,
+    // where module-IIFE-scoped functions like `wrSaveSubnetRoute` are
+    // unreachable. Result: clicking "Create Route" silently threw a
+    // ReferenceError and did nothing. Building the buttons as DOM nodes and
+    // attaching the original onclick via addEventListener preserves both
+    // closures and lexical scope.
     modal.innerHTML = `
-        <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:12px; width:640px; max-width:90vw; max-height:85vh; display:flex; flex-direction:column; box-shadow:0 20px 60px rgba(0,0,0,0.4); overflow:hidden;">
+        <div class="ws-dialog-shell" style="background:var(--bg-card); border:1px solid var(--border); border-radius:12px; width:640px; max-width:90vw; max-height:85vh; display:flex; flex-direction:column; box-shadow:0 20px 60px rgba(0,0,0,0.4); overflow:hidden;">
             <div style="padding:20px 24px; border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between;">
                 <h3 style="margin:0; font-size:16px; font-weight:600;">${config.title || 'Dialog'}</h3>
-                <button onclick="this.closest('div[style*=fixed]').remove()" style="background:none; border:none; color:var(--text-muted); font-size:20px; cursor:pointer; padding:4px;">✕</button>
+                <button class="ws-dialog-x" style="background:none; border:none; color:var(--text-muted); font-size:20px; cursor:pointer; padding:4px;">✕</button>
             </div>
             <div style="padding:20px 24px; flex:1; overflow-y:auto;">
                 ${config.html || ''}
             </div>
-            <div style="padding:16px 24px; border-top:1px solid var(--border); display:flex; justify-content:flex-end; gap:8px; flex-wrap:wrap;">
-                ${buttons}
-            </div>
+            <div class="ws-dialog-buttons" style="padding:16px 24px; border-top:1px solid var(--border); display:flex; justify-content:flex-end; gap:8px; flex-wrap:wrap;"></div>
         </div>`;
+
+    // Wire the close [✕] button.
+    const xBtn = modal.querySelector('.ws-dialog-x');
+    if (xBtn) xBtn.addEventListener('click', () => modal.remove());
+
+    // Build the footer buttons as DOM nodes so handlers keep their closures.
+    const btnRow = modal.querySelector('.ws-dialog-buttons');
+    (config.buttons || []).forEach(function (btn) {
+        const el = document.createElement('button');
+        const isPrimary = btn.label.includes('Save') || btn.label.includes('Add') || btn.label.includes('Apply') || btn.label.includes('Create');
+        el.className = 'btn btn-sm' + (isPrimary ? ' btn-primary' : '');
+        el.style.fontSize = '13px';
+        el.textContent = btn.label;
+        if (typeof btn.onclick === 'function') {
+            el.addEventListener('click', function () {
+                try { btn.onclick(dlg); }
+                catch (e) {
+                    if (typeof showToast === 'function') {
+                        showToast('Action failed: ' + (e && e.message ? e.message : String(e)), 'error');
+                    } else {
+                        console.error('showDialog button handler threw:', e);
+                    }
+                }
+            });
+        }
+        btnRow.appendChild(el);
+    });
 
     document.body.appendChild(modal);
     modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
@@ -25459,8 +25990,8 @@ function renderNodeSecurity(node, data) {
         const ufwStatus = (data.ufw.status || '').trim();
         const isActive = ufwStatus.toLowerCase().includes('active');
         const statusBadge = isActive
-            ? '<span style="background:#22c55e20; color:#22c55e; padding:2px 10px; border-radius:6px; font-size:11px; font-weight:600;">Active</span>'
-            : '<span style="background:#f59e0b20; color:#f59e0b; padding:2px 10px; border-radius:6px; font-size:11px; font-weight:600;">Inactive</span>';
+            ? renderStatusPill({ tone: 'ok', label: 'Active' })
+            : renderStatusPill({ tone: 'warn', label: 'Inactive' });
 
         ufwHtml = `
         <div class="card" style="margin-bottom:16px;">
@@ -25517,8 +26048,8 @@ function renderNodeSecurity(node, data) {
     const updList = (updates.list || '').trim();
     const pkgMgr = updates.package_manager || 'unknown';
     const updBadge = updCount > 0
-        ? `<span style="background:#f59e0b20; color:#f59e0b; padding:2px 10px; border-radius:6px; font-size:11px; font-weight:600;">${updCount} update${updCount !== 1 ? 's' : ''} available</span>`
-        : '<span style="background:#22c55e20; color:#22c55e; padding:2px 10px; border-radius:6px; font-size:11px; font-weight:600;">Up to date</span>';
+        ? renderStatusPill({ tone: 'warn', label: `${updCount} update${updCount !== 1 ? 's' : ''} available` })
+        : renderStatusPill({ tone: 'ok', label: 'Up to date' });
 
     const updHtml = `
     <div class="card" style="margin-bottom:16px;">
@@ -26513,7 +27044,7 @@ async function loadPlugins() {
         if (!resp.ok) { list.innerHTML = '<div style="color:var(--text-muted);text-align:center;">Failed to load plugins</div>'; return; }
         const plugins = await resp.json();
         if (plugins.length === 0) {
-            list.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:20px;">No plugins installed</div>';
+            list.innerHTML = renderEmptyState({ title: 'No plugins installed' });
             return;
         }
         list.innerHTML = plugins.map(p => {
@@ -26546,7 +27077,7 @@ async function showInstallPluginModal() {
 
     // Load store
     const storeList = document.getElementById('plugin-store-list');
-    if (storeList) storeList.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:20px;">Loading plugin store...</div>';
+    if (storeList) storeList.innerHTML = renderBlockSkeleton({lines:3});
     try {
         const resp = await fetch(apiUrl('/api/plugins/store'));
         if (!resp.ok) {
@@ -26556,7 +27087,7 @@ async function showInstallPluginModal() {
         }
         const plugins = await resp.json();
         if (!Array.isArray(plugins) || plugins.length === 0) {
-            if (storeList) storeList.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:20px;">No plugins available</div>';
+            if (storeList) storeList.innerHTML = renderEmptyState({ title: 'No plugins available' });
             return;
         }
         if (storeList) storeList.innerHTML = plugins.map(p => `
@@ -26620,7 +27151,13 @@ async function installPlugin() {
 }
 
 async function uninstallPlugin(id, name) {
-    if (!confirm(`Uninstall plugin "${name}"? This will remove all plugin files.`)) return;
+    if (!(await showDangerConfirm({
+        title: 'Uninstall plugin "' + name + '"?',
+        danger: 'Plugin files will be permanently removed from this node.',
+        detail: 'Any state managed by the plugin (configs, scheduled jobs, persistent data) may be lost. Reinstalling later does not recover it.',
+        countdown: 3,
+        confirmLabel: 'Uninstall plugin',
+    }))) return;
     try {
         const resp = await fetch(apiUrl(`/api/plugins/${id}`), { method: 'DELETE' });
         const data = await resp.json();
@@ -26738,6 +27275,11 @@ function addPluginNavItem(manifest) {
 document.addEventListener('DOMContentLoaded', function() {
     setTimeout(loadPluginAssets, 1000);
     startDangerPolling();
+    // Mount the cluster-scope pill in the header (defends against
+    // cross-cluster mistakes by keeping current scope ambient) and the
+    // trust-signal footer (version, identity, last-checked).
+    try { mountClusterPill(); } catch (_) {}
+    try { mountTrustFooter(); } catch (_) {}
 });
 
 // ─── Danger-op banner (deadman-switch confirmations) ───
@@ -26964,7 +27506,7 @@ async function loadApiAuditLog() {
         if (!resp.ok) return;
         const entries = await resp.json();
         if (entries.length === 0) {
-            el.innerHTML = '<div style="color:var(--text-muted);text-align:center;">No audit entries yet</div>';
+            el.innerHTML = renderEmptyState({ title: 'No audit entries yet' });
             return;
         }
         el.innerHTML = entries.map(e => `<div style="display:flex;gap:12px;padding:4px 0;border-bottom:1px solid var(--border);">
@@ -27027,7 +27569,13 @@ async function createApiKey() {
 }
 
 async function revokeApiKey(id, name) {
-    if (!confirm(`Revoke API key "${name}"? Any applications using this key will lose access.`)) return;
+    if (!(await showDangerConfirm({
+        title: 'Revoke API key "' + name + '"?',
+        danger: 'Any application or script using this key will immediately lose access.',
+        detail: 'Revocation is irreversible — you cannot undo this. Issue a new key if you need to re-grant access.',
+        countdown: 3,
+        confirmLabel: 'Revoke key',
+    }))) return;
     try {
         const resp = await fetch(apiUrl(`/api/tokens/${id}`), { method: 'DELETE' });
         const data = await resp.json();
@@ -27141,7 +27689,7 @@ async function wolfnoteLogin() {
 }
 
 async function wolfnoteDisconnect() {
-    if (!confirm('Disconnect from WolfNote?')) return;
+    if (!(await showConfirm('Disconnect from WolfNote? You can reconnect any time.', 'Disconnect WolfNote'))) return;
     try {
         await fetch('/api/wolfnote/disconnect', { method: 'POST' });
         loadWolfNoteConfig();
@@ -27243,7 +27791,7 @@ async function loadWolfNoteNotes() {
 
         const notes = Array.isArray(data) ? data : [];
         if (notes.length === 0) {
-            container.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:20px;">No notes yet</div>';
+            container.innerHTML = renderEmptyState({ title: 'No notes yet' });
             return;
         }
 
@@ -27524,7 +28072,7 @@ async function wolfnoteFromCurrentView() {
         });
         const data = await resp.json();
         if (data.error) {
-            alert('WolfNote error: ' + data.error);
+            showToast('WolfNote error: ' + data.error, 'error');
         } else {
             const btn = document.getElementById('wolfnote-topbar-btn');
             if (btn) {
@@ -27534,7 +28082,7 @@ async function wolfnoteFromCurrentView() {
             }
         }
     } catch (e) {
-        alert('Failed to save to WolfNote: ' + e.message);
+        showToast('Failed to save to WolfNote: ' + e.message, 'error');
     }
 }
 
@@ -27606,7 +28154,12 @@ async function loadUsers() {
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
         const users = await resp.json();
         if (users.length === 0) {
-            container.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:20px;background:var(--bg-input);border-radius:8px;border:1px solid var(--border);">No WolfStack users created yet. Click <strong>+ Add User</strong> to create one.</div>';
+            container.innerHTML = renderEmptyState({
+                icon: '👤',
+                title: 'No WolfStack users yet',
+                body: 'WolfStack users sign in with their own credentials. Add one to give a teammate access without sharing your login.',
+                action: { label: '+ Add user', onclick: 'showCreateUserForm()' },
+            });
             return;
         }
         let html = '<div style="display:flex;flex-direction:column;gap:8px;">';
@@ -27661,7 +28214,13 @@ async function createUser() {
 }
 
 async function deleteUser(username) {
-    if (!confirm('Delete user "' + username + '"?')) return;
+    if (!(await showDangerConfirm({
+        title: 'Delete user "' + username + '"?',
+        danger: 'The user will lose access immediately and any active sessions will be terminated.',
+        detail: 'User deletion is irreversible. Any audit-trail entries authored by this user remain but show the deleted name.',
+        countdown: 3,
+        confirmLabel: 'Delete user',
+    }))) return;
     try {
         const resp = await fetch('/api/auth/users/' + encodeURIComponent(username), { method: 'DELETE' });
         const data = await resp.json();
@@ -27679,10 +28238,11 @@ async function editUserClusters(username) {
         const users = await resp.json();
         const u = (users || []).find(x => x.username === username);
         const current = (u && Array.isArray(u.allowed_clusters)) ? u.allowed_clusters.join(', ') : '';
-        const next = prompt(
+        const next = await showPrompt(
             'Clusters this user is allowed to see (comma-separated).\n' +
             'Leave blank to grant access to ALL clusters.\n\n' +
             'Current: ' + (current || '(all)'),
+            'Allowed clusters',
             current
         );
         if (next === null) return;
@@ -27704,7 +28264,7 @@ async function editUserClusters(username) {
 }
 
 async function changePassword(username) {
-    const newPass = prompt('New password for "' + username + '":');
+    const newPass = await showPrompt('New password for "' + username + '":', 'Change password', '');
     if (!newPass) return;
     try {
         const resp = await fetch('/api/auth/users/' + encodeURIComponent(username) + '/password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: newPass }) });
@@ -27743,7 +28303,7 @@ async function confirmTotp() {
 }
 
 async function disableTotp(username) {
-    if (!confirm('Disable 2FA for "' + username + '"?')) return;
+    if (!(await showConfirm('Disable 2FA for "' + username + '"? They can re-enable it from their account settings.', 'Disable 2FA'))) return;
     try {
         const resp = await fetch('/api/auth/users/' + encodeURIComponent(username) + '/2fa/disable', { method: 'POST' });
         const data = await resp.json();
@@ -29069,7 +29629,7 @@ async function wolfrunDelete(serviceId, serviceName) {
 
     // Fetch service details to show instances
     const instDiv = document.getElementById('wolfrun-delete-instances');
-    instDiv.innerHTML = '<span style="color:var(--text-muted);">Loading...</span>';
+    instDiv.innerHTML = renderBlockSkeleton({lines:3});
     try {
         const resp = await fetch(wolfrunApiUrl(`/api/wolfrun/services/${serviceId}`));
         if (resp.ok) {
@@ -29329,7 +29889,7 @@ function renderWolfRunAdoptItems(containers) {
     }).join('');
 
     if (containers.length === 0) {
-        listEl.innerHTML = `<div style="padding:24px; text-align:center; color:var(--text-muted); font-size:13px;">No containers match your search.</div>`;
+        listEl.innerHTML = renderEmptyState({ title: 'No containers match your search.' });
     }
 }
 
@@ -30474,7 +31034,7 @@ async function wdOpenConfig(mid) {
     var typeLabel = p.runtime ? ' (' + p.runtime.toUpperCase() + ')' : '';
     var isInstall = !!wdInstallMode;
     titleEl.textContent = (isInstall ? 'Install WolfDisk \u2014 ' : 'WolfDisk Configuration \u2014 ') + name + typeLabel;
-    bodyEl.innerHTML = '<div style="text-align:center; padding:20px; color:var(--text-muted);">Loading configuration...</div>';
+    bodyEl.innerHTML = renderBlockSkeleton({lines:3});
     var diagArea = document.getElementById('wd-diagnose-area');
     if (diagArea) diagArea.innerHTML = '';
     modal.style.display = 'flex';
@@ -30727,7 +31287,7 @@ async function loadSystemLogs() {
     const unit = document.getElementById('syslog-unit').value;
     const lines = document.getElementById('syslog-lines').value;
 
-    viewer.innerHTML = '<span style="color:var(--text-muted);">Loading logs...</span>';
+    viewer.innerHTML = renderBlockSkeleton({lines:3});
 
     try {
         const params = new URLSearchParams({ lines });
@@ -31208,11 +31768,11 @@ async function updateMonitorFormFields(existingCheck) {
     } else if (type === 'ping') {
         el.innerHTML = `<div class="form-group" style="margin-bottom:16px;"><label>Host</label><input type="text" id="sp-mon-host" class="form-control" placeholder="192.168.1.10" value="${escapeHtml(c.host || '')}"></div>`;
     } else if (type === 'container') {
-        el.innerHTML = `<div style="text-align:center; padding:16px; color:var(--text-muted);">Loading containers...</div>`;
+        el.innerHTML = renderBlockSkeleton({lines:3});
         await loadContainersForMonitor();
         el.innerHTML = renderContainerPicker(c);
     } else if (type === 'wolfrun') {
-        el.innerHTML = `<div style="text-align:center; padding:16px; color:var(--text-muted);">Loading WolfRun services...</div>`;
+        el.innerHTML = renderBlockSkeleton({lines:3});
         await loadWolfrunServicesForMonitor();
         el.innerHTML = renderWolfrunServicePicker(c);
     }
@@ -32132,7 +32692,7 @@ async function switchK8sTab(tab, silent) {
     const content = document.getElementById('k8s-tab-content');
     if (!content) return;
     if (!silent) {
-        content.innerHTML = '<div style="padding:20px; text-align:center; color:var(--text-muted);">Loading...</div>';
+        content.innerHTML = renderBlockSkeleton({lines:3});
         // Update tab button active states
         document.querySelectorAll('[data-k8s-tab]').forEach(btn => {
             btn.style.background = btn.dataset.k8sTab === tab ? 'rgba(50,108,229,0.15)' : '';
@@ -32542,7 +33102,7 @@ async function showK8sPodDetail(name, namespace) {
     k8sDetailOpen = true;
     const content = document.getElementById('k8s-tab-content');
     if (!content) return;
-    content.innerHTML = '<div style="padding:20px; text-align:center; color:var(--text-muted);">Loading pod details...</div>';
+    content.innerHTML = renderBlockSkeleton({lines:3});
     try {
         const resp = await fetch(`/api/kubernetes/clusters/${k8sCurrentCluster}/pods/${encodeURIComponent(name)}/detail?namespace=${encodeURIComponent(namespace)}`);
         if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Failed');
@@ -32851,7 +33411,7 @@ function renderK8sPodTerminalTab(podName, namespace, pod) {
 async function loadK8sPodProcesses(podName, namespace) {
     const container = document.getElementById('k8s-pod-tab-content');
     if (!container) return;
-    container.innerHTML = '<div style="padding:20px; text-align:center; color:var(--text-muted);">Loading processes...</div>';
+    container.innerHTML = renderBlockSkeleton({lines:3});
     try {
         const resp = await fetch(`/api/kubernetes/clusters/${k8sCurrentCluster}/pods/${encodeURIComponent(podName)}/exec`, {
             method: 'POST',
@@ -32893,7 +33453,7 @@ async function loadK8sPodProcesses(podName, namespace) {
 async function loadK8sPodDiskSpace(podName, namespace) {
     const container = document.getElementById('k8s-pod-tab-content');
     if (!container) return;
-    container.innerHTML = '<div style="padding:20px; text-align:center; color:var(--text-muted);">Loading disk usage...</div>';
+    container.innerHTML = renderBlockSkeleton({lines:3});
     try {
         const resp = await fetch(`/api/kubernetes/clusters/${k8sCurrentCluster}/pods/${encodeURIComponent(podName)}/exec`, {
             method: 'POST',
@@ -32957,7 +33517,7 @@ async function loadK8sPodDiskSpace(podName, namespace) {
 async function loadK8sPodResources(podName, namespace, pod) {
     const container = document.getElementById('k8s-pod-tab-content');
     if (!container) return;
-    container.innerHTML = '<div style="padding:20px; text-align:center; color:var(--text-muted);">Loading resource usage...</div>';
+    container.innerHTML = renderBlockSkeleton({lines:3});
 
     // Fetch kubectl top and memory info in parallel
     let topData = { cpu: 'N/A', memory: 'N/A' };
@@ -33052,7 +33612,7 @@ async function loadK8sPodResources(podName, namespace, pod) {
 async function loadK8sPodEvents(podName, namespace) {
     const container = document.getElementById('k8s-pod-tab-content');
     if (!container) return;
-    container.innerHTML = '<div style="padding:20px; text-align:center; color:var(--text-muted);">Loading events...</div>';
+    container.innerHTML = renderBlockSkeleton({lines:3});
     try {
         const resp = await fetch(`/api/kubernetes/clusters/${k8sCurrentCluster}/pods/${encodeURIComponent(podName)}/events?namespace=${encodeURIComponent(namespace)}`);
         if (!resp.ok) throw new Error('Failed to load events');
@@ -34732,7 +35292,7 @@ async function showK8sDeploymentDetail(name, namespace) {
     k8sDetailOpen = true;
     const content = document.getElementById('k8s-tab-content');
     if (!content) return;
-    content.innerHTML = '<div style="padding:20px; text-align:center; color:var(--text-muted);">Loading deployment details...</div>';
+    content.innerHTML = renderBlockSkeleton({lines:3});
     try {
         const resp = await fetch(`/api/kubernetes/clusters/${k8sCurrentCluster}/deployments/${encodeURIComponent(name)}/detail?namespace=${encodeURIComponent(namespace)}`);
         if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Failed');
@@ -35146,7 +35706,7 @@ let _topoContainerCache = {}; // nodeId → { docker: [...], lxc: [...], vms: [.
 function initTopology3D() {
     if (typeof THREE === 'undefined') {
         const c = document.getElementById('topology-container');
-        if (c) c.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:rgba(255,255,255,0.5);font-size:14px;">Loading 3D engine...</div>';
+        if (c) c.innerHTML = renderBlockSkeleton({lines:3});
         setTimeout(initTopology3D, 500);
         return;
     }
@@ -37147,7 +37707,11 @@ async function loadClusterBrowserSessions() {
         const resp = await fetch(apiUrl('/api/cluster-browser/sessions'));
         const sessions = resp.ok ? await resp.json() : [];
         if (!Array.isArray(sessions) || sessions.length === 0) {
-            grid.innerHTML = `<div style="color:var(--text-muted);font-size:13px;">No sessions running. Click <b>Start browser session</b> to launch one.</div>`;
+            grid.innerHTML = renderEmptyState({
+                icon: '🌐',
+                title: 'No browser sessions running',
+                body: 'Start a session to control a remote browser headlessly — useful for scripted automation or scraping behind a login.',
+            });
             return;
         }
         grid.innerHTML = sessions.map(s => {
@@ -37386,7 +37950,11 @@ function renderClusterServices(grouped) {
     const grid = document.getElementById('cluster-services-grid');
     if (!grid) return;
     if (grouped.length === 0) {
-        grid.innerHTML = `<div style="color:var(--text-muted);font-size:13px;padding:24px;text-align:center;background:var(--bg-secondary);border-radius:8px;">No services discovered yet. Sweep runs every 5 minutes — click <b>Rescan services</b> for an immediate pass, or <b>+ Add custom URL</b> to pin one we missed.</div>`;
+        grid.innerHTML = renderEmptyState({
+            icon: '🔎',
+            title: 'No services discovered yet',
+            body: 'WolfStack sweeps the cluster every 5 minutes for HTTP/SSH services. Trigger an immediate pass or pin one manually.',
+        });
         return;
     }
     grid.innerHTML = grouped.map(([category, services]) => `
@@ -38227,7 +38795,7 @@ async function wfLoadInfrastructureTree() {
     const div = document.getElementById('wf-prop-target-containers');
     if (!div) return;
     if (_wfInfraCache) { wfRenderInfraTree(div, _wfInfraCache); return; }
-    div.innerHTML = '<div style="color:var(--text-muted);font-size:11px;text-align:center;padding:12px;">Loading infrastructure...</div>';
+    div.innerHTML = renderBlockSkeleton({lines:3});
     try {
         const resp = await fetch('/api/wolfflow/infrastructure', { credentials: 'include' });
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
@@ -38436,7 +39004,7 @@ async function wfLoadWfTargetInfra() {
     const div = document.getElementById('wf-wftarget-containers');
     if (!div) return;
     if (_wfInfraCache) { wfRenderInfraTree(div, _wfInfraCache); return; }
-    div.innerHTML = '<div style="color:var(--text-muted);font-size:11px;text-align:center;padding:12px;">Loading infrastructure...</div>';
+    div.innerHTML = renderBlockSkeleton({lines:3});
     try {
         const resp = await fetch('/api/wolfflow/infrastructure', { credentials: 'include' });
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
@@ -38575,7 +39143,13 @@ async function saveWolfFlow() {
 }
 
 async function deleteWolfFlow(id, name) {
-    if (!confirm('Delete workflow "' + name + '"?\n\nThis cannot be undone.')) return;
+    if (!(await showDangerConfirm({
+        title: 'Delete workflow "' + name + '"?',
+        danger: 'The workflow definition and all its run history will be permanently deleted.',
+        detail: 'This cannot be undone. Any schedules or webhooks that trigger it will start failing.',
+        countdown: 3,
+        confirmLabel: 'Delete workflow',
+    }))) return;
     try {
         const resp = await fetch(`/api/wolfflow/workflows/${id}`, { method: 'DELETE', credentials: 'include' });
         if (!resp.ok) throw new Error('Delete failed');
@@ -39285,7 +39859,13 @@ async function wolframInstall() {
 }
 
 async function wolframUninstall() {
-    if (!confirm('Uninstall Wolfram? This will stop the service and remove the binary.')) return;
+    if (!(await showDangerConfirm({
+        title: 'Uninstall Wolfram?',
+        danger: 'The Wolfram service will be stopped and its binary removed from this node.',
+        detail: 'Any data Wolfram has written to disk will remain — this only removes the running service. Reinstall to start it again.',
+        countdown: 3,
+        confirmLabel: 'Uninstall Wolfram',
+    }))) return;
     try {
         const resp = await fetch(apiUrl('/api/wolfram/uninstall'), { method: 'POST' });
         const data = await resp.json();
@@ -39346,7 +39926,7 @@ async function wolframSaveConfig() {
 async function loadWolfUsbPage() {
     var el = document.getElementById('page-wolfusb');
     if (!el) return;
-    el.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted);">Loading WolfUSB...</div>';
+    el.innerHTML = renderBlockSkeleton({lines:3});
 
     try {
         var resp = await fetch(apiUrl('/api/wolfusb/status'));
@@ -39546,7 +40126,7 @@ async function refreshWolfUsbDevices() {
         // Assignments table
         if (assignBody) {
             if (assignments.length === 0) {
-                assignBody.innerHTML = '<div style="color:var(--text-muted);font-size:12px;text-align:center;padding:12px;">No devices assigned yet.</div>';
+                assignBody.innerHTML = renderEmptyState({ title: 'No devices assigned yet.' });
             } else {
                 var ahtml = '<table class="data-table" style="width:100%;font-size:12px;"><thead><tr><th>Device</th><th>Bus ID</th><th>From</th><th>To</th><th></th></tr></thead><tbody>';
                 assignments.forEach(function(a) {
@@ -39679,7 +40259,7 @@ function _wolfusbRenderSteps(steps, overallOk) {
     const body = document.getElementById('wolfusb-steps-body');
     if (!body) return;
     if (!Array.isArray(steps) || steps.length === 0) {
-        body.innerHTML = `<div style="color:#ef4444; font-size:13px;">No step data returned — check WolfStack logs.</div>`;
+        body.innerHTML = renderEmptyState({ title: 'No step data returned', body: 'check WolfStack logs.' });
         return;
     }
     const rows = steps.map(s => {
@@ -39788,7 +40368,7 @@ var WOLF_AVATARS = [
 async function wolfAgentsLoad() {
     const grid = document.getElementById('wolfagents-list');
     if (!grid) return;
-    grid.innerHTML = `<div style="color:var(--text-muted); font-size:13px; padding:24px; text-align:center; grid-column:1/-1;">Loading agents…</div>`;
+    grid.innerHTML = renderBlockSkeleton({lines:3});
     try {
         const resp = await fetch('/api/agents', { credentials: 'include' });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -39977,12 +40557,12 @@ document.addEventListener('keydown', function(e) {
 
 async function wolfAgentsLoadMemory(id) {
     const log = document.getElementById('wolfagents-chat-log');
-    log.innerHTML = `<div style="color:var(--text-muted); font-size:12px;">Loading history…</div>`;
+    log.innerHTML = renderBlockSkeleton({lines:3});
     try {
         const resp = await fetch(`/api/agents/${encodeURIComponent(id)}/memory?limit=100`, { credentials: 'include' });
         const mem = resp.ok ? await resp.json() : [];
         if (!Array.isArray(mem) || mem.length === 0) {
-            log.innerHTML = `<div style="color:var(--text-muted); font-size:12px;">No history yet. Say hello.</div>`;
+            log.innerHTML = renderEmptyState({ title: 'No history yet', body: 'Say hello.' });
             return;
         }
         log.innerHTML = mem.map(m => wolfAgentsMessageHtml(m.role, m.content, m.ts)).join('');
@@ -40572,7 +41152,7 @@ async function wolfAgentsLoadPending() {
     const id = _wolfAgentsActiveId;
     const list = document.getElementById('wolfagents-pending-list');
     if (!id || !list) return;
-    list.innerHTML = '<div style="color:var(--text-muted); padding:24px; text-align:center;">Loading…</div>';
+    list.innerHTML = renderBlockSkeleton({lines:3});
     try {
         const resp = await fetch(`/api/agents/${encodeURIComponent(id)}/pending`, { credentials: 'include' });
         const data = await resp.json();
@@ -40580,7 +41160,11 @@ async function wolfAgentsLoadPending() {
         const openCount = entries.filter(e => e.status === 'pending').length;
         _wolfAgentsUpdatePendingBadge(openCount);
         if (entries.length === 0) {
-            list.innerHTML = '<div style="color:var(--text-muted); padding:24px; text-align:center;">No pending actions yet — the agent hasn\'t requested anything that needs approval.</div>';
+            list.innerHTML = renderEmptyState({
+                icon: '✅',
+                title: 'No pending actions',
+                body: 'The agent hasn\'t asked for any approvals yet. Anything that needs your sign-off will appear here.',
+            });
             return;
         }
         list.innerHTML = entries.map(e => {
@@ -40628,7 +41212,7 @@ function _wolfAgentsUpdatePendingBadge(count) {
 async function wolfAgentsApprovePending(seq) {
     const id = _wolfAgentsActiveId;
     if (!id) return;
-    const note = await showPrompt('Optional approval note (shown in audit log):', '');
+    const note = await showPrompt('Optional approval note (shown in audit log):', 'Approve action', '');
     if (note === null) return; // cancelled
     try {
         const resp = await fetch(`/api/agents/${encodeURIComponent(id)}/pending/${seq}/approve`, {
@@ -40653,7 +41237,7 @@ async function wolfAgentsApprovePending(seq) {
 async function wolfAgentsDenyPending(seq) {
     const id = _wolfAgentsActiveId;
     if (!id) return;
-    const note = await showPrompt('Denial reason (shown to the agent on its next turn):', '');
+    const note = await showPrompt('Denial reason (shown to the agent on its next turn):', 'Deny action', '');
     if (note === null) return;
     try {
         const resp = await fetch(`/api/agents/${encodeURIComponent(id)}/pending/${seq}/deny`, {
@@ -40678,13 +41262,13 @@ async function wolfAgentsLoadAudit() {
     const id = _wolfAgentsActiveId;
     const list = document.getElementById('wolfagents-audit-list');
     if (!id || !list) return;
-    list.innerHTML = '<div style="color:var(--text-muted); padding:24px; text-align:center;">Loading…</div>';
+    list.innerHTML = renderBlockSkeleton({lines:3});
     try {
         const resp = await fetch(`/api/agents/${encodeURIComponent(id)}/audit?limit=200`, { credentials: 'include' });
         const data = await resp.json();
         const entries = Array.isArray(data) ? data.slice().reverse() : [];
         if (entries.length === 0) {
-            list.innerHTML = '<div style="color:var(--text-muted); padding:24px; text-align:center;">No tool invocations yet.</div>';
+            list.innerHTML = renderEmptyState({ title: 'No tool invocations yet.' });
             return;
         }
         list.innerHTML = entries.map(e => {
@@ -40701,14 +41285,6 @@ async function wolfAgentsLoadAudit() {
     } catch (e) {
         list.innerHTML = `<div style="color:#ef4444; padding:16px;">Failed to load: ${escapeHtml(e.message || String(e))}</div>`;
     }
-}
-
-// Lightweight prompt fallback when the app doesn't already have one.
-async function showPrompt(msg, def) {
-    if (typeof window.showPromptModal === 'function') return await window.showPromptModal(msg, def);
-    // Native browser prompt is ugly but functional and works everywhere.
-    const r = window.prompt(msg, def || '');
-    return r;
 }
 
 async function wolfAgentsDelete() {
@@ -40885,7 +41461,7 @@ function cpRender() {
     }
 
     if (groupings.length === 0) {
-        rows.innerHTML = `<div style="color:var(--text-muted);padding:30px;text-align:center;">No items to show.</div>`;
+        rows.innerHTML = renderEmptyState({ title: 'No items to show.' });
         return;
     }
 
@@ -41475,7 +42051,7 @@ async function cpSetMembers(groupId, members) {
 // ─── Group CRUD ───
 
 async function cpCreateGroup() {
-    const name = prompt('New group name:');
+    const name = await showPrompt('New group name:', 'Create group', '');
     if (!name || !name.trim()) return;
     try {
         const resp = await fetch('/api/control-panel/groups', {
@@ -41496,7 +42072,7 @@ async function cpCreateGroup() {
 async function cpRenameGroup(groupId) {
     const grp = _cpGroups.find(g => g.id === groupId);
     if (!grp) return;
-    const name = prompt('Rename group:', grp.name);
+    const name = await showPrompt('Rename group:', 'Rename group', grp.name);
     if (!name || !name.trim() || name.trim() === grp.name) return;
     await cpUpdateGroup(groupId, { name: name.trim() });
 }
@@ -41593,7 +42169,7 @@ async function cpBatchAction(rowId, action) {
         showToast(`Nothing to ${action}.`, 'info');
         return;
     }
-    if (!confirm(`${action.toUpperCase()} ${items.length} item${items.length === 1 ? '' : 's'}?`)) return;
+    if (!(await showConfirm(`${action.toUpperCase()} ${items.length} item${items.length === 1 ? '' : 's'}?`, 'Bulk ' + action))) return;
     let ok = 0, fail = 0;
     for (const it of items) {
         try {
@@ -41648,7 +42224,7 @@ async function cpActionRaw(it, action) {
 async function cpDeleteGroup(groupId) {
     const grp = _cpGroups.find(g => g.id === groupId);
     if (!grp) return;
-    if (!confirm(`Delete group "${grp.name}"? The items themselves are not affected.`)) return;
+    if (!(await showConfirm(`Delete group "${grp.name}"? The items themselves are not affected.`, 'Delete group'))) return;
     try {
         const resp = await fetch(`/api/control-panel/groups/${encodeURIComponent(groupId)}`, { method: 'DELETE' });
         if (!resp.ok) {
@@ -41667,7 +42243,7 @@ async function cpAction(key, action) {
     const it = _cpInventory.find(x => cpKey(x) === key);
     if (!it) return;
     const label = `${action} ${it.kind}/${it.name} on ${it.node_hostname}`;
-    if (action !== 'start' && !confirm(`${label}?`)) return;
+    if (action !== 'start' && !(await showConfirm(`${label}?`, label))) return;
     try {
         await cpActionRaw(it, action);
         showToast(`${label} — requested`, 'success');
@@ -41716,7 +42292,7 @@ let _sqlConnTesterId = null;
 async function sqlConnLoad() {
     const wrap = document.getElementById('sql-conn-list');
     if (!wrap) return;
-    wrap.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:20px;">Loading…</div>';
+    wrap.innerHTML = renderBlockSkeleton({lines:3});
     try {
         const resp = await fetch('/api/sql-connections');
         if (handleAuthError(resp)) return;
@@ -42301,7 +42877,7 @@ let _dbLastResult = null;       // last query result (for CSV export)
 async function dbLoadConnections() {
     const list = document.getElementById('db-conn-list');
     if (!list) return;
-    list.innerHTML = '<div style="color:var(--text-muted); text-align:center; padding:20px; font-size:13px;">Loading…</div>';
+    list.innerHTML = renderBlockSkeleton({lines:3});
     try {
         const resp = await fetch('/api/sql-connections');
         if (handleAuthError(resp)) return;
@@ -42329,7 +42905,7 @@ function dbRenderConnections() {
                 <a href="#" onclick="selectView('settings'); switchSettingsTab('sql'); return false;">Configure one →</a>
             </div>`;
         } else {
-            list.innerHTML = `<div style="text-align:center; padding:24px; color:var(--text-muted); font-size:13px;">No matches.</div>`;
+            list.innerHTML = renderEmptyState({ title: 'No matches.', tone: 'filtered' });
         }
         return;
     }
@@ -42505,7 +43081,7 @@ async function dbMgrLoadTree(force) {
         _dbMgrTablesCache = {};
     }
     if (_dbMgrSchemas === null) {
-        tree.innerHTML = '<div style="padding:12px; color:var(--text-muted); font-size:12px;">Loading…</div>';
+        tree.innerHTML = renderBlockSkeleton({lines:3});
         try {
             if (conn.kind === 'postgres') {
                 const schemas = await dbMgrRunSql(
@@ -43377,7 +43953,7 @@ async function dbDataInsertRow() {
     const cols = _dbDataLast.columns;
     const vals = [];
     for (const c of cols) {
-        const v = prompt(`${c} (leave blank for NULL):`);
+        const v = await showPrompt(`${c} (leave blank for NULL):`, 'Insert row — ' + c, '');
         if (v === null) return;  // cancel
         vals.push(v);
     }
@@ -44064,7 +44640,7 @@ async function dbDataReload() {
 
 function dbDataRenderGrid(wrap, data, st) {
     if (!data.columns || !data.columns.length) {
-        wrap.innerHTML = '<div style="padding:16px; color:var(--text-muted); font-size:12px;">No rows.</div>';
+        wrap.innerHTML = renderEmptyState({ title: 'No rows.' });
         return;
     }
     // Apply client-side filter (cheap text match across serialised cells).
@@ -44785,7 +45361,7 @@ function dbBldAddWhere() {
 function dbBldRenderWhere() {
     const el = document.getElementById('db-bld-where');
     if (!el) return;
-    if (!_dbBldWhere.length) { el.innerHTML = '<div style="color:var(--text-muted);">No conditions — SELECT returns all rows (up to the limit).</div>'; return; }
+    if (!_dbBldWhere.length) { el.innerHTML = renderEmptyState({ title: 'No conditions', body: 'SELECT returns all rows (up to the limit).' }); return; }
     const tableOpts = _dbBldTables.map(t => `<option value="${escapeHtml(t.schema)}.${escapeHtml(t.name)}">${escapeHtml(t.schema)}.${escapeHtml(t.name)}</option>`).join('');
     const opOpts = ['=','!=','<','<=','>','>=','LIKE','NOT LIKE','IS NULL','IS NOT NULL','IN'].map(o => `<option>${o}</option>`).join('');
     let html = '';
@@ -45308,12 +45884,12 @@ function dbStructTableRef(conn) {
 async function dbStructAddColumn() {
     const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
     if (!conn) return;
-    const name = prompt('New column name:');
+    const name = await showPrompt('New column name:', 'Add column', '');
     if (!name) return;
-    const type = prompt('Column type (e.g. VARCHAR(255), INT, TIMESTAMP):');
+    const type = await showPrompt('Column type (e.g. VARCHAR(255), INT, TIMESTAMP):', 'Add column — type', '');
     if (!type) return;
-    const nullable = confirm('Allow NULL? (OK = NULL, Cancel = NOT NULL)');
-    const defaultVal = prompt('Default value (leave blank for none):') || '';
+    const nullable = await showConfirm('Allow NULL values in this column?\n\nConfirm = NULL allowed (default).\nCancel = NOT NULL (every row must have a value).', 'Column nullability');
+    const defaultVal = (await showPrompt('Default value (leave blank for none):', 'Add column — default', '')) || '';
     let sql = `ALTER TABLE ${dbStructTableRef(conn)} ADD COLUMN ${dbMgrEscapeIdent(conn.kind, name)} ${type}`;
     if (!nullable) sql += ' NOT NULL';
     if (defaultVal.trim()) sql += ` DEFAULT ${defaultVal}`;
@@ -45330,11 +45906,11 @@ async function dbStructDropColumn(colName) {
 async function dbStructAddIndex() {
     const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
     if (!conn) return;
-    const name = prompt('Index name:');
+    const name = await showPrompt('Index name:', 'Add index', '');
     if (!name) return;
-    const cols = prompt('Column(s), comma-separated:');
+    const cols = await showPrompt('Column(s), comma-separated:', 'Add index — columns', '');
     if (!cols) return;
-    const unique = confirm('Make this a UNIQUE index? OK = unique, Cancel = normal');
+    const unique = await showConfirm('Make this a UNIQUE index?\n\nConfirm = UNIQUE (each value must occur only once).\nCancel = normal index (duplicates allowed).', 'Index type');
     const escCols = cols.split(',').map(c => dbMgrEscapeIdent(conn.kind, c.trim())).join(', ');
     let sql;
     if (conn.kind === 'postgres') {
@@ -45361,15 +45937,15 @@ async function dbStructDropIndex(idxName) {
 async function dbStructAddFk() {
     const conn = _dbConnsCache.find(c => c.id === _dbCurrentId);
     if (!conn) return;
-    const name = prompt('Constraint name:');
+    const name = await showPrompt('Constraint name:', 'Add foreign key', '');
     if (!name) return;
-    const col = prompt('Column in this table that references another:');
+    const col = await showPrompt('Column in this table that references another:', 'Foreign key — local column', '');
     if (!col) return;
-    const refTable = prompt('References which table? (schema.table or just table)');
+    const refTable = await showPrompt('References which table? (schema.table or just table)', 'Foreign key — referenced table', '');
     if (!refTable) return;
-    const refCol = prompt('References which column?');
+    const refCol = await showPrompt('References which column?', 'Foreign key — referenced column', '');
     if (!refCol) return;
-    const onDelete = prompt('ON DELETE action: NO ACTION / RESTRICT / CASCADE / SET NULL (blank = NO ACTION)') || 'NO ACTION';
+    const onDelete = (await showPrompt('ON DELETE action: NO ACTION / RESTRICT / CASCADE / SET NULL (blank = NO ACTION)', 'Foreign key — on delete', '')) || 'NO ACTION';
     const refParts = refTable.split('.').map(p => dbMgrEscapeIdent(conn.kind, p.trim())).join('.');
     const sql = `ALTER TABLE ${dbStructTableRef(conn)} ADD CONSTRAINT ${dbMgrEscapeIdent(conn.kind, name)} `
               + `FOREIGN KEY (${dbMgrEscapeIdent(conn.kind, col)}) `
@@ -45547,9 +46123,9 @@ function dbQueryCloseTab(idx, ev) {
     dbMgrRenderQueryTab(document.getElementById('db-mgr-body'));
 }
 
-function dbQueryRenameTab(idx) {
+async function dbQueryRenameTab(idx) {
     const cur = _dbQueryTabs[idx];
-    const name = prompt('Tab name:', cur.title);
+    const name = await showPrompt('Tab name:', 'Rename tab', cur.title);
     if (!name) return;
     cur.title = name;
     dbMgrRenderQueryTab(document.getElementById('db-mgr-body'));
