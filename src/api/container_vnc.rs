@@ -920,8 +920,61 @@ fi
                 String::new()
             };
 
+            // Mint LXC templates from images.linuxcontainers.org for Mint
+            // 22.x (Wilma / Xia / Zara / Zena) ship with a broken combo:
+            // Ubuntu Jammy (22.04) base packages but Mint's own repo
+            // (packages.linuxmint.com/<codename>) full of Noble-targeted
+            // packages that depend on the t64 ABI transition libraries
+            // (libatk1.0-0t64, libglib2.0-0t64, libgtk-3-0t64, libc6 ≥
+            // 2.38). None of those exist in Jammy, so any apt install that
+            // pulls in Mint's Thunar / xfce4-session aborts with "held
+            // broken packages". Root cause is upstream:
+            //   https://github.com/lxc/lxc-ci/blob/main/jenkins/jobs/image-mint.yaml
+            // hard-codes source.suite=jammy for every codename except the
+            // Mint 20.x ones — so Mint 22.x images were built on the wrong
+            // Ubuntu base.
+            //
+            // Workaround: pin packages.linuxmint.com to priority 100 (below
+            // Ubuntu's default 500) before the desktop install. apt then
+            // prefers Ubuntu Jammy's xfce4 over Mint's Noble-targeted
+            // xfce4 — same metapackage, but the Jammy version's deps stay
+            // Jammy-consistent and resolve cleanly. Safe on Mint 21.x too
+            // (where Jammy IS the right base) because the Mint and Ubuntu
+            // versions of these packages are typically identical there, so
+            // pinning is a no-op.
             format!(r#"
 echo "[wolfstack] Installing TigerVNC{label_suffix} on Debian/Ubuntu container..."
+
+# Mint LXC fix: when packages.linuxmint.com is enabled, pin it lower
+# than the Ubuntu base repo so apt picks Ubuntu's Jammy-consistent
+# versions of any package that exists in both. Works around an upstream
+# linuxcontainers.org bug (Mint 22.x images built on Jammy base instead
+# of Noble) that otherwise makes XFCE / Thunar / xfce4-session
+# unresolvable.
+#
+# Detection is format-agnostic: matches either legacy
+# `deb http://packages.linuxmint.com …` lines or modern deb822
+# `URIs: http://packages.linuxmint.com` lines, while skipping any line
+# whose first non-space char is a comment `#`. Recurses into
+# /etc/apt/sources.list.d so we don't miss differently-named files.
+if grep -RhsE "^[^#]*packages\.linuxmint\.com" /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null \
+    | grep -q .; then
+    echo "[wolfstack] Detected Linux Mint apt repo — pinning it below Ubuntu so xfce4 deps resolve against the Ubuntu base (works around upstream lxc-ci jammy/noble mismatch on Mint 22.x LXC templates)."
+    cat > /etc/apt/preferences.d/wolfstack-mint-fix.pref <<'WOLFSTACK_PREF_EOF'
+# Written by WolfStack VNC installer.
+# The linuxcontainers.org Mint 22.x LXC templates (Wilma / Xia / Zara /
+# Zena) use an Ubuntu Jammy base but expose the Mint repo's
+# Noble-targeted xfce4/thunar packages whose t64 deps don't exist in
+# Jammy. Pinning the Mint repo below Ubuntu lets apt fall back to
+# Ubuntu's Jammy-consistent versions for packages that exist in both.
+# Mint-only packages (themes, Cinnamon polish) are unaffected.
+# Safe to delete this file once you're on a corrected Mint LXC template.
+Package: *
+Pin: origin packages.linuxmint.com
+Pin-Priority: 100
+WOLFSTACK_PREF_EOF
+fi
+
 apt-get update -qq
 # Step 1: VNC core — must succeed. tigervnc-tools provides vncpasswd.
 # Kept in its own apt transaction so a broken desktop package set on the
@@ -1417,4 +1470,3 @@ pub async fn vnc_list(
     let keys: Vec<&String> = map.keys().collect();
     Ok(HttpResponse::Ok().json(serde_json::json!({ "keys": keys })))
 }
-
