@@ -545,27 +545,47 @@ fn build_install_script(
     let needs_drop_privs = chosen.as_ref()
         .map(|d| matches!(d.id.as_str(), "gnome" | "kde"))
         .unwrap_or(false);
-    let xstartup_body = if let Some(ref d) = chosen {
-        if needs_drop_privs {
-            format!(
-                "if [ \"$(id -u)\" = \"0\" ] && id admin >/dev/null 2>&1; then\n    \
-                    exec su - admin -c 'DISPLAY=:1 dbus-launch --exit-with-session {}'\n\
-                fi\n\
-                exec {}",
-                d.session_binary, d.session_binary
-            )
+    // Always emit a probe-list xstartup. When the user picked a desktop the
+    // chosen one goes first (with the GNOME/KDE privilege-drop dance), but
+    // we ALWAYS fall through to the other DE binaries and finally xterm.
+    // This is what saves the install when apt couldn't actually resolve
+    // the chosen DE's packages — e.g. Mint Zena LXC templates ship a
+    // mixed XFCE/GTK package set whose t64 deps are unsatisfiable on the
+    // Jammy base, so XFCE never installs even though we asked for it.
+    // Without this fallback the user would connect to a black screen.
+    let xstartup_body = {
+        let chosen_block = if let Some(ref d) = chosen {
+            if needs_drop_privs {
+                format!(
+                    "if command -v {bin} >/dev/null 2>&1; then\n    \
+                        if [ \"$(id -u)\" = \"0\" ] && id admin >/dev/null 2>&1; then\n        \
+                            exec su - admin -c 'DISPLAY=:1 dbus-launch --exit-with-session {bin}'\n    \
+                        fi\n    \
+                        exec {bin}\n\
+                    fi",
+                    bin = d.session_binary
+                )
+            } else {
+                format!(
+                    "if command -v {bin} >/dev/null 2>&1; then exec {bin}; fi",
+                    bin = d.session_binary
+                )
+            }
         } else {
-            format!("exec {}", d.session_binary)
-        }
-    } else {
-        // List of session binaries to try, in order. Detected one (if any)
-        // goes first so it always wins.
+            String::new()
+        };
+        // Build the rest of the probe list. Detected DE (if any) goes
+        // first, then everything else; skip whatever's already in the
+        // chosen block to avoid duplicates.
+        let chosen_bin = chosen.as_ref().map(|d| d.session_binary.as_str());
         let mut probes: Vec<&str> = Vec::new();
         if let Some(b) = detected_desktop {
-            probes.push(b);
+            if Some(b) != chosen_bin {
+                probes.push(b);
+            }
         }
         for (bin, _, _) in DE_PROBES {
-            if Some(*bin) != detected_desktop {
+            if Some(*bin) != detected_desktop && Some(*bin) != chosen_bin {
                 probes.push(bin);
             }
         }
@@ -573,7 +593,11 @@ fn build_install_script(
             .map(|b| format!("if command -v {b} >/dev/null 2>&1; then exec {b}; fi"))
             .collect::<Vec<_>>()
             .join("\n");
-        format!("{probe_lines}\n# Last-resort fallback so the user gets *something* on screen\nexec xterm -geometry 120x40")
+        let mut body = String::new();
+        if !chosen_block.is_empty() { body.push_str(&chosen_block); body.push('\n'); }
+        if !probe_lines.is_empty()  { body.push_str(&probe_lines);  body.push('\n'); }
+        body.push_str("# Last-resort fallback so the user gets *something* on screen\nexec xterm -geometry 120x40");
+        body
     };
 
     // Body of /usr/local/bin/wolfstack-vnc-start. Kept as a separate raw
@@ -850,17 +874,65 @@ apt-get install -y --no-install-recommends firefox-esr 2>/dev/null \
             } else {
                 String::new()
             };
+
+            // Desktop install — separate transaction from the VNC core.
+            //
+            // Why: some LXC templates (notably Mint Zena, which mixes
+            // newer Mint-built XFCE/Thunar onto a Jammy libc6 2.35 base)
+            // ship a desktop package set whose dependencies cannot be
+            // resolved at all. apt-get is atomic, so when those broken
+            // deps were bundled into the SAME apt call as
+            // tigervnc-tools, the whole transaction aborted and the
+            // user ended up with no vncpasswd — the install was dead on
+            // arrival. Splitting the calls keeps the VNC server working
+            // on broken templates; the user can manually pick a desktop
+            // afterwards or just live with the xterm fallback.
+            //
+            // Fallback chain: chosen DE → LXQt (Qt-based, immune to the
+            // GTK t64 transition that breaks XFCE on Mint Zena) → xterm
+            // only. We skip the LXQt step if LXQt was already the user's
+            // choice (no point retrying the same packages).
+            let desktop_block = if let Some(ref d) = chosen {
+                let chosen_pkgs = d.packages.join(" ");
+                let chosen_id = d.id.clone();
+                let chosen_label = d.label.clone();
+                let lxqt_fallback = if chosen_id != "lxqt" {
+                    r#"
+elif apt-get install -y --no-install-recommends lxqt-core qterminal; then
+    echo "[wolfstack] LXQt installed as fallback. The chosen desktop's packages couldn't be resolved on this LXC template (commonly seen on Mint Zena LXCs whose XFCE/GTK package set has unsatisfiable t64 dependencies on a Jammy libc6 base). VNC will start LXQt instead."
+    DESKTOP_OK=1"#
+                } else {
+                    ""
+                };
+                format!(r#"
+echo "[wolfstack] Installing desktop: {chosen_label}..."
+DESKTOP_OK=0
+if apt-get install -y --no-install-recommends {chosen_pkgs}; then
+    DESKTOP_OK=1{lxqt_fallback}
+fi
+if [ "$DESKTOP_OK" = "0" ]; then
+    echo "[wolfstack] WARNING: no desktop environment could be installed on this container. The LXC template's package metadata appears to be unable to resolve a working set of XFCE/GTK packages (this is a template-side problem, not WolfStack). VNC will still start — you'll get an xterm fallback. To install a desktop manually later, try: apt-get install lxqt-core qterminal"
+fi
+"#, chosen_pkgs = chosen_pkgs, chosen_label = chosen_label, lxqt_fallback = lxqt_fallback)
+            } else {
+                // vnc-only mode: required_pkgs is just "xterm", which is
+                // already in the VNC core list, so nothing to do here.
+                String::new()
+            };
+
             format!(r#"
 echo "[wolfstack] Installing TigerVNC{label_suffix} on Debian/Ubuntu container..."
 apt-get update -qq
-# tigervnc-tools provides vncpasswd (separate package on Debian/Ubuntu).
+# Step 1: VNC core — must succeed. tigervnc-tools provides vncpasswd.
+# Kept in its own apt transaction so a broken desktop package set on the
+# LXC template (see desktop step below) cannot take the VNC server down
+# with it.
 apt-get install -y --no-install-recommends \
     tigervnc-standalone-server tigervnc-common tigervnc-tools \
-    {required_pkgs} \
     dbus-x11 socat xterm fonts-dejavu \
     procps
-{extras_block}
-"#, label_suffix = label_suffix, required_pkgs = required_pkgs, extras_block = extras_block)
+{desktop_block}{extras_block}
+"#, label_suffix = label_suffix, desktop_block = desktop_block, extras_block = extras_block)
         }
 
         "alpine" => {
@@ -1345,3 +1417,4 @@ pub async fn vnc_list(
     let keys: Vec<&String> = map.keys().collect();
     Ok(HttpResponse::Ok().json(serde_json::json!({ "keys": keys })))
 }
+
