@@ -576,12 +576,16 @@ pub fn apply_on_startup(state: std::sync::Arc<RouterState>, self_node_id: &str) 
     // Subnet routes — apply kernel routing entries for remote subnets
     // accessible via WolfNet or other tunnels.
     let subnet_routes: Vec<_> = cfg.subnet_routes.iter()
-        .filter(|r| r.enabled && (r.node_id.is_none() || r.node_id.as_deref() == Some(self_node_id)))
+        .filter(|r| r.enabled && route_targets_self(r, self_node_id))
         .collect();
 
     if !subnet_routes.is_empty() {
         for route in subnet_routes {
-            match apply_subnet_route(route) {
+            // Startup: we don't carry "previous gateway" state across
+            // process restart, so pass None. Idempotent if the kernel
+            // already has our route; refuses if the kernel has someone
+            // else's route for the same CIDR.
+            match apply_subnet_route(route, None) {
                 Ok(()) => {
                     tracing::info!(
                         "WolfRouter startup: subnet route applied: {} via {}",
@@ -653,40 +657,183 @@ pub fn parse_cidr(cidr: &str) -> Option<(String, u32)> {
     Some((ip.to_string(), prefix))
 }
 
-/// Apply a single subnet route using `ip route add`. If the route already
-/// exists, this is idempotent — ip route silently ignores duplicates.
-fn apply_subnet_route(route: &SubnetRoute) -> Result<(), String> {
+/// Apply a single subnet route to the kernel.
+///
+/// `previous_gateway`: when this is an UPDATE/edit, pass the gateway value
+/// that WolfStack previously installed for this CIDR. The kernel doesn't
+/// track ownership, so we use this to distinguish "the existing route is
+/// ours, swap it" from "someone else owns the existing route, leave it
+/// alone" (Codex P1, v20.11.2). Pass `None` for fresh creates and for
+/// startup.
+///
+/// Behaviour:
+///   • No existing kernel route → `ip route add`.
+///   • Existing route's gateway == our new gateway → no-op (idempotent).
+///   • Existing route's gateway == `previous_gateway` (ours, edited) →
+///     `ip route replace` — atomic swap.
+///   • Existing route's gateway is anything else → REFUSE. That route was
+///     installed outside WolfStack (a VPN client, admin static, another
+///     routing daemon); silently replacing it would break the operator.
+///
+/// `pub` because the API handlers (create/update) and the cluster replication
+/// handler (config_receive) all need to apply at runtime — not just at
+/// process startup. Prior to v20.11.2 only the startup path applied routes,
+/// so newly-created routes never reached the kernel.
+pub fn apply_subnet_route(route: &SubnetRoute, previous_gateway: Option<&str>) -> Result<(), String> {
     use std::process::Command;
 
-    // Validate CIDR format before trying to apply
     if parse_cidr(&route.subnet_cidr).is_none() {
         return Err(format!("Invalid subnet CIDR: {}", route.subnet_cidr));
     }
-
-    // Validate gateway is a valid IPv4 address
     if route.gateway.parse::<std::net::Ipv4Addr>().is_err() {
         return Err(format!("Invalid gateway IP: {}", route.gateway));
     }
 
-    // Apply the route: ip route add <subnet> via <gateway>
+    let existing = read_kernel_route_gateway(&route.subnet_cidr)
+        .map_err(|e| format!("Failed to inspect existing route: {}", e))?;
+
+    match existing {
+        // No route currently — install ours.
+        None => {
+            let output = Command::new("ip")
+                .arg("route").arg("add")
+                .arg(&route.subnet_cidr).arg("via").arg(&route.gateway)
+                .output()
+                .map_err(|e| format!("Failed to execute ip command: {}", e))?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // "File exists" here means the destination IS routed but
+                // `read_kernel_route_gateway` couldn't parse the entry into
+                // a `<dest> via <gw>` form — connected `dev` routes,
+                // blackhole/unreachable, or a multipath. Refuse with a
+                // clear error rather than recursing (Codex P1, v20.11.2).
+                // A naive retry-on-File-exists would loop forever because
+                // the parser would keep returning None.
+                if stderr.contains("File exists") {
+                    Err(format!(
+                        "Route to {} already exists in an unsupported form (e.g. dev/blackhole/multipath). Inspect with `ip route show {}` and resolve before WolfStack can manage it.",
+                        route.subnet_cidr, route.subnet_cidr
+                    ))
+                } else {
+                    Err(format!("ip route add failed: {}", stderr.trim()))
+                }
+            }
+        }
+        // Already exactly what we want — no-op.
+        Some(gw) if gw == route.gateway => Ok(()),
+        // It's our previous entry — atomic swap with `ip route replace`.
+        Some(gw) if previous_gateway.map_or(false, |pgw| pgw == gw) => {
+            let output = Command::new("ip")
+                .arg("route").arg("replace")
+                .arg(&route.subnet_cidr).arg("via").arg(&route.gateway)
+                .output()
+                .map_err(|e| format!("Failed to execute ip command: {}", e))?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Err(format!("ip route replace failed: {}", stderr.trim()))
+            }
+        }
+        // Someone else owns this destination. Refuse.
+        Some(gw) => Err(format!(
+            "Route to {} already exists via {} (installed outside WolfStack). Refusing to overwrite — remove the existing route first if you want WolfStack to manage it.",
+            route.subnet_cidr, gw
+        )),
+    }
+}
+
+/// Read the gateway of an existing kernel route for the given CIDR, if any.
+/// Parses the first non-empty line of `ip route show <cidr>` looking for
+/// `via <ip>`. Returns Ok(None) if no route exists, or if the format is
+/// not the simple `<dest> via <ip> ...` shape we install ourselves
+/// (multi-path routes, blackhole, unreachable, etc. — caller treats the
+/// unparseable case conservatively).
+fn read_kernel_route_gateway(cidr: &str) -> Result<Option<String>, String> {
+    use std::process::Command;
+    let out = Command::new("ip")
+        .arg("route")
+        .arg("show")
+        .arg(cidr)
+        .output()
+        .map_err(|e| format!("ip route show: {}", e))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("ip route show failed: {}", stderr.trim()));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = match stdout.lines().find(|l| !l.trim().is_empty()) {
+        Some(l) => l,
+        None => return Ok(None), // no route present
+    };
+    let mut tokens = line.split_whitespace();
+    while let Some(t) = tokens.next() {
+        if t == "via" {
+            if let Some(gw) = tokens.next() {
+                if gw.parse::<std::net::Ipv4Addr>().is_ok() {
+                    return Ok(Some(gw.to_string()));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Remove a subnet route from the kernel via `ip route del`.
+///
+/// Idempotent: "No such process" / "does not exist" are treated as success.
+///
+/// Codex P1 (v20.11.2): we ALSO check that the kernel route's gateway still
+/// matches `route.gateway` before deleting. If the kernel currently has a
+/// different gateway for the same destination, that route was installed by
+/// something outside WolfStack (or replaced after our state diverged) — we
+/// must not delete it, or we'd break the operator's connectivity.
+pub fn remove_subnet_route(route: &SubnetRoute) -> Result<(), String> {
+    use std::process::Command;
+
+    // Inspect first. If the kernel has a different (or no) gateway for this
+    // CIDR, we have nothing to remove that's safely ours.
+    match read_kernel_route_gateway(&route.subnet_cidr) {
+        Ok(None) => return Ok(()),                       // already absent
+        Ok(Some(gw)) if gw != route.gateway => {
+            tracing::warn!(
+                "remove_subnet_route: kernel route for {} now uses gateway {} (we expected {}); leaving it in place",
+                route.subnet_cidr, gw, route.gateway
+            );
+            return Ok(());
+        }
+        Ok(Some(_)) => { /* matches — proceed with del */ }
+        Err(e) => {
+            // If the inspect failed, fall through to a conservative del
+            // attempt with explicit `via` so we only target our entry.
+            tracing::warn!("remove_subnet_route: pre-check failed: {} — attempting targeted del", e);
+        }
+    }
+
     let output = Command::new("ip")
         .arg("route")
-        .arg("add")
+        .arg("del")
         .arg(&route.subnet_cidr)
         .arg("via")
         .arg(&route.gateway)
         .output()
         .map_err(|e| format!("Failed to execute ip command: {}", e))?;
-
     if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // "File exists" errors are fine — route already applied
-        if stderr.contains("File exists") {
-            Ok(())
-        } else {
-            Err(format!("ip route add failed: {}", stderr.trim()))
-        }
+        return Ok(());
     }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("No such process") || stderr.contains("does not exist") {
+        return Ok(());
+    }
+    Err(format!("ip route del failed: {}", stderr.trim()))
+}
+
+/// True when the route should be installed on the node identified by
+/// `self_node_id`. Encapsulates the "None == cluster-wide, Some(id) == that
+/// node only" rule so all callers (startup, create, update, config_receive)
+/// agree.
+pub fn route_targets_self(route: &SubnetRoute, self_node_id: &str) -> bool {
+    route.node_id.is_none() || route.node_id.as_deref() == Some(self_node_id)
 }

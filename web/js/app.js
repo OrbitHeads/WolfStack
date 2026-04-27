@@ -1482,15 +1482,26 @@ function updateClusterPill() {
 //
 // Only mounted on the main app pages — login.html etc. don't need it.
 let _wsTrustFooterEl = null;
+// Most-recently-measured footer height in px. Used to drive
+// --ws-trust-footer-height. Updated whenever the footer's content reflows
+// (theme/font/viewport-width change, longer username, etc.) via the
+// ResizeObserver in mountTrustFooter(). Hard-coding a value broke when text
+// wrapped on narrow viewports — Codex P3, v20.11.2.
+let _wsTrustFooterHeight = 0;
+
 function mountTrustFooter() {
     if (_wsTrustFooterEl) return;
     const f = document.createElement('div');
     f.id = 'ws-trust-footer';
+    // No fixed height — the footer is sized by its content. The
+    // ResizeObserver below pushes the actual rendered height into
+    // --ws-trust-footer-height so the CSS calc() expressions in main-content
+    // (and any 100vh-based panels) stay accurate even when text wraps.
     f.style.cssText = 'position:fixed;bottom:0;left:0;right:0;z-index:90;'
         + 'background:var(--bg-secondary,#111827);border-top:1px solid var(--border-color,#2d2f3a);'
         + 'color:var(--text-muted,#9ca3af);font-size:11px;line-height:1.4;'
         + 'padding:4px 14px;display:flex;align-items:center;gap:14px;justify-content:space-between;'
-        + 'pointer-events:auto;font-family:inherit;';
+        + 'pointer-events:auto;font-family:inherit;box-sizing:border-box;';
     f.innerHTML = '<div id="ws-trust-left" style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">'
         + '<span><strong style="color:var(--text-secondary,#cbd5e1);">WolfStack</strong> '
         + '<span id="ws-trust-version">…</span></span>'
@@ -1501,11 +1512,40 @@ function mountTrustFooter() {
         + '</div>';
     document.body.appendChild(f);
     _wsTrustFooterEl = f;
-    // Make sure the existing task-log footer doesn't sit ON the trust footer.
-    // The task log sits at bottom:0 with z-index 150 — push the trust footer
-    // when the task log is open. Simplest: leave the trust footer at z-index:90
-    // and bottom:0; when task log opens, hide the trust footer.
-    document.body.style.paddingBottom = '24px';
+    // Track the actual rendered height so --ws-trust-footer-height stays
+    // accurate when content wraps onto a second line or styling changes.
+    //
+    // Codex P2 (v20.11.2): the previous version used entry.contentRect.height
+    // which is the CONTENT-box (no padding, no border). With our 4px top/4px
+    // bottom padding + 1px border the reservation came up ~9px short, so on
+    // wrapped lines the bottom of the page still rendered behind the footer.
+    // getBoundingClientRect() returns the border-box (the actual visible
+    // height the fixed footer occupies on screen) — that's what we need.
+    function measure() {
+        const h = Math.ceil(f.getBoundingClientRect().height);
+        if (h && h !== _wsTrustFooterHeight) {
+            _wsTrustFooterHeight = h;
+            _wsSyncTrustFooterVisibility();
+        }
+    }
+    if (typeof ResizeObserver === 'function') {
+        const ro = new ResizeObserver(measure);
+        ro.observe(f);
+    }
+    // Always do an initial sync — ResizeObserver fires once on observe(), but
+    // a microtask delay can race with mountTrustFooter()'s setup.
+    measure();
+    // Reserve space for the footer via the same CSS-variable pattern the
+    // task-log footer already uses. .main-content's height calc subtracts
+    // --ws-trust-footer-height, so any descendant that uses 100vh / calc(100vh
+    // — … - var(--ws-trust-footer-height, 0px)) doesn't get clipped behind the fixed footer.
+    //
+    // Codex review (2026-04-27): the previous body padding-bottom fix didn't
+    // help children using viewport-units (e.g. database manager grid) — those
+    // computed against the viewport, not the body, and rendered behind the
+    // footer. The CSS var is read by .main-content's height calc and so flows
+    // down naturally to viewport-sized children that overflow main-content.
+    _wsSyncTrustFooterVisibility();
     refreshTrustFooter();
 }
 
@@ -1552,7 +1592,18 @@ function _wsSyncTrustFooterVisibility() {
     const tl = document.getElementById('task-log-footer');
     const tlVisible = tl && tl.style.display !== 'none' && getComputedStyle(tl).display !== 'none';
     _wsTrustFooterEl.style.display = tlVisible ? 'none' : 'flex';
-    document.body.style.paddingBottom = tlVisible ? '0' : '24px';
+    // Drive --ws-trust-footer-height: when the trust footer is visible, reserve
+    // its height so .main-content (and viewport-sized descendants) shrink to
+    // match. When hidden (task log is up), reset to 0 so the task log's own
+    // --task-log-height takes over the bottom-of-viewport space.
+    document.documentElement.style.setProperty(
+        '--ws-trust-footer-height',
+        tlVisible ? '0px' : ((_wsTrustFooterHeight || 24) + 'px')
+    );
+    // Drop the legacy body-padding hack — it never affected children sized via
+    // 100vh / calc(100vh - … - var(--ws-trust-footer-height, 0px)), which is exactly the case that broke pages like
+    // the database manager (Codex P2, 2026-04-27).
+    document.body.style.paddingBottom = '';
 }
 
 // ─── API URL helper — route through proxy for remote nodes ───
@@ -40529,8 +40580,8 @@ function wolfAgentsToggleFullscreen() {
         card.style.borderRadius = '0';
         card.style.zIndex = '10000';
         if (log) {
-            log.style.maxHeight = 'calc(100vh - 260px)';
-            log.style.height = 'calc(100vh - 260px)';
+            log.style.maxHeight = 'calc(100vh - 260px - var(--ws-trust-footer-height, 0px))';
+            log.style.height = 'calc(100vh - 260px - var(--ws-trust-footer-height, 0px))';
         }
         if (btn) { btn.textContent = '❐'; btn.title = 'Exit fullscreen (Esc)'; }
     } else {
@@ -43004,7 +43055,7 @@ function dbOpenConnection(id) {
             <button class="btn btn-sm" onclick="dbTestConnection('${escapeHtml(conn.id)}', this)" style="padding:3px 10px; font-size:12px;">Test</button>
         </div>
 
-        <div id="db-mgr-grid" style="display:grid; grid-template-columns:${_dbTreeCollapsed ? '0 1fr' : '240px 1fr'}; gap:${_dbTreeCollapsed ? '0' : '12px'}; height:calc(100vh - 240px); min-height:460px; position:relative;">
+        <div id="db-mgr-grid" style="display:grid; grid-template-columns:${_dbTreeCollapsed ? '0 1fr' : '240px 1fr'}; gap:${_dbTreeCollapsed ? '0' : '12px'}; height:calc(100vh - 240px - var(--ws-trust-footer-height, 0px)); min-height:460px; position:relative;">
             <!-- Tree: databases + tables -->
             <div id="db-mgr-tree-panel" style="border:1px solid var(--border); border-radius:8px; overflow:hidden; display:${_dbTreeCollapsed ? 'none' : 'flex'}; flex-direction:column; background:var(--bg-secondary);">
                 <div style="padding:8px 10px; border-bottom:1px solid var(--border); font-size:12px; font-weight:600; display:flex; justify-content:space-between; align-items:center;">
@@ -44777,7 +44828,7 @@ async function dbMgrRenderDiagramTab(body) {
             <div style="flex:1;"></div>
             <span id="db-diag-stat" style="font-size:11px; color:var(--text-muted);"></span>
         </div>
-        <div id="db-diag-canvas" style="position:relative; border:1px solid var(--border); border-radius:6px; overflow:hidden; background:var(--bg-primary); height:calc(100vh - 340px); min-height:400px; cursor:grab;">
+        <div id="db-diag-canvas" style="position:relative; border:1px solid var(--border); border-radius:6px; overflow:hidden; background:var(--bg-primary); height:calc(100vh - 340px - var(--ws-trust-footer-height, 0px)); min-height:400px; cursor:grab;">
             <svg id="db-diag-svg" style="width:100%; height:100%; display:block;"></svg>
             <div id="db-diag-loading" style="position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:var(--text-muted); font-size:13px; background:var(--bg-primary);">Loading schema…</div>
         </div>

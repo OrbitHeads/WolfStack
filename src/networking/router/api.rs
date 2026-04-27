@@ -82,6 +82,32 @@ async fn drain_response(resp: reqwest::Response) {
 ///
 /// "Settings should replicate across the cluster when they are changed
 /// so nothing breaks" — this is that.
+
+// ─── Subnet-route overlap helpers (Codex P2, v20.11.2) ───
+//
+// Determine whether two subnet routes can both apply on the same node. A
+// route applies on node N iff its node_id is None (cluster-wide) or matches
+// N. Two routes overlap iff their CIDRs match AND both apply on at least
+// one shared node — that's exactly when:
+//   • either route is cluster-wide (node_id is None), OR
+//   • both pin to the same specific node.
+//
+// Disabled routes don't reach the kernel, so they can't conflict with
+// anything in practice. We still skip them here so users can stash
+// disabled "template" routes without false positives (Codex P2, v20.11.2).
+fn routes_can_overlap(a: &SubnetRoute, b: &SubnetRoute) -> bool {
+    if !a.enabled || !b.enabled { return false; }
+    if a.subnet_cidr != b.subnet_cidr { return false; }
+    a.node_id.is_none() || b.node_id.is_none() || a.node_id == b.node_id
+}
+
+fn scope_label(node_id: &Option<String>) -> String {
+    match node_id {
+        Some(id) => format!("node '{}'", id),
+        None => "cluster-wide".to_string(),
+    }
+}
+
 fn replicate_config_to_cluster(state: S) {
     // The clone of the config and nodes happens INSIDE the spawned task,
     // by which time the caller has returned and any write lock from the
@@ -258,18 +284,24 @@ pub async fn config_receive(
 ) -> HttpResponse {
     auth_or_return!(req, state);
     let new_cfg = body.into_inner();
+    let self_id = crate::agent::self_node_id();
     // Capture the set of proxy IDs we had BEFORE overwriting so we can
     // clean up rules for entries that were deleted on the originating
     // node. Without this, a delete-on-node-1 would leave stale iptables
     // /nftables rules on every other peer until a manual restart.
-    let removed_proxy_ids: Vec<String> = {
+    //
+    // Same problem applies to subnet routes — we capture the old set and
+    // diff it against the incoming one below.
+    let (removed_proxy_ids, old_routes) = {
         let cur = state.router.config.read().unwrap();
         let new_ids: std::collections::HashSet<&str> =
             new_cfg.proxies.iter().map(|p| p.id.as_str()).collect();
-        cur.proxies.iter()
+        let removed = cur.proxies.iter()
             .filter(|p| !new_ids.contains(p.id.as_str()))
             .map(|p| p.id.clone())
-            .collect()
+            .collect::<Vec<_>>();
+        let old_routes: Vec<crate::networking::router::SubnetRoute> = cur.subnet_routes.clone();
+        (removed, old_routes)
     };
     {
         let mut cur = state.router.config.write().unwrap();
@@ -280,14 +312,13 @@ pub async fn config_receive(
     }
     // Apply firewall locally if auto_apply is on.
     if new_cfg.auto_apply {
-        let ruleset = firewall::build_ruleset(&new_cfg, &crate::agent::self_node_id());
+        let ruleset = firewall::build_ruleset(&new_cfg, &self_id);
         if let Err(e) = firewall::apply(&ruleset, false) {
             tracing::warn!("router config-receive: firewall apply failed: {}", e);
         }
     }
     // Re-render dnsmasq for LANs hosted on this node. Stops orphaned
     // instances for LANs that were removed; starts/restarts current ones.
-    let self_id = crate::agent::self_node_id();
     dhcp::start_all_for_node(&new_cfg, &self_id);
     // Purge rules for entries that no longer exist in the config —
     // otherwise failover'd or previously-owned forwards keep running
@@ -303,6 +334,139 @@ pub async fn config_receive(
     for w in &pwarn {
         tracing::warn!("router config-receive: proxy apply: {}", w);
     }
+
+    // Reconcile subnet routes against the kernel.
+    //
+    // Bug fix v20.11.2 (sponsor report): previously this handler applied
+    // firewall + dnsmasq + proxies, but ignored cfg.subnet_routes entirely.
+    // A route created on node A and replicated to node B was saved into
+    // B's config but never made it onto B's kernel routing table. Result:
+    // adding a route on a peer node had no effect until that peer was
+    // restarted (which is when apply_startup walked the list).
+    //
+    // Strategy: diff old vs new for routes that target THIS node.
+    //   • Removed / disabled / moved-elsewhere → remove from kernel.
+    //   • New / re-enabled / different cidr|gateway → install in kernel.
+    use crate::networking::router::{
+        apply_subnet_route as ws_apply_route,
+        remove_subnet_route as ws_remove_route,
+        route_targets_self as ws_route_targets_self,
+        SubnetRoute,
+    };
+    let old_here: Vec<&SubnetRoute> = old_routes.iter()
+        .filter(|r| r.enabled && ws_route_targets_self(r, &self_id))
+        .collect();
+    let new_here: Vec<&SubnetRoute> = new_cfg.subnet_routes.iter()
+        .filter(|r| r.enabled && ws_route_targets_self(r, &self_id))
+        .collect();
+
+    // Helper: do two routes install the SAME kernel entry?
+    let same_kernel_entry = |a: &SubnetRoute, b: &SubnetRoute| -> bool {
+        a.subnet_cidr == b.subnet_cidr && a.gateway == b.gateway
+    };
+
+    // Helper: do two routes target the same kernel DESTINATION (the CIDR)?
+    // A same-destination "edit" can be applied atomically with `ip route
+    // replace`; we must NOT then `ip route del` the old entry, because that
+    // would remove the route we just put in place.
+    let same_kernel_destination = |a: &SubnetRoute, b: &SubnetRoute| -> bool {
+        a.subnet_cidr == b.subnet_cidr
+    };
+
+    // Apply phase: install everything the new config wants here.
+    // apply_subnet_route uses `ip route replace`, which is atomic — failure
+    // leaves the previously-working entry on the kernel rather than
+    // blackholing it (Codex P1, v20.11.2).
+    //
+    // We track which new entries succeeded by route id so the remove phase
+    // below can safely delete only those old entries whose replacement (if
+    // any) is confirmed to be in the kernel.
+    let mut applied_ok_ids = std::collections::HashSet::<String>::new();
+    for new in &new_here {
+        let already = old_here.iter().any(|o| same_kernel_entry(o, new));
+        // Look up the previous gateway for this CIDR among routes that
+        // previously targeted THIS node. Match by CIDR alone — not (id,
+        // CIDR) — so an admin who deleted route A and recreated it as B
+        // with the same destination still gets the atomic swap on peers
+        // (Codex P2, v20.11.2). Without this, a peer whose old config
+        // owned the kernel entry under id A would refuse to overwrite it
+        // when the new config presents id B for the same CIDR.
+        let prev_gw = old_here.iter()
+            .find(|o| o.subnet_cidr == new.subnet_cidr)
+            .map(|o| o.gateway.clone());
+        match ws_apply_route(new, prev_gw.as_deref()) {
+            Ok(()) => {
+                applied_ok_ids.insert(new.id.clone());
+                if !already {
+                    tracing::info!(
+                        "config_receive: applied subnet route {} via {}",
+                        new.subnet_cidr, new.gateway
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "config_receive: apply subnet route {} via {} failed: {}",
+                    new.subnet_cidr, new.gateway, e
+                );
+            }
+        }
+    }
+
+    // Remove phase: drop kernel entries that no longer have a place in the
+    // new config. We are conservative — if there is ANY chance the kernel
+    // still holds the old destination as a working entry, we keep it.
+    //
+    // Cases for an old route O:
+    //   • Same id present in new_here, same CIDR  →
+    //         apply has overwritten the kernel entry. Calling `ip route del`
+    //         would erase the replacement. Keep.
+    //   • Same id present in new_here, different CIDR (the user edited the
+    //     destination) →
+    //         If the new apply succeeded, the kernel has the new CIDR; the
+    //         old CIDR is stale and safe to delete. If the new apply failed,
+    //         the kernel still holds the old destination and removing it
+    //         would blackhole the previously-working subnet — keep.
+    //   • Different id but the SAME CIDR present in new_here →
+    //         apply already overwrote that kernel destination. Keep.
+    //   • Old id absent from new_here AND no new entry shares the CIDR →
+    //         The route was genuinely deleted (or moved off this node).
+    //         Remove from the kernel.
+    for old in &old_here {
+        let by_id   = new_here.iter().find(|n| n.id == old.id);
+        let by_cidr = new_here.iter().find(|n| same_kernel_destination(n, old));
+        // by_cidr takes precedence over by_id (Codex P1, v20.11.2).
+        // Reasoning: if ANY new entry shares this kernel destination, then
+        // the apply phase has already (re)installed the kernel route for
+        // that CIDR — `ip route del` would now delete the freshly-valid
+        // entry. This case includes the cross-id swap "A: X→Y, B: new=X"
+        // where deleting A's old kernel destination would erase B.
+        //
+        // Only when no new entry claims this CIDR do we consider deleting:
+        //   • by_id present (CIDR was edited away from this destination)
+        //     → safe iff the apply for id succeeded; otherwise keep so the
+        //       peer doesn't lose connectivity.
+        //   • by_id absent (route truly removed) → safe to delete.
+        let drop_old = match (by_id, by_cidr) {
+            (_, Some(_))      => false,
+            (Some(n), None)   => applied_ok_ids.contains(&n.id),
+            (None, None)      => true,
+        };
+        if drop_old {
+            if let Err(e) = ws_remove_route(old) {
+                tracing::warn!(
+                    "config_receive: remove subnet route {} via {} failed: {}",
+                    old.subnet_cidr, old.gateway, e
+                );
+            } else {
+                tracing::info!(
+                    "config_receive: removed stale subnet route {} via {}",
+                    old.subnet_cidr, old.gateway
+                );
+            }
+        }
+    }
+
     HttpResponse::Ok().body("synced")
 }
 
@@ -3329,10 +3493,40 @@ pub async fn create_subnet_route(req: HttpRequest, state: S, body: web::Json<Sub
         }));
     }
 
+    // Reject overlapping subnet-route destinations. Codex P2 (v20.11.2):
+    // apply uses `ip route replace`, which is atomic — but two routes that
+    // both apply to the same node with the same CIDR silently overwrite
+    // each other at the kernel level even though both still live in
+    // `cfg.subnet_routes`. Subsequent deletes of either id then remove the
+    // only kernel route. Reject the overlap up front.
+    //
+    // Two routes A and B overlap on node N iff their CIDRs match AND both
+    // apply on N. A route applies on N iff node_id is None (cluster-wide)
+    // or equals N. So the overlap predicate is:
+    //   • either route is cluster-wide, OR
+    //   • both pin to the same specific node.
+    // Re-check overlap inside the write lock to defeat TOCTOU races
+    // (Codex P2, v20.11.2): two concurrent overlapping creates could both
+    // pass a read-lock check and then both push, leaving duplicate
+    // entries. Doing the check + push under one write lock makes the
+    // operation atomic with respect to peer writers.
     {
         let mut cfg = state.router.config.write().unwrap();
+        let conflict = cfg.subnet_routes.iter()
+            .find(|r| r.id != route.id && routes_can_overlap(r, &route))
+            .cloned();
+        if let Some(conflict) = conflict {
+            let r_scope = scope_label(&route.node_id);
+            let c_scope = scope_label(&conflict.node_id);
+            return HttpResponse::Conflict().json(serde_json::json!({
+                "ok": false,
+                "error": format!(
+                    "A subnet route for {} already exists ({}). The new entry ({}) would overlap on at least one node — edit the existing entry or delete it first.",
+                    route.subnet_cidr, c_scope, r_scope
+                )
+            }));
+        }
         cfg.subnet_routes.push(route.clone());
-
         if let Err(e) = cfg.save() {
             return HttpResponse::InternalServerError().json(serde_json::json!({
                 "ok": false,
@@ -3341,11 +3535,35 @@ pub async fn create_subnet_route(req: HttpRequest, state: S, body: web::Json<Sub
         }
     }
 
+    // Apply to the kernel on this node if the route targets us. Bug fix
+    // (sponsor report v20.11.2): prior versions saved the route to config
+    // and replicated it cluster-wide, but never called `ip route add` on
+    // any node — so the route was visible in the UI but unreachable until
+    // the next service restart.
+    let self_id = crate::agent::self_node_id();
+    let mut apply_warning: Option<String> = None;
+    if route.enabled && super::route_targets_self(&route, &self_id) {
+        // Fresh create — no previous gateway to authorize a swap with.
+        if let Err(e) = super::apply_subnet_route(&route, None) {
+            tracing::warn!("create_subnet_route: apply failed on this node: {}", e);
+            apply_warning = Some(e);
+        } else {
+            tracing::info!(
+                "create_subnet_route: applied {} via {} on {}",
+                route.subnet_cidr, route.gateway, self_id
+            );
+        }
+    }
+
+    // Replication tells peer nodes to re-read config. config_receive on each
+    // peer now diffs old vs new subnet_routes and applies any that target it.
     replicate_config_to_cluster(state);
-    HttpResponse::Ok().json(serde_json::json!({
-        "ok": true,
-        "route": route
-    }))
+
+    let mut resp = serde_json::json!({ "ok": true, "route": route });
+    if let Some(w) = apply_warning {
+        resp["apply_warning"] = serde_json::Value::String(w);
+    }
+    HttpResponse::Ok().json(resp)
 }
 
 pub async fn update_subnet_route(
@@ -3371,18 +3589,56 @@ pub async fn update_subnet_route(
         }));
     }
 
+    // Capture the OLD route before overwriting so we can correctly remove
+    // its kernel entry if the CIDR/gateway changed or the route flipped to
+    // disabled. Without this, edits leave stale `ip route` entries behind.
+    let old_route = {
+        let cfg = state.router.config.read().unwrap();
+        cfg.subnet_routes.iter().find(|r| r.id == id).cloned()
+    };
+
+    // 404 BEFORE 409 (Codex P3, v20.11.2) — if the id doesn't exist, return
+    // Not Found regardless of whether the body would have collided with
+    // some other route. Otherwise stale-id PUTs misreport as Conflict.
+    if old_route.is_none() {
+        return HttpResponse::NotFound().json(serde_json::json!({
+            "ok": false,
+            "error": "Subnet route not found"
+        }));
+    }
+
+    // Atomic overlap-check + write (Codex P2, v20.11.2): combining both
+    // under one write lock prevents two concurrent updates from each
+    // passing a read-lock check and then both committing. The 404 was
+    // already returned above, but we still re-look-up the row here in
+    // case a concurrent delete removed it between then and now.
     {
         let mut cfg = state.router.config.write().unwrap();
+        let conflict = cfg.subnet_routes.iter()
+            .find(|r| r.id != id && routes_can_overlap(r, &updated))
+            .cloned();
+        if let Some(conflict) = conflict {
+            let u_scope = scope_label(&updated.node_id);
+            let c_scope = scope_label(&conflict.node_id);
+            return HttpResponse::Conflict().json(serde_json::json!({
+                "ok": false,
+                "error": format!(
+                    "Another subnet route for {} already exists ({}). This update ({}) would overlap on at least one node — edit that entry or delete one of them first.",
+                    updated.subnet_cidr, c_scope, u_scope
+                )
+            }));
+        }
         match cfg.subnet_routes.iter_mut().find(|r| r.id == id) {
             Some(route) => *route = updated.clone(),
             None => {
+                // Race: someone deleted us between the early 404 check
+                // and acquiring the write lock. Treat as 404 too.
                 return HttpResponse::NotFound().json(serde_json::json!({
                     "ok": false,
                     "error": "Subnet route not found"
                 }));
             }
         }
-
         if let Err(e) = cfg.save() {
             return HttpResponse::InternalServerError().json(serde_json::json!({
                 "ok": false,
@@ -3391,11 +3647,67 @@ pub async fn update_subnet_route(
         }
     }
 
+    // Reconcile kernel state on this node.
+    //
+    // Order matters (Codex P1, v20.11.2): we apply the NEW route first
+    // (apply_subnet_route uses `ip route replace`, which is atomic — failure
+    // leaves the existing route untouched), and only remove the OLD entry if
+    //   (a) the apply succeeded (or there's nothing to apply because the
+    //       route was disabled/moved off this node), AND
+    //   (b) the old destination CIDR actually differs from the new one,
+    //       because for same-CIDR edits the `replace` already overwrote it
+    //       in place — running `ip route del` would then take the route off
+    //       the kernel entirely.
+    //
+    // This means a typo in the new gateway never blackholes the previously-
+    // working route.
+    let self_id = crate::agent::self_node_id();
+    let mut apply_warning: Option<String> = None;
+    let new_should_apply = updated.enabled && super::route_targets_self(&updated, &self_id);
+    // For an update, pass the OLD gateway so apply_subnet_route can tell
+    // "this is our route, swap it" from "this is someone else's, leave it".
+    let prev_gw_for_apply = old_route.as_ref().and_then(|o| {
+        if o.enabled && super::route_targets_self(o, &self_id)
+            && o.subnet_cidr == updated.subnet_cidr {
+            Some(o.gateway.clone())
+        } else {
+            None
+        }
+    });
+    let new_apply_ok = if new_should_apply {
+        match super::apply_subnet_route(&updated, prev_gw_for_apply.as_deref()) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("update_subnet_route: apply failed on this node: {}", e);
+                apply_warning = Some(e);
+                false
+            }
+        }
+    } else {
+        true // nothing to apply, treat as "succeeded" so removal of obsolete old can proceed
+    };
+
+    if let Some(old) = &old_route {
+        let old_was_applied_here = old.enabled && super::route_targets_self(old, &self_id);
+        if old_was_applied_here {
+            let cidr_changed = updated.subnet_cidr != old.subnet_cidr;
+            // Remove the old entry only if it represents a different kernel
+            // destination than the new one and the new apply succeeded (or
+            // there is no new apply).
+            if (cidr_changed || !new_should_apply) && new_apply_ok {
+                if let Err(e) = super::remove_subnet_route(old) {
+                    tracing::warn!("update_subnet_route: remove old failed: {}", e);
+                }
+            }
+        }
+    }
+
     replicate_config_to_cluster(state);
-    HttpResponse::Ok().json(serde_json::json!({
-        "ok": true,
-        "route": updated
-    }))
+    let mut resp = serde_json::json!({ "ok": true, "route": updated });
+    if let Some(w) = apply_warning {
+        resp["apply_warning"] = serde_json::Value::String(w);
+    }
+    HttpResponse::Ok().json(resp)
 }
 
 pub async fn delete_subnet_route(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
@@ -3425,22 +3737,19 @@ pub async fn delete_subnet_route(req: HttpRequest, state: S, path: web::Path<Str
         deleted
     };
 
-    // Try to remove the route from the kernel if it was a real route
+    // Try to remove the route from the kernel if it was applied here.
+    // Codex P2 (v20.11.2): the previous version did this in a spawned
+    // blocking task, which let a fast delete→recreate sequence race —
+    // the spawned remove could fire AFTER the recreate's apply, deleting
+    // the just-installed kernel entry. Doing it synchronously matches
+    // create/update and keeps the API response well-ordered with the
+    // kernel mutation.
     if let Some(route) = deleted_route {
         let self_id = crate::agent::self_node_id();
-        // Only remove if it applies to this node
-        if route.node_id.is_none() || route.node_id.as_deref() == Some(&self_id) {
-            // Use a blocking task so we don't block the API response
-            tokio::task::spawn_blocking(move || {
-                use std::process::Command;
-                let _ = Command::new("ip")
-                    .arg("route")
-                    .arg("del")
-                    .arg(&route.subnet_cidr)
-                    .arg("via")
-                    .arg(&route.gateway)
-                    .output();
-            });
+        if super::route_targets_self(&route, &self_id) {
+            if let Err(e) = super::remove_subnet_route(&route) {
+                tracing::warn!("delete_subnet_route: remove failed: {}", e);
+            }
         }
     }
 

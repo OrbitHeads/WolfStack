@@ -2061,14 +2061,14 @@ body.sidebar-collapsed #task-log-footer {
 }
 
 /* ─── Main Content ─── */
-:root { --task-log-height: 0px; }
+:root { --task-log-height: 0px; --ws-trust-footer-height: 0px; }
 
 .main-content {
     margin-left: 260px;
-    min-height: calc(100vh - var(--task-log-height));
-    min-height: calc(100dvh - var(--task-log-height));
-    max-height: calc(100vh - var(--task-log-height));
-    max-height: calc(100dvh - var(--task-log-height));
+    min-height: calc(100vh - var(--task-log-height) - var(--ws-trust-footer-height));
+    min-height: calc(100dvh - var(--task-log-height) - var(--ws-trust-footer-height));
+    max-height: calc(100vh - var(--task-log-height) - var(--ws-trust-footer-height));
+    max-height: calc(100dvh - var(--task-log-height) - var(--ws-trust-footer-height));
     overflow-y: auto;
     transition: margin-left 0.3s ease;
 }
@@ -3555,13 +3555,16 @@ body.sidebar-collapsed #task-log-footer {
         -webkit-backdrop-filter: none !important;
     }
 
-    /* Fix viewport height for Android (address bar changes visible area) */
+    /* Fix viewport height for Android (address bar changes visible area).
+       Subtract --ws-trust-footer-height so the fixed trust footer doesn't
+       overlap the bottom of page content on mobile. The variable is 0 when
+       the footer is hidden (task log open), so this is a no-op then. */
     .main-content {
         margin-left: 0;
-        max-height: 100vh;
-        max-height: 100dvh;  /* dynamic viewport — excludes address bar */
-        min-height: 100vh;
-        min-height: 100dvh;
+        max-height: calc(100vh - var(--ws-trust-footer-height));
+        max-height: calc(100dvh - var(--ws-trust-footer-height));  /* dynamic viewport — excludes address bar */
+        min-height: calc(100vh - var(--ws-trust-footer-height));
+        min-height: calc(100dvh - var(--ws-trust-footer-height));
     }
 
     /* Solid top-bar background (replaces translucent + blur) */
