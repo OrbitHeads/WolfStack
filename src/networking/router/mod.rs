@@ -483,6 +483,11 @@ impl Default for RouterState {
 ///      dynamic ppp iface, and LAN/firewall may reference WAN zones.
 ///   2. LAN dnsmasq next — can only bind once its interface exists.
 ///   3. Firewall last — rules reference interfaces from 1+2.
+///   4. Subnet routes — kernel route entries on consumer nodes,
+///      forwarding plumbing (ip_forward / FORWARD ACCEPT / MASQUERADE
+///      / rp_filter loose) on gateway nodes. Runs even when no other
+///      router config is bound to this node, so a pure-gateway VPS
+///      gets its plumbing reinstalled after every restart/update.
 /// Safe-mode is explicitly OFF: unattended boot has no human to
 /// confirm rules within the 30s window, and auto-reverting on every
 /// reboot would be worse than "rules applied with no rollback".
@@ -503,74 +508,82 @@ pub fn apply_on_startup(state: std::sync::Arc<RouterState>, self_node_id: &str) 
         || cfg.rules.iter().any(|r| r.enabled
             && r.node_id.as_deref().map(|n| n == self_node_id).unwrap_or(true))
         || cfg.proxies.iter().any(|p| p.enabled && p.node_id == self_node_id);
-    if !applies_here {
-        tracing::debug!(
-            "WolfRouter startup: no router config bound to this node — skipping apply"
-        );
-        return;
-    }
 
-    let mut wan_ok = 0usize;
-    let mut wan_err = 0usize;
-    for conn in &cfg.wan_connections {
-        if conn.node_id != self_node_id { continue; }
-        if !conn.enabled { continue; }
-        match wan::apply(conn) {
-            Ok(()) => { wan_ok += 1; }
-            Err(e) => {
-                wan_err += 1;
-                tracing::error!(
-                    "WolfRouter startup: WAN '{}' apply failed: {}",
-                    conn.name, e
+    // WAN/DHCP/firewall/proxy work — only when this node owns at least
+    // one of those. Subnet-route plumbing is handled below regardless,
+    // because a node can be a pure subnet-route gateway (e.g. a VPS
+    // forwarding a remote LAN onto WolfNet) with no WolfRouter LAN /
+    // WAN / firewall config of its own. Sponsor klasSponsor 2026-04-28:
+    // pre-fix, a reinstall on a pure-gateway node returned early here
+    // and never re-applied ip_forward / FORWARD / MASQUERADE — the
+    // route survived but the forwarding plumbing didn't.
+    if applies_here {
+        let mut wan_ok = 0usize;
+        let mut wan_err = 0usize;
+        for conn in &cfg.wan_connections {
+            if conn.node_id != self_node_id { continue; }
+            if !conn.enabled { continue; }
+            match wan::apply(conn) {
+                Ok(()) => { wan_ok += 1; }
+                Err(e) => {
+                    wan_err += 1;
+                    tracing::error!(
+                        "WolfRouter startup: WAN '{}' apply failed: {}",
+                        conn.name, e
+                    );
+                }
+            }
+        }
+        if wan_ok + wan_err > 0 {
+            tracing::info!(
+                "WolfRouter startup: {} WAN connection(s) applied, {} failed",
+                wan_ok, wan_err
+            );
+        }
+
+        // dhcp::start_all_for_node already skips LANs bound to other
+        // nodes and logs per-LAN failures. No return value to aggregate.
+        dhcp::start_all_for_node(&cfg, self_node_id);
+
+        // Firewall — only if the user actually has rules. On a fresh
+        // install with empty rules the build produces an empty chain
+        // dump that's technically valid but emitting an info line just
+        // so sysadmins see activity at boot.
+        let ruleset = firewall::build_ruleset(&cfg, self_node_id);
+        match firewall::apply(&ruleset, false) {
+            Ok(prev) => {
+                *state.last_applied_rules.write().unwrap() = Some(prev);
+                tracing::info!(
+                    "WolfRouter startup: firewall rules applied ({} user rule(s))",
+                    cfg.rules.len()
                 );
             }
-        }
-    }
-    if wan_ok + wan_err > 0 {
-        tracing::info!(
-            "WolfRouter startup: {} WAN connection(s) applied, {} failed",
-            wan_ok, wan_err
-        );
-    }
-
-    // dhcp::start_all_for_node already skips LANs bound to other
-    // nodes and logs per-LAN failures. No return value to aggregate.
-    dhcp::start_all_for_node(&cfg, self_node_id);
-
-    // Firewall — only if the user actually has rules. On a fresh
-    // install with empty rules the build produces an empty chain
-    // dump that's technically valid but emitting an info line just
-    // so sysadmins see activity at boot.
-    let ruleset = firewall::build_ruleset(&cfg, self_node_id);
-    match firewall::apply(&ruleset, false) {
-        Ok(prev) => {
-            *state.last_applied_rules.write().unwrap() = Some(prev);
-            tracing::info!(
-                "WolfRouter startup: firewall rules applied ({} user rule(s))",
-                cfg.rules.len()
-            );
-        }
-        Err(e) => {
-            tracing::error!("WolfRouter startup: firewall apply failed: {}", e);
-        }
-    }
-
-    // Reverse-proxy vhosts — regenerate nginx site configs for every
-    // proxy bound to this node. Skip entirely when no proxies target
-    // this node, so a bare install without nginx doesn't log scary
-    // "nginx not installed" warnings on every boot.
-    if cfg.proxies.iter().any(|p| p.enabled && p.node_id == self_node_id) {
-        let warnings = proxy::apply_for_node(&cfg.proxies, self_node_id);
-        if warnings.is_empty() {
-            tracing::info!(
-                "WolfRouter startup: {} reverse-proxy vhost(s) regenerated",
-                cfg.proxies.iter().filter(|p| p.enabled && p.node_id == self_node_id).count()
-            );
-        } else {
-            for w in &warnings {
-                tracing::warn!("WolfRouter startup: proxy apply: {}", w);
+            Err(e) => {
+                tracing::error!("WolfRouter startup: firewall apply failed: {}", e);
             }
         }
+
+        // Reverse-proxy vhosts — regenerate nginx site configs for every
+        // proxy bound to this node. Skip entirely when no proxies target
+        // this node, so a bare install without nginx doesn't log scary
+        // "nginx not installed" warnings on every boot.
+        if cfg.proxies.iter().any(|p| p.enabled && p.node_id == self_node_id) {
+            let warnings = proxy::apply_for_node(&cfg.proxies, self_node_id);
+            if warnings.is_empty() {
+                tracing::info!(
+                    "WolfRouter startup: {} reverse-proxy vhost(s) regenerated",
+                    cfg.proxies.iter().filter(|p| p.enabled && p.node_id == self_node_id).count()
+                );
+            } else {
+                for w in &warnings {
+                    tracing::warn!("WolfRouter startup: proxy apply: {}", w);
+                }
+            }
+        }
+    } else {
+        tracing::debug!(
+            "WolfRouter startup: no LAN/WAN/firewall/proxy bound here — skipping those (subnet routes still checked below)"
+        );
     }
 
     // Subnet routes — apply kernel routing entries for remote subnets
