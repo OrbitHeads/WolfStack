@@ -529,6 +529,174 @@ fn bind_vfio_pci(bdf: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ─── Release / hand-back a PCI device after a VM is destroyed ───
+//
+// When a VM with PCI passthrough is deleted, we need to undo `bind_vfio_pci`
+// so the host kernel can claim the device again and use it normally. For NIC
+// passthrough specifically, the host typically had no netplan config for the
+// returned interface (cloud-init only saw it once it reappeared) — so the
+// NIC comes back unconfigured and the operator has to hand-edit netplan to
+// get DHCP working. We close that loop by writing a per-iface netplan
+// drop-in here.
+//
+// All operations are best-effort. None of them fail the calling delete
+// flow; the worst case is the device stays bound to vfio-pci (which is
+// what was happening anyway before this code existed).
+
+/// Detach a PCI device from vfio-pci and let the kernel re-bind it to the
+/// appropriate driver (e1000e, igb, nvidia, etc). Idempotent: if the device
+/// is already bound to something other than vfio-pci, this is a no-op so we
+/// don't touch user-managed devices.
+///
+/// Returns `Some(ifname)` when the device is a network controller (PCI
+/// class 0x02xxxx) and a netdev appeared after re-binding; `None` for
+/// non-NIC devices, devices that didn't re-bind, or any failure path.
+pub fn release_pci_device(bdf: &str) -> Option<String> {
+    let bdf = normalize_bdf(bdf).ok()?;
+    let dev_path = format!("/sys/bus/pci/devices/{}", bdf);
+    if !Path::new(&dev_path).exists() {
+        return None;
+    }
+
+    // Only release if the device is currently bound to vfio-pci. If the
+    // user (or a different tool) bound it to something else after a VM
+    // shutdown, leave that choice alone.
+    let bound_to_vfio = std::fs::read_link(format!("{}/driver", dev_path))
+        .ok()
+        .and_then(|p| p.file_name().and_then(|s| s.to_str()).map(String::from))
+        .as_deref()
+        == Some("vfio-pci");
+    if !bound_to_vfio {
+        return None;
+    }
+
+    // PCI class is in the form "0xCCSSPP" — class, subclass, prog-IF.
+    // Class 0x02 = Network controller (Ethernet, WLAN, etc).
+    let class_hex = std::fs::read_to_string(format!("{}/class", dev_path))
+        .unwrap_or_default();
+    let is_nic = class_hex
+        .trim()
+        .trim_start_matches("0x")
+        .to_lowercase()
+        .starts_with("02");
+
+    // Unbind from vfio-pci.
+    let _ = std::fs::write(format!("{}/driver/unbind", dev_path), bdf.as_bytes());
+
+    // Clear driver_override so the kernel's normal driver-matching logic
+    // can pick the right driver. Writing an empty string is the documented
+    // way to clear it (kernel sysfs(7)).
+    let _ = std::fs::write(format!("{}/driver_override", dev_path), b"");
+
+    // Trigger driver probe — kernel scans loaded drivers and binds the
+    // matching one (e1000e/igb/r8169/nvidia/...).
+    let _ = std::fs::write("/sys/bus/pci/drivers_probe", bdf.as_bytes());
+
+    if !is_nic {
+        return None;
+    }
+
+    // Give the kernel a brief moment to bind the driver and create the
+    // netdev. Network drivers register the netdev synchronously inside
+    // their probe, so this is usually instant — but on slow systems or
+    // when the driver wasn't pre-loaded we want a small grace period.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // Look up the iface name via /sys/bus/pci/devices/<bdf>/net/<iface>.
+    let net_dir = format!("{}/net", dev_path);
+    if let Ok(entries) = std::fs::read_dir(&net_dir) {
+        for e in entries.flatten() {
+            if let Some(name) = e.file_name().to_str() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Write a netplan drop-in giving a freshly-released NIC a DHCP config so
+/// the operator doesn't have to hand-edit netplan after VM delete. The
+/// drop-in uses `optional: true` so a future re-passthrough of the same
+/// NIC won't hang the boot (netplan will skip the missing iface).
+///
+/// No-op when /etc/netplan doesn't exist (Fedora/RHEL/Arch use NM /
+/// systemd-networkd / etc — those distros' resolvers will pick up the
+/// returned NIC themselves once udev fires).
+pub fn write_netplan_dhcp_dropin_for(iface: &str) -> Result<(), String> {
+    if !Path::new("/etc/netplan").is_dir() {
+        return Ok(());
+    }
+    // Sanity-check the iface name to avoid path traversal / weird chars.
+    if iface.is_empty()
+        || iface.len() > 32
+        || !iface
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return Err(format!("refusing to write netplan dropin for iface name `{}`", iface));
+    }
+
+    let path = format!("/etc/netplan/99-wolfstack-released-{}.yaml", iface);
+    let content = format!(
+        "# Written by WolfStack on PCI passthrough release.\n\
+         # The interface `{iface}` was returned to the host from a VM that\n\
+         # had it bound to vfio-pci. Cloud-init / the original netplan\n\
+         # didn't know about it (the NIC was missing at boot or had been\n\
+         # claimed by vfio-pci before netplan ran), so the host had no IP\n\
+         # config for it. This drop-in gives it DHCP. `optional: true`\n\
+         # means boot won't hang if the iface is later re-passthrough'd to\n\
+         # another VM and disappears again.\n\
+         #\n\
+         # Safe to delete this file once you've configured the iface in\n\
+         # your main netplan config or the iface no longer exists.\n\
+         network:\n  \
+         version: 2\n  \
+         ethernets:\n    \
+         {iface}:\n      \
+         dhcp4: true\n      \
+         optional: true\n",
+        iface = iface
+    );
+    std::fs::write(&path, content).map_err(|e| format!("write {}: {}", path, e))?;
+
+    // netplan generate (validate) → apply. Best-effort; if either fails
+    // the file is still on disk and will take effect on next boot.
+    let _ = std::process::Command::new("netplan").arg("generate").output();
+    let _ = std::process::Command::new("netplan").arg("apply").output();
+    Ok(())
+}
+
+/// Release every PCI device in `config.pci_devices` (best-effort). For
+/// network devices, also writes a netplan drop-in so the returned NIC
+/// gets DHCP without manual intervention. Called from `delete_vm` on the
+/// native QEMU path.
+pub fn release_passthrough_devices(config: &VmConfig) {
+    for p in &config.pci_devices {
+        if p.bdf.is_empty() {
+            continue;
+        }
+        if let Some(iface) = release_pci_device(&p.bdf) {
+            tracing::info!(
+                "released PCI passthrough device {} → host iface {}",
+                p.bdf,
+                iface
+            );
+            if let Err(e) = write_netplan_dhcp_dropin_for(&iface) {
+                tracing::warn!(
+                    "released NIC {} but couldn't write netplan dropin: {}",
+                    iface,
+                    e
+                );
+            }
+        } else {
+            tracing::debug!(
+                "release_pci_device({}): not bound to vfio-pci or non-NIC — no-op",
+                p.bdf
+            );
+        }
+    }
+}
+
 // ─── Proxmox qm set helpers ───
 
 /// Apply passthrough devices to a Proxmox VM via `qm set`.

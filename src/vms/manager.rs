@@ -2743,13 +2743,18 @@ impl VmManager {
     }
 
     pub fn delete_vm(&self, name: &str) -> Result<(), String> {
-        // Release the VM's WolfNet IP from the route cache so it becomes
-        // available for the next allocation. Without this, the IP stays
-        // in WOLFNET_ROUTES / routes.json until the next poll cycle, and
-        // a VM recreated immediately afterwards would see the IP as
-        // "still in use" and get empty / a different address.
-        let released_ip: Option<String> =
-            self.get_vm(name).and_then(|c| c.wolfnet_ip.clone());
+        // Capture the VM config BEFORE any destroy step. We need:
+        //   • wolfnet_ip — to release it from the route cache below.
+        //   • pci_devices — to hand back any vfio-pci-bound devices to
+        //     the host kernel after destroy (otherwise the NIC/GPU/USB
+        //     stays bound to vfio-pci forever even though the VM that
+        //     was using it is gone).
+        // We don't read it twice because libvirt's `virsh dumpxml` stops
+        // working as soon as we've called `virsh undefine`.
+        let pre_destroy_config: Option<VmConfig> = self.get_vm(name);
+        let released_ip: Option<String> = pre_destroy_config
+            .as_ref()
+            .and_then(|c| c.wolfnet_ip.clone());
 
         // On Proxmox, delegate to qm destroy
         if containers::is_proxmox() {
@@ -2784,6 +2789,9 @@ impl VmManager {
                 let bridge = Self::wn_bridge_name(name);
                 self.cleanup_wolfnet_bridge(&bridge, released_ip.as_deref());
                 if let Some(ip) = released_ip { containers::release_wolfnet_ip(&ip); }
+                if let Some(ref cfg) = pre_destroy_config {
+                    super::passthrough::release_passthrough_devices(cfg);
+                }
                 return Ok(());
             }
             // Retry without --nvram for non-UEFI VMs
@@ -2793,6 +2801,9 @@ impl VmManager {
                 let bridge = Self::wn_bridge_name(name);
                 self.cleanup_wolfnet_bridge(&bridge, released_ip.as_deref());
                 if let Some(ip) = released_ip { containers::release_wolfnet_ip(&ip); }
+                if let Some(ref cfg) = pre_destroy_config {
+                    super::passthrough::release_passthrough_devices(cfg);
+                }
                 return Ok(());
             }
             let stderr = String::from_utf8_lossy(&output2.stderr);
@@ -2804,10 +2815,18 @@ impl VmManager {
             let _ = self.stop_vm(name, true);
         }
 
-        // Load config to find extra disk files to clean up
-        if let Some(config) = self.get_vm(name) {
+        // Use the config we captured at the top of delete_vm — getting it
+        // again here would just re-read the same JSON.
+        if let Some(ref config) = pre_destroy_config {
+            // Release any PCI passthrough devices the VM was holding —
+            // unbinds them from vfio-pci so the host kernel can use them
+            // again, and writes a netplan drop-in for any returned NIC so
+            // it comes up with DHCP without the operator hand-editing
+            // /etc/netplan/. Best-effort.
+            super::passthrough::release_passthrough_devices(config);
+
             // Delete OS disk at custom path if applicable
-            let os_disk = self.vm_os_disk_path(&config);
+            let os_disk = self.vm_os_disk_path(config);
             let _ = fs::remove_file(&os_disk);
 
             // Delete all extra volume files
