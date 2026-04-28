@@ -471,6 +471,13 @@ pub async fn config_receive(
         }
     }
 
+    // Re-sync the wolfnetd CIDR table now that we've replicated the new
+    // config. This applies on every node, regardless of whether this
+    // node is consumer or gateway for any of the routes — locally
+    // originated traffic on this box may want to use a CIDR advertised
+    // by some other peer.
+    super::sync_subnet_routes_to_wolfnet(&new_cfg.subnet_routes);
+
     HttpResponse::Ok().body("synced")
 }
 
@@ -3563,6 +3570,15 @@ pub async fn create_subnet_route(req: HttpRequest, state: S, body: web::Json<Sub
         }
     }
 
+    // Tell wolfnetd about the new CIDR. Without this, kernel routes
+    // pointing at wolfnet0 stay invisible to the userspace daemon and
+    // packets get dropped before encapsulation. Order doesn't matter
+    // vs replication — wolfnet sync is local-only.
+    {
+        let cfg = state.router.config.read().unwrap();
+        super::sync_subnet_routes_to_wolfnet(&cfg.subnet_routes);
+    }
+
     // Replication tells peer nodes to re-read config. config_receive on each
     // peer now diffs old vs new subnet_routes and applies any that target it.
     replicate_config_to_cluster(state);
@@ -3721,6 +3737,10 @@ pub async fn update_subnet_route(
         }
     }
 
+    {
+        let cfg = state.router.config.read().unwrap();
+        super::sync_subnet_routes_to_wolfnet(&cfg.subnet_routes);
+    }
     replicate_config_to_cluster(state);
     let mut resp = serde_json::json!({ "ok": true, "route": updated });
     if let Some(w) = apply_warning {
@@ -3772,6 +3792,10 @@ pub async fn delete_subnet_route(req: HttpRequest, state: S, path: web::Path<Str
         }
     }
 
+    {
+        let cfg = state.router.config.read().unwrap();
+        super::sync_subnet_routes_to_wolfnet(&cfg.subnet_routes);
+    }
     replicate_config_to_cluster(state);
     HttpResponse::Ok().json(serde_json::json!({
         "ok": true,

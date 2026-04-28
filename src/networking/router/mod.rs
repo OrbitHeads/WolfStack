@@ -621,6 +621,13 @@ pub fn apply_on_startup(state: std::sync::Arc<RouterState>, self_node_id: &str) 
             }
         }
     }
+
+    // Always sync the WolfNet CIDR table — even on nodes where this
+    // node is neither consumer nor gateway, wolfnetd needs to know how
+    // to encapsulate locally-originated traffic toward advertised
+    // subnets (e.g. an app running on this box pinging into a remote
+    // LAN exposed through another peer).
+    sync_subnet_routes_to_wolfnet(&cfg.subnet_routes);
 }
 
 /// Background safe-mode tick — checks whether the rollback deadline has
@@ -992,6 +999,61 @@ pub fn first_addr_in_cidr(cidr: &str) -> Option<String> {
     if parts.len() != 4 { return None; }
     let last = parts[3].saturating_add(1);
     Some(format!("{}.{}.{}.{}", parts[0], parts[1], parts[2], last))
+}
+
+/// Write the cluster's enabled SubnetRoutes to
+/// /var/run/wolfnet/subnet-routes.json so wolfnetd can do longest-prefix
+/// matching for packets it reads off the TUN. WITHOUT this file, the
+/// kernel route on the consumer (`ip route add 10.10.0.0/16 via
+/// <gw> dev wolfnet0`) is meaningless to userspace — TUN devices have
+/// no link layer, so the kernel's "next-hop" hint is invisible to
+/// wolfnetd, and packets destined for the advertised LAN either get
+/// dropped (no peer matches the LAN IP) or sent to the first
+/// auto-gateway peer (often the wrong one). Sponsor klasSponsor
+/// 2026-04-28 hit exactly this — diagnostics all-green at the OS
+/// level, but no ping replies because wolfnetd was dropping the
+/// packets at the consumer side before encapsulation.
+///
+/// File format: { "<cidr>": "<gateway-wolfnet-ip>", ... }. Replaces
+/// the file atomically (write + rename pattern not needed: small map,
+/// single writer, wolfnetd reads on SIGHUP or 15s tick).
+///
+/// Sends SIGHUP to wolfnetd so the new map takes effect immediately
+/// (same pattern as containers/mod.rs::flush_routes_to_disk).
+pub fn sync_subnet_routes_to_wolfnet(routes: &[SubnetRoute]) {
+    use std::process::Command;
+
+    let map: std::collections::HashMap<String, String> = routes.iter()
+        .filter(|r| r.enabled)
+        .map(|r| (r.subnet_cidr.clone(), r.gateway.clone()))
+        .collect();
+
+    let path = "/var/run/wolfnet/subnet-routes.json";
+    if let Err(e) = std::fs::create_dir_all("/var/run/wolfnet") {
+        tracing::warn!("Failed to create /var/run/wolfnet: {}", e);
+        return;
+    }
+    let json = match serde_json::to_string_pretty(&map) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!("Failed to serialize subnet-routes.json: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = std::fs::write(path, &json) {
+        tracing::warn!("Failed to write {}: {}", path, e);
+        return;
+    }
+
+    // SIGHUP wolfnetd so it reloads. Best-effort: if wolfnet isn't
+    // running yet (e.g. we're applying config during early boot), the
+    // 15s periodic reload will pick the file up later.
+    if let Ok(output) = Command::new("pidof").arg("wolfnet").output() {
+        let pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !pid_str.is_empty() {
+            let _ = Command::new("kill").args(["-HUP", &pid_str]).output();
+        }
+    }
 }
 
 /// Run `ip -4 route get <first-in-subnet>` and pull out the egress iface
