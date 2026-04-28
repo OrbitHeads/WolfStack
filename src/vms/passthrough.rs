@@ -668,8 +668,11 @@ pub fn write_netplan_dhcp_dropin_for(iface: &str) -> Result<(), String> {
 
 /// Release every PCI device in `config.pci_devices` (best-effort). For
 /// network devices, also writes a netplan drop-in so the returned NIC
-/// gets DHCP without manual intervention. Called from `delete_vm` on the
-/// native QEMU path.
+/// gets DHCP without manual intervention. Called from `delete_vm` on
+/// every VM-management backend (native QEMU, libvirt, Proxmox) — the
+/// per-backend code is responsible for capturing `pre_destroy_config`
+/// before the platform's destroy step makes the source-of-truth
+/// (config file / dumpxml / qm config) unreadable.
 pub fn release_passthrough_devices(config: &VmConfig) {
     for p in &config.pci_devices {
         if p.bdf.is_empty() {

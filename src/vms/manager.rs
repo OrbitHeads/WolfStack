@@ -2771,6 +2771,14 @@ impl VmManager {
                 let bridge = Self::wn_bridge_name(&vmid.to_string());
                 self.cleanup_wolfnet_bridge(&bridge, released_ip.as_deref());
                 if let Some(ip) = released_ip { containers::release_wolfnet_ip(&ip); }
+                // Release any PCI passthrough devices the VM was holding.
+                // qm_list_all() populates VmConfig.pci_devices by running
+                // parse_proxmox_passthrough() on `qm config <vmid>`, so the
+                // pre-destroy snapshot already has the BDF list — no
+                // separate qm config parse needed here.
+                if let Some(ref cfg) = pre_destroy_config {
+                    super::passthrough::release_passthrough_devices(cfg);
+                }
                 return Ok(());
             }
             let stderr = String::from_utf8_lossy(&output.stderr);
