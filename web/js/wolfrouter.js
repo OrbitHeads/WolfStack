@@ -7501,13 +7501,16 @@
         }
 
         const sevColour = {
-            ok:                 { bg: 'rgba(34,197,94,0.15)',  fg: '#4ade80', border: 'rgba(34,197,94,0.5)',  label: '✓ Working' },
-            missing:            { bg: 'rgba(239,68,68,0.15)',  fg: '#fca5a5', border: 'rgba(239,68,68,0.5)',  label: '✗ Broken — route not in Linux' },
-            wrong_gateway:      { bg: 'rgba(234,179,8,0.15)',  fg: '#fde047', border: 'rgba(234,179,8,0.5)',  label: '⚠ Conflict — different route already there' },
-            unsupported_form:   { bg: 'rgba(234,179,8,0.15)',  fg: '#fde047', border: 'rgba(234,179,8,0.5)',  label: '⚠ Special route — needs manual fix' },
-            kernel_query_failed:{ bg: 'rgba(239,68,68,0.15)',  fg: '#fca5a5', border: 'rgba(239,68,68,0.5)',  label: '✗ Could not check' },
-            disabled:           { bg: 'rgba(148,163,184,0.15)',fg: '#94a3b8', border: 'rgba(148,163,184,0.5)',label: '⊘ Switched off' },
-            not_targeted_here:  { bg: 'rgba(148,163,184,0.15)',fg: '#94a3b8', border: 'rgba(148,163,184,0.5)',label: '— Not for this node' },
+            ok:                      { bg: 'rgba(34,197,94,0.15)',  fg: '#4ade80', border: 'rgba(34,197,94,0.5)',  label: '✓ Working' },
+            gateway_ok:              { bg: 'rgba(34,197,94,0.15)',  fg: '#4ade80', border: 'rgba(34,197,94,0.5)',  label: '✓ Working (gateway)' },
+            missing:                 { bg: 'rgba(239,68,68,0.15)',  fg: '#fca5a5', border: 'rgba(239,68,68,0.5)',  label: '✗ Broken — route not in Linux' },
+            wrong_gateway:           { bg: 'rgba(234,179,8,0.15)',  fg: '#fde047', border: 'rgba(234,179,8,0.5)',  label: '⚠ Conflict — different route already there' },
+            unsupported_form:        { bg: 'rgba(234,179,8,0.15)',  fg: '#fde047', border: 'rgba(234,179,8,0.5)',  label: '⚠ Special route — needs manual fix' },
+            gateway_misconfigured:   { bg: 'rgba(239,68,68,0.15)',  fg: '#fca5a5', border: 'rgba(239,68,68,0.5)',  label: '✗ Gateway plumbing missing' },
+            forwarding_misconfigured:{ bg: 'rgba(234,179,8,0.15)',  fg: '#fde047', border: 'rgba(234,179,8,0.5)',  label: '⚠ Half-broken — forwarding missing' },
+            kernel_query_failed:     { bg: 'rgba(239,68,68,0.15)',  fg: '#fca5a5', border: 'rgba(239,68,68,0.5)',  label: '✗ Could not check' },
+            disabled:                { bg: 'rgba(148,163,184,0.15)',fg: '#94a3b8', border: 'rgba(148,163,184,0.5)',label: '⊘ Switched off' },
+            not_targeted_here:       { bg: 'rgba(148,163,184,0.15)',fg: '#94a3b8', border: 'rgba(148,163,184,0.5)',label: '— Not for this node' },
         };
 
         // Pre-flight: detect routes whose Node Assignment matches NO node
@@ -7623,9 +7626,17 @@
             for (const [nodeId, e] of sortedEntries) {
                 const sev = sevColour[e.status] || sevColour.unsupported_form;
                 const nodeName = (topoNodeName(nodeId)) || nodeId;
+                // Gateway nodes deliberately don't install a kernel route
+                // for the CIDR they own — they reach it directly via their
+                // wolfnet0 interface and forward peer traffic in via
+                // iptables. Saying "no entry — kernel does not have this
+                // CIDR" on the gateway is misleading; show the gateway
+                // role instead so the row reads coherently.
                 const kernelLine = e.kernel_present
                     ? `<code style="font-size:11px;">${escHtml((e.kernel_raw || '').trim().split('\n')[0] || '(empty)')}</code>`
-                    : '<span style="color:var(--text-muted); font-size:11px;">(no entry — kernel does not have this CIDR)</span>';
+                    : (e.is_gateway_here
+                        ? '<span style="color:var(--text-muted); font-size:11px;">(gateway role — no kernel route expected; forwarding handled via iptables)</span>'
+                        : '<span style="color:var(--text-muted); font-size:11px;">(no entry — kernel does not have this CIDR)</span>');
                 const fwd = e.ip_forward;
                 const fwdHint = (isTarget(nodeId) && fwd === '0' && e.enabled)
                     ? `<div style="margin-top:6px; font-size:11px; color:#fde047;">⚠ <code>net.ipv4.ip_forward = 0</code> on this node — packets that need to traverse this route will be dropped. Enable forwarding with <code>sysctl -w net.ipv4.ip_forward=1</code> and persist via <code>/etc/sysctl.conf</code>.</div>`
