@@ -921,6 +921,19 @@ pub struct ForwardingState {
     /// Wolfnet iface name we inspected against (for the operator to
     /// double-check the right interface was probed).
     pub wolfnet_iface: String,
+    /// Egress interface the kernel would use to send a packet INTO the
+    /// subnet from this node — derived from `ip route get <first IP in
+    /// subnet>`. On the gateway this MUST be a LAN-side iface that's
+    /// physically connected to the subnet; if it's the wolfnet iface
+    /// we'd loop, and if it's the default-route iface the gateway has
+    /// no actual path to the LAN. v22.0.2 — added after sponsor
+    /// klasSponsor's diagnostics page went all-green but pings still
+    /// failed because the gateway VPS had no LAN-side route to
+    /// 10.10.0.0/16 (the WolfStack plumbing was correct; the gateway
+    /// box itself wasn't physically wired into the LAN).
+    pub subnet_egress_iface: Option<String>,
+    /// Source IP the kernel would pick for that egress.
+    pub subnet_egress_src: Option<String>,
 }
 
 /// Inspect the kernel forwarding state for a given subnet route. Pure
@@ -947,6 +960,14 @@ pub fn read_forwarding_state(route: &SubnetRoute) -> ForwardingState {
     let forward_out = check(&["-C", "FORWARD", "-s", &route.subnet_cidr, "-o", &wn_iface, "-j", "ACCEPT"]);
     let masquerade = check(&["-t", "nat", "-C", "POSTROUTING", "-d", &route.subnet_cidr, "-j", "MASQUERADE"]);
 
+    // Probe how the kernel would actually send a packet into the subnet.
+    // We run `ip route get` against a representative address (the network
+    // address + 1, which is in-range for any sensible CIDR). The result
+    // tells us the real egress iface and source IP — on the gateway,
+    // anything other than a LAN-facing iface is a problem WolfStack's
+    // four other checks can't detect.
+    let (subnet_egress_iface, subnet_egress_src) = inspect_subnet_egress(&route.subnet_cidr);
+
     ForwardingState {
         ip_forward,
         rp_filter_wolfnet,
@@ -955,7 +976,56 @@ pub fn read_forwarding_state(route: &SubnetRoute) -> ForwardingState {
         forward_out,
         masquerade,
         wolfnet_iface: wn_iface,
+        subnet_egress_iface,
+        subnet_egress_src,
     }
+}
+
+/// First usable address in a CIDR, suitable as a probe target for
+/// `ip route get`. Returns None on malformed CIDR. For /24+ the network
+/// address has a 0 last octet, so +1 is the conventional first host;
+/// for narrower prefixes we'd hit edge cases, but those subnets
+/// (a /31 or /32) aren't realistic destinations for subnet routing.
+pub fn first_addr_in_cidr(cidr: &str) -> Option<String> {
+    let (net, _prefix) = parse_cidr(cidr)?;
+    let parts: Vec<u8> = net.split('.').filter_map(|p| p.parse().ok()).collect();
+    if parts.len() != 4 { return None; }
+    let last = parts[3].saturating_add(1);
+    Some(format!("{}.{}.{}.{}", parts[0], parts[1], parts[2], last))
+}
+
+/// Run `ip -4 route get <first-in-subnet>` and pull out the egress iface
+/// + source IP. Returns (None, None) if anything failed (parse error,
+/// command error, kernel said unreachable). Pure read.
+fn inspect_subnet_egress(cidr: &str) -> (Option<String>, Option<String>) {
+    use std::process::Command;
+    let probe_ip = match first_addr_in_cidr(cidr) {
+        Some(ip) => ip,
+        None => return (None, None),
+    };
+    let out = Command::new("ip")
+        .args(["-4", "route", "get", &probe_ip])
+        .output();
+    let stdout = match out {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return (None, None),
+    };
+    let text = String::from_utf8_lossy(&stdout);
+    // Format examples:
+    //   "10.10.0.1 via 192.168.1.1 dev eth0 src 192.168.1.50 uid 0 \n    cache"
+    //   "10.10.0.1 dev wolfnet0 src 10.100.10.30 uid 0 \n    cache"
+    // We walk tokens looking for "dev <X>" and "src <Y>".
+    let mut iface = None;
+    let mut src = None;
+    let mut tokens = text.split_whitespace();
+    while let Some(tok) = tokens.next() {
+        match tok {
+            "dev" => iface = tokens.next().map(|s| s.to_string()),
+            "src" => src = tokens.next().map(|s| s.to_string()),
+            _ => {}
+        }
+    }
+    (iface, src)
 }
 
 /// Tear down the iptables rules that `enable_subnet_route_forwarding`

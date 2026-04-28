@@ -3850,20 +3850,54 @@ pub async fn diagnostics_subnet_routes(req: HttpRequest, state: S) -> HttpRespon
             if !fwd.masquerade {
                 missing.push("POSTROUTING MASQUERADE (LAN reply path)");
             }
-            if missing.is_empty() {
-                (
-                    "gateway_ok",
-                    format!(
-                        "Working — this node is the gateway for `{}` (wolfnet0 owns `{}`). All forwarding plumbing (ip_forward, FORWARD ACCEPT, MASQUERADE) is in place. Packets from peers will be forwarded into the LAN and replies routed back.",
-                        r.subnet_cidr, r.gateway
-                    ),
-                )
-            } else {
+
+            // v22.0.2 — even with all four plumbing pieces in place, the
+            // gateway needs an actual LAN-side path to forward packets
+            // onto. If `ip route get <first IP in subnet>` resolves out
+            // the wolfnet iface, we'd loop traffic back into the mesh
+            // (gateway has no physical connection to the LAN). Sponsor
+            // klasSponsor 2026-04-28 hit exactly this — diagnostics all
+            // green, but the gateway VPS wasn't wired into 10.10.0.0/16.
+            let egress_loop = fwd.subnet_egress_iface.as_deref()
+                == Some(fwd.wolfnet_iface.as_str());
+            let egress_unknown = fwd.subnet_egress_iface.is_none();
+
+            if !missing.is_empty() {
                 (
                     "gateway_misconfigured",
                     format!(
                         "Gateway role broken — this node owns `{}` (the route's gateway) and should be forwarding peer traffic into `{}`, but the following forwarding pieces are missing: {}. Fix: edit the route → save (re-applies plumbing), or restart WolfStack on this node.",
                         r.gateway, r.subnet_cidr, missing.join(", ")
+                    ),
+                )
+            } else if egress_loop {
+                (
+                    "gateway_no_lan_path",
+                    format!(
+                        "Plumbing is correct, but this node has no LAN-side path to `{}`. The kernel says traffic to that subnet would go back out `{}` — the same WolfNet interface peers come in on — which would loop forever. WolfStack can't forward packets the kernel itself can't reach: you need a NIC on this gateway that's physically (or via VLAN) connected to `{}` and configured with an IP in that subnet. Check `ip route get` on this node and `ip -4 addr` to confirm a LAN-facing interface exists.",
+                        r.subnet_cidr, fwd.wolfnet_iface, r.subnet_cidr
+                    ),
+                )
+            } else if egress_unknown {
+                (
+                    "gateway_egress_unknown",
+                    format!(
+                        "Plumbing is correct, but we couldn't determine where this node would actually send packets destined for `{}` — `ip route get` returned no result. Usually means the destination is unreachable from this node (no specific route AND no default route applies). Verify with `ip route get {}` on this gateway.",
+                        r.subnet_cidr,
+                        super::first_addr_in_cidr(&r.subnet_cidr).unwrap_or_else(|| r.subnet_cidr.clone())
+                    ),
+                )
+            } else {
+                let egress_summary = match (&fwd.subnet_egress_iface, &fwd.subnet_egress_src) {
+                    (Some(i), Some(s)) => format!(" Egress for `{}` resolves via `{}` (src `{}`).", r.subnet_cidr, i, s),
+                    (Some(i), None) => format!(" Egress for `{}` resolves via `{}`.", r.subnet_cidr, i),
+                    _ => String::new(),
+                };
+                (
+                    "gateway_ok",
+                    format!(
+                        "Working — this node is the gateway for `{}` (wolfnet0 owns `{}`). All forwarding plumbing (ip_forward, FORWARD ACCEPT, MASQUERADE) is in place. Packets from peers will be forwarded into the LAN and replies routed back.{}",
+                        r.subnet_cidr, r.gateway, egress_summary
                     ),
                 )
             }
