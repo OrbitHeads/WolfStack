@@ -29009,7 +29009,7 @@ async function tiLoadStatus() {
         const last = s.last_refresh_secs ? new Date(s.last_refresh_secs * 1000).toLocaleString() : 'never';
         const summary = document.getElementById('ti-status-summary');
         if (summary) {
-            const ipsetMsg = s.ipset_available ? '' : ' <span style="color:var(--warning);">⚠ ipset not installed — enforcement cannot be activated until you install it.</span>';
+            const ipsetMsg = s.ipset_available ? '' : ' <span style="color:var(--warning);">⚠ <code>ipset</code> isn\'t installed yet — WolfStack will try to install it automatically the first time you flip to enforce mode.</span>';
             summary.innerHTML = `Blocklist size: <strong>${s.blocklist_size.toLocaleString()}</strong> entries
                 (${s.blocklist_v4_count.toLocaleString()} IPv4 / ${s.blocklist_v6_count.toLocaleString()} IPv6).
                 Last refresh: <strong>${last}</strong>.${ipsetMsg}`;

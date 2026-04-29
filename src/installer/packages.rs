@@ -146,6 +146,18 @@ const PACKAGES: &[PackageMapping] = &[
         suse: Some("bind-utils"),
         service_unit: None,
     },
+    PackageMapping {
+        // Required for Threat Intel: kernel-side IP set used by the
+        // -m set --match-set rule we install in WOLFSTACK_THREAT_INTEL.
+        // No daemon — just a CLI that talks to the xt_set kernel module.
+        logical: "ipset",
+        binary: "ipset",
+        debian: Some("ipset"),
+        rhel: Some("ipset"),
+        arch: Some("ipset"),
+        suse: Some("ipset"),
+        service_unit: None,
+    },
 ];
 
 /// Outcome of an install attempt. Returned to the API caller (and

@@ -885,14 +885,38 @@ pub fn apply_state_change() -> Result<(), String> {
 
     if enforcement_active(&cfg) {
         // Going to enforce. ipset MUST be available — otherwise the
-        // iptables rule would dangle. Refuse rather than silently
-        // applying a rule that can't be evaluated.
+        // iptables rule would dangle. If it's missing, try to install
+        // it via the system package manager rather than refusing.
         if !ipset::ipset_available() {
-            return Err(
-                "ipset binary is not installed on this node. \
-                 Install ipset (apt/dnf/pacman: ipset) and try again."
-                    .to_string()
-            );
+            tracing::info!("threat-intel: ipset not present, attempting auto-install");
+            match crate::installer::packages::install("ipset") {
+                Ok(report) if report.success => {
+                    tracing::info!("threat-intel: ipset installed: {}", report.message);
+                }
+                Ok(report) => {
+                    return Err(format!(
+                        "Auto-install of ipset reported failure: {}. Install manually with `apt install ipset` (or your distro's equivalent) and try again.",
+                        report.message
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Could not auto-install ipset: {}. Install manually with `apt install ipset` (or your distro's equivalent) and try again.",
+                        e
+                    ));
+                }
+            }
+            // Re-check — install reported success but binary should now
+            // be on PATH. If still missing, something's off (PATH cache,
+            // weird package layout) and we should refuse rather than
+            // pretend.
+            if !ipset::ipset_available() {
+                return Err(
+                    "ipset auto-install reported success but the binary is still not on PATH. \
+                     Restart WolfStack or install ipset manually."
+                        .to_string()
+                );
+            }
         }
         // Seed the ipsets with whatever we have cached — typically from
         // an earlier dry-run refresh. Empty seed is fine; the kernel
