@@ -413,13 +413,16 @@
         <div id="login-version" style="text-align:center;font-size:10px;color:rgba(255,255,255,0.25);margin-top:6px;"></div>
     </div>
 
-    <!-- Startup overlay: shown until the API is reachable. Hides on
-         the first successful response from /api/auth/check. Without
-         this, refreshing the login page during a service restart (or
-         a long upgrade) shows half-loaded content and "failed to
-         fetch" errors. Adam Cogswell 2026-04-29: "the upgrade took a
-         long time to run, please stop the failed-to-fetch message". -->
-    <div id="wolfstack-starting-overlay" style="position:fixed; inset:0; background:rgba(7,11,20,0.96); z-index:9999; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:18px; color:#e2e8f0;">
+    <!-- Startup overlay: shown ONLY when the API doesn't respond
+         within the first ~400ms or fails outright. On a healthy
+         server the first /api/auth/check returns in <100ms and the
+         user never sees the overlay at all — fast logins flow
+         straight to the form / redirect. Adam Cogswell 2026-04-29:
+         the previous version flashed the overlay on every page load
+         (and on post-login redirects when index.html bounced back
+         here) because it started visible and only hid AFTER the
+         probe resolved. -->
+    <div id="wolfstack-starting-overlay" style="position:fixed; inset:0; background:rgba(7,11,20,0.96); z-index:9999; display:none; flex-direction:column; align-items:center; justify-content:center; gap:18px; color:#e2e8f0;">
         <img src="images/wolfstack-logo.png" alt="WolfStack" style="height:54px; opacity:0.85;">
         <div class="ws-spinner" style="width:42px; height:42px; border:3px solid rgba(168,85,247,0.25); border-top-color:#a855f7; border-radius:50%; animation: ws-spin 0.9s linear infinite;"></div>
         <div style="font-size:15px; font-weight:600;">Starting WolfStack on <code id="ws-host" style="background:rgba(168,85,247,0.12); padding:2px 8px; border-radius:6px; color:#c4b5fd;"></code>…</div>
@@ -431,48 +434,58 @@
         // Set the hostname in the overlay before anything else runs.
         document.getElementById('ws-host').textContent = window.location.hostname || 'this server';
 
-        // Gate every other fetch behind an API-reachability probe. We
-        // hit /api/auth/check (lightweight, unauthenticated tolerant)
-        // and retry on any failure (network error, 5xx, JSON decode
-        // error). Once it succeeds, hide the overlay and run the
-        // normal init flow. This catches the systemd-restart window
-        // and the slow-upgrade window where the binary is mid-swap.
+        // Gate every other fetch behind an API-reachability probe. The
+        // overlay starts HIDDEN and only appears if the first probe
+        // takes longer than ~400ms — on a healthy server this means
+        // no flash at all, instant form. When a real outage happens
+        // (service restart, long upgrade), the overlay reveals after
+        // the grace window and stays up until the API responds, with
+        // unbounded retry.
         function wsApiReady() {
             return new Promise((resolve) => {
                 let attempts = 0;
+                let overlayShown = false;
+                const overlayEl = document.getElementById('wolfstack-starting-overlay');
+                const showOverlay = () => {
+                    if (!overlayShown && overlayEl) {
+                        overlayEl.style.display = 'flex';
+                        overlayShown = true;
+                    }
+                };
+                // Reveal the overlay if the FIRST probe hasn't resolved
+                // by 400ms. Fast servers (<400ms) never trigger this.
+                const graceTimer = setTimeout(showOverlay, 400);
                 const probe = () => {
                     attempts++;
                     // 4s per attempt — long enough for a sluggish first
-                    // response after a fresh start, short enough that
-                    // the user gets feedback if the server is wedged.
+                    // response, short enough for feedback when wedged.
                     const ctrl = new AbortController();
                     const timer = setTimeout(() => ctrl.abort(), 4000);
                     fetch('/api/auth/check', { signal: ctrl.signal, cache: 'no-store' })
                         .then(r => {
                             clearTimeout(timer);
-                            if (r.ok) {
-                                // Got a real response — backend's awake.
-                                resolve();
-                            } else if (r.status >= 500) {
-                                // 5xx → backend's there but not happy. Keep retrying.
+                            clearTimeout(graceTimer);
+                            // Any HTTP response (even 401) means the
+                            // backend is alive enough to gate auth —
+                            // resolve and run the normal init flow.
+                            // 5xx is the only case we keep retrying
+                            // because that means the backend is up but
+                            // broken, and another second often clears it.
+                            if (r.status >= 500) {
+                                showOverlay();
                                 setTimeout(probe, 1000);
                             } else {
-                                // 4xx (e.g. 401) means backend's responding to
-                                // auth — that's "ready" for our purposes.
                                 resolve();
                             }
                         })
                         .catch(() => {
                             clearTimeout(timer);
-                            // ALWAYS retry — never give up. Some upgrades
-                            // legitimately take 2–3 minutes (binary
-                            // download + cargo build + service restart),
-                            // and a backend wedged on startup might come
-                            // back when the operator fixes whatever's
-                            // wrong. The detail line escalates wording
-                            // so the user knows we're still alive but
-                            // we never schedule a "stop" — the loop
-                            // continues until the page is closed.
+                            // Network error / abort — backend isn't
+                            // reachable. Show overlay (if not already)
+                            // and keep retrying forever, never giving
+                            // up. Detail wording escalates so the user
+                            // knows we're alive but persistent.
+                            showOverlay();
                             const detail = document.getElementById('ws-starting-detail');
                             if (detail) {
                                 if (attempts > 60) {
@@ -490,15 +503,19 @@
             });
         }
 
-        // Hide the overlay once the API is reachable, then continue
-        // with the normal page-init flow below.
+        // When ready, hide overlay (if it ever showed). The init flow
+        // below runs UNGATED so global functions (handleLogin,
+        // handleForgot, etc.) stay at top-level scope — the form's
+        // inline `onsubmit="handleLogin(event)"` can't see them
+        // otherwise. The overlay is purely visual and never blocks
+        // the login submit path. Adam Cogswell 2026-04-29: previous
+        // version wrapped everything in wsRunInitChecks() and broke
+        // login outright.
         wsApiReady().then(() => {
             const o = document.getElementById('wolfstack-starting-overlay');
             if (o) o.style.display = 'none';
-            wsRunInitChecks();
         });
 
-        function wsRunInitChecks() {
         // Check if direct login is disabled on this node
         fetch('/api/settings/login-disabled')
             .then(r => r.json())
@@ -839,8 +856,6 @@
             el.textContent = msg;
             el.classList.add('visible');
         }
-        } // close wsRunInitChecks — entered when /api/auth/check first
-          // succeeded. Until then, the startup overlay is shown.
     </script>
 </body>
 
