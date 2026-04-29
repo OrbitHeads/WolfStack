@@ -169,6 +169,13 @@ pub fn render_config(lan: &LanSegment) -> Result<String, String> {
 
 /// Start (or restart) the dnsmasq instance for a LAN.
 pub fn start(lan: &LanSegment) -> Result<(), String> {
+    // Pre-flight: verify the LAN's interface is in a state where dnsmasq
+    // can actually be useful. Without this, dnsmasq starts cleanly even
+    // when the interface is missing or has no IP — `bind-interfaces` just
+    // gives it no socket and the user gets the silent "no DHCP, no DNS"
+    // failure that's a nightmare to diagnose.
+    preflight_lan_interface(lan)?;
+
     // First render fresh config.
     let cfg_path = render_config(lan)?;
 
@@ -203,6 +210,134 @@ pub fn start(lan: &LanSegment) -> Result<(), String> {
     }
     info!("WolfRouter: dnsmasq started for LAN {} on {}", lan.name, lan.interface);
     Ok(())
+}
+
+/// Pre-flight: confirm the LAN's interface exists, is up, and has the
+/// configured router_ip assigned. Tries to bring the interface up if it
+/// finds it down — once. If anything's still wrong, returns a descriptive
+/// error explaining EXACTLY what to fix, rather than letting dnsmasq
+/// silently start with no socket.
+fn preflight_lan_interface(lan: &LanSegment) -> Result<(), String> {
+    let iface = &lan.interface;
+
+    // 1. Interface exists in /sys/class/net?
+    let sys_path = format!("/sys/class/net/{}", iface);
+    if !std::path::Path::new(&sys_path).exists() {
+        let available = list_host_interfaces();
+        return Err(format!(
+            "LAN '{}' is configured for interface '{}', but no such interface exists on this host. \
+             Available interfaces: {}. \
+             Either create the bridge first, or change the LAN's interface setting in WolfRouter.",
+            lan.name, iface,
+            if available.is_empty() { "(none)".to_string() } else { available.join(", ") }
+        ));
+    }
+
+    // 2. Operstate. If down, try once to bring it up — common case is the
+    // user has just configured the bridge and forgotten to flip it up.
+    if !is_interface_up(iface) {
+        let _ = Command::new("ip").args(["link", "set", iface, "up"]).output();
+        // Brief pause: link state transitions aren't synchronous,
+        // particularly for bridges that need to walk their slave list.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        if !is_interface_up(iface) {
+            return Err(format!(
+                "LAN '{}' interface '{}' is DOWN. Tried `ip link set {} up` but it didn't come up. \
+                 If '{}' is a bridge, it likely has no slave interfaces — add at least one with \
+                 `ip link set <slave> master {}` and `ip link set <slave> up`. \
+                 If it's a physical NIC, check the cable/driver.",
+                lan.name, iface, iface, iface, iface
+            ));
+        }
+        info!("WolfRouter: brought interface '{}' up for LAN '{}'", iface, lan.name);
+    }
+
+    // 3. IP assignment. dnsmasq's `bind-interfaces` will refuse to listen
+    // if there's no IPv4 on the interface; same applies if the only IP
+    // doesn't match the configured router_ip (clients would DHCP-request
+    // an answer from a gateway IP that doesn't exist on the local
+    // segment).
+    let assigned = interface_addresses(iface);
+    if !assigned.iter().any(|ip| ip == &lan.router_ip) {
+        let prefix = lan.subnet_cidr.split('/').nth(1).unwrap_or("24");
+        if assigned.is_empty() {
+            return Err(format!(
+                "LAN '{}' interface '{}' is up but has no IPv4 address. \
+                 The LAN's router_ip is set to '{}' — assign it with: \
+                 `ip addr add {}/{} dev {}` (and persist via your distro's network config).",
+                lan.name, iface, lan.router_ip, lan.router_ip, prefix, iface
+            ));
+        }
+        return Err(format!(
+            "LAN '{}' interface '{}' has IPv4 address(es) [{}], but the LAN's router_ip is set to '{}' — \
+             clients DHCP'd into '{}' would have a gateway that isn't on this segment. \
+             Either assign {} to {} (`ip addr add {}/{} dev {}`), or change the LAN's router_ip to one of the existing addresses.",
+            lan.name, iface,
+            assigned.join(", "),
+            lan.router_ip, lan.router_ip,
+            lan.router_ip, iface,
+            lan.router_ip, prefix, iface
+        ));
+    }
+
+    Ok(())
+}
+
+/// List all non-loopback interfaces visible to the kernel. Used to give
+/// the admin a useful "did you mean…" hint when their LAN config points
+/// at a bridge that doesn't exist.
+fn list_host_interfaces() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name == "lo" { continue; }
+                out.push(name.to_string());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// True when the kernel reports the interface as carrying or capable of
+/// carrying traffic. We accept both `up` and `unknown`:
+/// - "up": physical NIC with carrier, or bridge with active slaves
+/// - "unknown": bridges without slaves report this even when configured
+///   up; tap/tun devices likewise. dnsmasq can still bind to them.
+/// - "down" / "lowerlayerdown": dnsmasq's bind-interfaces will silently
+///   produce no socket. Refuse and surface the diagnostic.
+fn is_interface_up(iface: &str) -> bool {
+    let path = format!("/sys/class/net/{}/operstate", iface);
+    std::fs::read_to_string(&path)
+        .map(|s| {
+            let s = s.trim().to_lowercase();
+            s == "up" || s == "unknown"
+        })
+        .unwrap_or(false)
+}
+
+/// Return all IPv4 addresses currently assigned to the interface (just the
+/// host part, not CIDR). Empty Vec if `ip` isn't on PATH or the interface
+/// has nothing — the caller distinguishes those cases via the existence
+/// check that ran upstream.
+fn interface_addresses(iface: &str) -> Vec<String> {
+    let out = match Command::new("ip").args(["-o", "-4", "addr", "show", "dev", iface]).output() {
+        Ok(o) if o.status.success() => o,
+        _ => return vec![],
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut result = Vec::new();
+    for line in stdout.lines() {
+        if let Some(idx) = line.find("inet ") {
+            let after = &line[idx + 5..];
+            let cidr = after.split_whitespace().next().unwrap_or("");
+            if let Some((ip, _)) = cidr.split_once('/') {
+                result.push(ip.to_string());
+            }
+        }
+    }
+    result
 }
 
 /// Stop the dnsmasq instance for a LAN (if any). Safe to call even when
