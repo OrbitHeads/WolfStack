@@ -2250,6 +2250,13 @@
     async function wrRenderLanHealth() {
         const container = document.getElementById('wr-health-container');
         if (!container) return;
+        // Preserve the user's open/closed toggle on the cluster
+        // validation banner across the 12s auto-refresh — without this,
+        // every poll re-renders the DOM and re-collapses whatever the
+        // user had expanded. Saved before the fetch so the new HTML
+        // can restore it after.
+        const existingBanner = container.querySelector('details.wr-cluster-banner');
+        const savedBannerOpen = existingBanner ? existingBanner.open : null;
         // Fetch in parallel: cluster-wide config validation banner +
         // per-LAN health cards. Either one independently failing leaves
         // the other rendered.
@@ -2287,6 +2294,13 @@
         }
 
         container.innerHTML = banner + body;
+        // Restore the user's toggle if they had one. New banners
+        // (first render, or when payload shape changes) fall through to
+        // the default open/closed driven by severity.
+        if (savedBannerOpen !== null) {
+            const newBanner = container.querySelector('details.wr-cluster-banner');
+            if (newBanner) newBanner.open = savedBannerOpen;
+        }
     }
 
     function renderValidationBanner(payload) {
@@ -2305,12 +2319,27 @@
             totalErr += r.error_count || 0;
             const colour = (r.error_count > 0) ? '#ef4444' : (r.warning_count > 0 ? '#f59e0b' : '#22c55e');
             const ts = r.generated_at ? new Date(r.generated_at * 1000).toLocaleString() : '—';
-            return `<li><strong>${escHtml(n.node_id)}</strong>${n.is_self ? ' <span style="color:var(--text-muted);">(this node)</span>' : ''} — <span style="color:${colour};">${r.ok_count||0} ok · ${r.warning_count||0} warn · ${r.error_count||0} err</span> <span style="color:var(--text-muted);">@ ${escHtml(ts)}</span></li>`;
+            // When a node has zero ok/warn/err findings it means it has
+            // nothing configured for WolfRouter to validate (no LANs,
+            // no WANs, no firewall rules pinned to it). Render that
+            // explicitly instead of the meaningless "0 ok · 0 warn · 0 err".
+            const findings = (r.ok_count||0) + (r.warning_count||0) + (r.error_count||0);
+            const inner = findings === 0
+                ? `<span style="color:var(--text-muted);">no WolfRouter config on this node</span>`
+                : `<span style="color:${colour};">${r.ok_count||0} ok · ${r.warning_count||0} warn · ${r.error_count||0} err</span>`;
+            return `<li><strong>${escHtml(n.node_id)}</strong>${n.is_self ? ' <span style="color:var(--text-muted);">(this node)</span>' : ''} — ${inner} <span style="color:var(--text-muted);">@ ${escHtml(ts)}</span></li>`;
         }).join('');
         const summaryColour = (totalErr > 0) ? '#ef4444' : (totalWarn > 0 ? '#f59e0b' : '#22c55e');
-        const summary = `${nodes.length} node(s) · ${totalOk} ok · ${totalWarn} warn · ${totalErr} err${unreachable > 0 ? ` · ${unreachable} unreachable` : ''}`;
+        const totalFindings = totalOk + totalWarn + totalErr;
+        const summary = totalFindings === 0
+            ? `${nodes.length} node(s) · nothing to validate yet${unreachable > 0 ? ` · ${unreachable} unreachable` : ''}`
+            : `${nodes.length} node(s) · ${totalOk} ok · ${totalWarn} warn · ${totalErr} err${unreachable > 0 ? ` · ${unreachable} unreachable` : ''}`;
+        // Only auto-open when there's something the operator should
+        // act on. The wrRenderLanHealth caller preserves the user's
+        // manual toggle across refreshes via the `wr-cluster-banner`
+        // class — tagging it here so the selector finds it.
         return `
-            <details ${(totalErr > 0 || totalWarn > 0 || unreachable > 0) ? 'open' : ''} class="card" style="margin-bottom:12px;">
+            <details ${(totalErr > 0 || totalWarn > 0 || unreachable > 0) ? 'open' : ''} class="card wr-cluster-banner" style="margin-bottom:12px;">
                 <summary class="card-header" style="cursor:pointer; display:flex; gap:10px; align-items:center;">
                     <span style="color:${summaryColour}; font-weight:600;">Cluster validation:</span>
                     <span>${escHtml(summary)}</span>

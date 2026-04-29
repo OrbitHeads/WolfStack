@@ -833,6 +833,106 @@ pub fn validate_local_configs(state: &RouterState, self_node_id: &str) -> Valida
     let cfg = state.config.read().unwrap().clone();
     let mut findings: Vec<ValidationFinding> = Vec::new();
 
+    // ── Host-level baseline checks ──────────────────────────────────
+    // Run regardless of whether WolfRouter has any config items on this
+    // node — without these, a fresh Proxmox node (has its own bridges
+    // and routes but no WolfRouter LAN segments yet) would show as
+    // "nothing to validate" which is misleading. These mirror the
+    // checks GET /api/router/preflight runs but in `ValidationFinding`
+    // shape so the cluster panel can show them in one place.
+    //
+    // Adam Cogswell 2026-04-29: "how can there be no lans configured?
+    // even proxmox clusters have lans" — answer: Proxmox manages its
+    // own bridges, and WolfRouter is the SDN layer on top. Until the
+    // operator creates a WolfRouter LAN segment, there's nothing
+    // WolfRouter-specific to validate. Showing host-level info here
+    // makes the panel useful from the very first boot.
+    {
+        // IPv4 forwarding — required for any LAN/firewall routing to
+        // do useful work. Proxmox/libvirt/Docker all need this on too.
+        let forward = std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false);
+        findings.push(ValidationFinding {
+            category: "host",
+            item_id: "ip_forward".into(),
+            item_name: "IPv4 forwarding".into(),
+            severity: if forward { "ok" } else { "warning" },
+            message: if forward {
+                "net.ipv4.ip_forward = 1 — host can route between interfaces.".into()
+            } else {
+                "net.ipv4.ip_forward = 0 — without this, ANY LAN segment, firewall rule, or container bridge that needs to route traffic between interfaces will silently drop packets.".into()
+            },
+        });
+
+        // Default IPv4 route presence.
+        let default_route = std::process::Command::new("ip")
+            .args(["-4", "route", "show", "default"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        let first_route = default_route.lines().next().unwrap_or("").trim().to_string();
+        findings.push(ValidationFinding {
+            category: "host",
+            item_id: "default_route".into(),
+            item_name: "Default IPv4 route".into(),
+            severity: if first_route.is_empty() { "warning" } else { "ok" },
+            message: if first_route.is_empty() {
+                "No default IPv4 route — this node can't reach the internet, and any LAN clients masqueraded through it will get host-unreachable.".into()
+            } else {
+                format!("Present: {}", first_route)
+            },
+        });
+
+        // Non-loopback network interfaces. Useful presence signal for
+        // a fresh node — confirms the host has its kernel networking
+        // even before any WolfRouter config exists.
+        let iface_count = std::fs::read_dir("/sys/class/net")
+            .map(|d| d.filter_map(|e| e.ok())
+                 .filter(|e| e.file_name() != "lo")
+                 .count())
+            .unwrap_or(0);
+        let iface_names: Vec<String> = std::fs::read_dir("/sys/class/net")
+            .map(|d| d.filter_map(|e| e.ok())
+                 .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+                 .filter(|n| n != "lo")
+                 .collect())
+            .unwrap_or_default();
+        findings.push(ValidationFinding {
+            category: "host",
+            item_id: "interfaces".into(),
+            item_name: "Network interfaces".into(),
+            severity: if iface_count == 0 { "error" } else { "ok" },
+            message: if iface_count == 0 {
+                "No non-loopback interfaces found. This node has no usable networking.".into()
+            } else {
+                format!("{} non-loopback interface(s): {}", iface_count, iface_names.join(", "))
+            },
+        });
+
+        // /etc/hosts — minimal sanity. Without a 127.0.0.1 line, every
+        // local API call routed through "localhost" fails.
+        let hosts_ok = std::fs::read_to_string("/etc/hosts")
+            .map(|c| c.lines().any(|l| {
+                let t = l.trim();
+                !t.starts_with('#') && (t.starts_with("127.0.0.1") || t.starts_with("::1"))
+            }))
+            .unwrap_or(false);
+        findings.push(ValidationFinding {
+            category: "host",
+            item_id: "hosts_loopback".into(),
+            item_name: "/etc/hosts loopback entry".into(),
+            severity: if hosts_ok { "ok" } else { "error" },
+            message: if hosts_ok {
+                "Loopback entry present.".into()
+            } else {
+                "/etc/hosts has no `127.0.0.1 localhost` line — local API calls through `localhost` will fail.".into()
+            },
+        });
+    }
+
     // ── LANs ────────────────────────────────────────────────────────
     for lan in &cfg.lans {
         if lan.node_id != self_node_id { continue; }

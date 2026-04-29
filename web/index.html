@@ -6554,10 +6554,15 @@
                     </div>
 
                     <div id="wr-tab-health" class="wr-tab-panel" style="padding:16px; display:none;">
-                        <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:12px; flex-wrap:wrap;">
-                            <div style="font-size:12px; color:var(--text-muted); max-width:680px;">
-                                Live runtime health for every LAN — interface state, dnsmasq process, DNS port binding, plus a real UDP DNS probe. Catches the silent "DHCP works but clients can't resolve" trap. Refreshed every 10s while this tab is open.
-                            </div>
+                        <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px; margin-bottom:12px; flex-wrap:wrap;">
+                            <details style="font-size:12px; color:var(--text-muted); max-width:760px;">
+                                <summary style="cursor:pointer; font-weight:600; color:var(--text);">What does this page show?</summary>
+                                <div style="margin-top:8px; line-height:1.5;">
+                                    <p style="margin:0 0 8px 0;"><strong>Cluster validation panel</strong> (top): one-line summary per node — host basics like network interfaces present, default IPv4 route, IPv4 forwarding enabled, /etc/hosts sanity, plus any WolfRouter LANs / WANs / firewall rules pinned to that node. <strong>It only counts items WolfRouter manages</strong> — your Proxmox bridges, libvirt networks, and Docker bridges aren't included here (they're shown on the Zones / DHCP / WAN tabs).</p>
+                                    <p style="margin:0 0 8px 0;"><strong>Per-LAN cards</strong> (below): for each WolfRouter LAN segment, a real-time check of interface state, dnsmasq process, DNS port binding, and a live UDP DNS probe. Catches the silent "DHCP works but clients can't resolve" trap. <strong>Empty if you haven't created any WolfRouter LAN segments yet</strong> — go to the DHCP / LANs tab to create one.</p>
+                                    <p style="margin:0;"><strong>Auto-refresh:</strong> validation re-runs every 5 minutes server-side; this page polls every 12 seconds while open. Click ↻ Refresh to force an immediate cluster fan-out.</p>
+                                </div>
+                            </details>
                             <button class="btn btn-sm" onclick="wrRenderLanHealth()" title="Refresh now">↻ Refresh</button>
                         </div>
                         <div id="wr-health-container"></div>

@@ -1223,7 +1223,52 @@ pub async fn threat_intel_status(req: HttpRequest, state: web::Data<AppState>) -
 pub async fn threat_intel_cluster_status(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
 
-    let nodes = state.cluster.get_all_nodes();
+    // WolfRouter (and its Threat Intel tab) is per-cluster — a bastion
+    // managing 5 clusters across 14 servers should NOT see every cluster's
+    // peers lumped into every cluster view. Honour the same `?cluster=NAME`
+    // filter the topology endpoint uses; nameless nodes normalise to
+    // "WolfStack". Caveat (intentional, surfaced via the UI): the actual
+    // ThreatIntelConfig is one global file at /etc/wolfstack/threat-intel.json
+    // — propagation is cluster-wide. Adam Cogswell 2026-04-29: noticed
+    // the status panel was showing all 14 servers regardless of which
+    // cluster's WolfRouter view was open.
+    let cluster_filter = req.uri().query()
+        .and_then(|q| {
+            for pair in q.split('&') {
+                if let Some(rest) = pair.strip_prefix("cluster=") {
+                    return urlencoding::decode(rest).ok().map(|s| s.into_owned());
+                }
+            }
+            None
+        });
+    let normalize = |n: Option<&str>| -> String {
+        match n {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => "WolfStack".into(),
+        }
+    };
+    let self_cluster_raw = state.cluster.get_self_cluster_name();
+    let self_cluster_norm = normalize(
+        if self_cluster_raw.is_empty() { None } else { Some(self_cluster_raw.as_str()) }
+    );
+    let include_self = match &cluster_filter {
+        Some(want) => &self_cluster_norm == want,
+        None => true,
+    };
+
+    let all_nodes = state.cluster.get_all_nodes();
+    let nodes: Vec<_> = all_nodes.into_iter()
+        .filter(|n| {
+            if n.is_self || n.id == state.cluster.self_id {
+                include_self
+            } else {
+                match &cluster_filter {
+                    Some(want) => &normalize(n.cluster_name.as_deref()) == want,
+                    None => true,
+                }
+            }
+        })
+        .collect();
     let secret = state.cluster_secret.clone();
     let self_id = state.cluster.self_id.clone();
 
