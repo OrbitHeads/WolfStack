@@ -4682,13 +4682,63 @@ pub async fn get_lan_health(
     HttpResponse::Ok().json(report)
 }
 
-/// GET /api/router/health
-/// Aggregate every LAN's health across the cluster. Used by the Health
-/// tab's overview list.
-pub async fn list_lan_health(req: HttpRequest, state: S) -> HttpResponse {
+/// GET /api/router/health[?cluster=NAME]
+/// Aggregate every LAN's health across the requested cluster. Used by
+/// the Health tab's overview list. **Cluster-scoped**: WolfRouter is
+/// per-cluster, so a bastion managing multiple clusters must NOT mix
+/// LANs from cluster A into cluster B's view. When `?cluster=NAME` is
+/// set, LANs whose owning node isn't in that cluster are filtered out.
+pub async fn list_lan_health(
+    req: HttpRequest, state: S,
+    query: web::Query<TopologyQuery>,
+) -> HttpResponse {
     auth_or_return!(req, state);
-    let lans: Vec<LanSegment> = state.router.config.read().unwrap().lans.clone();
+    let cluster_filter = query.cluster.clone();
+    let lans_all: Vec<LanSegment> = state.router.config.read().unwrap().lans.clone();
     let self_id = crate::agent::self_node_id();
+
+    // Build a node_id → cluster_name map once so filtering N LANs is
+    // O(N) instead of O(N²) cluster lookups. Node cluster name uses the
+    // same "WolfStack" alias as the topology endpoint for nameless nodes.
+    let nodes = state.cluster.get_all_nodes();
+    let normalize = |n: Option<&str>| -> String {
+        match n {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => "WolfStack".into(),
+        }
+    };
+    let self_cluster_raw = state.cluster.get_self_cluster_name();
+    let self_cluster_norm = normalize(
+        if self_cluster_raw.is_empty() { None } else { Some(self_cluster_raw.as_str()) }
+    );
+    let mut node_cluster: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for n in &nodes {
+        // Use the canonical self_cluster for self — gossip can leave a
+        // stale name on the in-memory entry.
+        let cname = if n.is_self || n.id == self_id {
+            self_cluster_norm.clone()
+        } else {
+            normalize(n.cluster_name.as_deref())
+        };
+        node_cluster.insert(n.id.clone(), cname);
+    }
+
+    // Filter LANs by cluster_filter. LANs whose owning node we don't
+    // know about (stale config? gone-but-not-tombstoned?) fall through
+    // to "WolfStack" so they don't silently disappear.
+    let lans: Vec<LanSegment> = lans_all.into_iter()
+        .filter(|l| {
+            let lan_cluster = node_cluster.get(&l.node_id)
+                .cloned()
+                .unwrap_or_else(|| "WolfStack".into());
+            match &cluster_filter {
+                Some(want) => &lan_cluster == want,
+                None => true,
+            }
+        })
+        .collect();
+
     let mut out: Vec<super::health::LanHealth> = Vec::with_capacity(lans.len());
     for lan in lans {
         if lan.node_id == self_id {
@@ -4713,7 +4763,10 @@ pub async fn list_lan_health(req: HttpRequest, state: S) -> HttpResponse {
             });
         }
     }
-    HttpResponse::Ok().json(serde_json::json!({ "lans": out }))
+    HttpResponse::Ok().json(serde_json::json!({
+        "lans": out,
+        "cluster_filter": cluster_filter,
+    }))
 }
 
 /// POST /api/router/segments/{id}/restart-dnsmasq
@@ -5061,15 +5114,32 @@ pub async fn fix_tick_pppoe_default_route(req: HttpRequest, state: S, path: web:
     }
 }
 
-/// GET /api/router/preflight-cluster
-/// Fan out to every WolfStack node in the cluster, ask each one for
-/// its /api/router/preflight, and aggregate. The "is every node where
-/// WolfRouter runs healthy?" view. Same fan-out shape as
-/// `get_cluster_validation`. Each peer's preflight already includes
-/// the per-row Fix actions; the UI just renders all of them.
-pub async fn get_cluster_preflight(req: HttpRequest, state: S) -> HttpResponse {
+/// GET /api/router/preflight-cluster[?cluster=NAME]
+/// Fan out to every WolfStack node in the requested cluster, ask each
+/// one for its /api/router/preflight, and aggregate. **Cluster-scoped**:
+/// without `?cluster=NAME` we return every node, but the UI always
+/// passes the current cluster.
+pub async fn get_cluster_preflight(
+    req: HttpRequest, state: S,
+    query: web::Query<TopologyQuery>,
+) -> HttpResponse {
     auth_or_return!(req, state);
+    let cluster_filter = query.cluster.clone();
     let nodes = state.cluster.get_all_nodes();
+    let normalize = |n: Option<&str>| -> String {
+        match n {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => "WolfStack".into(),
+        }
+    };
+    let self_cluster_raw = state.cluster.get_self_cluster_name();
+    let self_cluster_norm = normalize(
+        if self_cluster_raw.is_empty() { None } else { Some(self_cluster_raw.as_str()) }
+    );
+    let include_self = match &cluster_filter {
+        Some(want) => &self_cluster_norm == want,
+        None => true,
+    };
     let client = &*ROUTER_RPC_CLIENT;
     let mut peer_futs = Vec::new();
     let mut local_row: Option<serde_json::Value> = None;
@@ -5080,7 +5150,7 @@ pub async fn get_cluster_preflight(req: HttpRequest, state: S) -> HttpResponse {
     // miss.
     let self_id = crate::agent::self_node_id();
     let self_node = nodes.iter().find(|n| n.is_self).cloned();
-    if let Some(sn) = self_node {
+    if include_self { if let Some(sn) = self_node {
         let host = resolve_node_address(&sn.address);
         let url = format!("http://127.0.0.1:{}/api/router/preflight", sn.port + 1);
         let secret = state.cluster_secret.clone();
@@ -5109,10 +5179,15 @@ pub async fn get_cluster_preflight(req: HttpRequest, state: S) -> HttpResponse {
             }
         }
         let _ = host; // resolve_node_address result not needed for the loopback URL
-    }
+    } } // close `if include_self {` and `if let Some(sn)`
 
     for node in &nodes {
         if node.is_self { continue; }
+        // Skip peers whose cluster doesn't match the filter.
+        let node_cluster = normalize(node.cluster_name.as_deref());
+        if let Some(want) = &cluster_filter {
+            if &node_cluster != want { continue; }
+        }
         let host = resolve_node_address(&node.address);
         let urls = [
             format!("https://{}:{}/api/router/preflight", host, node.port),
@@ -5181,20 +5256,39 @@ pub async fn get_local_validation(req: HttpRequest, state: S) -> HttpResponse {
     }
 }
 
-/// GET /api/router/validation-cluster
-/// Fan out to every cluster peer, ask for their /api/router/validation,
-/// and aggregate. The "is every node in every cluster healthy?" view
-/// the user asked for. Peer queries run in parallel; offline peers come
-/// back as `{"node_id": "...", "error": "..."}` so the UI shows a row
-/// per peer regardless of reachability.
-pub async fn get_cluster_validation(req: HttpRequest, state: S) -> HttpResponse {
+/// GET /api/router/validation-cluster[?cluster=NAME]
+/// Fan out to every peer in the requested cluster, ask for their
+/// /api/router/validation, and aggregate. **Cluster-scoped**:
+/// WolfRouter is per-cluster; without `?cluster=NAME` we return
+/// every node, but the UI always passes the current cluster.
+pub async fn get_cluster_validation(
+    req: HttpRequest, state: S,
+    query: web::Query<TopologyQuery>,
+) -> HttpResponse {
     auth_or_return!(req, state);
+    let cluster_filter = query.cluster.clone();
     let self_id = crate::agent::self_node_id();
     let nodes = state.cluster.get_all_nodes();
+    let normalize = |n: Option<&str>| -> String {
+        match n {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => "WolfStack".into(),
+        }
+    };
+    let self_cluster_raw = state.cluster.get_self_cluster_name();
+    let self_cluster_norm = normalize(
+        if self_cluster_raw.is_empty() { None } else { Some(self_cluster_raw.as_str()) }
+    );
+    // Self is included only when its cluster matches (or no filter).
+    let include_self = match &cluster_filter {
+        Some(want) => &self_cluster_norm == want,
+        None => true,
+    };
 
-    // Local snapshot first — drop the read lock before spawning peer
-    // queries so concurrent watchdog ticks aren't stalled.
-    let local_report = {
+    // Local snapshot only when we'll actually include self in the
+    // result — saves a spawn_blocking when the bastion isn't in the
+    // filtered cluster.
+    let local_report = if include_self {
         let cached = state.router.last_validation.read().unwrap().clone();
         match cached {
             Some(r) => Some(r),
@@ -5207,20 +5301,31 @@ pub async fn get_cluster_validation(req: HttpRequest, state: S) -> HttpResponse 
                 }).await.ok().flatten()
             }
         }
+    } else {
+        None
     };
 
-    // Build per-peer futures.
+    // Build per-peer futures, filtering by requested cluster. The
+    // existing topology endpoint applies the same normalisation: a
+    // node with no `cluster_name` is grouped under "WolfStack".
     let client = &*ROUTER_RPC_CLIENT;
     let mut peer_futs = Vec::new();
     let mut local_row: Option<serde_json::Value> = None;
     for node in &nodes {
         if node.is_self {
-            local_row = Some(serde_json::json!({
-                "node_id": node.id,
-                "is_self": true,
-                "report": local_report,
-            }));
+            if include_self {
+                local_row = Some(serde_json::json!({
+                    "node_id": node.id,
+                    "is_self": true,
+                    "report": local_report,
+                }));
+            }
             continue;
+        }
+        // Skip peers whose cluster doesn't match the filter.
+        let node_cluster = normalize(node.cluster_name.as_deref());
+        if let Some(want) = &cluster_filter {
+            if &node_cluster != want { continue; }
         }
         let host = resolve_node_address(&node.address);
         let urls = [
