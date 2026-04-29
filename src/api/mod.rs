@@ -1211,6 +1211,133 @@ pub async fn threat_intel_status(req: HttpRequest, state: web::Data<AppState>) -
     }))
 }
 
+/// GET /api/threat-intel/cluster-status — aggregate Threat Intel status
+/// across every WolfStack node in the cluster, so the bastion's UI can
+/// show "node X is enforcing 12k entries, last refresh 5min ago" for
+/// every peer at once instead of just the local node.
+///
+/// Self status comes from in-memory cache (cheap). Online peers are
+/// queried in parallel via the inter-node HTTP channel with a 4-second
+/// timeout each — slow peers don't block the response. Offline /
+/// non-WolfStack nodes are listed with status: null and a reason.
+pub async fn threat_intel_cluster_status(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    let nodes = state.cluster.get_all_nodes();
+    let secret = state.cluster_secret.clone();
+    let self_id = state.cluster.self_id.clone();
+
+    // Build the local node's summary up front from the in-memory cache.
+    // Cheap; doesn't do any HTTP. Same shape as the per-peer fetch result
+    // so the aggregator stays uniform.
+    let local_summary = {
+        let cfg = crate::threat_intel::ThreatIntelConfig::load();
+        let snapshot = crate::threat_intel::snapshot_cache();
+        serde_json::json!({
+            "enabled": cfg.enabled,
+            "dry_run": cfg.dry_run,
+            "paused": cfg.paused,
+            "enforcement_active": crate::threat_intel::enforcement_active(&cfg),
+            "applied": snapshot.applied,
+            "last_refresh_secs": snapshot.last_refresh_secs,
+            "blocklist_size": snapshot.blocklist_size,
+            "blocklist_v4_count": snapshot.blocklist_v4.len(),
+            "blocklist_v6_count": snapshot.blocklist_v6.len(),
+            "providers": snapshot.providers,
+            "ipset_available": crate::threat_intel::ipset::ipset_available(),
+        })
+    };
+
+    // Fetch peer statuses concurrently. Each fetch has its own short
+    // timeout; one slow peer doesn't drag the whole aggregation.
+    let client = &*API_HTTP_CLIENT;
+    let mut futures: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = serde_json::Value> + Send>>> = Vec::new();
+    for node in nodes.iter() {
+        if node.is_self || node.id == self_id {
+            // Local entry — emit synchronously.
+            let entry = serde_json::json!({
+                "id": node.id,
+                "hostname": node.hostname,
+                "address": node.address,
+                "is_self": true,
+                "online": true,
+                "reachable": true,
+                "status": local_summary.clone(),
+                "error": serde_json::Value::Null,
+            });
+            futures.push(Box::pin(async move { entry }));
+            continue;
+        }
+        if !node.online {
+            let entry = serde_json::json!({
+                "id": node.id, "hostname": node.hostname, "address": node.address,
+                "is_self": false, "online": false, "reachable": false,
+                "status": serde_json::Value::Null,
+                "error": "Node is offline",
+            });
+            futures.push(Box::pin(async move { entry }));
+            continue;
+        }
+        if node.node_type != "wolfstack" {
+            let entry = serde_json::json!({
+                "id": node.id, "hostname": node.hostname, "address": node.address,
+                "is_self": false, "online": node.online, "reachable": false,
+                "status": serde_json::Value::Null,
+                "error": format!("Node type '{}' does not run threat-intel", node.node_type),
+            });
+            futures.push(Box::pin(async move { entry }));
+            continue;
+        }
+        // Online wolfstack peer — fetch over inter-node.
+        let id = node.id.clone();
+        let hostname = node.hostname.clone();
+        let address = node.address.clone();
+        let port = node.port;
+        let secret = secret.clone();
+        let client = client.clone();
+        futures.push(Box::pin(async move {
+            let urls = build_node_urls(&address, port, "/api/threat-intel/status");
+            for url in &urls {
+                match client.get(url)
+                    .timeout(std::time::Duration::from_secs(4))
+                    .header("X-WolfStack-Secret", &secret)
+                    .send().await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        if let Ok(body) = resp.json::<serde_json::Value>().await {
+                            return serde_json::json!({
+                                "id": id, "hostname": hostname, "address": address,
+                                "is_self": false, "online": true, "reachable": true,
+                                "status": body, "error": serde_json::Value::Null,
+                            });
+                        }
+                    }
+                    Ok(resp) => {
+                        let code = resp.status();
+                        let _ = resp.bytes().await;
+                        return serde_json::json!({
+                            "id": id, "hostname": hostname, "address": address,
+                            "is_self": false, "online": true, "reachable": false,
+                            "status": serde_json::Value::Null,
+                            "error": format!("Peer returned HTTP {}", code),
+                        });
+                    }
+                    Err(_) => continue,
+                }
+            }
+            serde_json::json!({
+                "id": id, "hostname": hostname, "address": address,
+                "is_self": false, "online": true, "reachable": false,
+                "status": serde_json::Value::Null,
+                "error": "Could not reach peer (timeout / network)",
+            })
+        }));
+    }
+
+    let results = futures::future::join_all(futures).await;
+    HttpResponse::Ok().json(serde_json::json!({ "nodes": results }))
+}
+
 /// GET /api/threat-intel/lookup/{ip} — is this IP currently blocked, and which feed CIDRs match?
 pub async fn threat_intel_lookup(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
@@ -20699,6 +20826,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/threat-intel/pause", web::post().to(threat_intel_pause))
         .route("/api/threat-intel/resume", web::post().to(threat_intel_resume))
         .route("/api/threat-intel/status", web::get().to(threat_intel_status))
+        .route("/api/threat-intel/cluster-status", web::get().to(threat_intel_cluster_status))
         .route("/api/threat-intel/lookup/{ip}", web::get().to(threat_intel_lookup))
         .route("/api/settings/login-disabled", web::get().to(login_disabled_status))
         .route("/api/settings/login-disabled", web::post().to(set_login_disabled))

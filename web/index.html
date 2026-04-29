@@ -6763,6 +6763,17 @@
                         <!-- Self-blacklist banner — populated by tiLoadStatus when one or more cluster IPs appear on a feed. Hidden by default. -->
                         <div id="ti-self-banner" style="display:none; margin-bottom:16px; padding:14px 16px; background:rgba(220,38,38,0.10); border:1px solid rgba(220,38,38,0.35); border-radius:10px;"></div>
 
+                        <!-- Cluster-wide status table — shows every cluster node's threat-intel state in one place. -->
+                        <div style="background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:14px 16px; margin-bottom:16px;">
+                            <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
+                                <h4 style="margin:0; font-size:14px;">Cluster status</h4>
+                                <button class="btn btn-sm" onclick="tiLoadClusterStatus()" id="ti-cluster-refresh-btn" title="Re-fetch cluster status now">↻</button>
+                            </div>
+                            <div id="ti-cluster-status-table" style="overflow:auto;">
+                                <div style="color:var(--text-muted); font-size:13px; padding:12px 0;">Loading cluster status…</div>
+                            </div>
+                        </div>
+
                         <!-- Top status row: master state + emergency pause -->
                         <div id="ti-status-row" style="display:flex; gap:12px; flex-wrap:wrap; align-items:stretch; margin-bottom:16px;">
                             <div style="flex:2 1 360px; min-width:300px; background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:14px 16px;">

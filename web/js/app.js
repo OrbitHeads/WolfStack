@@ -28858,6 +28858,23 @@ const TI_DELISTING = {
 function tiRenderTab() {
     tiLoadConfig();
     tiLoadStatus();
+    tiLoadClusterStatus();
+    tiStartClusterPolling();
+}
+
+// Poll cluster status every 30s while the Threat Intel tab is the
+// active WolfRouter tab. Stops automatically when user switches tabs.
+var _tiClusterPollTimer = null;
+function tiStartClusterPolling() {
+    if (_tiClusterPollTimer) return; // already running
+    _tiClusterPollTimer = setInterval(() => {
+        // Only poll if the Threat Intel panel is currently visible —
+        // otherwise we'd keep hammering the cluster aggregator while
+        // the user is on a different tab.
+        const panel = document.getElementById('wr-tab-threat-intel');
+        if (!panel || panel.style.display === 'none') return;
+        tiLoadClusterStatus();
+    }, 30000);
 }
 
 function tiEsc(s) {
@@ -28910,6 +28927,90 @@ function tiRenderProviders(providers) {
             <button class="btn btn-sm" onclick="tiSaveProvider('${id}', ${needsKey})">💾 Save</button>
         </div>`;
     }).join('');
+}
+
+async function tiLoadClusterStatus() {
+    const target = document.getElementById('ti-cluster-status-table');
+    if (!target) return;
+    try {
+        const resp = await fetch('/api/threat-intel/cluster-status');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data = await resp.json();
+        tiRenderClusterStatusTable(data.nodes || []);
+    } catch (e) {
+        target.innerHTML = `<div style="color:var(--danger); font-size:12px;">Failed to load cluster status: ${tiEsc(e.message || e)}</div>`;
+    }
+}
+
+function tiBadgeForNode(s) {
+    // Mirror the colours used in the local-node status badge so the
+    // cluster table reads the same way.
+    if (!s) return '<span style="font-size:11px; padding:3px 8px; border-radius:4px; background:var(--bg-tertiary); color:var(--text-muted);">UNKNOWN</span>';
+    if (s.paused) return '<span style="font-size:11px; padding:3px 8px; border-radius:4px; background:rgba(220,38,38,0.18); color:#fca5a5;">PAUSED</span>';
+    if (s.enforcement_active && s.applied) return '<span style="font-size:11px; padding:3px 8px; border-radius:4px; background:rgba(16,185,129,0.18); color:#6ee7b7;">ENFORCING</span>';
+    if (s.enabled && s.dry_run) return '<span style="font-size:11px; padding:3px 8px; border-radius:4px; background:rgba(234,179,8,0.18); color:#fde68a;">DRY-RUN</span>';
+    if (s.enabled) return '<span style="font-size:11px; padding:3px 8px; border-radius:4px; background:rgba(99,102,241,0.18); color:#a5b4fc;">ENABLED</span>';
+    return '<span style="font-size:11px; padding:3px 8px; border-radius:4px; background:var(--bg-tertiary); color:var(--text-muted);">OFF</span>';
+}
+
+function tiRenderClusterStatusTable(rows) {
+    const target = document.getElementById('ti-cluster-status-table');
+    if (!target) return;
+    if (!rows || rows.length === 0) {
+        target.innerHTML = '<div style="color:var(--text-muted); font-size:13px; padding:8px 0;">No nodes in this cluster.</div>';
+        return;
+    }
+    // Sort: self first, then by hostname ascending.
+    rows.sort((a, b) => {
+        if (a.is_self && !b.is_self) return -1;
+        if (b.is_self && !a.is_self) return 1;
+        return String(a.hostname || '').localeCompare(String(b.hostname || ''));
+    });
+    const html = `<table style="width:100%; border-collapse:collapse; font-size:12px;">
+        <thead>
+            <tr style="border-bottom:1px solid var(--border); text-align:left;">
+                <th style="padding:6px 8px; font-weight:600; color:var(--text-secondary);">Node</th>
+                <th style="padding:6px 8px; font-weight:600; color:var(--text-secondary);">Status</th>
+                <th style="padding:6px 8px; font-weight:600; color:var(--text-secondary);">Blocklist</th>
+                <th style="padding:6px 8px; font-weight:600; color:var(--text-secondary);">Last refresh</th>
+                <th style="padding:6px 8px; font-weight:600; color:var(--text-secondary);">Notes</th>
+            </tr>
+        </thead>
+        <tbody>${rows.map(row => {
+            const dot = row.online ? '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#22c55e;margin-right:6px;"></span>' : '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#ef4444;margin-right:6px;"></span>';
+            const selfTag = row.is_self ? ' <span style="font-size:10px; padding:1px 4px; border-radius:3px; background:var(--bg-tertiary); color:var(--text-muted);">this node</span>' : '';
+            const s = row.status;
+            const blocklistCell = s
+                ? `<strong>${(s.blocklist_size || 0).toLocaleString()}</strong> <span style="color:var(--text-muted); font-size:11px;">(${(s.blocklist_v4_count||0).toLocaleString()} v4 / ${(s.blocklist_v6_count||0).toLocaleString()} v6)</span>`
+                : '<span style="color:var(--text-muted);">—</span>';
+            const lastCell = s && s.last_refresh_secs
+                ? new Date(s.last_refresh_secs * 1000).toLocaleString()
+                : '<span style="color:var(--text-muted);">never</span>';
+            // Notes column: explicit error from aggregator (offline / unreachable),
+            // or per-provider error counts when reachable.
+            let notes = '';
+            if (row.error) {
+                notes = `<span style="color:var(--warning);">${tiEsc(row.error)}</span>`;
+            } else if (s) {
+                const providerErrors = Object.entries(s.providers || {}).filter(([_, p]) => p && p.last_error);
+                if (providerErrors.length > 0) {
+                    notes = `<span style="color:var(--warning);" title="${providerErrors.map(([id, p]) => tiEsc(id + ': ' + p.last_error)).join('\n')}">${providerErrors.length} feed error(s)</span>`;
+                } else if (s.ipset_available === false) {
+                    notes = '<span style="color:var(--warning);">ipset not installed</span>';
+                } else {
+                    notes = '<span style="color:var(--text-muted);">—</span>';
+                }
+            }
+            return `<tr style="border-bottom:1px solid var(--border);">
+                <td style="padding:6px 8px;">${dot}<strong>${tiEsc(row.hostname || row.address)}</strong>${selfTag}<br><span style="font-size:10px;color:var(--text-muted);font-family:var(--font-mono);">${tiEsc(row.address)}</span></td>
+                <td style="padding:6px 8px;">${tiBadgeForNode(s)}</td>
+                <td style="padding:6px 8px;">${blocklistCell}</td>
+                <td style="padding:6px 8px;">${lastCell}</td>
+                <td style="padding:6px 8px;">${notes}</td>
+            </tr>`;
+        }).join('')}</tbody>
+    </table>`;
+    target.innerHTML = html;
 }
 
 function tiRenderSelfBanner(self_blacklisted) {
