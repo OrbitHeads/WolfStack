@@ -388,6 +388,18 @@
             </div>
         </header>
 
+        <!-- Deprecation banner: legacy Proxmox API integration -->
+        <div id="deprecated-pve-banner" style="display:none; margin:12px 16px 0; padding:14px 18px; background:rgba(234,179,8,0.12); border:1px solid rgba(234,179,8,0.4); border-radius:8px; color:var(--text-primary);">
+            <div style="display:flex; align-items:flex-start; gap:12px;">
+                <div style="font-size:20px; line-height:1;">⚠️</div>
+                <div style="flex:1; font-size:13px; line-height:1.5;">
+                    <div style="font-weight:600; margin-bottom:4px;">Proxmox API integration removed</div>
+                    <div id="deprecated-pve-banner-body" style="color:var(--text-secondary);"></div>
+                </div>
+                <button onclick="dismissProxmoxCleanupBanner()" class="btn btn-sm" style="background:var(--accent-primary); color:#fff; border:none; padding:6px 12px; border-radius:6px; cursor:pointer; white-space:nowrap;">Dismiss</button>
+            </div>
+        </div>
+
         <!-- Page Content -->
         <div class="page-content">
             <!-- ═══ Datacenter Overview ═══ -->
@@ -7869,13 +7881,6 @@ region = us-east-1"></textarea>
                 <button class="modal-close" onclick="closeModal()">&times;</button>
             </div>
             <div class="modal-body">
-                <div class="form-group">
-                    <label>Node Type</label>
-                    <select class="form-control" id="new-server-type" onchange="updateServerForm()">
-                        <option value="wolfstack">🐺 WolfStack</option>
-                        <option value="proxmox">&#x1F5A5; Proxmox VE</option>
-                    </select>
-                </div>
                 <div class="form-group" id="ws-cluster-field">
                     <label>Cluster Name</label>
                     <input type="text" class="form-control" id="new-server-cluster-name"
@@ -7899,59 +7904,6 @@ region = us-east-1"></textarea>
                 <div class="form-group">
                     <label id="new-server-port-label">Port (default: 8553)</label>
                     <input type="number" class="form-control" id="new-server-port" value="8553">
-                </div>
-                <!-- Proxmox-specific fields -->
-                <div id="pve-fields" style="display:none;">
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px;">
-                        <div class="form-group">
-                            <label>Cluster Name</label>
-                            <input type="text" class="form-control" id="new-pve-cluster-name"
-                                placeholder="My Proxmox Cluster">
-                            <small style="color: var(--text-muted);">Display name for the sidebar</small>
-                        </div>
-                        <div class="form-group">
-                            <label>PVE Node Name</label>
-                            <input type="text" class="form-control" id="new-pve-node-name"
-                                placeholder="pve1 (as shown in Proxmox sidebar)">
-                            <small style="color: var(--text-muted);">Others auto-discovered</small>
-                        </div>
-                        <div class="form-group">
-                            <label>Token ID</label>
-                            <input type="text" class="form-control" id="new-pve-token-id"
-                                placeholder="root@pam!wolfstack">
-                            <small style="color: var(--text-muted);">Datacenter → Permissions → API Tokens</small>
-                        </div>
-                        <div class="form-group">
-                            <label>Token Secret</label>
-                            <input type="text" class="form-control" id="new-pve-token-secret"
-                                placeholder="a2e0dcfb-f3eb-4674-965d-0dda7974ba73">
-                            <small style="color: var(--text-muted);">Shown only once when creating</small>
-                        </div>
-                        <div class="form-group" style="grid-column: span 2;">
-                            <label>TLS Fingerprint (optional)</label>
-                            <input type="text" class="form-control" id="new-pve-fingerprint"
-                                placeholder="Leave blank for self-signed certs">
-                        </div>
-                        <div
-                            style="grid-column: span 2; background:rgba(234,179,8,0.1); border:1px solid rgba(234,179,8,0.25); border-radius:8px; padding:14px; margin-top:4px;">
-                            <div style="font-weight:600; font-size:13px; color:var(--warning); margin-bottom:6px;">⚠️
-                                API Token Permissions Required</div>
-                            <p style="font-size:12px; color:var(--text-secondary); margin:0 0 8px;">Your token needs
-                                <strong>PVEAuditor</strong> role to read node status, VMs, and containers. Without it,
-                                nodes will show as offline.
-                            </p>
-                            <p style="font-size:12px; color:var(--text-secondary); margin:0 0 4px;"><strong>Web
-                                    UI:</strong> Datacenter → Permissions → Add → API Token Permission → Path: <code
-                                    style="background:var(--bg-tertiary);padding:1px 4px;border-radius:3px;font-size:11px;">/</code>
-                                → Role: <code
-                                    style="background:var(--bg-tertiary);padding:1px 4px;border-radius:3px;font-size:11px;">PVEAuditor</code>
-                                → Propagate ✅</p>
-                            <p style="font-size:12px; color:var(--text-secondary); margin:0;"><strong>CLI:</strong>
-                                <code
-                                    style="background:var(--bg-tertiary);padding:1px 4px;border-radius:3px;font-size:11px;">pveum aclmod / -token 'root@pam!wolfstack' -role PVEAuditor</code>
-                            </p>
-                        </div>
-                    </div>
                 </div>
                 <p id="wolfstack-hint" style="font-size: 12px; color: var(--text-muted);">
                     If using WolfNet, enter the WolfNet IP (e.g. 10.10.10.x).

@@ -1099,28 +1099,8 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                                     if n.has_kvm { format!("{}", n.vm_count) } else { "—".to_string() },
                                 ));
                             }
-                            // PVE nodes as separate rows
-                            for n in all_nodes.iter().filter(|n| n.node_type == "proxmox") {
-                                let status_class = if n.online { "online" } else { "offline" };
-                                let status_text = if n.online { "Online" } else { "Offline" };
-                                let (cpu_str, mem_str) = if let Some(ref m) = n.metrics {
-                                    let cpu = m.cpu_usage_percent;
-                                    let mem_pct = if m.memory_total_bytes > 0 { (m.memory_used_bytes as f64 / m.memory_total_bytes as f64 * 100.0) as u64 } else { 0 };
-                                    let cpu_color = if cpu > 80.0 { "#dc2626" } else if cpu > 50.0 { "#d97706" } else { "#16a34a" };
-                                    let mem_color = if mem_pct > 90 { "#dc2626" } else if mem_pct > 70 { "#d97706" } else { "#16a34a" };
-                                    (
-                                        format!(r#"<div class="bar"><div class="bar-fill" style="width:{}%;background:{}"></div></div><span class="meta">{:.0}%</span>"#, cpu.min(100.0), cpu_color, cpu),
-                                        format!(r#"<div class="bar"><div class="bar-fill" style="width:{}%;background:{}"></div></div><span class="meta">{} / {}</span>"#, mem_pct.min(100), mem_color, fmt_bytes(m.memory_used_bytes), fmt_bytes(m.memory_total_bytes)),
-                                    )
-                                } else {
-                                    ("—".to_string(), "—".to_string())
-                                };
-                                let pve_name = if n.hostname.is_empty() { &n.address } else { &n.hostname };
-                                html.push_str(&format!(
-                                    r#"<tr><td><strong>{}</strong> <span class="badge info">PVE</span><br><span class="meta">{} &bull; port {}</span></td><td><span class="badge {}">{}</span></td><td>{}</td><td>{}</td><td>—</td><td>{}</td><td>{}</td></tr>"#,
-                                    pve_name, n.address, n.port, status_class, status_text, cpu_str, mem_str, n.lxc_count, n.vm_count,
-                                ));
-                            }
+                            // (Legacy Proxmox-API entries are no longer rendered — they're surfaced
+                            // through the deprecation banner so the user can remove them.)
                             html.push_str("</tbody></table>");
 
                             // ─── Docker Containers Table ───
@@ -1312,43 +1292,6 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                                 }
                             }
 
-                            // ─── Proxmox VE Guests Table ───
-                            {
-                                let mut pve_guests: Vec<(String, crate::proxmox::PveGuest)> = Vec::new();
-                                for node in all_nodes.iter().filter(|n| n.node_type == "proxmox" && n.online) {
-                                    if let (Some(token), Some(pve_name)) = (&node.pve_token, &node.pve_node_name) {
-                                        let fp = node.pve_fingerprint.as_deref();
-                                        if let Ok((_status, _lc, _vc, _cn, guests)) = crate::proxmox::poll_pve_node(&node.address, node.port, token, fp, pve_name).await {
-                                            let label = node.pve_cluster_name.as_deref().unwrap_or(&node.hostname);
-                                            for g in guests {
-                                                pve_guests.push((label.to_string(), g));
-                                            }
-                                        }
-                                    }
-                                }
-                                if !pve_guests.is_empty() {
-                                    html.push_str(r#"<h2>Proxmox VE Guests</h2>
-                                    <table><thead><tr><th>Guest</th><th>PVE Node</th><th>Type</th><th>State</th><th>CPUs</th><th>Memory</th><th>Disk</th><th>Uptime</th></tr></thead><tbody>"#);
-                                    for (label, g) in &pve_guests {
-                                        let state_class = match g.status.as_str() { "running" => "running", "paused" => "paused", _ => "stopped" };
-                                        let type_label = if g.guest_type == "qemu" { "VM" } else { "CT" };
-                                        let uptime_str = if g.uptime == 0 { "—".to_string() } else {
-                                            let d = g.uptime / 86400; let h = (g.uptime % 86400) / 3600;
-                                            if d > 0 { format!("{}d {}h", d, h) } else { format!("{}h", h) }
-                                        };
-                                        let mem_pct = if g.maxmem > 0 { (g.mem as f64 / g.maxmem as f64 * 100.0) as u64 } else { 0 };
-                                        let disk_pct = if g.maxdisk > 0 { (g.disk as f64 / g.maxdisk as f64 * 100.0) as u64 } else { 0 };
-                                        html.push_str(&format!(
-                                            r#"<tr><td><strong>{}</strong><br><span class="meta">ID {}</span></td><td class="meta">{}</td><td><span class="badge info">{}</span></td><td><span class="badge {}">{}</span></td><td>{}</td><td>{} / {}<br><span class="meta">{}%</span></td><td>{} / {}<br><span class="meta">{}%</span></td><td>{}</td></tr>"#,
-                                            g.name, g.vmid, label, type_label, state_class, g.status, g.cpus,
-                                            fmt_bytes(g.mem), fmt_bytes(g.maxmem), mem_pct,
-                                            fmt_bytes(g.disk), fmt_bytes(g.maxdisk), disk_pct,
-                                            uptime_str,
-                                        ));
-                                    }
-                                    html.push_str("</tbody></table>");
-                                }
-                            }
 
                             // ─── Issues Table ───
                             if all_issues.is_empty() {
@@ -1447,34 +1390,9 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                              disk_used, disk_total, docker_count, lxc_count, vm_count, m.uptime_secs)
                         }).await.unwrap();
 
-                    // Collect per-guest CPU stats from Proxmox nodes in the cluster
-                    let pve_nodes: Vec<_> = ai_state.cluster.get_all_nodes().into_iter()
-                        .filter(|n| n.node_type == "proxmox" && n.online && n.pve_token.is_some())
-                        .collect();
-
-                    let mut guest_stats_owned: Vec<(String, String, u64, String, f32)> = Vec::new();
-                    for pve_node in &pve_nodes {
-                        let token = pve_node.pve_token.as_deref().unwrap_or("");
-                        let pve_name = pve_node.pve_node_name.as_deref().unwrap_or(&pve_node.hostname);
-                        let fp = pve_node.pve_fingerprint.as_deref();
-                        if let Ok((_status, _lxc, _vm, _cluster, guests)) =
-                            crate::proxmox::poll_pve_node(&pve_node.address, pve_node.port, token, fp, pve_name).await
-                        {
-                            for g in guests.iter().filter(|g| g.status == "running") {
-                                guest_stats_owned.push((
-                                    pve_name.to_string(),
-                                    g.guest_type.clone(),
-                                    g.vmid,
-                                    g.name.clone(),
-                                    g.cpu,
-                                ));
-                            }
-                        }
-                    }
-
-                    let guest_stats_refs: Vec<(&str, &str, u64, &str, f32)> = guest_stats_owned.iter()
-                        .map(|(node, gtype, vmid, name, cpu)| (node.as_str(), gtype.as_str(), *vmid, name.as_str(), *cpu))
-                        .collect();
+                    // Legacy Proxmox-API guests no longer feed AI metrics — those entries are
+                    // surfaced via the deprecation banner and not polled.
+                    let guest_stats_refs: Vec<(&str, &str, u64, &str, f32)> = Vec::new();
 
                     // Gather Kubernetes cluster health (blocking kubectl calls)
                     let k8s_health = tokio::task::spawn_blocking(|| {

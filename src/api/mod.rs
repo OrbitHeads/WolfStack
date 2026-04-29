@@ -1115,6 +1115,31 @@ pub async fn systemd_service_action(req: HttpRequest, state: web::Data<AppState>
     }
 }
 
+/// GET /api/cluster/proxmox-cleanup — return the notice (if any) of legacy
+/// Proxmox-API entries that were auto-removed on startup. The UI shows a
+/// banner while this exists.
+pub async fn proxmox_cleanup_notice(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match crate::agent::ProxmoxCleanupNotice::load() {
+        Some(notice) => HttpResponse::Ok().json(serde_json::json!({
+            "removed_count": notice.removed_count,
+            "addresses": notice.addresses,
+            "backup_path": notice.backup_path,
+            "timestamp": notice.timestamp,
+        })),
+        None => HttpResponse::Ok().json(serde_json::json!({ "removed_count": 0 })),
+    }
+}
+
+/// POST /api/cluster/proxmox-cleanup/dismiss — dismiss the banner (deletes notice file)
+pub async fn proxmox_cleanup_dismiss(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match crate::agent::ProxmoxCleanupNotice::dismiss() {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "dismissed": true })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
 /// GET /api/nodes — all cluster nodes
 pub async fn get_nodes(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     let caller = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
@@ -1327,21 +1352,24 @@ pub async fn cluster_secret_receive(req: HttpRequest, state: web::Data<AppState>
 
 /// POST /api/nodes — add a server to the cluster
 #[derive(Deserialize)]
+#[allow(dead_code)]
 pub struct AddServerRequest {
     pub address: String,
     pub port: Option<u16>,
     #[serde(default)]
-    pub node_type: Option<String>,       // "wolfstack" (default) or "proxmox"
+    pub node_type: Option<String>,       // "wolfstack" (default) or "proxmox" (rejected with 410)
     #[serde(default)]
     pub join_token: Option<String>,      // Required for WolfStack nodes — validates against remote
+    // Legacy Proxmox-only fields: kept on the struct so old clients still get parsed
+    // (and answered with a friendly 410) instead of a JSON deserialisation error.
     #[serde(default)]
-    pub pve_token: Option<String>,       // PVEAPIToken=user@realm!tokenid=uuid
+    pub pve_token: Option<String>,
     #[serde(default)]
     pub pve_fingerprint: Option<String>,
     #[serde(default)]
     pub pve_node_name: Option<String>,
     #[serde(default)]
-    pub pve_cluster_name: Option<String>, // User-friendly cluster name for sidebar
+    pub pve_cluster_name: Option<String>,
     #[serde(default)]
     pub cluster_name: Option<String>,     // Generic cluster name for WolfStack nodes
 }
@@ -1359,239 +1387,166 @@ pub async fn add_node(req: HttpRequest, state: web::Data<AppState>, body: web::J
     let node_type = body.node_type.as_deref().unwrap_or("wolfstack");
 
     if node_type == "proxmox" {
-        let port = body.port.unwrap_or(8006);
-        let token = body.pve_token.clone().unwrap_or_default();
-        let fingerprint = body.pve_fingerprint.clone();
-        let pve_node_name = body.pve_node_name.clone().unwrap_or_default();
-        let cluster_name = body.pve_cluster_name.clone();
-
-        if token.is_empty() || pve_node_name.is_empty() {
-            return HttpResponse::BadRequest().json(serde_json::json!({
-                "error": "Proxmox nodes require pve_token and pve_node_name"
-            }));
-        }
-
-        // Block duplicate Proxmox nodes — check if this address+port+node_name already exists
-        let existing_nodes = state.cluster.get_all_nodes();
-        for existing in &existing_nodes {
-            if existing.address == body.address && existing.port == port
-                && existing.pve_node_name.as_deref() == Some(&pve_node_name)
-            {
-                return HttpResponse::Conflict().json(serde_json::json!({
-                    "error": format!(
-                        "Proxmox node '{}' at {}:{} already exists in the cluster (id: '{}'). \
-                         Remove the existing node first if you want to re-add it.",
-                        pve_node_name, body.address, port, existing.id
-                    )
-                }));
-            }
-        }
-
-        // Try to discover all nodes in the cluster
-        let client = crate::proxmox::PveClient::new(&body.address, port, &token, fingerprint.as_deref(), &pve_node_name);
-        let discovered = client.discover_nodes().await.unwrap_or_default();
-
-        let mut added_ids = Vec::new();
-        let mut added_nodes = Vec::new();
-        let mut skipped_nodes = Vec::new();
-
-        if discovered.len() > 1 {
-            // Multi-node cluster — add each discovered node (skip duplicates)
-            for node_name in &discovered {
-                // Skip if this node already exists
-                let already_exists = existing_nodes.iter().any(|n|
-                    n.address == body.address && n.port == port
-                    && n.pve_node_name.as_deref() == Some(node_name)
-                );
-                if already_exists {
-                    skipped_nodes.push(node_name.clone());
-                    continue;
-                }
-                let id = state.cluster.add_proxmox_server(
-                    body.address.clone(), port, token.clone(),
-                    fingerprint.clone(), node_name.clone(), cluster_name.clone(),
-                );
-
-                added_ids.push(id);
-                added_nodes.push(node_name.clone());
-            }
-        } else {
-            // Single node or discovery failed — add just the specified node
-            let id = state.cluster.add_proxmox_server(
-                body.address.clone(), port, token, fingerprint,
-                pve_node_name.clone(), cluster_name.clone(),
-            );
-
-            added_ids.push(id);
-            added_nodes.push(pve_node_name.clone());
-        }
-
-        HttpResponse::Ok().json(serde_json::json!({
-            "ids": added_ids,
-            "address": body.address,
-            "port": port,
-            "node_type": "proxmox",
-            "nodes_discovered": added_nodes,
-            "nodes_skipped": skipped_nodes,
-            "cluster_name": cluster_name,
-        }))
-    } else {
-        let port = body.port.unwrap_or(8553);
-        let cluster_name = body.cluster_name.clone();
-
-        // Validate join token against the remote server
-        let join_token = body.join_token.clone().unwrap_or_default();
-        if join_token.is_empty() {
-            return HttpResponse::BadRequest().json(serde_json::json!({
-                "error": "Join token is required. Get it from the remote server's dashboard."
-            }));
-        }
-
-        // Call the remote server to verify the token
-        // Try HTTPS on the given port first (accept self-signed certs), then HTTP on port+1 (inter-node port)
-        let verify_path = format!("/api/cluster/verify-token?token={}", join_token);
-        let urls = vec![
-            format!("https://{}:{}{}", body.address, port, verify_path),
-            format!("http://{}:{}{}", body.address, port + 1, verify_path),
-            format!("http://{}:{}{}", body.address, port, verify_path),
-        ];
-
-        let client = &*API_HTTP_CLIENT;
-
-        let mut last_error = String::new();
-        let mut verified = false;
-        for url in &urls {
-            match client.get(url).timeout(std::time::Duration::from_secs(5)).send().await {
-                Ok(resp) => {
-                    if let Ok(data) = resp.json::<serde_json::Value>().await {
-                        if data.get("valid").and_then(|v| v.as_bool()) == Some(true) {
-
-                            verified = true;
-                            break;
-                        } else {
-                            let err_msg = data.get("error").and_then(|v| v.as_str()).unwrap_or("Invalid join token");
-                            return HttpResponse::Forbidden().json(serde_json::json!({
-                                "error": err_msg
-                            }));
-                        }
-                    }
-                    // Got a response but couldn't parse — try next URL
-                    last_error = format!("Unparseable response from {}", url);
-                }
-                Err(e) => {
-                    last_error = format!("{}", e);
-                    // Connection failed — try next URL
-                }
-            }
-        }
-
-        if !verified {
-            return HttpResponse::BadGateway().json(serde_json::json!({
-                "error": format!("Cannot reach remote server at {}:{} — {}", body.address, port, last_error)
-            }));
-        }
-
-        // Check for WolfNet IP conflicts before adding the node.
-        // Fetch the remote node's status to get its wolfnet_ips, then compare
-        // against all IPs known in this cluster (local + remote via route cache).
-        let status_urls = build_node_urls(&body.address, port, "/api/agent/status");
-        let cluster_secret = crate::auth::load_cluster_secret();
-        let default_secret = crate::auth::default_cluster_secret();
-        let mut remote_wolfnet_ips: Vec<String> = Vec::new();
-        for url in &status_urls {
-            // Try the active cluster secret first, then the default (new node may not have received custom secret yet)
-            for secret in [&cluster_secret, &default_secret.to_string()] {
-                if let Ok(resp) = client.get(url)
-                    .timeout(std::time::Duration::from_secs(5))
-                    .header("X-WolfStack-Secret", secret)
-                    .send().await
-                {
-                    if resp.status().is_success() {
-                        if let Ok(data) = resp.json::<serde_json::Value>().await {
-                            if let Some(ips) = data.get("wolfnet_ips").and_then(|v| v.as_array()) {
-                                remote_wolfnet_ips = ips.iter()
-                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                    .collect();
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-            if !remote_wolfnet_ips.is_empty() { break; }
-        }
-
-        if !remote_wolfnet_ips.is_empty() {
-            // Collect all WolfNet IPs known in this cluster
-            let local_ips = containers::wolfnet_used_ips();
-            let route_ips: Vec<String> = containers::WOLFNET_ROUTES.lock().unwrap()
-                .keys().cloned().collect();
-
-            let mut conflicts = Vec::new();
-            for ip in &remote_wolfnet_ips {
-                if local_ips.contains(ip) || route_ips.contains(ip) {
-                    conflicts.push(ip.clone());
-                }
-            }
-            if !conflicts.is_empty() {
-                return HttpResponse::Conflict().json(serde_json::json!({
-                    "error": format!(
-                        "Cannot join node: WolfNet IP conflict — {} is already in use in this cluster. \
-                         Change the node's IP in /etc/wolfnet/config.toml and restart wolfnet before joining.",
-                        conflicts.join(", ")
-                    )
-                }));
-            }
-        }
-
-        // Block duplicate nodes — check if a node with this address:port already exists
-        let existing_nodes = state.cluster.get_all_nodes();
-        for existing in &existing_nodes {
-            if existing.address == body.address && existing.port == port {
-                return HttpResponse::Conflict().json(serde_json::json!({
-                    "error": format!(
-                        "A node at {}:{} already exists in the cluster (hostname: '{}', id: '{}'). \
-                         Remove the existing node first if you want to re-add it.",
-                        body.address, port, existing.hostname, existing.id
-                    )
-                }));
-            }
-        }
-
-        let id = state.cluster.add_server(body.address.clone(), port, cluster_name.clone());
-
-        // If we have a custom cluster secret (on disk), push it to the new node
-        let active_secret = crate::auth::load_cluster_secret();
-        if active_secret != crate::auth::default_cluster_secret() {
-            let addr = body.address.clone();
-            let secret = active_secret;
-            tokio::spawn(async move {
-                let client = &*API_HTTP_CLIENT;
-                let urls = build_node_urls(&addr, port, "/api/cluster/secret/receive");
-                for url in &urls {
-                    if let Ok(resp) = client.post(url)
-                        .timeout(std::time::Duration::from_secs(10))
-                        .header("X-WolfStack-Secret", crate::auth::default_cluster_secret())
-                        .json(&serde_json::json!({ "secret": secret }))
-                        .send()
-                        .await
-                    {
-                        let success = resp.status().is_success();
-                        let _ = resp.bytes().await;
-                        if success { break; }
-                    }
-                }
-            });
-        }
-
-        HttpResponse::Ok().json(serde_json::json!({
-            "id": id,
-            "address": body.address,
-            "port": port,
-            "node_type": "wolfstack",
-            "cluster_name": cluster_name,
-        }))
+        return HttpResponse::Gone().json(serde_json::json!({
+            "error": "Proxmox API nodes have been deprecated, please install WolfStack on each node and then add them as WolfStack nodes to the main cluster — see our install page at https://wolfstack.org/download.php"
+        }));
     }
+
+    let port = body.port.unwrap_or(8553);
+    let cluster_name = body.cluster_name.clone();
+
+    // Validate join token against the remote server
+    let join_token = body.join_token.clone().unwrap_or_default();
+    if join_token.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "Join token is required. Get it from the remote server's dashboard."
+        }));
+    }
+
+    // Call the remote server to verify the token
+    // Try HTTPS on the given port first (accept self-signed certs), then HTTP on port+1 (inter-node port)
+    let verify_path = format!("/api/cluster/verify-token?token={}", join_token);
+    let urls = vec![
+        format!("https://{}:{}{}", body.address, port, verify_path),
+        format!("http://{}:{}{}", body.address, port + 1, verify_path),
+        format!("http://{}:{}{}", body.address, port, verify_path),
+    ];
+
+    let client = &*API_HTTP_CLIENT;
+
+    let mut last_error = String::new();
+    let mut verified = false;
+    for url in &urls {
+        match client.get(url).timeout(std::time::Duration::from_secs(5)).send().await {
+            Ok(resp) => {
+                if let Ok(data) = resp.json::<serde_json::Value>().await {
+                    if data.get("valid").and_then(|v| v.as_bool()) == Some(true) {
+
+                        verified = true;
+                        break;
+                    } else {
+                        let err_msg = data.get("error").and_then(|v| v.as_str()).unwrap_or("Invalid join token");
+                        return HttpResponse::Forbidden().json(serde_json::json!({
+                            "error": err_msg
+                        }));
+                    }
+                }
+                // Got a response but couldn't parse — try next URL
+                last_error = format!("Unparseable response from {}", url);
+            }
+            Err(e) => {
+                last_error = format!("{}", e);
+                // Connection failed — try next URL
+            }
+        }
+    }
+
+    if !verified {
+        return HttpResponse::BadGateway().json(serde_json::json!({
+            "error": format!("Cannot reach remote server at {}:{} — {}", body.address, port, last_error)
+        }));
+    }
+
+    // Check for WolfNet IP conflicts before adding the node.
+    // Fetch the remote node's status to get its wolfnet_ips, then compare
+    // against all IPs known in this cluster (local + remote via route cache).
+    let status_urls = build_node_urls(&body.address, port, "/api/agent/status");
+    let cluster_secret = crate::auth::load_cluster_secret();
+    let default_secret = crate::auth::default_cluster_secret();
+    let mut remote_wolfnet_ips: Vec<String> = Vec::new();
+    for url in &status_urls {
+        // Try the active cluster secret first, then the default (new node may not have received custom secret yet)
+        for secret in [&cluster_secret, &default_secret.to_string()] {
+            if let Ok(resp) = client.get(url)
+                .timeout(std::time::Duration::from_secs(5))
+                .header("X-WolfStack-Secret", secret)
+                .send().await
+            {
+                if resp.status().is_success() {
+                    if let Ok(data) = resp.json::<serde_json::Value>().await {
+                        if let Some(ips) = data.get("wolfnet_ips").and_then(|v| v.as_array()) {
+                            remote_wolfnet_ips = ips.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect();
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        if !remote_wolfnet_ips.is_empty() { break; }
+    }
+
+    if !remote_wolfnet_ips.is_empty() {
+        // Collect all WolfNet IPs known in this cluster
+        let local_ips = containers::wolfnet_used_ips();
+        let route_ips: Vec<String> = containers::WOLFNET_ROUTES.lock().unwrap()
+            .keys().cloned().collect();
+
+        let mut conflicts = Vec::new();
+        for ip in &remote_wolfnet_ips {
+            if local_ips.contains(ip) || route_ips.contains(ip) {
+                conflicts.push(ip.clone());
+            }
+        }
+        if !conflicts.is_empty() {
+            return HttpResponse::Conflict().json(serde_json::json!({
+                "error": format!(
+                    "Cannot join node: WolfNet IP conflict — {} is already in use in this cluster. \
+                     Change the node's IP in /etc/wolfnet/config.toml and restart wolfnet before joining.",
+                    conflicts.join(", ")
+                )
+            }));
+        }
+    }
+
+    // Block duplicate nodes — check if a node with this address:port already exists
+    let existing_nodes = state.cluster.get_all_nodes();
+    for existing in &existing_nodes {
+        if existing.address == body.address && existing.port == port {
+            return HttpResponse::Conflict().json(serde_json::json!({
+                "error": format!(
+                    "A node at {}:{} already exists in the cluster (hostname: '{}', id: '{}'). \
+                     Remove the existing node first if you want to re-add it.",
+                    body.address, port, existing.hostname, existing.id
+                )
+            }));
+        }
+    }
+
+    let id = state.cluster.add_server(body.address.clone(), port, cluster_name.clone());
+
+    // If we have a custom cluster secret (on disk), push it to the new node
+    let active_secret = crate::auth::load_cluster_secret();
+    if active_secret != crate::auth::default_cluster_secret() {
+        let addr = body.address.clone();
+        let secret = active_secret;
+        tokio::spawn(async move {
+            let client = &*API_HTTP_CLIENT;
+            let urls = build_node_urls(&addr, port, "/api/cluster/secret/receive");
+            for url in &urls {
+                if let Ok(resp) = client.post(url)
+                    .timeout(std::time::Duration::from_secs(10))
+                    .header("X-WolfStack-Secret", crate::auth::default_cluster_secret())
+                    .json(&serde_json::json!({ "secret": secret }))
+                    .send()
+                    .await
+                {
+                    let success = resp.status().is_success();
+                    let _ = resp.bytes().await;
+                    if success { break; }
+                }
+            }
+        });
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "id": id,
+        "address": body.address,
+        "port": port,
+        "node_type": "wolfstack",
+        "cluster_name": cluster_name,
+    }))
 }
 
 /// DELETE /api/nodes/{id} — remove a server
@@ -11697,8 +11652,10 @@ pub async fn wolfflow_infrastructure(req: HttpRequest, state: web::Data<AppState
     let mut clusters: std::collections::HashMap<String, Vec<serde_json::Value>> = std::collections::HashMap::new();
 
     for node in &nodes {
+        // Skip legacy Proxmox-API-only entries — they're surfaced via the deprecation banner.
+        if node.node_type == "proxmox" { continue; }
+
         let cluster_name = node.cluster_name.clone()
-            .or(node.pve_cluster_name.clone())
             .unwrap_or_else(|| "Default".to_string());
 
         let mut node_data = serde_json::json!({
@@ -20125,6 +20082,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/cluster/diagnose", web::post().to(cluster_diagnose))
         .route("/api/nodes", web::get().to(get_nodes))
         .route("/api/nodes", web::post().to(add_node))
+        .route("/api/cluster/proxmox-cleanup", web::get().to(proxmox_cleanup_notice))
+        .route("/api/cluster/proxmox-cleanup/dismiss", web::post().to(proxmox_cleanup_dismiss))
         .route("/api/nodes/{id}", web::get().to(get_node))
         .route("/api/nodes/{id}", web::delete().to(remove_node))
         .route("/api/nodes/{id}/settings", web::patch().to(update_node_settings))

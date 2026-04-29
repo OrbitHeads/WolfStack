@@ -1879,17 +1879,9 @@ function buildServerTree(nodes) {
     // On first build (no expanded state saved yet), expand self node
     const isFirstBuild = expandedNodes.size === 0;
 
-    // Separate WolfStack and PVE nodes
+    // PVE-typed nodes (legacy API integration) are hidden from the sidebar — they're
+    // surfaced through the deprecation banner instead. Only render WolfStack nodes here.
     const wsNodes = sorted.filter(n => n.node_type !== 'proxmox');
-    const pveNodes = sorted.filter(n => n.node_type === 'proxmox');
-
-    // Group PVE nodes by cluster name (or address as fallback)
-    const pveClusters = {};
-    pveNodes.forEach(n => {
-        const key = n.pve_cluster_name || n.address;
-        if (!pveClusters[key]) pveClusters[key] = [];
-        pveClusters[key].push(n);
-    });
 
     let html = '';
 
@@ -2031,55 +2023,6 @@ function buildServerTree(nodes) {
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="wolfram" onclick="selectServerView('${node.id}', 'wolfram')">
                             <span class="icon">🧠</span> Wolfram
-                        </a>
-                    </div>
-                </div>`;
-        });
-
-        html += `
-            </div>
-        </div>`;
-    });
-
-    // Render PVE clusters (grouped)
-    // Sort PVE clusters alphabetically
-    const pveKeys = Object.keys(pveClusters).sort((a, b) => a.localeCompare(b));
-
-    pveKeys.forEach(clusterName => {
-        const clusterNodes = pveClusters[clusterName];
-        const clusterId = 'pve-cluster-' + clusterName.replace(/[^a-zA-Z0-9]/g, '_');
-        const shouldExpandCluster = isFirstBuild ? false : expandedNodes.has(clusterId);
-        const anyOnline = clusterNodes.some(n => n.online);
-        const nodeIds = clusterNodes.map(n => `'${n.id}'`).join(',');
-
-        html += `
-        <div class="server-tree-node">
-            <div class="server-node-header" data-cluster-id="${clusterId}" onclick="toggleServerNode('${clusterId}')" style="background: linear-gradient(90deg, rgba(99,102,241,0.05), transparent);">
-                <span class="tree-toggle ${shouldExpandCluster ? 'expanded' : ''}" id="toggle-${clusterId}">▶</span>
-                <span class="server-dot ${anyOnline ? 'online' : 'offline'}"></span>
-                <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"><span style="position:relative;display:inline-block;width:20px;height:18px;vertical-align:middle;margin-right:6px;"><span style="display:inline-block;width:15px;height:15px;opacity:0.9;"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="2" width="18" height="6" rx="1"/><rect x="3" y="10" width="18" height="6" rx="1"/><rect x="3" y="18" width="18" height="4" rx="1"/><circle cx="7" cy="5" r="1" fill="currentColor"/><circle cx="7" cy="13" r="1" fill="currentColor"/><circle cx="7" cy="20" r="1" fill="currentColor"/></svg></span><span style="position:absolute;bottom:-3px;right:-4px;min-width:15px;height:15px;line-height:15px;text-align:center;font-size:9px;font-weight:700;color:#fff;background:#16a34a;border-radius:50%;z-index:2;">${clusterNodes.length}</span></span>${clusterName}</span>
-                <span class="remove-server-btn" onclick="event.stopPropagation(); openPveClusterSettings('${clusterName}')" title="Cluster settings" style="margin-left:4px;">⚙️</span>
-                <span class="remove-server-btn" onclick="event.stopPropagation(); confirmRemovePveCluster('${clusterName}', [${nodeIds}])" title="Remove cluster">🗑️</span>
-            </div>
-            <div class="server-node-children ${shouldExpandCluster ? 'expanded' : ''}" id="children-${clusterId}">`;
-
-        // Each node within the cluster
-        clusterNodes.forEach(node => {
-            const shouldExpandNode = expandedNodes.has(node.id);
-            html += `
-                <div class="server-tree-node" style="margin-left: 8px;">
-                    <div class="server-node-header" data-node-id="${node.id}" onclick="openServerNode('${node.id}')" style="padding-left: 8px;">
-                        <span class="tree-toggle ${shouldExpandNode ? 'expanded' : ''}" id="toggle-${node.id}" onclick="event.stopPropagation(); toggleServerNode('${node.id}')">▶</span>
-                        <span class="server-dot ${node.online ? 'online' : 'offline'}"></span>
-                        <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${node.pve_node_name || node.hostname}</span>
-                    </div>
-                    <div class="server-node-children ${shouldExpandNode ? 'expanded' : ''}" id="children-${node.id}">
-                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="dashboard" onclick="selectServerView('${node.id}', 'dashboard')">
-                            <span class="icon">📊</span> Dashboard
-                        </a>
-                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="pve-resources" onclick="selectServerView('${node.id}', 'pve-resources')">
-                            <span class="icon">🖥️</span> VMs & Containers
-                            ${(node.vm_count || node.lxc_count) ? `<span class="badge" style="font-size:10px; padding:1px 6px;">${(node.vm_count || 0) + (node.lxc_count || 0)}</span>` : ''}
                         </a>
                     </div>
                 </div>`;
@@ -2297,9 +2240,9 @@ function renderDatacenterOverview() {
         </div>`;
     };
 
-    // 1. Group nodes
+    // 1. Group nodes — legacy PVE entries are surfaced via the deprecation banner only.
     const wsNodes = nodes.filter(n => n.node_type !== 'proxmox');
-    const pveNodes = nodes.filter(n => n.node_type === 'proxmox');
+    const pveNodes = [];
 
     // 2. Cluster grouping — WolfStack
     const wsClusters = {};
@@ -3639,6 +3582,33 @@ function initCharts() {
 }
 
 // ─── Nodes / Servers ───
+async function refreshProxmoxCleanupBanner() {
+    const banner = document.getElementById('deprecated-pve-banner');
+    if (!banner) return;
+    try {
+        const resp = await fetch('/api/cluster/proxmox-cleanup');
+        if (!resp.ok) { banner.style.display = 'none'; return; }
+        const info = await resp.json();
+        if (!info || !info.removed_count) { banner.style.display = 'none'; return; }
+        const body = document.getElementById('deprecated-pve-banner-body');
+        if (body) {
+            const backup = info.backup_path ? `<code style="background:rgba(0,0,0,0.25); padding:1px 5px; border-radius:3px; font-size:12px;">${info.backup_path}</code>` : '<em>(unknown location)</em>';
+            body.innerHTML = `Proxmox API nodes have been deprecated, please install WolfStack on each node and then add them as WolfStack nodes to the main cluster — see our install page at <a href="https://wolfstack.org/download.php" target="_blank" rel="noopener" style="color:var(--accent-primary); text-decoration:underline;">https://wolfstack.org/download.php</a>. Your config has been backed up to ${backup} and the nodes removed.`;
+        }
+        banner.style.display = '';
+    } catch (e) {
+        banner.style.display = 'none';
+    }
+}
+
+async function dismissProxmoxCleanupBanner() {
+    try {
+        await fetch('/api/cluster/proxmox-cleanup/dismiss', { method: 'POST' });
+    } catch (e) { /* ignore */ }
+    const banner = document.getElementById('deprecated-pve-banner');
+    if (banner) banner.style.display = 'none';
+}
+
 async function fetchNodes() {
     try {
         const resp = await fetch('/api/nodes');
@@ -3730,16 +3700,10 @@ async function fetchNodes() {
         if (typeof topologyCheckUpdate === 'function') topologyCheckUpdate();
     } catch (e) {
         console.error('Failed to fetch nodes:', e);
-        // If we're on HTTPS and getting NetworkErrors, the TLS certificate likely
-        // doesn't match (e.g. accessing via IP with a domain cert). The HTTP
-        // inter-node server runs on port+1, so redirect there automatically.
-        if (window.location.protocol === 'https:' && e instanceof TypeError &&
-            e.message.includes('NetworkError') && !window.location.search.includes('no_tls_redirect')) {
-            const httpPort = parseInt(window.location.port || '443') + 1;
-            window.location.href = 'http://' + window.location.hostname + ':' + httpPort +
-                window.location.pathname + '?no_tls_redirect=1';
-            return;
-        }
+        // Transient fetch failures (TLS handshakes during restarts, slow WolfNet
+        // hops, momentary network blips) just count toward the session-check
+        // failure budget. Only after 3 consecutive failures do we treat the
+        // session as gone and bounce to login.
         _sessionCheckFails++;
         if (_sessionCheckFails >= 3) window.location.href = '/login.html';
     }
@@ -7550,44 +7514,24 @@ function closeModal() {
 }
 
 async function addServer() {
-    const nodeType = (document.getElementById('new-server-type') || {}).value || 'wolfstack';
     const address = document.getElementById('new-server-address').value.trim();
-    const port = parseInt(document.getElementById('new-server-port').value) || (nodeType === 'proxmox' ? 8006 : 8553);
-
-    const clusterName = (document.getElementById('new-server-cluster-name') || {}).value?.trim() || '';
+    const port = parseInt(document.getElementById('new-server-port').value) || 8553;
+    const wsClusterName = (document.getElementById('new-server-cluster-name') || {}).value.trim();
+    const joinToken = (document.getElementById('new-server-join-token') || {}).value.trim();
 
     if (!address) { showToast('Enter a server address', 'error'); return; }
-
-    var payload = { address, port, node_type: nodeType, cluster_name: clusterName || null };
-
-    if (nodeType === 'proxmox') {
-        var pveTokenId = (document.getElementById('new-pve-token-id') || {}).value.trim();
-        var pveTokenSecret = (document.getElementById('new-pve-token-secret') || {}).value.trim();
-        var pveName = (document.getElementById('new-pve-node-name') || {}).value.trim();
-        var pveFingerprint = (document.getElementById('new-pve-fingerprint') || {}).value.trim();
-        var pveClusterName = (document.getElementById('new-pve-cluster-name') || {}).value.trim();
-
-        if (!pveTokenId || !pveTokenSecret || !pveName) {
-            showToast('PVE Node Name, Token ID, and Token Secret are required', 'error');
-            return;
-        }
-        // Combine into PVE API token format: user@pam!tokenid=secret-uuid
-        payload.pve_token = pveTokenId + '=' + pveTokenSecret;
-        payload.pve_node_name = pveName;
-        if (pveFingerprint) payload.pve_fingerprint = pveFingerprint;
-        if (pveClusterName) payload.pve_cluster_name = pveClusterName;
-    } else {
-        // Standard WolfStack node
-        var wsClusterName = (document.getElementById('new-server-cluster-name') || {}).value.trim();
-        var joinToken = (document.getElementById('new-server-join-token') || {}).value.trim();
-        // Default to "WolfStack" if empty, as requested
-        payload.cluster_name = wsClusterName || "WolfStack";
-        if (!joinToken) {
-            showToast('Join token is required. Get it from the remote server.', 'error');
-            return;
-        }
-        payload.join_token = joinToken;
+    if (!joinToken) {
+        showToast('Join token is required. Get it from the remote server.', 'error');
+        return;
     }
+
+    const payload = {
+        address,
+        port,
+        node_type: 'wolfstack',
+        cluster_name: wsClusterName || 'WolfStack',
+        join_token: joinToken,
+    };
 
     try {
         var resp = await fetch('/api/nodes', {
@@ -7601,57 +7545,16 @@ async function addServer() {
             taskLog('Add server: ' + address, 'failed');
             return;
         }
-        if (nodeType === 'proxmox' && data.nodes_discovered) {
-            showToast('Proxmox cluster added — ' + data.nodes_discovered.length + ' node(s) discovered: ' + data.nodes_discovered.join(', '), 'success');
-            taskLog('Added Proxmox cluster: ' + address);
-        } else {
-            showToast('Server ' + address + ' added', 'success');
-            taskLog('Added server: ' + address);
-            setTimeout(() => showToast('💡 When done adding nodes, use "Update WolfNet Connections" in Cluster Settings to sync networking', 'info'), 1500);
-        }
+        showToast('Server ' + address + ' added', 'success');
+        taskLog('Added server: ' + address);
+        setTimeout(() => showToast('💡 When done adding nodes, use "Update WolfNet Connections" in Cluster Settings to sync networking', 'info'), 1500);
         closeModal();
         document.getElementById('new-server-address').value = '';
-        if (document.getElementById('new-pve-token-id')) document.getElementById('new-pve-token-id').value = '';
-        if (document.getElementById('new-pve-token-secret')) document.getElementById('new-pve-token-secret').value = '';
-        if (document.getElementById('new-pve-node-name')) document.getElementById('new-pve-node-name').value = '';
-        if (document.getElementById('new-pve-fingerprint')) document.getElementById('new-pve-fingerprint').value = '';
-        if (document.getElementById('new-pve-cluster-name')) document.getElementById('new-pve-cluster-name').value = '';
         if (document.getElementById('new-server-join-token')) document.getElementById('new-server-join-token').value = '';
         fetchNodes();
     } catch (e) {
         showToast('Failed: ' + e.message, 'error');
         taskLog('Add server: ' + address, 'failed');
-    }
-}
-
-function updateServerForm() {
-    var sel = (document.getElementById('new-server-type') || {}).value;
-    var pveFields = document.getElementById('pve-fields');
-    var wsClusterField = document.getElementById('ws-cluster-field');
-    var wsHint = document.getElementById('wolfstack-hint');
-    var portLabel = document.getElementById('new-server-port-label');
-    var portInput = document.getElementById('new-server-port');
-
-    if (sel === 'proxmox') {
-        if (pveFields) pveFields.style.display = 'block';
-        if (wsClusterField) wsClusterField.style.display = 'none';
-        if (wsHint) wsHint.style.display = 'none';
-        if (portLabel) portLabel.textContent = 'Port (default: 8006)';
-        if (portInput) portInput.value = '8006';
-        var joinField = document.getElementById('ws-join-token-field');
-        var ownTokenDisplay = document.getElementById('ws-own-token-display');
-        if (joinField) joinField.style.display = 'none';
-        if (ownTokenDisplay) ownTokenDisplay.style.display = 'none';
-    } else {
-        if (pveFields) pveFields.style.display = 'none';
-        if (wsClusterField) wsClusterField.style.display = 'block';
-        if (wsHint) wsHint.style.display = 'block';
-        if (portLabel) portLabel.textContent = 'Port (default: 8553)';
-        if (portInput) portInput.value = '8553';
-        var joinField = document.getElementById('ws-join-token-field');
-        var ownTokenDisplay = document.getElementById('ws-own-token-display');
-        if (joinField) joinField.style.display = 'block';
-        if (ownTokenDisplay) ownTokenDisplay.style.display = 'block';
     }
 }
 
@@ -11264,6 +11167,7 @@ try {
 
 loadUserPreferences().then(loadHiddenFeatures); // sync prefs then apply sidebar hides
 fetchNodes();
+refreshProxmoxCleanupBanner(); // show deprecation banner if startup auto-cleanup ran
 fetchMetricsHistory(); // Initial history load
 loadTaskLog(); // Restore task log from localStorage
 checkWolfNoteTopBar(); // Show WolfNote button if connected
@@ -38864,10 +38768,10 @@ function wfRenderInfraTree(div, infra) {
     Object.keys(infra).sort().forEach(clusterName => {
         html += `<div style="font-size:11px;font-weight:700;color:var(--text-secondary);margin:8px 0 4px;border-bottom:1px solid var(--border);padding-bottom:2px;">${escapeHtml(clusterName)}</div>`;
         (infra[clusterName] || []).forEach(node => {
+            if (node.node_type === 'proxmox') return;
             const nodeLabel = node.hostname || node.id;
-            const type = node.node_type === 'proxmox' ? ' (PVE)' : '';
             const dot = node.online ? '<span style="color:#22c55e;">&#9679;</span>' : '<span style="color:#ef4444;">&#9679;</span>';
-            html += `<div style="margin-left:4px;margin-bottom:2px;font-size:11px;color:var(--text-primary);">${dot} <strong>${escapeHtml(nodeLabel)}</strong>${type}</div>`;
+            html += `<div style="margin-left:4px;margin-bottom:2px;font-size:11px;color:var(--text-primary);">${dot} <strong>${escapeHtml(nodeLabel)}</strong></div>`;
             // Docker containers
             (node.docker || []).forEach(c => {
                 const stDot = c.state === 'running' ? '<span style="color:#22c55e;font-size:8px;">&#9679;</span>' : '<span style="color:#888;font-size:8px;">&#9679;</span>';
