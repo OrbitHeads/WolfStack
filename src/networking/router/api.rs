@@ -481,6 +481,37 @@ pub async fn config_receive(
     HttpResponse::Ok().body("synced")
 }
 
+/// Verify `value` is a syntactically valid IPv4 dotted-quad AND falls
+/// inside `cidr`. Returns a descriptive error keyed by field name when
+/// either check fails. Catches:
+///   • typos like "10.1010.100" or "192.168..1" (parse failure)
+///   • configurations like router_ip=10.0.0.1 with subnet 192.168.1.0/24
+///     (parses but isn't in the network — clients DHCP'd in would have a
+///     gateway off-segment, traffic gets routed but ARP fails)
+fn validate_ipv4_in_cidr(field: &str, value: &str, cidr: &str) -> Result<(), String> {
+    let value_trimmed = value.trim();
+    let ip: std::net::Ipv4Addr = value_trimmed.parse()
+        .map_err(|_| format!("'{}' = '{}' is not a valid IPv4 address", field, value_trimmed))?;
+    let (net_str, prefix_str) = cidr.split_once('/')
+        .ok_or_else(|| format!("subnet_cidr '{}' is malformed (missing '/')", cidr))?;
+    let net: std::net::Ipv4Addr = net_str.parse()
+        .map_err(|_| format!("subnet_cidr '{}' has invalid network part", cidr))?;
+    let prefix: u8 = prefix_str.parse()
+        .map_err(|_| format!("subnet_cidr '{}' has invalid prefix", cidr))?;
+    if prefix > 32 {
+        return Err(format!("subnet_cidr '{}' prefix > 32", cidr));
+    }
+    let mask: u32 = if prefix == 0 { 0 } else { (!0u32) << (32 - prefix) };
+    if (u32::from(ip) & mask) != (u32::from(net) & mask) {
+        return Err(format!(
+            "'{}' = {} is not inside the LAN's subnet {} — \
+             clients leased an IP from this LAN would have an off-segment gateway and traffic would silently fail",
+            field, value_trimmed, cidr
+        ));
+    }
+    Ok(())
+}
+
 /// Reject a LanSegment whose user-supplied fields contain newlines or
 /// other dnsmasq directive separators. dhcp::render_config writes these
 /// into a config file unescaped — without this guard a maliciously
@@ -523,10 +554,25 @@ fn validate_segment(seg: &LanSegment) -> Result<(), String> {
         check("dhcp.pool_end", &seg.dhcp.pool_end)?;
         check("dhcp.lease_time", &seg.dhcp.lease_time)?;
     }
+    // Format-level validation for IP-bearing fields. Without this, typos
+    // like "10.1010.100" (missing dot) parse as plausible-looking strings,
+    // sail through the empty/newline check, and only blow up later when
+    // dnsmasq silently rejects the rendered config and starts with no
+    // socket. Catch the typo at Save where the user's still in the form
+    // and can fix it immediately.
+    validate_ipv4_in_cidr("router_ip", &seg.router_ip, &seg.subnet_cidr)?;
+    if seg.dhcp.enabled {
+        validate_ipv4_in_cidr("dhcp.pool_start", &seg.dhcp.pool_start, &seg.subnet_cidr)?;
+        validate_ipv4_in_cidr("dhcp.pool_end",   &seg.dhcp.pool_end,   &seg.subnet_cidr)?;
+    }
+
     for (i, r) in seg.dhcp.reservations.iter().enumerate() {
         check(&format!("reservations[{}].mac", i), &r.mac)?;
         check(&format!("reservations[{}].ip", i), &r.ip)?;
         if let Some(h) = &r.hostname { check(&format!("reservations[{}].hostname", i), h)?; }
+        // Reservation IP must be a real IPv4 inside the subnet — otherwise
+        // dnsmasq accepts the line but never matches the lease request.
+        validate_ipv4_in_cidr(&format!("reservations[{}].ip", i), &r.ip, &seg.subnet_cidr)?;
         // dnsmasq renders reservations as `dhcp-host=<mac>,<ip>[,<hostname>]`
         // — a literal comma in any field would inject an extra dnsmasq
         // option (e.g. `tag:foo`, `set:group`, `interface=eth0`). The
@@ -4341,4 +4387,64 @@ async fn set_lan_dns_port(
     actix_web::HttpResponse::Ok().json(serde_json::json!({
         "ok": true, "message": msg,
     }))
+}
+
+#[cfg(test)]
+mod ipv4_validation_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_missing_dot_typo() {
+        // The exact case PapaSchlumpf hit: "10.10.10.100" → "10.1010.100".
+        let r = validate_ipv4_in_cidr("dhcp.pool_start", "10.1010.100", "10.10.10.0/24");
+        assert!(r.is_err());
+        let msg = r.unwrap_err();
+        assert!(msg.contains("not a valid IPv4"), "unexpected: {}", msg);
+    }
+
+    #[test]
+    fn rejects_quad_outside_subnet() {
+        let r = validate_ipv4_in_cidr("router_ip", "192.168.1.1", "10.0.0.0/24");
+        assert!(r.is_err());
+        let msg = r.unwrap_err();
+        assert!(msg.contains("is not inside the LAN's subnet"), "unexpected: {}", msg);
+    }
+
+    #[test]
+    fn accepts_valid_in_subnet() {
+        assert!(validate_ipv4_in_cidr("router_ip", "192.168.1.1", "192.168.1.0/24").is_ok());
+        assert!(validate_ipv4_in_cidr("dhcp.pool_start", "10.10.10.100", "10.10.10.0/24").is_ok());
+    }
+
+    #[test]
+    fn rejects_malformed_cidr() {
+        // No slash.
+        assert!(validate_ipv4_in_cidr("router_ip", "192.168.1.1", "192.168.1.0").is_err());
+        // Bad prefix.
+        assert!(validate_ipv4_in_cidr("router_ip", "192.168.1.1", "192.168.1.0/abc").is_err());
+        assert!(validate_ipv4_in_cidr("router_ip", "192.168.1.1", "192.168.1.0/40").is_err());
+        // Bad network part.
+        assert!(validate_ipv4_in_cidr("router_ip", "192.168.1.1", "not.an.ip/24").is_err());
+    }
+
+    #[test]
+    fn slash_zero_accepts_anything() {
+        assert!(validate_ipv4_in_cidr("any", "8.8.8.8", "0.0.0.0/0").is_ok());
+    }
+
+    #[test]
+    fn empty_value_rejected() {
+        assert!(validate_ipv4_in_cidr("router_ip", "", "192.168.1.0/24").is_err());
+        assert!(validate_ipv4_in_cidr("router_ip", "   ", "192.168.1.0/24").is_err());
+    }
+
+    #[test]
+    fn boundary_addresses_in_24() {
+        // Network address (.0) and broadcast (.255) DO live inside the
+        // /24 mathematically — we accept them at format-validation time.
+        // Whether they make sense as router_ip / pool endpoint is a
+        // higher-level concern dnsmasq itself catches.
+        assert!(validate_ipv4_in_cidr("x", "192.168.1.0", "192.168.1.0/24").is_ok());
+        assert!(validate_ipv4_in_cidr("x", "192.168.1.255", "192.168.1.0/24").is_ok());
+    }
 }
