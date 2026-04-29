@@ -1910,16 +1910,34 @@ pub async fn assign_zone(req: HttpRequest, state: S, body: web::Json<ZoneAssignR
     HttpResponse::Ok().json(&zones_snapshot)
 }
 
-pub async fn get_zones(req: HttpRequest, state: S) -> HttpResponse {
+pub async fn get_zones(req: HttpRequest, state: S, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
-    HttpResponse::Ok().json(&state.router.config.read().unwrap().zones)
+    let zones = state.router.config.read().unwrap().zones.clone();
+    match cluster_node_id_set(&state, &query) {
+        None => HttpResponse::Ok().json(zones),
+        Some(set) => {
+            // ZoneAssignments outer key is node_id. Drop entries for
+            // nodes that aren't in the requested cluster.
+            let filtered = ZoneAssignments {
+                assignments: zones.assignments.into_iter()
+                    .filter(|(node_id, _)| set.contains(node_id))
+                    .collect(),
+            };
+            HttpResponse::Ok().json(filtered)
+        }
+    }
 }
 
 // ─── LAN segments ───
 
-pub async fn list_segments(req: HttpRequest, state: S) -> HttpResponse {
+pub async fn list_segments(req: HttpRequest, state: S, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
-    HttpResponse::Ok().json(&state.router.config.read().unwrap().lans)
+    let lans = state.router.config.read().unwrap().lans.clone();
+    let filtered: Vec<&LanSegment> = match cluster_node_id_set(&state, &query) {
+        None => lans.iter().collect(),
+        Some(set) => lans.iter().filter(|l| set.contains(&l.node_id)).collect(),
+    };
+    HttpResponse::Ok().json(filtered)
 }
 
 pub async fn create_segment(req: HttpRequest, state: S, body: web::Json<LanSegment>) -> HttpResponse {
@@ -2158,9 +2176,22 @@ pub async fn get_query_log(
 
 // ─── Firewall rules ───
 
-pub async fn list_rules(req: HttpRequest, state: S) -> HttpResponse {
+pub async fn list_rules(req: HttpRequest, state: S, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
-    HttpResponse::Ok().json(&state.router.config.read().unwrap().rules)
+    let rules = state.router.config.read().unwrap().rules.clone();
+    let filtered: Vec<&FirewallRule> = match cluster_node_id_set(&state, &query) {
+        None => rules.iter().collect(),
+        // Rules with node_id=None are cluster-agnostic ("apply to every
+        // node"); show those in every cluster's view. Rules pinned to
+        // a specific node are shown only in that node's cluster view.
+        Some(set) => rules.iter()
+            .filter(|r| match &r.node_id {
+                None => true,
+                Some(nid) => set.contains(nid),
+            })
+            .collect(),
+    };
+    HttpResponse::Ok().json(filtered)
 }
 
 pub async fn create_rule(req: HttpRequest, state: S, body: web::Json<FirewallRule>) -> HttpResponse {
@@ -3017,17 +3048,26 @@ fn which(cmd: &str) -> bool {
 
 // ─── WAN connections (DHCP / Static / PPPoE) ───
 
-pub async fn list_wan(req: HttpRequest, state: S) -> HttpResponse {
+pub async fn list_wan(req: HttpRequest, state: S, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
-    let cfg = state.router.config.read().unwrap();
+    let conns: Vec<wan::WanConnection> = state.router.config.read().unwrap().wan_connections.clone();
+    let cluster_set = cluster_node_id_set(&state, &query);
     // Mask passwords on the way out — never roundtrip plaintext to UI.
-    let masked: Vec<wan::WanConnection> = cfg.wan_connections.iter().map(|c| {
-        let mut clone = c.clone();
-        if let wan::WanMode::Pppoe(ref mut p) = clone.mode {
-            if !p.password.is_empty() { p.password = "***".into(); }
-        }
-        clone
-    }).collect();
+    // Filter by cluster: each WAN is pinned to a specific node, so we
+    // keep only those whose node is in the active cluster.
+    let masked: Vec<wan::WanConnection> = conns.into_iter()
+        .filter(|c| match &cluster_set {
+            None => true,
+            Some(set) => set.contains(&c.node_id),
+        })
+        .map(|c| {
+            let mut clone = c;
+            if let wan::WanMode::Pppoe(ref mut p) = clone.mode {
+                if !p.password.is_empty() { p.password = "***".into(); }
+            }
+            clone
+        })
+        .collect();
     HttpResponse::Ok().json(masked)
 }
 
@@ -3860,9 +3900,14 @@ pub async fn import_config(
 
 // ─── Reverse-proxy entries ───
 
-pub async fn list_proxies(req: HttpRequest, state: S) -> HttpResponse {
+pub async fn list_proxies(req: HttpRequest, state: S, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
-    HttpResponse::Ok().json(&state.router.config.read().unwrap().proxies)
+    let proxies = state.router.config.read().unwrap().proxies.clone();
+    let filtered: Vec<&proxy::ProxyEntry> = match cluster_node_id_set(&state, &query) {
+        None => proxies.iter().collect(),
+        Some(set) => proxies.iter().filter(|p| set.contains(&p.node_id)).collect(),
+    };
+    HttpResponse::Ok().json(filtered)
 }
 
 /// Returns every candidate backend the operator can point a proxy at,
@@ -4044,10 +4089,21 @@ pub async fn delete_proxy(req: HttpRequest, state: S, path: web::Path<String>) -
 
 // ─── Subnet Routing ───
 
-pub async fn list_subnet_routes(req: HttpRequest, state: S) -> HttpResponse {
+pub async fn list_subnet_routes(req: HttpRequest, state: S, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
-    let cfg = state.router.config.read().unwrap();
-    HttpResponse::Ok().json(&cfg.subnet_routes)
+    let routes = state.router.config.read().unwrap().subnet_routes.clone();
+    let filtered: Vec<&SubnetRoute> = match cluster_node_id_set(&state, &query) {
+        None => routes.iter().collect(),
+        // Subnet routes with node_id=None are cluster-agnostic
+        // (apply to every node); show in every cluster's view.
+        Some(set) => routes.iter()
+            .filter(|r| match &r.node_id {
+                None => true,
+                Some(nid) => set.contains(nid),
+            })
+            .collect(),
+    };
+    HttpResponse::Ok().json(filtered)
 }
 
 pub async fn create_subnet_route(req: HttpRequest, state: S, body: web::Json<SubnetRoute>) -> HttpResponse {
@@ -5370,6 +5426,55 @@ pub async fn get_cluster_validation(
     let mut rows = futures::future::join_all(peer_futs).await;
     if let Some(local) = local_row { rows.insert(0, local); }
     HttpResponse::Ok().json(serde_json::json!({ "nodes": rows }))
+}
+
+// ─── Cluster-scoping helper ─────────────────────────────────────────
+//
+// WolfRouter is per-cluster. Every list endpoint that returns config
+// items must filter by the active cluster — otherwise a bastion with
+// (say) 5 clusters / 14 servers shows every cluster's LANs / rules /
+// WANs / proxies / zones in every cluster's WolfRouter view, which
+// is a real cross-cluster leak (Adam Cogswell 2026-04-29: "the user
+// should NEVER EVER see anything from another cluster in wolfrouter
+// they are on distinct networks").
+//
+// `cluster_node_id_set` returns the set of node IDs that belong to
+// the requested cluster (None = no filter, return everything). Each
+// list endpoint then keeps items whose `node_id` is in that set
+// (plus optionally items with `node_id = None`, which apply globally
+// and are inherently cluster-agnostic).
+
+fn cluster_node_id_set(
+    state: &S,
+    query: &TopologyQuery,
+) -> Option<std::collections::HashSet<String>> {
+    let want = match &query.cluster {
+        Some(c) if !c.is_empty() => c.clone(),
+        _ => return None, // no filter requested
+    };
+    let normalize = |n: Option<&str>| -> String {
+        match n {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => "WolfStack".into(),
+        }
+    };
+    let self_cluster_raw = state.cluster.get_self_cluster_name();
+    let self_cluster_norm = normalize(
+        if self_cluster_raw.is_empty() { None } else { Some(self_cluster_raw.as_str()) }
+    );
+    let self_id = crate::agent::self_node_id();
+    let mut set = std::collections::HashSet::new();
+    for n in state.cluster.get_all_nodes() {
+        let cname = if n.is_self || n.id == self_id {
+            self_cluster_norm.clone()
+        } else {
+            normalize(n.cluster_name.as_deref())
+        };
+        if cname == want {
+            set.insert(n.id.clone());
+        }
+    }
+    Some(set)
 }
 
 // ─── Mount ───
