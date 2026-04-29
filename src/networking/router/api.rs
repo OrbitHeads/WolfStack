@@ -2181,12 +2181,18 @@ pub async fn list_rules(req: HttpRequest, state: S, query: web::Query<TopologyQu
     let rules = state.router.config.read().unwrap().rules.clone();
     let filtered: Vec<&FirewallRule> = match cluster_node_id_set(&state, &query) {
         None => rules.iter().collect(),
-        // Rules with node_id=None are cluster-agnostic ("apply to every
-        // node"); show those in every cluster's view. Rules pinned to
-        // a specific node are shown only in that node's cluster view.
+        // Strict cluster isolation: when a cluster filter is active,
+        // ONLY show rules pinned to a node in that cluster. Rules
+        // with node_id=None ("legacy global, applies everywhere")
+        // are hidden — they would otherwise leak across cluster
+        // views since they apply to nodes the operator isn't
+        // currently managing. Operators with legacy global rules
+        // need to re-pin them to a specific node from the WolfRouter
+        // → Firewall tab. Adam Cogswell 2026-04-29: "firewall rules
+        // should be cluster only".
         Some(set) => rules.iter()
             .filter(|r| match &r.node_id {
-                None => true,
+                None => false,
                 Some(nid) => set.contains(nid),
             })
             .collect(),
@@ -4094,11 +4100,14 @@ pub async fn list_subnet_routes(req: HttpRequest, state: S, query: web::Query<To
     let routes = state.router.config.read().unwrap().subnet_routes.clone();
     let filtered: Vec<&SubnetRoute> = match cluster_node_id_set(&state, &query) {
         None => routes.iter().collect(),
-        // Subnet routes with node_id=None are cluster-agnostic
-        // (apply to every node); show in every cluster's view.
+        // Strict cluster isolation, same as list_rules — a route with
+        // node_id=None ("apply cluster-wide") would leak across
+        // cluster views since it operates on nodes the operator
+        // isn't currently managing. Hide them; operators need to
+        // pin to a specific node when creating from a cluster view.
         Some(set) => routes.iter()
             .filter(|r| match &r.node_id {
-                None => true,
+                None => false,
                 Some(nid) => set.contains(nid),
             })
             .collect(),
