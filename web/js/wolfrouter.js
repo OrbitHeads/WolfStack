@@ -544,6 +544,10 @@
         if (tab === 'tools')        wrRenderDnsTools();
         if (tab === 'traceroute')   wrRenderTraceroute();
         if (tab === 'logs')         wrRenderLogs();
+        if (tab === 'threat-intel') {
+            // Defined in app.js (so it shares the toast/dialog primitives).
+            if (typeof tiRenderTab === 'function') tiRenderTab();
+        }
     }
 
     // ─── Master render ───

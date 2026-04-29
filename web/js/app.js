@@ -28815,6 +28815,280 @@ async function passkeyDelete(credentialId, btn) {
     }
 }
 
+// ─── Threat Intelligence (WolfRouter tab) ───
+//
+// Lives in app.js (rather than wolfrouter.js) so it shares the global
+// showToast / wolfConfirm primitives and the same fetch error handling
+// the rest of the SPA uses.
+
+// Cached config so per-field toggles don't have to round-trip the entire
+// config object back and forth on every change.
+var _tiCachedConfig = null;
+var _tiCachedStatus = null;
+
+function tiRenderTab() {
+    tiLoadConfig();
+    tiLoadStatus();
+}
+
+function tiEsc(s) {
+    return String(s).replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+}
+
+async function tiLoadConfig() {
+    try {
+        const resp = await fetch('/api/threat-intel/config');
+        if (!resp.ok) throw new Error('Failed to load config');
+        const cfg = await resp.json();
+        _tiCachedConfig = cfg;
+        // Master toggles
+        document.getElementById('ti-cfg-enabled').checked = !!cfg.enabled;
+        document.getElementById('ti-cfg-dry-run').checked = !!cfg.dry_run;
+        document.getElementById('ti-cfg-refresh-hours').value = cfg.refresh_hours || 6;
+        document.getElementById('ti-cfg-allowlist').value = (cfg.allowlist || []).join('\n');
+        // Render provider rows
+        tiRenderProviders(cfg.providers || {});
+    } catch (e) {
+        showToast('Failed to load threat-intel config: ' + (e.message || e), 'error');
+    }
+}
+
+function tiRenderProviders(providers) {
+    const list = document.getElementById('ti-providers-list');
+    if (!list) return;
+    // Stable display order
+    const known = [
+        ['spamhaus_drop',       'Spamhaus DROP / EDROP / dropv6', false, 'https://www.spamhaus.org/drop/'],
+        ['firehol_level1',      'FireHOL Level 1',                false, 'https://iplists.firehol.org/'],
+        ['crowdsec_community',  'CrowdSec community blocklist',   true,  'https://app.crowdsec.net/'],
+        ['abuseipdb',           'AbuseIPDB',                      true,  'https://www.abuseipdb.com/account/api'],
+    ];
+    list.innerHTML = known.map(([id, name, needsKey, url]) => {
+        const cur = providers[id] || { enabled: false, api_key: '', url_override: '' };
+        const enabledChecked = cur.enabled ? 'checked' : '';
+        const keyVal = (cur.api_key || '').replace(/"/g, '&quot;');
+        const keyField = needsKey
+            ? `<input type="password" id="ti-prov-key-${id}" placeholder="API key" value="${keyVal}" style="flex:1; min-width:160px; padding:5px 8px; font-family:var(--font-mono); font-size:12px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:4px; color:var(--text);">`
+            : '';
+        const linkText = needsKey ? '🔑 Get key' : '🔗 Source';
+        return `<div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center; padding:10px 12px; border:1px solid var(--border); border-radius:8px; margin-bottom:8px; background:var(--bg-secondary);">
+            <label style="display:flex; align-items:center; gap:8px; min-width:280px; cursor:pointer; flex:1;">
+                <input type="checkbox" id="ti-prov-en-${id}" ${enabledChecked}>
+                <span><strong>${tiEsc(name)}</strong></span>
+            </label>
+            ${keyField}
+            <a href="${tiEsc(url)}" target="_blank" rel="noopener" style="font-size:11px; color:var(--accent-primary); text-decoration:none; white-space:nowrap;">${linkText}</a>
+            <button class="btn btn-sm" onclick="tiSaveProvider('${id}', ${needsKey})">💾 Save</button>
+        </div>`;
+    }).join('');
+}
+
+async function tiLoadStatus() {
+    try {
+        const resp = await fetch('/api/threat-intel/status');
+        if (!resp.ok) throw new Error('Failed to load status');
+        const s = await resp.json();
+        _tiCachedStatus = s;
+        // Status badge
+        const badge = document.getElementById('ti-status-badge');
+        if (badge) {
+            let label, bg, fg;
+            if (s.paused) { label = 'PAUSED'; bg = 'rgba(220,38,38,0.18)'; fg = '#fca5a5'; }
+            else if (s.enforcement_active && s.applied) { label = 'ENFORCING'; bg = 'rgba(16,185,129,0.18)'; fg = '#6ee7b7'; }
+            else if (s.enabled && s.dry_run) { label = 'DRY-RUN'; bg = 'rgba(234,179,8,0.18)'; fg = '#fde68a'; }
+            else if (s.enabled) { label = 'ENABLED'; bg = 'rgba(99,102,241,0.18)'; fg = '#a5b4fc'; }
+            else { label = 'OFF'; bg = 'var(--bg-tertiary)'; fg = 'var(--text-muted)'; }
+            badge.textContent = label;
+            badge.style.background = bg;
+            badge.style.color = fg;
+        }
+        // Status summary text
+        const last = s.last_refresh_secs ? new Date(s.last_refresh_secs * 1000).toLocaleString() : 'never';
+        const summary = document.getElementById('ti-status-summary');
+        if (summary) {
+            const ipsetMsg = s.ipset_available ? '' : ' <span style="color:var(--warning);">⚠ ipset not installed — enforcement cannot be activated until you install it.</span>';
+            summary.innerHTML = `Blocklist size: <strong>${s.blocklist_size.toLocaleString()}</strong> entries
+                (${s.blocklist_v4_count.toLocaleString()} IPv4 / ${s.blocklist_v6_count.toLocaleString()} IPv6).
+                Last refresh: <strong>${last}</strong>.${ipsetMsg}`;
+        }
+        // Pause / resume button visibility
+        const pauseBtn = document.getElementById('ti-pause-btn');
+        const resumeBtn = document.getElementById('ti-resume-btn');
+        if (pauseBtn && resumeBtn) {
+            if (s.paused) { pauseBtn.style.display = 'none'; resumeBtn.style.display = ''; }
+            else          { pauseBtn.style.display = '';     resumeBtn.style.display = 'none'; }
+        }
+        // Provider row state lines (success / error / count)
+        Object.keys(s.providers || {}).forEach(id => {
+            const ps = s.providers[id];
+            const row = document.querySelector(`#ti-prov-en-${id}`)?.closest('div');
+            if (!row) return;
+            // Append/replace a small status line — keyed by class so we don't duplicate.
+            let line = row.querySelector('.ti-prov-status');
+            if (!line) {
+                line = document.createElement('div');
+                line.className = 'ti-prov-status';
+                line.style.cssText = 'flex-basis:100%; font-size:11px; color:var(--text-muted); margin-top:4px;';
+                row.appendChild(line);
+            }
+            const when = ps.last_attempt_secs ? new Date(ps.last_attempt_secs * 1000).toLocaleString() : 'never';
+            if (ps.last_error) {
+                line.innerHTML = `<span style="color:var(--danger);">⚠ ${tiEsc(ps.last_error)}</span> &middot; last attempt ${when}`;
+            } else if (ps.last_count) {
+                line.textContent = `Last fetch: ${ps.last_count.toLocaleString()} entries at ${when}`;
+            } else {
+                line.textContent = `No fetch yet`;
+            }
+        });
+        // Blocklist preview
+        const preview = document.getElementById('ti-blocklist-preview');
+        if (preview) {
+            const v4 = (s.sample_v4 || []).map(tiEsc).join('\n');
+            const v6 = (s.sample_v6 || []).map(tiEsc).join('\n');
+            if (!v4 && !v6) {
+                preview.innerHTML = '<em style="color:var(--text-muted);">Empty &mdash; run a refresh to populate.</em>';
+            } else {
+                preview.innerHTML = `<div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+                    <div><div style="font-weight:600; margin-bottom:4px;">IPv4 (first ${s.sample_v4.length} of ${s.blocklist_v4_count.toLocaleString()})</div><pre style="margin:0; white-space:pre-wrap; word-break:break-all;">${v4 || '<em>—</em>'}</pre></div>
+                    <div><div style="font-weight:600; margin-bottom:4px;">IPv6 (first ${s.sample_v6.length} of ${s.blocklist_v6_count.toLocaleString()})</div><pre style="margin:0; white-space:pre-wrap; word-break:break-all;">${v6 || '<em>—</em>'}</pre></div>
+                </div>`;
+            }
+        }
+    } catch (e) {
+        showToast('Failed to load threat-intel status: ' + (e.message || e), 'error');
+    }
+}
+
+async function tiPatchEnableTriple() {
+    // Called when the user toggles "Enabled" or "Dry-run" — both go in
+    // a single PATCH so the backend's apply_state_change runs at most
+    // once for the change pair.
+    const enabled = document.getElementById('ti-cfg-enabled').checked;
+    const dry_run = document.getElementById('ti-cfg-dry-run').checked;
+    const body = { enabled, dry_run };
+    try {
+        const resp = await fetch('/api/threat-intel/config', {
+            method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            showToast(data.error || 'Failed to update config', 'error');
+            // Reload to re-sync the UI with whatever the backend rolled to.
+            tiLoadConfig();
+            return;
+        }
+        showToast('Threat intel updated', 'success');
+        _tiCachedConfig = data;
+        tiLoadStatus();
+    } catch (e) {
+        showToast('Update failed: ' + e.message, 'error');
+        tiLoadConfig();
+    }
+}
+
+async function tiSaveRefreshHours() {
+    const v = parseInt(document.getElementById('ti-cfg-refresh-hours').value, 10);
+    if (isNaN(v) || v < 1 || v > 168) { showToast('Refresh hours must be 1–168', 'error'); return; }
+    try {
+        const resp = await fetch('/api/threat-intel/config', {
+            method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ refresh_hours: v }),
+        });
+        if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Server error');
+        showToast('Refresh interval saved', 'success');
+    } catch (e) { showToast(e.message, 'error'); }
+}
+
+async function tiSaveAllowlist() {
+    const lines = document.getElementById('ti-cfg-allowlist').value.split('\n').map(s => s.trim()).filter(Boolean);
+    try {
+        const resp = await fetch('/api/threat-intel/config', {
+            method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ allowlist: lines }),
+        });
+        if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Server error');
+        showToast('Allowlist saved', 'success');
+    } catch (e) { showToast(e.message, 'error'); }
+}
+
+async function tiSaveProvider(id, needsKey) {
+    const enabled = document.getElementById('ti-prov-en-' + id).checked;
+    const keyEl = document.getElementById('ti-prov-key-' + id);
+    let useKey;
+    if (!needsKey) {
+        useKey = '';
+    } else if (!keyEl) {
+        useKey = '';
+    } else if (keyEl.value === '***') {
+        // User left the masked value as-is → preserve the on-disk key.
+        useKey = '***';
+    } else {
+        // Anything else (including an empty string) is what the user
+        // wants stored — empty means "clear the key on disk".
+        useKey = keyEl.value.trim();
+    }
+    const body = { providers: { [id]: { enabled, api_key: useKey, url_override: '' } } };
+    try {
+        const resp = await fetch('/api/threat-intel/config', {
+            method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body),
+        });
+        if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Server error');
+        showToast('Provider saved', 'success');
+        tiLoadConfig();
+    } catch (e) { showToast(e.message, 'error'); }
+}
+
+async function tiRefreshNow() {
+    const btn = document.getElementById('ti-refresh-now-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Refreshing…'; }
+    try {
+        const resp = await fetch('/api/threat-intel/refresh', { method: 'POST' });
+        if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Server error');
+        showToast('Refreshed', 'success');
+        tiLoadStatus();
+    } catch (e) {
+        showToast('Refresh failed: ' + e.message, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.innerHTML = '↻ Refresh now'; }
+    }
+}
+
+async function tiPause() {
+    if (!await wolfConfirm('Pause threat-intel enforcement? The kernel rule will be removed immediately. Configuration is preserved — click Resume to re-activate.', 'Pause enforcement')) return;
+    try {
+        const resp = await fetch('/api/threat-intel/pause', { method: 'POST' });
+        if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Server error');
+        showToast('Enforcement paused', 'success');
+        tiLoadStatus();
+        tiLoadConfig();
+    } catch (e) { showToast(e.message, 'error'); }
+}
+
+async function tiResume() {
+    try {
+        const resp = await fetch('/api/threat-intel/resume', { method: 'POST' });
+        if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Server error');
+        showToast('Enforcement resumed', 'success');
+        tiLoadStatus();
+        tiLoadConfig();
+    } catch (e) { showToast(e.message, 'error'); }
+}
+
+async function tiLookup() {
+    const ip = document.getElementById('ti-lookup-ip').value.trim();
+    const out = document.getElementById('ti-lookup-result');
+    if (!ip) { out.textContent = 'Enter an IP to check.'; return; }
+    try {
+        const resp = await fetch('/api/threat-intel/lookup/' + encodeURIComponent(ip));
+        const data = await resp.json();
+        if (!resp.ok) { out.innerHTML = '<span style="color:var(--danger);">' + tiEsc(data.error || 'Lookup failed') + '</span>'; return; }
+        if (data.blocked) {
+            const m = data.matches.map(tiEsc).join(', ');
+            out.innerHTML = `<span style="color:var(--danger); font-weight:600;">🚫 BLOCKED</span> by: <code>${m}</code>`;
+        } else {
+            out.innerHTML = `<span style="color:var(--success); font-weight:600;">✓ Not blocked</span>`;
+        }
+    } catch (e) { out.innerHTML = '<span style="color:var(--danger);">' + tiEsc(e.message) + '</span>'; }
+}
+
 // ─── Cluster Secret Management ───
 
 async function loadClusterSecretStatus() {

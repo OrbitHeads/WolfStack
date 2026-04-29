@@ -5220,6 +5220,67 @@
                                 <div style="color:var(--text-muted);font-size:13px;padding:12px 0;">Loading…</div>
                             </div>
                         </div>
+
+                        <!-- ─── Help / explainer (collapsible) ─── -->
+                        <details style="margin-top:18px; max-width:720px; background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:0; overflow:hidden;">
+                            <summary style="cursor:pointer; padding:12px 16px; font-weight:600; font-size:14px; user-select:none; display:flex; align-items:center; gap:8px;">
+                                💡 What are passkeys, and how do I use them? &mdash; click to expand
+                            </summary>
+                            <div style="padding:6px 18px 18px; font-size:13px; line-height:1.65; color:var(--text-secondary);">
+
+                                <h5 style="font-size:13px; margin:14px 0 6px; color:var(--text-primary);">What is a passkey?</h5>
+                                <p style="margin:0 0 10px;">
+                                    A passkey is a small cryptographic key stored securely on your device &mdash; your laptop&rsquo;s
+                                    Secure Enclave, your phone, or a USB security key (YubiKey, Titan, etc.). Instead of typing
+                                    a password, you confirm a fingerprint, face scan, PIN, or button press, and your device
+                                    proves to WolfStack that it&rsquo;s really you. Passkeys can&rsquo;t be phished, can&rsquo;t be reused
+                                    across sites, and can&rsquo;t be leaked in a database breach.
+                                </p>
+
+                                <h5 style="font-size:13px; margin:14px 0 6px; color:var(--text-primary);">How do I add my first one?</h5>
+                                <ol style="margin:0 0 10px 20px; padding:0;">
+                                    <li>Type a label that will help you recognise it later (e.g. <em>&ldquo;MacBook Touch ID&rdquo;</em>, <em>&ldquo;YubiKey&rdquo;</em>, <em>&ldquo;iPhone&rdquo;</em>) and click <strong>Add passkey</strong>.</li>
+                                    <li>Your browser will pop up its built-in passkey dialog. Choose where to save it &mdash; this device, your phone (via Bluetooth/QR), or an inserted security key.</li>
+                                    <li>Confirm with your fingerprint, face, PIN, or button press.</li>
+                                    <li>That&rsquo;s it. Next time you sign in, click <em>&ldquo;Sign in with passkey&rdquo;</em> on the login page and skip the password.</li>
+                                </ol>
+
+                                <h5 style="font-size:13px; margin:14px 0 6px; color:var(--text-primary);">Add more than one</h5>
+                                <p style="margin:0 0 10px;">
+                                    We strongly recommend registering at least two passkeys &mdash; ideally on different devices
+                                    (e.g. your laptop plus your phone, or a primary YubiKey plus a backup). If you lose access
+                                    to one, the others still let you in. Without a backup passkey, you&rsquo;d fall back to your
+                                    Linux password &mdash; which is fine, but defeats the point of passwordless login.
+                                </p>
+
+                                <h5 style="font-size:13px; margin:14px 0 6px; color:var(--text-primary);">Important: passkeys are tied to the URL you&rsquo;re visiting</h5>
+                                <p style="margin:0 0 10px;">
+                                    A passkey registered while visiting WolfStack at <code>https://wolfstack.example.com:8553</code>
+                                    won&rsquo;t work if you later visit the server at its IP address (<code>https://10.0.0.5:8553</code>).
+                                    Browsers refuse to do passkeys on bare IP addresses at all. Pick a hostname &mdash; ideally a
+                                    real DNS name &mdash; and stick to it. If you have to use IPs, you&rsquo;ll need to keep using passwords.
+                                </p>
+
+                                <h5 style="font-size:13px; margin:14px 0 6px; color:var(--text-primary);">What if I lose my device?</h5>
+                                <p style="margin:0 0 10px;">
+                                    Two safety nets:
+                                </p>
+                                <ul style="margin:0 0 10px 20px; padding:0;">
+                                    <li><strong>Other passkeys still work.</strong> If you registered more than one, just sign in with another.</li>
+                                    <li><strong>Your Linux password still works.</strong> The classic <em>username + password</em> form on the login page is unaffected by passkey registration. Sign in that way and remove the lost device from this list.</li>
+                                </ul>
+
+                                <h5 style="font-size:13px; margin:14px 0 6px; color:var(--text-primary);">Common questions</h5>
+                                <ul style="margin:0 0 6px 20px; padding:0;">
+                                    <li><strong>Do passkeys replace my password?</strong> Not in this version. They sit <em>alongside</em> it &mdash; you can use either to sign in.</li>
+                                    <li><strong>Does this work in any browser?</strong> Any modern browser supports WebAuthn: Chrome, Firefox, Safari, Edge. We don&rsquo;t support older IE-style browsers.</li>
+                                    <li><strong>Do I need a hardware key?</strong> No. Most modern devices have a built-in passkey store (Touch ID on Mac, Windows Hello, Android biometrics, iCloud Keychain). A YubiKey or similar gives you a portable, hardware-backed option but isn&rsquo;t required.</li>
+                                    <li><strong>Where are passkeys stored?</strong> The <em>private</em> half stays on your device &mdash; we never see it. WolfStack only stores the <em>public</em> half plus a label, in <code>/etc/wolfstack/webauthn.json</code> (mode 0600).</li>
+                                    <li><strong>Can I use the same passkey across multiple WolfStack servers?</strong> Yes &mdash; if you register the same authenticator on each server. Each server has its own list; there&rsquo;s no central sync.</li>
+                                </ul>
+
+                            </div>
+                        </details>
                     </div>
 
                     <!-- ─── File Locations Tab ─── -->
@@ -6417,6 +6478,7 @@
                         <button class="wr-tab" data-tab="tools" onclick="wrSelectTab('tools')">🛠 DNS Tools</button>
                         <button class="wr-tab" data-tab="traceroute" onclick="wrSelectTab('traceroute')">🛰 Visual TraceRoute</button>
                         <button class="wr-tab" data-tab="logs" onclick="wrSelectTab('logs')">📜 Logs</button>
+                        <button class="wr-tab" data-tab="threat-intel" onclick="wrSelectTab('threat-intel')">🛡 Threat Intel</button>
                     </div>
 
                     <!-- Rack view canvas (default visible) -->
@@ -6693,6 +6755,155 @@
                     <div id="wr-tab-logs" class="wr-tab-panel" style="padding:16px; display:none;">
                         <div style="font-size:12px; color:var(--text-muted); margin-bottom:12px;">Firewall log stream (NFLOG → kernel log). Only rules with "Log this match" set appear here.</div>
                         <pre id="wr-logs-pre" style="font-family:var(--font-mono); font-size:11px; background:var(--bg-secondary); padding:10px; border-radius:6px; max-height:400px; overflow:auto;"></pre>
+                    </div>
+
+                    <!-- ═══ Threat Intel ═══ -->
+                    <div id="wr-tab-threat-intel" class="wr-tab-panel" style="padding:16px; display:none;">
+                        <!-- Top status row: master state + emergency pause -->
+                        <div id="ti-status-row" style="display:flex; gap:12px; flex-wrap:wrap; align-items:stretch; margin-bottom:16px;">
+                            <div style="flex:2 1 360px; min-width:300px; background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:14px 16px;">
+                                <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+                                    <h4 style="margin:0; font-size:14px;">🛡 Threat Intelligence</h4>
+                                    <span id="ti-status-badge" style="font-size:11px; padding:3px 8px; border-radius:4px; background:var(--bg-tertiary); color:var(--text-muted);">Loading…</span>
+                                </div>
+                                <div id="ti-status-summary" style="font-size:13px; color:var(--text-secondary); line-height:1.55;">Loading status…</div>
+                            </div>
+                            <div style="flex:1 1 220px; min-width:200px; background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:14px 16px; display:flex; flex-direction:column; gap:8px;">
+                                <div style="font-size:11px; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.5px;">Emergency</div>
+                                <button id="ti-pause-btn" onclick="tiPause()" class="btn" style="background:rgba(220,38,38,0.15); border:1px solid rgba(220,38,38,0.4); color:#fca5a5; font-weight:600;">⏸ Pause enforcement</button>
+                                <button id="ti-resume-btn" onclick="tiResume()" class="btn" style="display:none; background:rgba(16,185,129,0.15); border:1px solid rgba(16,185,129,0.4); color:#6ee7b7; font-weight:600;">▶ Resume enforcement</button>
+                                <div style="font-size:11px; color:var(--text-muted);">Drops the kernel rule immediately while preserving config &amp; ipset state.</div>
+                            </div>
+                        </div>
+
+                        <!-- Master settings -->
+                        <div style="background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:14px 16px; margin-bottom:16px;">
+                            <h4 style="margin:0 0 8px 0; font-size:14px;">Master settings</h4>
+                            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px 16px; font-size:13px;">
+                                <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+                                    <input type="checkbox" id="ti-cfg-enabled" onchange="tiPatchEnableTriple()">
+                                    <span><strong>Enabled</strong> &mdash; runs feed refreshes</span>
+                                </label>
+                                <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+                                    <input type="checkbox" id="ti-cfg-dry-run" onchange="tiPatchEnableTriple()">
+                                    <span><strong>Dry-run mode</strong> &mdash; report only, no firewall changes</span>
+                                </label>
+                                <label style="display:flex; align-items:center; gap:8px;">
+                                    <span style="white-space:nowrap;">Refresh every</span>
+                                    <input type="number" id="ti-cfg-refresh-hours" min="1" max="168" value="6" style="width:64px; padding:4px 6px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:4px; color:var(--text);">
+                                    <span>hours</span>
+                                    <button class="btn btn-sm" onclick="tiSaveRefreshHours()" style="margin-left:auto;">Save</button>
+                                </label>
+                                <button class="btn btn-sm btn-primary" onclick="tiRefreshNow()" id="ti-refresh-now-btn">↻ Refresh now</button>
+                            </div>
+                            <div style="font-size:12px; color:var(--text-muted); margin-top:10px;">
+                                On a fresh install threat intel is <strong>off</strong> and dry-run. Turn on dry-run first to see what
+                                would be blocked, then untick dry-run to enforce. Cluster nodes, RFC1918 ranges, and the IP you're
+                                connecting from are always exempted; you cannot lock yourself out by accident.
+                            </div>
+                        </div>
+
+                        <!-- Feed providers -->
+                        <div style="background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:14px 16px; margin-bottom:16px;">
+                            <h4 style="margin:0 0 10px 0; font-size:14px;">Feed providers</h4>
+                            <div id="ti-providers-list">
+                                <div style="color:var(--text-muted); font-size:13px; padding:12px 0;">Loading…</div>
+                            </div>
+                        </div>
+
+                        <!-- Allowlist + Lookup -->
+                        <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:16px;">
+                            <div style="background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:14px 16px;">
+                                <h4 style="margin:0 0 8px 0; font-size:14px;">Allowlist (CIDRs to never block)</h4>
+                                <textarea id="ti-cfg-allowlist" placeholder="One CIDR per line, e.g. 203.0.113.0/24" style="width:100%; min-height:90px; font-family:var(--font-mono); font-size:12px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:6px; padding:8px; color:var(--text); resize:vertical;"></textarea>
+                                <button class="btn btn-sm" onclick="tiSaveAllowlist()" style="margin-top:8px;">💾 Save allowlist</button>
+                            </div>
+                            <div style="background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:14px 16px;">
+                                <h4 style="margin:0 0 8px 0; font-size:14px;">Lookup IP</h4>
+                                <div style="display:flex; gap:8px;">
+                                    <input type="text" id="ti-lookup-ip" placeholder="8.8.8.8" style="flex:1; padding:6px 10px; font-family:var(--font-mono); font-size:13px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:6px; color:var(--text);">
+                                    <button class="btn btn-sm" onclick="tiLookup()">Lookup</button>
+                                </div>
+                                <div id="ti-lookup-result" style="margin-top:10px; font-size:12px; color:var(--text-muted);">Enter an IP to check whether it's currently blocked.</div>
+                            </div>
+                        </div>
+
+                        <!-- Sample of current blocklist -->
+                        <div style="background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:14px 16px;">
+                            <h4 style="margin:0 0 8px 0; font-size:14px;">Blocklist preview</h4>
+                            <div id="ti-blocklist-preview" style="font-family:var(--font-mono); font-size:11px; color:var(--text-secondary); max-height:200px; overflow:auto;">Loading…</div>
+                            <div style="font-size:11px; color:var(--text-muted); margin-top:8px;">Showing the first 50 entries of each family. The full list lives in the kernel ipset; use Lookup IP to check a specific address.</div>
+                        </div>
+
+                        <!-- ─── Help / explainer (collapsible) ─── -->
+                        <details style="margin-top:18px; background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:0; overflow:hidden;">
+                            <summary style="cursor:pointer; padding:12px 16px; font-weight:600; font-size:14px; user-select:none; display:flex; align-items:center; gap:8px;">
+                                💡 How does this work? &mdash; click to expand
+                            </summary>
+                            <div style="padding:6px 18px 18px; font-size:13px; line-height:1.65; color:var(--text-secondary);">
+
+                                <h5 style="font-size:13px; margin:14px 0 6px; color:var(--text-primary);">What is Threat Intelligence?</h5>
+                                <p style="margin:0 0 10px;">
+                                    WolfStack pulls public lists of known-bad IP addresses (botnets, scanners, ransomware command-and-control, spam sources)
+                                    from a few well-respected providers, deduplicates them into a single list, and tells the kernel firewall to
+                                    drop incoming packets from any of those IPs. Your existing WolfRouter firewall rules still apply on top &mdash;
+                                    threat intel is one extra layer that runs first.
+                                </p>
+
+                                <h5 style="font-size:13px; margin:14px 0 6px; color:var(--text-primary);">Recommended first-time workflow</h5>
+                                <ol style="margin:0 0 10px 20px; padding:0;">
+                                    <li><strong>Tick "Enabled" but leave "Dry-run mode" on.</strong> Click <em>Refresh now</em>. The system will fetch all enabled feeds and show you exactly what <strong>would</strong> be blocked &mdash; without touching the kernel firewall.</li>
+                                    <li><strong>Review the blocklist preview.</strong> Look at the sample IPs. Use <em>Lookup IP</em> to spot-check a few addresses you care about (your office IP, a friend&rsquo;s server, etc.) to make sure they&rsquo;re not on the list.</li>
+                                    <li><strong>If anything important is on the list,</strong> add it to the <em>Allowlist</em> and save. Allowlisted CIDRs are stripped from every future refresh.</li>
+                                    <li><strong>When you&rsquo;re happy, untick "Dry-run mode".</strong> The kernel rule is installed, the badge flips to <span style="background:rgba(16,185,129,0.18); color:#6ee7b7; padding:1px 6px; border-radius:4px; font-size:11px;">ENFORCING</span>, and bad IPs start getting dropped.</li>
+                                </ol>
+
+                                <h5 style="font-size:13px; margin:14px 0 6px; color:var(--text-primary);">The feed providers explained</h5>
+                                <ul style="margin:0 0 10px 20px; padding:0;">
+                                    <li><strong>Spamhaus DROP / EDROP / dropv6</strong> &mdash; Hijacked IP ranges and direct allocations to criminal organisations. Very high quality, very low false-positive rate. <em>No API key needed.</em> Recommended for everyone.</li>
+                                    <li><strong>FireHOL Level 1</strong> &mdash; A curated union of the most consistent &ldquo;definitely-attacking-someone-right-now&rdquo; feeds. Larger than Spamhaus but still well-maintained. <em>No API key needed.</em> Recommended for everyone.</li>
+                                    <li><strong>CrowdSec community blocklist</strong> &mdash; Real-time IPs being reported by the global CrowdSec community. Fresher than Spamhaus but with a bit more noise. <em>API key required</em> &mdash; sign up free at <a href="https://app.crowdsec.net/" target="_blank" rel="noopener" style="color:var(--accent-primary);">app.crowdsec.net</a>.</li>
+                                    <li><strong>AbuseIPDB</strong> &mdash; A long-running community-curated database. We pull only entries with a 90%+ confidence score. <em>API key required</em> &mdash; free tier at <a href="https://www.abuseipdb.com/account/api" target="_blank" rel="noopener" style="color:var(--accent-primary);">abuseipdb.com</a> gives 1000 requests/day, plenty for our 6-hour refresh.</li>
+                                </ul>
+                                <p style="margin:0 0 10px;">
+                                    Enabling more providers makes the blocklist bigger but also slightly increases the chance of a false positive.
+                                    Spamhaus + FireHOL is a sensible default; add CrowdSec or AbuseIPDB if you want broader coverage.
+                                </p>
+
+                                <h5 style="font-size:13px; margin:14px 0 6px; color:var(--text-primary);">What can never be blocked (safety belt)</h5>
+                                <ul style="margin:0 0 10px 20px; padding:0;">
+                                    <li><strong>Loopback</strong> (<code>127.0.0.0/8</code>, <code>::1</code>) &mdash; the host always talks to itself.</li>
+                                    <li><strong>Private networks</strong> (<code>10.x</code>, <code>172.16/12</code>, <code>192.168/16</code>, link-local, ULA) &mdash; LAN traffic is never dropped.</li>
+                                    <li><strong>CGNAT range</strong> (<code>100.64/10</code>) &mdash; covers Tailscale, Starlink, ISP-NAT users.</li>
+                                    <li><strong>Every node in your WolfStack cluster</strong> &mdash; their addresses are stripped from the blocklist on every refresh.</li>
+                                    <li><strong>Your own IP when you click Refresh</strong> &mdash; the API exempts the IP you&rsquo;re connecting from so you can&rsquo;t accidentally lock yourself out.</li>
+                                    <li><strong>Anything you&rsquo;ve allowlisted</strong> &mdash; one CIDR per line in the box above.</li>
+                                </ul>
+
+                                <h5 style="font-size:13px; margin:14px 0 6px; color:var(--text-primary);">Emergency pause &mdash; when to use it</h5>
+                                <p style="margin:0 0 10px;">
+                                    The big <span style="color:#fca5a5;">⏸ Pause enforcement</span> button removes the kernel rule immediately while keeping
+                                    everything else (config, feeds, blocklist) intact. Use it when:
+                                </p>
+                                <ul style="margin:0 0 10px 20px; padding:0;">
+                                    <li>A customer can&rsquo;t reach you and you suspect threat-intel is the cause &mdash; pause first, debug second.</li>
+                                    <li>You&rsquo;re running a temporary task that needs to talk to an IP that might be on a feed (security research, pentest, etc.).</li>
+                                    <li>You&rsquo;re troubleshooting a network issue and want to rule threat-intel out of the picture.</li>
+                                </ul>
+                                <p style="margin:0 0 10px;">Click <span style="color:#6ee7b7;">▶ Resume enforcement</span> to bring it back &mdash; instant, no re-fetch needed.</p>
+
+                                <h5 style="font-size:13px; margin:14px 0 6px; color:var(--text-primary);">Common questions</h5>
+                                <ul style="margin:0 0 6px 20px; padding:0;">
+                                    <li><strong>Will this break my customers?</strong> Only if their IP appears on a public threat feed. That&rsquo;s rare for legitimate users; we recommend dry-run mode first to verify.</li>
+                                    <li><strong>What about IPv6?</strong> Spamhaus dropv6 covers it. Other v6-aware feeds are rolling out gradually.</li>
+                                    <li><strong>Does this need <code>ipset</code>?</strong> Yes &mdash; the kernel-level matcher uses it. Most distros have it pre-installed; if not, <code>apt install ipset</code> / <code>dnf install ipset</code> / <code>pacman -S ipset</code>.</li>
+                                    <li><strong>How often do feeds refresh?</strong> Whatever you set above &mdash; default 6 hours. Public feeds update at most a few times per day, polling more often is just rude.</li>
+                                    <li><strong>Does this work in a cluster?</strong> Each node has its own threat-intel config and ipset. Cluster-wide propagation is a future enhancement.</li>
+                                    <li><strong>Where&rsquo;s the data stored?</strong> Config at <code>/etc/wolfstack/threat-intel.json</code>, runtime state at <code>/etc/wolfstack/threat-intel-state.json</code>. Both survive restarts; ipsets are restored from state on boot.</li>
+                                </ul>
+
+                            </div>
+                        </details>
                     </div>
                 </div>
             </div>

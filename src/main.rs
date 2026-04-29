@@ -60,6 +60,7 @@ mod plugins;
 mod sql_connections;
 mod netguard;
 mod certbot;
+mod threat_intel;
 #[allow(dead_code)]
 mod integrations;
 
@@ -470,6 +471,12 @@ async fn main() -> std::io::Result<()> {
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 tokio::task::spawn_blocking(move || {
+                    // Restore threat-intel ipsets BEFORE the router applies its
+                    // ruleset. Without this, a host reboot would leave the
+                    // ipsets empty/missing and `iptables-restore --test` would
+                    // reject the rule that references them, leaving the user
+                    // un-protected until they re-enable from the UI.
+                    crate::threat_intel::startup();
                     crate::networking::router::apply_on_startup(router_state, &nid);
                 }).await.ok();
             });
@@ -509,6 +516,18 @@ async fn main() -> std::io::Result<()> {
                 tokio::task::spawn_blocking(danger::tick).await.ok();
             }
         });
+
+        // Threat-intel scheduler: every minute, refresh feeds when the
+        // configured interval has elapsed. No-op when disabled (~1µs config
+        // file read). Lives separate from the WolfRouter apply path —
+        // refresh_all updates the cache + ipset, build_ruleset's hook
+        // picks the result up on the next firewall apply.
+        {
+            let cluster_for_ti = cluster.clone();
+            tokio::spawn(async move {
+                threat_intel::scheduler_loop(cluster_for_ti).await;
+            });
+        }
 
         // Daily certbot renewal. Runs certbot's own `renew --quiet`
         // which is a no-op for any cert with >30 days left, so it's

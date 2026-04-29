@@ -794,6 +794,228 @@ pub async fn passkey_delete(req: HttpRequest, state: web::Data<AppState>, path: 
     }
 }
 
+// ─── Threat Intelligence (WolfRouter integration) ───
+
+/// Helper: collect the cluster's known node addresses for the safe-filter.
+fn ti_cluster_node_ips(state: &web::Data<AppState>) -> Vec<String> {
+    state.cluster.get_all_nodes().iter().map(|n| n.address.clone()).collect()
+}
+
+/// Helper: best-effort extraction of the requesting client's IP. Used as a
+/// transient exemption so an admin can't accidentally lock themselves out
+/// of their own dashboard if their public IP appears on a feed.
+fn ti_request_client_ip(req: &HttpRequest) -> Vec<String> {
+    let raw = req.connection_info().peer_addr().unwrap_or("").to_string();
+    // peer_addr is "ip:port" — strip the port for the safe-filter compare.
+    let ip = match raw.rsplit_once(':') {
+        Some((host, _)) => host.to_string(),
+        None => raw,
+    };
+    if ip.is_empty() { Vec::new() } else { vec![ip] }
+}
+
+/// Mask API keys before returning a config to the frontend. Empty fields
+/// stay empty; non-empty fields become "***" so the UI knows a key is
+/// configured without seeing the value.
+fn ti_mask_keys(mut cfg: crate::threat_intel::ThreatIntelConfig) -> crate::threat_intel::ThreatIntelConfig {
+    for (_, p) in cfg.providers.iter_mut() {
+        if !p.api_key.is_empty() {
+            p.api_key = "***".to_string();
+        }
+    }
+    cfg
+}
+
+/// GET /api/threat-intel/config — return the persisted config (API keys masked).
+pub async fn threat_intel_get_config(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let cfg = crate::threat_intel::ThreatIntelConfig::load();
+    HttpResponse::Ok().json(ti_mask_keys(cfg))
+}
+
+#[derive(Deserialize)]
+pub struct ThreatIntelPatchRequest {
+    #[serde(default)] pub enabled: Option<bool>,
+    #[serde(default)] pub dry_run: Option<bool>,
+    #[serde(default)] pub paused: Option<bool>,
+    #[serde(default)] pub refresh_hours: Option<u64>,
+    #[serde(default)] pub providers: Option<std::collections::HashMap<String, crate::threat_intel::ProviderConfig>>,
+    #[serde(default)] pub allowlist: Option<Vec<String>>,
+}
+
+/// PATCH /api/threat-intel/config — partial update. If the enabled / dry_run /
+/// paused triplet changes, runs `apply_state_change()` to make the kernel
+/// state catch up.
+///
+/// API key sentinel: a provider value of `"***"` means "don't change",
+/// preserving the existing on-disk key. Anything else (including empty
+/// string to clear) is used verbatim.
+pub async fn threat_intel_patch_config(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<ThreatIntelPatchRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let mut cfg = crate::threat_intel::ThreatIntelConfig::load();
+    let prev_enforcement = crate::threat_intel::enforcement_active(&cfg);
+
+    if let Some(v) = body.enabled { cfg.enabled = v; }
+    if let Some(v) = body.dry_run { cfg.dry_run = v; }
+    if let Some(v) = body.paused { cfg.paused = v; }
+    if let Some(v) = body.refresh_hours {
+        // Clamp at the API boundary too so the saved config matches what the
+        // scheduler will actually use.
+        cfg.refresh_hours = v.clamp(1, 168);
+    }
+    if let Some(allowlist) = &body.allowlist { cfg.allowlist = allowlist.clone(); }
+    if let Some(providers) = &body.providers {
+        for (id, incoming) in providers.iter() {
+            let entry = cfg.providers.entry(id.clone()).or_insert_with(|| crate::threat_intel::ProviderConfig {
+                enabled: false, api_key: String::new(), url_override: String::new(),
+            });
+            entry.enabled = incoming.enabled;
+            // Sentinel "***" means "don't change". Anything else replaces.
+            if incoming.api_key != "***" {
+                entry.api_key = incoming.api_key.clone();
+            }
+            entry.url_override = incoming.url_override.clone();
+        }
+    }
+
+    if let Err(e) = cfg.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+
+    let new_enforcement = crate::threat_intel::enforcement_active(&cfg);
+    let mut apply_error: Option<String> = None;
+    if new_enforcement != prev_enforcement {
+        // The kernel state needs to catch up. Run on a blocking thread —
+        // apply_state_change shells out to ipset/iptables-restore.
+        match tokio::task::spawn_blocking(crate::threat_intel::apply_state_change).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => apply_error = Some(e),
+            Err(e) => apply_error = Some(format!("apply task panicked: {}", e)),
+        }
+        // If the apply failed, roll the config back so on-disk state matches kernel state.
+        if apply_error.is_some() {
+            let mut rolled = crate::threat_intel::ThreatIntelConfig::load();
+            // Easiest rollback: flip the enable/dry_run/paused fields back.
+            // We do NOT touch other fields the user changed (allowlist, providers) —
+            // only the enforcement transition that just failed.
+            rolled.enabled = if prev_enforcement { true } else { rolled.enabled && false };
+            // Simpler: just restore the prior enforcement triplet by inverting our last change.
+            // Reload and undo via the prev value.
+            // To keep this readable: load latest, then set the three flags to whatever
+            // produced prev_enforcement. We don't know the exact prev triplet without
+            // re-reading earlier state — so just clear `enabled` and `paused`, set
+            // `dry_run = true`. This is the conservative "off" state.
+            rolled.enabled = false;
+            rolled.dry_run = true;
+            rolled.paused = false;
+            let _ = rolled.save();
+        }
+    }
+
+    if let Some(e) = apply_error {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": format!("Config saved, but enforcement could not be activated: {}. Configuration was rolled back to a safe state.", e),
+        }));
+    }
+    HttpResponse::Ok().json(ti_mask_keys(crate::threat_intel::ThreatIntelConfig::load()))
+}
+
+/// POST /api/threat-intel/refresh — trigger an immediate refresh.
+pub async fn threat_intel_refresh(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let cluster_ips = ti_cluster_node_ips(&state);
+    let admin_ip = ti_request_client_ip(&req);
+    let new_state = crate::threat_intel::refresh_all(cluster_ips, admin_ip).await;
+    HttpResponse::Ok().json(new_state)
+}
+
+/// POST /api/threat-intel/pause — emergency-off. Drops the kernel rule
+/// immediately while preserving config + ipset state for a one-click
+/// resume.
+pub async fn threat_intel_pause(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let mut cfg = crate::threat_intel::ThreatIntelConfig::load();
+    if cfg.paused {
+        return HttpResponse::Ok().json(serde_json::json!({ "paused": true, "no_op": true }));
+    }
+    cfg.paused = true;
+    if let Err(e) = cfg.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+    match tokio::task::spawn_blocking(crate::threat_intel::apply_state_change).await {
+        Ok(Ok(())) => HttpResponse::Ok().json(serde_json::json!({ "paused": true })),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("apply task panicked: {}", e) })),
+    }
+}
+
+/// POST /api/threat-intel/resume — undo a pause.
+pub async fn threat_intel_resume(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let mut cfg = crate::threat_intel::ThreatIntelConfig::load();
+    if !cfg.paused {
+        return HttpResponse::Ok().json(serde_json::json!({ "paused": false, "no_op": true }));
+    }
+    cfg.paused = false;
+    if let Err(e) = cfg.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+    match tokio::task::spawn_blocking(crate::threat_intel::apply_state_change).await {
+        Ok(Ok(())) => HttpResponse::Ok().json(serde_json::json!({ "paused": false })),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("apply task panicked: {}", e) })),
+    }
+}
+
+/// GET /api/threat-intel/status — current state for the UI: per-provider
+/// fetch status, total blocklist size, applied flag, sample of recently
+/// added IPs (first 50 of each family — the UI uses these for "preview"
+/// rendering without shipping 200k entries to the browser).
+pub async fn threat_intel_status(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let snapshot = crate::threat_intel::snapshot_cache();
+    let cfg = crate::threat_intel::ThreatIntelConfig::load();
+
+    let sample_v4: Vec<String> = snapshot.blocklist_v4.iter().take(50).cloned().collect();
+    let sample_v6: Vec<String> = snapshot.blocklist_v6.iter().take(50).cloned().collect();
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "enabled": cfg.enabled,
+        "dry_run": cfg.dry_run,
+        "paused": cfg.paused,
+        "enforcement_active": crate::threat_intel::enforcement_active(&cfg),
+        "applied": snapshot.applied,
+        "last_refresh_secs": snapshot.last_refresh_secs,
+        "blocklist_size": snapshot.blocklist_size,
+        "blocklist_v4_count": snapshot.blocklist_v4.len(),
+        "blocklist_v6_count": snapshot.blocklist_v6.len(),
+        "sample_v4": sample_v4,
+        "sample_v6": sample_v6,
+        "providers": snapshot.providers,
+        "ipset_available": crate::threat_intel::ipset::ipset_available(),
+        "max_blocklist_size": crate::threat_intel::MAX_BLOCKLIST_SIZE,
+    }))
+}
+
+/// GET /api/threat-intel/lookup/{ip} — is this IP currently blocked, and which feed CIDRs match?
+pub async fn threat_intel_lookup(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let ip = path.into_inner();
+    if ip.parse::<std::net::IpAddr>().is_err() {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Not a valid IP address" }));
+    }
+    let matches = crate::threat_intel::lookup_ip(&ip);
+    HttpResponse::Ok().json(serde_json::json!({
+        "ip": ip,
+        "blocked": !matches.is_empty(),
+        "matches": matches,
+    }))
+}
+
 // ─── Password Reset API (no auth required) ───
 
 /// GET /api/auth/smtp-configured — check if SMTP is configured (controls "Lost Password" visibility)
@@ -20261,6 +20483,13 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/auth/passkey/login/finish", web::post().to(passkey_login_finish))
         .route("/api/auth/passkeys", web::get().to(passkey_list))
         .route("/api/auth/passkeys/{id}", web::delete().to(passkey_delete))
+        .route("/api/threat-intel/config", web::get().to(threat_intel_get_config))
+        .route("/api/threat-intel/config", web::patch().to(threat_intel_patch_config))
+        .route("/api/threat-intel/refresh", web::post().to(threat_intel_refresh))
+        .route("/api/threat-intel/pause", web::post().to(threat_intel_pause))
+        .route("/api/threat-intel/resume", web::post().to(threat_intel_resume))
+        .route("/api/threat-intel/status", web::get().to(threat_intel_status))
+        .route("/api/threat-intel/lookup/{ip}", web::get().to(threat_intel_lookup))
         .route("/api/settings/login-disabled", web::get().to(login_disabled_status))
         .route("/api/settings/login-disabled", web::post().to(set_login_disabled))
         .route("/api/auth/smtp-configured", web::get().to(smtp_configured))
