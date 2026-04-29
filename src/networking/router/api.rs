@@ -1878,8 +1878,13 @@ pub struct ZoneAssignRequest {
     pub zone: Option<Zone>,  // None = remove
 }
 
-pub async fn assign_zone(req: HttpRequest, state: S, body: web::Json<ZoneAssignRequest>) -> HttpResponse {
+pub async fn assign_zone(req: HttpRequest, state: S, body: web::Json<ZoneAssignRequest>, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
+    // Cluster guard — refuse to set/clear a zone on a node that
+    // belongs to a different cluster. This is the strict-cluster
+    // isolation principle: cluster A's WolfRouter must not affect
+    // cluster B's nodes.
+    if let Some(resp) = cluster_guard_node_id(&state, &query, Some(&body.node_id)) { return resp; }
     // Apply the config change under the write lock, then release the
     // lock BEFORE shelling out to iptables-restore. Pre-v18.7.30 the
     // whole firewall apply ran with the write lock held — a slow
@@ -1940,13 +1945,14 @@ pub async fn list_segments(req: HttpRequest, state: S, query: web::Query<Topolog
     HttpResponse::Ok().json(filtered)
 }
 
-pub async fn create_segment(req: HttpRequest, state: S, body: web::Json<LanSegment>) -> HttpResponse {
+pub async fn create_segment(req: HttpRequest, state: S, body: web::Json<LanSegment>, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
     // Validate — no embedded newlines in any field that feeds into a
     // dnsmasq config line. See dhcp::render_config for the attack model.
     if let Err(e) = validate_segment(&body) {
         return HttpResponse::BadRequest().body(e);
     }
+    if let Some(resp) = cluster_guard_node_id(&state, &query, Some(&body.node_id)) { return resp; }
     let mut segment = body.into_inner();
     if segment.id.is_empty() { segment.id = gen_id("lan"); }
 
@@ -1973,6 +1979,7 @@ pub async fn update_segment(
     state: S,
     path: web::Path<String>,
     body: web::Json<LanSegment>,
+    query: web::Query<TopologyQuery>,
 ) -> HttpResponse {
     auth_or_return!(req, state);
     if let Err(e) = validate_segment(&body) {
@@ -1983,6 +1990,11 @@ pub async fn update_segment(
     if updated.id != id {
         return HttpResponse::BadRequest().body("id mismatch");
     }
+    // Both the existing item AND the new node_id must be in the
+    // active cluster — block re-pinning a LAN to a node in another
+    // cluster, and block editing a LAN that belongs to another cluster.
+    if let Some(resp) = cluster_guard_existing_lan(&state, &query, &id) { return resp; }
+    if let Some(resp) = cluster_guard_node_id(&state, &query, Some(&updated.node_id)) { return resp; }
     {
         let mut cfg = state.router.config.write().unwrap();
         let idx = match cfg.lans.iter().position(|l| l.id == id) {
@@ -2001,9 +2013,10 @@ pub async fn update_segment(
     HttpResponse::Ok().json(&updated)
 }
 
-pub async fn delete_segment(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
+pub async fn delete_segment(req: HttpRequest, state: S, path: web::Path<String>, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
+    if let Some(resp) = cluster_guard_existing_lan(&state, &query, &id) { return resp; }
     let removed = {
         let mut cfg = state.router.config.write().unwrap();
         let r = cfg.lans.iter().position(|l| l.id == id).map(|i| cfg.lans.remove(i));
@@ -2200,8 +2213,9 @@ pub async fn list_rules(req: HttpRequest, state: S, query: web::Query<TopologyQu
     HttpResponse::Ok().json(filtered)
 }
 
-pub async fn create_rule(req: HttpRequest, state: S, body: web::Json<FirewallRule>) -> HttpResponse {
+pub async fn create_rule(req: HttpRequest, state: S, body: web::Json<FirewallRule>, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
+    if let Some(resp) = cluster_guard_node_id(&state, &query, body.node_id.as_deref()) { return resp; }
     let mut rule = body.into_inner();
     if rule.id.is_empty() { rule.id = gen_id("rule"); }
 
@@ -2236,6 +2250,7 @@ pub async fn update_rule(
     state: S,
     path: web::Path<String>,
     body: web::Json<FirewallRule>,
+    query: web::Query<TopologyQuery>,
 ) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
@@ -2243,6 +2258,8 @@ pub async fn update_rule(
     if updated.id != id {
         return HttpResponse::BadRequest().body("id mismatch");
     }
+    if let Some(resp) = cluster_guard_existing_rule(&state, &query, &id) { return resp; }
+    if let Some(resp) = cluster_guard_node_id(&state, &query, updated.node_id.as_deref()) { return resp; }
     let ruleset_opt = {
         let mut cfg = state.router.config.write().unwrap();
         let idx = match cfg.rules.iter().position(|r| r.id == id) {
@@ -2264,9 +2281,10 @@ pub async fn update_rule(
     HttpResponse::Ok().json(&updated)
 }
 
-pub async fn delete_rule(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
+pub async fn delete_rule(req: HttpRequest, state: S, path: web::Path<String>, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
+    if let Some(resp) = cluster_guard_existing_rule(&state, &query, &id) { return resp; }
     let ruleset_opt = {
         let mut cfg = state.router.config.write().unwrap();
         cfg.rules.retain(|r| r.id != id);
@@ -3077,8 +3095,9 @@ pub async fn list_wan(req: HttpRequest, state: S, query: web::Query<TopologyQuer
     HttpResponse::Ok().json(masked)
 }
 
-pub async fn create_wan(req: HttpRequest, state: S, body: web::Json<wan::WanConnection>) -> HttpResponse {
+pub async fn create_wan(req: HttpRequest, state: S, body: web::Json<wan::WanConnection>, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
+    if let Some(resp) = cluster_guard_node_id(&state, &query, Some(&body.node_id)) { return resp; }
     let mut conn = body.into_inner();
     if conn.id.is_empty() { conn.id = gen_id("wan"); }
     if let Err(e) = wan::validate(&conn) {
@@ -3113,6 +3132,7 @@ pub async fn create_wan(req: HttpRequest, state: S, body: web::Json<wan::WanConn
 pub async fn update_wan(
     req: HttpRequest, state: S,
     path: web::Path<String>, body: web::Json<wan::WanConnection>,
+    query: web::Query<TopologyQuery>,
 ) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
@@ -3123,6 +3143,8 @@ pub async fn update_wan(
     if let Err(e) = wan::validate(&updated) {
         return HttpResponse::BadRequest().body(e);
     }
+    if let Some(resp) = cluster_guard_existing_wan(&state, &query, &id) { return resp; }
+    if let Some(resp) = cluster_guard_node_id(&state, &query, Some(&updated.node_id)) { return resp; }
     // Preserve the existing password if the UI sent the masked "***"
     // sentinel (PUT bodies don't carry plaintext passwords back).
     {
@@ -3157,9 +3179,10 @@ pub async fn update_wan(
     HttpResponse::Ok().json(&response)
 }
 
-pub async fn delete_wan(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
+pub async fn delete_wan(req: HttpRequest, state: S, path: web::Path<String>, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
+    if let Some(resp) = cluster_guard_existing_wan(&state, &query, &id) { return resp; }
     let removed = {
         let mut cfg = state.router.config.write().unwrap();
         let r = cfg.wan_connections.iter().position(|c| c.id == id)
@@ -3725,9 +3748,34 @@ pub async fn tool_install(
 /// loss if you're restoring onto the same node.
 pub async fn export_config(
     req: HttpRequest, state: S,
+    query: web::Query<TopologyQuery>,
 ) -> HttpResponse {
     auth_or_return!(req, state);
     let mut cfg = state.router.config.read().unwrap().clone();
+
+    // Cluster filter: when ?cluster=NAME is set, strip every item
+    // that doesn't belong to a node in that cluster — same strict
+    // shape as list_segments / list_rules / etc. Without this, the
+    // export from Cluster A's WolfRouter view would dump every
+    // cluster's items in one file. Adam Cogswell 2026-04-29:
+    // "wolfrouter module is cluster only nothing in it should bleed
+    // anywhere else to any other clusters".
+    if let Some(set) = cluster_node_id_set(&state, &query) {
+        cfg.lans.retain(|l| set.contains(&l.node_id));
+        cfg.wan_connections.retain(|c| set.contains(&c.node_id));
+        cfg.proxies.retain(|p| set.contains(&p.node_id));
+        cfg.rules.retain(|r| match &r.node_id {
+            None => false,
+            Some(nid) => set.contains(nid),
+        });
+        cfg.subnet_routes.retain(|r| match &r.node_id {
+            None => false,
+            Some(nid) => set.contains(nid),
+        });
+        // ZoneAssignments outer key is node_id.
+        cfg.zones.assignments.retain(|node_id, _| set.contains(node_id));
+    }
+
     // Mask PPPoE passwords in-place.
     for w in cfg.wan_connections.iter_mut() {
         if let wan::WanMode::Pppoe(ref mut p) = w.mode {
@@ -3739,7 +3787,8 @@ pub async fn export_config(
         Err(e) => return HttpResponse::InternalServerError().body(format!("serialize: {}", e)),
     };
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-    let filename = format!("wolfrouter-config-{}.json", ts);
+    let cluster_tag = query.cluster.as_deref().unwrap_or("all");
+    let filename = format!("wolfrouter-config-{}-{}.json", cluster_tag, ts);
     HttpResponse::Ok()
         .insert_header(("Content-Type", "application/json"))
         .insert_header(("Content-Disposition", format!("attachment; filename=\"{}\"", filename)))
@@ -3921,8 +3970,19 @@ pub async fn list_proxies(req: HttpRequest, state: S, query: web::Query<Topology
 /// and containers by engine (Docker vs LXC) in separate lists. Each
 /// entry carries the pre-resolved host+port so the UI doesn't need
 /// extra round-trips to learn where the backend actually lives.
-pub async fn list_proxy_backends(req: HttpRequest, state: S) -> HttpResponse {
+pub async fn list_proxy_backends(req: HttpRequest, state: S, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
+
+    // Cluster filter: only include backends owned by a node in the
+    // requested cluster. VMs carry a host_id; local docker/lxc
+    // containers belong to the bastion, so they're included only if
+    // the bastion is in the requested cluster.
+    let cluster_set = cluster_node_id_set(&state, &query);
+    let self_id = crate::agent::self_node_id();
+    let bastion_in_cluster = match &cluster_set {
+        None => true,
+        Some(set) => set.contains(&self_id),
+    };
 
     // VMs — split by vm_type so the picker can group them. "libvirt"
     // covers WolfStack's native KVM-over-libvirt VMs; "proxmox" covers
@@ -3930,6 +3990,13 @@ pub async fn list_proxy_backends(req: HttpRequest, state: S) -> HttpResponse {
     let mut vms_libvirt = Vec::new();
     let mut vms_proxmox = Vec::new();
     for v in state.vms.lock().unwrap().list_vms() {
+        // Skip VMs whose hosting node isn't in the requested cluster.
+        if let Some(set) = &cluster_set {
+            match &v.host_id {
+                Some(hid) if set.contains(hid) => {}
+                _ => continue,
+            }
+        }
         let host = v.wolfnet_ip.clone().unwrap_or_default();
         let is_pve = v.vmid.is_some();
         let entry = serde_json::json!({
@@ -3949,28 +4016,32 @@ pub async fn list_proxy_backends(req: HttpRequest, state: S) -> HttpResponse {
     // which network the container's on; either works from the host's
     // nginx as long as it's non-empty.
     let mut containers_docker = Vec::new();
-    for c in crate::containers::docker_list_all_cached() {
-        if c.ip_address.is_empty() { continue; }
-        containers_docker.push(serde_json::json!({
-            "id": c.id,
-            "name": c.name,
-            "host": c.ip_address,
-            "running": c.state == "running",
-            "container_type": "docker",
-        }));
+    if bastion_in_cluster {
+        for c in crate::containers::docker_list_all_cached() {
+            if c.ip_address.is_empty() { continue; }
+            containers_docker.push(serde_json::json!({
+                "id": c.id,
+                "name": c.name,
+                "host": c.ip_address,
+                "running": c.state == "running",
+                "container_type": "docker",
+            }));
+        }
     }
 
     // LXC containers — same idea, different manager.
     let mut containers_lxc = Vec::new();
-    for c in crate::containers::lxc_list_all_cached() {
-        if c.ip_address.is_empty() { continue; }
-        containers_lxc.push(serde_json::json!({
-            "id": c.name,
-            "name": c.name,
-            "host": c.ip_address,
-            "running": c.state == "running",
-            "container_type": "lxc",
-        }));
+    if bastion_in_cluster {
+        for c in crate::containers::lxc_list_all_cached() {
+            if c.ip_address.is_empty() { continue; }
+            containers_lxc.push(serde_json::json!({
+                "id": c.name,
+                "name": c.name,
+                "host": c.ip_address,
+                "running": c.state == "running",
+                "container_type": "lxc",
+            }));
+        }
     }
 
     HttpResponse::Ok().json(serde_json::json!({
@@ -3985,7 +4056,7 @@ pub async fn list_proxy_backends(req: HttpRequest, state: S) -> HttpResponse {
     }))
 }
 
-pub async fn create_proxy(req: HttpRequest, state: S, body: web::Json<proxy::ProxyEntry>) -> HttpResponse {
+pub async fn create_proxy(req: HttpRequest, state: S, body: web::Json<proxy::ProxyEntry>, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
     let mut entry = body.into_inner();
     if entry.id.is_empty() { entry.id = gen_id("proxy"); }
@@ -3995,6 +4066,7 @@ pub async fn create_proxy(req: HttpRequest, state: S, body: web::Json<proxy::Pro
     if entry.node_id.is_empty() {
         entry.node_id = crate::agent::self_node_id();
     }
+    if let Some(resp) = cluster_guard_node_id(&state, &query, Some(&entry.node_id)) { return resp; }
 
     // Resolve the domain up front so the stored entry always carries a
     // pinned IP. We don't want the forward silently following DNS flaps
@@ -4030,6 +4102,7 @@ pub async fn update_proxy(
     state: S,
     path: web::Path<String>,
     body: web::Json<proxy::ProxyEntry>,
+    query: web::Query<TopologyQuery>,
 ) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
@@ -4040,6 +4113,8 @@ pub async fn update_proxy(
     if updated.node_id.is_empty() {
         updated.node_id = crate::agent::self_node_id();
     }
+    if let Some(resp) = cluster_guard_existing_proxy(&state, &query, &id) { return resp; }
+    if let Some(resp) = cluster_guard_node_id(&state, &query, Some(&updated.node_id)) { return resp; }
     if let Err(e) = proxy::resolve_entry_public_ip(&mut updated) {
         return HttpResponse::BadRequest().body(e);
     }
@@ -4069,9 +4144,10 @@ pub async fn update_proxy(
     }))
 }
 
-pub async fn delete_proxy(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
+pub async fn delete_proxy(req: HttpRequest, state: S, path: web::Path<String>, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
+    if let Some(resp) = cluster_guard_existing_proxy(&state, &query, &id) { return resp; }
     let proxies = {
         let mut cfg = state.router.config.write().unwrap();
         cfg.proxies.retain(|p| p.id != id);
@@ -4115,8 +4191,9 @@ pub async fn list_subnet_routes(req: HttpRequest, state: S, query: web::Query<To
     HttpResponse::Ok().json(filtered)
 }
 
-pub async fn create_subnet_route(req: HttpRequest, state: S, body: web::Json<SubnetRoute>) -> HttpResponse {
+pub async fn create_subnet_route(req: HttpRequest, state: S, body: web::Json<SubnetRoute>, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
+    if let Some(resp) = cluster_guard_node_id(&state, &query, body.node_id.as_deref()) { return resp; }
     let mut route = body.into_inner();
 
     // Generate ID if not provided
@@ -4229,6 +4306,7 @@ pub async fn update_subnet_route(
     state: S,
     path: web::Path<String>,
     body: web::Json<SubnetRoute>,
+    query: web::Query<TopologyQuery>,
 ) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
@@ -4246,6 +4324,8 @@ pub async fn update_subnet_route(
             "error": "gateway is required"
         }));
     }
+    if let Some(resp) = cluster_guard_existing_subnet_route(&state, &query, &id) { return resp; }
+    if let Some(resp) = cluster_guard_node_id(&state, &query, updated.node_id.as_deref()) { return resp; }
 
     // Capture the OLD route before overwriting so we can correctly remove
     // its kernel entry if the CIDR/gateway changed or the route flipped to
@@ -4383,9 +4463,10 @@ pub async fn update_subnet_route(
     HttpResponse::Ok().json(resp)
 }
 
-pub async fn delete_subnet_route(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
+pub async fn delete_subnet_route(req: HttpRequest, state: S, path: web::Path<String>, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
+    if let Some(resp) = cluster_guard_existing_subnet_route(&state, &query, &id) { return resp; }
 
     let deleted_route = {
         let mut cfg = state.router.config.write().unwrap();
@@ -5484,6 +5565,71 @@ fn cluster_node_id_set(
         }
     }
     Some(set)
+}
+
+/// Block a write that would affect a node outside the requested
+/// cluster. Returns `None` when the operation is allowed:
+///   • no `?cluster=` filter (admin / no scope) → allow
+///   • node_id is in the cluster's node set → allow
+///
+/// Returns `Some(HttpResponse)` to short-circuit the handler when:
+///   • node_id is None and a cluster filter is active (legacy
+///     "global" item — banned per strict cluster isolation)
+///   • node_id is in a different cluster (cross-cluster affect)
+///
+/// Adam Cogswell 2026-04-29: "WOLFROUTER IS cluster limited, cluster
+/// 1's wolfrouter must not display or affect anything on cluster 2".
+/// The "affect" half lives here — every create/update/delete on
+/// router config calls this before mutating.
+fn cluster_guard_node_id(state: &S, query: &TopologyQuery, node_id: Option<&str>) -> Option<HttpResponse> {
+    let set = cluster_node_id_set(state, query)?;
+    match node_id {
+        None => Some(HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "this WolfRouter view is cluster-scoped — items must be pinned to a node in this cluster (cluster-agnostic / global items aren't allowed)",
+        }))),
+        Some(nid) if set.contains(nid) => None,
+        Some(nid) => Some(HttpResponse::Forbidden().json(serde_json::json!({
+            "error": format!("node '{}' is not in this cluster — cross-cluster operations are blocked", nid),
+        }))),
+    }
+}
+
+/// Same as `cluster_guard_node_id` but resolves the node_id by
+/// looking up an existing config item by id. Used by PUT/DELETE
+/// handlers that don't carry the node_id in the URL — they need to
+/// check what node OWNS the item before allowing the operation.
+fn cluster_guard_existing_lan(state: &S, query: &TopologyQuery, lan_id: &str) -> Option<HttpResponse> {
+    let nid = state.router.config.read().unwrap()
+        .lans.iter().find(|l| l.id == lan_id).map(|l| l.node_id.clone());
+    cluster_guard_node_id(state, query, nid.as_deref())
+}
+fn cluster_guard_existing_wan(state: &S, query: &TopologyQuery, wan_id: &str) -> Option<HttpResponse> {
+    let nid = state.router.config.read().unwrap()
+        .wan_connections.iter().find(|w| w.id == wan_id).map(|w| w.node_id.clone());
+    cluster_guard_node_id(state, query, nid.as_deref())
+}
+fn cluster_guard_existing_proxy(state: &S, query: &TopologyQuery, proxy_id: &str) -> Option<HttpResponse> {
+    let nid = state.router.config.read().unwrap()
+        .proxies.iter().find(|p| p.id == proxy_id).map(|p| p.node_id.clone());
+    cluster_guard_node_id(state, query, nid.as_deref())
+}
+fn cluster_guard_existing_rule(state: &S, query: &TopologyQuery, rule_id: &str) -> Option<HttpResponse> {
+    // Rules have node_id: Option<String>. Look up the item; flatten
+    // the outer Option (item-not-found) into the inner Option that
+    // cluster_guard_node_id understands. A None node_id (legacy
+    // "global" rule) gets rejected by the strict guard.
+    let cfg = state.router.config.read().unwrap();
+    let rule = cfg.rules.iter().find(|r| r.id == rule_id);
+    let inner: Option<String> = rule.and_then(|r| r.node_id.clone());
+    drop(cfg);
+    cluster_guard_node_id(state, query, inner.as_deref())
+}
+fn cluster_guard_existing_subnet_route(state: &S, query: &TopologyQuery, route_id: &str) -> Option<HttpResponse> {
+    let cfg = state.router.config.read().unwrap();
+    let route = cfg.subnet_routes.iter().find(|r| r.id == route_id);
+    let inner: Option<String> = route.and_then(|r| r.node_id.clone());
+    drop(cfg);
+    cluster_guard_node_id(state, query, inner.as_deref())
 }
 
 // ─── Mount ───
