@@ -569,16 +569,19 @@
 
         // ─── Passkey (WebAuthn) login ─────────────────────────────────
         // Reveal the passkey button only when (a) the browser supports
-        // WebAuthn, and (b) the server has at least one passkey registered.
-        // Probing the start endpoint is the cheapest way to check both —
-        // 200 = passkeys available, 404 = none, anything else = hide.
+        // WebAuthn, and (b) the server reports at least one passkey is
+        // registered AND the current origin is WebAuthn-eligible. The
+        // /available probe is read-only — it does not create any ceremony
+        // state, so reloading the login page is free.
         (async () => {
             if (!window.PublicKeyCredential) return;
             try {
-                const probe = await fetch('/api/auth/passkey/login/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' });
+                const probe = await fetch('/api/auth/passkey/available');
                 if (!probe.ok) return;
-                // We've consumed a challenge here; the browser flow below issues a fresh one.
-                document.getElementById('passkey-section').style.display = '';
+                const data = await probe.json();
+                if (data && data.available) {
+                    document.getElementById('passkey-section').style.display = '';
+                }
             } catch (e) { /* ignore */ }
         })();
 

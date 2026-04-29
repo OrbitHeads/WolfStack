@@ -659,6 +659,24 @@ pub async fn passkey_register_finish(req: HttpRequest, state: web::Data<AppState
     }
 }
 
+/// GET /api/auth/passkey/available — anonymous lightweight probe used by the
+/// login page to decide whether to render the "Sign in with passkey" button.
+/// Returns `{available: bool}` without creating any ceremony state.
+pub async fn passkey_available(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    let config = crate::auth::webauthn::WebAuthnConfig::load();
+    if config.credentials.is_empty() {
+        return HttpResponse::Ok().json(serde_json::json!({ "available": false }));
+    }
+    // Verify the request hostname can actually do WebAuthn — bare-IP
+    // origins will fail at registration/auth time, so don't pretend
+    // they can sign in.
+    let hostname_ok = match passkey_rp_origin(&req, &state) {
+        Ok((rp_id, _)) => rp_id.parse::<std::net::IpAddr>().is_err(),
+        Err(_) => false,
+    };
+    HttpResponse::Ok().json(serde_json::json!({ "available": hostname_ok }))
+}
+
 /// POST /api/auth/passkey/login/start — issue a discoverable-credential challenge.
 /// Anonymous endpoint — does NOT require a session.
 pub async fn passkey_login_start(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
@@ -20236,6 +20254,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/auth/login", web::post().to(login))
         .route("/api/auth/logout", web::post().to(logout))
         .route("/api/auth/check", web::get().to(auth_check))
+        .route("/api/auth/passkey/available", web::get().to(passkey_available))
         .route("/api/auth/passkey/register/start", web::post().to(passkey_register_start))
         .route("/api/auth/passkey/register/finish", web::post().to(passkey_register_finish))
         .route("/api/auth/passkey/login/start", web::post().to(passkey_login_start))
