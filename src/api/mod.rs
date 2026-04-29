@@ -999,18 +999,29 @@ pub async fn threat_intel_status(req: HttpRequest, state: web::Data<AppState>) -
     // Mapping IP → hostname is best-effort: we look in the cluster node
     // list. If the mapping fails (IP not in cluster, race during node
     // removal), the UI just shows "(unknown)" — non-blocking.
+    //
+    // Filter unspecified addresses (0.0.0.0 / ::) at read time too —
+    // covers the in-memory cache when it was populated from a state file
+    // written by an older release before the upstream filter existed.
     let nodes = state.cluster.get_all_nodes();
-    let self_blacklisted: Vec<serde_json::Value> = snapshot.self_blacklisted.iter().map(|(ip, providers)| {
-        let hostname = nodes.iter()
-            .find(|n| n.address == *ip)
-            .map(|n| n.hostname.clone())
-            .unwrap_or_default();
-        serde_json::json!({
-            "ip": ip,
-            "hostname": hostname,
-            "listed_by": providers,
+    let self_blacklisted: Vec<serde_json::Value> = snapshot.self_blacklisted.iter()
+        .filter(|(ip, _)| {
+            match ip.parse::<std::net::IpAddr>() {
+                Ok(p) => !p.is_unspecified(),
+                Err(_) => false,
+            }
         })
-    }).collect();
+        .map(|(ip, providers)| {
+            let hostname = nodes.iter()
+                .find(|n| n.address == *ip)
+                .map(|n| n.hostname.clone())
+                .unwrap_or_default();
+            serde_json::json!({
+                "ip": ip,
+                "hostname": hostname,
+                "listed_by": providers,
+            })
+        }).collect();
 
     HttpResponse::Ok().json(serde_json::json!({
         "enabled": cfg.enabled,

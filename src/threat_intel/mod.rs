@@ -215,10 +215,19 @@ impl ThreatIntelConfig {
 
 impl ThreatIntelState {
     pub fn load() -> Self {
-        match std::fs::read_to_string(state_path()) {
+        let mut s: Self = match std::fs::read_to_string(state_path()) {
             Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
-            Err(_) => Self::default(),
-        }
+            Err(_) => return Self::default(),
+        };
+        // Sanitise on load: strip unspecified addresses (0.0.0.0 / ::) from
+        // self_blacklisted in case an older release wrote them. Cheap, idempotent.
+        s.self_blacklisted.retain(|ip, _| {
+            match ip.parse::<std::net::IpAddr>() {
+                Ok(p) => !p.is_unspecified(),
+                Err(_) => false,
+            }
+        });
+        s
     }
 
     pub fn save(&self) -> Result<(), String> {
