@@ -2306,7 +2306,15 @@
     function renderValidationBanner(payload) {
         const nodes = (payload && Array.isArray(payload.nodes)) ? payload.nodes : [];
         if (!nodes.length) return '';
-        let totalOk = 0, totalWarn = 0, totalErr = 0;
+        // Count NODES by status (not findings). A node is:
+        //   • err  if any of its findings is an error
+        //   • warn if any warning and no errors
+        //   • ok   if all findings are ok (or it has no findings yet)
+        // The summary line is "N nodes · X ok · Y warn · Z err" where
+        // X+Y+Z+unreachable = N — operator's mental model is "how
+        // many of my nodes are healthy", not "how many checks
+        // succeeded across the fleet".
+        let nodesOk = 0, nodesWarn = 0, nodesErr = 0;
         let unreachable = 0;
         const rows = nodes.map(n => {
             if (n.error) {
@@ -2314,26 +2322,28 @@
                 return `<li><strong>${escHtml(n.node_id)}</strong>${n.cluster_name ? ` <span style="color:var(--text-muted);">(${escHtml(n.cluster_name)})</span>` : ''} — <span style="color:#f59e0b;">unreachable: ${escHtml(n.error)}</span></li>`;
             }
             const r = n.report || {};
-            totalOk += r.ok_count || 0;
-            totalWarn += r.warning_count || 0;
-            totalErr += r.error_count || 0;
-            const colour = (r.error_count > 0) ? '#ef4444' : (r.warning_count > 0 ? '#f59e0b' : '#22c55e');
+            const errC  = r.error_count   || 0;
+            const warnC = r.warning_count || 0;
+            const okC   = r.ok_count      || 0;
+            if (errC > 0) {
+                nodesErr++;
+            } else if (warnC > 0) {
+                nodesWarn++;
+            } else {
+                nodesOk++;
+            }
+            const colour = errC > 0 ? '#ef4444' : (warnC > 0 ? '#f59e0b' : '#22c55e');
             const ts = r.generated_at ? new Date(r.generated_at * 1000).toLocaleString() : '—';
-            // When a node has zero ok/warn/err findings it means it has
-            // nothing configured for WolfRouter to validate (no LANs,
-            // no WANs, no firewall rules pinned to it). Render that
-            // explicitly instead of the meaningless "0 ok · 0 warn · 0 err".
-            const findings = (r.ok_count||0) + (r.warning_count||0) + (r.error_count||0);
+            const findings = okC + warnC + errC;
+            // Per-row detail still shows the breakdown of findings
+            // (informational), but the summary uses node counts.
             const inner = findings === 0
                 ? `<span style="color:var(--text-muted);">no WolfRouter config on this node</span>`
-                : `<span style="color:${colour};">${r.ok_count||0} ok · ${r.warning_count||0} warn · ${r.error_count||0} err</span>`;
+                : `<span style="color:${colour};">${okC} ok · ${warnC} warn · ${errC} err checks</span>`;
             return `<li><strong>${escHtml(n.node_id)}</strong>${n.is_self ? ' <span style="color:var(--text-muted);">(this node)</span>' : ''} — ${inner} <span style="color:var(--text-muted);">@ ${escHtml(ts)}</span></li>`;
         }).join('');
-        const summaryColour = (totalErr > 0) ? '#ef4444' : (totalWarn > 0 ? '#f59e0b' : '#22c55e');
-        const totalFindings = totalOk + totalWarn + totalErr;
-        const summary = totalFindings === 0
-            ? `${nodes.length} node(s) · nothing to validate yet${unreachable > 0 ? ` · ${unreachable} unreachable` : ''}`
-            : `${nodes.length} node(s) · ${totalOk} ok · ${totalWarn} warn · ${totalErr} err${unreachable > 0 ? ` · ${unreachable} unreachable` : ''}`;
+        const summaryColour = nodesErr > 0 ? '#ef4444' : (nodesWarn > 0 || unreachable > 0 ? '#f59e0b' : '#22c55e');
+        const summary = `${nodes.length} node(s) · ${nodesOk} ok · ${nodesWarn} warn · ${nodesErr} err${unreachable > 0 ? ` · ${unreachable} unreachable` : ''}`;
         // Only auto-open when there's something the operator should
         // act on. The wrRenderLanHealth caller preserves the user's
         // manual toggle across refreshes via the `wr-cluster-banner`

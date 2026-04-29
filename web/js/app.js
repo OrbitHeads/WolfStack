@@ -28932,8 +28932,20 @@ function tiRenderProviders(providers) {
 async function tiLoadClusterStatus() {
     const target = document.getElementById('ti-cluster-status-table');
     if (!target) return;
+    // Threat Intel lives as a tab inside WolfRouter, which is
+    // per-cluster. Pass the active cluster name so the backend's
+    // /api/threat-intel/cluster-status only returns peers in THIS
+    // cluster — without the filter, a bastion managing 5 clusters /
+    // 14 servers shows all 14 in every cluster's view. (Adam Cogswell
+    // 2026-04-29: confirmed the panel was leaking other clusters'
+    // nodes after v22.6.2's backend filter landed but the frontend
+    // wasn't passing the param.)
+    const cluster = (typeof window.wrState === 'object' && window.wrState && window.wrState.cluster) || null;
+    const url = cluster
+        ? '/api/threat-intel/cluster-status?cluster=' + encodeURIComponent(cluster)
+        : '/api/threat-intel/cluster-status';
     try {
-        const resp = await fetch('/api/threat-intel/cluster-status');
+        const resp = await fetch(url);
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
         const data = await resp.json();
         tiRenderClusterStatusTable(data.nodes || []);
