@@ -797,8 +797,20 @@ pub async fn passkey_delete(req: HttpRequest, state: web::Data<AppState>, path: 
 // ─── Threat Intelligence (WolfRouter integration) ───
 
 /// Helper: collect the cluster's known node addresses for the safe-filter.
+/// Filters out the unspecified address (0.0.0.0 / ::) — that's the
+/// "listen on all interfaces" sentinel some nodes report instead of a
+/// real public address; passing it to threat-intel as an exempt creates
+/// no value and confuses the self-blacklist scan.
 fn ti_cluster_node_ips(state: &web::Data<AppState>) -> Vec<String> {
-    state.cluster.get_all_nodes().iter().map(|n| n.address.clone()).collect()
+    state.cluster.get_all_nodes().iter()
+        .map(|n| n.address.clone())
+        .filter(|a| {
+            match a.parse::<std::net::IpAddr>() {
+                Ok(ip) => !ip.is_unspecified(),
+                Err(_) => false,  // unparseable strings are useless to safe-filter
+            }
+        })
+        .collect()
 }
 
 /// Helper: best-effort extraction of the requesting client's IP. Used as a

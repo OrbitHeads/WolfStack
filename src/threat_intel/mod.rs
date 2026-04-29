@@ -332,6 +332,8 @@ fn cidr_contains(cidr: &str, ip: &std::net::IpAddr) -> bool {
 /// fundamentals — RFC1918 plus the loopback ranges. Cluster-node IPs and
 /// the calling admin's IP are layered on top at apply time.
 pub const SAFE_CIDRS_V4: &[&str] = &[
+    "0.0.0.0/8",       // "this network" / unspecified (RFC 1122) — FireHOL
+                       //   legitimately lists this range; never our problem
     "127.0.0.0/8",     // loopback
     "10.0.0.0/8",      // RFC1918
     "172.16.0.0/12",   // RFC1918
@@ -342,6 +344,7 @@ pub const SAFE_CIDRS_V4: &[&str] = &[
 ];
 
 pub const SAFE_CIDRS_V6: &[&str] = &[
+    "::/128",          // unspecified
     "::1/128",         // loopback
     "fe80::/10",       // link-local
     "fc00::/7",        // ULA (RFC4193)
@@ -501,6 +504,19 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_self_blacklist_skips_unspecified() {
+        // FireHOL Level 1 legitimately lists 0.0.0.0/8 (RFC 1122 "this
+        // network"). Nodes that haven't reported a real address show up
+        // in cluster_node_ips as "0.0.0.0" — must not appear in banner.
+        let mut sp_v4 = BTreeSet::new();
+        sp_v4.insert("0.0.0.0/8".to_string());
+        let mut per_provider = HashMap::new();
+        per_provider.insert("firehol_level1".to_string(), (sp_v4, BTreeSet::new()));
+        let cluster_ips = vec!["0.0.0.0".to_string()];
+        assert!(scan_self_blacklist(&cluster_ips, &per_provider).is_empty());
+    }
+
+    #[test]
     fn test_scan_self_blacklist_skips_safe_ranges() {
         // RFC1918 IPs should never appear in the banner even if a malformed
         // feed listed them — we don't want noise from that case.
@@ -578,6 +594,13 @@ pub fn scan_self_blacklist(
             Ok(p) => p,
             Err(_) => continue,
         };
+        // Skip the unspecified address (0.0.0.0 / ::). It's not a real host
+        // address — it's the "listen on all interfaces" sentinel and shows
+        // up in cluster_node_ips when a node hasn't reported its real
+        // public address yet. Feeds frequently list 0.0.0.0/8 (RFC 1122
+        // "this network") which would create a false banner alert.
+        if parsed.is_unspecified() { continue; }
+
         // Only check IPs that aren't already in always-safe ranges — there's
         // no scenario where a feed would meaningfully list 10.x as
         // "malicious" against this admin's interest, and we want zero
@@ -777,6 +800,13 @@ pub async fn scheduler_loop(cluster: std::sync::Arc<crate::agent::ClusterState>)
             .get_all_nodes()
             .iter()
             .map(|n| n.address.clone())
+            .filter(|a| {
+                // Drop 0.0.0.0 / :: — listen-on-all sentinel, not a real address.
+                match a.parse::<std::net::IpAddr>() {
+                    Ok(ip) => !ip.is_unspecified(),
+                    Err(_) => false,
+                }
+            })
             .collect();
         // Scheduler has no notion of an "admin IP" — pass empty extras.
         // API-triggered refreshes pass the requester's IP to protect
