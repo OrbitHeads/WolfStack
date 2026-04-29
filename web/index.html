@@ -6759,6 +6759,10 @@
 
                     <!-- ═══ Threat Intel ═══ -->
                     <div id="wr-tab-threat-intel" class="wr-tab-panel" style="padding:16px; display:none;">
+
+                        <!-- Self-blacklist banner — populated by tiLoadStatus when one or more cluster IPs appear on a feed. Hidden by default. -->
+                        <div id="ti-self-banner" style="display:none; margin-bottom:16px; padding:14px 16px; background:rgba(220,38,38,0.10); border:1px solid rgba(220,38,38,0.35); border-radius:10px;"></div>
+
                         <!-- Top status row: master state + emergency pause -->
                         <div id="ti-status-row" style="display:flex; gap:12px; flex-wrap:wrap; align-items:stretch; margin-bottom:16px;">
                             <div style="flex:2 1 360px; min-width:300px; background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:14px 16px;">
@@ -6846,8 +6850,9 @@
                                 <p style="margin:0 0 10px;">
                                     WolfStack pulls public lists of known-bad IP addresses (botnets, scanners, ransomware command-and-control, spam sources)
                                     from a few well-respected providers, deduplicates them into a single list, and tells the kernel firewall to
-                                    drop incoming packets from any of those IPs. Your existing WolfRouter firewall rules still apply on top &mdash;
-                                    threat intel is one extra layer that runs first.
+                                    drop traffic to or from any of those IPs in <strong>both directions</strong>: incoming attackers reaching your services,
+                                    AND outgoing connections from your containers/VMs to known C2 servers (the canonical &ldquo;ransomware calling home&rdquo; case).
+                                    Your existing WolfRouter firewall rules still apply on top &mdash; threat intel is one extra layer that runs first.
                                 </p>
 
                                 <h5 style="font-size:13px; margin:14px 0 6px; color:var(--text-primary);">Recommended first-time workflow</h5>
@@ -6879,6 +6884,29 @@
                                     <li><strong>Your own IP when you click Refresh</strong> &mdash; the API exempts the IP you&rsquo;re connecting from so you can&rsquo;t accidentally lock yourself out.</li>
                                     <li><strong>Anything you&rsquo;ve allowlisted</strong> &mdash; one CIDR per line in the box above.</li>
                                 </ul>
+
+                                <h5 style="font-size:13px; margin:14px 0 6px; color:var(--text-primary);">What if my own IP is on a feed?</h5>
+                                <p style="margin:0 0 10px;">
+                                    A common case when renting from Hetzner, OVH, Vultr, etc.: the IP you got was previously misused by another customer
+                                    and still has residual reputation. Each refresh, WolfStack checks whether any of your <em>own</em> cluster IPs appear
+                                    on the feeds you've enabled and surfaces them in a red banner at the top of this tab if so. The banner includes:
+                                </p>
+                                <ul style="margin:0 0 10px 20px; padding:0;">
+                                    <li>Direct &ldquo;check this IP&rdquo; links to each provider's lookup tool, so you can verify the listing</li>
+                                    <li>Direct &ldquo;submit delisting&rdquo; links so you can ask the upstream feed to remove you</li>
+                                    <li>A &ldquo;faster path&rdquo; section with hosting-provider-specific instructions for getting a clean IP swap</li>
+                                </ul>
+                                <p style="margin:0 0 10px;">
+                                    <strong>Importantly:</strong> WolfStack always exempts your own IPs from your own blocklist, so this never affects
+                                    <em>your</em> cluster traffic. The warning matters because <em>other</em> networks pulling the same feeds may silently
+                                    drop traffic from your server, which surfaces as &ldquo;some users can't reach my service&rdquo; with no obvious cause.
+                                </p>
+
+                                <h5 style="font-size:13px; margin:14px 0 6px; color:var(--text-primary);">A feed false-positive blocked something my container needs</h5>
+                                <p style="margin:0 0 10px;">
+                                    Add the destination CIDR to the <em>Allowlist</em> above and click Save. The next refresh strips that range from
+                                    the active blocklist in both directions. For one-off addresses use a <code>/32</code> (or <code>/128</code> for IPv6).
+                                </p>
 
                                 <h5 style="font-size:13px; margin:14px 0 6px; color:var(--text-primary);">Emergency pause &mdash; when to use it</h5>
                                 <p style="margin:0 0 10px;">

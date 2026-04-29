@@ -28826,6 +28826,35 @@ async function passkeyDelete(credentialId, btn) {
 var _tiCachedConfig = null;
 var _tiCachedStatus = null;
 
+// Per-provider delisting / lookup info used by the self-blacklist banner.
+// Keep in sync with the provider IDs in src/threat_intel/feeds.rs.
+const TI_DELISTING = {
+    spamhaus_drop: {
+        name: 'Spamhaus DROP / EDROP',
+        lookup: ip => 'https://check.spamhaus.org/results/?query=' + encodeURIComponent(ip),
+        delisting: 'https://www.spamhaus.org/lookup/',
+        notes: 'Spamhaus DROP/EDROP lists hijacked netblocks and ranges allocated to criminals. Delisting usually requires your hosting provider to push the request upstream — once the LIR confirms the issue is fixed, Spamhaus removes the range quickly.',
+    },
+    firehol_level1: {
+        name: 'FireHOL Level 1',
+        lookup: () => 'https://iplists.firehol.org/?ipset=firehol_level1',
+        delisting: 'https://iplists.firehol.org/',
+        notes: 'FireHOL Level 1 is an aggregate of other feeds. Search at iplists.firehol.org to find which child feed lists the IP, submit delisting there, and FireHOL re-syncs automatically (usually within a day).',
+    },
+    crowdsec_community: {
+        name: 'CrowdSec community blocklist',
+        lookup: ip => 'https://app.crowdsec.net/cti/' + encodeURIComponent(ip),
+        delisting: 'https://app.crowdsec.net/',
+        notes: 'CrowdSec listings are reported by community members. If you control the IP, sign in to your CrowdSec account, look up the IP, and submit a delisting request from the CTI page.',
+    },
+    abuseipdb: {
+        name: 'AbuseIPDB',
+        lookup: ip => 'https://www.abuseipdb.com/check/' + encodeURIComponent(ip),
+        delisting: 'https://www.abuseipdb.com/edit-account',
+        notes: 'AbuseIPDB tracks user-reported abuse. Check current reports via the lookup link, then dispute false reports through the AbuseIPDB account portal.',
+    },
+};
+
 function tiRenderTab() {
     tiLoadConfig();
     tiLoadStatus();
@@ -28883,12 +28912,86 @@ function tiRenderProviders(providers) {
     }).join('');
 }
 
+function tiRenderSelfBanner(self_blacklisted) {
+    const banner = document.getElementById('ti-self-banner');
+    if (!banner) return;
+    if (!self_blacklisted || self_blacklisted.length === 0) {
+        banner.style.display = 'none';
+        banner.innerHTML = '';
+        return;
+    }
+    // Build per-IP rows. Each row: IP + hostname, listing summary, and a
+    // collapsible "How to get delisted" details block per provider.
+    const rows = self_blacklisted.map(entry => {
+        const ip = entry.ip;
+        const host = entry.hostname ? ` <span style="color:var(--text-muted); font-weight:400;">(${tiEsc(entry.hostname)})</span>` : '';
+        const listed = (entry.listed_by || []).map(pid => {
+            const info = TI_DELISTING[pid];
+            return info ? tiEsc(info.name) : tiEsc(pid);
+        }).join(', ');
+
+        // Per-provider action block
+        const actions = (entry.listed_by || []).map(pid => {
+            const info = TI_DELISTING[pid];
+            if (!info) return '';
+            const lookupUrl = typeof info.lookup === 'function' ? info.lookup(ip) : info.lookup;
+            return `<div style="padding:10px 12px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:6px; margin-bottom:8px;">
+                <div style="font-weight:600; font-size:13px; margin-bottom:4px;">${tiEsc(info.name)}</div>
+                <div style="font-size:12px; color:var(--text-secondary); margin-bottom:8px; line-height:1.55;">${tiEsc(info.notes)}</div>
+                <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                    <a href="${tiEsc(lookupUrl)}" target="_blank" rel="noopener" class="btn btn-sm" style="text-decoration:none;">🔍 Check this IP</a>
+                    <a href="${tiEsc(info.delisting)}" target="_blank" rel="noopener" class="btn btn-sm" style="text-decoration:none;">📤 Submit delisting</a>
+                </div>
+            </div>`;
+        }).join('');
+
+        return `<div style="padding:12px 14px; background:rgba(220,38,38,0.08); border:1px solid rgba(220,38,38,0.25); border-radius:8px; margin-top:10px;">
+            <div style="font-size:14px; margin-bottom:8px;">
+                <strong style="color:#fca5a5; font-family:var(--font-mono);">${tiEsc(ip)}</strong>${host}
+                — listed by <strong>${listed}</strong>
+            </div>
+            ${actions}
+        </div>`;
+    }).join('');
+
+    banner.innerHTML = `
+        <div style="display:flex; align-items:flex-start; gap:12px;">
+            <div style="font-size:24px; line-height:1;">⚠️</div>
+            <div style="flex:1;">
+                <div style="font-weight:700; font-size:14px; color:#fca5a5; margin-bottom:4px;">One of your own server IPs is on a public blocklist</div>
+                <div style="font-size:13px; color:var(--text-secondary); line-height:1.55;">
+                    This usually means the previous owner of this IP misused it, leaving residual reputation behind.
+                    WolfStack is automatically exempting your IP from <em>your own</em> blocklist so cluster traffic still flows —
+                    but other networks pulling the same feeds may silently drop traffic <em>to</em> your server, which can
+                    cause hard-to-diagnose problems for your own users.
+                </div>
+            </div>
+        </div>
+        ${rows}
+        <details style="margin-top:12px; padding:10px 12px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px;">
+            <summary style="cursor:pointer; font-weight:600; font-size:13px; user-select:none;">⚡ Faster path — request a clean IP from your hosting provider</summary>
+            <div style="margin-top:8px; font-size:12px; color:var(--text-secondary); line-height:1.7;">
+                Most major hosts will swap you to a different IP on request &mdash; usually faster than waiting for delisting.
+                <ul style="margin:6px 0 0 18px; padding:0;">
+                    <li><strong>Hetzner:</strong> Robot &rarr; Server &rarr; IPs &rarr; request additional / change IP (often instant for Cloud, ticket for dedicated)</li>
+                    <li><strong>OVH:</strong> Manager &rarr; Bare Metal Cloud &rarr; IP services &rarr; order replacement IP</li>
+                    <li><strong>DigitalOcean / Linode / Vultr:</strong> open a support ticket explaining the IP is on a public blocklist</li>
+                    <li><strong>AWS:</strong> release the Elastic IP and allocate a new one</li>
+                    <li><strong>Self-hosted / colo:</strong> contact your ISP's abuse desk &mdash; they can usually rotate a static IP within a day</li>
+                </ul>
+                Mention &ldquo;the IP is listed on Spamhaus / FireHOL with residual reputation from the previous tenant&rdquo; &mdash; that phrasing typically gets the fastest response.
+            </div>
+        </details>`;
+    banner.style.display = '';
+}
+
 async function tiLoadStatus() {
     try {
         const resp = await fetch('/api/threat-intel/status');
         if (!resp.ok) throw new Error('Failed to load status');
         const s = await resp.json();
         _tiCachedStatus = s;
+        tiRenderSelfBanner(s.self_blacklisted);
         // Status badge
         const badge = document.getElementById('ti-status-badge');
         if (badge) {

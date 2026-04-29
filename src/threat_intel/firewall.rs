@@ -17,6 +17,18 @@
 /// IPv4. Empty when disabled or dry-run. Append the result inside the
 /// `*filter` section, after WOLFROUTER_IN/FWD/OUT are declared but
 /// before the `COMMIT` line.
+///
+/// The chain matches on **both** `src` and `dst`:
+/// - `src` catches inbound from blocklisted IPs (attackers reaching us)
+/// - `dst` catches outbound to blocklisted IPs (e.g. malware in a
+///   container calling home to a known C2 server)
+///
+/// Jumped from all three WolfRouter chains:
+/// - `WOLFROUTER_IN`  — packets destined for this host
+/// - `WOLFROUTER_FWD` — packets routed/bridged through this host
+///                       (Docker published ports, LXC, VMs on bridges)
+/// - `WOLFROUTER_OUT` — packets originating from this host (incl.
+///                       host-networked containers)
 pub fn iptables_lines_v4() -> String {
     let cfg = super::ThreatIntelConfig::load();
     if !super::enforcement_active(&cfg) {
@@ -26,15 +38,26 @@ pub fn iptables_lines_v4() -> String {
     out.push_str(":");
     out.push_str(super::CHAIN_NAME);
     out.push_str(" - [0:0]\n");
+    // Inbound from blocklisted source.
     out.push_str("-A ");
     out.push_str(super::CHAIN_NAME);
     out.push_str(" -m set --match-set ");
     out.push_str(super::IPSET_NAME_V4);
     out.push_str(" src -j DROP\n");
+    // Outbound to blocklisted destination — catches C2 callouts.
+    out.push_str("-A ");
+    out.push_str(super::CHAIN_NAME);
+    out.push_str(" -m set --match-set ");
+    out.push_str(super::IPSET_NAME_V4);
+    out.push_str(" dst -j DROP\n");
+    // Jumps from all three managed chains.
     out.push_str("-A WOLFROUTER_IN -j ");
     out.push_str(super::CHAIN_NAME);
     out.push('\n');
     out.push_str("-A WOLFROUTER_FWD -j ");
+    out.push_str(super::CHAIN_NAME);
+    out.push('\n');
+    out.push_str("-A WOLFROUTER_OUT -j ");
     out.push_str(super::CHAIN_NAME);
     out.push('\n');
     out
@@ -42,6 +65,7 @@ pub fn iptables_lines_v4() -> String {
 
 /// Same for ip6tables. WolfRouter's current build_ruleset is IPv4-only,
 /// but we expose this for when v6 lands. Empty when disabled or dry-run.
+/// Same src/dst dual-direction matching as the IPv4 version.
 #[allow(dead_code)]
 pub fn ip6tables_lines() -> String {
     let cfg = super::ThreatIntelConfig::load();
@@ -57,10 +81,18 @@ pub fn ip6tables_lines() -> String {
     out.push_str(" -m set --match-set ");
     out.push_str(super::IPSET_NAME_V6);
     out.push_str(" src -j DROP\n");
+    out.push_str("-A ");
+    out.push_str(super::CHAIN_NAME);
+    out.push_str(" -m set --match-set ");
+    out.push_str(super::IPSET_NAME_V6);
+    out.push_str(" dst -j DROP\n");
     out.push_str("-A WOLFROUTER_IN -j ");
     out.push_str(super::CHAIN_NAME);
     out.push('\n');
     out.push_str("-A WOLFROUTER_FWD -j ");
+    out.push_str(super::CHAIN_NAME);
+    out.push('\n');
+    out.push_str("-A WOLFROUTER_OUT -j ");
     out.push_str(super::CHAIN_NAME);
     out.push('\n');
     out

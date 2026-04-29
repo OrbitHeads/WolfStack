@@ -150,6 +150,17 @@ pub struct ThreatIntelState {
     /// Whether the kernel rules are currently live (false in dry-run or when disabled).
     #[serde(default)]
     pub applied: bool,
+    /// Cluster node IPs that themselves appear on one or more enabled feeds.
+    /// Map from cluster IP → list of provider IDs that listed it. Empty when
+    /// none of our own IPs are listed (the common case).
+    ///
+    /// IPs in this map are still automatically exempted from the active
+    /// blocklist (so our own traffic flows). The map exists only to
+    /// surface the listing to the admin via the UI banner so they can
+    /// take action — e.g. request a clean IP from their hosting provider
+    /// or submit a delisting request to the upstream feed.
+    #[serde(default)]
+    pub self_blacklisted: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -470,6 +481,49 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_self_blacklist_finds_listing() {
+        let mut sp_v4 = BTreeSet::new();
+        sp_v4.insert("203.0.113.5".to_string());
+        let mut fh_v4 = BTreeSet::new();
+        fh_v4.insert("203.0.113.0/24".to_string()); // CIDR containment
+
+        let mut per_provider = HashMap::new();
+        per_provider.insert("spamhaus_drop".to_string(),  (sp_v4, BTreeSet::new()));
+        per_provider.insert("firehol_level1".to_string(), (fh_v4, BTreeSet::new()));
+
+        let cluster_ips = vec!["203.0.113.5".to_string(), "8.8.8.8".to_string()];
+        let result = scan_self_blacklist(&cluster_ips, &per_provider);
+        assert_eq!(result.len(), 1);
+        let listed = &result["203.0.113.5"];
+        assert!(listed.contains(&"spamhaus_drop".to_string()));
+        assert!(listed.contains(&"firehol_level1".to_string()));
+        assert!(!result.contains_key("8.8.8.8"));
+    }
+
+    #[test]
+    fn test_scan_self_blacklist_skips_safe_ranges() {
+        // RFC1918 IPs should never appear in the banner even if a malformed
+        // feed listed them — we don't want noise from that case.
+        let mut sp_v4 = BTreeSet::new();
+        sp_v4.insert("10.0.0.0/8".to_string()); // would-be-listing
+        let mut per_provider = HashMap::new();
+        per_provider.insert("spamhaus_drop".to_string(), (sp_v4, BTreeSet::new()));
+        let cluster_ips = vec!["10.5.6.7".to_string()];
+        let result = scan_self_blacklist(&cluster_ips, &per_provider);
+        assert!(result.is_empty(), "RFC1918 IPs must not appear in self-blacklist banner");
+    }
+
+    #[test]
+    fn test_scan_self_blacklist_empty_when_no_listings() {
+        let mut sp_v4 = BTreeSet::new();
+        sp_v4.insert("203.0.113.5".to_string());
+        let mut per_provider = HashMap::new();
+        per_provider.insert("spamhaus_drop".to_string(), (sp_v4, BTreeSet::new()));
+        let cluster_ips = vec!["8.8.8.8".to_string()];
+        assert!(scan_self_blacklist(&cluster_ips, &per_provider).is_empty());
+    }
+
+    #[test]
     fn test_state_round_trip_serde() {
         let mut s = ThreatIntelState::default();
         s.blocklist_size = 12345;
@@ -478,11 +532,84 @@ mod tests {
         s.providers.insert("spamhaus_drop".to_string(), ProviderState {
             last_count: 1000, last_success_secs: 1_700_000_000, last_error: String::new(), last_attempt_secs: 1_700_000_000,
         });
+        s.self_blacklisted.insert("203.0.113.5".to_string(), vec!["spamhaus_drop".to_string()]);
         let json = serde_json::to_string(&s).unwrap();
         let back: ThreatIntelState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.blocklist_size, 12345);
         assert_eq!(back.providers["spamhaus_drop"].last_count, 1000);
+        assert_eq!(back.self_blacklisted["203.0.113.5"], vec!["spamhaus_drop"]);
     }
+
+    #[test]
+    fn test_state_default_has_empty_self_blacklisted() {
+        let s = ThreatIntelState::default();
+        assert!(s.self_blacklisted.is_empty());
+    }
+
+    #[test]
+    fn test_legacy_state_json_loads_without_self_blacklisted() {
+        // Pre-v22.5.0 state files don't have the self_blacklisted field —
+        // serde(default) must populate it as empty.
+        let legacy = r#"{"last_refresh_secs":0,"providers":{},"blocklist_size":0,"blocklist_v4":[],"blocklist_v6":[],"applied":false}"#;
+        let parsed: ThreatIntelState = serde_json::from_str(legacy).expect("legacy state must parse");
+        assert!(parsed.self_blacklisted.is_empty());
+    }
+}
+
+// ═══════════════════════════════════════════════
+// ─── Self-blacklist detection ───
+// ═══════════════════════════════════════════════
+
+/// For each of our own cluster IPs, return the IDs of every provider whose
+/// raw fetch result lists that IP. Empty map = none of our IPs are listed
+/// (the common case). Non-empty = surface to the admin via the UI banner
+/// because some external networks (consuming the same feeds) may silently
+/// drop traffic from this server.
+///
+/// Matches both exact-IP entries and CIDR-containment, mirroring the
+/// matching behaviour used by the kernel ipset.
+pub fn scan_self_blacklist(
+    cluster_node_ips: &[String],
+    per_provider_raw: &HashMap<String, (BTreeSet<String>, BTreeSet<String>)>,
+) -> HashMap<String, Vec<String>> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for ip_str in cluster_node_ips.iter() {
+        let parsed: std::net::IpAddr = match ip_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // Only check IPs that aren't already in always-safe ranges — there's
+        // no scenario where a feed would meaningfully list 10.x as
+        // "malicious" against this admin's interest, and we want zero
+        // false positives in this banner.
+        let safe_set: &[&str] = match parsed {
+            std::net::IpAddr::V4(_) => SAFE_CIDRS_V4,
+            std::net::IpAddr::V6(_) => SAFE_CIDRS_V6,
+        };
+        let in_safe_range = safe_set.iter().any(|c| cidr_contains(c, &parsed));
+        if in_safe_range { continue; }
+
+        let mut listed_by: Vec<String> = Vec::new();
+        for (provider_id, (v4_set, v6_set)) in per_provider_raw.iter() {
+            let pool = match parsed {
+                std::net::IpAddr::V4(_) => v4_set,
+                std::net::IpAddr::V6(_) => v6_set,
+            };
+            // Exact /32-or-/128 match first (cheap), then CIDR containment.
+            let exact_hit = pool.contains(ip_str);
+            let cidr_hit = !exact_hit && pool.iter().any(|entry| {
+                entry != ip_str && cidr_contains(entry, &parsed)
+            });
+            if exact_hit || cidr_hit {
+                listed_by.push(provider_id.clone());
+            }
+        }
+        if !listed_by.is_empty() {
+            listed_by.sort();
+            out.insert(ip_str.clone(), listed_by);
+        }
+    }
+    out
 }
 
 // ═══════════════════════════════════════════════
@@ -518,11 +645,18 @@ pub async fn refresh_all(
     // would otherwise stall the async runtime. Sequencing them serially is
     // fine — refreshes happen every few hours and worst-case 4 × 30s is
     // well under the schedule interval.
+    //
+    // The closure returns `per_provider_raw` alongside the unioned sets so
+    // the caller can perform the self-blacklist check (which provider listed
+    // each cluster IP) BEFORE the union loses provenance.
     let providers_cfg = cfg.providers.clone();
     let fetch_results = tokio::task::spawn_blocking(move || {
         let mut all_v4: BTreeSet<String> = BTreeSet::new();
         let mut all_v6: BTreeSet<String> = BTreeSet::new();
         let mut per_provider: HashMap<String, ProviderState> = HashMap::new();
+        // Raw per-provider fetch results — kept only long enough to do the
+        // self-blacklist scan. Not persisted.
+        let mut per_provider_raw: HashMap<String, (BTreeSet<String>, BTreeSet<String>)> = HashMap::new();
         for provider in feeds::all_providers() {
             let pcfg = providers_cfg.get(provider.id).cloned().unwrap_or(ProviderConfig {
                 enabled: false, api_key: String::new(), url_override: String::new(),
@@ -537,6 +671,7 @@ pub async fn refresh_all(
                     state.last_count = result.total();
                     state.last_success_secs = now;
                     state.last_error = String::new();
+                    per_provider_raw.insert(provider.id.to_string(), (result.v4.clone(), result.v6.clone()));
                     all_v4.extend(result.v4);
                     all_v6.extend(result.v6);
                 }
@@ -546,14 +681,19 @@ pub async fn refresh_all(
             }
             per_provider.insert(provider.id.to_string(), state);
         }
-        (all_v4, all_v6, per_provider)
+        (all_v4, all_v6, per_provider, per_provider_raw)
     }).await.unwrap_or_else(|e| {
         tracing::warn!("threat-intel refresh task panicked: {}", e);
-        (BTreeSet::new(), BTreeSet::new(), HashMap::new())
+        (BTreeSet::new(), BTreeSet::new(), HashMap::new(), HashMap::new())
     });
 
-    let (all_v4, all_v6, per_provider) = fetch_results;
+    let (all_v4, all_v6, per_provider, per_provider_raw) = fetch_results;
     new_state.providers = per_provider;
+
+    // Self-blacklist scan: which of our own cluster IPs appear on which
+    // providers' raw lists? Done BEFORE filter_safe strips them, since
+    // filter_safe by design exempts cluster IPs and we'd lose the signal.
+    new_state.self_blacklisted = scan_self_blacklist(&cluster_node_ips, &per_provider_raw);
 
     // Apply safe-filter (loopback / RFC1918 / cluster IPs / admin IP / user allowlist).
     let mut combined_exempts: Vec<String> = cluster_node_ips;
