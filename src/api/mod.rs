@@ -826,6 +826,71 @@ fn ti_request_client_ip(req: &HttpRequest) -> Vec<String> {
     if ip.is_empty() { Vec::new() } else { vec![ip] }
 }
 
+/// Fan out an `ipset` install request to every online WolfStack peer
+/// in the cluster, in the background. Used when the local admin flips
+/// Threat Intel to enforce mode — peers will need ipset present when
+/// their own admin (or our future cluster-wide propagation) enables
+/// enforcement there too. Best effort: per-peer 90-second timeout,
+/// failures logged but never propagated to the user.
+///
+/// Skips: this node, offline nodes, non-wolfstack nodes (Proxmox-only
+/// entries can't install packages).
+fn ti_install_ipset_on_peers(state: &web::Data<AppState>) {
+    let nodes = state.cluster.get_all_nodes();
+    let secret = state.cluster_secret.clone();
+    let self_id = state.cluster.self_id.clone();
+    let peers: Vec<(String, String, u16)> = nodes.iter()
+        .filter(|n| !n.is_self && n.id != self_id && n.online && n.node_type == "wolfstack")
+        .map(|n| (n.hostname.clone(), n.address.clone(), n.port))
+        .collect();
+    if peers.is_empty() { return; }
+
+    tokio::spawn(async move {
+        let client = &*API_HTTP_CLIENT;
+        let body = serde_json::json!({ "package": "ipset" });
+        for (hostname, address, port) in &peers {
+            let urls = build_node_urls(address, *port, "/api/system/install-package");
+            let mut delivered = false;
+            for url in &urls {
+                match client.post(url)
+                    .timeout(std::time::Duration::from_secs(90))
+                    .header("X-WolfStack-Secret", &secret)
+                    .json(&body)
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        if let Ok(data) = resp.json::<serde_json::Value>().await {
+                            let ok = data.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+                            let msg = data.get("message").and_then(|v| v.as_str())
+                                .or_else(|| data.get("error").and_then(|v| v.as_str()))
+                                .unwrap_or("(no message)").to_string();
+                            if ok {
+                                tracing::info!("threat-intel: ipset installed on peer '{}' ({}): {}", hostname, address, msg);
+                            } else {
+                                tracing::warn!("threat-intel: ipset install on peer '{}' ({}) reported failure: {}", hostname, address, msg);
+                            }
+                        }
+                        delivered = true;
+                        break;
+                    }
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let _ = resp.bytes().await;
+                        tracing::warn!("threat-intel: ipset install on peer '{}' ({}) returned HTTP {}", hostname, address, status);
+                        delivered = true;
+                        break;
+                    }
+                    Err(_) => continue,
+                }
+            }
+            if !delivered {
+                tracing::warn!("threat-intel: could not reach peer '{}' ({}) for ipset install — try manually or wait until next enable", hostname, address);
+            }
+        }
+    });
+}
+
 /// Mask API keys before returning a config to the frontend. Empty fields
 /// stay empty; non-empty fields become "***" so the UI knows a key is
 /// configured without seeing the value.
@@ -904,7 +969,16 @@ pub async fn threat_intel_patch_config(
         // The kernel state needs to catch up. Run on a blocking thread —
         // apply_state_change shells out to ipset/iptables-restore.
         match tokio::task::spawn_blocking(crate::threat_intel::apply_state_change).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                // Local enforcement just activated — fan out an ipset
+                // install to every online WolfStack peer in the cluster
+                // so they're ready when their own admin enables it. Runs
+                // in the background; we don't block the user's API call
+                // on per-peer install timing.
+                if new_enforcement {
+                    ti_install_ipset_on_peers(&state);
+                }
+            }
             Ok(Err(e)) => apply_error = Some(e),
             Err(e) => apply_error = Some(format!("apply task panicked: {}", e)),
         }
@@ -977,7 +1051,15 @@ pub async fn threat_intel_resume(req: HttpRequest, state: web::Data<AppState>) -
         return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
     }
     match tokio::task::spawn_blocking(crate::threat_intel::apply_state_change).await {
-        Ok(Ok(())) => HttpResponse::Ok().json(serde_json::json!({ "paused": false })),
+        Ok(Ok(())) => {
+            // If unpausing actually re-activated enforcement (the common
+            // case — pause was the only thing turning it off), make sure
+            // peers have ipset.
+            if crate::threat_intel::enforcement_active(&crate::threat_intel::ThreatIntelConfig::load()) {
+                ti_install_ipset_on_peers(&state);
+            }
+            HttpResponse::Ok().json(serde_json::json!({ "paused": false }))
+        }
         Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("apply task panicked: {}", e) })),
     }
