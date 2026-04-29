@@ -891,6 +891,73 @@ fn ti_install_ipset_on_peers(state: &web::Data<AppState>) {
     });
 }
 
+/// Push the local Threat Intel config to every online WolfStack peer
+/// in the cluster, in the background. Peers receive the unmasked config
+/// (real API keys, not "***") so their own scheduler can actually fetch
+/// feeds. Best effort: per-peer 30s timeout; failures logged.
+///
+/// Cycle-breaker: peers that receive this call have caller == "cluster-node"
+/// in their PATCH handler, which skips the re-propagation step.
+fn ti_propagate_config_to_peers(state: &web::Data<AppState>) {
+    let nodes = state.cluster.get_all_nodes();
+    let secret = state.cluster_secret.clone();
+    let self_id = state.cluster.self_id.clone();
+    let peers: Vec<(String, String, u16)> = nodes.iter()
+        .filter(|n| !n.is_self && n.id != self_id && n.online && n.node_type == "wolfstack")
+        .map(|n| (n.hostname.clone(), n.address.clone(), n.port))
+        .collect();
+    if peers.is_empty() { return; }
+
+    // Read the unmasked on-disk config and serialise the full struct.
+    // The receiving peer's PATCH handler will use its own ProviderConfig
+    // sentinel logic — including a real key value (not "***") replaces
+    // the on-disk key.
+    let cfg = crate::threat_intel::ThreatIntelConfig::load();
+    let payload = serde_json::json!({
+        "enabled": cfg.enabled,
+        "dry_run": cfg.dry_run,
+        "paused": cfg.paused,
+        "refresh_hours": cfg.refresh_hours,
+        "providers": cfg.providers,
+        "allowlist": cfg.allowlist,
+    });
+
+    tokio::spawn(async move {
+        let client = &*API_HTTP_CLIENT;
+        for (hostname, address, port) in &peers {
+            let urls = build_node_urls(address, *port, "/api/threat-intel/config");
+            let mut delivered = false;
+            for url in &urls {
+                match client.patch(url)
+                    .timeout(std::time::Duration::from_secs(30))
+                    .header("X-WolfStack-Secret", &secret)
+                    .json(&payload)
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        let _ = resp.bytes().await;
+                        tracing::info!("threat-intel: config propagated to peer '{}' ({})", hostname, address);
+                        delivered = true;
+                        break;
+                    }
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let _ = resp.bytes().await;
+                        tracing::warn!("threat-intel: config push to peer '{}' ({}) returned HTTP {}", hostname, address, status);
+                        delivered = true;
+                        break;
+                    }
+                    Err(_) => continue,
+                }
+            }
+            if !delivered {
+                tracing::warn!("threat-intel: could not reach peer '{}' ({}) for config propagation", hostname, address);
+            }
+        }
+    });
+}
+
 /// Mask API keys before returning a config to the frontend. Empty fields
 /// stay empty; non-empty fields become "***" so the UI knows a key is
 /// configured without seeing the value.
@@ -932,7 +999,11 @@ pub async fn threat_intel_patch_config(
     state: web::Data<AppState>,
     body: web::Json<ThreatIntelPatchRequest>,
 ) -> HttpResponse {
-    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let caller = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
+    // Cycle-breaker: when a peer receives a propagated config push, the
+    // caller is "cluster-node" (X-WolfStack-Secret auth). Don't re-propagate
+    // back out — the originating bastion is already fanning to every node.
+    let from_peer = caller == "cluster-node";
     let mut cfg = crate::threat_intel::ThreatIntelConfig::load();
     let prev_enforcement = crate::threat_intel::enforcement_active(&cfg);
 
@@ -975,7 +1046,7 @@ pub async fn threat_intel_patch_config(
                 // so they're ready when their own admin enables it. Runs
                 // in the background; we don't block the user's API call
                 // on per-peer install timing.
-                if new_enforcement {
+                if new_enforcement && !from_peer {
                     ti_install_ipset_on_peers(&state);
                 }
             }
@@ -1007,6 +1078,14 @@ pub async fn threat_intel_patch_config(
             "error": format!("Config saved, but enforcement could not be activated: {}. Configuration was rolled back to a safe state.", e),
         }));
     }
+
+    // Cluster-wide propagation. Fire-and-forget — peers process the same
+    // PATCH (with caller=cluster-node) which short-circuits their own
+    // re-propagation, so we won't loop.
+    if !from_peer {
+        ti_propagate_config_to_peers(&state);
+    }
+
     HttpResponse::Ok().json(ti_mask_keys(crate::threat_intel::ThreatIntelConfig::load()))
 }
 
@@ -1021,9 +1100,10 @@ pub async fn threat_intel_refresh(req: HttpRequest, state: web::Data<AppState>) 
 
 /// POST /api/threat-intel/pause — emergency-off. Drops the kernel rule
 /// immediately while preserving config + ipset state for a one-click
-/// resume.
+/// resume. Cluster-wide: propagates pause to every online peer.
 pub async fn threat_intel_pause(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let caller = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
+    let from_peer = caller == "cluster-node";
     let mut cfg = crate::threat_intel::ThreatIntelConfig::load();
     if cfg.paused {
         return HttpResponse::Ok().json(serde_json::json!({ "paused": true, "no_op": true }));
@@ -1033,15 +1113,19 @@ pub async fn threat_intel_pause(req: HttpRequest, state: web::Data<AppState>) ->
         return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
     }
     match tokio::task::spawn_blocking(crate::threat_intel::apply_state_change).await {
-        Ok(Ok(())) => HttpResponse::Ok().json(serde_json::json!({ "paused": true })),
+        Ok(Ok(())) => {
+            if !from_peer { ti_propagate_config_to_peers(&state); }
+            HttpResponse::Ok().json(serde_json::json!({ "paused": true }))
+        }
         Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("apply task panicked: {}", e) })),
     }
 }
 
-/// POST /api/threat-intel/resume — undo a pause.
+/// POST /api/threat-intel/resume — undo a pause. Cluster-wide.
 pub async fn threat_intel_resume(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let caller = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
+    let from_peer = caller == "cluster-node";
     let mut cfg = crate::threat_intel::ThreatIntelConfig::load();
     if !cfg.paused {
         return HttpResponse::Ok().json(serde_json::json!({ "paused": false, "no_op": true }));
@@ -1054,9 +1138,12 @@ pub async fn threat_intel_resume(req: HttpRequest, state: web::Data<AppState>) -
         Ok(Ok(())) => {
             // If unpausing actually re-activated enforcement (the common
             // case — pause was the only thing turning it off), make sure
-            // peers have ipset.
-            if crate::threat_intel::enforcement_active(&crate::threat_intel::ThreatIntelConfig::load()) {
+            // peers have ipset and the same config.
+            if !from_peer
+                && crate::threat_intel::enforcement_active(&crate::threat_intel::ThreatIntelConfig::load())
+            {
                 ti_install_ipset_on_peers(&state);
+                ti_propagate_config_to_peers(&state);
             }
             HttpResponse::Ok().json(serde_json::json!({ "paused": false }))
         }
