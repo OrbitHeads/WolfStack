@@ -491,6 +491,115 @@ impl Default for RouterState {
 /// Safe-mode is explicitly OFF: unattended boot has no human to
 /// confirm rules within the 30s window, and auto-reverting on every
 /// reboot would be worse than "rules applied with no rollback".
+/// Detect and remove default routes whose next-hop is one of THIS
+/// host's own IPv4 addresses. Such routes can never deliver a packet
+/// — the kernel can't ARP itself — and emit ICMP host-unreachable
+/// from a local IP, producing the classic `traceroute` `!H`-on-hop-1
+/// symptom. There is no legitimate setup that ships a default route
+/// pointing at your own IP.
+///
+/// Real failure mode (PapaSchlumpf, April 2026): a router box had its
+/// LAN gateway IP (10.10.10.1) configured as the LAN segment's
+/// dnsmasq-served gateway AND someone added `gateway 10.10.10.1` on
+/// the SAME box's `/etc/network/interfaces` LAN stanza. ifup
+/// installed `default via 10.10.10.1 dev ens1 proto static` (metric
+/// 0). Because 10.10.10.1 was a secondary IP on ens1 (the box itself
+/// answers as that gateway for LAN clients), every packet originated
+/// by the router got rejected with ICMP host-unreachable from
+/// 10.10.10.2 — including LAN clients masqueraded out toward the
+/// internet. Starlink's DHCP-installed working default at metric 100
+/// lost to the metric-0 garbage every time.
+///
+/// This runs once per process start, gated to nodes that are actually
+/// doing WolfRouter work (`applies_here` in apply_on_startup). One-
+/// shot — we don't fight a misconfigured /etc/network/interfaces on
+/// every network reload. The operator still has to remove the
+/// persistent source, which the pre-flight UI surfaces with a
+/// copy-paste fix.
+///
+/// Returns the list of deleted route lines for logging.
+fn purge_self_loop_defaults() -> Vec<String> {
+    use std::process::Command;
+
+    let mut removed = Vec::new();
+
+    // Step 1: collect every non-loopback, non-host-scope IPv4 address
+    // on this machine. These are the addresses that could never serve
+    // as a legitimate next-hop in a default route on THIS box.
+    let addr_out = match Command::new("ip").args(["-j", "-4", "addr"]).output() {
+        Ok(o) if o.status.success() => o,
+        _ => return removed, // ip(8) missing or failed — nothing to do
+    };
+    let mut local_ips: Vec<String> = Vec::new();
+    if let Ok(arr) = serde_json::from_slice::<Vec<serde_json::Value>>(&addr_out.stdout) {
+        for entry in arr {
+            if let Some(addrs) = entry.get("addr_info").and_then(|v| v.as_array()) {
+                for ai in addrs {
+                    if ai.get("family").and_then(|v| v.as_str()) != Some("inet") { continue; }
+                    if ai.get("scope").and_then(|v| v.as_str()) == Some("host") { continue; }
+                    if let Some(ip) = ai.get("local").and_then(|v| v.as_str()) {
+                        local_ips.push(ip.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if local_ips.is_empty() { return removed; }
+
+    // Step 2: walk every default route and check its `via` next-hop
+    // against the local-IP set. Only routes whose next-hop is a local
+    // IP are deleted — anything else is left strictly alone.
+    let route_out = match Command::new("ip").args(["-4", "route", "show", "default"]).output() {
+        Ok(o) if o.status.success() => o,
+        _ => return removed,
+    };
+    let route_text = String::from_utf8_lossy(&route_out.stdout).to_string();
+
+    for line in route_text.lines() {
+        let line = line.trim();
+        if !line.starts_with("default") { continue; }
+        let via = line.split_whitespace()
+            .skip_while(|t| *t != "via")
+            .nth(1)
+            .unwrap_or("");
+        if via.is_empty() { continue; } // `default dev X` (point-to-point) — never local-IP-bogus
+        if !local_ips.iter().any(|ip| ip == via) { continue; }
+
+        // Self-loop confirmed. Build `ip route del <full args>` so we
+        // delete THIS exact route (matched on dev/proto/metric) rather
+        // than a similar one. Pass tokens individually — Command takes
+        // care of escaping; line never contains shell metacharacters
+        // because it came straight from `ip` output.
+        //
+        // Filter output-only annotations that `ip route show` emits but
+        // `ip route del` rejects as unknown arguments. `linkdown` is
+        // the one we actually see in the wild; the list is defensive.
+        let mut args: Vec<&str> = vec!["route", "del"];
+        args.extend(
+            line.split_whitespace()
+                .filter(|t| !matches!(*t, "linkdown" | "onlink"))
+        );
+        match Command::new("ip").args(&args).output() {
+            Ok(o) if o.status.success() => {
+                removed.push(line.to_string());
+            }
+            Ok(o) => {
+                tracing::warn!(
+                    "WolfRouter startup: failed to delete self-loop default route '{}': {}",
+                    line, String::from_utf8_lossy(&o.stderr).trim()
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "WolfRouter startup: failed to spawn ip route del for '{}': {}",
+                    line, e
+                );
+            }
+        }
+    }
+    removed
+}
+
 pub fn apply_on_startup(state: std::sync::Arc<RouterState>, self_node_id: &str) {
     let cfg = state.config.read().unwrap().clone();
 
@@ -518,6 +627,27 @@ pub fn apply_on_startup(state: std::sync::Arc<RouterState>, self_node_id: &str) 
     // and never re-applied ip_forward / FORWARD / MASQUERADE — the
     // route survived but the forwarding plumbing didn't.
     if applies_here {
+        // Self-loop default routes — kill any `default via <local-ip>`
+        // before WAN apply so by the time WolfRouter is "up", the
+        // routing table doesn't have a metric-0 self-loop hijacking
+        // egress. Strictly bounded: deletes ONLY routes whose next-hop
+        // is one of this host's own IPv4 addresses. Such routes are
+        // unambiguous misconfig — they cannot deliver a packet. Routes
+        // with a real off-box next-hop are never touched.
+        let purged = purge_self_loop_defaults();
+        for r in &purged {
+            tracing::warn!(
+                "WolfRouter startup: removed self-loop default route '{}' \
+                 (next-hop is one of this host's own IPv4 addresses — could \
+                 never deliver packets, was producing ICMP host-unreachable \
+                 on every egress attempt). Persistent source is likely a \
+                 `gateway <local-ip>` line in /etc/network/interfaces, \
+                 /etc/netplan/*.yaml, or a NetworkManager profile — remove \
+                 it to prevent reinstall on next boot.",
+                r
+            );
+        }
+
         let mut wan_ok = 0usize;
         let mut wan_err = 0usize;
         for conn in &cfg.wan_connections {

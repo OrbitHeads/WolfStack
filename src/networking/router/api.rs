@@ -1332,8 +1332,379 @@ pub async fn preflight(
         });
     }
 
-    // self_id resolved earlier for future checks; silence unused lint.
-    let _ = self_id;
+    // 8) WAN routing & default route — without these the node itself
+    // can't egress, and LAN clients masqueraded through it can't reach
+    // anything either. The exact symptom that motivated this section:
+    // PPPoE WAN dialed up fine, but `use_default_route` defaulted off
+    // (sane default on a mixed box, lethal on a dedicated router) and
+    // the box ended up with `nodefaultroute` written into the peer
+    // file. `traceroute` from the router returned `!H` from its own
+    // LAN IP because the kernel had no usable egress.
+    //
+    // Source: networking/router/wan.rs:227-228, 444-453 — the
+    // use_default_route default and the resulting peer-file branch.
+    let default_route_text = std::process::Command::new("ip")
+        .args(["-4", "route", "show", "default"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let has_default_route = !default_route_text.is_empty();
+
+    // Snapshot enabled WAN connections owned by this node. Remote-node
+    // WAN connections are checked when the user opens preflight against
+    // that node — we can't read its iptables/ppp state from here.
+    let local_wans: Vec<wan::WanConnection> = {
+        let cfg = state.router.config.read().unwrap();
+        cfg.wan_connections.iter()
+            .filter(|w| w.enabled && w.node_id == self_id)
+            .cloned()
+            .collect()
+    };
+
+    if has_default_route {
+        let first = default_route_text.lines().next().unwrap_or("").trim();
+        checks.push(PreflightCheck {
+            id: "default_route",
+            name: "Default IPv4 route",
+            ok: true,
+            severity: "info",
+            message: format!("Present: {}", first),
+            fix: None,
+        });
+    } else if local_wans.is_empty() {
+        checks.push(PreflightCheck {
+            id: "default_route",
+            name: "Default IPv4 route",
+            ok: false,
+            severity: "warning",
+            message: "No default IPv4 route on this node, and no WolfRouter WAN connection is configured here. The node can't reach the internet, and any LAN clients routed through it will get host-unreachable.".into(),
+            fix: Some("Either add a WAN connection in WolfRouter → WAN connections (DHCP / Static / PPPoE), or configure a default route via the host's network config.".into()),
+        });
+    } else {
+        // There IS a WAN configured here but no default route. Almost
+        // always either (a) PPPoE with `use_default_route` unticked, or
+        // (b) the WAN link itself didn't come up. Pull out (a) so the
+        // fix instructions point at the exact UI checkbox.
+        let pppoe_no_default: Vec<&wan::WanConnection> = local_wans.iter()
+            .filter(|w| matches!(&w.mode, wan::WanMode::Pppoe(p) if !p.use_default_route))
+            .collect();
+        if !pppoe_no_default.is_empty() {
+            let names = pppoe_no_default.iter()
+                .map(|w| format!("'{}'", w.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            checks.push(PreflightCheck {
+                id: "default_route",
+                name: "Default IPv4 route",
+                ok: false,
+                severity: "error",
+                message: format!(
+                    "No default IPv4 route. PPPoE WAN(s) {} have 'Use as default route' unticked, so pppd writes `nodefaultroute` to the peer file. The router itself has no internet, and LAN clients routed through it get host-unreachable.",
+                    names
+                ),
+                fix: Some("WolfRouter → WAN connections → edit each PPPoE entry → tick 'Use as default route' (and 'Use ISP DNS' unless you've configured DNS yourself), then Save. WolfRouter rewrites the peer file with `defaultroute replacedefaultroute` and redials.".into()),
+            });
+        } else {
+            checks.push(PreflightCheck {
+                id: "default_route",
+                name: "Default IPv4 route",
+                ok: false,
+                severity: "error",
+                message: "No default IPv4 route on this node, despite WAN connection(s) being configured here. The router itself has no internet and LAN clients routed through it can't reach anything either.".into(),
+                fix: Some("The configured WAN link probably didn't come up. Check:\n  • PPPoE: `pgrep -af pppd` and `journalctl -u pppd -n 50`\n  • DHCP:  `ip -4 addr show <wan-iface>` should show a public IP\n  • Static: `ping <gateway>` should answer".into()),
+            });
+        }
+    }
+
+    // 8a') Self-loop default route — if a `default via X` route's
+    // next-hop X is one of THIS host's own IPs, the kernel either
+    // returns ENETUNREACH or emits ICMP host-unreachable from that
+    // local IP, and traceroute/ping report `!H`.
+    //
+    // Real failure mode that motivated this check (PapaSchlumpf, April
+    // 2026): on a router box with WolfRouter serving 10.10.10.0/24,
+    // ens1 had primary 10.10.10.2 (the host's own LAN IP) AND
+    // secondary 10.10.10.1 (the LAN gateway address dnsmasq listens
+    // on). /etc/network/interfaces had `gateway 10.10.10.1`, so ifup
+    // installed `default via 10.10.10.1 dev ens1 proto static`. With
+    // metric 0 it beat the working Starlink DHCP default (metric 100),
+    // and every egress packet from the router got rejected because the
+    // gateway was the box itself. LAN clients masqueraded through the
+    // box hit the same dead route.
+    //
+    // We catch this by collecting every IPv4 address on the host and
+    // checking each `default via …` line against that set. A
+    // next-hop matching a local IP is unambiguous misconfig — never a
+    // legitimate setup.
+    if has_default_route {
+        // All non-loopback local IPv4s on this host.
+        let mut local_ips: Vec<String> = Vec::new();
+        if let Ok(out) = std::process::Command::new("ip")
+            .args(["-j", "-4", "addr"])
+            .output()
+        {
+            if out.status.success() {
+                if let Ok(arr) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout) {
+                    for entry in arr {
+                        if let Some(addrs) = entry.get("addr_info").and_then(|v| v.as_array()) {
+                            for ai in addrs {
+                                if ai.get("family").and_then(|v| v.as_str()) != Some("inet") { continue; }
+                                if ai.get("scope").and_then(|v| v.as_str()) == Some("host") { continue; }
+                                if let Some(ip) = ai.get("local").and_then(|v| v.as_str()) {
+                                    local_ips.push(ip.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Walk each default route line; flag any whose `via` is local.
+        let mut self_loops: Vec<(String, String)> = Vec::new(); // (via_ip, full_line)
+        for line in default_route_text.lines() {
+            let line = line.trim();
+            if !line.starts_with("default") { continue; }
+            // Parse `via <ip>` — token after "via".
+            let via = line.split_whitespace()
+                .skip_while(|t| *t != "via")
+                .nth(1)
+                .unwrap_or("");
+            if !via.is_empty() && local_ips.iter().any(|ip| ip == via) {
+                self_loops.push((via.to_string(), line.to_string()));
+            }
+        }
+        if !self_loops.is_empty() {
+            // Build a fix that lists every offending route + the explicit
+            // `ip route del` for each, so the user can copy-paste exactly
+            // what to remove. Then point at the persistent source.
+            let mut bad = String::new();
+            let mut del_cmds = String::new();
+            for (via, line) in &self_loops {
+                bad.push_str(&format!("\n  • {}", line));
+                del_cmds.push_str(&format!("\n  sudo ip route del {}", line));
+                let _ = via;
+            }
+            let total_defaults = default_route_text.lines()
+                .filter(|l| l.trim().starts_with("default")).count();
+            let context = if total_defaults > self_loops.len() {
+                format!(
+                    "\n\nThere are {} default route(s) total — at least one of them is real (e.g. your DHCP/PPPoE WAN). Removing the self-loop one(s) leaves the working route in charge.",
+                    total_defaults
+                )
+            } else {
+                "\n\nThis is your ONLY default route, so the box has no real path out. After removing it, add a WAN connection (or persist a DHCP lease on your WAN iface) so a real default route gets installed.".into()
+            };
+            checks.push(PreflightCheck {
+                id: "default_route_self_loop",
+                name: "Default route points to local IP (self-loop)",
+                ok: false,
+                severity: "error",
+                message: format!(
+                    "{} default route(s) point at this host's own IP, which the kernel rejects with ICMP host-unreachable:{}{}",
+                    self_loops.len(), bad, context
+                ),
+                fix: Some(format!(
+                    "Remove the self-loop route(s) live:{}\n\nThen find the persistent source so they don't come back on reboot. Common culprits:\n  • /etc/network/interfaces — a `gateway <local-ip>` line on a LAN-side iface (remove that line, leave `address` alone).\n  • /etc/netplan/*.yaml — a `gateway4:` or static `routes: - to: default` entry pointing at a local IP (remove it, then `sudo netplan apply`).\n  • NetworkManager — `nmcli connection show` and edit/remove the offending profile's gateway.\n\nAfter removal, run `ip route` again — only your WAN's default (DHCP / PPPoE) should remain.",
+                    del_cmds
+                )),
+            });
+        }
+    }
+
+    // 8b) Egress route resolution — `ip route get 1.1.1.1` answers
+    // "if I sent to a public IP right now, which interface would the
+    // kernel pick?" Cheap, generates zero traffic, and catches the
+    // case where a default route exists but points to an iface without
+    // an IP / a dead gateway (the route is in the table but the kernel
+    // refuses to use it).
+    if has_default_route {
+        match std::process::Command::new("ip")
+            .args(["-4", "route", "get", "1.1.1.1"])
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                let txt = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                let dev = txt.split_whitespace()
+                    .skip_while(|t| *t != "dev")
+                    .nth(1)
+                    .unwrap_or("");
+                if dev.is_empty() {
+                    checks.push(PreflightCheck {
+                        id: "egress_route",
+                        name: "Egress route resolution",
+                        ok: false,
+                        severity: "error",
+                        message: format!("`ip route get 1.1.1.1` returned no egress interface: {}", txt),
+                        fix: Some("Default route exists but the kernel couldn't resolve a next-hop. Check that the WAN interface is up and has an IPv4 (`ip -4 addr`).".into()),
+                    });
+                } else {
+                    checks.push(PreflightCheck {
+                        id: "egress_route",
+                        name: "Egress route resolution",
+                        ok: true,
+                        severity: "info",
+                        message: format!("Egress via {} (kernel pick for 1.1.1.1)", dev),
+                        fix: None,
+                    });
+                }
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                checks.push(PreflightCheck {
+                    id: "egress_route",
+                    name: "Egress route resolution",
+                    ok: false,
+                    severity: "error",
+                    message: format!("`ip route get 1.1.1.1` failed: {}", stderr),
+                    fix: Some("Most often: WAN link is down. PPPoE → check `pppd` is running. DHCP → check the iface holds an IPv4. Static → check the gateway responds.".into()),
+                });
+            }
+            Err(_) => {} // ip(8) missing — covered by other checks
+        }
+    }
+
+    // 8c) Per-WAN checks for connections owned by this node. Each WAN
+    // emits a link-state check (PPPoE: pppd is dialed and ppp* exists;
+    // DHCP/Static: the configured iface has an IPv4) plus a MASQUERADE
+    // rule check on the egress iface.
+    //
+    // The DHCP branch is critical for Starlink, cable modems, and any
+    // ISP that doesn't need PPPoE — WolfRouter calls DHCP a passthrough
+    // (the host's own dhclient/networkd owns the iface), which works
+    // beautifully when the host is configured to DHCP that iface, and
+    // catastrophically when it isn't. Symptom: WAN saved fine in
+    // WolfRouter, no error, but the iface stays unconfigured because
+    // nothing on the OS side ever sent a DHCPDISCOVER. No IP → no
+    // default route → !H from the router's LAN IP on traceroute.
+    // Source: networking/router/wan.rs:681-694 — the passthrough mode.
+    let iface_has_ipv4 = |iface: &str| -> Option<String> {
+        let out = std::process::Command::new("ip")
+            .args(["-j", "-4", "addr", "show", "dev", iface])
+            .output()
+            .ok()?;
+        if !out.status.success() { return None; }
+        let arr: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).ok()?;
+        for entry in arr {
+            for ai in entry.get("addr_info")?.as_array()? {
+                if ai.get("family").and_then(|v| v.as_str()) == Some("inet") {
+                    if ai.get("scope").and_then(|v| v.as_str()) == Some("host") { continue; }
+                    let ip = ai.get("local").and_then(|v| v.as_str())?;
+                    return Some(ip.to_string());
+                }
+            }
+        }
+        None
+    };
+
+    for w in &local_wans {
+        // Resolve egress iface + link status per mode.
+        //   PPPoE: iface name is dynamic (ppp0/1/...) and only exists
+        //   once pppd has dialed up. wan::pppoe_status reads the live
+        //   state and returns the active iface + IP.
+        //
+        //   DHCP/Static: the configured physical iface IS the egress
+        //   iface. "Up" here means it has a non-loopback IPv4 — for
+        //   DHCP that's set by the host's DHCP client on lease, for
+        //   Static by /etc/network/interfaces or equivalent.
+        let mode_label = match &w.mode {
+            wan::WanMode::Pppoe(_) => "PPPoE",
+            wan::WanMode::Dhcp => "DHCP",
+            wan::WanMode::Static(_) => "Static",
+        };
+        let (egress_iface, link_status) = match &w.mode {
+            wan::WanMode::Pppoe(_) => match wan::pppoe_status(w) {
+                Some((iface, ip)) => (Some(iface.clone()), Some(Ok(format!("PPPoE link up: {} ({})", iface, ip)))),
+                None => (None, Some(Err((
+                    format!(
+                        "PPPoE link '{}' on {} is not up — no ppp* interface with the expected pid file.",
+                        w.name, w.interface
+                    ),
+                    "Check pppd:\n  • `pgrep -af pppd`\n  • `journalctl -u pppd -n 50` (or `tail -n 50 /var/log/syslog | grep pppd`)\n  • Confirm ISP credentials in WolfRouter → WAN connections → Edit.".to_string(),
+                )))),
+            },
+            wan::WanMode::Dhcp | wan::WanMode::Static(_) => match iface_has_ipv4(&w.interface) {
+                Some(ip) => (Some(w.interface.clone()), Some(Ok(format!("{} link up: {} ({})", mode_label, w.interface, ip)))),
+                None => (Some(w.interface.clone()), Some(Err((
+                    format!(
+                        "WAN '{}' ({}) on {}: interface has no IPv4 address. {}",
+                        w.name, mode_label, w.interface,
+                        if matches!(w.mode, wan::WanMode::Dhcp) {
+                            "WolfRouter's DHCP mode is a passthrough — the host's own DHCP client (dhclient / systemd-networkd / NetworkManager) is supposed to own this iface, but nothing has given it a lease."
+                        } else {
+                            "Static mode is a passthrough — the host's network config is supposed to assign this iface, but no IPv4 is present."
+                        }
+                    ),
+                    if matches!(w.mode, wan::WanMode::Dhcp) {
+                        format!(
+                            "Bring the iface up and request a lease manually to confirm the upstream is reachable:\n  sudo ip link set {iface} up\n  sudo dhclient -v {iface}\n\nIf that gets an IP, persist it. On Debian/Ubuntu (`/etc/network/interfaces`):\n  auto {iface}\n  iface {iface} inet dhcp\n\nOn netplan (`/etc/netplan/*.yaml`):\n  network:\n    ethernets:\n      {iface}:\n        dhcp4: true\n\nIf dhclient gets nothing, the upstream isn't handing out leases — for Starlink, check the dishy is online, the cable is plugged into the right WAN port, and the router boot order isn't racing the dishy bring-up.",
+                            iface = w.interface
+                        )
+                    } else {
+                        format!(
+                            "Configure a static IP on {iface} via the host's network config. On Debian/Ubuntu (`/etc/network/interfaces`):\n  auto {iface}\n  iface {iface} inet static\n      address <CIDR>\n      gateway <gateway-ip>\n\nThen `sudo systemctl restart networking` (or `netplan apply` on netplan).",
+                            iface = w.interface
+                        )
+                    },
+                )))),
+            },
+        };
+
+        if let Some(status) = link_status {
+            match status {
+                Ok(msg) => checks.push(PreflightCheck {
+                    id: "wan_link",
+                    name: "WAN link state",
+                    ok: true,
+                    severity: "info",
+                    message: format!("WAN '{}': {}", w.name, msg),
+                    fix: None,
+                }),
+                Err((msg, fix)) => checks.push(PreflightCheck {
+                    id: "wan_link",
+                    name: "WAN link state",
+                    ok: false,
+                    severity: "error",
+                    message: msg,
+                    fix: Some(fix),
+                }),
+            }
+        }
+
+        if let Some(iface) = egress_iface.as_deref() {
+            let masq_present = std::process::Command::new("iptables")
+                .args(["-t", "nat", "-C", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if masq_present {
+                checks.push(PreflightCheck {
+                    id: "wan_masquerade",
+                    name: "WAN NAT (MASQUERADE)",
+                    ok: true,
+                    severity: "info",
+                    message: format!("WAN '{}': POSTROUTING -o {} -j MASQUERADE present", w.name, iface),
+                    fix: None,
+                });
+            } else {
+                checks.push(PreflightCheck {
+                    id: "wan_masquerade",
+                    name: "WAN NAT (MASQUERADE)",
+                    ok: false,
+                    severity: "error",
+                    message: format!(
+                        "WAN '{}': no MASQUERADE rule on {}. LAN clients routed through this WAN leave with private source IPs and the upstream drops them.",
+                        w.name, iface
+                    ),
+                    fix: Some(format!(
+                        "WolfRouter installs this on apply — re-apply the WAN entry from WolfRouter → WAN connections → '{}' → Save. As a one-shot manual fix:\n  iptables -t nat -A POSTROUTING -o {} -j MASQUERADE",
+                        w.name, iface
+                    )),
+                });
+            }
+        }
+    }
 
     let has_error = checks.iter().any(|c| !c.ok && c.severity == "error");
     let has_warning = checks.iter().any(|c| !c.ok && c.severity == "warning");
