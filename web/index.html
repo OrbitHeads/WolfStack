@@ -4260,6 +4260,7 @@
                         <button class="settings-tab-btn" onclick="switchSettingsTab('backup')">📦 Config Backup</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('users')">👤 Users &amp; Auth</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('security')">🔐 Security</button>
+                        <button class="settings-tab-btn" onclick="switchSettingsTab('passkeys')">🔑 Passkeys</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('systemcheck')">🩺 System Check</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('paths')">📂 File Locations</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('reverseproxy')">🌐 Reverse Proxy</button>
@@ -5198,6 +5199,26 @@
                             </div>
                         </div>
                         <div id="cluster-secret-results" style="margin-top:16px;display:none;">
+                        </div>
+                    </div>
+
+                    <!-- ─── Passkeys Tab ─── -->
+                    <div id="settings-tab-passkeys" class="settings-tab-panel">
+                        <div style="background:var(--bg-input);border-radius:12px;padding:20px;border:1px solid var(--border);max-width:720px;">
+                            <h4 style="margin:0 0 8px 0;font-size:15px;">Passkeys (WebAuthn)</h4>
+                            <p style="font-size:13px;color:var(--text-muted);margin:0 0 16px 0;">
+                                Sign in without a password using a hardware security key, your phone, or a biometric (Touch ID, Windows Hello).
+                                Each passkey is bound to this server's hostname &mdash; passkeys registered on one hostname won't work on another.
+                            </p>
+                            <div id="passkeys-warning" style="display:none;background:rgba(234,179,8,0.1);border:1px solid rgba(234,179,8,0.3);border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:12px;color:var(--text-secondary);"></div>
+                            <div style="display:flex;gap:8px;align-items:center;margin-bottom:16px;">
+                                <input type="text" id="new-passkey-label" placeholder="Label (e.g. MacBook Touch ID, YubiKey)"
+                                    style="flex:1;padding:8px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text);font-size:13px;">
+                                <button class="btn btn-primary" onclick="passkeyAdd()" id="btn-passkey-add">➕ Add passkey</button>
+                            </div>
+                            <div id="passkeys-list">
+                                <div style="color:var(--text-muted);font-size:13px;padding:12px 0;">Loading…</div>
+                            </div>
                         </div>
                     </div>
 

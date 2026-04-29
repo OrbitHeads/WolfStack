@@ -26564,6 +26564,8 @@ function switchSettingsTab(tabName) {
         loadAlertingConfig();
     } else if (tabName === 'security') {
         loadClusterSecretStatus();
+    } else if (tabName === 'passkeys') {
+        loadPasskeys();
     } else if (tabName === 'paths') {
         loadFileLocations();
     } else if (tabName === 'reverseproxy') {
@@ -28678,6 +28680,140 @@ async function loadSponsorHeaderBadge() {
 }
 // Load on page startup
 document.addEventListener('DOMContentLoaded', loadSponsorHeaderBadge);
+
+// ─── Passkeys (WebAuthn) ───
+
+function _b64uToBuf(s) {
+    s = String(s).replace(/-/g, '+').replace(/_/g, '/');
+    const pad = s.length % 4; if (pad) s += '='.repeat(4 - pad);
+    const bin = atob(s);
+    const buf = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+    return buf.buffer;
+}
+function _bufToB64u(buf) {
+    const bytes = new Uint8Array(buf);
+    let s = ''; for (const b of bytes) s += String.fromCharCode(b);
+    return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function loadPasskeys() {
+    const list = document.getElementById('passkeys-list');
+    const warn = document.getElementById('passkeys-warning');
+    if (!list) return;
+    if (warn) {
+        warn.style.display = 'none';
+        const host = window.location.hostname;
+        const isIp = /^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes(':');
+        if (!window.PublicKeyCredential) {
+            warn.textContent = 'Your browser does not support WebAuthn.';
+            warn.style.display = '';
+        } else if (isIp) {
+            warn.textContent = 'Passkeys require accessing WolfStack via a hostname, not an IP. Add a /etc/hosts entry or DNS record, then revisit this page over the hostname URL.';
+            warn.style.display = '';
+        }
+    }
+    list.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:12px 0;">Loading…</div>';
+    try {
+        const resp = await fetch('/api/auth/passkeys');
+        if (!resp.ok) { list.innerHTML = '<div style="color:var(--danger);font-size:13px;">Failed to load passkeys.</div>'; return; }
+        const data = await resp.json();
+        const items = data.passkeys || [];
+        if (items.length === 0) {
+            list.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:12px 0;">No passkeys registered yet. Add one above to enable passwordless sign-in.</div>';
+            return;
+        }
+        list.innerHTML = items.map(pk => {
+            const label = (pk.label || 'Passkey').replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+            const reg = pk.registered_at ? new Date(pk.registered_at).toLocaleString() : '—';
+            const used = pk.last_used_at ? new Date(pk.last_used_at).toLocaleString() : 'never';
+            const id = encodeURIComponent(pk.credential_id);
+            return `<div style="display:flex;align-items:center;gap:12px;padding:12px 14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;margin-bottom:8px;">
+                <div style="flex:1;">
+                    <div style="font-weight:600;font-size:13px;">🔑 ${label}</div>
+                    <div style="font-size:11px;color:var(--text-muted);margin-top:2px;">Registered ${reg} &middot; Last used ${used}</div>
+                </div>
+                <button class="btn btn-sm" onclick="passkeyDelete('${id}', this)" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);font-size:11px;">🗑 Remove</button>
+            </div>`;
+        }).join('');
+    } catch (e) {
+        list.innerHTML = '<div style="color:var(--danger);font-size:13px;">Failed to load passkeys: ' + (e.message || e) + '</div>';
+    }
+}
+
+async function passkeyAdd() {
+    const labelEl = document.getElementById('new-passkey-label');
+    const btn = document.getElementById('btn-passkey-add');
+    const label = (labelEl && labelEl.value.trim()) || ('Passkey ' + new Date().toLocaleDateString());
+    if (!window.PublicKeyCredential) { showToast('Your browser does not support WebAuthn', 'error'); return; }
+    btn.disabled = true;
+    const orig = btn.innerHTML;
+    btn.innerHTML = 'Waiting for authenticator…';
+    try {
+        const startResp = await fetch('/api/auth/passkey/register/start', {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ label }),
+        });
+        if (!startResp.ok) {
+            const data = await startResp.json().catch(() => ({}));
+            throw new Error(data.error || ('Server returned ' + startResp.status));
+        }
+        const { challenge, ceremony_id } = await startResp.json();
+        const pk = challenge.publicKey || challenge;
+        const opts = { ...pk };
+        opts.challenge = _b64uToBuf(opts.challenge);
+        opts.user = { ...opts.user, id: _b64uToBuf(opts.user.id) };
+        if (Array.isArray(opts.excludeCredentials)) {
+            opts.excludeCredentials = opts.excludeCredentials.map(c => ({ ...c, id: _b64uToBuf(c.id) }));
+        }
+        const cred = await navigator.credentials.create({ publicKey: opts });
+        if (!cred) throw new Error('No credential returned');
+        const r = cred.response;
+        const credJson = {
+            id: cred.id,
+            rawId: _bufToB64u(cred.rawId),
+            type: cred.type,
+            response: {
+                attestationObject: _bufToB64u(r.attestationObject),
+                clientDataJSON: _bufToB64u(r.clientDataJSON),
+            },
+            extensions: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {},
+        };
+        const finishResp = await fetch('/api/auth/passkey/register/finish', {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ ceremony_id, label, response: credJson }),
+        });
+        if (!finishResp.ok) {
+            const data = await finishResp.json().catch(() => ({}));
+            throw new Error(data.error || ('Server returned ' + finishResp.status));
+        }
+        showToast('Passkey added', 'success');
+        if (labelEl) labelEl.value = '';
+        loadPasskeys();
+    } catch (err) {
+        showToast('Failed to add passkey: ' + (err.message || err), 'error');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = orig;
+    }
+}
+
+async function passkeyDelete(credentialId, btn) {
+    if (!await wolfConfirm('Remove this passkey? You will not be able to use it for sign-in any more.', 'Remove passkey')) return;
+    if (btn) { btn.disabled = true; btn.innerHTML = '…'; }
+    try {
+        const resp = await fetch('/api/auth/passkeys/' + credentialId, { method: 'DELETE' });
+        if (!resp.ok) {
+            const data = await resp.json().catch(() => ({}));
+            throw new Error(data.error || ('Server returned ' + resp.status));
+        }
+        showToast('Passkey removed', 'success');
+        loadPasskeys();
+    } catch (err) {
+        showToast('Failed to remove passkey: ' + (err.message || err), 'error');
+        if (btn) { btn.disabled = false; btn.innerHTML = '🗑 Remove'; }
+    }
+}
 
 // ─── Cluster Secret Management ───
 

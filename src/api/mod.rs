@@ -584,6 +584,198 @@ pub async fn auth_check(req: HttpRequest, state: web::Data<AppState>) -> HttpRes
     }
 }
 
+// ─── Passkey / WebAuthn (additive — coexists with PAM/WolfStack login) ───
+
+/// Derive (rp_id, origin) from the inbound request's Host header. Strips the
+/// port for the RP ID; the origin keeps it. Returns an error if the host
+/// header is missing or unparseable.
+fn passkey_rp_origin(req: &HttpRequest, state: &web::Data<AppState>) -> Result<(String, String), String> {
+    let host_hdr = req.headers().get("Host")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| "Missing Host header".to_string())?;
+    // Strip any port suffix for the RP ID; keep it for the origin.
+    let host_no_port = match host_hdr.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => h,
+        _ => host_hdr,
+    };
+    let scheme = if state.tls_enabled { "https" } else { "http" };
+    let origin = format!("{}://{}", scheme, host_hdr);
+    Ok((host_no_port.to_string(), origin))
+}
+
+#[derive(Deserialize)]
+pub struct PasskeyRegisterStartRequest {
+    #[serde(default)]
+    pub label: String,
+}
+
+/// POST /api/auth/passkey/register/start — issue a registration challenge for the
+/// currently-logged-in user. Requires an existing session.
+pub async fn passkey_register_start(req: HttpRequest, state: web::Data<AppState>, body: web::Json<PasskeyRegisterStartRequest>) -> HttpResponse {
+    let username = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
+    if username == "cluster-node" {
+        return HttpResponse::Forbidden().json(serde_json::json!({ "error": "Inter-node calls cannot register passkeys" }));
+    }
+    let (rp_id, origin) = match passkey_rp_origin(&req, &state) {
+        Ok(p) => p, Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    };
+    let display_name = if body.label.is_empty() { username.as_str() } else { body.label.as_str() };
+    let config = crate::auth::webauthn::WebAuthnConfig::load();
+    match crate::auth::webauthn::start_registration(&config, &rp_id, &origin, &username, display_name) {
+        Ok((challenge, ceremony_id)) => HttpResponse::Ok().json(serde_json::json!({
+            "challenge": challenge,
+            "ceremony_id": ceremony_id,
+        })),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PasskeyRegisterFinishRequest {
+    pub ceremony_id: String,
+    #[serde(default)]
+    pub label: String,
+    pub response: serde_json::Value,
+}
+
+/// POST /api/auth/passkey/register/finish — verify the attestation and persist the credential.
+pub async fn passkey_register_finish(req: HttpRequest, state: web::Data<AppState>, body: web::Json<PasskeyRegisterFinishRequest>) -> HttpResponse {
+    let username = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
+    if username == "cluster-node" {
+        return HttpResponse::Forbidden().json(serde_json::json!({ "error": "Inter-node calls cannot register passkeys" }));
+    }
+    let (rp_id, origin) = match passkey_rp_origin(&req, &state) {
+        Ok(p) => p, Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    };
+    let label = if body.label.is_empty() { "Passkey".to_string() } else { body.label.clone() };
+    let mut config = crate::auth::webauthn::WebAuthnConfig::load();
+    match crate::auth::webauthn::finish_registration(&mut config, &rp_id, &origin, &body.ceremony_id, &username, &label, &body.response) {
+        Ok(stored) => HttpResponse::Ok().json(serde_json::json!({
+            "credential_id": stored.credential_id,
+            "label": stored.label,
+            "registered_at": stored.registered_at,
+        })),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// POST /api/auth/passkey/login/start — issue a discoverable-credential challenge.
+/// Anonymous endpoint — does NOT require a session.
+pub async fn passkey_login_start(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    // If passkey login is unconfigured (no credentials registered) return 404
+    // so the frontend can hide the "Sign in with passkey" button quickly.
+    let config = crate::auth::webauthn::WebAuthnConfig::load();
+    if config.credentials.is_empty() {
+        return HttpResponse::NotFound().json(serde_json::json!({ "error": "No passkeys registered on this server" }));
+    }
+    // Check rate limit on this IP — same budget as the password login.
+    let client_ip = req.connection_info().peer_addr().unwrap_or("unknown").to_string();
+    if state.login_limiter.is_locked_out(&client_ip) {
+        return HttpResponse::TooManyRequests().json(serde_json::json!({
+            "error": "Too many failed login attempts. Please try again later."
+        }));
+    }
+    let (rp_id, origin) = match passkey_rp_origin(&req, &state) {
+        Ok(p) => p, Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    };
+    match crate::auth::webauthn::start_authentication(&rp_id, &origin) {
+        Ok((challenge, ceremony_id)) => HttpResponse::Ok().json(serde_json::json!({
+            "challenge": challenge,
+            "ceremony_id": ceremony_id,
+        })),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PasskeyLoginFinishRequest {
+    pub ceremony_id: String,
+    pub response: serde_json::Value,
+}
+
+/// POST /api/auth/passkey/login/finish — verify the assertion, create a session, set cookie.
+/// Anonymous endpoint.
+pub async fn passkey_login_finish(req: HttpRequest, state: web::Data<AppState>, body: web::Json<PasskeyLoginFinishRequest>) -> HttpResponse {
+    let client_ip = req.connection_info().peer_addr().unwrap_or("unknown").to_string();
+    if state.login_limiter.is_locked_out(&client_ip) {
+        return HttpResponse::TooManyRequests().json(serde_json::json!({
+            "error": "Too many failed login attempts. Please try again later."
+        }));
+    }
+    // Same direct-login-disabled check the password endpoint does.
+    {
+        let nodes = state.cluster.nodes.read().unwrap();
+        if let Some(self_node) = nodes.get(&state.cluster.self_id) {
+            if self_node.login_disabled {
+                return HttpResponse::Forbidden().json(serde_json::json!({
+                    "error": "Direct login is disabled on this server. Access it via the primary dashboard."
+                }));
+            }
+        }
+    }
+    let (rp_id, origin) = match passkey_rp_origin(&req, &state) {
+        Ok(p) => p, Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    };
+    let mut config = crate::auth::webauthn::WebAuthnConfig::load();
+    match crate::auth::webauthn::finish_authentication(&mut config, &rp_id, &origin, &body.ceremony_id, &body.response) {
+        Ok(username) => {
+            state.login_limiter.clear(&client_ip);
+            let token = state.sessions.create_session(&username);
+            let mut cookie = Cookie::build("wolfstack_session", &token)
+                .path("/")
+                .http_only(true)
+                .same_site(actix_web::cookie::SameSite::Strict)
+                .max_age(actix_web::cookie::time::Duration::hours(8))
+                .finish();
+            if state.tls_enabled { cookie.set_secure(true); }
+            HttpResponse::Ok()
+                .cookie(cookie)
+                .json(serde_json::json!({ "success": true, "username": username }))
+        }
+        Err(e) => {
+            state.login_limiter.record_failure(&client_ip);
+            HttpResponse::Unauthorized().json(serde_json::json!({ "success": false, "error": e }))
+        }
+    }
+}
+
+/// GET /api/auth/passkeys — list the current user's registered passkeys.
+pub async fn passkey_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    let username = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
+    if username == "cluster-node" {
+        return HttpResponse::Forbidden().json(serde_json::json!({ "error": "Inter-node calls cannot list passkeys" }));
+    }
+    let config = crate::auth::webauthn::WebAuthnConfig::load();
+    let creds = crate::auth::webauthn::list_credentials(&config, &username);
+    let out: Vec<serde_json::Value> = creds.iter().map(|c| serde_json::json!({
+        "credential_id": c.credential_id,
+        "label": c.label,
+        "registered_at": c.registered_at,
+        "last_used_at": c.last_used_at,
+    })).collect();
+    HttpResponse::Ok().json(serde_json::json!({ "passkeys": out }))
+}
+
+/// DELETE /api/auth/passkeys/{id} — remove a passkey owned by the current user.
+pub async fn passkey_delete(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let username = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
+    if username == "cluster-node" {
+        return HttpResponse::Forbidden().json(serde_json::json!({ "error": "Inter-node calls cannot delete passkeys" }));
+    }
+    let credential_id = path.into_inner();
+    let mut config = crate::auth::webauthn::WebAuthnConfig::load();
+    // Ownership check — only the owning user can delete their own passkeys.
+    let owns = config.credentials.iter().any(|c| c.credential_id == credential_id && c.username == username);
+    if !owns {
+        return HttpResponse::NotFound().json(serde_json::json!({ "error": "Passkey not found" }));
+    }
+    match crate::auth::webauthn::remove_credential(&mut config, &credential_id) {
+        Ok(true) => HttpResponse::Ok().json(serde_json::json!({ "removed": true })),
+        Ok(false) => HttpResponse::NotFound().json(serde_json::json!({ "error": "Passkey not found" })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
 // ─── Password Reset API (no auth required) ───
 
 /// GET /api/auth/smtp-configured — check if SMTP is configured (controls "Lost Password" visibility)
@@ -20044,6 +20236,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/auth/login", web::post().to(login))
         .route("/api/auth/logout", web::post().to(logout))
         .route("/api/auth/check", web::get().to(auth_check))
+        .route("/api/auth/passkey/register/start", web::post().to(passkey_register_start))
+        .route("/api/auth/passkey/register/finish", web::post().to(passkey_register_finish))
+        .route("/api/auth/passkey/login/start", web::post().to(passkey_login_start))
+        .route("/api/auth/passkey/login/finish", web::post().to(passkey_login_finish))
+        .route("/api/auth/passkeys", web::get().to(passkey_list))
+        .route("/api/auth/passkeys/{id}", web::delete().to(passkey_delete))
         .route("/api/settings/login-disabled", web::get().to(login_disabled_status))
         .route("/api/settings/login-disabled", web::post().to(set_login_disabled))
         .route("/api/auth/smtp-configured", web::get().to(smtp_configured))

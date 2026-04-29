@@ -341,6 +341,15 @@
                 </button>
             </form>
 
+            <!-- Passkey login — visible only when at least one passkey is registered on this server -->
+            <div id="passkey-section" style="display:none; margin-top:14px;">
+                <div style="text-align:center; color:var(--text-muted); font-size:12px; margin-bottom:10px;">— or —</div>
+                <button type="button" class="login-btn" id="passkey-btn" onclick="passkeyLogin()" style="background:rgba(99,102,241,0.12); border:1px solid rgba(99,102,241,0.4);">
+                    🔑 Sign in with passkey
+                </button>
+                <div id="passkey-error" class="error-msg" style="margin-top:10px; display:none;"></div>
+            </div>
+
             <div id="forgot-link" style="display:none; text-align:center; margin-top:16px;">
                 <a href="#" onclick="showForgotForm(); return false;" style="color:var(--text-muted); font-size:13px; text-decoration:none;">
                     Lost Password?
@@ -557,6 +566,97 @@
                 }
             })
             .catch(() => {});
+
+        // ─── Passkey (WebAuthn) login ─────────────────────────────────
+        // Reveal the passkey button only when (a) the browser supports
+        // WebAuthn, and (b) the server has at least one passkey registered.
+        // Probing the start endpoint is the cheapest way to check both —
+        // 200 = passkeys available, 404 = none, anything else = hide.
+        (async () => {
+            if (!window.PublicKeyCredential) return;
+            try {
+                const probe = await fetch('/api/auth/passkey/login/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' });
+                if (!probe.ok) return;
+                // We've consumed a challenge here; the browser flow below issues a fresh one.
+                document.getElementById('passkey-section').style.display = '';
+            } catch (e) { /* ignore */ }
+        })();
+
+        // Decode helpers — WebAuthn API speaks ArrayBuffers; the server JSON uses base64url.
+        function b64uToBuf(s) {
+            s = String(s).replace(/-/g, '+').replace(/_/g, '/');
+            const pad = s.length % 4; if (pad) s += '='.repeat(4 - pad);
+            const bin = atob(s);
+            const buf = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+            return buf.buffer;
+        }
+        function bufToB64u(buf) {
+            const bytes = new Uint8Array(buf);
+            let s = ''; for (const b of bytes) s += String.fromCharCode(b);
+            return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        }
+
+        async function passkeyLogin() {
+            const btn = document.getElementById('passkey-btn');
+            const errEl = document.getElementById('passkey-error');
+            errEl.style.display = 'none';
+            btn.disabled = true;
+            const orig = btn.innerHTML;
+            btn.innerHTML = 'Waiting for passkey…';
+            try {
+                const startResp = await fetch('/api/auth/passkey/login/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' });
+                if (!startResp.ok) {
+                    const data = await startResp.json().catch(() => ({}));
+                    throw new Error(data.error || ('Server returned ' + startResp.status));
+                }
+                const { challenge, ceremony_id } = await startResp.json();
+
+                // Convert the challenge JSON's base64url fields into ArrayBuffers
+                // for the WebAuthn API. webauthn-rs delivers `publicKey` as the
+                // outer key in the CTAP-style JSON.
+                const pk = challenge.publicKey || challenge;
+                const opts = { ...pk };
+                opts.challenge = b64uToBuf(opts.challenge);
+                if (Array.isArray(opts.allowCredentials)) {
+                    opts.allowCredentials = opts.allowCredentials.map(c => ({ ...c, id: b64uToBuf(c.id) }));
+                }
+
+                const cred = await navigator.credentials.get({ publicKey: opts, mediation: 'optional' });
+                if (!cred) throw new Error('No credential returned');
+
+                // Marshal credential back into JSON (base64url binary fields)
+                const r = cred.response;
+                const credJson = {
+                    id: cred.id,
+                    rawId: bufToB64u(cred.rawId),
+                    type: cred.type,
+                    response: {
+                        authenticatorData: bufToB64u(r.authenticatorData),
+                        clientDataJSON: bufToB64u(r.clientDataJSON),
+                        signature: bufToB64u(r.signature),
+                        userHandle: r.userHandle ? bufToB64u(r.userHandle) : null,
+                    },
+                    extensions: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {},
+                };
+
+                const finishResp = await fetch('/api/auth/passkey/login/finish', {
+                    method: 'POST',
+                    headers: {'Content-Type':'application/json'},
+                    body: JSON.stringify({ ceremony_id, response: credJson }),
+                });
+                if (!finishResp.ok) {
+                    const data = await finishResp.json().catch(() => ({}));
+                    throw new Error(data.error || ('Server returned ' + finishResp.status));
+                }
+                window.location.href = '/';
+            } catch (err) {
+                errEl.textContent = (err && err.message) || 'Passkey login failed';
+                errEl.style.display = '';
+                btn.disabled = false;
+                btn.innerHTML = orig;
+            }
+        }
 
         function showForgotForm() {
             document.getElementById('login-form').style.display = 'none';
