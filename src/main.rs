@@ -482,6 +482,16 @@ async fn main() -> std::io::Result<()> {
             });
         }
 
+        // Background dnsmasq watchdog. Re-applies any LAN whose dnsmasq
+        // crashed / was killed / never bound :53 to router_ip. Per-LAN
+        // circuit breaker stops loops on permanently broken configs.
+        // First tick is ~90s after spawn so the startup apply above has
+        // settled.
+        crate::networking::router::spawn_dnsmasq_watchdog(
+            app_state.router.clone(),
+            node_id.clone(),
+        );
+
         // WolfAgents: one-shot migration for pre-v18.6.1 agents that
         // were created with an empty allowed_tools list. Runs before
         // the API starts serving so the first agent chat after upgrade

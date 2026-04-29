@@ -31,6 +31,7 @@ pub mod api;
 pub mod wan;
 pub mod host_dns;
 pub mod proxy;
+pub mod health;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -452,6 +453,44 @@ pub struct RouterState {
     /// Per-node topology snapshots populated by the agent tick. Keyed by
     /// node_id. The local node is computed on demand, not cached here.
     pub remote_topologies: RwLock<HashMap<String, topology::NodeTopology>>,
+    /// Last cluster-wide config-validation report. Populated by
+    /// `validate_local_configs` at startup and on every watchdog tick.
+    /// Surfaced via /api/router/validation so operators see what was
+    /// flagged at the most recent boot/scan.
+    pub last_validation: RwLock<Option<ValidationReport>>,
+}
+
+/// Snapshot of a per-node config-validation pass. One row per
+/// validation finding across LANs/WANs/zones. Stored in RouterState
+/// so the UI can render "what happened at startup" without re-running
+/// the checks every page load.
+#[derive(Debug, Clone, serde::Serialize, Default)]
+pub struct ValidationReport {
+    /// Unix seconds when this report was generated.
+    pub generated_at: u64,
+    /// Node that produced this report (this node).
+    pub node_id: String,
+    /// Total counts derived from `findings` for the UI summary chip.
+    pub ok_count: u32,
+    pub warning_count: u32,
+    pub error_count: u32,
+    /// Per-finding details. Each finding is scoped to a config item
+    /// (LAN id, WAN id, etc.) so the UI can group them.
+    pub findings: Vec<ValidationFinding>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ValidationFinding {
+    /// "lan" | "wan" | "zone" | "subnet_route" | "firewall"
+    pub category: &'static str,
+    /// Identifier of the config item the finding refers to (LAN id,
+    /// WAN id, etc.) — empty when the finding is global to a category.
+    pub item_id: String,
+    /// Display name (LAN name, WAN name) — for the UI chip.
+    pub item_name: String,
+    /// "ok" | "warning" | "error".
+    pub severity: &'static str,
+    pub message: String,
 }
 
 impl RouterState {
@@ -461,6 +500,7 @@ impl RouterState {
             last_applied_rules: RwLock::new(None),
             rollback_deadline: RwLock::new(None),
             remote_topologies: RwLock::new(HashMap::new()),
+            last_validation: RwLock::new(None),
         }
     }
 }
@@ -518,7 +558,7 @@ impl Default for RouterState {
 /// copy-paste fix.
 ///
 /// Returns the list of deleted route lines for logging.
-fn purge_self_loop_defaults() -> Vec<String> {
+pub(super) fn purge_self_loop_defaults() -> Vec<String> {
     use std::process::Command;
 
     let mut removed = Vec::new();
@@ -758,6 +798,295 @@ pub fn apply_on_startup(state: std::sync::Arc<RouterState>, self_node_id: &str) 
     // subnets (e.g. an app running on this box pinging into a remote
     // LAN exposed through another peer).
     sync_subnet_routes_to_wolfnet(&cfg.subnet_routes);
+
+    // Final pass: validate every config item this node owns and stash
+    // the report in router state. The Health tab's "Last validation"
+    // banner reads from this; the watchdog refreshes it every 5 minutes.
+    // Runs unconditionally — a node that "doesn't apply WolfRouter
+    // here" still benefits from having an authoritative "yes, your
+    // configs are sane" snapshot, especially when it's a pure subnet-
+    // route gateway whose only WolfRouter config is the route itself.
+    run_validation_and_store(&state, self_node_id);
+}
+
+/// Walk every config item this node owns and produce a [`ValidationReport`].
+/// Called from `apply_on_startup` (at boot) and from the watchdog (every
+/// 5 minutes). Read-only with respect to user data — never mutates
+/// config; only inspects it against host state.
+///
+/// For LANs: defers to `health::lan_health` so we use the same checks
+/// the per-LAN UI shows. Self-heal side effects (`ip addr add`, log
+/// "bound to actual iface") DO run here — they're the same idempotent
+/// safe fixes we'd do at apply time, and running them at startup means
+/// `interface=br-lan / router_ip on ens1` configs come up healthy on
+/// the very first boot after upgrade instead of waiting for the next
+/// watchdog tick.
+///
+/// For WANs: link state, MASQUERADE rule presence (matches the
+/// preflight checks at GET /api/router/preflight).
+///
+/// For zones: that the assigned interfaces exist on this host.
+///
+/// For firewall rules pinned to this node: that referenced LAN/Zone/VM
+/// endpoints resolve (otherwise the rule no-ops silently in iptables).
+pub fn validate_local_configs(state: &RouterState, self_node_id: &str) -> ValidationReport {
+    let cfg = state.config.read().unwrap().clone();
+    let mut findings: Vec<ValidationFinding> = Vec::new();
+
+    // ── LANs ────────────────────────────────────────────────────────
+    for lan in &cfg.lans {
+        if lan.node_id != self_node_id { continue; }
+        let report = health::lan_health(lan, self_node_id);
+        let mut had_issue = false;
+        for c in &report.checks {
+            if c.ok { continue; }
+            had_issue = true;
+            findings.push(ValidationFinding {
+                category: "lan",
+                item_id: lan.id.clone(),
+                item_name: lan.name.clone(),
+                severity: match c.severity { "error" => "error", "warning" => "warning", _ => "warning" },
+                message: format!("[{}] {}", c.name, c.message),
+            });
+        }
+        if !had_issue {
+            findings.push(ValidationFinding {
+                category: "lan",
+                item_id: lan.id.clone(),
+                item_name: lan.name.clone(),
+                severity: "ok",
+                message: format!(
+                    "All checks pass on '{}'.", lan.interface
+                ),
+            });
+        }
+    }
+
+    // ── WAN connections ─────────────────────────────────────────────
+    for w in &cfg.wan_connections {
+        if w.node_id != self_node_id || !w.enabled { continue; }
+        let iface_status = match &w.mode {
+            wan::WanMode::Pppoe(_) => match wan::pppoe_status(w) {
+                Some((iface, ip)) => Ok(format!("PPPoE up: {} ({})", iface, ip)),
+                None => Err(format!("PPPoE link '{}' on {} is not up — pppd not running.", w.name, w.interface)),
+            },
+            wan::WanMode::Dhcp | wan::WanMode::Static(_) => {
+                let assigned = dhcp::interface_addresses(&w.interface);
+                if assigned.is_empty() {
+                    Err(format!(
+                        "WAN '{}': interface {} has no IPv4 address. Host's DHCP/static config didn't assign one.",
+                        w.name, w.interface
+                    ))
+                } else {
+                    Ok(format!("Link up: {} ({})", w.interface, assigned.join(",")))
+                }
+            }
+        };
+        match iface_status {
+            Ok(msg) => findings.push(ValidationFinding {
+                category: "wan", item_id: w.id.clone(), item_name: w.name.clone(),
+                severity: "ok", message: msg,
+            }),
+            Err(msg) => findings.push(ValidationFinding {
+                category: "wan", item_id: w.id.clone(), item_name: w.name.clone(),
+                severity: "error", message: msg,
+            }),
+        }
+    }
+
+    // ── Zones ───────────────────────────────────────────────────────
+    if let Some(node_zones) = cfg.zones.assignments.get(self_node_id) {
+        for (iface, _zone) in node_zones {
+            let exists = std::path::Path::new(&format!("/sys/class/net/{}", iface)).exists();
+            if !exists {
+                findings.push(ValidationFinding {
+                    category: "zone",
+                    item_id: iface.clone(),
+                    item_name: iface.clone(),
+                    severity: "warning",
+                    message: format!(
+                        "Zone assignment references interface '{}' which doesn't exist on this host. Firewall rules referencing this zone no-op silently.",
+                        iface
+                    ),
+                });
+            }
+        }
+    }
+
+    // ── Firewall rules ──────────────────────────────────────────────
+    // Cheap parse: only flag rules pinned to this node whose endpoints
+    // can't resolve. Compiled rule output already includes a `# skipped`
+    // comment in those cases, but operators rarely look at iptables-save
+    // output — surfacing it here means they see the issue at boot.
+    for rule in cfg.rules.iter().filter(|r|
+        r.enabled && r.node_id.as_deref() == Some(self_node_id)
+    ) {
+        for (label, ep) in [("from", &rule.from), ("to", &rule.to)] {
+            match ep {
+                Endpoint::Lan { id } => {
+                    if !cfg.lans.iter().any(|l| &l.id == id) {
+                        findings.push(ValidationFinding {
+                            category: "firewall",
+                            item_id: rule.id.clone(),
+                            item_name: rule.comment.clone(),
+                            severity: "warning",
+                            message: format!(
+                                "Firewall rule '{}' references LAN id '{}' on its `{}` endpoint, but no such LAN exists. Rule no-ops.",
+                                rule.id, id, label
+                            ),
+                        });
+                    }
+                }
+                Endpoint::Interface { name } => {
+                    if !std::path::Path::new(&format!("/sys/class/net/{}", name)).exists() {
+                        findings.push(ValidationFinding {
+                            category: "firewall",
+                            item_id: rule.id.clone(),
+                            item_name: rule.comment.clone(),
+                            severity: "warning",
+                            message: format!(
+                                "Firewall rule '{}' references interface '{}' on its `{}` endpoint, but no such interface exists on this host.",
+                                rule.id, name, label
+                            ),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut ok_count = 0u32;
+    let mut warning_count = 0u32;
+    let mut error_count = 0u32;
+    for f in &findings {
+        match f.severity {
+            "ok" => ok_count += 1,
+            "warning" => warning_count += 1,
+            "error" => error_count += 1,
+            _ => {}
+        }
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    ValidationReport {
+        generated_at: now,
+        node_id: self_node_id.to_string(),
+        ok_count, warning_count, error_count,
+        findings,
+    }
+}
+
+/// Run validation, store the result in router state, and log a summary
+/// line. Idempotent — safe to call from startup and from the watchdog.
+pub fn run_validation_and_store(state: &RouterState, self_node_id: &str) {
+    let report = validate_local_configs(state, self_node_id);
+    if report.error_count > 0 || report.warning_count > 0 {
+        tracing::warn!(
+            "WolfRouter validation: {} ok / {} warnings / {} errors across this node's configs",
+            report.ok_count, report.warning_count, report.error_count
+        );
+        for f in &report.findings {
+            if f.severity == "error" {
+                tracing::error!(
+                    "WolfRouter validation [{}/{}]: {}",
+                    f.category, f.item_name, f.message
+                );
+            } else if f.severity == "warning" {
+                tracing::warn!(
+                    "WolfRouter validation [{}/{}]: {}",
+                    f.category, f.item_name, f.message
+                );
+            }
+        }
+    } else {
+        tracing::info!(
+            "WolfRouter validation: all {} config item(s) on this node look healthy",
+            report.ok_count
+        );
+    }
+    *state.last_validation.write().unwrap() = Some(report);
+}
+
+/// Background dnsmasq watchdog. Every 60s, walks the LANs owned by this
+/// node and re-applies any whose dnsmasq isn't running OR whose DNS port
+/// isn't bound to router_ip. Per-LAN circuit breaker (see health::Breaker)
+/// stops us looping on a permanently broken LAN.
+///
+/// Why this exists: WolfRouter dnsmasq is spawned by `dhcp::start` as a
+/// detached daemon — there's no systemd unit to auto-restart it. Before
+/// this watchdog, any silent crash of the per-LAN dnsmasq (kernel OOM,
+/// iface flap that confuses bind-interfaces, an admin's `pkill dnsmasq`)
+/// left the LAN with no DHCP/DNS until the next manual save-and-apply.
+/// PapaSchlumpf's "DHCP works on Wednesday, broken on Friday" reports
+/// were almost certainly a flavour of this.
+pub fn spawn_dnsmasq_watchdog(state: std::sync::Arc<RouterState>, self_node_id: String) {
+    std::thread::spawn(move || {
+        // Stagger first tick: let apply_on_startup finish so we don't
+        // race it on a fresh boot. 90s = first tick well after the
+        // 3s-delayed startup apply has had a chance to settle.
+        std::thread::sleep(std::time::Duration::from_secs(90));
+        let mut tick: u64 = 0;
+        loop {
+            let lans: Vec<LanSegment> = {
+                let cfg = state.config.read().unwrap();
+                cfg.lans.iter()
+                    .filter(|l| l.node_id == self_node_id)
+                    .cloned()
+                    .collect()
+            };
+            for lan in &lans {
+                // Cheap probe: if both the process is alive AND :listen_port
+                // is bound to router_ip, do nothing. The bind check uses
+                // the same `ss -ulnp` parser the health endpoint uses.
+                let healthy = health::dnsmasq_is_serving(lan);
+                if healthy {
+                    health::breaker_record_success(&lan.id);
+                    continue;
+                }
+                if !health::breaker_allow_attempt(&lan.id) {
+                    // Open breaker: skip until cooldown expires. The
+                    // health panel surfaces the open state so the
+                    // operator knows we've given up trying.
+                    continue;
+                }
+                tracing::warn!(
+                    "WolfRouter watchdog: LAN '{}' dnsmasq isn't serving — restarting.",
+                    lan.name
+                );
+                match dhcp::start(lan) {
+                    Ok(_) => {
+                        health::breaker_record_success(&lan.id);
+                        tracing::info!(
+                            "WolfRouter watchdog: LAN '{}' dnsmasq restarted.",
+                            lan.name
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "WolfRouter watchdog: LAN '{}' restart failed: {}",
+                            lan.name, e
+                        );
+                        health::breaker_record_failure(&lan.id, &e);
+                    }
+                }
+            }
+            // Every 5th tick (~5 min) re-run the full config validation
+            // pass and refresh `state.last_validation`. The cluster-wide
+            // health endpoint reads this so operators see "configs are
+            // still sane" / "this node has drifted" without each page
+            // load triggering its own scan.
+            tick = tick.wrapping_add(1);
+            if tick % 5 == 0 {
+                run_validation_and_store(&state, &self_node_id);
+            }
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    });
 }
 
 /// Background safe-mode tick — checks whether the rollback deadline has

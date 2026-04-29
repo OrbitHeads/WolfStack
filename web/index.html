@@ -6468,6 +6468,7 @@
                         <button class="wr-tab active" data-tab="firewall" onclick="wrSelectTab('firewall')">🔥 Firewall</button>
                         <button class="wr-tab" data-tab="lans" onclick="wrSelectTab('lans')">🌐 DHCP / LANs</button>
                         <button class="wr-tab" data-tab="leases" onclick="wrSelectTab('leases')">📡 DHCP Leases</button>
+                        <button class="wr-tab" data-tab="health" onclick="wrSelectTab('health')">🩺 LAN Health</button>
                         <button class="wr-tab" data-tab="zones" onclick="wrSelectTab('zones')">🎯 Zones</button>
                         <button class="wr-tab" data-tab="policy" onclick="wrSelectTab('policy')">🕸 Policy map</button>
                         <button class="wr-tab" data-tab="wan" onclick="wrSelectTab('wan')">🌍 WAN / PPPoE</button>
@@ -6550,6 +6551,16 @@
                     <div id="wr-tab-leases" class="wr-tab-panel" style="padding:16px; display:none;">
                         <div style="font-size:12px; color:var(--text-muted); margin-bottom:12px;">Live DHCP leases across every LAN. Refreshed every 10s.</div>
                         <div id="wr-leases-container"></div>
+                    </div>
+
+                    <div id="wr-tab-health" class="wr-tab-panel" style="padding:16px; display:none;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:12px; flex-wrap:wrap;">
+                            <div style="font-size:12px; color:var(--text-muted); max-width:680px;">
+                                Live runtime health for every LAN — interface state, dnsmasq process, DNS port binding, plus a real UDP DNS probe. Catches the silent "DHCP works but clients can't resolve" trap. Refreshed every 10s while this tab is open.
+                            </div>
+                            <button class="btn btn-sm" onclick="wrRenderLanHealth()" title="Refresh now">↻ Refresh</button>
+                        </div>
+                        <div id="wr-health-container"></div>
                     </div>
 
                     <div id="wr-tab-zones" class="wr-tab-panel" style="padding:16px; display:none;">

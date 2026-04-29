@@ -35,8 +35,11 @@ fn ensure_dirs() -> Result<(), String> {
     Ok(())
 }
 
-/// Write the dnsmasq config for one LAN. Returns the path written.
-pub fn render_config(lan: &LanSegment) -> Result<String, String> {
+/// Write the dnsmasq config for one LAN using an explicit bind interface.
+/// `bind_iface` may differ from `lan.interface` when apply-time self-heal
+/// resolves a mismatch (router_ip is on a different iface than configured).
+/// Returns the path written.
+pub fn render_config_for_iface(lan: &LanSegment, bind_iface: &str) -> Result<String, String> {
     ensure_dirs()?;
     let path = format!("{}/lan-{}.conf", DNSMASQ_DIR, lan.id);
 
@@ -46,9 +49,16 @@ pub fn render_config(lan: &LanSegment) -> Result<String, String> {
         "# WolfRouter LAN: {} ({})\n# Managed by WolfStack — do not edit by hand.\n",
         lan.name, lan.id
     ));
+    if bind_iface != lan.interface {
+        cfg.push_str(&format!(
+            "# Self-heal active: configured interface is '{}', \
+             but router_ip {} is on '{}', so dnsmasq is bound to '{}'.\n",
+            lan.interface, lan.router_ip, bind_iface, bind_iface
+        ));
+    }
 
     // Strict interface binding: only listen on the LAN's interface.
-    cfg.push_str(&format!("interface={}\n", lan.interface));
+    cfg.push_str(&format!("interface={}\n", bind_iface));
     cfg.push_str("bind-interfaces\n");
     cfg.push_str("except-interface=lo\n");
 
@@ -167,17 +177,177 @@ pub fn render_config(lan: &LanSegment) -> Result<String, String> {
     Ok(path)
 }
 
-/// Start (or restart) the dnsmasq instance for a LAN.
-pub fn start(lan: &LanSegment) -> Result<(), String> {
-    // Pre-flight: verify the LAN's interface is in a state where dnsmasq
-    // can actually be useful. Without this, dnsmasq starts cleanly even
-    // when the interface is missing or has no IP — `bind-interfaces` just
-    // gives it no socket and the user gets the silent "no DHCP, no DNS"
-    // failure that's a nightmare to diagnose.
-    preflight_lan_interface(lan)?;
+/// Outcome of the apply-time interface resolution. The watchdog and health
+/// panel use this to surface "we silently fixed something for you" so the
+/// operator can persist the fix in their saved config.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ApplyResolution {
+    /// LAN's configured interface carries router_ip — nothing to fix.
+    Healthy { iface: String },
+    /// router_ip is on a different interface than configured. dnsmasq is
+    /// bound to the actual carrier; saved config still says `configured`.
+    /// Operator should either move the IP, or update the saved config —
+    /// the UI exposes both as one-click actions.
+    BoundToActualInterface { configured: String, actual: String },
+    /// Configured interface exists but didn't carry router_ip (and no
+    /// other interface did either). We assigned router_ip live with
+    /// `ip addr add`. Not persisted to /etc/network/interfaces or
+    /// netplan — operator should persist if they want it across reboots
+    /// without the watchdog re-applying every tick.
+    AssignedRouterIp { iface: String },
+}
 
-    // First render fresh config.
-    let cfg_path = render_config(lan)?;
+impl ApplyResolution {
+    pub fn iface(&self) -> &str {
+        match self {
+            ApplyResolution::Healthy { iface } => iface,
+            ApplyResolution::BoundToActualInterface { actual, .. } => actual,
+            ApplyResolution::AssignedRouterIp { iface } => iface,
+        }
+    }
+}
+
+/// Decide which interface dnsmasq should bind for this LAN, performing
+/// safe live fixes when host state and saved config disagree:
+///   • configured iface ✓ + router_ip on it ✓                  → Healthy
+///   • configured iface ✓ + router_ip on a *different* iface  → BoundToActualInterface
+///   • configured iface ✓ + router_ip on no iface              → ip addr add → AssignedRouterIp
+///   • configured iface ✗ + router_ip on a different iface    → BoundToActualInterface
+///   • configured iface ✗ + router_ip on no iface              → Err
+///
+/// Used by both the live `start()` path and the UI's read-only health
+/// probe. Every "self-heal" branch only runs when the current state is
+/// already broken — working LANs always fall into Healthy.
+pub fn resolve_apply_interface(lan: &LanSegment) -> Result<ApplyResolution, String> {
+    let configured = lan.interface.clone();
+    let configured_exists = std::path::Path::new(
+        &format!("/sys/class/net/{}", configured)
+    ).exists();
+
+    // Find ANY interface (not just the configured one) currently carrying
+    // router_ip. The PapaSchlumpf case: router_ip was a secondary on ens1
+    // while the saved LAN config said `br-lan`.
+    let actual_carrier = find_interface_with_ip(&lan.router_ip);
+
+    if configured_exists {
+        // Bring the configured iface up if it's down — the watchdog hits
+        // this on every tick after a reboot if the bridge starts down.
+        if !is_interface_up(&configured) {
+            let _ = Command::new("ip").args(["link", "set", &configured, "up"]).output();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            if !is_interface_up(&configured) {
+                return Err(format!(
+                    "LAN '{}' interface '{}' is DOWN. Tried `ip link set {} up` but it didn't come up. \
+                     If '{}' is a bridge, it likely has no slave interfaces — add at least one with \
+                     `ip link set <slave> master {}` and `ip link set <slave> up`. \
+                     If it's a physical NIC, check the cable/driver.",
+                    lan.name, configured, configured, configured, configured
+                ));
+            }
+            info!("WolfRouter: brought interface '{}' up for LAN '{}'", configured, lan.name);
+        }
+
+        let configured_addrs = interface_addresses(&configured);
+        if configured_addrs.iter().any(|ip| ip == &lan.router_ip) {
+            return Ok(ApplyResolution::Healthy { iface: configured });
+        }
+
+        // Configured iface up but router_ip not on it.
+        if let Some(other) = actual_carrier {
+            // router_ip lives on a different interface — bind there.
+            // Don't rewrite the saved config: the operator may have
+            // INTENDED `configured` and just hasn't moved the IP yet.
+            // The health panel surfaces this with a one-click "use
+            // <other> as the saved interface" action.
+            tracing::warn!(
+                "WolfRouter LAN '{}': router_ip {} is on '{}', not configured iface '{}'. \
+                 Binding dnsmasq to '{}' for this apply.",
+                lan.name, lan.router_ip, other, configured, other
+            );
+            return Ok(ApplyResolution::BoundToActualInterface {
+                configured, actual: other,
+            });
+        }
+
+        // No interface carries router_ip. Add it to the configured iface.
+        let prefix = lan.subnet_cidr.split('/').nth(1).unwrap_or("24");
+        let cidr = format!("{}/{}", lan.router_ip, prefix);
+        let out = Command::new("ip")
+            .args(["addr", "add", &cidr, "dev", &configured])
+            .output()
+            .map_err(|e| format!("ip addr add: {}", e))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // "File exists" is a benign race — kernel got there first.
+            if !stderr.contains("File exists") {
+                return Err(format!(
+                    "Tried to assign LAN '{}' router_ip {} to '{}' (so dnsmasq can bind), \
+                     but `ip addr add {} dev {}` failed: {}. \
+                     If you intended router_ip on a different interface, edit the LAN.",
+                    lan.name, lan.router_ip, configured, cidr, configured, stderr.trim()
+                ));
+            }
+        }
+        tracing::warn!(
+            "WolfRouter LAN '{}': assigned router_ip {} to '{}' live (was on no interface). \
+             Persist via your distro's network config if you want this across reboots.",
+            lan.name, cidr, configured
+        );
+        return Ok(ApplyResolution::AssignedRouterIp { iface: configured });
+    }
+
+    // Configured iface doesn't exist on this host at all.
+    if let Some(other) = actual_carrier {
+        // router_ip is on SOME iface — bind there, surface the mismatch.
+        tracing::warn!(
+            "WolfRouter LAN '{}': configured iface '{}' doesn't exist; \
+             router_ip {} is on '{}', binding there.",
+            lan.name, configured, lan.router_ip, other
+        );
+        return Ok(ApplyResolution::BoundToActualInterface {
+            configured, actual: other,
+        });
+    }
+    let available = list_host_interfaces();
+    Err(format!(
+        "LAN '{}' interface '{}' doesn't exist on this host, and router_ip {} \
+         isn't assigned to any interface either. Available interfaces: {}. \
+         Either create the bridge first, change the LAN's interface, or \
+         assign {} to an existing interface.",
+        lan.name, configured, lan.router_ip,
+        if available.is_empty() { "(none)".to_string() } else { available.join(", ") },
+        lan.router_ip
+    ))
+}
+
+/// Find the (first) interface carrying the given IPv4 address, or None
+/// when no interface has it. Walks `/sys/class/net` and asks `ip addr`
+/// per interface — same shape the rest of dhcp.rs uses.
+fn find_interface_with_ip(target_ip: &str) -> Option<String> {
+    for iface in list_host_interfaces() {
+        if interface_addresses(&iface).iter().any(|ip| ip == target_ip) {
+            return Some(iface);
+        }
+    }
+    None
+}
+
+/// Start (or restart) the dnsmasq instance for a LAN. Returns the
+/// apply-time resolution outcome so the caller (watchdog, save-and-apply
+/// path) can surface "we silently fixed X" to the operator.
+pub fn start(lan: &LanSegment) -> Result<ApplyResolution, String> {
+    // Resolve which interface to bind. Self-healing: when router_ip is
+    // on a different iface than configured, we bind to the actual one;
+    // when no iface carries router_ip but the configured iface exists,
+    // we add router_ip to it live. Hard-fails only when no iface exists
+    // at all — there's no safe auto-fix for that.
+    let resolution = resolve_apply_interface(lan)?;
+    let bind_iface = resolution.iface().to_string();
+
+    // Render config using the resolved interface (not lan.interface
+    // directly — the two differ when self-heal kicked in).
+    let cfg_path = render_config_for_iface(lan, &bind_iface)?;
 
     // If there's an existing instance, kill it gracefully first. Our pid
     // files are per-LAN so we don't affect anyone else's dnsmasq.
@@ -208,85 +378,14 @@ pub fn start(lan: &LanSegment) -> Result<(), String> {
             lan.name, stderr.trim()
         ));
     }
-    info!("WolfRouter: dnsmasq started for LAN {} on {}", lan.name, lan.interface);
-    Ok(())
-}
-
-/// Pre-flight: confirm the LAN's interface exists, is up, and has the
-/// configured router_ip assigned. Tries to bring the interface up if it
-/// finds it down — once. If anything's still wrong, returns a descriptive
-/// error explaining EXACTLY what to fix, rather than letting dnsmasq
-/// silently start with no socket.
-fn preflight_lan_interface(lan: &LanSegment) -> Result<(), String> {
-    let iface = &lan.interface;
-
-    // 1. Interface exists in /sys/class/net?
-    let sys_path = format!("/sys/class/net/{}", iface);
-    if !std::path::Path::new(&sys_path).exists() {
-        let available = list_host_interfaces();
-        return Err(format!(
-            "LAN '{}' is configured for interface '{}', but no such interface exists on this host. \
-             Available interfaces: {}. \
-             Either create the bridge first, or change the LAN's interface setting in WolfRouter.",
-            lan.name, iface,
-            if available.is_empty() { "(none)".to_string() } else { available.join(", ") }
-        ));
-    }
-
-    // 2. Operstate. If down, try once to bring it up — common case is the
-    // user has just configured the bridge and forgotten to flip it up.
-    if !is_interface_up(iface) {
-        let _ = Command::new("ip").args(["link", "set", iface, "up"]).output();
-        // Brief pause: link state transitions aren't synchronous,
-        // particularly for bridges that need to walk their slave list.
-        std::thread::sleep(std::time::Duration::from_millis(400));
-        if !is_interface_up(iface) {
-            return Err(format!(
-                "LAN '{}' interface '{}' is DOWN. Tried `ip link set {} up` but it didn't come up. \
-                 If '{}' is a bridge, it likely has no slave interfaces — add at least one with \
-                 `ip link set <slave> master {}` and `ip link set <slave> up`. \
-                 If it's a physical NIC, check the cable/driver.",
-                lan.name, iface, iface, iface, iface
-            ));
-        }
-        info!("WolfRouter: brought interface '{}' up for LAN '{}'", iface, lan.name);
-    }
-
-    // 3. IP assignment. dnsmasq's `bind-interfaces` will refuse to listen
-    // if there's no IPv4 on the interface; same applies if the only IP
-    // doesn't match the configured router_ip (clients would DHCP-request
-    // an answer from a gateway IP that doesn't exist on the local
-    // segment).
-    let assigned = interface_addresses(iface);
-    if !assigned.iter().any(|ip| ip == &lan.router_ip) {
-        let prefix = lan.subnet_cidr.split('/').nth(1).unwrap_or("24");
-        if assigned.is_empty() {
-            return Err(format!(
-                "LAN '{}' interface '{}' is up but has no IPv4 address. \
-                 The LAN's router_ip is set to '{}' — assign it with: \
-                 `ip addr add {}/{} dev {}` (and persist via your distro's network config).",
-                lan.name, iface, lan.router_ip, lan.router_ip, prefix, iface
-            ));
-        }
-        return Err(format!(
-            "LAN '{}' interface '{}' has IPv4 address(es) [{}], but the LAN's router_ip is set to '{}' — \
-             clients DHCP'd into '{}' would have a gateway that isn't on this segment. \
-             Either assign {} to {} (`ip addr add {}/{} dev {}`), or change the LAN's router_ip to one of the existing addresses.",
-            lan.name, iface,
-            assigned.join(", "),
-            lan.router_ip, lan.router_ip,
-            lan.router_ip, iface,
-            lan.router_ip, prefix, iface
-        ));
-    }
-
-    Ok(())
+    info!("WolfRouter: dnsmasq started for LAN {} on {}", lan.name, bind_iface);
+    Ok(resolution)
 }
 
 /// List all non-loopback interfaces visible to the kernel. Used to give
 /// the admin a useful "did you mean…" hint when their LAN config points
 /// at a bridge that doesn't exist.
-fn list_host_interfaces() -> Vec<String> {
+pub(super) fn list_host_interfaces() -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
         for entry in entries.flatten() {
@@ -307,7 +406,7 @@ fn list_host_interfaces() -> Vec<String> {
 ///   up; tap/tun devices likewise. dnsmasq can still bind to them.
 /// - "down" / "lowerlayerdown": dnsmasq's bind-interfaces will silently
 ///   produce no socket. Refuse and surface the diagnostic.
-fn is_interface_up(iface: &str) -> bool {
+pub(super) fn is_interface_up(iface: &str) -> bool {
     let path = format!("/sys/class/net/{}/operstate", iface);
     std::fs::read_to_string(&path)
         .map(|s| {
@@ -321,7 +420,7 @@ fn is_interface_up(iface: &str) -> bool {
 /// host part, not CIDR). Empty Vec if `ip` isn't on PATH or the interface
 /// has nothing — the caller distinguishes those cases via the existence
 /// check that ran upstream.
-fn interface_addresses(iface: &str) -> Vec<String> {
+pub(super) fn interface_addresses(iface: &str) -> Vec<String> {
     let out = match Command::new("ip").args(["-o", "-4", "addr", "show", "dev", iface]).output() {
         Ok(o) if o.status.success() => o,
         _ => return vec![],
@@ -468,8 +567,27 @@ fn prefix_to_netmask(prefix: u32) -> String {
 pub fn start_all_for_node(config: &RouterConfig, self_node_id: &str) {
     for lan in &config.lans {
         if lan.node_id != self_node_id { continue; }
-        if let Err(e) = start(lan) {
-            warn!("Failed to start LAN '{}': {}", lan.name, e);
+        match start(lan) {
+            Ok(ApplyResolution::Healthy { .. }) => {}
+            Ok(ApplyResolution::BoundToActualInterface { configured, actual }) => {
+                warn!(
+                    "WolfRouter LAN '{}': self-healed at apply — configured iface '{}' \
+                     doesn't carry router_ip {}, bound dnsmasq to '{}'. \
+                     Update the LAN's saved interface to '{}' from the UI to make this stick.",
+                    lan.name, configured, lan.router_ip, actual, actual
+                );
+            }
+            Ok(ApplyResolution::AssignedRouterIp { iface }) => {
+                warn!(
+                    "WolfRouter LAN '{}': self-healed at apply — added router_ip {} to '{}' live \
+                     (no interface carried it). Persist via your distro's network config to \
+                     survive reboots without watchdog re-applying.",
+                    lan.name, lan.router_ip, iface
+                );
+            }
+            Err(e) => {
+                warn!("Failed to start LAN '{}': {}", lan.name, e);
+            }
         }
     }
 }

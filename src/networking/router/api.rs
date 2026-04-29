@@ -258,6 +258,68 @@ async fn proxy_router_get_to_node(
         .body(format!("all upstream URLs failed, last error: {}", last_err))
 }
 
+/// Sibling of `proxy_router_get_to_node` for POST routes. Used by the
+/// LAN Health one-click actions (`restart-dnsmasq`, `set-interface`)
+/// when the target LAN is owned by a remote node — the operator
+/// triggered the action from any cluster node, but the actual side
+/// effect (`dhcp::start`, write to `/etc/wolfstack/router.json`) only
+/// makes sense on the owner.
+///
+/// Same URL fallback ladder as the GET variant. Body is JSON-encoded.
+async fn proxy_router_post_to_node(
+    state: S,
+    node_id: &str,
+    api_path: &str,
+    body: serde_json::Value,
+) -> HttpResponse {
+    let node = match state.cluster.get_node(node_id) {
+        Some(n) => n,
+        None => return HttpResponse::NotFound().body(format!("node {} not found", node_id)),
+    };
+    if node.is_self {
+        return HttpResponse::BadRequest().body("refusing to proxy to self");
+    }
+    let internal_port = node.port + 1;
+    let host = resolve_node_address(&node.address);
+    let urls = [
+        format!("https://{}:{}/api/{}", host, node.port, api_path),
+        format!("http://{}:{}/api/{}", host, internal_port, api_path),
+        format!("http://{}:{}/api/{}", host, node.port, api_path),
+    ];
+    let client = &*ROUTER_RPC_CLIENT;
+    let mut last_err = String::new();
+    for url in &urls {
+        let res = client.post(url)
+            .header("X-WolfStack-Secret", &state.cluster_secret)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(30))
+            .send().await;
+        match res {
+            Ok(r) => {
+                let status = r.status();
+                let actix_status = actix_web::http::StatusCode::from_u16(status.as_u16())
+                    .unwrap_or(actix_web::http::StatusCode::BAD_GATEWAY);
+                let content_type = r.headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("application/json")
+                    .to_string();
+                match r.bytes().await {
+                    Ok(body) => {
+                        return HttpResponse::build(actix_status)
+                            .insert_header(("content-type", content_type))
+                            .body(body);
+                    }
+                    Err(e) => { last_err = format!("read body: {}", e); continue; }
+                }
+            }
+            Err(e) => { last_err = format!("{} → {}", url, e); continue; }
+        }
+    }
+    HttpResponse::BadGateway()
+        .body(format!("all upstream URLs failed, last error: {}", last_err))
+}
+
 /// Minimal query-param encoder — only escapes the handful of bytes that
 /// actually break a URL. Sufficient for passing through `?lines=N`
 /// style values we control on both ends.
@@ -942,6 +1004,29 @@ struct PreflightCheck {
     fix: Option<String>,
 }
 
+/// One-click Fix action returned alongside the checks list, keyed by
+/// check id. The UI looks each row up by `c.id`; if there's a matching
+/// entry it renders a "Fix" button that POSTs to `url`. Only safe
+/// actions get attached — anything that could lock the operator out
+/// (UDP/53 host-firewall edits on the management interface, etc.)
+/// stays instructions-only.
+#[derive(serde::Serialize, Clone)]
+pub struct PreflightAction {
+    /// Human label shown on the button (e.g. "Enable IP forwarding").
+    pub label: String,
+    /// API path. UI POSTs JSON `{}` (or the `body` field, if present).
+    pub url: String,
+    /// Short tooltip explaining what the action will do.
+    pub detail: String,
+    /// Confirmation text shown in `confirm()` before the POST. Empty
+    /// for trivially safe actions.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub confirm: String,
+    /// Optional JSON body to POST. Default is `{}`.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub body: serde_json::Value,
+}
+
 pub async fn preflight(
     req: HttpRequest,
     state: S,
@@ -950,6 +1035,8 @@ pub async fn preflight(
     auth_or_return!(req, state);
 
     let mut checks: Vec<PreflightCheck> = Vec::new();
+    let mut actions: std::collections::HashMap<&'static str, PreflightAction>
+        = std::collections::HashMap::new();
 
     // 1) /etc/hosts — needed for hostname resolution on most distros.
     // Allow for hosts files without an explicit entry for the local
@@ -1318,8 +1405,17 @@ pub async fn preflight(
             name: "IPv4 forwarding",
             ok: false,
             severity: "warning",
-            message: "net.ipv4.ip_forward = 0. Firewall rules and LAN segments won't actually route traffic until this is enabled.".into(),
-            fix: Some("Enable persistently with:\n  echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-wolfrouter.conf\n  sudo sysctl --system".into()),
+            message: "net.ipv4.ip_forward = 0. Firewall rules and LAN segments won't actually route traffic until this is enabled. \
+                      Why it matters: when forwarding is off, the kernel drops every packet whose destination isn't *this* host — including LAN-client traffic to the internet through your WAN. Symptom: clients get DHCP leases, ping the router, but `ping 1.1.1.1` times out. \
+                      Safe to enable everywhere — Proxmox, libvirt, Docker, and LXC bridges all expect `ip_forward=1` themselves; this is the default on any box that routes for anything.".into(),
+            fix: Some("Enable persistently with:\n  echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-wolfrouter.conf\n  sudo sysctl --system\n\nOr click the Fix button — WolfStack writes the same drop-in and reloads sysctl.".into()),
+        });
+        actions.insert("ip_forward", PreflightAction {
+            label: "Enable IP forwarding".into(),
+            url: "/api/router/fix/enable-ip-forward".into(),
+            detail: "Writes net.ipv4.ip_forward=1 to /etc/sysctl.d/99-wolfrouter.conf and reloads sysctl. Idempotent. Proxmox/libvirt/Docker bridges all need this on too — never breaks them.".into(),
+            confirm: String::new(),
+            body: serde_json::Value::Null,
         });
     } else {
         checks.push(PreflightCheck {
@@ -1401,11 +1497,23 @@ pub async fn preflight(
                 ok: false,
                 severity: "error",
                 message: format!(
-                    "No default IPv4 route. PPPoE WAN(s) {} have 'Use as default route' unticked, so pppd writes `nodefaultroute` to the peer file. The router itself has no internet, and LAN clients routed through it get host-unreachable.",
+                    "No default IPv4 route. PPPoE WAN(s) {} have 'Use as default route' unticked, so pppd writes `nodefaultroute` to the peer file. \
+                     Why this kills you: without a default route, the kernel doesn't know where to send packets that aren't on a directly-connected subnet. The router itself can't reach the internet, and every LAN client masqueraded through it gets host-unreachable on anything outside its own LAN.",
                     names
                 ),
-                fix: Some("WolfRouter → WAN connections → edit each PPPoE entry → tick 'Use as default route' (and 'Use ISP DNS' unless you've configured DNS yourself), then Save. WolfRouter rewrites the peer file with `defaultroute replacedefaultroute` and redials.".into()),
+                fix: Some("WolfRouter → WAN connections → edit each PPPoE entry → tick 'Use as default route' (and 'Use ISP DNS' unless you've configured DNS yourself), then Save. WolfRouter rewrites the peer file with `defaultroute replacedefaultroute` and redials.\n\nOr click the Fix button — WolfStack ticks the flag, saves, and redials pppd for you.".into()),
             });
+            // Action targets the FIRST offending PPPoE — multi-PPPoE
+            // setups are rare; the operator can repeat for any others.
+            if let Some(w) = pppoe_no_default.first() {
+                actions.insert("default_route", PreflightAction {
+                    label: "Tick 'Use as default route' & redial".into(),
+                    url: format!("/api/router/fix/wan/{}/tick-pppoe-default-route", w.id),
+                    detail: "Sets use_default_route=true on this PPPoE WAN, saves, and redials pppd so the peer-file change takes effect.".into(),
+                    confirm: "Redial PPPoE? You'll lose the WAN link for ~5–10s while pppd reconnects.".into(),
+                    body: serde_json::Value::Null,
+                });
+            }
         } else {
             checks.push(PreflightCheck {
                 id: "default_route",
@@ -1506,9 +1614,16 @@ pub async fn preflight(
                     self_loops.len(), bad, context
                 ),
                 fix: Some(format!(
-                    "Remove the self-loop route(s) live:{}\n\nThen find the persistent source so they don't come back on reboot. Common culprits:\n  • /etc/network/interfaces — a `gateway <local-ip>` line on a LAN-side iface (remove that line, leave `address` alone).\n  • /etc/netplan/*.yaml — a `gateway4:` or static `routes: - to: default` entry pointing at a local IP (remove it, then `sudo netplan apply`).\n  • NetworkManager — `nmcli connection show` and edit/remove the offending profile's gateway.\n\nAfter removal, run `ip route` again — only your WAN's default (DHCP / PPPoE) should remain.",
+                    "Remove the self-loop route(s) live:{}\n\nThen find the persistent source so they don't come back on reboot. Common culprits:\n  • /etc/network/interfaces — a `gateway <local-ip>` line on a LAN-side iface (remove that line, leave `address` alone).\n  • /etc/netplan/*.yaml — a `gateway4:` or static `routes: - to: default` entry pointing at a local IP (remove it, then `sudo netplan apply`).\n  • NetworkManager — `nmcli connection show` and edit/remove the offending profile's gateway.\n\nAfter removal, run `ip route` again — only your WAN's default (DHCP / PPPoE) should remain.\n\nOr click the Fix button — WolfStack deletes them with the same `ip route del` lines.",
                     del_cmds
                 )),
+            });
+            actions.insert("default_route_self_loop", PreflightAction {
+                label: "Delete self-loop route(s)".into(),
+                url: "/api/router/fix/purge-self-loop-routes".into(),
+                detail: "Deletes ONLY routes whose next-hop is a local IP. Such routes can never deliver a packet, so this is bounded — Proxmox/libvirt bridges never use local-IP next-hops, so they're untouched.".into(),
+                confirm: "Delete the self-loop default route(s)? This is safe — these routes can never deliver a packet, so removing them cannot make egress worse. Your WAN's real default route (if any) stays untouched.".into(),
+                body: serde_json::Value::Null,
             });
         }
     }
@@ -1661,14 +1776,42 @@ pub async fn preflight(
                     message: format!("WAN '{}': {}", w.name, msg),
                     fix: None,
                 }),
-                Err((msg, fix)) => checks.push(PreflightCheck {
-                    id: "wan_link",
-                    name: "WAN link state",
-                    ok: false,
-                    severity: "error",
-                    message: msg,
-                    fix: Some(fix),
-                }),
+                Err((msg, fix)) => {
+                    checks.push(PreflightCheck {
+                        id: "wan_link",
+                        name: "WAN link state",
+                        ok: false,
+                        severity: "error",
+                        message: msg,
+                        fix: Some(fix),
+                    });
+                    // For DHCP-mode WANs, offer a one-click "request a
+                    // lease via dhclient" — covers the Starlink boot-
+                    // race trap. For Static, no auto-fix possible
+                    // (operator must supply addresses). For PPPoE,
+                    // the redial endpoint is the right tool.
+                    match &w.mode {
+                        wan::WanMode::Dhcp => {
+                            actions.insert("wan_link", PreflightAction {
+                                label: format!("dhclient {}", w.interface),
+                                url: "/api/router/fix/dhclient".into(),
+                                detail: "Brings the iface up and requests a DHCP lease. Safe — runs the same dhclient(8) the host's own networking would. Doesn't conflict with Proxmox: if Proxmox's networkd already manages this iface, this just renews the existing lease.".into(),
+                                confirm: String::new(),
+                                body: serde_json::json!({ "iface": &w.interface }),
+                            });
+                        }
+                        wan::WanMode::Pppoe(_) => {
+                            actions.insert("wan_link", PreflightAction {
+                                label: "Re-apply WAN (redial)".into(),
+                                url: format!("/api/router/fix/wan/{}/reapply", w.id),
+                                detail: "Re-runs the WAN apply path: rewrites the pppd peer file and redials the link.".into(),
+                                confirm: "Redial PPPoE? You'll lose the WAN link for ~5–10s while pppd reconnects.".into(),
+                                body: serde_json::Value::Null,
+                            });
+                        }
+                        wan::WanMode::Static(_) => {}
+                    }
+                }
             }
         }
 
@@ -1694,13 +1837,21 @@ pub async fn preflight(
                     ok: false,
                     severity: "error",
                     message: format!(
-                        "WAN '{}': no MASQUERADE rule on {}. LAN clients routed through this WAN leave with private source IPs and the upstream drops them.",
+                        "WAN '{}': no MASQUERADE rule on {}. \
+                         Why this matters: without MASQUERADE on the egress iface, packets from your LAN leave with their original private source IP (e.g. 10.10.10.50). The upstream — your ISP / the wider internet — has no route back to that, so it drops the packet. Symptom: clients ping the router fine, ping each other fine, but `ping 1.1.1.1` from a client gets nothing.",
                         w.name, iface
                     ),
                     fix: Some(format!(
-                        "WolfRouter installs this on apply — re-apply the WAN entry from WolfRouter → WAN connections → '{}' → Save. As a one-shot manual fix:\n  iptables -t nat -A POSTROUTING -o {} -j MASQUERADE",
+                        "WolfRouter installs this on apply — re-apply the WAN entry from WolfRouter → WAN connections → '{}' → Save. As a one-shot manual fix:\n  iptables -t nat -A POSTROUTING -o {} -j MASQUERADE\n\nOr click the Fix button — WolfStack re-runs the WAN apply path which re-installs the MASQUERADE rule.",
                         w.name, iface
                     )),
+                });
+                actions.insert("wan_masquerade", PreflightAction {
+                    label: "Re-apply WAN".into(),
+                    url: format!("/api/router/fix/wan/{}/reapply", w.id),
+                    detail: "Re-runs the WAN apply path: re-installs MASQUERADE on the egress iface, rewrites pppd peer file if PPPoE.".into(),
+                    confirm: String::new(),
+                    body: serde_json::Value::Null,
                 });
             }
         }
@@ -1714,6 +1865,7 @@ pub async fn preflight(
         "ok": !has_error,
         "status": status,
         "checks": checks,
+        "actions": actions,
     }))
 }
 
@@ -4486,6 +4638,635 @@ pub async fn diagnostics_subnet_routes(req: HttpRequest, state: S) -> HttpRespon
     }))
 }
 
+// ─── LAN Health ───
+//
+// Per-LAN runtime health for the WolfRouter "Health" tab. Each endpoint
+// is read-only except `restart_dnsmasq` and `set_lan_interface`, which
+// are explicit one-click actions surfaced as `action: "..."` on the
+// health checks themselves. Cross-node calls proxy via the existing
+// `proxy_router_get_to_node`.
+
+/// GET /api/router/segments/{id}/health
+/// Returns a `LanHealth` for one LAN. When the LAN is owned by another
+/// node, proxies the call to the owner so the operator gets the *live*
+/// runtime state, not stale cluster cache.
+pub async fn get_lan_health(
+    req: HttpRequest, state: S, path: web::Path<String>
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let id = path.into_inner();
+    let (lan_opt, owner_id) = {
+        let cfg = state.router.config.read().unwrap();
+        let lan = cfg.lans.iter().find(|l| l.id == id).cloned();
+        let owner = lan.as_ref().map(|l| l.node_id.clone());
+        (lan, owner)
+    };
+    let Some(lan) = lan_opt else {
+        return HttpResponse::NotFound().body("LAN not found");
+    };
+    let self_id = crate::agent::self_node_id();
+    if owner_id.as_deref() != Some(&self_id) {
+        let owner = owner_id.unwrap_or_default();
+        return proxy_router_get_to_node(
+            state, &owner,
+            &format!("router/segments/{}/health", id),
+            "",
+        ).await;
+    }
+    // Local: run health checks on the blocking pool — `ss`, iptables-save
+    // and the UDP probe all do syscalls that shouldn't block the runtime.
+    let lan2 = lan.clone();
+    let report = tokio::task::spawn_blocking(move || {
+        super::health::lan_health(&lan2, &self_id)
+    }).await.unwrap_or_else(|_| super::health::lan_health(&lan, &crate::agent::self_node_id()));
+    HttpResponse::Ok().json(report)
+}
+
+/// GET /api/router/health
+/// Aggregate every LAN's health across the cluster. Used by the Health
+/// tab's overview list.
+pub async fn list_lan_health(req: HttpRequest, state: S) -> HttpResponse {
+    auth_or_return!(req, state);
+    let lans: Vec<LanSegment> = state.router.config.read().unwrap().lans.clone();
+    let self_id = crate::agent::self_node_id();
+    let mut out: Vec<super::health::LanHealth> = Vec::with_capacity(lans.len());
+    for lan in lans {
+        if lan.node_id == self_id {
+            let lan2 = lan.clone();
+            let nid = self_id.clone();
+            let report = tokio::task::spawn_blocking(move || {
+                super::health::lan_health(&lan2, &nid)
+            }).await.unwrap_or_else(|_|
+                super::health::lan_health(&lan, &self_id)
+            );
+            out.push(report);
+        } else {
+            // Stub for remote LANs — the per-LAN endpoint can drill in.
+            out.push(super::health::LanHealth {
+                lan_id: lan.id.clone(),
+                lan_name: lan.name.clone(),
+                node_id: lan.node_id.clone(),
+                status: "remote",
+                checks: vec![],
+                apply_resolution: None,
+                breaker: None,
+            });
+        }
+    }
+    HttpResponse::Ok().json(serde_json::json!({ "lans": out }))
+}
+
+/// POST /api/router/segments/{id}/restart-dnsmasq
+/// One-click "Restart dnsmasq for this LAN". Resets the watchdog circuit
+/// breaker so the next tick gives it another chance, then runs
+/// `dhcp::start` with self-heal. Cross-node proxied to the owner.
+pub async fn restart_lan_dnsmasq(
+    req: HttpRequest, state: S, path: web::Path<String>
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let id = path.into_inner();
+    let (lan_opt, owner_id) = {
+        let cfg = state.router.config.read().unwrap();
+        let lan = cfg.lans.iter().find(|l| l.id == id).cloned();
+        let owner = lan.as_ref().map(|l| l.node_id.clone());
+        (lan, owner)
+    };
+    let Some(lan) = lan_opt else {
+        return HttpResponse::NotFound().body("LAN not found");
+    };
+    let self_id = crate::agent::self_node_id();
+    if owner_id.as_deref() != Some(&self_id) {
+        let owner = owner_id.unwrap_or_default();
+        // Reuse the GET proxy path — the inter-node port accepts POST
+        // through the same `/proxy/{path}` machinery.
+        return proxy_router_post_to_node(
+            state, &owner,
+            &format!("router/segments/{}/restart-dnsmasq", id),
+            serde_json::json!({}),
+        ).await;
+    }
+    super::health::breaker_reset(&lan.id);
+    let lan2 = lan.clone();
+    let result = tokio::task::spawn_blocking(move || dhcp::start(&lan2)).await;
+    match result {
+        Ok(Ok(resolution)) => {
+            super::health::breaker_record_success(&lan.id);
+            HttpResponse::Ok().json(serde_json::json!({
+                "success": true,
+                "resolution": resolution,
+            }))
+        }
+        Ok(Err(e)) => {
+            super::health::breaker_record_failure(&lan.id, &e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "success": false,
+                "error": e,
+            }))
+        }
+        Err(_) => HttpResponse::InternalServerError().body("blocking task panicked"),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SetLanInterfaceRequest {
+    pub interface: String,
+}
+
+/// POST /api/router/segments/{id}/set-interface
+/// One-click "Use the actual interface" from the LAN Health panel —
+/// rewrites the saved LAN config so `interface` matches the iface that
+/// actually carries `router_ip`. Validates the new value the same way
+/// PUT /segments/{id} would, then re-applies dnsmasq.
+pub async fn set_lan_interface(
+    req: HttpRequest, state: S,
+    path: web::Path<String>, body: web::Json<SetLanInterfaceRequest>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let id = path.into_inner();
+    let new_iface = body.interface.trim().to_string();
+    if new_iface.is_empty() {
+        return HttpResponse::BadRequest().body("interface must be non-empty");
+    }
+    // Same character whitelist as validate_segment uses for interfaces:
+    // letters, digits, '.', '-', '_' (Linux netdev names allow these).
+    if !new_iface.chars().all(|c|
+        c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
+    ) {
+        return HttpResponse::BadRequest().body("interface contains invalid characters");
+    }
+
+    let (lan_opt, owner_id) = {
+        let cfg = state.router.config.read().unwrap();
+        let lan = cfg.lans.iter().find(|l| l.id == id).cloned();
+        let owner = lan.as_ref().map(|l| l.node_id.clone());
+        (lan, owner)
+    };
+    let Some(_lan) = lan_opt else {
+        return HttpResponse::NotFound().body("LAN not found");
+    };
+    let self_id = crate::agent::self_node_id();
+    if owner_id.as_deref() != Some(&self_id) {
+        let owner = owner_id.unwrap_or_default();
+        return proxy_router_post_to_node(
+            state, &owner,
+            &format!("router/segments/{}/set-interface", id),
+            serde_json::json!({ "interface": new_iface }),
+        ).await;
+    }
+
+    // Mutate config under the write lock, save, then drop the lock
+    // BEFORE shelling out to dhcp::start. Same pattern as set_query_log.
+    let updated_lan = {
+        let mut cfg = state.router.config.write().unwrap();
+        let seg = match cfg.lans.iter_mut().find(|l| l.id == id) {
+            Some(s) => s,
+            None => return HttpResponse::NotFound().body("LAN not found"),
+        };
+        seg.interface = new_iface;
+        let updated = seg.clone();
+        if let Err(e) = cfg.save() {
+            return HttpResponse::InternalServerError().body(format!("save: {}", e));
+        }
+        updated
+    };
+
+    super::health::breaker_reset(&updated_lan.id);
+    let lan2 = updated_lan.clone();
+    let result = tokio::task::spawn_blocking(move || dhcp::start(&lan2)).await;
+    replicate_config_to_cluster(state.clone());
+    match result {
+        Ok(Ok(resolution)) => HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "resolution": resolution,
+            "lan": updated_lan,
+        })),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "success": false,
+            "error": e,
+        })),
+        Err(_) => HttpResponse::InternalServerError().body("blocking task panicked"),
+    }
+}
+
+// ─── Preflight one-click Fix actions ────────────────────────────────
+//
+// Each handler does exactly ONE narrowly-scoped fix surfaced as a Fix
+// button on a preflight row. Strictly safe — anything that could lock
+// the operator out (host firewall edits on the management interface,
+// say) stays instructions-only.
+
+/// POST /api/router/fix/enable-ip-forward
+/// Persist `net.ipv4.ip_forward=1` to /etc/sysctl.d/99-wolfrouter.conf
+/// and reload sysctl. Idempotent — overwriting the drop-in is the
+/// behaviour we want when a previous run wrote a stale value.
+pub async fn fix_enable_ip_forward(req: HttpRequest, state: S) -> HttpResponse {
+    auth_or_return!(req, state);
+    let res = tokio::task::spawn_blocking(|| {
+        let dropin = "/etc/sysctl.d/99-wolfrouter.conf";
+        let body = "# Written by WolfRouter — required for any LAN/firewall forwarding to work.\n\
+                    net.ipv4.ip_forward=1\n";
+        if let Err(e) = std::fs::write(dropin, body) {
+            return Err(format!("write {}: {}", dropin, e));
+        }
+        // Reload via `sysctl --system` so the change takes effect now,
+        // not just at next reboot. Fallback to a direct write if sysctl
+        // isn't available — most distros have it but containers often
+        // don't ship it.
+        let out = std::process::Command::new("sysctl").arg("--system").output();
+        match out {
+            Ok(o) if o.status.success() => Ok(format!(
+                "Wrote {} and reloaded sysctl. IP forwarding is now ON.",
+                dropin
+            )),
+            _ => {
+                // Direct kernel write — works without sysctl(8).
+                if let Err(e) = std::fs::write("/proc/sys/net/ipv4/ip_forward", "1\n") {
+                    return Err(format!(
+                        "wrote {} but couldn't apply live (`sysctl --system` failed AND direct /proc write failed: {}). \
+                         The change will take effect at next reboot.",
+                        dropin, e
+                    ));
+                }
+                Ok(format!(
+                    "Wrote {} and applied via /proc (sysctl(8) wasn't available). \
+                     IP forwarding is now ON.",
+                    dropin
+                ))
+            }
+        }
+    }).await.unwrap_or_else(|_| Err("blocking task panicked".into()));
+    match res {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "success": true, "message": msg })),
+        Err(e)  => HttpResponse::InternalServerError().json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /api/router/fix/purge-self-loop-routes
+/// Delete every `default via <local-ip>` self-loop route. Same logic
+/// the startup hook uses (`purge_self_loop_defaults`) — deletes ONLY
+/// routes whose next-hop is one of THIS host's own IPs. Such routes
+/// can never deliver a packet, so this can never make egress worse.
+pub async fn fix_purge_self_loop_routes(req: HttpRequest, state: S) -> HttpResponse {
+    auth_or_return!(req, state);
+    let removed = tokio::task::spawn_blocking(|| {
+        super::purge_self_loop_defaults()
+    }).await.unwrap_or_default();
+    if removed.is_empty() {
+        HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "message": "No self-loop default routes found — nothing to remove. \
+                        If preflight still flags this, find the persistent source \
+                        (/etc/network/interfaces, /etc/netplan/*.yaml, \
+                        NetworkManager profile) and remove it from there too.",
+            "removed": removed,
+        }))
+    } else {
+        HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "message": format!(
+                "Removed {} self-loop default route(s) live. \
+                 Edit the persistent source (e.g. `gateway <local-ip>` line in \
+                 /etc/network/interfaces) so they don't come back at next reboot.",
+                removed.len()
+            ),
+            "removed": removed,
+        }))
+    }
+}
+
+#[derive(Deserialize)]
+pub struct DhclientIfaceRequest { pub iface: String }
+
+/// POST /api/router/fix/dhclient
+/// Bring an interface up and request a DHCP lease via dhclient(8).
+/// Used by the WAN-DHCP "interface has no IPv4" preflight row when
+/// the host's own DHCP client never grabbed a lease (Starlink trap,
+/// boot-order race against the dishy bring-up).
+pub async fn fix_dhclient_iface(
+    req: HttpRequest, state: S, body: web::Json<DhclientIfaceRequest>
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let iface = body.iface.trim().to_string();
+    if iface.is_empty() || !iface.chars().all(|c|
+        c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
+    ) {
+        return HttpResponse::BadRequest().body("invalid iface");
+    }
+    let res = tokio::task::spawn_blocking(move || {
+        // Bring it up (idempotent — `set up` on an up iface is a no-op).
+        let _ = std::process::Command::new("ip")
+            .args(["link", "set", &iface, "up"]).output();
+        // dhclient -v writes verbose output to stderr; we propagate
+        // the first error line so the operator sees what happened.
+        let out = std::process::Command::new("dhclient")
+            .args(["-v", "-1", "-nw", &iface])  // -1 = exit if lease can't be obtained
+            .output()
+            .map_err(|e| format!("spawn dhclient: {} (is dhclient installed?)", e))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(format!("dhclient on {} failed: {}", iface, stderr.trim()));
+        }
+        Ok(format!(
+            "Requested a DHCP lease on {}. Re-run preflight in a few seconds — \
+             the iface should now show an IPv4 address.",
+            iface
+        ))
+    }).await.unwrap_or_else(|_| Err("blocking task panicked".into()));
+    match res {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "success": true, "message": msg })),
+        Err(e)  => HttpResponse::InternalServerError().json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /api/router/fix/wan/{id}/reapply
+/// Re-apply a WAN connection — installs MASQUERADE, redials PPPoE if
+/// needed, etc. Same logic the WAN editor's Save button runs.
+pub async fn fix_reapply_wan(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
+    auth_or_return!(req, state);
+    let id = path.into_inner();
+    let conn = {
+        let cfg = state.router.config.read().unwrap();
+        cfg.wan_connections.iter().find(|w| w.id == id).cloned()
+    };
+    let Some(conn) = conn else {
+        return HttpResponse::NotFound().body("WAN connection not found");
+    };
+    if conn.node_id != crate::agent::self_node_id() {
+        // Cross-node: proxy to the owning node so the kernel changes
+        // happen there, not here.
+        return proxy_router_post_to_node(
+            state, &conn.node_id,
+            &format!("router/fix/wan/{}/reapply", id),
+            serde_json::json!({}),
+        ).await;
+    }
+    let res = tokio::task::spawn_blocking(move || wan::apply(&conn)).await;
+    match res {
+        Ok(Ok(())) => HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "message": "WAN re-applied. MASQUERADE rule should be back; PPPoE redialed if applicable.",
+        })),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "success": false, "error": e,
+        })),
+        Err(_) => HttpResponse::InternalServerError().body("blocking task panicked"),
+    }
+}
+
+/// POST /api/router/fix/wan/{id}/tick-pppoe-default-route
+/// Set `use_default_route=true` on a PPPoE WAN, save, redial. The
+/// preflight row that asks for this exists because pppd writes
+/// `nodefaultroute` to the peer file when the flag is off — clearing
+/// it requires a redial.
+pub async fn fix_tick_pppoe_default_route(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
+    auth_or_return!(req, state);
+    let id = path.into_inner();
+    let updated = {
+        let mut cfg = state.router.config.write().unwrap();
+        let Some(conn) = cfg.wan_connections.iter_mut().find(|w| w.id == id) else {
+            return HttpResponse::NotFound().body("WAN connection not found");
+        };
+        let owner = conn.node_id.clone();
+        if owner != crate::agent::self_node_id() {
+            // Drop the lock before the proxy so we don't hold it across .await.
+            drop(cfg);
+            return proxy_router_post_to_node(
+                state, &owner,
+                &format!("router/fix/wan/{}/tick-pppoe-default-route", id),
+                serde_json::json!({}),
+            ).await;
+        }
+        match &mut conn.mode {
+            wan::WanMode::Pppoe(p) => { p.use_default_route = true; }
+            _ => return HttpResponse::BadRequest().body("WAN is not PPPoE — flag doesn't apply"),
+        }
+        let updated = conn.clone();
+        if let Err(e) = cfg.save() {
+            return HttpResponse::InternalServerError().body(format!("save: {}", e));
+        }
+        updated
+    };
+    let res = tokio::task::spawn_blocking(move || wan::apply(&updated)).await;
+    replicate_config_to_cluster(state.clone());
+    match res {
+        Ok(Ok(())) => HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "message": "Ticked 'use_default_route' on the PPPoE WAN, saved, and redialed. \
+                        pppd should now install a default route.",
+        })),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "success": false, "error": e,
+        })),
+        Err(_) => HttpResponse::InternalServerError().body("blocking task panicked"),
+    }
+}
+
+/// GET /api/router/preflight-cluster
+/// Fan out to every WolfStack node in the cluster, ask each one for
+/// its /api/router/preflight, and aggregate. The "is every node where
+/// WolfRouter runs healthy?" view. Same fan-out shape as
+/// `get_cluster_validation`. Each peer's preflight already includes
+/// the per-row Fix actions; the UI just renders all of them.
+pub async fn get_cluster_preflight(req: HttpRequest, state: S) -> HttpResponse {
+    auth_or_return!(req, state);
+    let nodes = state.cluster.get_all_nodes();
+    let client = &*ROUTER_RPC_CLIENT;
+    let mut peer_futs = Vec::new();
+    let mut local_row: Option<serde_json::Value> = None;
+
+    // Local first — direct call into preflight() would need refactoring
+    // its current signature, so we just hit our own HTTP endpoint to
+    // keep one code path. 4s timeout against ourselves should never
+    // miss.
+    let self_id = crate::agent::self_node_id();
+    let self_node = nodes.iter().find(|n| n.is_self).cloned();
+    if let Some(sn) = self_node {
+        let host = resolve_node_address(&sn.address);
+        let url = format!("http://127.0.0.1:{}/api/router/preflight", sn.port + 1);
+        let secret = state.cluster_secret.clone();
+        let res = client.get(&url)
+            .header("X-WolfStack-Secret", &secret)
+            .timeout(std::time::Duration::from_secs(8))
+            .send().await;
+        match res {
+            Ok(r) if r.status().is_success() => {
+                if let Ok(v) = r.json::<serde_json::Value>().await {
+                    local_row = Some(serde_json::json!({
+                        "node_id": self_id,
+                        "is_self": true,
+                        "preflight": v,
+                    }));
+                }
+            }
+            _ => {
+                // Loopback failed for some reason — emit an error row
+                // rather than silently dropping the local node.
+                local_row = Some(serde_json::json!({
+                    "node_id": self_id,
+                    "is_self": true,
+                    "error": format!("loopback preflight call to {} failed", url),
+                }));
+            }
+        }
+        let _ = host; // resolve_node_address result not needed for the loopback URL
+    }
+
+    for node in &nodes {
+        if node.is_self { continue; }
+        let host = resolve_node_address(&node.address);
+        let urls = [
+            format!("https://{}:{}/api/router/preflight", host, node.port),
+            format!("http://{}:{}/api/router/preflight", host, node.port + 1),
+            format!("http://{}:{}/api/router/preflight", host, node.port),
+        ];
+        let secret = state.cluster_secret.clone();
+        let nid = node.id.clone();
+        let cluster = node.cluster_name.clone().unwrap_or_default();
+        peer_futs.push(async move {
+            let mut last_err = String::new();
+            for url in &urls {
+                let res = client.get(url)
+                    .header("X-WolfStack-Secret", &secret)
+                    .timeout(std::time::Duration::from_secs(8))
+                    .send().await;
+                match res {
+                    Ok(r) if r.status().is_success() => {
+                        match r.json::<serde_json::Value>().await {
+                            Ok(v) => return serde_json::json!({
+                                "node_id": nid,
+                                "cluster_name": cluster,
+                                "is_self": false,
+                                "preflight": v,
+                            }),
+                            Err(e) => { last_err = format!("decode: {}", e); continue; }
+                        }
+                    }
+                    Ok(r) => { last_err = format!("HTTP {}", r.status()); continue; }
+                    Err(e) => { last_err = format!("{}: {}", url, e); continue; }
+                }
+            }
+            serde_json::json!({
+                "node_id": nid,
+                "cluster_name": cluster,
+                "is_self": false,
+                "error": last_err,
+            })
+        });
+    }
+    let mut rows = futures::future::join_all(peer_futs).await;
+    if let Some(local) = local_row { rows.insert(0, local); }
+    HttpResponse::Ok().json(serde_json::json!({ "nodes": rows }))
+}
+
+/// GET /api/router/validation
+/// Return this node's most recent ValidationReport. If none stored yet
+/// (process just started, watchdog hasn't ticked), runs one inline so
+/// callers always get a fresh answer. Cheap — same checks the per-LAN
+/// health endpoint runs.
+pub async fn get_local_validation(req: HttpRequest, state: S) -> HttpResponse {
+    auth_or_return!(req, state);
+    let cached = state.router.last_validation.read().unwrap().clone();
+    if let Some(r) = cached {
+        return HttpResponse::Ok().json(r);
+    }
+    let state_clone = state.clone();
+    let self_id = crate::agent::self_node_id();
+    let report = tokio::task::spawn_blocking(move || {
+        super::run_validation_and_store(&state_clone.router, &self_id);
+        state_clone.router.last_validation.read().unwrap().clone()
+    }).await.ok().flatten();
+    match report {
+        Some(r) => HttpResponse::Ok().json(r),
+        None => HttpResponse::InternalServerError().body("validation produced no report"),
+    }
+}
+
+/// GET /api/router/validation-cluster
+/// Fan out to every cluster peer, ask for their /api/router/validation,
+/// and aggregate. The "is every node in every cluster healthy?" view
+/// the user asked for. Peer queries run in parallel; offline peers come
+/// back as `{"node_id": "...", "error": "..."}` so the UI shows a row
+/// per peer regardless of reachability.
+pub async fn get_cluster_validation(req: HttpRequest, state: S) -> HttpResponse {
+    auth_or_return!(req, state);
+    let self_id = crate::agent::self_node_id();
+    let nodes = state.cluster.get_all_nodes();
+
+    // Local snapshot first — drop the read lock before spawning peer
+    // queries so concurrent watchdog ticks aren't stalled.
+    let local_report = {
+        let cached = state.router.last_validation.read().unwrap().clone();
+        match cached {
+            Some(r) => Some(r),
+            None => {
+                let st = state.clone();
+                let nid = self_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    super::run_validation_and_store(&st.router, &nid);
+                    st.router.last_validation.read().unwrap().clone()
+                }).await.ok().flatten()
+            }
+        }
+    };
+
+    // Build per-peer futures.
+    let client = &*ROUTER_RPC_CLIENT;
+    let mut peer_futs = Vec::new();
+    let mut local_row: Option<serde_json::Value> = None;
+    for node in &nodes {
+        if node.is_self {
+            local_row = Some(serde_json::json!({
+                "node_id": node.id,
+                "is_self": true,
+                "report": local_report,
+            }));
+            continue;
+        }
+        let host = resolve_node_address(&node.address);
+        let urls = [
+            format!("https://{}:{}/api/router/validation", host, node.port),
+            format!("http://{}:{}/api/router/validation", host, node.port + 1),
+            format!("http://{}:{}/api/router/validation", host, node.port),
+        ];
+        let secret = state.cluster_secret.clone();
+        let nid = node.id.clone();
+        let cluster = node.cluster_name.clone().unwrap_or_default();
+        peer_futs.push(async move {
+            let mut last_err = String::new();
+            for url in &urls {
+                let res = client.get(url)
+                    .header("X-WolfStack-Secret", &secret)
+                    .timeout(std::time::Duration::from_secs(4))
+                    .send().await;
+                match res {
+                    Ok(r) if r.status().is_success() => {
+                        match r.json::<serde_json::Value>().await {
+                            Ok(v) => return serde_json::json!({
+                                "node_id": nid,
+                                "cluster_name": cluster,
+                                "is_self": false,
+                                "report": v,
+                            }),
+                            Err(e) => { last_err = format!("decode: {}", e); continue; }
+                        }
+                    }
+                    Ok(r) => { last_err = format!("HTTP {}", r.status()); continue; }
+                    Err(e) => { last_err = format!("{}: {}", url, e); continue; }
+                }
+            }
+            serde_json::json!({
+                "node_id": nid,
+                "cluster_name": cluster,
+                "is_self": false,
+                "error": last_err,
+            })
+        });
+    }
+    let mut rows = futures::future::join_all(peer_futs).await;
+    if let Some(local) = local_row { rows.insert(0, local); }
+    HttpResponse::Ok().json(serde_json::json!({ "nodes": rows }))
+}
+
 // ─── Mount ───
 
 pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
@@ -4503,6 +5284,18 @@ pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
         .route("/api/router/segments/{id}/leases", web::get().to(get_leases))
         .route("/api/router/segments/{id}/query-log", web::get().to(get_query_log))
         .route("/api/router/segments/{id}/query-log", web::post().to(set_query_log))
+        .route("/api/router/segments/{id}/health", web::get().to(get_lan_health))
+        .route("/api/router/segments/{id}/restart-dnsmasq", web::post().to(restart_lan_dnsmasq))
+        .route("/api/router/segments/{id}/set-interface", web::post().to(set_lan_interface))
+        .route("/api/router/health", web::get().to(list_lan_health))
+        .route("/api/router/validation", web::get().to(get_local_validation))
+        .route("/api/router/validation-cluster", web::get().to(get_cluster_validation))
+        .route("/api/router/preflight-cluster", web::get().to(get_cluster_preflight))
+        .route("/api/router/fix/enable-ip-forward", web::post().to(fix_enable_ip_forward))
+        .route("/api/router/fix/purge-self-loop-routes", web::post().to(fix_purge_self_loop_routes))
+        .route("/api/router/fix/dhclient", web::post().to(fix_dhclient_iface))
+        .route("/api/router/fix/wan/{id}/reapply", web::post().to(fix_reapply_wan))
+        .route("/api/router/fix/wan/{id}/tick-pppoe-default-route", web::post().to(fix_tick_pppoe_default_route))
         .route("/api/router/rules", web::get().to(list_rules))
         .route("/api/router/rules", web::post().to(create_rule))
         .route("/api/router/rules/{id}", web::put().to(update_rule))
