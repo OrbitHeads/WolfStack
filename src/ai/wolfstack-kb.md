@@ -1,5 +1,15 @@
 # WolfStack Expert Knowledge Base
 
+## Behavioural rules for the AI (READ THIS FIRST)
+**Never hallucinate. If you don't know something, say so.**
+- If the user asks about a feature, command, file path, port, config field, API endpoint, or version, and you can't verify it from this knowledge base, the running cluster, an [EXEC] tool result, or a file you've actually read — **say "I don't know"** or "I'm not sure — let me check" and then check, instead of inventing an answer.
+- Never invent file paths, port numbers, environment variables, CLI flags, API routes, or config keys. If a user asks "is there a flag for X?" and this KB doesn't list one, the answer is "I don't see one — there may not be" not a guess.
+- Never make up commit hashes, version numbers, dates, names, or quotes.
+- Distinguish "I read this in the KB" from "I'm inferring this is probably true". Inferences are fine when labelled as such ("this is probably how it works, but I haven't verified").
+- When the user asks "what's the latest version?" or similar live-state question, run an [EXEC] tool or fetch the running cluster's state — don't recite a version from training data or memory.
+- If a user reports a bug or behaviour that contradicts what this KB says, trust the user, ask for the exact error message, and run a diagnostic — don't insist the KB is right.
+- For diagnosing problems, prefer reading actual logs (`journalctl -u wolfstack -n 100`), config files, or live API responses over recalling general patterns. Cite what you read.
+
 ## Architecture
 - Single Rust binary (actix-web 4), no database, no containers needed
 - Config persisted as JSON files in /etc/wolfstack/
@@ -140,6 +150,7 @@
 ## Running behind a reverse proxy (Cloudflare Tunnel, nginx, Traefik, etc.)
 - Point the proxy at the main API port (default 8553, or whatever `--port` sets). Status pages, cluster browser sessions, consoles and the SPA all ride that one port.
 - Required proxy headers: `Host` (preserve original), `X-Forwarded-Proto`, `X-Forwarded-For`. actix-web's `connection_info()` reads these for URL generation (cluster browser `connect_url`, etc.).
+- Passkey login also reads `X-Forwarded-Proto` and `X-Forwarded-Host` (v22.6.9+). If you see "host header is incorrect for passkeys", the proxy is missing one of those — see the Authentication section.
 - Enable WebSocket upgrades — consoles, VNC, k8s provisioning, and cluster browser all use WS on the same port.
 - Status pages work out of the box at `https://your-domain/status/{slug}` with no extra routing.
 - Port 8550 (dedicated status listener) is NOT needed behind a proxy and can be left un-forwarded; it's only there for admins who want no-auth public pages on a separate port without a proxy.
@@ -215,9 +226,44 @@
 - Linux crypt() against /etc/shadow (default)
 - WolfStack native user accounts with Argon2 password hashing
 - TOTP two-factor authentication
+- WebAuthn / passkey login (v22.3.0+) — additive, sits alongside PAM
 - OIDC/SSO (Enterprise): Authentik, Azure AD, Okta, Keycloak, any OIDC provider
 - Cookie-based sessions (wolfstack_session cookie)
 - Inter-node auth: X-WolfStack-Secret header
+
+### Passkey login behind a reverse proxy (v22.6.9+)
+- `passkey_rp_origin()` reads `X-Forwarded-Proto` and `X-Forwarded-Host` first, falls back to `Host` + `state.tls_enabled`. Without these, a wolfstack running plain HTTP behind nginx/Caddy/Traefik that terminates TLS would derive `origin=http://example.com` while the browser presents `origin=https://example.com` → webauthn-rs rejects with "host header is incorrect for passkeys"
+- Multi-hop proxy chains: takes the first comma-separated value from the header (the original client-facing host/scheme)
+- Bogus `X-Forwarded-Proto` values fall back to local TLS state, so a misconfigured proxy doesn't break direct access
+- IPv6 hosts (`[::1]:8553`) handled correctly — port stripping only fires when the suffix is all-digits
+
+## Certificates page (v22.6.9+)
+- Three input modes: Let's Encrypt (certbot, existing), Generate Self-Signed, Install / Update
+- Self-signed: `openssl req -x509 -newkey rsa:2048 -nodes -sha256` with `-addext "subjectAltName=..."`. Auto-detects DNS vs IP for each SAN entry. Default validity 825 days.
+- Install / Update: paste cert + key PEM; supports encrypted PKCS#8 (`BEGIN ENCRYPTED PRIVATE KEY`) and legacy PEM (`Proc-Type: 4,ENCRYPTED`) via a `key_passphrase` field. Passphrase passed to openssl via `WS_KEY_PASS` env var, never argv. Decrypted key is what gets stored on disk.
+- Atomic write: everything goes through `<path>.new` + `verify_cert_key_pair` (modulus check for RSA, public-key comparison for EC) + `rename`. A bad upload never overwrites a working cert.
+- Path whitelist: `/etc/wolfstack/`, `/etc/pve/local/`, `/etc/pve/nodes/`. Anything else (including path traversal) is rejected.
+- Discovery (existing): scans certbot CLI, `/etc/letsencrypt/live/`, `/etc/wolfstack/cert.pem` + `key.pem`, and Proxmox `pveproxy-ssl` pairs across all nodes/per-node directories. Lists everything in the page.
+- Diagnostics: warns if only one of `/etc/wolfstack/cert.pem` and `key.pem` exists (the manual-install footgun)
+- "Update" button on existing proxmox/custom certs pre-fills the install target so the user can replace them in place
+- After install: API response carries `restart_service` (`wolfstack` or `pveproxy`). Frontend opens a `confirm()` dialog — never auto-restart. User clicks OK → POST `/api/certificates/restart-service` schedules a deferred restart (1.5s for wolfstack so HTTP response flushes, 100ms for pveproxy)
+- Endpoints: `POST /api/certificates/install`, `POST /api/certificates/self-signed`, `POST /api/certificates/restart-service`, `GET /api/certificates/list`, `POST /api/certificates` (Let's Encrypt)
+
+## Installer (setup.sh)
+- Curl-piped: `curl -sSL https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfStack/master/setup.sh | sudo bash`
+- Flags: `--beta` (use beta branch), `--yes`/`-y` (skip confirmation), `--agent` (agent-only install — see Clustering), `--install-dir <path>` (redirect Cargo target dir to external mount for low-disk hosts)
+- Pre-flight checks (v22.6.9+) run before any package install:
+  - DNS-on-:53 conflicts: Technitium, Pi-hole, AdGuard, BIND, Unbound, dnsmasq, systemd-resolved (the last is handled automatically — left alone)
+  - Port conflicts on 8553/8554/8555 with role labels; distinguishes "our previous wolfstack" vs other process
+  - Reverse proxies on 80/443 (info only — WolfStack core doesn't bind these)
+  - Existing `/etc/wolfstack/` content → flagged as upgrade; explicit warning when `custom-cluster-secret` is present (move-to-new-cluster footgun)
+  - ufw / firewalld active without :8553 allowed → exact `ufw allow` / `firewall-cmd` command shown
+  - Architecture not in {x86_64, aarch64} → warns about source-build path (~10–30 min, ~3 GB free disk)
+  - Confirmation prompt with TTY detection: works under `bash setup.sh` AND `curl|bash` (reads from /dev/tty)
+- Install manifest at `/var/log/wolfstack/install-<timestamp>.log`: full diff of installed packages before vs after via `dpkg-query` / `rpm -qa` / `pacman -Q`. Used by the uninstaller for rollback.
+- Join token: pre-generated at `/etc/wolfstack/join-token` (mode 0600) using `openssl rand -hex 32` or `od /dev/urandom` fallback. Format matches Rust's `load_join_token()` so the binary picks it up on first start. Printed in the completion banner — paste into master server's "Add Node" form.
+- Local uninstaller: fetched from same branch as setup.sh, saved to `/usr/local/bin/wolfstack-uninstall`. Falls back to inline minimal stub if offline (stops service, removes binary + unit, optional `--purge` for /etc/wolfstack). Reachable when DNS is broken.
+- Disk-space check: only on source-build fallback (when prebuilt binary download fails). Requires ~3 GB at the build dir; prompts to continue if less.
 
 ## AI Agent
 - Three providers: Claude (Anthropic), Gemini (Google), Local AI (self-hosted)
@@ -249,6 +295,15 @@
 - Cluster secret for inter-node authentication
 - Default secret used if no custom-cluster-secret file exists
 - Node proxy: /api/nodes/{id}/proxy/{path} forwards API calls to remote nodes
+
+### Server vs agent install mode (v22.6.9+)
+- Two install modes selected at `setup.sh` time: server (default) and agent (`--agent` flag)
+- Server install: full management UI on :8553, cluster API, all subsystems. Run on ONE node per management domain — that's the "single pane of glass"
+- Agent install: cluster API stays bound (so the master's node-proxy still works), but the SPA / login.html / static assets are NOT served. Hitting `/` on an agent returns a small HTML page explaining it's an agent and how to add it from the master
+- Implemented via the `--agent` CLI flag on the wolfstack binary. In agent mode, all three `HttpServer` blocks (HTTPS, HTTP inter-node, no-TLS fallback) swap the SPA + Files service for `default_service(web::to(agent_index_handler))`. `api::configure` is registered regardless, so cluster proxy works
+- setup.sh appends `--agent` to the systemd `ExecStart=` line. On a rerun with the opposite flag it sed-edits the unit file and saves a backup at `wolfstack.service.pre-agent-flip`, then daemon-reloads + restarts
+- Agent mode does NOT reduce installed runtime deps — every node still needs LXC, Docker, QEMU, etc. to actually run workloads
+- If the master has rotated the cluster secret (Settings → Security), agent nodes need the same `/etc/wolfstack/custom-cluster-secret` or X-WolfStack-Secret auth fails. Surfaced in the install banner and the agent index HTML.
 
 ## Common Issues
 
