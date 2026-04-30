@@ -29,11 +29,15 @@ BRANCH="master"
 CUSTOM_INSTALL_DIR=""
 ASSUME_YES=false
 AGENT_MODE=false
+SKIP_PBS_BUILD=false
+FORCE_PBS_BUILD=false
 while [ $# -gt 0 ]; do
     case "$1" in
         --beta) BRANCH="beta" ;;
         --yes|-y|--assume-yes) ASSUME_YES=true ;;
         --agent) AGENT_MODE=true ;;
+        --skip-pbs-build|--no-pbs-build) SKIP_PBS_BUILD=true ;;
+        --build-pbs|--pbs-from-source) FORCE_PBS_BUILD=true ;;
         --install-dir|--install)
             if [ -n "$2" ]; then
                 shift
@@ -662,9 +666,140 @@ else
     fi
 fi
 
+# ─── Source-build fallback for architectures Proxmox doesn't ship binaries for ─
+# Proxmox publishes proxmox-backup-client ONLY for amd64
+# (http://download.proxmox.com/debian/pbs/dists/{bookworm,trixie}/pbs-no-subscription/
+# only has binary-amd64/). Every other architecture — Raspberry Pi (aarch64),
+# Apple Silicon Linux (aarch64), ARM servers (aarch64), armv7l Pis — silently
+# fails the .deb extraction path above. This block builds the client crate from
+# source via cargo so PBS backup destinations work on ARM hosts.
+#
+# Skip with --skip-pbs-build if you don't need PBS and don't want to wait
+# 20-30 min on a Pi. Force a rebuild attempt with --build-pbs even on amd64.
+pbs_build_from_source() {
+    local target_arch="${HOST_ARCH:-$(uname -m)}"
+    echo ""
+    echo "  Building proxmox-backup-client from source for $target_arch..."
+    echo "  This takes ~20-30 minutes on a Raspberry Pi 4. Re-run setup.sh"
+    echo "  with --skip-pbs-build to skip on next upgrade if you don't need PBS."
+
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "  ✗ Cargo (Rust toolchain) not found — cannot build from source."
+        echo "    Install Rust first: https://rustup.rs/  then re-run setup.sh"
+        return 1
+    fi
+
+    # Build dependencies. The proxmox-backup-client crate links libssl, libacl,
+    # libfuse3 (for fuse-mount of pxar archives), and libsystemd. Names vary
+    # by distro — best-effort install, build will fail loudly if any are missing.
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get install -y --no-install-recommends \
+            git build-essential pkg-config clang \
+            libssl-dev libacl1-dev libfuse3-dev libsystemd-dev uuid-dev 2>/dev/null \
+            || echo "  ⚠ Some build deps may be missing — continuing anyway"
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y git gcc gcc-c++ make pkgconf-pkg-config clang \
+            openssl-devel libacl-devel fuse3-devel systemd-devel libuuid-devel 2>/dev/null \
+            || echo "  ⚠ Some build deps may be missing — continuing anyway"
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -S --needed --noconfirm git base-devel pkg-config clang \
+            openssl acl fuse3 systemd-libs util-linux 2>/dev/null \
+            || echo "  ⚠ Some build deps may be missing — continuing anyway"
+    elif command -v zypper >/dev/null 2>&1; then
+        zypper install -y git gcc gcc-c++ make pkg-config clang \
+            libopenssl-devel libacl-devel fuse3-devel systemd-devel libuuid-devel 2>/dev/null \
+            || echo "  ⚠ Some build deps may be missing — continuing anyway"
+    fi
+
+    local src="${CUSTOM_INSTALL_DIR:-/var/cache/wolfstack}/proxmox-backup-src"
+    rm -rf "$src"
+    mkdir -p "$(dirname "$src")"
+
+    if ! git clone --depth 1 https://git.proxmox.com/git/proxmox-backup.git "$src" 2>&1 | tail -3; then
+        echo "  ✗ Could not clone proxmox-backup source from git.proxmox.com"
+        rm -rf "$src"
+        return 1
+    fi
+
+    # Build only the client crate. The wider workspace pulls in PBS-server
+    # crates (proxmox-backup-server, daemons, web UI assets) that need
+    # extra build infrastructure we don't want to drag in for the client.
+    # Re-use the swap created earlier in the wolfstack source-build block
+    # if memory is tight (1GB Pi 3, 2GB Pi 4).
+    local cargo_jobs=""
+    local total_kb
+    total_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
+    if [ -n "$total_kb" ] && [ "$total_kb" -lt 4000000 ]; then
+        cargo_jobs="-j 1"
+        echo "  Low memory detected — limiting build to one job"
+    fi
+
+    if ! ( cd "$src" && cargo build --release $cargo_jobs --bin proxmox-backup-client ) 2>&1 | tail -15; then
+        echo "  ✗ cargo build failed — see output above"
+        echo "    The proxmox-backup workspace can be sensitive to system library"
+        echo "    versions. If openssl-sys, libfuse-sys, or proxmox-* crates"
+        echo "    failed, install the matching -devel/-dev packages and re-run."
+        rm -rf "$src"
+        return 1
+    fi
+
+    if [ -x "$src/target/release/proxmox-backup-client" ]; then
+        install -m 0755 "$src/target/release/proxmox-backup-client" /usr/local/bin/proxmox-backup-client
+        echo "  ✓ proxmox-backup-client built and installed to /usr/local/bin/"
+        rm -rf "$src"
+        return 0
+    fi
+    rm -rf "$src"
+    return 1
+}
+
+if [ "$pbs_install_success" != "true" ] && [ "$SKIP_PBS_BUILD" != "true" ]; then
+    # Tell the user WHY the install failed (most likely: arch mismatch).
+    case "$HOST_ARCH" in
+        x86_64)
+            echo "  ⚠ proxmox-backup-client install failed on x86_64 — unusual."
+            echo "    Network or repo issue likely. Skipping source build (the apt"
+            echo "    path should have worked). Re-run with --build-pbs to force"
+            echo "    a from-source attempt anyway."
+            ;;
+        aarch64|arm64|armv7l|armv6l)
+            echo ""
+            echo "  ℹ Proxmox doesn't publish proxmox-backup-client binaries for $HOST_ARCH."
+            echo "    The Debian PBS repo at download.proxmox.com only has binary-amd64/."
+            echo "    Falling back to source build so PBS backup destinations work here."
+            pbs_build_from_source && pbs_install_success=true
+            ;;
+        *)
+            echo "  ℹ No upstream proxmox-backup-client binary for $HOST_ARCH."
+            echo "    Attempting source build via cargo..."
+            pbs_build_from_source && pbs_install_success=true
+            ;;
+    esac
+fi
+
+# Allow `--build-pbs` to force a source build on amd64 too (useful for users
+# who want to track upstream master rather than the published bookworm/trixie
+# .deb releases).
+if [ "$pbs_install_success" = "true" ] && [ "$FORCE_PBS_BUILD" = "true" ]; then
+    echo "  --build-pbs requested — replacing installed binary with source build"
+    pbs_build_from_source || true
+fi
+if [ "$pbs_install_success" != "true" ] && [ "$FORCE_PBS_BUILD" = "true" ]; then
+    pbs_build_from_source && pbs_install_success=true
+fi
+
 if [ "$pbs_install_success" != "true" ]; then
-    echo "⚠ Could not install proxmox-backup-client. PBS integration will be unavailable."
-    echo "  You can install manually later. See: https://pbs.proxmox.com/docs/backup-client.html"
+    echo ""
+    echo "  ⚠ proxmox-backup-client is NOT installed on this host."
+    echo "    Impact: PBS backup destinations in WolfStack will not work."
+    echo "    Workarounds — these backup destinations all work without PBS client:"
+    echo "      • Local filesystem"
+    echo "      • S3 / S3-compatible (Backblaze B2, MinIO, etc.)"
+    echo "      • NFS mount"
+    echo "      • SMB / CIFS share"
+    echo "      • SSHFS to a remote WolfStack node"
+    echo "      • WolfDisk replication"
+    echo "    Manual install (if you really need PBS): https://pbs.proxmox.com/docs/backup-client.html"
 fi
 
 # Fix libfuse3 soname: proxmox-backup-client links against libfuse3.so.3
