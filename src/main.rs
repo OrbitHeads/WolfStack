@@ -102,11 +102,56 @@ struct Cli {
     /// Print this server's join token and exit
     #[arg(long)]
     show_token: bool,
+
+    /// Run in agent-only mode — exposes the cluster API for a master node to
+    /// proxy through, but does NOT serve the management SPA. Use this on
+    /// every node except the one you want to log into. Persisted via the
+    /// systemd ExecStart line written by setup.sh --agent.
+    #[arg(long)]
+    agent: bool,
 }
 
 /// Serve the login page for unauthenticated requests to /
 /// Version string used as cache-buster for static assets.
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Agent-mode root handler — returned for any path the SPA would normally
+/// serve. The node is functional (cluster API still bound) but this user
+/// hit the wrong door: they should manage it from the cluster's master
+/// node UI, not by hitting this node directly.
+async fn agent_index_handler() -> HttpResponse {
+    let html = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WolfStack Agent Node</title>
+<style>
+body { font-family: system-ui, -apple-system, sans-serif; max-width: 640px; margin: 8vh auto; padding: 0 24px; color: #1a1a1a; line-height: 1.55; }
+h1 { color: #dc2626; margin-bottom: 4px; }
+.muted { color: #666; font-size: 14px; }
+.box { background: #f5f5f5; border-left: 3px solid #dc2626; padding: 16px 20px; border-radius: 4px; margin: 24px 0; }
+code { background: #ececec; padding: 2px 6px; border-radius: 3px; font-size: 13px; }
+ol { padding-left: 22px; }
+ol li { margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<h1>WolfStack Agent Node</h1>
+<p class="muted">This server is running in agent-only mode &mdash; the cluster API is up but the management UI is intentionally not served from this node.</p>
+<div class="box">
+<strong>Manage this node from your master server&rsquo;s UI.</strong> Log into the management node you set up first, then add this server via <em>Add Node</em> using its hostname or IP and the join token below.
+</div>
+<ol>
+<li>Find this node&rsquo;s join token: <code>sudo cat /etc/wolfstack/join-token</code></li>
+<li>Open the management UI on your master server (port 8553).</li>
+<li>Cluster &rarr; Add Node &rarr; paste the token, hostname, and IP.</li>
+</ol>
+<p class="muted"><strong>If you rotated the cluster secret</strong> on the master (Settings &rarr; Security), copy <code>/etc/wolfstack/custom-cluster-secret</code> from the master to this node before the first connection &mdash; otherwise inter-node calls will fail X-WolfStack-Secret authentication.</p>
+<p class="muted">To convert this node into a full management server, edit the systemd unit at <code>/etc/systemd/system/wolfstack.service</code>, remove the <code>--agent</code> flag from <code>ExecStart=</code>, then run <code>sudo systemctl daemon-reload &amp;&amp; sudo systemctl restart wolfstack</code>.</p>
+</body>
+</html>"#;
+    HttpResponse::Ok().content_type("text/html").body(html)
+}
 
 async fn index_handler(req: HttpRequest, state: web::Data<api::AppState>) -> HttpResponse {
     // Check if authenticated
@@ -1972,7 +2017,13 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
 
         // Determine web directory
         let web_dir = find_web_dir();
-        info!("  Serving web UI from: {}", web_dir);
+        let agent_mode = cli.agent;
+        if agent_mode {
+            info!("  ⚙ Agent-only mode — management SPA disabled, cluster API only");
+            info!("    Manage this node from the master server's UI (Add Node).");
+        } else {
+            info!("  Serving web UI from: {}", web_dir);
+        }
         info!("");
 
         // Resolve TLS certificate paths
@@ -2027,13 +2078,18 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
             // Start HTTPS server on main port + HTTP server on port+1 for inter-node
             let https_bind = format!("{}:{}", cli.bind, api_port);
             let https_server = HttpServer::new(move || {
-                App::new()
+                let app = App::new()
                     .app_data(app_state.clone())
                     .app_data(actix_multipart::form::MultipartFormConfig::default().total_limit(2 * 1024 * 1024 * 1024))
                     .app_data(actix_web::web::PayloadConfig::new(2 * 1024 * 1024 * 1024))
-                    .configure(api::configure)
-                    .route("/", web::get().to(index_handler))
-                    .service(actix_files::Files::new("/", &web_dir).index_file("login.html"))
+                    .configure(api::configure);
+                if agent_mode {
+                    app.default_service(web::to(agent_index_handler))
+                } else {
+                    app
+                        .route("/", web::get().to(index_handler))
+                        .service(actix_files::Files::new("/", &web_dir).index_file("login.html"))
+                }
             })
             // Tighten the lifecycle so peers churning connections (cluster
             // polling, wolfrun/statuspage broadcasts from older peers)
@@ -2053,13 +2109,18 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
 
             let http_bind = format!("{}:{}", cli.bind, inter_node_port);
             let http_server = HttpServer::new(move || {
-                App::new()
+                let app = App::new()
                     .app_data(app_state2.clone())
                     .app_data(actix_multipart::form::MultipartFormConfig::default().total_limit(2 * 1024 * 1024 * 1024))
                     .app_data(actix_web::web::PayloadConfig::new(2 * 1024 * 1024 * 1024))
-                    .configure(api::configure)
-                    .route("/", web::get().to(index_handler))
-                    .service(actix_files::Files::new("/", &web_dir2).index_file("login.html"))
+                    .configure(api::configure);
+                if agent_mode {
+                    app.default_service(web::to(agent_index_handler))
+                } else {
+                    app
+                        .route("/", web::get().to(index_handler))
+                        .service(actix_files::Files::new("/", &web_dir2).index_file("login.html"))
+                }
             })
             .keep_alive(std::time::Duration::from_secs(2))
             .client_request_timeout(std::time::Duration::from_secs(3))
@@ -2113,13 +2174,18 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
 
             // Start HTTP server (same as before — no breaking changes)
             let main_server = HttpServer::new(move || {
-                App::new()
+                let app = App::new()
                     .app_data(app_state.clone())
                     .app_data(actix_multipart::form::MultipartFormConfig::default().total_limit(2 * 1024 * 1024 * 1024))
                     .app_data(actix_web::web::PayloadConfig::new(2 * 1024 * 1024 * 1024))
-                    .configure(api::configure)
-                    .route("/", web::get().to(index_handler))
-                    .service(actix_files::Files::new("/", &web_dir).index_file("login.html"))
+                    .configure(api::configure);
+                if agent_mode {
+                    app.default_service(web::to(agent_index_handler))
+                } else {
+                    app
+                        .route("/", web::get().to(index_handler))
+                        .service(actix_files::Files::new("/", &web_dir).index_file("login.html"))
+                }
             })
             // See matching block above on the TLS path for why these
             // lifecycle knobs matter. Keep-alive / disconnect tuning

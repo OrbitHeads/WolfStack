@@ -7284,6 +7284,149 @@ async function requestCertificate() {
     }
 }
 
+// Targets that can be selected as install/update destinations.
+// Always includes the WolfStack default; updatable certs (proxmox, custom)
+// are appended from the discovered cert list so users can replace them.
+function refreshCertTargetOptions(certs) {
+    const targets = [{ label: '/etc/wolfstack/cert.pem + key.pem (default)', value: '' }];
+    (certs || []).forEach(c => {
+        // Only writable / replaceable targets — never offer to overwrite Let's Encrypt
+        // managed paths (certbot owns those, manual writes break renewals).
+        if (c.source !== 'proxmox' && c.source !== 'custom') return;
+        if (!c.cert_path || !c.key_path) return;
+        targets.push({
+            label: `${c.domain} — ${c.cert_path}`,
+            value: JSON.stringify({ cert_path: c.cert_path, key_path: c.key_path }),
+        });
+    });
+    ['cert-install-target', 'cert-ss-target'].forEach(id => {
+        const sel = document.getElementById(id);
+        if (!sel) return;
+        const previous = sel.value;
+        sel.innerHTML = targets.map(t =>
+            `<option value="${escapeAttr(t.value)}">${escapeHtml(t.label)}</option>`
+        ).join('');
+        // Preserve selection across reloads if it still exists
+        if ([...sel.options].some(o => o.value === previous)) sel.value = previous;
+    });
+}
+
+function readCertTarget(selectId) {
+    const sel = document.getElementById(selectId);
+    if (!sel || !sel.value) return { cert_path: null, key_path: null };
+    try {
+        const v = JSON.parse(sel.value);
+        return { cert_path: v.cert_path || null, key_path: v.key_path || null };
+    } catch (_) {
+        return { cert_path: null, key_path: null };
+    }
+}
+
+async function generateSelfSignedCertificate() {
+    const host = (document.getElementById('cert-ss-host')?.value || '').trim();
+    if (!host) { showToast('Enter a hostname / common name', 'error'); return; }
+    const sansRaw = (document.getElementById('cert-ss-sans')?.value || '').trim();
+    const alt_names = sansRaw ? sansRaw.split(/\s+/).filter(Boolean) : [];
+    const days = parseInt(document.getElementById('cert-ss-days')?.value || '825', 10) || 825;
+    const target = readCertTarget('cert-ss-target');
+
+    showToast('Generating self-signed certificate…', 'info');
+    try {
+        const resp = await fetch(apiUrl('/api/certificates/self-signed'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ host, alt_names, days, ...target }),
+        });
+        const data = await resp.json();
+        if (resp.ok) {
+            showToast(data.message || 'Self-signed certificate generated', 'success');
+            loadCertificates();
+            promptRestartAfterCert(data.restart_service);
+        } else {
+            showToast(data.error || 'Self-signed generation failed', 'error');
+        }
+    } catch (e) {
+        showToast('Failed: ' + e.message, 'error');
+    }
+}
+
+async function installCustomCertificate() {
+    const cert_pem = (document.getElementById('cert-install-cert')?.value || '').trim();
+    const key_pem  = (document.getElementById('cert-install-key')?.value  || '').trim();
+    const key_passphrase = document.getElementById('cert-install-passphrase')?.value || '';
+    if (!cert_pem || !key_pem) {
+        showToast('Both certificate and private key are required', 'error');
+        return;
+    }
+    const target = readCertTarget('cert-install-target');
+
+    showToast('Installing certificate…', 'info');
+    try {
+        const payload = { cert_pem, key_pem, ...target };
+        if (key_passphrase) payload.key_passphrase = key_passphrase;
+        const resp = await fetch(apiUrl('/api/certificates/install'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+        if (resp.ok) {
+            showToast(data.message || 'Certificate installed', 'success');
+            document.getElementById('cert-install-cert').value = '';
+            document.getElementById('cert-install-key').value = '';
+            const passField = document.getElementById('cert-install-passphrase');
+            if (passField) passField.value = '';
+            loadCertificates();
+            promptRestartAfterCert(data.restart_service);
+        } else {
+            showToast(data.error || 'Certificate installation failed', 'error');
+        }
+    } catch (e) {
+        showToast('Failed: ' + e.message, 'error');
+    }
+}
+
+// After a successful cert install/generate, ask the user whether to restart
+// the service that needs to reload the cert. We never restart automatically
+// — wolfstack restarting itself drops the user's session, and pveproxy
+// restarting interrupts other admins on the Proxmox UI. Always confirm.
+function promptRestartAfterCert(service) {
+    if (!service) return;
+    const label = service === 'wolfstack'
+        ? 'WolfStack (this UI will briefly disconnect and reconnect)'
+        : 'pveproxy on the Proxmox host (other Proxmox UI sessions will disconnect)';
+    const ok = window.confirm(
+        `Certificate installed.\n\nRestart ${label} now to activate the new certificate?\n\nClick OK to restart, or Cancel to restart later from a terminal.`
+    );
+    if (!ok) {
+        showToast(`Certificate is installed but not yet active. Run: sudo systemctl restart ${service}  when ready.`, 'info');
+        return;
+    }
+    fetch(apiUrl('/api/certificates/restart-service'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ service }),
+    }).then(async resp => {
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok) {
+            showToast(data.message || `Restarting ${service}…`, 'success');
+        } else {
+            showToast(data.error || `Failed to restart ${service}`, 'error');
+        }
+    }).catch(e => showToast('Restart failed: ' + e.message, 'error'));
+}
+
+// Pre-select an existing cert as the install target and scroll to the form.
+function prepareCertUpdate(certPath, keyPath) {
+    const sel = document.getElementById('cert-install-target');
+    if (!sel) return;
+    const wanted = JSON.stringify({ cert_path: certPath, key_path: keyPath });
+    const match = [...sel.options].find(o => o.value === wanted);
+    if (match) sel.value = wanted;
+    document.getElementById('cert-install-cert')?.focus();
+    document.getElementById('cert-install-cert')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
 async function loadCertificates() {
     const el = document.getElementById('cert-list');
     if (!el) return;
@@ -7293,21 +7436,30 @@ async function loadCertificates() {
         const certs = data.certs || data; // handle both new {certs,diagnostics} and legacy array format
         const diagnostics = data.diagnostics || [];
 
+        refreshCertTargetOptions(certs);
+
         let html = '';
         if (!certs || certs.length === 0) {
-            html += '<p style="color: var(--text-muted);">No certificates installed. Request one above.</p>';
+            html += '<p style="color: var(--text-muted);">No certificates installed. Request, generate, or upload one above.</p>';
         } else {
-            html += certs.map(c => `
+            html += certs.map(c => {
+                const updatable = (c.source === 'proxmox' || c.source === 'custom') && c.cert_path && c.key_path;
+                // Single-quoted attribute so JSON.stringify's double quotes don't break parsing.
+                const updateBtn = updatable
+                    ? `<button class="btn btn-sm" style="margin-left: 12px;" onclick='prepareCertUpdate(${JSON.stringify(c.cert_path)}, ${JSON.stringify(c.key_path)})'>Update</button>`
+                    : '';
+                return `
                 <div style="padding: 10px; margin-bottom: 8px; background: var(--bg-tertiary); border-radius: 8px; display: flex; align-items: center; gap: 12px;">
                     <span style="font-size: 20px;">${c.valid ? '✅' : '⚠️'}</span>
                     <div style="flex:1;">
-                        <strong>${c.domain}</strong><br>
-                        <span style="font-size: 12px; color: var(--text-muted);">${c.cert_path}</span>
-                        ${c.source ? `<br><span style="font-size: 11px; color: var(--text-muted);">Source: ${c.source}</span>` : ''}
-                        ${c.expiry ? `<br><span style="font-size: 12px; color: var(--text-muted);">Expires: ${c.expiry}</span>` : ''}
+                        <strong>${escapeHtml(c.domain)}</strong><br>
+                        <span style="font-size: 12px; color: var(--text-muted);">${escapeHtml(c.cert_path)}</span>
+                        ${c.source ? `<br><span style="font-size: 11px; color: var(--text-muted);">Source: ${escapeHtml(c.source)}</span>` : ''}
+                        ${c.expiry ? `<br><span style="font-size: 12px; color: var(--text-muted);">Expires: ${escapeHtml(c.expiry)}</span>` : ''}
                     </div>
-                </div>
-            `).join('');
+                    ${updateBtn}
+                </div>`;
+            }).join('');
         }
 
         if (diagnostics.length > 0) {
@@ -7315,7 +7467,7 @@ async function loadCertificates() {
                 <details style="margin-top: 12px; font-size: 13px;">
                     <summary style="cursor: pointer; color: var(--text-muted); user-select: none;">🔍 Discovery diagnostics</summary>
                     <div style="margin-top: 8px; padding: 10px; background: var(--bg-tertiary); border-radius: 8px; font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.8;">
-                        ${diagnostics.map(d => `<div>${d}</div>`).join('')}
+                        ${diagnostics.map(d => `<div>${escapeHtml(d)}</div>`).join('')}
                     </div>
                 </details>`;
         }

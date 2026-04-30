@@ -3468,7 +3468,7 @@
         <div id="page-certificates" class="page-view" style="display:none;">
             <div class="card">
                 <div class="card-header">
-                    <h3>SSL Certificates</h3>
+                    <h3>Let's Encrypt (Certbot)</h3>
                 </div>
                 <div class="card-body">
                     <div class="form-group">
@@ -3489,6 +3489,77 @@
                     </p>
                 </div>
             </div>
+
+            <div class="card" style="margin-top: 20px;">
+                <div class="card-header">
+                    <h3>Generate Self-Signed Certificate</h3>
+                </div>
+                <div class="card-body">
+                    <div class="form-group">
+                        <label>Hostname / Common Name</label>
+                        <input type="text" class="form-control" id="cert-ss-host" placeholder="server.lan">
+                    </div>
+                    <div class="form-group" style="margin-top: 12px;">
+                        <label>Additional Subject Alt Names (one per line — DNS names or IPs)</label>
+                        <textarea class="form-control" id="cert-ss-sans" rows="3" placeholder="server&#10;192.168.1.10" style="font-family: var(--font-mono);"></textarea>
+                    </div>
+                    <div class="form-group" style="margin-top: 12px; display: flex; gap: 12px; align-items: flex-end;">
+                        <div style="flex: 0 0 140px;">
+                            <label>Validity (days)</label>
+                            <input type="number" class="form-control" id="cert-ss-days" value="825" min="1" max="3650">
+                        </div>
+                        <div style="flex: 1;">
+                            <label>Install To (optional — defaults to /etc/wolfstack/)</label>
+                            <select class="form-control" id="cert-ss-target">
+                                <option value="">/etc/wolfstack/cert.pem + key.pem (default)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <button class="btn btn-primary" onclick="generateSelfSignedCertificate()" style="margin-top: 12px;">
+                        🛡️ Generate Self-Signed Certificate
+                    </button>
+                    <p style="margin-top: 12px; font-size: 13px; color: var(--text-muted);">
+                        Browsers will warn about self-signed certificates — use only for LAN / internal access.
+                        Restart WolfStack after generating to enable HTTPS.
+                    </p>
+                </div>
+            </div>
+
+            <div class="card" style="margin-top: 20px;">
+                <div class="card-header">
+                    <h3>Install / Update Certificate</h3>
+                </div>
+                <div class="card-body">
+                    <p style="font-size: 13px; color: var(--text-muted); margin-top: 0;">
+                        Paste an existing certificate and private key in PEM format. Use this to install a
+                        cert obtained elsewhere, or to <strong>update / replace</strong> a certificate already
+                        on disk (including Proxmox <code>pveproxy-ssl</code>).
+                    </p>
+                    <div class="form-group">
+                        <label>Install To</label>
+                        <select class="form-control" id="cert-install-target">
+                            <option value="">/etc/wolfstack/cert.pem + key.pem (default)</option>
+                        </select>
+                    </div>
+                    <div class="form-group" style="margin-top: 12px;">
+                        <label>Certificate (PEM, including any chain)</label>
+                        <textarea class="form-control" id="cert-install-cert" rows="6" placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----" style="font-family: var(--font-mono); font-size: 12px;"></textarea>
+                    </div>
+                    <div class="form-group" style="margin-top: 12px;">
+                        <label>Private Key (PEM)</label>
+                        <textarea class="form-control" id="cert-install-key" rows="6" placeholder="-----BEGIN PRIVATE KEY-----&#10;...&#10;-----END PRIVATE KEY-----" style="font-family: var(--font-mono); font-size: 12px;"></textarea>
+                    </div>
+                    <div class="form-group" style="margin-top: 12px;">
+                        <label>Key Passphrase <span style="color: var(--text-muted); font-weight: normal;">(only if the key is encrypted)</span></label>
+                        <input type="password" class="form-control" id="cert-install-passphrase" placeholder="Leave empty for unencrypted keys" autocomplete="off">
+                        <small style="color: var(--text-muted);">If your private key starts with <code>-----BEGIN ENCRYPTED PRIVATE KEY-----</code> or contains <code>Proc-Type: 4,ENCRYPTED</code>, paste the passphrase here. The decrypted key is what gets stored on disk — the passphrase is never persisted.</small>
+                    </div>
+                    <button class="btn btn-primary" onclick="installCustomCertificate()" style="margin-top: 12px;">
+                        📥 Install Certificate
+                    </button>
+                </div>
+            </div>
+
             <div class="card" style="margin-top: 20px;">
                 <div class="card-header">
                     <h3>Installed Certificates</h3>

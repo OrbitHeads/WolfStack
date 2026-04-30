@@ -589,16 +589,59 @@ pub async fn auth_check(req: HttpRequest, state: web::Data<AppState>) -> HttpRes
 /// Derive (rp_id, origin) from the inbound request's Host header. Strips the
 /// port for the RP ID; the origin keeps it. Returns an error if the host
 /// header is missing or unparseable.
+///
+/// Reverse-proxy compatibility: when X-Forwarded-Proto is present we trust
+/// it for the scheme (and X-Forwarded-Host for the hostname when set), so
+/// a wolfstack behind nginx/Caddy/Traefik that terminates TLS reports
+/// `https://...` to webauthn-rs even though wolfstack itself only sees a
+/// plain HTTP connection. Without this, the browser presents
+/// origin=https://example.com and we expect origin=http://example.com →
+/// webauthn-rs rejects with an origin mismatch and the user gets a
+/// "host header is incorrect for passkeys" failure.
 fn passkey_rp_origin(req: &HttpRequest, state: &web::Data<AppState>) -> Result<(String, String), String> {
-    let host_hdr = req.headers().get("Host")
-        .and_then(|v| v.to_str().ok())
+    let fwd_host  = req.headers().get("X-Forwarded-Host").and_then(|v| v.to_str().ok());
+    let host      = req.headers().get("Host").and_then(|v| v.to_str().ok());
+    let fwd_proto = req.headers().get("X-Forwarded-Proto").and_then(|v| v.to_str().ok());
+    derive_passkey_rp_origin(host, fwd_host, fwd_proto, state.tls_enabled)
+}
+
+/// Pure function that derives (rp_id, origin) from raw header values.
+/// Factored out of `passkey_rp_origin` so it's unit-testable without
+/// constructing an HttpRequest + full AppState. Behaviour:
+///
+/// - Host comes from X-Forwarded-Host first (reverse proxy preserves original
+///   client Host here), falling back to the Host header.
+/// - Multi-hop proxies produce comma-separated values — take the first entry,
+///   which is the original client-facing value.
+/// - Scheme comes from X-Forwarded-Proto when present and valid (http|https),
+///   otherwise from the local TLS state.
+/// - rp_id is the host with the port stripped; origin keeps the port.
+pub fn derive_passkey_rp_origin(
+    host: Option<&str>,
+    fwd_host: Option<&str>,
+    fwd_proto: Option<&str>,
+    tls_enabled: bool,
+) -> Result<(String, String), String> {
+    let host_hdr = fwd_host
+        .filter(|s| !s.is_empty())
+        .or(host)
         .ok_or_else(|| "Missing Host header".to_string())?;
-    // Strip any port suffix for the RP ID; keep it for the origin.
+    let host_hdr = host_hdr.split(',').next().unwrap_or("").trim();
+    if host_hdr.is_empty() {
+        return Err("Missing Host header".to_string());
+    }
+
     let host_no_port = match host_hdr.rsplit_once(':') {
         Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => h,
         _ => host_hdr,
     };
-    let scheme = if state.tls_enabled { "https" } else { "http" };
+
+    let scheme = fwd_proto
+        .map(|s| s.split(',').next().unwrap_or("").trim())
+        .filter(|s| *s == "http" || *s == "https")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| if tls_enabled { "https".into() } else { "http".into() });
+
     let origin = format!("{}://{}", scheme, host_hdr);
     Ok((host_no_port.to_string(), origin))
 }
@@ -3725,6 +3768,110 @@ pub async fn list_certificates(req: HttpRequest, state: web::Data<AppState>) -> 
     HttpResponse::Ok().json(certs)
 }
 
+#[derive(Deserialize)]
+pub struct CertInstallRequest {
+    pub cert_pem: String,
+    pub key_pem: String,
+    #[serde(default)]
+    pub cert_path: Option<String>,
+    #[serde(default)]
+    pub key_path: Option<String>,
+    /// Passphrase for an encrypted private key (PKCS#8 ENCRYPTED PRIVATE KEY
+    /// or legacy Proc-Type: ENCRYPTED). Optional — required only when the
+    /// pasted key is passphrase-protected. Stored only as long as it takes
+    /// openssl to decrypt the key, never persisted to disk.
+    #[serde(default)]
+    pub key_passphrase: Option<String>,
+}
+
+/// POST /api/certificates/install — write user-supplied PEM cert+key to disk.
+/// Used for both fresh installs and replacing/updating existing certs (e.g.
+/// overwriting the Proxmox pveproxy-ssl pair).
+///
+/// Response includes `restart_service`: the systemd unit the user should
+/// be prompted to restart for the new cert to take effect (`wolfstack` or
+/// `pveproxy`). The frontend opens a confirm modal — we never auto-restart.
+pub async fn install_certificate(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<CertInstallRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let target_cert = body.cert_path.clone().unwrap_or_else(|| "/etc/wolfstack/cert.pem".to_string());
+    let restart_service = installer::restart_service_name_for_cert(&target_cert);
+    match installer::install_certificate_files(
+        &body.cert_pem,
+        &body.key_pem,
+        body.cert_path.as_deref(),
+        body.key_path.as_deref(),
+        body.key_passphrase.as_deref(),
+    ) {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({
+            "message": msg,
+            "restart_service": restart_service,
+        })),
+        Err(e)  => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CertSelfSignedRequest {
+    pub host: String,
+    #[serde(default)]
+    pub alt_names: Vec<String>,
+    #[serde(default)]
+    pub cert_path: Option<String>,
+    #[serde(default)]
+    pub key_path: Option<String>,
+    #[serde(default)]
+    pub days: Option<u32>,
+}
+
+/// POST /api/certificates/self-signed — generate a self-signed cert via openssl.
+pub async fn create_self_signed_certificate(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<CertSelfSignedRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let target_cert = body.cert_path.clone().unwrap_or_else(|| "/etc/wolfstack/cert.pem".to_string());
+    let restart_service = installer::restart_service_name_for_cert(&target_cert);
+    match installer::generate_self_signed_certificate(
+        &body.host,
+        &body.alt_names,
+        body.cert_path.as_deref(),
+        body.key_path.as_deref(),
+        body.days.unwrap_or(825),
+    ) {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({
+            "message": msg,
+            "restart_service": restart_service,
+        })),
+        Err(e)  => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CertRestartRequest {
+    pub service: String,
+}
+
+/// POST /api/certificates/restart-service — explicitly restart wolfstack
+/// or pveproxy after a cert install. Called by the frontend's confirm
+/// modal so the user controls the restart timing. Validated against a
+/// fixed allowlist; arbitrary services are rejected.
+pub async fn cert_restart_service(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<CertRestartRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match installer::restart_cert_service(&body.service) {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+        Err(e)  => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
 // ─── Agent API (server-to-server, no auth required) ───
 
 /// GET /api/agent/status — return this node's status (for remote polling)
@@ -3982,8 +4129,22 @@ pub async fn traceroute_handler(
     let output = match output {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => {
+            // Distinguish "traceroute isn't installed" from any other
+            // spawn failure — the frontend uses `missing_tool` to show
+            // an inline install button instead of a generic error.
+            // Adam Cogswell 2026-04-30: Ubuntu minimal images ship
+            // without traceroute and the previous error gave the user
+            // no in-app remedy.
+            let is_missing = e.kind() == std::io::ErrorKind::NotFound
+                || e.raw_os_error() == Some(2 /* ENOENT */);
             return HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": format!("Failed to run traceroute: {}. Install with: apt install traceroute (Debian/Ubuntu) or dnf install traceroute (RHEL).", e)
+                "error": if is_missing {
+                    "traceroute isn't installed on this host. Click the button below to install it (apt/dnf/pacman), or run the install manually.".to_string()
+                } else {
+                    format!("Failed to run traceroute: {}", e)
+                },
+                "missing_tool": if is_missing { Some("traceroute") } else { None },
+                "install_package": if is_missing { Some("traceroute") } else { None },
             }));
         }
         Err(e) => {
@@ -20949,6 +21110,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // Certificates
         .route("/api/certificates", web::post().to(request_certificate))
         .route("/api/certificates/list", web::get().to(list_certificates))
+        .route("/api/certificates/install", web::post().to(install_certificate))
+        .route("/api/certificates/self-signed", web::post().to(create_self_signed_certificate))
+        .route("/api/certificates/restart-service", web::post().to(cert_restart_service))
         // Containers
         .route("/api/containers/status", web::get().to(container_runtime_status))
         .route("/api/containers/install", web::post().to(install_container_runtime))
@@ -22350,4 +22514,118 @@ pub fn configure_statuspage_only(cfg: &mut web::ServiceConfig) {
         .route("/", web::get().to(statuspage_public_index))
         .route("/status", web::get().to(statuspage_public_index))
         .route("/status/{slug}", web::get().to(statuspage_public_page_dedicated));
+}
+
+#[cfg(test)]
+mod passkey_origin_tests {
+    use super::derive_passkey_rp_origin;
+
+    // Direct local access (no reverse proxy)
+    #[test]
+    fn direct_http_local_no_tls() {
+        let r = derive_passkey_rp_origin(Some("192.168.1.10:8553"), None, None, false).unwrap();
+        assert_eq!(r.0, "192.168.1.10");
+        assert_eq!(r.1, "http://192.168.1.10:8553");
+    }
+    #[test]
+    fn direct_https_local_with_tls() {
+        let r = derive_passkey_rp_origin(Some("wolfstack.local:8553"), None, None, true).unwrap();
+        assert_eq!(r.0, "wolfstack.local");
+        assert_eq!(r.1, "https://wolfstack.local:8553");
+    }
+
+    // Reverse proxy terminating TLS (the bug we just fixed) — wolfstack
+    // itself runs HTTP (tls_enabled=false) but X-Forwarded-Proto says https.
+    // Without the fix, origin would be http:// and webauthn-rs rejects.
+    #[test]
+    fn reverse_proxy_terminating_tls() {
+        let r = derive_passkey_rp_origin(
+            Some("10.0.0.5:8553"),         // wolfstack sees Host as the proxy's upstream
+            Some("wolfstack.example.com"), // X-Forwarded-Host preserved by nginx
+            Some("https"),                 // X-Forwarded-Proto from nginx
+            false,                         // wolfstack itself isn't running TLS
+        ).unwrap();
+        assert_eq!(r.0, "wolfstack.example.com");
+        assert_eq!(r.1, "https://wolfstack.example.com");
+    }
+
+    // Reverse proxy without X-Forwarded-Host (some setups only set proto).
+    #[test]
+    fn reverse_proxy_only_proto() {
+        let r = derive_passkey_rp_origin(
+            Some("wolfstack.example.com"), // proxy has rewritten Host to upstream
+            None,
+            Some("https"),
+            false,
+        ).unwrap();
+        assert_eq!(r.0, "wolfstack.example.com");
+        assert_eq!(r.1, "https://wolfstack.example.com");
+    }
+
+    // Multi-hop proxy chain: X-Forwarded-Host has comma-separated values,
+    // the first is the original client-facing host.
+    #[test]
+    fn multi_hop_takes_first_value() {
+        let r = derive_passkey_rp_origin(
+            Some("internal:8553"),
+            Some("external.example.com, edge-proxy.internal"),
+            Some("https, http"),
+            false,
+        ).unwrap();
+        assert_eq!(r.0, "external.example.com");
+        assert_eq!(r.1, "https://external.example.com");
+    }
+
+    // X-Forwarded-Host empty (some proxies set it to "" rather than dropping it).
+    #[test]
+    fn empty_forwarded_host_falls_back_to_host() {
+        let r = derive_passkey_rp_origin(Some("ws.local:8553"), Some(""), None, false).unwrap();
+        assert_eq!(r.0, "ws.local");
+        assert_eq!(r.1, "http://ws.local:8553");
+    }
+
+    // Bogus X-Forwarded-Proto values are ignored — fall back to local TLS.
+    #[test]
+    fn bogus_proto_falls_back() {
+        let r = derive_passkey_rp_origin(Some("ws.local"), None, Some("garbage"), true).unwrap();
+        assert_eq!(r.1, "https://ws.local");
+        let r = derive_passkey_rp_origin(Some("ws.local"), None, Some("ftp"), false).unwrap();
+        assert_eq!(r.1, "http://ws.local");
+    }
+
+    // Strip port for rp_id, keep port in origin.
+    #[test]
+    fn port_handling() {
+        let r = derive_passkey_rp_origin(Some("host.example.com:8553"), None, None, true).unwrap();
+        assert_eq!(r.0, "host.example.com");
+        assert_eq!(r.1, "https://host.example.com:8553");
+    }
+
+    // No Host at all → error (we can't construct an origin without one).
+    #[test]
+    fn missing_host_errors() {
+        let r = derive_passkey_rp_origin(None, None, None, false);
+        assert!(r.is_err());
+    }
+    #[test]
+    fn empty_host_errors() {
+        let r = derive_passkey_rp_origin(Some(""), Some(""), None, false);
+        assert!(r.is_err());
+    }
+
+    // IPv6 in host: rsplit_once(':') would chop on every colon. Verify the
+    // "all-digits port" check protects IPv6 literals like [::1]:8553 from
+    // being mangled. (The Host header for IPv6 is bracketed.)
+    #[test]
+    fn ipv6_host_with_port() {
+        let r = derive_passkey_rp_origin(Some("[::1]:8553"), None, None, false).unwrap();
+        assert_eq!(r.0, "[::1]");
+        assert_eq!(r.1, "http://[::1]:8553");
+    }
+    #[test]
+    fn ipv6_host_no_port() {
+        let r = derive_passkey_rp_origin(Some("[fe80::1]"), None, None, false).unwrap();
+        assert_eq!(r.0, "[fe80::1]");
+        assert_eq!(r.1, "http://[fe80::1]");
+    }
 }
