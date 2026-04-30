@@ -281,7 +281,7 @@
 - OIDC/SSO
 - WolfHost (web hosting platform)
 - WolfCustom (white-label branding)
-- License: £79/$99 per server per month
+- License: £79/$99 per installation per month +VAT (one "installation" = one WolfStack install on one host; e.g. 5 hosts running WolfStack = 5 installations = 5 × £79/month)
 - License propagation: install on one node, all cluster nodes pick it up automatically
 
 ## Plugin System

@@ -654,14 +654,31 @@ fn scan_pve_certificates() -> Vec<(String, String, String)> {
     results
 }
 
+/// Locations under /etc/wolfstack where a user might naturally place their
+/// own cert+key. We probe all of these on startup and from the
+/// Certificates page so a manual `cp cert.pem /etc/wolfstack/tls/` works
+/// without an explicit ExecStart override (NyvenZA's v22.6.8 issue).
+///
+/// Each entry is (label, cert_path, key_path). Order matters — the first
+/// pair where BOTH files exist is what gets used by `find_tls_certificate`.
+fn wolfstack_local_cert_paths() -> &'static [(&'static str, &'static str, &'static str)] {
+    &[
+        ("wolfstack (custom)",         "/etc/wolfstack/cert.pem",            "/etc/wolfstack/key.pem"),
+        ("wolfstack (tls/)",           "/etc/wolfstack/tls/cert.pem",        "/etc/wolfstack/tls/key.pem"),
+        ("wolfstack (tls/ fullchain)", "/etc/wolfstack/tls/fullchain.pem",   "/etc/wolfstack/tls/privkey.pem"),
+        ("wolfstack (ssl/)",           "/etc/wolfstack/ssl/cert.pem",        "/etc/wolfstack/ssl/key.pem"),
+        ("wolfstack (ssl/ fullchain)", "/etc/wolfstack/ssl/fullchain.pem",   "/etc/wolfstack/ssl/privkey.pem"),
+    ]
+}
+
 /// Find TLS certificate files for a domain (Let's Encrypt or /etc/wolfstack/)
 /// Returns (cert_path, key_path) if both exist
 pub fn find_tls_certificate(domain: Option<&str>) -> Option<(String, String)> {
-    // Check explicit /etc/wolfstack/ paths first
-    let ws_cert = "/etc/wolfstack/cert.pem";
-    let ws_key = "/etc/wolfstack/key.pem";
-    if std::path::Path::new(ws_cert).exists() && std::path::Path::new(ws_key).exists() {
-        return Some((ws_cert.to_string(), ws_key.to_string()));
+    // Check the WolfStack-local cert locations first (cert.pem, tls/, ssl/, etc.)
+    for (_label, cert, key) in wolfstack_local_cert_paths() {
+        if std::path::Path::new(cert).exists() && std::path::Path::new(key).exists() {
+            return Some((cert.to_string(), key.to_string()));
+        }
     }
 
     // Try certbot CLI first
@@ -710,28 +727,30 @@ pub fn list_certificates() -> serde_json::Value {
     let mut seen = std::collections::HashSet::new();
     let mut diagnostics: Vec<String> = Vec::new();
 
-    // 1. Check /etc/wolfstack/ custom certs — both files required
-    let ws_cert = "/etc/wolfstack/cert.pem";
-    let ws_key = "/etc/wolfstack/key.pem";
-    let ws_cert_exists = std::path::Path::new(ws_cert).exists();
-    let ws_key_exists  = std::path::Path::new(ws_key).exists();
-    if ws_cert_exists && ws_key_exists {
-        seen.insert(ws_cert.to_string());
-        results.push(serde_json::json!({
-            "domain": "wolfstack (custom)",
-            "cert_path": ws_cert,
-            "key_path": ws_key,
-            "source": "custom",
-            "valid": true,
-        }));
-    } else if ws_cert_exists != ws_key_exists {
-        // Common manual-install footgun: only one of the two files placed,
-        // or named differently. Surface it instead of silently ignoring.
-        let missing = if ws_cert_exists { ws_key } else { ws_cert };
-        diagnostics.push(format!(
-            "⚠️ Found one of /etc/wolfstack/cert.pem and /etc/wolfstack/key.pem but not both — missing {}. The cert will not be loaded until both files exist.",
-            missing
-        ));
+    // 1. Check every WolfStack-local cert location (cert.pem, tls/, ssl/, etc.)
+    // — both files of each pair required. For pairs where only one of the
+    // two files exists, surface a diagnostic so the user knows the partial
+    // install isn't being silently ignored.
+    for (label, cert_path, key_path) in wolfstack_local_cert_paths() {
+        let cert_exists = std::path::Path::new(cert_path).exists();
+        let key_exists  = std::path::Path::new(key_path).exists();
+        if cert_exists && key_exists {
+            if seen.contains(*cert_path) { continue; }
+            seen.insert(cert_path.to_string());
+            results.push(serde_json::json!({
+                "domain": label,
+                "cert_path": cert_path,
+                "key_path": key_path,
+                "source": "custom",
+                "valid": true,
+            }));
+        } else if cert_exists != key_exists {
+            let missing = if cert_exists { key_path } else { cert_path };
+            diagnostics.push(format!(
+                "⚠️ Found one of {} and {} but not both — missing {}. The cert will not be loaded until both files exist.",
+                cert_path, key_path, missing
+            ));
+        }
     }
 
     // 2. Certbot CLI
@@ -793,6 +812,10 @@ pub fn list_certificates() -> serde_json::Value {
 /// Anything else is rejected to prevent path traversal or accidental writes
 /// to arbitrary locations like /etc/ssl/certs which are managed by the OS.
 fn cert_target_allowed(cert_path: &str, key_path: &str) -> Result<(), String> {
+    // /etc/wolfstack/ already covers /etc/wolfstack/tls/ and /etc/wolfstack/ssl/
+    // because the prefix match accepts subdirectories. We list it here for
+    // clarity; both `find_tls_certificate` and `list_certificates` actively
+    // probe those subdirectories so the cert-install UI can target them.
     #[cfg(not(test))]
     let allowed_prefixes: &[&str] = &[
         "/etc/wolfstack/",
@@ -1355,6 +1378,36 @@ mod cert_tests {
         assert!(cert_target_allowed(
             "/etc/wolfstack/../passwd", "/etc/wolfstack/key.pem"
         ).is_err());
+    }
+    #[test]
+    fn whitelist_accepts_wolfstack_subdirectories() {
+        // NyvenZA's path — /etc/wolfstack/tls/ is a natural place users put
+        // certs and the cert-install UI must accept it as a write target.
+        assert!(cert_target_allowed(
+            "/etc/wolfstack/tls/cert.pem", "/etc/wolfstack/tls/key.pem"
+        ).is_ok());
+        assert!(cert_target_allowed(
+            "/etc/wolfstack/ssl/fullchain.pem", "/etc/wolfstack/ssl/privkey.pem"
+        ).is_ok());
+    }
+
+    #[test]
+    fn local_cert_paths_table_includes_tls_and_ssl_subdirs() {
+        // Regression test for NyvenZA — the bug was that the discovery code
+        // only looked at /etc/wolfstack/cert.pem and /etc/wolfstack/key.pem,
+        // ignoring /etc/wolfstack/tls/ entirely. Verify the path table that
+        // both find_tls_certificate and list_certificates iterate over now
+        // includes the tls/ and ssl/ subdirectories.
+        let paths = wolfstack_local_cert_paths();
+        let cert_paths: Vec<&str> = paths.iter().map(|(_, c, _)| *c).collect();
+        assert!(cert_paths.contains(&"/etc/wolfstack/cert.pem"),
+            "must keep the original /etc/wolfstack/cert.pem entry");
+        assert!(cert_paths.contains(&"/etc/wolfstack/tls/cert.pem"),
+            "must probe /etc/wolfstack/tls/cert.pem (NyvenZA's path)");
+        assert!(cert_paths.contains(&"/etc/wolfstack/tls/fullchain.pem"),
+            "must probe /etc/wolfstack/tls/fullchain.pem (Let's-Encrypt-style naming)");
+        assert!(cert_paths.contains(&"/etc/wolfstack/ssl/cert.pem"),
+            "must probe /etc/wolfstack/ssl/cert.pem (alt convention)");
     }
 
     // ─── generate_self_signed_certificate ─────────────────────────────────

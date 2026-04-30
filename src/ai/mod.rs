@@ -551,13 +551,13 @@ impl AiAgent {
                     call_gemini(&self.client, &config.gemini_api_key, &config.model, &system_prompt, &history, &current_msg).await?
                 }
                 "openrouter" => {
-                    call_local(&self.client, "https://openrouter.ai/api/v1", &config.openrouter_api_key, &config.model, &system_prompt, &history, &current_msg).await?
+                    call_local_with_tools(&self.client, "https://openrouter.ai/api/v1", &config.openrouter_api_key, &config.model, &system_prompt, &history, &current_msg).await?
                 }
                 "openai" => {
-                    call_local(&self.client, "https://api.openai.com/v1", &config.openai_api_key, &config.model, &system_prompt, &history, &current_msg).await?
+                    call_local_with_tools(&self.client, "https://api.openai.com/v1", &config.openai_api_key, &config.model, &system_prompt, &history, &current_msg).await?
                 }
                 "local" => {
-                    call_local(&self.client, &config.local_url, &config.local_api_key, &config.model, &system_prompt, &history, &current_msg).await?
+                    call_local_with_tools(&self.client, &config.local_url, &config.local_api_key, &config.model, &system_prompt, &history, &current_msg).await?
                 }
                 _ => {
                     call_claude(&self.client, &config.claude_api_key, &config.model, &system_prompt, &history, &current_msg).await?
@@ -2012,6 +2012,190 @@ pub async fn simple_chat(
 
 /// Call a local/self-hosted AI via the OpenAI-compatible chat completions API.
 /// Works with: Ollama, LM Studio, LocalAI, vLLM, text-generation-webui, llama.cpp server.
+/// Build the OpenAI-compatible `tools` array that mirrors WolfStack's
+/// bracket-tag tools ([EXEC], [EXEC_ALL], [READ], [WEBSEARCH], [FETCH],
+/// [SECURITY_AUDIT], [WOLFNOTE], [ACTION]).
+///
+/// Why this exists: small function-calling-specific models (FunctionGemma,
+/// Gorilla, NexusRaven, Hermes-Function-Calling) IGNORE prose tool
+/// descriptions in the system prompt — they only invoke from the
+/// structured `tools` parameter. Without this, FunctionGemma:latest
+/// (270M) self-reports "I'm limited to WolfRun and WolfNote" because
+/// nothing in the OpenAI request body tells it about list_containers,
+/// list_nodes, etc. (Gary's Discord debug 2026-04-30.)
+///
+/// Larger general-purpose models (gpt-4, claude-sonnet, gemini-pro) also
+/// see this — they may use either the structured tool calls OR the
+/// bracket-tag prose. Both paths are converted to bracket tags before
+/// the response is returned, so the existing tool-execution loop in
+/// `chat()` works unchanged.
+fn openai_tools_schema() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "exec_local",
+                "description": "Run a read-only shell command on the local WolfStack node. Use for ls, cat, ps, df, lscpu, systemctl status, docker ps, lxc-ls, ip route, and similar. Destructive commands (rm, kill, reboot, mv) are blocked.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "description": "The shell command to run." }
+                    },
+                    "required": ["command"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "exec_all",
+                "description": "Run a read-only shell command on EVERY WolfStack node in the cluster (including Proxmox nodes). Use when the user asks about a remote node or wants a cluster-wide view. Output is labelled by hostname.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "description": "The shell command to run on every node." }
+                    },
+                    "required": ["command"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a WolfStack config or log file from a curated allow-list. Safer than exec_local cat — credentials (cluster secret, TLS private keys, join token, license key) are unconditionally denied; symlink escape blocked; 64 KB cap.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Absolute path to the file, e.g. /etc/wolfstack/router.json." }
+                    },
+                    "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web (DuckDuckGo). Returns the top 5 results as title + URL + snippet. Use for package names, distro quirks, Docker/Proxmox docs — anything outside the WolfStack codebase or current server state.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Search query." }
+                    },
+                    "required": ["query"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "fetch_url",
+                "description": "Fetch the text content of a URL (up to 8000 chars). Loopback and private-range addresses are refused. Typical workflow: web_search → pick a result → fetch_url that result → summarise.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "Public HTTP/HTTPS URL to fetch." }
+                    },
+                    "required": ["url"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "security_audit",
+                "description": "Run the built-in security audit. Checks /etc/wolfstack file permissions, default cluster secret usage, Docker container restart policies, and more. Returns a plain-text report.",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "wolfnote_create",
+                "description": "Create a note in the user's WolfNote account. Use when the user explicitly asks you to save, document, log, or 'remember' something.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string", "description": "Descriptive note title." },
+                        "content": { "type": "string", "description": "Note body — plain text or simple HTML." }
+                    },
+                    "required": ["title", "content"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "propose_action",
+                "description": "Propose a fix for a problem. The user sees an Approve/Dismiss button — the command runs ONLY after they approve. Use for any fix the user might want to apply.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id":      { "type": "string", "description": "Unique ID for this action card." },
+                        "title":   { "type": "string", "description": "Short title shown on the card." },
+                        "risk":    { "type": "string", "enum": ["low", "medium", "high"], "description": "low = restart/reload, medium = config change/install, high = disk/network/user change." },
+                        "explain": { "type": "string", "description": "Why this fixes the problem." },
+                        "target":  { "type": "string", "enum": ["local", "all"], "description": "local = this node, all = every cluster node." },
+                        "command": { "type": "string", "description": "The shell command to run if approved." }
+                    },
+                    "required": ["id", "title", "risk", "explain", "target", "command"]
+                }
+            }
+        }
+    ])
+}
+
+/// Translate a single OpenAI `tool_call` (from a function-calling model's
+/// response) into the equivalent WolfStack bracket-tag the rest of the
+/// agent loop already knows how to execute. This is the bridge that lets
+/// FunctionGemma / Gorilla / etc. drive the same execution machinery as
+/// prose-tag models.
+///
+/// Returns None if the tool name is unrecognised or arguments are malformed,
+/// so a hallucinating model can't slip an arbitrary tag through.
+fn tool_call_to_bracket(name: &str, args: &serde_json::Value) -> Option<String> {
+    let s = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    match name {
+        "exec_local"  => { let c = s("command"); if c.is_empty() { None } else { Some(format!("[EXEC]{}[/EXEC]", c)) } },
+        "exec_all"    => { let c = s("command"); if c.is_empty() { None } else { Some(format!("[EXEC_ALL]{}[/EXEC_ALL]", c)) } },
+        "read_file"   => { let p = s("path");    if p.is_empty() { None } else { Some(format!("[READ path=\"{}\"][/READ]", p.replace('"', "\\\""))) } },
+        "web_search"  => { let q = s("query");   if q.is_empty() { None } else { Some(format!("[WEBSEARCH query=\"{}\"][/WEBSEARCH]", q.replace('"', "\\\""))) } },
+        "fetch_url"   => { let u = s("url");     if u.is_empty() { None } else { Some(format!("[FETCH url=\"{}\"][/FETCH]", u.replace('"', "\\\""))) } },
+        "security_audit" => Some("[SECURITY_AUDIT][/SECURITY_AUDIT]".to_string()),
+        "wolfnote_create" => {
+            let title = s("title");
+            let content = s("content");
+            if title.is_empty() || content.is_empty() { None }
+            else { Some(format!("[WOLFNOTE title=\"{}\"]{}[/WOLFNOTE]", title.replace('"', "\\\""), content)) }
+        },
+        "propose_action" => {
+            let id = s("id"); let title = s("title"); let risk = s("risk");
+            let explain = s("explain"); let target = s("target"); let command = s("command");
+            if [id, title, risk, explain, target, command].iter().any(|v| v.is_empty()) { None }
+            else {
+                Some(format!(
+                    "[ACTION id=\"{}\" title=\"{}\" risk=\"{}\" explain=\"{}\" target=\"{}\"]{}[/ACTION]",
+                    id.replace('"', "\\\""),
+                    title.replace('"', "\\\""),
+                    risk,
+                    explain.replace('"', "\\\""),
+                    target,
+                    command,
+                ))
+            }
+        },
+        _ => None, // Unknown tool name from a hallucinating model — drop it.
+    }
+}
+
+/// Compatibility wrapper preserving the old call_local signature for
+/// scoped callers that don't want function-calling. Sends a plain
+/// chat/completions request — no `tools` field. Used by the
+/// health-recommend, issue-explain, and call_ai_simple paths where the
+/// caller deliberately scopes the model to a narrow task and doesn't
+/// want it to invoke arbitrary tools (e.g. health-recommend should
+/// produce text + ACTION tags, not run shell commands directly).
 async fn call_local(
     client: &reqwest::Client,
     base_url: &str,
@@ -2020,6 +2204,41 @@ async fn call_local(
     system: &str,
     history: &[ChatMessage],
     user_msg: &str,
+) -> Result<String, String> {
+    call_local_inner(client, base_url, api_key, model, system, history, user_msg, false).await
+}
+
+/// Function-calling variant of `call_local`. Sends the OpenAI-compatible
+/// `tools` schema so small function-calling-specific models
+/// (FunctionGemma, Gorilla, NexusRaven, Hermes-FC) can invoke tools they'd
+/// otherwise ignore in the prose-tag system prompt. Tool calls in the
+/// response are translated back to bracket-tag form before returning,
+/// so the tool-execution loop in `chat()` works without changes.
+///
+/// This is what the agent's main chat loop uses; scoped contexts
+/// (health-recommend, etc.) keep using `call_local` to avoid letting
+/// the model break out of its narrow scope.
+async fn call_local_with_tools(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    system: &str,
+    history: &[ChatMessage],
+    user_msg: &str,
+) -> Result<String, String> {
+    call_local_inner(client, base_url, api_key, model, system, history, user_msg, true).await
+}
+
+async fn call_local_inner(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    system: &str,
+    history: &[ChatMessage],
+    user_msg: &str,
+    with_tools: bool,
 ) -> Result<String, String> {
     if base_url.is_empty() {
         return Err("Local AI URL not configured — set it in Settings → AI Agent".to_string());
@@ -2053,12 +2272,35 @@ async fn call_local(
         "content": user_msg
     }));
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "messages": messages,
         "max_tokens": 4096,
         "temperature": 0.7,
     });
+
+    if with_tools {
+        let tools_schema = openai_tools_schema();
+        // Debug log so the next "why can't the AI use tool X" report is
+        // diagnosable in seconds — see what was actually offered to the model.
+        if let Some(arr) = tools_schema.as_array() {
+            let names: Vec<&str> = arr.iter()
+                .filter_map(|t| t["function"]["name"].as_str())
+                .collect();
+            tracing::debug!(
+                target: "wolfstack::ai",
+                "call_local: offering {} tools to model={} url={}: {:?}",
+                names.len(), model, url, names
+            );
+        }
+        body["tools"] = tools_schema;
+        body["tool_choice"] = serde_json::json!("auto");
+    } else {
+        tracing::debug!(
+            target: "wolfstack::ai",
+            "call_local: bare chat (no tools) — model={} url={}", model, url
+        );
+    }
 
     let mut req = client.post(&url)
         .header("content-type", "application/json")
@@ -2076,13 +2318,105 @@ async fn call_local(
     let text = resp.text().await.map_err(|e| format!("Local AI response error: {}", e))?;
 
     if !status.is_success() {
+        // Some endpoints (older Ollama, some llama.cpp builds) reject the
+        // `tools` field with a 400. Retry once without it so basic chat
+        // still works on those servers; FC won't but at least the user
+        // gets a response.
+        let body_lower = text.to_lowercase();
+        let looks_like_tools_rejection = with_tools && status.as_u16() == 400 && (
+            body_lower.contains("tools") ||
+            body_lower.contains("tool_choice") ||
+            body_lower.contains("unknown field") ||
+            body_lower.contains("unsupported")
+        );
+        if looks_like_tools_rejection {
+            tracing::debug!(
+                target: "wolfstack::ai",
+                "call_local: server rejected `tools` field — retrying without it (model={})", model
+            );
+            return call_local_no_tools(client, &url, api_key, model, system, history, user_msg).await;
+        }
         return Err(format!("Local AI returned {} — {}", status, text.chars().take(500).collect::<String>()));
     }
 
     let json: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| format!("Local AI JSON parse error: {}", e))?;
 
-    // OpenAI format: {"choices": [{"message": {"content": "..."}}]}
+    // OpenAI format: {"choices": [{"message": {"content": "...", "tool_calls": [...]}}]}
+    let msg = &json["choices"][0]["message"];
+    let mut combined = msg["content"].as_str().unwrap_or("").to_string();
+
+    if with_tools {
+        // Translate any structured tool_calls into bracket tags so the
+        // tool-execution loop in chat() (which scans for [EXEC] etc.) handles
+        // them uniformly, regardless of which model variety produced them.
+        if let Some(tool_calls) = msg["tool_calls"].as_array() {
+            for tc in tool_calls {
+                let name = tc["function"]["name"].as_str().unwrap_or("");
+                // Arguments arrive as a JSON-encoded string per the OpenAI spec.
+                let args_raw = tc["function"]["arguments"].as_str().unwrap_or("{}");
+                let args: serde_json::Value = serde_json::from_str(args_raw)
+                    .unwrap_or(serde_json::json!({}));
+                if let Some(tag) = tool_call_to_bracket(name, &args) {
+                    if !combined.is_empty() && !combined.ends_with('\n') {
+                        combined.push('\n');
+                    }
+                    combined.push_str(&tag);
+                }
+            }
+        }
+    }
+
+    if combined.is_empty() {
+        return Err(format!("Unexpected local AI response format: {}", text.chars().take(200).collect::<String>()));
+    }
+    Ok(combined)
+}
+
+/// Fallback used when an OpenAI-compatible server rejects the `tools`
+/// field (older Ollama / llama.cpp builds). Plain chat completion, no
+/// function-calling — model still gets the prose-tag instructions in
+/// the system prompt.
+async fn call_local_no_tools(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    model: &str,
+    system: &str,
+    history: &[ChatMessage],
+    user_msg: &str,
+) -> Result<String, String> {
+    let mut messages = vec![
+        serde_json::json!({"role": "system", "content": system})
+    ];
+    for msg in history {
+        messages.push(serde_json::json!({"role": msg.role, "content": msg.content}));
+    }
+    messages.push(serde_json::json!({"role": "user", "content": user_msg}));
+
+    let body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "max_tokens": 4096,
+        "temperature": 0.7,
+    });
+
+    let mut req = client.post(url)
+        .header("content-type", "application/json")
+        .json(&body);
+    if !api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", api_key));
+    }
+
+    let resp = req.send().await
+        .map_err(|e| format!("Local AI connection failed ({}): {}", url, e))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| format!("Local AI response error: {}", e))?;
+    if !status.is_success() {
+        return Err(format!("Local AI returned {} — {}", status, text.chars().take(500).collect::<String>()));
+    }
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("Local AI JSON parse error: {}", e))?;
     json["choices"][0]["message"]["content"]
         .as_str()
         .map(|s| s.to_string())
@@ -3062,4 +3396,152 @@ fn run_security_audit() -> String {
     }
 
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tool_calling_tests {
+    use super::*;
+
+    /// The schema must mirror every bracket-tag tool the existing prose-mode
+    /// agent supports — otherwise small function-calling models silently
+    /// lose access to whatever's missing. This is the regression test for
+    /// the FunctionGemma "I'm limited to WolfRun and WolfNote" bug.
+    #[test]
+    fn schema_lists_every_tool() {
+        let schema = openai_tools_schema();
+        let arr = schema.as_array().expect("schema must be array");
+        let names: Vec<&str> = arr.iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+
+        // Every tool the bracket-tag system supports must have a schema entry.
+        for required in &[
+            "exec_local",
+            "exec_all",
+            "read_file",
+            "web_search",
+            "fetch_url",
+            "security_audit",
+            "wolfnote_create",
+            "propose_action",
+        ] {
+            assert!(names.contains(required),
+                "tools schema must expose `{}` to function-calling models — \
+                 otherwise small models like FunctionGemma can't invoke it. \
+                 Currently exposed: {:?}", required, names);
+        }
+    }
+
+    #[test]
+    fn schema_entries_have_complete_function_definitions() {
+        // OpenAI function-calling spec: each tool needs type=function and
+        // a function with name + description + parameters object.
+        // Models reject the request if any of these are missing.
+        let schema = openai_tools_schema();
+        for tool in schema.as_array().unwrap() {
+            assert_eq!(tool["type"], "function");
+            let f = &tool["function"];
+            assert!(f["name"].is_string(), "missing function.name in {:?}", tool);
+            assert!(f["description"].is_string(), "missing function.description in {:?}", tool);
+            assert_eq!(f["parameters"]["type"], "object",
+                "function.parameters.type must be 'object' in {:?}", tool);
+        }
+    }
+
+    #[test]
+    fn translate_exec_local_to_bracket() {
+        let args = serde_json::json!({"command": "ls /etc/wolfstack"});
+        let out = tool_call_to_bracket("exec_local", &args).unwrap();
+        assert_eq!(out, "[EXEC]ls /etc/wolfstack[/EXEC]");
+    }
+
+    #[test]
+    fn translate_exec_all_to_bracket() {
+        let args = serde_json::json!({"command": "docker ps"});
+        let out = tool_call_to_bracket("exec_all", &args).unwrap();
+        assert_eq!(out, "[EXEC_ALL]docker ps[/EXEC_ALL]");
+    }
+
+    #[test]
+    fn translate_read_file_with_quote_escape() {
+        let args = serde_json::json!({"path": "/etc/wolfstack/router.json"});
+        let out = tool_call_to_bracket("read_file", &args).unwrap();
+        assert_eq!(out, "[READ path=\"/etc/wolfstack/router.json\"][/READ]");
+    }
+
+    #[test]
+    fn translate_web_search() {
+        let args = serde_json::json!({"query": "proxmox vs wolfstack"});
+        let out = tool_call_to_bracket("web_search", &args).unwrap();
+        assert_eq!(out, "[WEBSEARCH query=\"proxmox vs wolfstack\"][/WEBSEARCH]");
+    }
+
+    #[test]
+    fn translate_fetch_url() {
+        let args = serde_json::json!({"url": "https://example.com/docs"});
+        let out = tool_call_to_bracket("fetch_url", &args).unwrap();
+        assert_eq!(out, "[FETCH url=\"https://example.com/docs\"][/FETCH]");
+    }
+
+    #[test]
+    fn translate_security_audit_no_args() {
+        let args = serde_json::json!({});
+        let out = tool_call_to_bracket("security_audit", &args).unwrap();
+        assert_eq!(out, "[SECURITY_AUDIT][/SECURITY_AUDIT]");
+    }
+
+    #[test]
+    fn translate_wolfnote() {
+        let args = serde_json::json!({"title": "Cluster health 2026-04-30", "content": "All nodes green."});
+        let out = tool_call_to_bracket("wolfnote_create", &args).unwrap();
+        assert!(out.starts_with("[WOLFNOTE title=\"Cluster health 2026-04-30\"]"));
+        assert!(out.ends_with("[/WOLFNOTE]"));
+        assert!(out.contains("All nodes green."));
+    }
+
+    #[test]
+    fn translate_propose_action() {
+        let args = serde_json::json!({
+            "id": "fix-dns",
+            "title": "Fix DNS",
+            "risk": "medium",
+            "explain": "/etc/resolv.conf is empty",
+            "target": "local",
+            "command": "echo 'nameserver 8.8.8.8' > /etc/resolv.conf"
+        });
+        let out = tool_call_to_bracket("propose_action", &args).unwrap();
+        assert!(out.starts_with("[ACTION id=\"fix-dns\""));
+        assert!(out.contains("risk=\"medium\""));
+        assert!(out.contains("target=\"local\""));
+        assert!(out.ends_with("[/ACTION]"));
+    }
+
+    #[test]
+    fn translate_unknown_tool_returns_none() {
+        // A hallucinating model invoking a tool we don't define must NOT
+        // produce a bracket tag the executor would then run.
+        let out = tool_call_to_bracket("rm_rf", &serde_json::json!({"path": "/"}));
+        assert!(out.is_none(), "unknown tool name must yield None");
+    }
+
+    #[test]
+    fn translate_missing_required_arg_returns_none() {
+        // exec_local with no `command` argument is a malformed call —
+        // we return None rather than emitting [EXEC][/EXEC] which would
+        // run an empty command.
+        let out = tool_call_to_bracket("exec_local", &serde_json::json!({}));
+        assert!(out.is_none());
+
+        let out = tool_call_to_bracket("propose_action", &serde_json::json!({"id":"x"}));
+        assert!(out.is_none(), "propose_action without all required fields must be rejected");
+    }
+
+    #[test]
+    fn translate_escapes_quotes_in_string_args() {
+        // A path with a literal " in it would otherwise break out of the
+        // attribute value and confuse the bracket-tag parser.
+        let args = serde_json::json!({"path": "/tmp/a\"b.json"});
+        let out = tool_call_to_bracket("read_file", &args).unwrap();
+        assert!(out.contains("\\\""), "quote in path must be escaped, got: {}", out);
+    }
 }
