@@ -1732,7 +1732,10 @@
             unlock(); return;
         }
         if (dnsMode === 'wolf_router' && listenPort !== 53 && !extServerRaw) {
-            say('❌', 'Listen port isn\'t 53, so clients need another DNS IP to use — fill in the "DNS server advertised to clients" field (Advanced section). Save aborted.', '#ef4444');
+            say('❌',
+                'Listen port isn\'t 53, so clients need a DNS IP they can reach on :53 — fill in the "DNS server advertised to clients" field (Advanced section).<br><br>' +
+                '<strong>This is just a reference IP — it doesn\'t need to be running yet.</strong> Set it to your AdGuard/Pi-hole container\'s planned IP (e.g. <code>172.17.0.5</code>). Save will move dnsmasq off :53, freeing it for AdGuard to bind. Only then does AdGuard need to actually be up.',
+                '#ef4444');
             unlock(); return;
         }
         lan.dns = Object.assign(lan.dns || {}, {
@@ -5920,9 +5923,15 @@
             let anyFailed = false;
             for (const cl of createdLans) {
                 try {
+                    // Pass the LAN's actual listen_port so we don't hit
+                    // the misleading "Connection refused on :53" error
+                    // when the LAN is on a non-standard port (5353
+                    // etc., when AdGuard/Pi-hole takes :53). Default
+                    // to 53 when not set.
+                    const probePort = (cl.listenPort && cl.listenPort > 0) ? cl.listenPort : 53;
                     const r = await fetch(wrUrl('/api/router/test-dns'), {
                         method: 'POST', headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ router_ip: cl.routerIp, hostname: 'cloudflare.com' }),
+                        body: JSON.stringify({ router_ip: cl.routerIp, hostname: 'cloudflare.com', port: probePort }),
                     });
                     const j = await r.json();
                     if (j.success) {
@@ -6291,6 +6300,9 @@
                 ${head}
                 <div style="font-size:12px; margin-top:6px;">
                     dnsmasq is on :53 for this LAN. Move it off to let a container own :53 on <code>${escHtml(lan.interface)}</code>.
+                </div>
+                <div style="font-size:11px; color:var(--text-muted); margin-top:4px; line-height:1.5;">
+                    💡 The "Advertise DNS" IP doesn't need to be running yet — it's just a future reference DHCP will hand out to clients. Set it to your AdGuard/Pi-hole container's planned IP, click Apply, and dnsmasq will move off :53 — freeing it for AdGuard to bind. <strong>Then</strong> start AdGuard on that IP.
                 </div>
                 <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:6px;">
                     <label style="font-size:12px; color:var(--text-muted); display:flex; gap:6px; align-items:center;">

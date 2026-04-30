@@ -696,10 +696,16 @@ fn validate_segment(seg: &LanSegment) -> Result<(), String> {
                 && seg.dns.external_server.as_deref().map(str::trim).unwrap_or("").is_empty()
             {
                 return Err(
-                    "When listen_port isn't 53, external_server must be set so \
-                     DHCP can advertise a DNS server clients can reach on the \
-                     standard port. (WolfRouter's own DNS would be on a \
-                     non-standard port that DHCP option 6 can't signal.)"
+                    "When listen_port isn't 53, external_server must be set — DHCP option 6 \
+                     can only advertise a DNS resolver on the standard port :53, so clients \
+                     need to be pointed at a separate resolver IP they can reach there. \
+                     Typical setup: AdGuard Home or Pi-hole running in a container on this \
+                     host with port 53 mapped, e.g. 172.17.0.5. \n\n\
+                     IMPORTANT: this IP doesn't have to be running yet — it's just a string \
+                     reference DHCP will hand out to clients. Set it to your AdGuard/Pi-hole \
+                     container's planned IP, save this LAN, and dnsmasq will move off :53 — \
+                     freeing it for AdGuard. Only THEN does AdGuard need to actually be up. \
+                     (PapaSchlumpf 2026-04-30: this resolves the chicken-and-egg.)"
                         .into(),
                 );
             }
@@ -3372,9 +3378,21 @@ pub struct TestDnsRequest {
     /// exist regardless of the user's upstream forwarder choice.
     #[serde(default = "default_test_hostname")]
     pub hostname: String,
+    /// Optional port for the dig query. Defaults to 53. Frontends that
+    /// know the LAN's `dns.listen_port` should pass it explicitly so
+    /// the test probes the actual dnsmasq listener — without this,
+    /// LANs on a non-standard port (5353 etc., common when AdGuard or
+    /// Pi-hole takes :53 in front of WolfRouter) get misleading
+    /// "Connection refused on :53" failures even though dnsmasq is
+    /// happily bound on the configured port. PapaSchlumpf 2026-04-30:
+    /// "the health check blocks it because nothing else is listening
+    /// on port 53 ... non-resolvable circle".
+    #[serde(default = "default_test_port")]
+    pub port: u16,
 }
 
 fn default_test_hostname() -> String { "cloudflare.com".into() }
+fn default_test_port() -> u16 { 53 }
 
 /// POST /api/router/test-dns — fire a single DNS query at a LAN's
 /// router IP and report whether dnsmasq is actually answering. The
@@ -3415,10 +3433,12 @@ pub async fn test_dns(
         }));
     }
 
+    let port = if r.port == 0 { 53 } else { r.port };
     let start = std::time::Instant::now();
     let out = std::process::Command::new("dig")
         .args([
             &format!("@{}", r.router_ip),
+            "-p", &port.to_string(),
             hostname,
             "+short", "+time=3", "+tries=1",
         ])
@@ -3443,11 +3463,13 @@ pub async fn test_dns(
                 // No usable answer. Craft a message that points at the
                 // likely cause: dnsmasq not bound (:53 already taken by
                 // systemd-resolved or another resolver), or upstream
-                // forwarder unreachable from the host.
+                // forwarder unreachable from the host. Reports against
+                // the actual queried port (not hardcoded :53) so LANs
+                // on a non-standard port don't get misleading errors.
                 let err = if stderr.contains("connection refused") || stdout.contains("connection refused") {
-                    format!("Connection refused on {}:53 — dnsmasq isn't listening. Likely cause: another resolver holds :53 (run `ss -tulnp | grep :53` on the host).", r.router_ip)
+                    format!("Connection refused on {}:{} — dnsmasq isn't listening on that port. Run `ss -tulnp 'sport = :{}'` on the host to see what (if anything) holds it.", r.router_ip, port, port)
                 } else if stderr.contains("timed out") || stdout.contains("timed out") || stdout.is_empty() {
-                    format!("No answer from {}:53 within 3s — dnsmasq may not be bound on the LAN interface, or a firewall rule is blocking port 53. Check `systemctl status` / `iptables -L WOLFROUTER_IN -nv`.", r.router_ip)
+                    format!("No answer from {}:{} within 3s — dnsmasq may not be bound on the LAN interface, or a firewall rule is blocking UDP/{}. Check `systemctl status` / `iptables -L WOLFROUTER_IN -nv`.", r.router_ip, port, port)
                 } else {
                     format!("DNS server responded but did not return an A record. dig output: {}", stdout)
                 };
@@ -5845,7 +5867,7 @@ async fn set_lan_dns_port(
     if body.new_port != 53 && external.is_empty() {
         return actix_web::HttpResponse::BadRequest().json(serde_json::json!({
             "ok": false,
-            "error": "external_server is required when new_port isn't 53 — DHCP option 6 can only advertise a DNS server on the standard port, so clients need to be pointed at a resolver they can reach (typically the AdGuard/Pi-hole container IP).",
+            "error": "external_server is required when new_port isn't 53 — DHCP option 6 can only advertise a resolver on the standard port :53, so clients need to be pointed at a separate IP they can reach there (typically the AdGuard/Pi-hole container IP). NOTE: this IP doesn't need to be running yet — it's just a future reference. Set it now, dnsmasq will move off :53 freeing it, then start AdGuard on that IP.",
         }));
     }
     // Build the candidate LAN outside the write lock first, then
