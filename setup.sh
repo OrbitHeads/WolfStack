@@ -51,6 +51,15 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+# Existing install = upgrade. The /api/upgrade endpoint in older WolfStack
+# binaries spawns this script via `curl|bash` without --yes, with stdin nulled
+# out, so any interactive prompt would block the upgrade forever. If
+# /etc/wolfstack exists this is an upgrade, not a fresh install — force
+# unattended mode so the in-app "Upgrade" button actually completes.
+if [ -d /etc/wolfstack ]; then
+    ASSUME_YES=true
+fi
+
 # Allow git to operate on repos owned by other users (setup.sh runs as root
 # but repos may have been cloned by a regular user)
 export GIT_CONFIG_COUNT=1
