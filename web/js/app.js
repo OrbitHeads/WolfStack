@@ -2417,6 +2417,11 @@ function initMap() {
     if (worldMap) return;
     const mapEl = document.getElementById('world-map');
     if (!mapEl) return;
+    // Leaflet is loaded with `defer` in index.html but app.js is injected via
+    // document.write without defer, so on cold loads `L` may not be ready when
+    // the first dashboard render fires updateMap(). Bail quietly — the next
+    // poll tick will retry once Leaflet has parsed.
+    if (typeof L === 'undefined') return;
 
     worldMap = L.map('world-map', {
         attributionControl: false,
@@ -2430,6 +2435,7 @@ function initMap() {
 
 function updateMap(nodes) {
     if (!document.getElementById('world-map')) return;
+    if (typeof L === 'undefined') return;
     if (!worldMap) initMap();
     if (!worldMap) return;
 
