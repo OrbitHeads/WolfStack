@@ -66,6 +66,19 @@ const PACKAGES: &[PackageMapping] = &[
         service_unit: None,
     },
     PackageMapping {
+        // Used by the Visual TraceRoute tab in WolfRouter and the
+        // /api/traceroute endpoint. Ubuntu minimal / cloud images ship
+        // without it by default — Adam Cogswell 2026-04-30 reported
+        // the tab failing with no in-app install path.
+        logical: "traceroute",
+        binary: "traceroute",
+        debian: Some("traceroute"),
+        rhel: Some("traceroute"),
+        arch: Some("traceroute"),
+        suse: Some("traceroute"),
+        service_unit: None,
+    },
+    PackageMapping {
         logical: "conntrack",
         binary: "conntrack",
         debian: Some("conntrack"),
@@ -302,4 +315,47 @@ fn svc_active(unit: &str) -> bool {
     Command::new("systemctl")
         .args(["is-active", "--quiet", unit])
         .status().map(|s| s.success()).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Visual TraceRoute one-click installer in WolfRouter and the
+    /// System Check page both look up the logical name "traceroute"
+    /// and assume every supported distro can resolve it. If somebody
+    /// later refactors PACKAGES and drops a row, that breakage would
+    /// be invisible until a real user hit it. Pin it down here.
+    #[test]
+    fn traceroute_mapping_resolves_for_all_distros() {
+        let pkg = PACKAGES.iter().find(|p| p.logical == "traceroute")
+            .expect("traceroute logical name must be in PACKAGES");
+        for d in [
+            DistroFamily::Debian,
+            DistroFamily::RedHat,
+            DistroFamily::Arch,
+            DistroFamily::Suse,
+        ] {
+            assert_eq!(
+                resolve(pkg, d), Some("traceroute"),
+                "traceroute mapping missing for distro {:?}", d
+            );
+        }
+        assert_eq!(pkg.binary, "traceroute");
+    }
+
+    /// Every logical name advertised through the System Check UI's
+    /// "Install" button must be in this table — otherwise the button
+    /// 400s with "unknown package". Keep the list of expected logical
+    /// names checked here; failing this test means a callsite was
+    /// added without a corresponding row.
+    #[test]
+    fn known_logical_names_are_present() {
+        for logical in &["traceroute", "tcpdump", "conntrack"] {
+            assert!(
+                PACKAGES.iter().any(|p| p.logical == *logical),
+                "expected logical name {:?} in PACKAGES", logical
+            );
+        }
+    }
 }

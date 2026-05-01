@@ -4137,14 +4137,23 @@ pub async fn traceroute_handler(
             // no in-app remedy.
             let is_missing = e.kind() == std::io::ErrorKind::NotFound
                 || e.raw_os_error() == Some(2 /* ENOENT */);
+            // Build the manual-install command for THIS host's distro
+            // so the UI's copy-paste fallback isn't apt-only on RHEL /
+            // Arch / SUSE machines.
+            let install_command = if is_missing {
+                let distro = crate::installer::detect_distro();
+                let (mgr, args) = crate::installer::pkg_install_cmd(distro);
+                Some(format!("sudo {} {} traceroute", mgr, args))
+            } else { None };
             return HttpResponse::InternalServerError().json(serde_json::json!({
                 "error": if is_missing {
-                    "traceroute isn't installed on this host. Click the button below to install it (apt/dnf/pacman), or run the install manually.".to_string()
+                    "traceroute isn't installed on this host. Click the button below to install it, or run the install manually.".to_string()
                 } else {
                     format!("Failed to run traceroute: {}", e)
                 },
                 "missing_tool": if is_missing { Some("traceroute") } else { None },
                 "install_package": if is_missing { Some("traceroute") } else { None },
+                "install_command": install_command,
             }));
         }
         Err(e) => {

@@ -4336,6 +4336,49 @@
             return;
         }
         if (!resp.ok) {
+            // When traceroute itself isn't installed the backend tags
+            // the response with `missing_tool`. Surface an inline
+            // install button instead of a dead-end error so the user
+            // doesn't have to leave the tab to fix it.
+            // Adam Cogswell 2026-04-30: Ubuntu minimal ships without
+            // traceroute; previous flow had no in-app remedy.
+            if (data && data.missing_tool === 'traceroute') {
+                const pkg = data.install_package || 'traceroute';
+                // Distro-aware manual-install command supplied by the
+                // backend (apt-get / dnf / pacman / zypper). Falls back
+                // to apt only if the server didn't send one — the new
+                // backend always does, so this is belt-and-braces for
+                // cluster nodes still running an older build.
+                const manualCmd = data.install_command || ('sudo apt install ' + pkg);
+                if (status) {
+                    status.innerHTML = `❌ ${wrEsc(data.error || 'traceroute is not installed')} ` +
+                        `<button id="wr-tr-install" class="btn btn-sm btn-primary" style="margin-left:8px;">📦 Install ${wrEsc(pkg)}</button>`;
+                    const btn = document.getElementById('wr-tr-install');
+                    if (btn) btn.onclick = async () => {
+                        btn.disabled = true;
+                        btn.textContent = '⏳ Installing…';
+                        try {
+                            const ir = await fetch('/api/system/install-package', {
+                                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ package: pkg }),
+                            });
+                            const idata = await ir.json().catch(() => ({}));
+                            if (!ir.ok || idata.success === false) {
+                                status.innerHTML = `❌ Install failed: ${wrEsc(idata.error || ir.statusText || 'unknown')}. Try the package manager directly: <code>${wrEsc(manualCmd)}</code>.`;
+                                return;
+                            }
+                            status.textContent = '✅ Installed — re-running trace…';
+                            // Re-fire the original Trace flow so the user
+                            // doesn't have to click again.
+                            wrTracerouteGo();
+                        } catch (e) {
+                            status.innerHTML = `❌ Install errored: ${wrEsc(e.message || String(e))}.`;
+                        }
+                    };
+                }
+                if (goBtn) { goBtn.disabled = false; goBtn.textContent = '🛰 Trace'; }
+                return;
+            }
             if (status) status.textContent = '❌ ' + (data.error || resp.statusText);
             if (goBtn) { goBtn.disabled = false; goBtn.textContent = '🛰 Trace'; }
             return;

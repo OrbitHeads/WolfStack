@@ -165,6 +165,7 @@ pub fn run_checks() -> Vec<DependencyCheck> {
     out.push(simple_auto("tcpdump", "Networking", &["--version"],
         "packet capture (Packets tab in WolfRouter)",
         hint("tcpdump", "tcpdump", "tcpdump", "tcpdump")));
+    out.push(check_traceroute());
     out.push(simple_auto("pppd", "Networking", &["--version"],
         "PPPoE dial-up (WolfRouter WAN)",
         hint("ppp", "ppp", "ppp", "ppp")));
@@ -495,6 +496,37 @@ fn check_kernel_module(modname: &str, category: &str, why: &str) -> DependencyCh
         },
         ai_helpful: !known,
         install_package: None,
+    }
+}
+
+/// Visual TraceRoute (and the /api/traceroute endpoint) shells out to
+/// `traceroute`. It's not in the core diag-tool bundle and Ubuntu's
+/// minimal / cloud images don't ship it. Surface it on the System
+/// Check page with a one-click install button so an operator who
+/// opens the WolfRouter Trace tab knows up front whether they need
+/// to install something. Adam Cogswell 2026-04-30: "if traceroute is
+/// missing offer the user the chance to install it from a button".
+fn check_traceroute() -> DependencyCheck {
+    let (found, ver) = bin_check("traceroute", &["--version"]);
+    let status = if found { DepStatus::Ok } else { DepStatus::Missing };
+    let detail = if found {
+        "Installed — Visual TraceRoute tab in WolfRouter renders the path map.".into()
+    } else {
+        "Not installed — the WolfRouter Visual TraceRoute tab will fail. Common on Ubuntu minimal / cloud images that omit it from the default package set.".into()
+    };
+    DependencyCheck {
+        name: "traceroute".into(),
+        category: "Networking".into(),
+        status,
+        version: ver,
+        detail,
+        install_hint: if found { None } else {
+            Some(hint("traceroute", "traceroute", "traceroute", "traceroute"))
+        },
+        ai_helpful: false,
+        // One-click install hooked to /api/system/install-package via
+        // the "traceroute" mapping added in installer/packages.rs.
+        install_package: if found { None } else { Some("traceroute".into()) },
     }
 }
 
