@@ -28,6 +28,7 @@ mod proxmox;
 mod mysql_editor;
 mod appstore;
 mod alerting;
+mod predictive;
 mod wolfrun;
 mod statuspage;
 mod ceph;
@@ -387,9 +388,26 @@ async fn main() -> std::io::Result<()> {
         // Initialize Status Page monitoring state
         let statuspage_state = Arc::new(statuspage::StatusPageState::new());
 
+        // Predictive ops — load proposals/acks/history from disk so a
+        // restart doesn't blind the analyzer for 24 hours. Acks get
+        // an immediate prune of any expired entries to keep the file
+        // bounded over years of operator use.
+        let predictive_proposals = Arc::new(std::sync::RwLock::new(
+            predictive::ProposalStore::load(),
+        ));
+        let predictive_acks = Arc::new(std::sync::RwLock::new({
+            let mut a = predictive::AckStore::load();
+            a.prune_expired();
+            a
+        }));
+        let predictive_metrics = Arc::new(std::sync::RwLock::new(
+            predictive::MetricsHistory::load(),
+        ));
+
         // Create app state
+        let monitor_arc = Arc::new(Mutex::new(mon));
         let app_state = web::Data::new(api::AppState {
-            monitor: Mutex::new(mon),
+            monitor: monitor_arc.clone(),
             metrics_history: Mutex::new(monitoring::MetricsHistory::new()),
             cluster: cluster.clone(),
             sessions: sessions.clone(),
@@ -413,7 +431,28 @@ async fn main() -> std::io::Result<()> {
             image_watcher_cache: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             integrations: Arc::new(crate::integrations::IntegrationState::new(&cluster_secret)),
             router: Arc::new(crate::networking::router::RouterState::new()),
+            predictive_proposals: predictive_proposals.clone(),
+            predictive_acks: predictive_acks.clone(),
+            predictive_metrics: predictive_metrics.clone(),
+            predictive_cluster_cache: Arc::new(std::sync::Mutex::new(None)),
+            node_id: node_id.clone(),
         });
+
+        // Predictive ops orchestrator — 5-min loop that samples
+        // disks, records into history, runs analyzers, and upserts
+        // proposals into the inbox. Ack/snooze/dismiss are honoured
+        // before any proposal is materialised. Threshold + first-
+        // appearance notification dispatch landed in convergence
+        // A+B — orchestrator now reads SystemMetrics off the shared
+        // monitor and fires alerting channels on Critical/High.
+        {
+            let p = predictive_proposals.clone();
+            let a = predictive_acks.clone();
+            let m = predictive_metrics.clone();
+            let mon = monitor_arc.clone();
+            let n = node_id.clone();
+            tokio::spawn(predictive::orchestrator::run_loop(p, a, m, mon, n));
+        }
 
         // Start the WolfRouter safe-mode watcher — auto-reverts firewall
         // changes if the user doesn't confirm within the safe-mode window.
@@ -1555,8 +1594,32 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
 
                             let display_name = if node.hostname.is_empty() { &node.address } else { &node.hostname };
 
-                            // Check thresholds
-                            let triggered = alerting::check_thresholds(&config, cpu_pct, mem_pct, disk_pct);
+                            // Check thresholds.
+                            //
+                            // Convergence B (the predictive ops pipeline) now owns
+                            // first-appearance threshold dispatch via
+                            // `predictive::notify::find_first_appearance_alerts` +
+                            // `dispatch_alerts`, fired from each tick of
+                            // `predictive::orchestrator`. That layer:
+                            //   • Has a unified Severity tier with snooze/dismiss/ack
+                            //     semantics instead of the old cooldown HashMap
+                            //   • Auto-resolves on `ConditionCleared` so the recovery
+                            //     branch below isn't needed for thresholds it covers
+                            //   • Surfaces in the Predictive Inbox alongside trend-based
+                            //     findings (disk-fill ETA, container restart-loops, etc.)
+                            //
+                            // We keep this `triggered` binding *only* so the recovery-
+                            // notification branch downstream still executes on legacy
+                            // signals — it's harmless when `triggered` is empty. The
+                            // primary alert-fire loop below sees zero entries and
+                            // becomes a no-op.
+                            //
+                            // Per-node remote-peer dispatch: each cluster node runs its
+                            // own predictive orchestrator; remote peers' findings are
+                            // surfaced via `/api/proposals/cluster` aggregation in the
+                            // Inbox UI.
+                            let _ = (cpu_pct, mem_pct, disk_pct, &config);  // signal: kept for the recovery branch
+                            let triggered: Vec<alerting::ThresholdAlert> = Vec::new();
 
                             for alert in &triggered {
                                 if !alerting::is_in_cooldown(&cooldowns, &node.id, &alert.alert_type) {
@@ -1731,8 +1794,22 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                         let docker_stats = tokio::task::spawn_blocking(|| containers::docker_stats()).await.unwrap_or_default();
                         let lxc_stats = tokio::task::spawn_blocking(|| containers::lxc_stats()).await.unwrap_or_default();
 
-                        let docker_alerts = alerting::check_container_thresholds(&config, &docker_stats, "docker");
-                        let lxc_alerts = alerting::check_container_thresholds(&config, &lxc_stats, "lxc");
+                        // Container memory threshold dispatch — RETIRED.
+                        //
+                        // Predictive item 5 (`predictive::container_memory`) is the
+                        // canonical source for per-container memory findings. It uses
+                        // the same `containers::*_stats_cached()` data this loop did,
+                        // but routes through the unified Inbox with snooze/dismiss/ack
+                        // semantics instead of the legacy cooldown HashMap. The
+                        // first-appearance dispatch in `predictive::notify` fires the
+                        // Discord/Slack/Telegram/email channels with stable severity
+                        // and per-finding dedup.
+                        //
+                        // Keep these `_stats` bindings — they're consumed by the
+                        // top-N renderer below, which is unrelated to thresholds.
+                        let _ = (&docker_stats, &lxc_stats, &config);
+                        let docker_alerts: Vec<alerting::ContainerAlert> = Vec::new();
+                        let lxc_alerts: Vec<alerting::ContainerAlert> = Vec::new();
 
                         let all_container_alerts: Vec<_> = docker_alerts.into_iter().chain(lxc_alerts.into_iter()).collect();
 

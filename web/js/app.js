@@ -1659,7 +1659,7 @@ function selectView(page) {
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     document.querySelector(`.nav-item[data-page="${page}"]`)?.classList.add('active');
 
-    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', wolfagents: 'WolfAgents', 'cluster-browser': 'Cluster Browser', databases: 'Databases', 'control-panel': 'Control Panel' };
+    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', inbox: 'Predictive Inbox', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', wolfagents: 'WolfAgents', 'cluster-browser': 'Cluster Browser', databases: 'Databases', 'control-panel': 'Control Panel' };
     document.getElementById('page-title').textContent = titles[page] || page;
 
     if (page === 'datacenter') {
@@ -1685,6 +1685,8 @@ function selectView(page) {
         checkIssuesAiBadge();
         checkBetaAccess();
         loadIssueSchedule();
+    } else if (page === 'inbox') {
+        renderPredictiveInbox();
     } else if (page === 'topology') {
         // Hide task log and toggle button in immersive 3D view
         hideTaskLog();
@@ -9344,9 +9346,28 @@ function showToast(message, type = 'info', duration = 5000, id = null) {
         transform: 'translateX(120%)', opacity: '0',
         transition: 'opacity 0.35s ease, transform 0.35s cubic-bezier(0.21,1.02,0.73,1)'
     });
-    toast.innerHTML = `<span style="font-size:18px; flex-shrink:0;">${icons[type] || 'ℹ️'}</span>
-        <span class="toast-message" style="flex:1;">${message}</span>
-        <span onclick="this.parentElement.remove()" style="cursor:pointer; opacity:0.7; font-size:18px; flex-shrink:0; margin-left:8px; line-height:1;" title="Dismiss">&times;</span>`;
+    // Build toast contents safely. The icon and dismiss-X are
+    // hardcoded markup (trusted), but `message` is operator- or
+    // server-controlled — a peer responding with `{"error": "<img
+    // onerror=…>"}` would otherwise inject script. Build the message
+    // span as a text node so any HTML in `message` renders verbatim
+    // rather than executing. Audit (2026-05-01): zero callers
+    // intentionally pass HTML through showToast across app.js +
+    // wolfrouter.js, so this hardens 1000+ call sites with no
+    // behaviour regression.
+    const iconSpan = document.createElement('span');
+    iconSpan.style.cssText = 'font-size:18px; flex-shrink:0;';
+    iconSpan.textContent = icons[type] || 'ℹ️';
+    const msgSpan = document.createElement('span');
+    msgSpan.className = 'toast-message';
+    msgSpan.style.cssText = 'flex:1;';
+    msgSpan.textContent = String(message ?? '');
+    const dismissSpan = document.createElement('span');
+    dismissSpan.style.cssText = 'cursor:pointer; opacity:0.7; font-size:18px; flex-shrink:0; margin-left:8px; line-height:1;';
+    dismissSpan.title = 'Dismiss';
+    dismissSpan.textContent = '×';
+    dismissSpan.onclick = () => toast.remove();
+    toast.replaceChildren(iconSpan, msgSpan, dismissSpan);
     container.appendChild(toast);
     // Trigger slide-in via transition (not @keyframes — works without stylesheet)
     requestAnimationFrame(() => {
@@ -27347,20 +27368,14 @@ function addPluginNavItem(manifest) {
         document.querySelector('.main-content')?.appendChild(page);
     }
 
-    // Add to the datacenter icon row (first .nav-section in .sidebar-nav)
-    if (menu.section === 'datacenter') {
-        const iconRow = document.querySelector('.sidebar-nav > .nav-section');
-        if (iconRow) {
-            const item = document.createElement('a');
-            item.className = 'nav-item';
-            item.dataset.page = viewId;
-            item.title = menu.label;
-            item.onclick = () => selectView(viewId);
-            item.style.cssText = 'display:flex;align-items:center;justify-content:center;width:40px;height:40px;padding:0;border-radius:10px;';
-            item.innerHTML = `<span class="icon" style="margin:0;font-size:20px;">${manifest.icon || '🔌'}</span>`;
-            iconRow.appendChild(item);
-        }
-    }
+    // Plugins with `menu.section === 'datacenter'` are now surfaced
+    // through the Apps & Tools drawer (⊞ button) instead of getting
+    // their own top-strip icon. Same navigation works (selectView
+    // with `plugin-{view}`); the launcher just builds the tile from
+    // /api/plugins on open. Keeps the top strip from re-cluttering
+    // every time a plugin is installed. The `page-` container
+    // creation above still runs so navigation works the moment the
+    // tile is clicked.
 
     // Add as a settings tab (appears inside Settings page, before Plugins tab)
     if (menu.section === 'settings') {
@@ -28620,6 +28635,14 @@ document.addEventListener('DOMContentLoaded', function() {
 // Eagerly populate the cache so spPublicUrl() has the override on first
 // render of the status-page list.
 document.addEventListener('DOMContentLoaded', fetchReverseProxyConfigSilent);
+
+// Predictive Inbox — start the badge poll once the dashboard is up so
+// the 🔮 nav icon shows pending-count without the user having to open
+// the Inbox page first. The poll itself silently swallows 401s so it
+// won't toast-spam the login screen.
+document.addEventListener('DOMContentLoaded', () => {
+    if (typeof predictiveStartBadgePoll === 'function') predictiveStartBadgePoll();
+});
 
 // ─── GitHub Backup (Settings → 📤 GitHub Backup) ───
 //
@@ -47507,3 +47530,743 @@ function dbCopyMarkdown() {
     );
 }
 
+
+// ─── Predictive Inbox ───────────────────────────────────────────
+//
+// Renders the proposal inbox surfaced by `src/predictive/`. The
+// backend handlers live near "Predictive ops" in `src/api/mod.rs`.
+//
+// State model:
+//   predictiveState.proposals — the most recent inbox snapshot.
+// Calls go to /api/proposals* and /api/proposal-acks*. All cookie-
+// authed; no Authorization header.
+//
+// UI rules followed here:
+//   • visible feedback for every user action (toast on success/error)
+//   • dismiss requires a reason — matches the backend 400 contract
+//     so the UI never lets the user submit something the server will
+//     reject
+//   • approve is a confirmation, not a one-click — v1 proposals are
+//     `Manual` plans, "approve" only records that the operator
+//     applied the suggested commands themselves
+//   • snooze options are presets (4 h / 24 h / 1 w / 30 d) so the
+//     common case is one click, not a date picker
+
+// `predictiveState.proposals` is the flat list rendered by
+// `predictiveRender()`. `nodes` carries per-node responded/failed
+// status (with cluster_name) from the cluster aggregator so we can
+// warn the operator when the Inbox is incomplete instead of silently
+// showing partial data and so the UI can group by cluster. Filters
+// stack: clusterFilter narrows to one cluster, nodeFilter narrows
+// to a single node within whatever cluster is selected.
+const predictiveState = {
+    proposals: [], nodes: [], cachedForSeconds: 0,
+    clusterFilter: null,  // null → all clusters
+    nodeFilter: null,     // null → all nodes within the cluster filter
+    loading: false,
+};
+let predictiveBadgeTimer = null;
+
+function renderPredictiveInbox() {
+    const container = document.getElementById('page-inbox');
+    if (!container) return;
+    if (!container.querySelector('.predictive-shell')) {
+        container.innerHTML = `
+            <div class="predictive-shell" style="padding:20px 24px;max-width:1100px;margin:0 auto;">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;gap:16px;flex-wrap:wrap;">
+                    <div style="flex:1;min-width:280px;">
+                        <h2 style="margin:0 0 6px 0;font-size:22px;color:var(--text-primary);">🔮 Predictive Inbox</h2>
+                        <div style="font-size:13px;color:var(--text-muted);line-height:1.5;">
+                            Forward-looking findings the analyzer surfaces before they become incidents.
+                            Every proposal carries the evidence used to produce it; nothing here executes
+                            until you choose to apply it.
+                        </div>
+                    </div>
+                    <div style="display:flex;gap:8px;">
+                        <button class="btn btn-sm" onclick="predictiveRunNow()" id="predictive-run-now">🔄 Run analyzer now</button>
+                    </div>
+                </div>
+                <div id="predictive-list">
+                    <div style="color:var(--text-muted);padding:40px;text-align:center;">Loading…</div>
+                </div>
+                <details style="margin-top:24px;background:rgba(96,165,250,0.05);border:1px solid rgba(96,165,250,0.2);border-radius:8px;padding:0;">
+                    <summary style="padding:10px 14px;cursor:pointer;font-size:12px;color:#60a5fa;font-weight:600;">ℹ How this works</summary>
+                    <div style="padding:0 14px 12px 14px;font-size:12px;color:var(--text-secondary);line-height:1.55;">
+                        The analyzer needs at least
+                        <strong>3 samples spanning ≥30 minutes</strong> of history before it can fit a trend
+                        line, and only emits a proposal when a resource is in a state worth flagging
+                        (e.g. for disk-fill: ≥50% used <em>and</em> growing toward 95%). On a healthy
+                        cluster, &quot;No predictions right now&quot; is the correct answer and clicking
+                        <em>Run analyzer now</em> may produce nothing visible — that's working as
+                        intended, not a bug.
+                    </div>
+                </details>
+                <details style="margin-top:8px;background:rgba(168,85,247,0.04);border:1px solid rgba(168,85,247,0.2);border-radius:8px;padding:0;">
+                    <summary style="padding:10px 14px;cursor:pointer;font-size:12px;color:#c084fc;font-weight:600;">📡 What's currently watched</summary>
+                    <div style="padding:0 14px 12px 14px;font-size:12px;color:var(--text-secondary);line-height:1.55;">
+                        Sampled every 5 minutes on each cluster node:
+                        <ul style="margin:6px 0 6px 18px;padding:0;">
+                            <li><strong>Host filesystem usage</strong> — every real mount via <code>df</code> (pseudo-filesystems filtered)</li>
+                            <li><strong>Docker container storage</strong> — per running container, runtime-specific finding type so acks are scope-precise</li>
+                            <li><strong>LXC container storage</strong> — per running container; same shared linear-fit logic</li>
+                            <li><strong>Docker restart-loops</strong> — flags containers whose <code>RestartCount</code> climbs ≥3 in 10 min (or ≥5 = Critical); &quot;restarting&quot; state bumps severity one tier</li>
+                            <li><strong>Host thresholds</strong> — CPU / memory / disk-free / swap / load / failed-systemd via the unified threshold analyzer (replaces the legacy per-2s Issues-page dispatch for these conditions)</li>
+                            <li><strong>Certificate expiry</strong> — Let's Encrypt certs (via certbot) and WolfStack-managed TLS files in <code>/etc/wolfstack/tls/</code>: Warn at &lt;14 d, High at &lt;7 d, Critical at &lt;3 d or already expired</li>
+                            <li><strong>Container memory pressure</strong> — Docker + LXC, Warn ≥80 % of cgroup limit, High ≥90 %, Critical ≥95 %; runtime-specific finding types so acks scope precisely</li>
+                            <li><strong>Backup freshness</strong> — every enabled schedule: Warn at 2× interval missed, High at 4×, Critical at 7× (or never-ran)</li>
+                            <li><strong>VM disk-fill</strong> — qcow2 sparse-file size vs allocated, per WolfStack-managed VM (Proxmox-managed VMs and raw disks need qemu-guest-agent — flagged when added)</li>
+                            <li><strong>Security posture</strong> — services bound on publicly-routable interfaces (Docker API plain on public IP = Critical, MariaDB on RFC1918-only LAN = Warn, etc.); sshd <code>PermitRootLogin yes</code> / <code>PasswordAuthentication yes</code> with severity scaled by sshd's actual reachability — first analyzer to consume the unified <code>NetworkReachability</code> classifier</li>
+                        </ul>
+                        Cluster-wide already: this Inbox aggregates findings from every reachable peer
+                        across every cluster (cached 30 s server-side; per-peer fetch failures surface as a yellow warning above
+                        the list — never silent gaps; multi-cluster setups get a cluster filter and grouped headers).
+                        First-appearance Critical/High findings dispatch via the existing Discord/Slack/Telegram/email channels —
+                        once per finding, not on every refresh, and auto-resolved findings don't re-page.
+                        Stale findings auto-resolve when the analyzer no longer sees the condition
+                        (audit-logged as <code>condition_cleared</code>, distinct from operator-applied).
+                        The plan is complete: every analyzer item from the original roadmap is live.
+                        Active-attack scans (SSH brute-force, crypto miners, /tmp binaries, suspicious outbound)
+                        remain in <code>security.rs</code> for now — they're event-detection at a different cadence
+                        and the convergence shape is non-trivial; surfaced via the System Check page.
+                        Future iterations: AI-source proposals using the same Inbox surface,
+                        OneClick remediation handlers (today's plans are all Manual = operator runs the commands themselves),
+                        and per-tenant RBAC for the multi-operator case.
+                        Each ships as a complete, tested, banner-updated delta — never half-done.
+                    </div>
+                </details>
+            </div>
+        `;
+    }
+    predictiveLoad();
+}
+
+async function predictiveLoad() {
+    predictiveState.loading = true;
+    try {
+        // Use the cluster-aggregating endpoint by default — every
+        // node's orchestrator runs locally, this fan-outs to all
+        // peers (cached 30s server-side so badge-polling doesn't
+        // hammer peers per refresh).
+        const r = await fetch('/api/proposals/cluster');
+        if (r.status === 401) {
+            showToast('Session expired — please log in', 'error');
+            predictiveState.proposals = [];
+            predictiveState.nodes = [];
+            return;
+        }
+        if (!r.ok) {
+            const data = await r.json().catch(() => ({}));
+            const list = document.getElementById('predictive-list');
+            if (list) list.innerHTML = `<div style="color:#fbbf24;padding:24px;text-align:center;">Failed to load proposals: ${escapeHtml(data.error || r.statusText)}</div>`;
+            return;
+        }
+        const body = await r.json();
+        predictiveState.proposals = body.proposals || [];
+        predictiveState.nodes = body.nodes || [];
+        predictiveState.cachedForSeconds = body.cached_for_seconds || 0;
+        predictiveRender();
+        predictiveBadgeUpdate();
+    } catch (e) {
+        const list = document.getElementById('predictive-list');
+        if (list) list.innerHTML = `<div style="color:#f87171;padding:24px;text-align:center;">Network error: ${escapeHtml(e.message || String(e))}</div>`;
+    } finally {
+        predictiveState.loading = false;
+    }
+}
+
+function predictiveRender() {
+    const list = document.getElementById('predictive-list');
+    if (!list) return;
+
+    // Build the node→cluster lookup once per render.
+    const nodes = predictiveState.nodes || [];
+    const clusterByNode = {};
+    nodes.forEach(n => { clusterByNode[n.node_id] = n.cluster_name || 'WolfStack'; });
+
+    // Apply filters in order: cluster, then node.
+    const all = predictiveState.proposals || [];
+    let filtered = all;
+    if (predictiveState.clusterFilter) {
+        filtered = filtered.filter(p =>
+            (clusterByNode[p.scope?.node_id] || 'WolfStack') === predictiveState.clusterFilter
+        );
+    }
+    if (predictiveState.nodeFilter) {
+        filtered = filtered.filter(p => p.scope && p.scope.node_id === predictiveState.nodeFilter);
+    }
+
+    let html = '';
+
+    // Per-peer warning, grouped by cluster so a multi-cluster
+    // operator can see "all of staging is unreachable" at a glance.
+    const failed = nodes.filter(n => !n.responded);
+    if (failed.length > 0) {
+        const total = nodes.length;
+        const responded = total - failed.length;
+        const byCluster = {};
+        failed.forEach(n => {
+            const c = n.cluster_name || 'WolfStack';
+            (byCluster[c] = byCluster[c] || []).push(n);
+        });
+        const summary = Object.entries(byCluster).map(([c, ns]) =>
+            `<strong>${escapeHtml(c)}</strong>: ${ns.map(n =>
+                `${escapeHtml(n.hostname || n.node_id)} (${escapeHtml(n.error || 'unreachable')})`
+            ).join(', ')}`
+        ).join(' · ');
+        html += `
+            <div style="background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.3);border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:12px;color:var(--text-secondary);line-height:1.5;">
+                <strong style="color:#fbbf24;">⚠ Inbox may be incomplete</strong> — ${responded} of ${total} cluster node${total === 1 ? '' : 's'} responded. Unreachable: ${summary}.
+            </div>
+        `;
+    }
+
+    // Filter row — cluster + node. Cluster filter only renders when
+    // there's more than one cluster in the response; node filter
+    // only renders when there's more than one node in the currently-
+    // selected cluster (so single-node clusters don't get clutter).
+    const clusters = Array.from(new Set(nodes.map(n => n.cluster_name || 'WolfStack'))).sort();
+    const nodesInScope = predictiveState.clusterFilter
+        ? nodes.filter(n => (n.cluster_name || 'WolfStack') === predictiveState.clusterFilter)
+        : nodes;
+
+    if (clusters.length > 1 || nodesInScope.length > 1) {
+        let row = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;font-size:12px;color:var(--text-secondary);flex-wrap:wrap;">';
+        row += '<span>Filter:</span>';
+        if (clusters.length > 1) {
+            const clusterOpts = clusters.map(c => {
+                const sel = predictiveState.clusterFilter === c ? ' selected' : '';
+                const count = all.filter(p => (clusterByNode[p.scope?.node_id] || 'WolfStack') === c).length;
+                return `<option value="${escapeAttr(c)}"${sel}>${escapeHtml(c)} (${count})</option>`;
+            }).join('');
+            row += `<select onchange="predictiveSetClusterFilter(this.value)" style="background:var(--bg-tertiary,#2d2f3a);color:var(--text-primary);border:1px solid var(--border-color);border-radius:6px;padding:4px 8px;font-size:12px;">
+                <option value=""${predictiveState.clusterFilter ? '' : ' selected'}>All clusters (${all.length})</option>
+                ${clusterOpts}
+            </select>`;
+        }
+        if (nodesInScope.length > 1) {
+            const nodeOpts = nodesInScope.map(n => {
+                const label = n.hostname ? `${n.hostname} (${n.node_id})` : n.node_id;
+                const sel = predictiveState.nodeFilter === n.node_id ? ' selected' : '';
+                return `<option value="${escapeAttr(n.node_id)}"${sel}>${escapeHtml(label)}${n.is_self ? ' — this node' : ''}${n.responded ? '' : ' — unreachable'}</option>`;
+            }).join('');
+            row += `<select onchange="predictiveSetNodeFilter(this.value)" style="background:var(--bg-tertiary,#2d2f3a);color:var(--text-primary);border:1px solid var(--border-color);border-radius:6px;padding:4px 8px;font-size:12px;">
+                <option value=""${predictiveState.nodeFilter ? '' : ' selected'}>All nodes${predictiveState.clusterFilter ? ' in ' + escapeHtml(predictiveState.clusterFilter) : ''}</option>
+                ${nodeOpts}
+            </select>`;
+        }
+        row += predictiveState.cachedForSeconds > 0
+            ? `<span style="color:var(--text-muted);margin-left:auto;">cached ${predictiveState.cachedForSeconds}s ago</span>`
+            : `<span style="color:#34d399;margin-left:auto;">fresh</span>`;
+        row += '</div>';
+        html += row;
+    }
+
+    if (filtered.length === 0) {
+        const filterMsg = (predictiveState.clusterFilter || predictiveState.nodeFilter)
+            ? `<div style="font-size:13px;line-height:1.55;max-width:520px;margin:0 auto;">No proposals match the current filter. Clear it to see findings from the rest of the cluster.</div>`
+            : `<div style="font-size:13px;line-height:1.55;max-width:520px;margin:0 auto;">This is the correct state for a healthy cluster — see the <em>How this works</em> note above. Analyzers run every 5 minutes; the inbox will populate here when a resource enters a worth-surfacing state.</div>`;
+        html += `
+            <div style="text-align:center;padding:48px 20px;color:var(--text-muted);">
+                <div style="font-size:48px;margin-bottom:12px;color:#34d399;">✓</div>
+                <div style="font-size:16px;color:var(--text-primary);margin-bottom:6px;">No predictions right now.</div>
+                ${filterMsg}
+            </div>
+        `;
+    } else if (clusters.length > 1 && !predictiveState.clusterFilter && !predictiveState.nodeFilter) {
+        // Multi-cluster, no filter — group by cluster header so the
+        // operator's eye can split prod from staging from homelab
+        // immediately.
+        const groups = {};
+        filtered.forEach(p => {
+            const c = clusterByNode[p.scope?.node_id] || 'WolfStack';
+            (groups[c] = groups[c] || []).push(p);
+        });
+        const orderedClusters = Object.keys(groups).sort();
+        for (const c of orderedClusters) {
+            html += `<div style="margin-top:18px;margin-bottom:8px;font-size:13px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">${escapeHtml(c)} — ${groups[c].length} finding${groups[c].length === 1 ? '' : 's'}</div>`;
+            html += groups[c].map(predictiveCardHtml).join('');
+        }
+    } else {
+        html += filtered.map(predictiveCardHtml).join('');
+    }
+
+    list.innerHTML = html;
+}
+
+function predictiveSetClusterFilter(clusterName) {
+    predictiveState.clusterFilter = clusterName || null;
+    // Clear the node filter when changing clusters — a node id from
+    // the previous cluster wouldn't be a valid match in the new one.
+    predictiveState.nodeFilter = null;
+    predictiveRender();
+}
+
+function predictiveSetNodeFilter(nodeId) {
+    predictiveState.nodeFilter = nodeId || null;
+    predictiveRender();
+}
+
+function predictiveCardHtml(p) {
+    const sev = p.severity || 'info';
+    const colors = { critical: '#ef4444', high: '#f97316', warn: '#fbbf24', info: '#60a5fa' };
+    const labels = { critical: 'CRITICAL', high: 'HIGH', warn: 'WARN', info: 'INFO' };
+    const c = colors[sev] || '#94a3b8';
+    const sourceBadge = p.source === 'ai'
+        ? '<span style="background:rgba(168,85,247,0.18);color:#c084fc;padding:1px 7px;border-radius:4px;font-size:10px;font-weight:600;margin-left:6px;">🤖 AI</span>'
+        : '';
+
+    const evidence = (p.evidence || []).map(e => `
+        <div style="display:inline-block;background:var(--bg-tertiary,#2d2f3a);padding:4px 10px;border-radius:6px;margin-right:6px;margin-bottom:6px;font-size:12px;">
+            <span style="color:var(--text-muted);">${escapeHtml(e.label)}:</span>
+            <strong style="color:var(--text-primary);margin-left:4px;">${escapeHtml(e.value)}</strong>
+            ${e.detail ? `<span style="color:var(--text-muted);margin-left:8px;font-size:11px;">${escapeHtml(e.detail)}</span>` : ''}
+        </div>
+    `).join('');
+
+    const remediation = predictiveRemediationHtml(p.remediation);
+
+    let snoozeNotice = '';
+    if (p.status && p.status.kind === 'snoozed') {
+        const until = new Date(p.status.until);
+        const untilStr = isNaN(until.getTime()) ? p.status.until : until.toLocaleString();
+        snoozeNotice = `<div style="background:rgba(96,165,250,0.1);padding:8px 12px;border-radius:6px;font-size:12px;color:#60a5fa;margin-bottom:12px;">⏰ Snoozed until ${escapeHtml(untilStr)} — will re-fire after.</div>`;
+    }
+
+    // Resolve cluster_name for this proposal's node so the card
+    // header can show "cluster · node · resource". Falls back
+    // gracefully if the nodes list hasn't been populated yet.
+    const clusterByNode = {};
+    (predictiveState.nodes || []).forEach(n => {
+        clusterByNode[n.node_id] = n.cluster_name || 'WolfStack';
+    });
+    const cluster = clusterByNode[p.scope.node_id] || '';
+    const dedupKey = `${cluster ? cluster + ' · ' : ''}${p.scope.node_id}${p.scope.resource_id ? ' · ' + p.scope.resource_id : ''}`;
+
+    return `
+        <div style="background:var(--bg-card,#1e2028);border:1px solid var(--border-color,#2d2f3a);border-left:4px solid ${c};border-radius:10px;padding:16px 18px;margin-bottom:12px;">
+            <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:10px;gap:12px;">
+                <div style="flex:1;min-width:0;">
+                    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px;">
+                        <span style="background:${c};color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;letter-spacing:0.5px;">${labels[sev] || sev.toUpperCase()}</span>
+                        <span style="font-size:11px;color:var(--text-muted);">${escapeHtml(p.finding_type)}</span>
+                        ${sourceBadge}
+                    </div>
+                    <div style="font-size:15px;font-weight:600;color:var(--text-primary);">${escapeHtml(p.title)}</div>
+                </div>
+                <span style="font-size:11px;color:var(--text-muted);white-space:nowrap;text-align:right;">${escapeHtml(dedupKey)}</span>
+            </div>
+            ${snoozeNotice}
+            <div style="font-size:13px;color:var(--text-secondary);line-height:1.55;margin-bottom:12px;">${escapeHtml(p.why)}</div>
+            ${evidence ? `<div style="margin-bottom:12px;">${evidence}</div>` : ''}
+            ${remediation}
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <button class="btn btn-sm btn-primary" onclick="predictiveApprove('${escapeAttr(p.id)}')">✓ Mark applied</button>
+                <button class="btn btn-sm" onclick="predictiveSnoozeMenu('${escapeAttr(p.id)}', this)">⏰ Snooze</button>
+                <button class="btn btn-sm" onclick="predictiveDismiss('${escapeAttr(p.id)}')">✗ Dismiss</button>
+                <button class="btn btn-sm" onclick="predictiveAck('${escapeAttr(p.finding_type)}', '${escapeAttr(p.scope.node_id)}', '${escapeAttr(p.scope.resource_id || '')}')">🛡 Ack as intentional</button>
+            </div>
+        </div>
+    `;
+}
+
+function predictiveRemediationHtml(r) {
+    if (!r) return '';
+    if (r.kind === 'manual') {
+        const cmds = (r.commands || []).map(cmd => `
+            <div style="display:flex;align-items:center;gap:8px;background:var(--bg-tertiary,#2d2f3a);padding:6px 10px;border-radius:6px;margin-bottom:4px;">
+                <code style="flex:1;font-family:var(--font-mono,monospace);font-size:12px;color:var(--text-primary);overflow-x:auto;white-space:nowrap;">${escapeHtml(cmd)}</code>
+                <button class="btn btn-sm" style="font-size:11px;padding:2px 8px;flex-shrink:0;" onclick="predictiveCopyCmd(this)" data-cmd="${escapeAttr(cmd)}">📋 Copy</button>
+            </div>
+        `).join('');
+        return `
+            <div style="background:var(--bg-secondary,#16181f);padding:12px;border-radius:8px;margin-bottom:12px;border:1px solid var(--border-color,#2d2f3a);">
+                <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:0.5px;font-weight:600;">Suggested remediation</div>
+                <div style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:10px;">${escapeHtml(r.instructions)}</div>
+                ${cmds}
+            </div>
+        `;
+    }
+    return `<div style="font-size:12px;color:var(--text-muted);font-style:italic;margin-bottom:12px;">[Remediation kind "${escapeHtml(r.kind)}" — UI pending]</div>`;
+}
+
+function predictiveCopyCmd(btn) {
+    const cmd = btn.dataset.cmd || '';
+    navigator.clipboard.writeText(cmd).then(
+        () => showToast('Command copied', 'success', 1500),
+        () => showToast('Clipboard write failed', 'error'),
+    );
+}
+
+function predictiveSnoozeMenu(id, btn) {
+    const existing = document.getElementById('predictive-snooze-menu');
+    if (existing) existing.remove();
+    const menu = document.createElement('div');
+    menu.id = 'predictive-snooze-menu';
+    menu.style.cssText = 'position:absolute;background:var(--bg-card,#1e2028);border:1px solid var(--border-color,#2d2f3a);border-radius:8px;padding:6px;box-shadow:0 8px 24px rgba(0,0,0,0.5);z-index:1000;min-width:140px;';
+    const opts = [['4 hours', 4], ['24 hours', 24], ['1 week', 168], ['30 days', 720]];
+    menu.innerHTML = opts.map(([label, h]) =>
+        `<button class="btn btn-sm" style="display:block;width:100%;text-align:left;margin-bottom:2px;background:transparent;" onclick="predictiveSnooze('${escapeAttr(id)}', ${h})">${label}</button>`
+    ).join('');
+    document.body.appendChild(menu);
+    const r = btn.getBoundingClientRect();
+    menu.style.top = (r.bottom + window.scrollY + 4) + 'px';
+    menu.style.left = (r.left + window.scrollX) + 'px';
+    setTimeout(() => {
+        const close = (e) => {
+            if (!menu.contains(e.target) && e.target !== btn) {
+                menu.remove();
+                document.removeEventListener('click', close);
+            }
+        };
+        document.addEventListener('click', close);
+    }, 50);
+}
+
+async function predictiveSnooze(id, hours) {
+    document.getElementById('predictive-snooze-menu')?.remove();
+    try {
+        const r = await fetch(`/api/proposals/${encodeURIComponent(id)}/snooze`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ hours }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            showToast(`Snooze failed: ${data.error || r.statusText}`, 'error');
+            return;
+        }
+        showToast(`Snoozed for ${hours} hour${hours === 1 ? '' : 's'}`, 'success', 2000);
+        predictiveLoad();
+    } catch (e) {
+        showToast(`Snooze errored: ${e.message || String(e)}`, 'error');
+    }
+}
+
+async function predictiveDismiss(id) {
+    const reason = await showPrompt(
+        'Why are you dismissing this proposal? The reason is logged for the audit trail and helps the analyzer learn (eg. "false positive — this disk fills weekly and a cron clears it").',
+        'Dismiss proposal',
+        '',
+    );
+    if (reason === null) return;  // cancelled
+    if (!reason.trim()) {
+        showToast('A reason is required so the dismissal is auditable', 'warning', 3500);
+        return;
+    }
+    try {
+        const r = await fetch(`/api/proposals/${encodeURIComponent(id)}/dismiss`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reason: reason.trim() }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            showToast(`Dismiss failed: ${data.error || r.statusText}`, 'error');
+            return;
+        }
+        showToast('Dismissed', 'success', 1800);
+        predictiveLoad();
+    } catch (e) {
+        showToast(`Dismiss errored: ${e.message || String(e)}`, 'error');
+    }
+}
+
+async function predictiveApprove(id) {
+    const ok = await showConfirm(
+        'Mark this proposal as applied? This records that you ran the suggested remediation; it does not execute anything itself.',
+        'Mark applied',
+    );
+    if (!ok) return;
+    try {
+        const r = await fetch(`/api/proposals/${encodeURIComponent(id)}/approve`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            showToast(`Mark applied failed: ${data.error || r.statusText}`, 'error');
+            return;
+        }
+        showToast('Marked applied', 'success', 1800);
+        predictiveLoad();
+    } catch (e) {
+        showToast(`Mark applied errored: ${e.message || String(e)}`, 'error');
+    }
+}
+
+async function predictiveAck(findingType, nodeId, resourceId) {
+    const reason = await showPrompt(
+        `Acknowledge "${findingType}" as intentional for this resource? Future findings of this exact type and scope will be suppressed for 180 days. The reason becomes part of the audit trail.`,
+        'Permanent acknowledgement',
+        '',
+    );
+    if (reason === null) return;
+    if (!reason.trim()) {
+        showToast('A reason is required for an acknowledgement', 'warning', 3500);
+        return;
+    }
+    const scope = resourceId
+        ? { kind: 'resource', node_id: nodeId, resource_id: resourceId }
+        : { kind: 'node', node_id: nodeId };
+    try {
+        const r = await fetch('/api/proposal-acks', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                finding_type: findingType,
+                scope,
+                reason: reason.trim(),
+            }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            showToast(`Ack failed: ${data.error || r.statusText}`, 'error');
+            return;
+        }
+        showToast('Acknowledged for 180 days', 'success', 2200);
+        predictiveLoad();
+    } catch (e) {
+        showToast(`Ack errored: ${e.message || String(e)}`, 'error');
+    }
+}
+
+async function predictiveRunNow() {
+    const btn = document.getElementById('predictive-run-now');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Running…'; }
+    const before = (predictiveState.proposals || []).length;
+    try {
+        const r = await fetch('/api/proposals/run-now', { method: 'POST' });
+        if (!r.ok) {
+            const data = await r.json().catch(() => ({}));
+            showToast(`Run failed: ${data.error || r.statusText}`, 'error');
+            return;
+        }
+        await predictiveLoad();
+        const after = (predictiveState.proposals || []).length;
+        if (after === before && after === 0) {
+            // Differentiate "ran cleanly, found nothing" from "ran and
+            // surfaced new findings" — the first case is what an idle
+            // healthy cluster always looks like, and operators expect
+            // visible feedback that the click did something.
+            showToast('Analyzer ran — no new findings (this is normal)', 'success', 2500);
+        } else if (after > before) {
+            showToast(`Analyzer ran — ${after - before} new finding${after - before === 1 ? '' : 's'}`, 'success', 2500);
+        } else {
+            showToast('Analyzer run complete', 'success', 1500);
+        }
+    } catch (e) {
+        showToast(`Run errored: ${e.message || String(e)}`, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '🔄 Run analyzer now'; }
+    }
+}
+
+function predictiveBadgeUpdate() {
+    const badge = document.getElementById('predictive-badge');
+    if (!badge) return;
+    const count = (predictiveState.proposals || []).filter(p =>
+        p.status && p.status.kind === 'pending'
+    ).length;
+    if (count > 0) {
+        badge.textContent = count > 99 ? '99+' : String(count);
+        badge.style.display = 'inline-block';
+    } else {
+        badge.style.display = 'none';
+    }
+}
+
+// Background poll so the badge updates even when the user isn't on
+// the Inbox page. Keep cadence slow — 60s — so we don't burn the
+// orchestrator's read locks. The orchestrator itself runs the
+// analyzer every 5 min; checking the resulting state every 60 s
+// gives near-real-time badge updates.
+function predictiveStartBadgePoll() {
+    if (predictiveBadgeTimer) return;
+    const tick = async () => {
+        try {
+            // Cluster endpoint — server caches for 30s so this 60s
+            // poll across N operators only costs at most two peer
+            // round-trips per minute regardless of operator count.
+            const r = await fetch('/api/proposals/cluster');
+            if (r.ok) {
+                const body = await r.json();
+                predictiveState.proposals = body.proposals || [];
+                predictiveState.nodes = body.nodes || [];
+                predictiveBadgeUpdate();
+            }
+        } catch (_) { /* network blips are silent — the next tick retries */ }
+    };
+    tick();
+    predictiveBadgeTimer = setInterval(tick, 60000);
+}
+
+window.renderPredictiveInbox = renderPredictiveInbox;
+window.predictiveRunNow = predictiveRunNow;
+window.predictiveSnooze = predictiveSnooze;
+window.predictiveSnoozeMenu = predictiveSnoozeMenu;
+window.predictiveDismiss = predictiveDismiss;
+window.predictiveApprove = predictiveApprove;
+window.predictiveAck = predictiveAck;
+window.predictiveCopyCmd = predictiveCopyCmd;
+window.predictiveStartBadgePoll = predictiveStartBadgePoll;
+window.predictiveSetNodeFilter = predictiveSetNodeFilter;
+window.predictiveSetClusterFilter = predictiveSetClusterFilter;
+
+// ─── Apps & Tools drawer ──────────────────────────────────────────
+//
+// Slide-out launcher containing the secondary nav items that used to
+// crowd the top icon strip. The list lives here (single source of
+// truth) so adding/removing a tile is a one-line edit. Each tile
+// click navigates via the existing `selectView` and auto-closes the
+// drawer.
+
+const APP_DRAWER_TILES = [
+    {
+        id: 'control-panel', icon: '🎛️', name: 'Control Panel',
+        desc: 'Every VM, LXC and Docker across the cluster, one view.',
+    },
+    {
+        id: 'global-wolfnet', icon: '🌐', name: 'Global View',
+        desc: 'World map of every cluster you manage.',
+    },
+    {
+        id: 'topology', icon: '🖥️', name: '3D Server Room',
+        desc: 'Immersive 3D topology of every host.',
+    },
+    {
+        id: 'wolfflow', icon: '⚡', name: 'WolfFlow',
+        desc: 'Build and run automation flows across the cluster.',
+    },
+    {
+        id: 'wolfagents', icon: '🐺', name: 'WolfAgents',
+        desc: 'Named AI agents with persistent memory.',
+    },
+    {
+        id: 'cluster-browser', icon: '🔗', name: 'Cluster Browser',
+        desc: 'Open cluster web apps without a VPN.',
+    },
+    {
+        id: 'databases', icon: '🗄️', name: 'Databases',
+        desc: 'Query any configured SQL connection across the cluster.',
+    },
+    {
+        id: 'appstore', icon: '🛍️', name: 'App Store',
+        desc: 'Browse and install applications onto any host.',
+    },
+];
+
+function appDrawerTileHtml(t) {
+    return `
+        <button class="app-drawer-tile" onclick="appDrawerNav('${escapeAttr(t.id)}')"
+            style="background:var(--bg-secondary,#16181f);border:1px solid var(--border-color,#2d2f3a);border-radius:10px;padding:14px 12px;cursor:pointer;text-align:left;color:var(--text-primary);font-family:inherit;display:flex;flex-direction:column;gap:6px;transition:transform 0.12s ease, border-color 0.12s ease, background 0.12s ease;"
+            onmouseenter="this.style.borderColor='var(--accent,#3b82f6)';this.style.background='var(--bg-tertiary,#2d2f3a)';this.style.transform='translateY(-1px)';"
+            onmouseleave="this.style.borderColor='var(--border-color,#2d2f3a)';this.style.background='var(--bg-secondary,#16181f)';this.style.transform='translateY(0)';">
+            <div style="font-size:28px;line-height:1;">${escapeHtml(t.icon || '🧩')}</div>
+            <div style="font-size:14px;font-weight:600;">${escapeHtml(t.name)}</div>
+            <div style="font-size:11px;color:var(--text-muted);line-height:1.4;">${escapeHtml(t.desc || '')}</div>
+        </button>
+    `;
+}
+
+function renderAppDrawer(pluginTiles) {
+    const grid = document.getElementById('app-drawer-grid');
+    if (!grid) return;
+    let html = `<div style="grid-column:1/-1;font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin:4px 0 -4px 4px;">Built-in views</div>`;
+    html += APP_DRAWER_TILES.map(appDrawerTileHtml).join('');
+    if (pluginTiles && pluginTiles.length > 0) {
+        html += `<div style="grid-column:1/-1;font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin:18px 0 -4px 4px;">Plugins</div>`;
+        html += pluginTiles.map(appDrawerTileHtml).join('');
+    }
+    grid.innerHTML = html;
+}
+
+/// Fetch enabled plugins that expose a top-level menu entry, normalise
+/// to the same `{id, icon, name, desc}` shape the built-in tiles use.
+/// Returns [] silently on any error so a broken plugin endpoint never
+/// breaks the launcher.
+async function loadAppDrawerPluginTiles() {
+    try {
+        const r = await fetch('/api/plugins');
+        if (!r.ok) return [];
+        const all = await r.json();
+        if (!Array.isArray(all)) return [];
+        return all
+            .filter(p => p && p.manifest && p.manifest.enabled !== false)
+            .filter(p => p.manifest.menu && p.manifest.menu.view)
+            .map(p => ({
+                // Plugin pages live under `page-plugin-{view}` per
+                // `addPluginNavItem` — match that convention so the
+                // drawer click navigates to the correct DOM container.
+                id:   `plugin-${p.manifest.menu.view}`,
+                icon: p.manifest.icon || '🧩',
+                name: p.manifest.menu.label || p.manifest.name || p.manifest.id,
+                desc: p.manifest.description || '',
+            }));
+    } catch (_) { return []; }
+}
+
+function openAppDrawer() {
+    console.log('[apps-drawer] openAppDrawer() called');
+    const backdrop = document.getElementById('app-drawer-backdrop');
+    const drawer = document.getElementById('app-drawer');
+    console.log('[apps-drawer] elements:', { backdrop: !!backdrop, drawer: !!drawer });
+    if (!backdrop || !drawer) {
+        console.warn('[apps-drawer] elements missing — index.html out of sync? Hard-refresh.');
+        return;
+    }
+
+    // Defensively re-parent the drawer + backdrop to <body> so any
+    // ancestor with `transform`/`filter`/`will-change` (which breaks
+    // `position: fixed` per the CSS containing-block spec) can't clip
+    // them. This is the most common cause of "the drawer is in the
+    // DOM but invisible" — the .main-content or .sidebar parent
+    // creates a containing block and the fixed-positioned drawer
+    // anchors to that instead of the viewport.
+    if (drawer.parentElement !== document.body) {
+        document.body.appendChild(drawer);
+    }
+    if (backdrop.parentElement !== document.body) {
+        document.body.appendChild(backdrop);
+    }
+
+    // Render built-ins immediately so the drawer feels responsive.
+    renderAppDrawer([]);
+
+    backdrop.style.display = 'block';
+    // Trigger transition on next frame so the opacity/transform
+    // animations actually run instead of jumping.
+    requestAnimationFrame(() => {
+        backdrop.style.opacity = '1';
+        drawer.style.transform = 'translateX(0)';
+    });
+    document.addEventListener('keydown', appDrawerEscHandler);
+
+    // Enrich with plugins (async, fire-and-forget).
+    loadAppDrawerPluginTiles().then(plugins => renderAppDrawer(plugins));
+}
+
+function closeAppDrawer() {
+    const backdrop = document.getElementById('app-drawer-backdrop');
+    const drawer = document.getElementById('app-drawer');
+    if (!backdrop || !drawer) return;
+    backdrop.style.opacity = '0';
+    drawer.style.transform = 'translateX(100%)';
+    document.removeEventListener('keydown', appDrawerEscHandler);
+    setTimeout(() => { backdrop.style.display = 'none'; }, 220);
+}
+
+function appDrawerEscHandler(e) {
+    if (e.key === 'Escape') closeAppDrawer();
+}
+
+function appDrawerNav(pageId) {
+    closeAppDrawer();
+    // Tiny delay so the drawer's slide-out animation starts before
+    // selectView re-renders the underlying view — feels less jarring
+    // than the two transitions racing.
+    setTimeout(() => selectView(pageId), 60);
+}
+
+window.openAppDrawer = openAppDrawer;
+window.closeAppDrawer = closeAppDrawer;
+window.appDrawerNav = appDrawerNav;

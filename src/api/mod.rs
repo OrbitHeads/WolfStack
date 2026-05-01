@@ -201,7 +201,10 @@ pub struct PbsRestoreProgress {
 
 /// Shared application state
 pub struct AppState {
-    pub monitor: std::sync::Mutex<SystemMonitor>,
+    /// `Arc<Mutex<…>>` so the predictive orchestrator can clone a
+    /// reference and call `collect()` on its own cadence without
+    /// blocking the high-frequency `cached_status_bg` task.
+    pub monitor: Arc<std::sync::Mutex<SystemMonitor>>,
     pub metrics_history: std::sync::Mutex<MetricsHistory>,
     pub cluster: Arc<ClusterState>,
     pub sessions: Arc<SessionManager>,
@@ -239,6 +242,22 @@ pub struct AppState {
     pub integrations: Arc<crate::integrations::IntegrationState>,
     /// WolfRouter (native firewall/DHCP/DNS) state
     pub router: Arc<crate::networking::router::RouterState>,
+    /// Predictive ops — pending/snoozed/dismissed proposals.
+    pub predictive_proposals: Arc<std::sync::RwLock<crate::predictive::ProposalStore>>,
+    /// Predictive ops — operator-declared "this is intentional" suppressions.
+    pub predictive_acks: Arc<std::sync::RwLock<crate::predictive::AckStore>>,
+    /// Predictive ops — rolling per-resource sample history.
+    pub predictive_metrics: Arc<std::sync::RwLock<crate::predictive::MetricsHistory>>,
+    /// 30-second aggregation cache for `/api/proposals/cluster`. Stores
+    /// the most-recent fan-out result so dashboards refreshing every
+    /// few seconds don't make N peers each round-trip per refresh.
+    /// Invalidated on every state-changing predictive endpoint (snooze /
+    /// dismiss / approve / run-now / ack create+delete) so operator
+    /// actions produce immediately-visible feedback.
+    pub predictive_cluster_cache: Arc<std::sync::Mutex<Option<(crate::predictive::cluster::ClusterProposalsResponse, std::time::Instant)>>>,
+    /// This node's identifier — copied here so predictive handlers
+    /// can build proposal scopes without threading it from main.
+    pub node_id: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -17196,6 +17215,475 @@ pub async fn system_install_package(
     }
 }
 
+// ─── Predictive ops: Inbox + Acknowledgements ────────────────────
+//
+// Surfaces the proposal store (analyzer findings) and the ack store
+// (operator-declared "this is intentional, stop firing") to the
+// frontend Inbox view. All endpoints require a session cookie; the
+// underlying store is `Arc<RwLock<...>>` in AppState so reads and
+// writes are cheap and the orchestrator background loop owns
+// long-held locks only inside spawn_blocking.
+
+/// GET /api/proposals — inbox view (Pending + active Snoozed),
+/// sorted Critical→Info, then most-recently-updated first.
+pub async fn predictive_proposals_list(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let store = match state.predictive_proposals.read() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let inbox: Vec<&crate::predictive::Proposal> = store.inbox();
+    HttpResponse::Ok().json(inbox)
+}
+
+/// GET /api/proposals/cluster — aggregated inbox across this node
+/// and every reachable cluster peer.
+///
+/// Cached for 30 s (`cluster::CACHE_TTL_SECS`) so a dashboard
+/// refresh doesn't translate into one HTTP fan-out per peer per
+/// refresh. Cache is invalidated on every state-changing predictive
+/// endpoint so operator actions produce immediately-visible
+/// feedback.
+///
+/// Per-peer fetch failures are surfaced in the `nodes` field so the
+/// UI can warn that the Inbox is incomplete instead of silently
+/// showing partial data.
+pub async fn predictive_proposals_cluster(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    // Cache hit?
+    {
+        let cache = state.predictive_cluster_cache.lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((value, ts)) = &*cache {
+            let age = ts.elapsed().as_secs();
+            if age < crate::predictive::cluster::CACHE_TTL_SECS {
+                let mut response = value.clone();
+                response.cached_for_seconds = age;
+                return HttpResponse::Ok().json(response);
+            }
+        }
+    }
+
+    // Cache miss — fan out.
+    let response = build_cluster_response(&state).await;
+
+    // Save back. Stale-on-poison falls through to a fresh build next
+    // time, which is the conservative choice.
+    {
+        let mut cache = state.predictive_cluster_cache.lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *cache = Some((response.clone(), std::time::Instant::now()));
+    }
+
+    HttpResponse::Ok().json(response)
+}
+
+async fn build_cluster_response(
+    state: &web::Data<AppState>,
+) -> crate::predictive::cluster::ClusterProposalsResponse {
+    use crate::predictive::cluster::{
+        ClusterProposalsResponse, NodeAggregateStatus, sort_proposals,
+    };
+
+    // Self proposals — clone out under a brief read lock.
+    let self_proposals: Vec<crate::predictive::Proposal> = {
+        let store = state.predictive_proposals.read()
+            .unwrap_or_else(|e| e.into_inner());
+        store.inbox().into_iter().cloned().collect()
+    };
+
+    // Self status — for the nodes list. We always responded to
+    // ourselves; that's a tautology worth surfacing so the UI never
+    // shows fewer entries than the cluster has nodes.
+    let nodes_snapshot = state.cluster.get_all_nodes();
+    let self_node = nodes_snapshot.iter().find(|n| n.is_self).cloned();
+    let self_status = NodeAggregateStatus {
+        node_id: state.node_id.clone(),
+        hostname: self_node.as_ref().map(|n| n.hostname.clone()).unwrap_or_default(),
+        is_self: true,
+        responded: true,
+        error: None,
+        cluster_name: self_node.as_ref().map(|n| resolve_cluster_label(n)).unwrap_or_default(),
+    };
+
+    // Peers — only online wolfstack nodes that aren't ourselves.
+    // Proxmox-typed nodes don't run our analyzer so we skip them.
+    let peers: Vec<_> = nodes_snapshot.into_iter()
+        .filter(|n| !n.is_self && n.node_type == "wolfstack" && n.online)
+        .collect();
+
+    // Fan-out — one task per peer, each with its own timeout. We
+    // collect the JoinHandles then await them with `tokio::join!` /
+    // `futures::join_all`-style sequence. Using FuturesUnordered
+    // would be tidier; for a small N this is fine.
+    // Keep `(id, hostname, cluster)` alongside each JoinHandle so
+    // that even if a task panics we still know which peer it was
+    // and which cluster it belongs to. Without these, a panicked
+    // task's `JoinError` carries no peer-level attribution and
+    // operators get a useless "<panicked>" entry in the warning
+    // banner with no cluster context.
+    let secret = state.cluster_secret.clone();
+    let mut handles: Vec<(String, String, String, tokio::task::JoinHandle<Result<Vec<crate::predictive::Proposal>, String>>)> =
+        Vec::with_capacity(peers.len());
+    for peer in &peers {
+        let urls = build_node_urls(&peer.address, peer.port, "/api/proposals");
+        let secret = secret.clone();
+        let cluster = resolve_cluster_label(peer);
+        let handle = tokio::spawn(async move {
+            fetch_peer_proposals(&urls, &secret).await
+        });
+        handles.push((peer.id.clone(), peer.hostname.clone(), cluster, handle));
+    }
+
+    let mut all_proposals = self_proposals;
+    let mut node_status: Vec<NodeAggregateStatus> = vec![self_status];
+
+    for (id, hostname, cluster_name, h) in handles {
+        match h.await {
+            Ok(Ok(proposals)) => {
+                all_proposals.extend(proposals);
+                node_status.push(NodeAggregateStatus {
+                    node_id: id, hostname, is_self: false,
+                    responded: true, error: None, cluster_name,
+                });
+            }
+            Ok(Err(e)) => {
+                node_status.push(NodeAggregateStatus {
+                    node_id: id, hostname, is_self: false,
+                    responded: false, error: Some(e), cluster_name,
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "predictive cluster: peer task for {} ({}) panicked: {}",
+                    id, hostname, e,
+                );
+                node_status.push(NodeAggregateStatus {
+                    node_id: id, hostname, is_self: false,
+                    responded: false,
+                    error: Some(format!("task panic: {}", e)),
+                    cluster_name,
+                });
+            }
+        }
+    }
+
+    sort_proposals(&mut all_proposals);
+
+    ClusterProposalsResponse {
+        proposals: all_proposals,
+        nodes: node_status,
+        cached_for_seconds: 0,
+    }
+}
+
+/// Fetch a peer's `/api/proposals` using inter-node auth. Returns a
+/// short, operator-readable error string on any failure mode so the
+/// UI's "node not responded" tooltip is meaningful.
+async fn fetch_peer_proposals(
+    urls: &[String],
+    secret: &str,
+) -> Result<Vec<crate::predictive::Proposal>, String> {
+    let mut last_status_err: Option<String> = None;
+    for url in urls {
+        let send = API_HTTP_CLIENT
+            .get(url)
+            .header("X-WolfStack-Secret", secret)
+            .send();
+        match tokio::time::timeout(crate::predictive::cluster::PEER_FETCH_TIMEOUT, send).await {
+            Err(_) => return Err("timeout".to_string()),
+            Ok(Err(_)) => continue,  // connection refused / TLS fail / etc — try next URL
+            Ok(Ok(resp)) => {
+                let status = resp.status();
+                if status.is_success() {
+                    return resp.json::<Vec<crate::predictive::Proposal>>().await
+                        .map_err(|e| format!("invalid response shape: {}", e));
+                }
+                if status == 401 || status == 403 {
+                    return Err(format!("auth rejected (HTTP {})", status.as_u16()));
+                }
+                if status == 404 {
+                    return Err("peer doesn't expose /api/proposals (older version?)".to_string());
+                }
+                last_status_err = Some(format!("HTTP {}", status.as_u16()));
+                continue;
+            }
+        }
+    }
+    Err(last_status_err.unwrap_or_else(|| "no URL reachable".to_string()))
+}
+
+/// Resolve a `Node` to the cluster grouping label used by the
+/// dashboard. Mirrors the rule in `web/js/app.js`:
+///
+/// - Proxmox-typed nodes prefer `pve_cluster_name`, then their
+///   own `cluster_name`, then their `address` (so a standalone
+///   PVE host shows under its hostname/IP).
+/// - WolfStack-typed nodes use `cluster_name` falling back to
+///   `"WolfStack"` for older nodes that never set one.
+///
+/// Lifted into Rust so the predictive Inbox aggregator groups by
+/// cluster the same way the rest of the UI does.
+fn resolve_cluster_label(node: &crate::agent::Node) -> String {
+    if node.node_type == "proxmox" {
+        node.pve_cluster_name.clone()
+            .or_else(|| node.cluster_name.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| node.address.clone())
+    } else {
+        node.cluster_name.clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "WolfStack".to_string())
+    }
+}
+
+/// Drop the cluster-aggregation cache so the next
+/// `/api/proposals/cluster` call rebuilds from scratch. Called from
+/// every state-changing predictive endpoint.
+fn invalidate_cluster_cache(state: &web::Data<AppState>) {
+    if let Ok(mut g) = state.predictive_cluster_cache.lock() {
+        *g = None;
+    }
+}
+
+/// GET /api/proposals/history — every proposal regardless of status
+/// (for the audit/history view).
+pub async fn predictive_proposals_history(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let store = match state.predictive_proposals.read() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    HttpResponse::Ok().json(&store.proposals)
+}
+
+/// GET /api/proposals/{id} — single proposal detail.
+pub async fn predictive_proposal_get(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let store = match state.predictive_proposals.read() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    match store.get(&id) {
+        Some(p) => HttpResponse::Ok().json(p),
+        None => HttpResponse::NotFound().json(serde_json::json!({ "error": "proposal not found" })),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SnoozeProposalRequest {
+    /// Snooze duration. Clamped to 1h..720h (30d) — silent forever
+    /// is what Dismiss is for.
+    pub hours: i64,
+}
+
+pub async fn predictive_proposal_snooze(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<SnoozeProposalRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let hours = body.into_inner().hours.clamp(1, 24 * 30);
+    let until = chrono::Utc::now() + chrono::Duration::hours(hours);
+    let mut store = match state.predictive_proposals.write() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    match store.snooze(&id, until) {
+        Ok(()) => {
+            let _ = store.save();
+            // Order matters: save first (so on-disk is fresh), then
+            // invalidate the cluster cache. The opposite order races
+            // — a concurrent /api/proposals/cluster could rebuild
+            // and re-cache the stale state in the gap.
+            drop(store);
+            invalidate_cluster_cache(&state);
+            HttpResponse::Ok().json(serde_json::json!({
+                "success": true,
+                "until": until.to_rfc3339(),
+            }))
+        }
+        Err(e) => HttpResponse::NotFound().json(serde_json::json!({ "error": e })),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct DismissProposalRequest {
+    /// Reason captured for audit + AI feedback. Required (non-empty
+    /// after trim) so dismissals carry context the next analyzer
+    /// run can learn from.
+    pub reason: String,
+}
+
+pub async fn predictive_proposal_dismiss(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<DismissProposalRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let reason = body.into_inner().reason.trim().to_string();
+    if reason.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "dismiss reason is required so the audit trail \
+                      and AI feedback have something to learn from",
+        }));
+    }
+    let mut store = match state.predictive_proposals.write() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    match store.dismiss(&id, reason) {
+        Ok(()) => {
+            let _ = store.save();
+            drop(store);
+            invalidate_cluster_cache(&state);
+            HttpResponse::Ok().json(serde_json::json!({ "success": true }))
+        }
+        Err(e) => HttpResponse::NotFound().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// POST /api/proposals/{id}/approve — record that the operator
+/// applied the remediation. v1 proposals are always
+/// `RemediationPlan::Manual`, so "approve" means "I ran the
+/// commands, mark this done"; v2 OneClick proposals will dispatch
+/// to a handler instead.
+pub async fn predictive_proposal_approve(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let mut store = match state.predictive_proposals.write() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    match store.record_approval(&id, crate::predictive::ApprovalOutcome::Applied) {
+        Ok(()) => {
+            let _ = store.save();
+            drop(store);
+            invalidate_cluster_cache(&state);
+            HttpResponse::Ok().json(serde_json::json!({ "success": true }))
+        }
+        Err(e) => HttpResponse::NotFound().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// POST /api/proposals/run-now — synchronously run one orchestrator
+/// tick instead of waiting for the next 5-min cadence. Useful right
+/// after the operator clears a finding to refresh the inbox.
+pub async fn predictive_proposals_run_now(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let proposals = state.predictive_proposals.clone();
+    let acks = state.predictive_acks.clone();
+    let metrics = state.predictive_metrics.clone();
+    let monitor = state.monitor.clone();
+    let node_id = state.node_id.clone();
+    crate::predictive::orchestrator::tick(&proposals, &acks, &metrics, &monitor, &node_id).await;
+    invalidate_cluster_cache(&state);
+    HttpResponse::Ok().json(serde_json::json!({ "success": true }))
+}
+
+// ─── Acks (operator suppressions) ─────────────────────────────────
+
+pub async fn predictive_acks_list(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let store = match state.predictive_acks.read() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    HttpResponse::Ok().json(&store.acks)
+}
+
+#[derive(Deserialize)]
+pub struct CreateAckRequest {
+    pub finding_type: String,
+    pub scope: crate::predictive::AckScope,
+    pub reason: String,
+    /// `None` → 180-day default. `Some(n)` clamped to 1..3650.
+    pub lifetime_days: Option<i64>,
+}
+
+pub async fn predictive_acks_create(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<CreateAckRequest>,
+) -> HttpResponse {
+    let user = match require_auth(&req, &state) {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+    let r = body.into_inner();
+    if r.reason.trim().is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "ack reason is required — it's what makes the \
+                      suppression auditable later",
+        }));
+    }
+    let lifetime = r.lifetime_days
+        .map(|d| chrono::Duration::days(d.clamp(1, 3650)));
+    let ack = crate::predictive::Ack::new(
+        r.finding_type, r.scope, r.reason, user, lifetime,
+    );
+    let id = ack.id.clone();
+    let mut store = match state.predictive_acks.write() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    store.add(ack);
+    let _ = store.save();
+    drop(store);
+    invalidate_cluster_cache(&state);
+    HttpResponse::Ok().json(serde_json::json!({ "success": true, "id": id }))
+}
+
+pub async fn predictive_acks_remove(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let mut store = match state.predictive_acks.write() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    if store.remove(&id) {
+        let _ = store.save();
+        drop(store);
+        invalidate_cluster_cache(&state);
+        HttpResponse::Ok().json(serde_json::json!({ "success": true }))
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({ "error": "ack not found" }))
+    }
+}
+
 // ─── WhatsApp webhook (inbound via Twilio) ───
 
 /// POST /api/whatsapp/webhook — Twilio delivers inbound WhatsApp
@@ -21558,6 +22046,19 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/alerts/config", web::post().to(alerts_config_save))
         .route("/api/alerts/test", web::post().to(alerts_test))
         .route("/api/system/install-package", web::post().to(system_install_package))
+        // Predictive ops — Inbox + Acks. Static segments before
+        // {id} so actix doesn't swallow them as ids.
+        .route("/api/proposals", web::get().to(predictive_proposals_list))
+        .route("/api/proposals/cluster", web::get().to(predictive_proposals_cluster))
+        .route("/api/proposals/history", web::get().to(predictive_proposals_history))
+        .route("/api/proposals/run-now", web::post().to(predictive_proposals_run_now))
+        .route("/api/proposals/{id}", web::get().to(predictive_proposal_get))
+        .route("/api/proposals/{id}/snooze", web::post().to(predictive_proposal_snooze))
+        .route("/api/proposals/{id}/dismiss", web::post().to(predictive_proposal_dismiss))
+        .route("/api/proposals/{id}/approve", web::post().to(predictive_proposal_approve))
+        .route("/api/proposal-acks", web::get().to(predictive_acks_list))
+        .route("/api/proposal-acks", web::post().to(predictive_acks_create))
+        .route("/api/proposal-acks/{id}", web::delete().to(predictive_acks_remove))
         // WolfAgents — named AI agents with persistent memory.
         .route("/api/agents", web::get().to(agents_list))
         .route("/api/agents", web::post().to(agents_create))

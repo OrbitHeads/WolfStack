@@ -2274,6 +2274,12 @@ pub struct ContainerInfo {
     pub mac_address: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub network_name: String,
+    /// Cumulative restart count reported by the runtime. Docker's
+    /// `State.RestartCount` from inspect; populated for Docker
+    /// containers. Always `None` for LXC (whose container-internal
+    /// init handles its own restart accounting).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2611,6 +2617,7 @@ fn docker_list(all: bool) -> Vec<ContainerInfo> {
                 gateway: container_gateway,
                 mac_address: container_mac,
                 network_name: net_name,
+                restart_count: Some(fields.restart_count),
             }
         })
         .collect()
@@ -2627,6 +2634,11 @@ struct DockerInspectFields {
     network_macs: String,
     merged_dir: String,
     restart_policy: String,
+    /// Cumulative number of times Docker has restarted this
+    /// container since creation (`State.RestartCount` from inspect).
+    /// The predictive restart-loop analyzer reads the delta of this
+    /// across ticks to detect crash-loops.
+    restart_count: u64,
 }
 
 /// Run ONE `docker inspect <id1> <id2> ...` and parse the resulting JSON
@@ -2702,6 +2714,9 @@ fn docker_batched_inspect(ids: &[String])
         }
         if let Some(s) = entry.pointer("/HostConfig/RestartPolicy/Name").and_then(|v| v.as_str()) {
             fields.restart_policy = s.to_string();
+        }
+        if let Some(n) = entry.pointer("/State/RestartCount").and_then(|v| v.as_u64()) {
+            fields.restart_count = n;
         }
         map.insert(id, fields);
     }
@@ -3626,6 +3641,7 @@ pub fn lxc_list_all() -> Vec<ContainerInfo> {
                 gateway: lxc_gateway,
                 mac_address: lxc_mac,
                 network_name: lxc_link,
+                restart_count: None,  // LXC: see ContainerInfo::restart_count doc
             });
         }
     }
@@ -3938,6 +3954,7 @@ fn pct_list_all() -> Vec<ContainerInfo> {
                     gateway: pve_gateway,
                     mac_address: pve_mac,
                     network_name: pve_bridge,
+                    restart_count: None,  // PVE-LXC: see ContainerInfo::restart_count doc
                 }
             })
         }).collect();
