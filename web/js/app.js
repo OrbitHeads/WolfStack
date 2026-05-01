@@ -47806,6 +47806,30 @@ function predictiveSetNodeFilter(nodeId) {
     predictiveRender();
 }
 
+// Map a proposal's finding_type + scope to a (label, icon, color)
+// tuple identifying *what* (host / Docker / LXC / VM / cert / …) so
+// every card carries an at-a-glance "this is on Server X, in
+// runtime Y" badge. Operators stop having to read the title to know
+// where a problem lives.
+function predictiveRuntimeBadge(p) {
+    const ft = p.finding_type || '';
+    const rid = (p.scope && p.scope.resource_id) || '';
+    if (ft.startsWith('docker_'))         return { label: 'DOCKER',   icon: '🐳', color: '#06b6d4' };
+    if (ft.startsWith('lxc_'))            return { label: 'LXC',      icon: '📦', color: '#a855f7' };
+    if (ft === 'vm_disk_fill')            return { label: 'VM',       icon: '💻', color: '#f59e0b' };
+    if (ft === 'cert_expiry_window')      return { label: 'CERT',     icon: '🔒', color: '#10b981' };
+    if (ft === 'backup_stale')            return { label: 'BACKUP',   icon: '💾', color: '#8b5cf6' };
+    if (ft.startsWith('sshd_'))           return { label: 'SSH',      icon: '🔑', color: '#ef4444' };
+    if (ft === 'service_bound_publicly')  return { label: 'NETWORK',  icon: '🌐', color: '#ef4444' };
+    if (ft === 'systemd_unit_failed')     return { label: 'SERVICE',  icon: '⚙️', color: '#f97316' };
+    if (ft.startsWith('host_'))           return { label: 'HOST',     icon: '🖥️', color: '#64748b' };
+    if (ft === 'disk_fill_eta')           return { label: 'HOST',     icon: '🖥️', color: '#64748b' };
+    // Fallback: surface the resource_id prefix so unknown finding
+    // types still get *some* attribution — better than a blank.
+    if (rid.includes(':')) return { label: rid.split(':')[0].toUpperCase(), icon: '📌', color: '#64748b' };
+    return { label: 'FINDING', icon: '📌', color: '#64748b' };
+}
+
 function predictiveCardHtml(p) {
     const sev = p.severity || 'info';
     const colors = { critical: '#ef4444', high: '#f97316', warn: '#fbbf24', info: '#60a5fa' };
@@ -47815,6 +47839,8 @@ function predictiveCardHtml(p) {
         ? '<span style="background:rgba(168,85,247,0.18);color:#c084fc;padding:1px 7px;border-radius:4px;font-size:10px;font-weight:600;margin-left:6px;">🤖 AI</span>'
         : '';
 
+    const runtime = predictiveRuntimeBadge(p);
+
     const evidence = (p.evidence || []).map(e => `
         <div style="display:inline-block;background:var(--bg-tertiary,#2d2f3a);padding:4px 10px;border-radius:6px;margin-right:6px;margin-bottom:6px;font-size:12px;">
             <span style="color:var(--text-muted);">${escapeHtml(e.label)}:</span>
@@ -47823,7 +47849,7 @@ function predictiveCardHtml(p) {
         </div>
     `).join('');
 
-    const remediation = predictiveRemediationHtml(p.remediation);
+    const remediation = predictiveRemediationHtml(p.remediation, p.id);
 
     let snoozeNotice = '';
     if (p.status && p.status.kind === 'snoozed') {
@@ -47832,28 +47858,37 @@ function predictiveCardHtml(p) {
         snoozeNotice = `<div style="background:rgba(96,165,250,0.1);padding:8px 12px;border-radius:6px;font-size:12px;color:#60a5fa;margin-bottom:12px;">⏰ Snoozed until ${escapeHtml(untilStr)} — will re-fire after.</div>`;
     }
 
-    // Resolve cluster_name for this proposal's node so the card
-    // header can show "cluster · node · resource". Falls back
-    // gracefully if the nodes list hasn't been populated yet.
+    // Resolve cluster_name + hostname for this proposal's node.
+    // Hostname is the human-friendly answer to "which server?";
+    // cluster groups it; resource_id (e.g. "docker:postgres", "/var/log",
+    // "vm:opnsense:...") finishes the address.
     const clusterByNode = {};
+    const hostnameByNode = {};
     (predictiveState.nodes || []).forEach(n => {
         clusterByNode[n.node_id] = n.cluster_name || 'WolfStack';
+        if (n.hostname) hostnameByNode[n.node_id] = n.hostname;
     });
     const cluster = clusterByNode[p.scope.node_id] || '';
-    const dedupKey = `${cluster ? cluster + ' · ' : ''}${p.scope.node_id}${p.scope.resource_id ? ' · ' + p.scope.resource_id : ''}`;
+    const host = hostnameByNode[p.scope.node_id] || p.scope.node_id;
+    const resource = p.scope.resource_id || '';
 
     return `
         <div style="background:var(--bg-card,#1e2028);border:1px solid var(--border-color,#2d2f3a);border-left:4px solid ${c};border-radius:10px;padding:16px 18px;margin-bottom:12px;">
             <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:10px;gap:12px;">
                 <div style="flex:1;min-width:0;">
-                    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px;">
+                    <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:6px;">
                         <span style="background:${c};color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;letter-spacing:0.5px;">${labels[sev] || sev.toUpperCase()}</span>
-                        <span style="font-size:11px;color:var(--text-muted);">${escapeHtml(p.finding_type)}</span>
+                        <span style="background:${runtime.color};color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;letter-spacing:0.5px;display:inline-flex;align-items:center;gap:4px;">${runtime.icon} ${runtime.label}</span>
                         ${sourceBadge}
                     </div>
-                    <div style="font-size:15px;font-weight:600;color:var(--text-primary);">${escapeHtml(p.title)}</div>
+                    <div style="font-size:15px;font-weight:600;color:var(--text-primary);margin-bottom:4px;">${escapeHtml(p.title)}</div>
+                    <div style="font-size:12px;color:var(--text-muted);display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                        ${cluster ? `<span style="color:#c084fc;font-weight:500;">${escapeHtml(cluster)}</span><span>·</span>` : ''}
+                        <span title="${escapeAttr(p.scope.node_id)}" style="color:var(--text-secondary);font-weight:500;">🖥️ ${escapeHtml(host)}</span>
+                        ${resource ? `<span>·</span><code style="background:var(--bg-tertiary,#2d2f3a);padding:1px 6px;border-radius:4px;font-size:11px;">${escapeHtml(resource)}</code>` : ''}
+                        <span style="opacity:0.5;margin-left:6px;">${escapeHtml(p.finding_type)}</span>
+                    </div>
                 </div>
-                <span style="font-size:11px;color:var(--text-muted);white-space:nowrap;text-align:right;">${escapeHtml(dedupKey)}</span>
             </div>
             ${snoozeNotice}
             <div style="font-size:13px;color:var(--text-secondary);line-height:1.55;margin-bottom:12px;">${escapeHtml(p.why)}</div>
@@ -47869,15 +47904,23 @@ function predictiveCardHtml(p) {
     `;
 }
 
-function predictiveRemediationHtml(r) {
+function predictiveRemediationHtml(r, proposalId) {
     if (!r) return '';
     if (r.kind === 'manual') {
-        const cmds = (r.commands || []).map(cmd => `
-            <div style="display:flex;align-items:center;gap:8px;background:var(--bg-tertiary,#2d2f3a);padding:6px 10px;border-radius:6px;margin-bottom:4px;">
-                <code style="flex:1;font-family:var(--font-mono,monospace);font-size:12px;color:var(--text-primary);overflow-x:auto;white-space:nowrap;">${escapeHtml(cmd)}</code>
-                <button class="btn btn-sm" style="font-size:11px;padding:2px 8px;flex-shrink:0;" onclick="predictiveCopyCmd(this)" data-cmd="${escapeAttr(cmd)}">📋 Copy</button>
-            </div>
-        `).join('');
+        const cmds = (r.commands || []).map((cmd, idx) => {
+            // Comments and informational lines (lines starting with `#`)
+            // get Copy but no Run — running a comment line is silly.
+            const isComment = cmd.trim().startsWith('#');
+            const runBtn = isComment ? '' :
+                `<button class="btn btn-sm btn-primary" style="font-size:11px;padding:2px 8px;flex-shrink:0;" onclick="predictiveRunCmd('${escapeAttr(proposalId)}', ${idx})">▶ Run</button>`;
+            return `
+                <div style="display:flex;align-items:center;gap:8px;background:var(--bg-tertiary,#2d2f3a);padding:6px 10px;border-radius:6px;margin-bottom:4px;">
+                    <code style="flex:1;font-family:var(--font-mono,monospace);font-size:12px;color:var(--text-primary);overflow-x:auto;white-space:nowrap;">${escapeHtml(cmd)}</code>
+                    ${runBtn}
+                    <button class="btn btn-sm" style="font-size:11px;padding:2px 8px;flex-shrink:0;" onclick="predictiveCopyCmd(this)" data-cmd="${escapeAttr(cmd)}">📋 Copy</button>
+                </div>
+            `;
+        }).join('');
         return `
             <div style="background:var(--bg-secondary,#16181f);padding:12px;border-radius:8px;margin-bottom:12px;border:1px solid var(--border-color,#2d2f3a);">
                 <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:0.5px;font-weight:600;">Suggested remediation</div>
@@ -47887,6 +47930,36 @@ function predictiveRemediationHtml(r) {
         `;
     }
     return `<div style="font-size:12px;color:var(--text-muted);font-style:italic;margin-bottom:12px;">[Remediation kind "${escapeHtml(r.kind)}" — UI pending]</div>`;
+}
+
+/// Open a console connected to the right target (host/docker/lxc/vm)
+/// for the proposal's scope, with the indexed command pre-run via
+/// `console.html`'s proposal_id+cmd_idx fetch path. The console
+/// resolves the target server-side from the proposal store, so the
+/// browser doesn't need to know where the finding lives.
+async function predictiveRunCmd(proposalId, cmdIdx) {
+    try {
+        // Pre-flight the metadata so we can pick the right console
+        // type and surface a useful error if the target's wrong.
+        const r = await fetch(`/api/proposals/${encodeURIComponent(proposalId)}/command/${encodeURIComponent(cmdIdx)}`);
+        if (!r.ok) {
+            const data = await r.json().catch(() => ({}));
+            showToast(`Couldn't open terminal: ${data.error || r.statusText}`, 'error');
+            return;
+        }
+        const meta = await r.json();
+        let url = '/console.html?type=' + encodeURIComponent(meta.console_type)
+            + '&name=' + encodeURIComponent(meta.console_name)
+            + '&proposal_id=' + encodeURIComponent(proposalId)
+            + '&cmd_idx=' + encodeURIComponent(cmdIdx);
+        if (meta.remote_node_id) {
+            url += '&node_id=' + encodeURIComponent(meta.remote_node_id);
+        }
+        window.open(url, 'console_predictive_' + proposalId + '_' + cmdIdx,
+            'width=960,height=600,menubar=no,toolbar=no');
+    } catch (e) {
+        showToast(`Open terminal errored: ${e.message || String(e)}`, 'error');
+    }
 }
 
 function predictiveCopyCmd(btn) {
@@ -48111,6 +48184,7 @@ window.predictiveCopyCmd = predictiveCopyCmd;
 window.predictiveStartBadgePoll = predictiveStartBadgePoll;
 window.predictiveSetNodeFilter = predictiveSetNodeFilter;
 window.predictiveSetClusterFilter = predictiveSetClusterFilter;
+window.predictiveRunCmd = predictiveRunCmd;
 
 // ─── Apps & Tools drawer ──────────────────────────────────────────
 //

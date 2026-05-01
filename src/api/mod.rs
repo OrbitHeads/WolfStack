@@ -17323,12 +17323,20 @@ async fn build_cluster_response(
     // collect the JoinHandles then await them with `tokio::join!` /
     // `futures::join_all`-style sequence. Using FuturesUnordered
     // would be tidier; for a small N this is fine.
-    // Keep `(id, hostname, cluster)` alongside each JoinHandle so
-    // that even if a task panics we still know which peer it was
-    // and which cluster it belongs to. Without these, a panicked
-    // task's `JoinError` carries no peer-level attribution and
-    // operators get a useless "<panicked>" entry in the warning
-    // banner with no cluster context.
+    // Each handle carries (node_id, hostname, cluster) so panics
+    // still identify the peer. The `node_id` here MUST match what
+    // the peer's own predictive orchestrator stamps onto
+    // `Proposal.scope.node_id` — otherwise the cluster filter in
+    // the Inbox UI maps the proposal to the wrong cluster and the
+    // list goes empty when the operator picks a non-default
+    // cluster.
+    //
+    // Each peer's orchestrator uses the local `state.node_id`,
+    // which is the value of `/etc/wolfstack/node_id` (the peer's
+    // *self_id*). Locally we know that as `peer.self_id` (Option),
+    // populated when the peer first reports. Falls back to
+    // `peer.id` (the locally-assigned cluster key) for peers that
+    // haven't reported a self_id yet.
     let secret = state.cluster_secret.clone();
     let mut handles: Vec<(String, String, String, tokio::task::JoinHandle<Result<Vec<crate::predictive::Proposal>, String>>)> =
         Vec::with_capacity(peers.len());
@@ -17336,10 +17344,11 @@ async fn build_cluster_response(
         let urls = build_node_urls(&peer.address, peer.port, "/api/proposals");
         let secret = secret.clone();
         let cluster = resolve_cluster_label(peer);
+        let canonical_id = peer.self_id.clone().unwrap_or_else(|| peer.id.clone());
         let handle = tokio::spawn(async move {
             fetch_peer_proposals(&urls, &secret).await
         });
-        handles.push((peer.id.clone(), peer.hostname.clone(), cluster, handle));
+        handles.push((canonical_id, peer.hostname.clone(), cluster, handle));
     }
 
     let mut all_proposals = self_proposals;
@@ -17587,6 +17596,100 @@ pub async fn predictive_proposal_approve(
         }
         Err(e) => HttpResponse::NotFound().json(serde_json::json!({ "error": e })),
     }
+}
+
+/// GET /api/proposals/{id}/command/{idx} — return one of a
+/// proposal's `Manual` remediation commands plus the resolved
+/// console target (type + name, plus remote `node_id` when the
+/// finding lives on a peer). Used by the Inbox UI's Run button:
+/// the dashboard opens `console.html` with these values, the page
+/// fetches the command via this endpoint, and writes it to the
+/// PTY's stdin so the operator drops into an interactive session
+/// with the suggested command pre-run.
+///
+/// Auth-gated. The command itself comes from the analyzer's
+/// proposal store on disk (never user-supplied), so URL injection
+/// can't smuggle in arbitrary shell — the command index is bounded
+/// by the proposal's recorded list.
+pub async fn predictive_proposal_command(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<(String, usize)>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let (id, idx) = path.into_inner();
+
+    let store = match state.predictive_proposals.read() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let Some(p) = store.get(&id) else {
+        return HttpResponse::NotFound().json(serde_json::json!({
+            "error": "proposal not found",
+        }));
+    };
+    let cmds = match &p.remediation {
+        crate::predictive::RemediationPlan::Manual { commands, .. } => commands,
+        _ => return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "proposal has no Manual remediation commands",
+        })),
+    };
+    let Some(command) = cmds.get(idx) else {
+        return HttpResponse::NotFound().json(serde_json::json!({
+            "error": "command index out of range",
+        }));
+    };
+
+    // Resolve the console target from scope.resource_id. The format
+    // mirrors the resource-id conventions each analyzer uses, so a
+    // finding on `docker:postgres` opens a docker exec session into
+    // postgres; `lxc:web` → lxc-attach; `vm:opnsense:...` → VM
+    // serial console; everything else → host shell on the node the
+    // finding lives on.
+    let (console_type, console_name) = resolve_console_target(p);
+
+    // Cross-node: if the finding is on a peer (scope.node_id !=
+    // this server's node_id), surface the peer's locally-assigned
+    // cluster-key id so console.html can use the existing
+    // remote-console proxy. Console.html accepts both peer.id and
+    // peer.self_id via `cluster.get_node`'s fallback scan.
+    let remote_node_id: Option<String> = if p.scope.node_id != state.node_id {
+        Some(p.scope.node_id.clone())
+    } else {
+        None
+    };
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "command": command,
+        "console_type": console_type,
+        "console_name": console_name,
+        "remote_node_id": remote_node_id,
+        "title": p.title,
+    }))
+}
+
+/// Map a proposal's `scope.resource_id` to a `(console_type,
+/// console_name)` pair compatible with the existing `/ws/console/
+/// {type}/{name}` route + `console.html?type=...&name=...` URL.
+/// Conventions match what each analyzer writes into resource_id.
+fn resolve_console_target(p: &crate::predictive::Proposal) -> (String, String) {
+    let rid = p.scope.resource_id.as_deref().unwrap_or("");
+    if let Some(name) = rid.strip_prefix("docker:") {
+        return ("docker".into(), name.to_string());
+    }
+    if let Some(name) = rid.strip_prefix("lxc:") {
+        return ("lxc".into(), name.to_string());
+    }
+    if let Some(rest) = rid.strip_prefix("vm:") {
+        // vm scope is `vm:<name>:<disk_path>` — take the name only.
+        let name = rest.split(':').next().unwrap_or(rest);
+        return ("vm".into(), name.to_string());
+    }
+    // host shell for everything else: filesystem mounts (`/var/log`),
+    // certs (`letsencrypt:...`, `wolfstack-tls:...`), backup
+    // schedules (`backup:<id>`), node-level findings (`host`,
+    // `sshd`), and per-unit findings (`my-unit.service`).
+    ("host".into(), "host".into())
 }
 
 /// POST /api/proposals/run-now — synchronously run one orchestrator
@@ -22053,6 +22156,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/proposals/history", web::get().to(predictive_proposals_history))
         .route("/api/proposals/run-now", web::post().to(predictive_proposals_run_now))
         .route("/api/proposals/{id}", web::get().to(predictive_proposal_get))
+        .route("/api/proposals/{id}/command/{idx}", web::get().to(predictive_proposal_command))
         .route("/api/proposals/{id}/snooze", web::post().to(predictive_proposal_snooze))
         .route("/api/proposals/{id}/dismiss", web::post().to(predictive_proposal_dismiss))
         .route("/api/proposals/{id}/approve", web::post().to(predictive_proposal_approve))
