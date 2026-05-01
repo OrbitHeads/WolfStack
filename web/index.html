@@ -8381,9 +8381,25 @@ region = us-east-1"></textarea>
                     '</div>';
                 document.body.appendChild(panel);
 
-                // Show bubble only if AI is configured
+                // Show bubble if ANY supported provider is configured.
+                // Earlier this only checked Claude + Gemini, so users on
+                // OpenAI / OpenRouter / Local would lose the AI bubble
+                // every restart and have to re-save Settings → AI Agent
+                // to get it back (the Save handler force-shows it).
+                // Reported by Gary KO4BSR 2026-05-01: local models become
+                // invisible after a wolfstack restart.
                 fetch('/api/ai/config').then(function (r) { return r.json(); }).then(function (cfg) {
-                    if ((cfg.has_claude_key || cfg.has_gemini_key) && cfg.model) {
+                    // `has_local_url` is the canonical masked-config
+                    // field (matches `has_claude_key`/`has_gemini_key`
+                    // pattern). Don't also peek at `cfg.local_url` —
+                    // two truthiness checks for the same condition is
+                    // a maintenance trap.
+                    var anyProvider = cfg.has_claude_key
+                        || cfg.has_gemini_key
+                        || cfg.has_openai_key
+                        || cfg.has_openrouter_key
+                        || cfg.has_local_url;
+                    if (anyProvider && cfg.model) {
                         bubble.style.display = 'flex';
                     }
                 }).catch(function () { });

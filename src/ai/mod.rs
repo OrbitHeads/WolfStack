@@ -2029,6 +2029,22 @@ pub async fn simple_chat(
 /// bracket-tag prose. Both paths are converted to bracket tags before
 /// the response is returned, so the existing tool-execution loop in
 /// `chat()` works unchanged.
+/// Tools that `chat()` can dispatch. Used as the allowlist for the
+/// content-side tool-call recovery parser so prose containing a
+/// stray `{"name": ...}` JSON object can't synthesise phantom tool
+/// dispatches. Keep in sync with the schema in `openai_tools_schema`
+/// and the dispatch arms in `tool_call_to_bracket`.
+const MAIN_AI_TOOLS: &[&str] = &[
+    "exec_local",
+    "exec_all",
+    "read_file",
+    "web_search",
+    "fetch_url",
+    "security_audit",
+    "wolfnote_create",
+    "propose_action",
+];
+
 fn openai_tools_schema() -> serde_json::Value {
     serde_json::json!([
         {
@@ -2281,26 +2297,36 @@ async fn call_local_inner(
 
     if with_tools {
         let tools_schema = openai_tools_schema();
-        // Debug log so the next "why can't the AI use tool X" report is
-        // diagnosable in seconds — see what was actually offered to the model.
         if let Some(arr) = tools_schema.as_array() {
             let names: Vec<&str> = arr.iter()
                 .filter_map(|t| t["function"]["name"].as_str())
                 .collect();
-            tracing::debug!(
+            tracing::info!(
                 target: "wolfstack::ai",
-                "call_local: offering {} tools to model={} url={}: {:?}",
-                names.len(), model, url, names
+                "call_local: model={} url={} offering {} tools: {:?}",
+                model, url, names.len(), names,
             );
         }
         body["tools"] = tools_schema;
         body["tool_choice"] = serde_json::json!("auto");
     } else {
-        tracing::debug!(
+        tracing::info!(
             target: "wolfstack::ai",
             "call_local: bare chat (no tools) — model={} url={}", model, url
         );
     }
+
+    // Surface request size — the #1 failure mode on small local models
+    // (4B and under) is the system prompt + tools + history overflowing
+    // the model's context window. Logged at debug level: chatty users
+    // would otherwise flood the info channel; switch to RUST_LOG=
+    // wolfstack::ai=debug when diagnosing local-model issues.
+    let body_size = serde_json::to_string(&body).map(|s| s.len()).unwrap_or(0);
+    tracing::debug!(
+        target: "wolfstack::ai",
+        "call_local: request body {} bytes ({} messages, system+tools included)",
+        body_size, body["messages"].as_array().map(|a| a.len()).unwrap_or(0),
+    );
 
     let mut req = client.post(&url)
         .header("content-type", "application/json")
@@ -2320,22 +2346,31 @@ async fn call_local_inner(
     if !status.is_success() {
         // Some endpoints (older Ollama, some llama.cpp builds) reject the
         // `tools` field with a 400. Retry once without it so basic chat
-        // still works on those servers; FC won't but at least the user
-        // gets a response.
+        // still works on those servers.
         let body_lower = text.to_lowercase();
         let looks_like_tools_rejection = with_tools && status.as_u16() == 400 && (
             body_lower.contains("tools") ||
             body_lower.contains("tool_choice") ||
             body_lower.contains("unknown field") ||
-            body_lower.contains("unsupported")
+            body_lower.contains("unsupported") ||
+            body_lower.contains("does not support tools") ||
+            body_lower.contains("function calling")
         );
         if looks_like_tools_rejection {
-            tracing::debug!(
+            tracing::warn!(
                 target: "wolfstack::ai",
-                "call_local: server rejected `tools` field — retrying without it (model={})", model
+                "call_local: server rejected `tools` field (HTTP {} — {}) — retrying without tools. \
+                 Model: {}. The chat will work but function calling won't; switch to a tool-fine-tuned model (qwen2.5, llama3.1, mistral-functioncalling, functiongemma) for [EXEC] support.",
+                status, text.chars().take(180).collect::<String>(), model
             );
             return call_local_no_tools(client, &url, api_key, model, system, history, user_msg).await;
         }
+        // Non-tools 4xx/5xx — surface the body so the user can act.
+        tracing::warn!(
+            target: "wolfstack::ai",
+            "call_local: server returned {} (model={} url={}): {}",
+            status, model, url, text.chars().take(400).collect::<String>(),
+        );
         return Err(format!("Local AI returned {} — {}", status, text.chars().take(500).collect::<String>()));
     }
 
@@ -2345,15 +2380,16 @@ async fn call_local_inner(
     // OpenAI format: {"choices": [{"message": {"content": "...", "tool_calls": [...]}}]}
     let msg = &json["choices"][0]["message"];
     let mut combined = msg["content"].as_str().unwrap_or("").to_string();
+    let finish_reason = json["choices"][0]["finish_reason"].as_str().unwrap_or("");
 
     if with_tools {
-        // Translate any structured tool_calls into bracket tags so the
-        // tool-execution loop in chat() (which scans for [EXEC] etc.) handles
-        // them uniformly, regardless of which model variety produced them.
+        // Path 1: structured `tool_calls` array (the OpenAI spec).
+        // Most well-behaved providers (Ollama with tool-fine-tuned
+        // models, llama.cpp server, vLLM, OpenRouter) emit this.
+        let mut had_structured = false;
         if let Some(tool_calls) = msg["tool_calls"].as_array() {
             for tc in tool_calls {
                 let name = tc["function"]["name"].as_str().unwrap_or("");
-                // Arguments arrive as a JSON-encoded string per the OpenAI spec.
                 let args_raw = tc["function"]["arguments"].as_str().unwrap_or("{}");
                 let args: serde_json::Value = serde_json::from_str(args_raw)
                     .unwrap_or(serde_json::json!({}));
@@ -2362,15 +2398,333 @@ async fn call_local_inner(
                         combined.push('\n');
                     }
                     combined.push_str(&tag);
+                    had_structured = true;
+                }
+            }
+        }
+
+        // Path 2: tool call emitted as JSON inside `content` instead
+        // of in the structured `tool_calls` field. Smaller / older /
+        // not-tool-fine-tuned models (incl. several Ollama defaults)
+        // do this. Without this branch the user sees raw JSON as the
+        // "AI's reply" and tools never fire — the failure mode users
+        // call the bug report writes itself for.
+        if !had_structured {
+            // Allowlist: the eight built-in tools `chat()` knows how
+            // to dispatch. An extracted call whose name isn't in this
+            // set is dropped (prevents prose like `{"name": "nginx",
+            // "status": "stopped"}` from materialising a phantom
+            // tool call).
+            let allowed = MAIN_AI_TOOLS;
+            if let Some(extracted) = extract_tool_calls_from_content(&combined, allowed) {
+                tracing::info!(
+                    target: "wolfstack::ai",
+                    "call_local: model emitted tool call inside content (no structured \
+                     tool_calls field) — parsed {} call(s) via fallback. \
+                     model={} finish_reason={}",
+                    extracted.len(), model, finish_reason,
+                );
+                let mut tags = String::new();
+                for (name, args) in &extracted {
+                    if let Some(tag) = tool_call_to_bracket(name, args) {
+                        if !tags.is_empty() { tags.push('\n'); }
+                        tags.push_str(&tag);
+                    }
+                }
+                if !tags.is_empty() {
+                    // Replace the JSON-in-content with the bracket
+                    // tag so the existing `chat()` execution loop
+                    // can dispatch it the same way it does
+                    // structured tool_calls.
+                    combined = tags;
                 }
             }
         }
     }
 
     if combined.is_empty() {
-        return Err(format!("Unexpected local AI response format: {}", text.chars().take(200).collect::<String>()));
+        tracing::warn!(
+            target: "wolfstack::ai",
+            "call_local: empty response (model={} finish_reason={} body_size={}). \
+             Common causes: model context exceeded by system prompt + tools + \
+             history; model doesn't follow instructions; server filtered the \
+             output. Body preview: {}",
+            model, finish_reason, text.len(),
+            text.chars().take(300).collect::<String>(),
+        );
+        return Err(format!(
+            "Local AI returned empty response (finish_reason={}). The request \
+             body was {} bytes — if the model has a small context window (4-8K \
+             on many small models) it may have run out of tokens. Try a model \
+             with a larger context, or simpler prompts.",
+            finish_reason, body_size,
+        ));
     }
     Ok(combined)
+}
+
+/// Several local-model providers (smaller Ollama defaults, llama.cpp
+/// without proper tool support, manually-prompted models) emit tool
+/// calls as JSON *inside* the `content` field rather than as the
+/// structured `tool_calls` array. This parser recognises the common
+/// shapes and returns the (function_name, arguments) pairs so we
+/// can translate them to the same bracket-tag format the rest of
+/// the code uses. Returns `None` if the content isn't a tool call.
+///
+/// **Critical safety property** — `allowed_tool_names` is the
+/// set of tool names the caller is willing to dispatch on. Any
+/// extracted call whose name is NOT in that set is dropped before
+/// it reaches the caller. Without this, prose containing legitimate
+/// JSON like `{"name": "nginx", "status": "stopped"}` (a model
+/// explaining service state, for example) would synthesise a
+/// phantom tool call. On a sysadmin platform that means potential
+/// command-injection-via-AI-response. The allowlist closes that.
+///
+/// Supported wire formats:
+///   • `{"name": "fn", "arguments": {…}}` — bare object (qwen2.5,
+///     several llama-tunes)
+///   • `[{"name": "fn", "arguments": {…}}, …]` — bare array
+///   • `{"function": {"name": "fn", "arguments": {…}}}` —
+///     OpenAI-shape inside content
+///   • Fenced ```json blocks with any of the above
+///   • `<tool_call>…</tool_call>` and `<function_call>…</function_call>`
+///     XML tags (FunctionGemma + a few others) — but **only** when
+///     the open tag begins at position 0 of the trimmed string,
+///     so a mid-prose `<tool_call>` echo can't trigger a dispatch.
+///   • Mistral's `[TOOL_CALLS] […]` prefix
+///
+/// Unrecognised content returns `None` and is treated as plain text.
+pub(crate) fn extract_tool_calls_from_content(
+    content: &str,
+    allowed_tool_names: &[&str],
+) -> Option<Vec<(String, serde_json::Value)>> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() { return None; }
+
+    // Strip Mistral-style prefix.
+    let candidate = trimmed
+        .strip_prefix("[TOOL_CALLS]").map(str::trim)
+        .unwrap_or(trimmed);
+
+    // Strip a fenced code block if the model wrapped its JSON in
+    // markdown. Use a proper close-fence search (rfind for the last
+    // ```) instead of `trim_end_matches("```")` which would silently
+    // accept arbitrary trailing backticks.
+    let candidate = if let Some(rest) = candidate.strip_prefix("```json")
+        .or_else(|| candidate.strip_prefix("```")) {
+        let inner = rest.trim_start();
+        match inner.rfind("```") {
+            Some(close_at) => inner[..close_at].trim_end(),
+            None => inner.trim_end(),  // unclosed fence — best-effort
+        }
+    } else { candidate };
+
+    // Strip XML-style wrappers — only when they begin at position 0.
+    // A mid-prose `<tool_call>echo</tool_call>` (e.g. the model
+    // explaining its own format to the user) must NOT extract.
+    let candidate = strip_xml_wrapper_anchored(candidate, "tool_call")
+        .or_else(|| strip_xml_wrapper_anchored(candidate, "function_call"))
+        .unwrap_or_else(|| candidate.to_string());
+    let candidate = candidate.trim();
+
+    // Try array first, then object.
+    let parsed: serde_json::Value = serde_json::from_str(candidate).ok()?;
+
+    let mut out = Vec::new();
+    if let Some(arr) = parsed.as_array() {
+        for item in arr {
+            if let Some((n, a)) = parse_one_call(item) {
+                if allowed_tool_names.contains(&n.as_str()) {
+                    out.push((n, a));
+                }
+            }
+        }
+    } else if let Some((n, a)) = parse_one_call(&parsed) {
+        if allowed_tool_names.contains(&n.as_str()) {
+            out.push((n, a));
+        }
+    }
+
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Strip an `<tag>…</tag>` wrapper *only* when the opening tag is
+/// at position zero of the input. Without the anchor, prose
+/// containing the tag mid-string would be misclassified as a tool
+/// call. Returns `None` when the wrapper isn't anchored or the
+/// closing tag is missing.
+fn strip_xml_wrapper_anchored(s: &str, tag: &str) -> Option<String> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let s_trimmed = s.trim_start();
+    if !s_trimmed.starts_with(&open) { return None; }
+    let after_open = &s_trimmed[open.len()..];
+    let close_at = after_open.rfind(&close)?;
+    Some(after_open[..close_at].trim().to_string())
+}
+
+fn parse_one_call(v: &serde_json::Value) -> Option<(String, serde_json::Value)> {
+    // Shape 1: {"name": ..., "arguments": ...}
+    if let (Some(name), args) = (v["name"].as_str(), &v["arguments"]) {
+        let args_v = if args.is_string() {
+            serde_json::from_str::<serde_json::Value>(args.as_str().unwrap_or("{}"))
+                .unwrap_or(serde_json::json!({}))
+        } else if args.is_null() {
+            serde_json::json!({})
+        } else {
+            args.clone()
+        };
+        return Some((name.to_string(), args_v));
+    }
+    // Shape 2: {"function": {"name": ..., "arguments": ...}}
+    if let Some(f) = v.get("function") {
+        if let (Some(name), args) = (f["name"].as_str(), &f["arguments"]) {
+            let args_v = if args.is_string() {
+                serde_json::from_str::<serde_json::Value>(args.as_str().unwrap_or("{}"))
+                    .unwrap_or(serde_json::json!({}))
+            } else if args.is_null() {
+                serde_json::json!({})
+            } else {
+                args.clone()
+            };
+            return Some((name.to_string(), args_v));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod content_tool_call_tests {
+    use super::*;
+
+    #[test]
+    fn bare_object_qwen_shape() {
+        let c = r#"{"name": "exec_local", "arguments": {"command": "ls /tmp"}}"#;
+        let calls = extract_tool_calls_from_content(c, MAIN_AI_TOOLS).expect("parse");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "exec_local");
+        assert_eq!(calls[0].1["command"], "ls /tmp");
+    }
+
+    #[test]
+    fn bare_array() {
+        let c = r#"[{"name":"exec_local","arguments":{"command":"df -h"}},
+                    {"name":"web_search","arguments":{"query":"foo"}}]"#;
+        let calls = extract_tool_calls_from_content(c, MAIN_AI_TOOLS).expect("parse");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].0, "web_search");
+    }
+
+    #[test]
+    fn openai_shape_inside_content() {
+        let c = r#"{"function": {"name": "read_file", "arguments": "{\"path\": \"/etc/foo\"}"}}"#;
+        let calls = extract_tool_calls_from_content(c, MAIN_AI_TOOLS).expect("parse");
+        assert_eq!(calls[0].0, "read_file");
+        assert_eq!(calls[0].1["path"], "/etc/foo");
+    }
+
+    #[test]
+    fn fenced_json_block() {
+        let c = "```json\n{\"name\":\"exec_local\",\"arguments\":{\"command\":\"uptime\"}}\n```";
+        let calls = extract_tool_calls_from_content(c, MAIN_AI_TOOLS).expect("parse");
+        assert_eq!(calls[0].0, "exec_local");
+    }
+
+    #[test]
+    fn xml_tool_call_wrapper() {
+        let c = r#"<tool_call>{"name":"exec_local","arguments":{"command":"whoami"}}</tool_call>"#;
+        let calls = extract_tool_calls_from_content(c, MAIN_AI_TOOLS).expect("parse");
+        assert_eq!(calls[0].0, "exec_local");
+    }
+
+    #[test]
+    fn function_call_wrapper_gemma() {
+        let c = r#"<function_call>{"name":"exec_local","arguments":{"command":"ls"}}</function_call>"#;
+        let calls = extract_tool_calls_from_content(c, MAIN_AI_TOOLS).expect("parse");
+        assert_eq!(calls[0].0, "exec_local");
+    }
+
+    #[test]
+    fn mistral_tool_calls_prefix() {
+        let c = r#"[TOOL_CALLS] [{"name":"exec_local","arguments":{"command":"ps"}}]"#;
+        let calls = extract_tool_calls_from_content(c, MAIN_AI_TOOLS).expect("parse");
+        assert_eq!(calls[0].0, "exec_local");
+    }
+
+    #[test]
+    fn plain_prose_returns_none() {
+        let c = "I'll help you with that. Let me check.";
+        assert!(extract_tool_calls_from_content(c, MAIN_AI_TOOLS).is_none());
+    }
+
+    #[test]
+    fn empty_returns_none() {
+        assert!(extract_tool_calls_from_content("", MAIN_AI_TOOLS).is_none());
+        assert!(extract_tool_calls_from_content("   \n  ", MAIN_AI_TOOLS).is_none());
+    }
+
+    /// Regression guard for the BLOCKER the reviewer flagged: a
+    /// model explaining service state with `{"name": "nginx",
+    /// "status": "stopped"}` must NOT synthesise a tool call. The
+    /// allowlist (MAIN_AI_TOOLS) drops anything whose name we don't
+    /// know how to dispatch.
+    #[test]
+    fn unknown_tool_name_is_dropped() {
+        let c = r#"{"name": "nginx", "arguments": {"command": "rm -rf /"}}"#;
+        assert!(
+            extract_tool_calls_from_content(c, MAIN_AI_TOOLS).is_none(),
+            "JSON with a non-allowlisted name must NOT be promoted to a tool call",
+        );
+        // Empty allowlist drops everything — proves the gate exists.
+        let real = r#"{"name": "exec_local", "arguments": {"command": "ls"}}"#;
+        assert!(
+            extract_tool_calls_from_content(real, &[]).is_none(),
+            "empty allowlist must drop even legitimate tool names",
+        );
+    }
+
+    /// Regression guard for the second BLOCKER: a model echoing
+    /// `<tool_call>...</tool_call>` mid-string (e.g. explaining the
+    /// format to the user) must NOT trigger extraction. Only
+    /// position-zero anchored wrappers count.
+    #[test]
+    fn mid_prose_xml_wrapper_does_not_match() {
+        let c = r#"Sure, here's an example: <tool_call>{"name":"exec_local","arguments":{"command":"ls"}}</tool_call> — that's how the format works."#;
+        assert!(
+            extract_tool_calls_from_content(c, MAIN_AI_TOOLS).is_none(),
+            "mid-prose XML wrappers must not extract — the open tag has to be at position 0",
+        );
+    }
+
+    #[test]
+    fn position_zero_xml_wrapper_does_match() {
+        // Same content but anchored at position zero — this one
+        // SHOULD parse, because that's what an actual tool-call
+        // emission looks like.
+        let c = r#"<tool_call>{"name":"exec_local","arguments":{"command":"ls"}}</tool_call>"#;
+        let calls = extract_tool_calls_from_content(c, MAIN_AI_TOOLS).expect("anchored extraction");
+        assert_eq!(calls[0].0, "exec_local");
+    }
+
+    #[test]
+    fn arguments_as_json_string_unpacked() {
+        // OpenAI spec: arguments arrives as a JSON-encoded string,
+        // not a real object. Some local models follow this even
+        // when emitting in `content`.
+        let c = r#"{"name": "exec_local", "arguments": "{\"command\": \"ls\"}"}"#;
+        let calls = extract_tool_calls_from_content(c, MAIN_AI_TOOLS).expect("parse");
+        assert_eq!(calls[0].1["command"], "ls");
+    }
+
+    #[test]
+    fn arguments_null_becomes_empty_object() {
+        // `security_audit` is in MAIN_AI_TOOLS and takes no args —
+        // a model emitting `arguments: null` is the realistic
+        // shape for that case.
+        let c = r#"{"name": "security_audit", "arguments": null}"#;
+        let calls = extract_tool_calls_from_content(c, MAIN_AI_TOOLS).expect("parse");
+        assert_eq!(calls[0].1, serde_json::json!({}));
+    }
 }
 
 /// Fallback used when an OpenAI-compatible server rejects the `tools`
