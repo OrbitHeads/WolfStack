@@ -4188,10 +4188,15 @@
 
         try {
             let result = await runCapture();
-            // Auto-install tcpdump if missing and retry once.
-            if (result.data?.error && /tcpdump/i.test(result.data.error)
-                && /no such file|not found|couldn't run/i.test(result.data.error))
-            {
+            // Auto-install tcpdump if the backend tagged the response
+            // with `missing_tool: "tcpdump"`, then retry once. Backend
+            // and frontend ship in the same binary so we always get
+            // the structured key — no legacy regex fallback needed.
+            if (result.data?.missing_tool === 'tcpdump') {
+                const manualCmd = result.data.install_command;
+                const manualHelp = manualCmd
+                    ? `Try manually: <code>${escHtml(manualCmd)}</code>`
+                    : `Install <code>tcpdump</code> with your distro's package manager and try again.`;
                 showStatus('📦 Installing tcpdump on this host (one-time)…');
                 setBtn(true, '📦 Installing tcpdump…');
                 const inst = await fetch(wrUrl('/api/router/install-tool'), {
@@ -4201,7 +4206,7 @@
                 });
                 const instData = await inst.json();
                 if (!instData.success) {
-                    showStatus(`✗ Couldn't install tcpdump automatically: ${escHtml(instData.error || 'unknown error')}`);
+                    showStatus(`✗ Couldn't install tcpdump automatically: ${escHtml(instData.error || 'unknown error')}. ${manualHelp}`);
                     showPlaceholder('Install tcpdump manually with your package manager and try again.');
                     return;
                 }
@@ -4344,12 +4349,14 @@
             // traceroute; previous flow had no in-app remedy.
             if (data && data.missing_tool === 'traceroute') {
                 const pkg = data.install_package || 'traceroute';
-                // Distro-aware manual-install command supplied by the
-                // backend (apt-get / dnf / pacman / zypper). Falls back
-                // to apt only if the server didn't send one — the new
-                // backend always does, so this is belt-and-braces for
-                // cluster nodes still running an older build.
-                const manualCmd = data.install_command || ('sudo apt install ' + pkg);
+                // Distro-aware manual-install command from the backend.
+                // null when the host's distro couldn't be identified —
+                // we then show a generic "use your package manager"
+                // message rather than guessing at a wrong shell.
+                const manualCmd = data.install_command;
+                const manualHelp = manualCmd
+                    ? `Try the package manager directly: <code>${wrEsc(manualCmd)}</code>.`
+                    : `Install <code>${wrEsc(pkg)}</code> with your distro's package manager and try again.`;
                 if (status) {
                     status.innerHTML = `❌ ${wrEsc(data.error || 'traceroute is not installed')} ` +
                         `<button id="wr-tr-install" class="btn btn-sm btn-primary" style="margin-left:8px;">📦 Install ${wrEsc(pkg)}</button>`;
@@ -4364,7 +4371,7 @@
                             });
                             const idata = await ir.json().catch(() => ({}));
                             if (!ir.ok || idata.success === false) {
-                                status.innerHTML = `❌ Install failed: ${wrEsc(idata.error || ir.statusText || 'unknown')}. Try the package manager directly: <code>${wrEsc(manualCmd)}</code>.`;
+                                status.innerHTML = `❌ Install failed: ${wrEsc(idata.error || ir.statusText || 'unknown')}. ${manualHelp}`;
                                 return;
                             }
                             status.textContent = '✅ Installed — re-running trace…';
@@ -4372,7 +4379,7 @@
                             // doesn't have to click again.
                             wrTracerouteGo();
                         } catch (e) {
-                            status.innerHTML = `❌ Install errored: ${wrEsc(e.message || String(e))}.`;
+                            status.innerHTML = `❌ Install errored: ${wrEsc(e.message || String(e))}. ${manualHelp}`;
                         }
                     };
                 }

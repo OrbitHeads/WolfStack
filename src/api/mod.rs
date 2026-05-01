@@ -4137,13 +4137,19 @@ pub async fn traceroute_handler(
             // no in-app remedy.
             let is_missing = e.kind() == std::io::ErrorKind::NotFound
                 || e.raw_os_error() == Some(2 /* ENOENT */);
-            // Build the manual-install command for THIS host's distro
-            // so the UI's copy-paste fallback isn't apt-only on RHEL /
-            // Arch / SUSE machines.
+            // Manual-install command for THIS host's distro. None when
+            // we can't identify the distro — better than guessing
+            // `apt-get` on Gentoo/Alpine/etc., which would mislead the
+            // user. The frontend renders a generic "install with your
+            // package manager" message in that case.
             let install_command = if is_missing {
                 let distro = crate::installer::detect_distro();
-                let (mgr, args) = crate::installer::pkg_install_cmd(distro);
-                Some(format!("sudo {} {} traceroute", mgr, args))
+                if matches!(distro, crate::installer::DistroFamily::Unknown) {
+                    None
+                } else {
+                    let (mgr, args) = crate::installer::pkg_install_cmd(distro);
+                    Some(format!("sudo {} {} traceroute", mgr, args))
+                }
             } else { None };
             return HttpResponse::InternalServerError().json(serde_json::json!({
                 "error": if is_missing {

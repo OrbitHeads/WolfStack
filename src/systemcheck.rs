@@ -166,6 +166,7 @@ pub fn run_checks() -> Vec<DependencyCheck> {
         "packet capture (Packets tab in WolfRouter)",
         hint("tcpdump", "tcpdump", "tcpdump", "tcpdump")));
     out.push(check_traceroute());
+    out.push(check_dig());
     out.push(simple_auto("pppd", "Networking", &["--version"],
         "PPPoE dial-up (WolfRouter WAN)",
         hint("ppp", "ppp", "ppp", "ppp")));
@@ -527,6 +528,39 @@ fn check_traceroute() -> DependencyCheck {
         // One-click install hooked to /api/system/install-package via
         // the "traceroute" mapping added in installer/packages.rs.
         install_package: if found { None } else { Some("traceroute".into()) },
+    }
+}
+
+/// `dig` (from bind-utils / dnsutils / bind) is used by WolfRouter's
+/// topology view for reverse-DNS router labels and by the forwarder
+/// probe in `networking::router::dns`. Missing dig fails silently —
+/// the user just sees IPs instead of hostnames in the rack view —
+/// which is degraded UX with no in-app explanation. Surface it on the
+/// System Check page with a one-click install so the operator knows
+/// why their topology labels look bare. The package name varies per
+/// distro (dnsutils on Debian, bind on Arch, bind-utils on RHEL/SUSE),
+/// so use the "bind-utils" logical name from installer/packages.rs.
+fn check_dig() -> DependencyCheck {
+    let (found, ver) = bin_check("dig", &["-v"]);
+    let status = if found { DepStatus::Ok } else { DepStatus::Missing };
+    let detail = if found {
+        "Installed — WolfRouter topology view can resolve reverse-DNS labels for routers and clients.".into()
+    } else {
+        "Not installed — WolfRouter topology view will show IP addresses instead of hostnames, and DNS forwarder probes report unreachable. Common on Arch and minimal-container images.".into()
+    };
+    DependencyCheck {
+        name: "dig".into(),
+        category: "Networking".into(),
+        status,
+        version: ver,
+        detail,
+        install_hint: if found { None } else {
+            Some(hint("dnsutils", "bind-utils", "bind", "bind-utils"))
+        },
+        ai_helpful: false,
+        // Logical name "bind-utils" maps to the right package per distro
+        // in installer/packages.rs (dnsutils on Debian, bind on Arch).
+        install_package: if found { None } else { Some("bind-utils".into()) },
     }
 }
 

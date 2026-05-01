@@ -351,11 +351,27 @@ mod tests {
     /// added without a corresponding row.
     #[test]
     fn known_logical_names_are_present() {
-        for logical in &["traceroute", "tcpdump", "conntrack"] {
+        for logical in &["traceroute", "tcpdump", "conntrack", "bind-utils"] {
             assert!(
                 PACKAGES.iter().any(|p| p.logical == *logical),
                 "expected logical name {:?} in PACKAGES", logical
             );
         }
+    }
+
+    /// bind-utils is unusual: the package name differs across all four
+    /// distros (dnsutils / bind-utils / bind / bind-utils). The
+    /// System Check page surfaces dig-missing via the "bind-utils"
+    /// logical name; if the per-distro names ever drift this test
+    /// catches it.
+    #[test]
+    fn bind_utils_resolves_per_distro_names() {
+        let pkg = PACKAGES.iter().find(|p| p.logical == "bind-utils")
+            .expect("bind-utils logical name must be in PACKAGES");
+        assert_eq!(resolve(pkg, DistroFamily::Debian), Some("dnsutils"));
+        assert_eq!(resolve(pkg, DistroFamily::RedHat), Some("bind-utils"));
+        assert_eq!(resolve(pkg, DistroFamily::Arch),   Some("bind"));
+        assert_eq!(resolve(pkg, DistroFamily::Suse),   Some("bind-utils"));
+        assert_eq!(pkg.binary, "dig");
     }
 }

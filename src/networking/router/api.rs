@@ -2949,8 +2949,33 @@ pub async fn packet_capture(
     let output = match tokio::time::timeout(timeout, cmd).await {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => {
+            // Distinguish "tcpdump isn't installed" from other spawn
+            // failures (permission denied, etc.) so the frontend can
+            // show an inline install button — same convention as
+            // /api/traceroute. The CAP_NET_RAW hint belongs only on
+            // the privilege-error branch; mixing it into the missing
+            // branch is noise.
+            let is_missing = e.kind() == std::io::ErrorKind::NotFound
+                || e.raw_os_error() == Some(2 /* ENOENT */);
+            let install_command = if is_missing {
+                let distro = crate::installer::detect_distro();
+                if matches!(distro, crate::installer::DistroFamily::Unknown) {
+                    None
+                } else {
+                    let (mgr, args) = crate::installer::pkg_install_cmd(distro);
+                    Some(format!("sudo {} {} tcpdump", mgr, args))
+                }
+            } else { None };
             return HttpResponse::Ok().json(serde_json::json!({
-                "lines": [], "error": format!("couldn't run 'tcpdump' — {} (install the 'tcpdump' package, and the WolfStack binary needs CAP_NET_RAW or root to capture)", e),
+                "lines": [],
+                "error": if is_missing {
+                    "tcpdump isn't installed on this host. Click the button below to install it, or run the install manually.".to_string()
+                } else {
+                    format!("couldn't run 'tcpdump' — {} (the WolfStack binary needs CAP_NET_RAW or root to capture)", e)
+                },
+                "missing_tool": if is_missing { Some("tcpdump") } else { None },
+                "install_package": if is_missing { Some("tcpdump") } else { None },
+                "install_command": install_command,
             }));
         }
         Err(_) => {
