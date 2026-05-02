@@ -1659,7 +1659,7 @@ function selectView(page) {
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     document.querySelector(`.nav-item[data-page="${page}"]`)?.classList.add('active');
 
-    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', wolfagents: 'WolfAgents', 'cluster-browser': 'Cluster Browser', databases: 'Databases', 'control-panel': 'Control Panel' };
+    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', inbox: 'Predictive Inbox', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', wolfagents: 'WolfAgents', 'cluster-browser': 'Cluster Browser', databases: 'Databases', 'control-panel': 'Control Panel' };
     document.getElementById('page-title').textContent = titles[page] || page;
 
     if (page === 'datacenter') {
@@ -1685,6 +1685,8 @@ function selectView(page) {
         checkIssuesAiBadge();
         checkBetaAccess();
         loadIssueSchedule();
+    } else if (page === 'inbox') {
+        renderPredictiveInbox();
     } else if (page === 'topology') {
         // Hide task log and toggle button in immersive 3D view
         hideTaskLog();
@@ -1879,17 +1881,9 @@ function buildServerTree(nodes) {
     // On first build (no expanded state saved yet), expand self node
     const isFirstBuild = expandedNodes.size === 0;
 
-    // Separate WolfStack and PVE nodes
+    // PVE-typed nodes (legacy API integration) are hidden from the sidebar — they're
+    // surfaced through the deprecation banner instead. Only render WolfStack nodes here.
     const wsNodes = sorted.filter(n => n.node_type !== 'proxmox');
-    const pveNodes = sorted.filter(n => n.node_type === 'proxmox');
-
-    // Group PVE nodes by cluster name (or address as fallback)
-    const pveClusters = {};
-    pveNodes.forEach(n => {
-        const key = n.pve_cluster_name || n.address;
-        if (!pveClusters[key]) pveClusters[key] = [];
-        pveClusters[key].push(n);
-    });
 
     let html = '';
 
@@ -2031,55 +2025,6 @@ function buildServerTree(nodes) {
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="wolfram" onclick="selectServerView('${node.id}', 'wolfram')">
                             <span class="icon">🧠</span> Wolfram
-                        </a>
-                    </div>
-                </div>`;
-        });
-
-        html += `
-            </div>
-        </div>`;
-    });
-
-    // Render PVE clusters (grouped)
-    // Sort PVE clusters alphabetically
-    const pveKeys = Object.keys(pveClusters).sort((a, b) => a.localeCompare(b));
-
-    pveKeys.forEach(clusterName => {
-        const clusterNodes = pveClusters[clusterName];
-        const clusterId = 'pve-cluster-' + clusterName.replace(/[^a-zA-Z0-9]/g, '_');
-        const shouldExpandCluster = isFirstBuild ? false : expandedNodes.has(clusterId);
-        const anyOnline = clusterNodes.some(n => n.online);
-        const nodeIds = clusterNodes.map(n => `'${n.id}'`).join(',');
-
-        html += `
-        <div class="server-tree-node">
-            <div class="server-node-header" data-cluster-id="${clusterId}" onclick="toggleServerNode('${clusterId}')" style="background: linear-gradient(90deg, rgba(99,102,241,0.05), transparent);">
-                <span class="tree-toggle ${shouldExpandCluster ? 'expanded' : ''}" id="toggle-${clusterId}">▶</span>
-                <span class="server-dot ${anyOnline ? 'online' : 'offline'}"></span>
-                <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"><span style="position:relative;display:inline-block;width:20px;height:18px;vertical-align:middle;margin-right:6px;"><span style="display:inline-block;width:15px;height:15px;opacity:0.9;"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="2" width="18" height="6" rx="1"/><rect x="3" y="10" width="18" height="6" rx="1"/><rect x="3" y="18" width="18" height="4" rx="1"/><circle cx="7" cy="5" r="1" fill="currentColor"/><circle cx="7" cy="13" r="1" fill="currentColor"/><circle cx="7" cy="20" r="1" fill="currentColor"/></svg></span><span style="position:absolute;bottom:-3px;right:-4px;min-width:15px;height:15px;line-height:15px;text-align:center;font-size:9px;font-weight:700;color:#fff;background:#16a34a;border-radius:50%;z-index:2;">${clusterNodes.length}</span></span>${clusterName}</span>
-                <span class="remove-server-btn" onclick="event.stopPropagation(); openPveClusterSettings('${clusterName}')" title="Cluster settings" style="margin-left:4px;">⚙️</span>
-                <span class="remove-server-btn" onclick="event.stopPropagation(); confirmRemovePveCluster('${clusterName}', [${nodeIds}])" title="Remove cluster">🗑️</span>
-            </div>
-            <div class="server-node-children ${shouldExpandCluster ? 'expanded' : ''}" id="children-${clusterId}">`;
-
-        // Each node within the cluster
-        clusterNodes.forEach(node => {
-            const shouldExpandNode = expandedNodes.has(node.id);
-            html += `
-                <div class="server-tree-node" style="margin-left: 8px;">
-                    <div class="server-node-header" data-node-id="${node.id}" onclick="openServerNode('${node.id}')" style="padding-left: 8px;">
-                        <span class="tree-toggle ${shouldExpandNode ? 'expanded' : ''}" id="toggle-${node.id}" onclick="event.stopPropagation(); toggleServerNode('${node.id}')">▶</span>
-                        <span class="server-dot ${node.online ? 'online' : 'offline'}"></span>
-                        <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${node.pve_node_name || node.hostname}</span>
-                    </div>
-                    <div class="server-node-children ${shouldExpandNode ? 'expanded' : ''}" id="children-${node.id}">
-                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="dashboard" onclick="selectServerView('${node.id}', 'dashboard')">
-                            <span class="icon">📊</span> Dashboard
-                        </a>
-                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="pve-resources" onclick="selectServerView('${node.id}', 'pve-resources')">
-                            <span class="icon">🖥️</span> VMs & Containers
-                            ${(node.vm_count || node.lxc_count) ? `<span class="badge" style="font-size:10px; padding:1px 6px;">${(node.vm_count || 0) + (node.lxc_count || 0)}</span>` : ''}
                         </a>
                     </div>
                 </div>`;
@@ -2297,9 +2242,9 @@ function renderDatacenterOverview() {
         </div>`;
     };
 
-    // 1. Group nodes
+    // 1. Group nodes — legacy PVE entries are surfaced via the deprecation banner only.
     const wsNodes = nodes.filter(n => n.node_type !== 'proxmox');
-    const pveNodes = nodes.filter(n => n.node_type === 'proxmox');
+    const pveNodes = [];
 
     // 2. Cluster grouping — WolfStack
     const wsClusters = {};
@@ -2474,6 +2419,11 @@ function initMap() {
     if (worldMap) return;
     const mapEl = document.getElementById('world-map');
     if (!mapEl) return;
+    // Leaflet is loaded with `defer` in index.html but app.js is injected via
+    // document.write without defer, so on cold loads `L` may not be ready when
+    // the first dashboard render fires updateMap(). Bail quietly — the next
+    // poll tick will retry once Leaflet has parsed.
+    if (typeof L === 'undefined') return;
 
     worldMap = L.map('world-map', {
         attributionControl: false,
@@ -2487,6 +2437,7 @@ function initMap() {
 
 function updateMap(nodes) {
     if (!document.getElementById('world-map')) return;
+    if (typeof L === 'undefined') return;
     if (!worldMap) initMap();
     if (!worldMap) return;
 
@@ -3639,6 +3590,33 @@ function initCharts() {
 }
 
 // ─── Nodes / Servers ───
+async function refreshProxmoxCleanupBanner() {
+    const banner = document.getElementById('deprecated-pve-banner');
+    if (!banner) return;
+    try {
+        const resp = await fetch('/api/cluster/proxmox-cleanup');
+        if (!resp.ok) { banner.style.display = 'none'; return; }
+        const info = await resp.json();
+        if (!info || !info.removed_count) { banner.style.display = 'none'; return; }
+        const body = document.getElementById('deprecated-pve-banner-body');
+        if (body) {
+            const backup = info.backup_path ? `<code style="background:rgba(0,0,0,0.25); padding:1px 5px; border-radius:3px; font-size:12px;">${info.backup_path}</code>` : '<em>(unknown location)</em>';
+            body.innerHTML = `Proxmox API nodes have been deprecated, please install WolfStack on each node and then add them as WolfStack nodes to the main cluster — see our install page at <a href="https://wolfstack.org/download.php" target="_blank" rel="noopener" style="color:var(--accent-primary); text-decoration:underline;">https://wolfstack.org/download.php</a>. Your config has been backed up to ${backup} and the nodes removed.`;
+        }
+        banner.style.display = '';
+    } catch (e) {
+        banner.style.display = 'none';
+    }
+}
+
+async function dismissProxmoxCleanupBanner() {
+    try {
+        await fetch('/api/cluster/proxmox-cleanup/dismiss', { method: 'POST' });
+    } catch (e) { /* ignore */ }
+    const banner = document.getElementById('deprecated-pve-banner');
+    if (banner) banner.style.display = 'none';
+}
+
 async function fetchNodes() {
     try {
         const resp = await fetch('/api/nodes');
@@ -3730,16 +3708,10 @@ async function fetchNodes() {
         if (typeof topologyCheckUpdate === 'function') topologyCheckUpdate();
     } catch (e) {
         console.error('Failed to fetch nodes:', e);
-        // If we're on HTTPS and getting NetworkErrors, the TLS certificate likely
-        // doesn't match (e.g. accessing via IP with a domain cert). The HTTP
-        // inter-node server runs on port+1, so redirect there automatically.
-        if (window.location.protocol === 'https:' && e instanceof TypeError &&
-            e.message.includes('NetworkError') && !window.location.search.includes('no_tls_redirect')) {
-            const httpPort = parseInt(window.location.port || '443') + 1;
-            window.location.href = 'http://' + window.location.hostname + ':' + httpPort +
-                window.location.pathname + '?no_tls_redirect=1';
-            return;
-        }
+        // Transient fetch failures (TLS handshakes during restarts, slow WolfNet
+        // hops, momentary network blips) just count toward the session-check
+        // failure budget. Only after 3 consecutive failures do we treat the
+        // session as gone and bounce to login.
         _sessionCheckFails++;
         if (_sessionCheckFails >= 3) window.location.href = '/login.html';
     }
@@ -7320,6 +7292,149 @@ async function requestCertificate() {
     }
 }
 
+// Targets that can be selected as install/update destinations.
+// Always includes the WolfStack default; updatable certs (proxmox, custom)
+// are appended from the discovered cert list so users can replace them.
+function refreshCertTargetOptions(certs) {
+    const targets = [{ label: '/etc/wolfstack/cert.pem + key.pem (default)', value: '' }];
+    (certs || []).forEach(c => {
+        // Only writable / replaceable targets — never offer to overwrite Let's Encrypt
+        // managed paths (certbot owns those, manual writes break renewals).
+        if (c.source !== 'proxmox' && c.source !== 'custom') return;
+        if (!c.cert_path || !c.key_path) return;
+        targets.push({
+            label: `${c.domain} — ${c.cert_path}`,
+            value: JSON.stringify({ cert_path: c.cert_path, key_path: c.key_path }),
+        });
+    });
+    ['cert-install-target', 'cert-ss-target'].forEach(id => {
+        const sel = document.getElementById(id);
+        if (!sel) return;
+        const previous = sel.value;
+        sel.innerHTML = targets.map(t =>
+            `<option value="${escapeAttr(t.value)}">${escapeHtml(t.label)}</option>`
+        ).join('');
+        // Preserve selection across reloads if it still exists
+        if ([...sel.options].some(o => o.value === previous)) sel.value = previous;
+    });
+}
+
+function readCertTarget(selectId) {
+    const sel = document.getElementById(selectId);
+    if (!sel || !sel.value) return { cert_path: null, key_path: null };
+    try {
+        const v = JSON.parse(sel.value);
+        return { cert_path: v.cert_path || null, key_path: v.key_path || null };
+    } catch (_) {
+        return { cert_path: null, key_path: null };
+    }
+}
+
+async function generateSelfSignedCertificate() {
+    const host = (document.getElementById('cert-ss-host')?.value || '').trim();
+    if (!host) { showToast('Enter a hostname / common name', 'error'); return; }
+    const sansRaw = (document.getElementById('cert-ss-sans')?.value || '').trim();
+    const alt_names = sansRaw ? sansRaw.split(/\s+/).filter(Boolean) : [];
+    const days = parseInt(document.getElementById('cert-ss-days')?.value || '825', 10) || 825;
+    const target = readCertTarget('cert-ss-target');
+
+    showToast('Generating self-signed certificate…', 'info');
+    try {
+        const resp = await fetch(apiUrl('/api/certificates/self-signed'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ host, alt_names, days, ...target }),
+        });
+        const data = await resp.json();
+        if (resp.ok) {
+            showToast(data.message || 'Self-signed certificate generated', 'success');
+            loadCertificates();
+            promptRestartAfterCert(data.restart_service);
+        } else {
+            showToast(data.error || 'Self-signed generation failed', 'error');
+        }
+    } catch (e) {
+        showToast('Failed: ' + e.message, 'error');
+    }
+}
+
+async function installCustomCertificate() {
+    const cert_pem = (document.getElementById('cert-install-cert')?.value || '').trim();
+    const key_pem  = (document.getElementById('cert-install-key')?.value  || '').trim();
+    const key_passphrase = document.getElementById('cert-install-passphrase')?.value || '';
+    if (!cert_pem || !key_pem) {
+        showToast('Both certificate and private key are required', 'error');
+        return;
+    }
+    const target = readCertTarget('cert-install-target');
+
+    showToast('Installing certificate…', 'info');
+    try {
+        const payload = { cert_pem, key_pem, ...target };
+        if (key_passphrase) payload.key_passphrase = key_passphrase;
+        const resp = await fetch(apiUrl('/api/certificates/install'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+        if (resp.ok) {
+            showToast(data.message || 'Certificate installed', 'success');
+            document.getElementById('cert-install-cert').value = '';
+            document.getElementById('cert-install-key').value = '';
+            const passField = document.getElementById('cert-install-passphrase');
+            if (passField) passField.value = '';
+            loadCertificates();
+            promptRestartAfterCert(data.restart_service);
+        } else {
+            showToast(data.error || 'Certificate installation failed', 'error');
+        }
+    } catch (e) {
+        showToast('Failed: ' + e.message, 'error');
+    }
+}
+
+// After a successful cert install/generate, ask the user whether to restart
+// the service that needs to reload the cert. We never restart automatically
+// — wolfstack restarting itself drops the user's session, and pveproxy
+// restarting interrupts other admins on the Proxmox UI. Always confirm.
+function promptRestartAfterCert(service) {
+    if (!service) return;
+    const label = service === 'wolfstack'
+        ? 'WolfStack (this UI will briefly disconnect and reconnect)'
+        : 'pveproxy on the Proxmox host (other Proxmox UI sessions will disconnect)';
+    const ok = window.confirm(
+        `Certificate installed.\n\nRestart ${label} now to activate the new certificate?\n\nClick OK to restart, or Cancel to restart later from a terminal.`
+    );
+    if (!ok) {
+        showToast(`Certificate is installed but not yet active. Run: sudo systemctl restart ${service}  when ready.`, 'info');
+        return;
+    }
+    fetch(apiUrl('/api/certificates/restart-service'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ service }),
+    }).then(async resp => {
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok) {
+            showToast(data.message || `Restarting ${service}…`, 'success');
+        } else {
+            showToast(data.error || `Failed to restart ${service}`, 'error');
+        }
+    }).catch(e => showToast('Restart failed: ' + e.message, 'error'));
+}
+
+// Pre-select an existing cert as the install target and scroll to the form.
+function prepareCertUpdate(certPath, keyPath) {
+    const sel = document.getElementById('cert-install-target');
+    if (!sel) return;
+    const wanted = JSON.stringify({ cert_path: certPath, key_path: keyPath });
+    const match = [...sel.options].find(o => o.value === wanted);
+    if (match) sel.value = wanted;
+    document.getElementById('cert-install-cert')?.focus();
+    document.getElementById('cert-install-cert')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
 async function loadCertificates() {
     const el = document.getElementById('cert-list');
     if (!el) return;
@@ -7329,21 +7444,30 @@ async function loadCertificates() {
         const certs = data.certs || data; // handle both new {certs,diagnostics} and legacy array format
         const diagnostics = data.diagnostics || [];
 
+        refreshCertTargetOptions(certs);
+
         let html = '';
         if (!certs || certs.length === 0) {
-            html += '<p style="color: var(--text-muted);">No certificates installed. Request one above.</p>';
+            html += '<p style="color: var(--text-muted);">No certificates installed. Request, generate, or upload one above.</p>';
         } else {
-            html += certs.map(c => `
+            html += certs.map(c => {
+                const updatable = (c.source === 'proxmox' || c.source === 'custom') && c.cert_path && c.key_path;
+                // Single-quoted attribute so JSON.stringify's double quotes don't break parsing.
+                const updateBtn = updatable
+                    ? `<button class="btn btn-sm" style="margin-left: 12px;" onclick='prepareCertUpdate(${JSON.stringify(c.cert_path)}, ${JSON.stringify(c.key_path)})'>Update</button>`
+                    : '';
+                return `
                 <div style="padding: 10px; margin-bottom: 8px; background: var(--bg-tertiary); border-radius: 8px; display: flex; align-items: center; gap: 12px;">
                     <span style="font-size: 20px;">${c.valid ? '✅' : '⚠️'}</span>
                     <div style="flex:1;">
-                        <strong>${c.domain}</strong><br>
-                        <span style="font-size: 12px; color: var(--text-muted);">${c.cert_path}</span>
-                        ${c.source ? `<br><span style="font-size: 11px; color: var(--text-muted);">Source: ${c.source}</span>` : ''}
-                        ${c.expiry ? `<br><span style="font-size: 12px; color: var(--text-muted);">Expires: ${c.expiry}</span>` : ''}
+                        <strong>${escapeHtml(c.domain)}</strong><br>
+                        <span style="font-size: 12px; color: var(--text-muted);">${escapeHtml(c.cert_path)}</span>
+                        ${c.source ? `<br><span style="font-size: 11px; color: var(--text-muted);">Source: ${escapeHtml(c.source)}</span>` : ''}
+                        ${c.expiry ? `<br><span style="font-size: 12px; color: var(--text-muted);">Expires: ${escapeHtml(c.expiry)}</span>` : ''}
                     </div>
-                </div>
-            `).join('');
+                    ${updateBtn}
+                </div>`;
+            }).join('');
         }
 
         if (diagnostics.length > 0) {
@@ -7351,7 +7475,7 @@ async function loadCertificates() {
                 <details style="margin-top: 12px; font-size: 13px;">
                     <summary style="cursor: pointer; color: var(--text-muted); user-select: none;">🔍 Discovery diagnostics</summary>
                     <div style="margin-top: 8px; padding: 10px; background: var(--bg-tertiary); border-radius: 8px; font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.8;">
-                        ${diagnostics.map(d => `<div>${d}</div>`).join('')}
+                        ${diagnostics.map(d => `<div>${escapeHtml(d)}</div>`).join('')}
                     </div>
                 </details>`;
         }
@@ -7550,44 +7674,24 @@ function closeModal() {
 }
 
 async function addServer() {
-    const nodeType = (document.getElementById('new-server-type') || {}).value || 'wolfstack';
     const address = document.getElementById('new-server-address').value.trim();
-    const port = parseInt(document.getElementById('new-server-port').value) || (nodeType === 'proxmox' ? 8006 : 8553);
-
-    const clusterName = (document.getElementById('new-server-cluster-name') || {}).value?.trim() || '';
+    const port = parseInt(document.getElementById('new-server-port').value) || 8553;
+    const wsClusterName = (document.getElementById('new-server-cluster-name') || {}).value.trim();
+    const joinToken = (document.getElementById('new-server-join-token') || {}).value.trim();
 
     if (!address) { showToast('Enter a server address', 'error'); return; }
-
-    var payload = { address, port, node_type: nodeType, cluster_name: clusterName || null };
-
-    if (nodeType === 'proxmox') {
-        var pveTokenId = (document.getElementById('new-pve-token-id') || {}).value.trim();
-        var pveTokenSecret = (document.getElementById('new-pve-token-secret') || {}).value.trim();
-        var pveName = (document.getElementById('new-pve-node-name') || {}).value.trim();
-        var pveFingerprint = (document.getElementById('new-pve-fingerprint') || {}).value.trim();
-        var pveClusterName = (document.getElementById('new-pve-cluster-name') || {}).value.trim();
-
-        if (!pveTokenId || !pveTokenSecret || !pveName) {
-            showToast('PVE Node Name, Token ID, and Token Secret are required', 'error');
-            return;
-        }
-        // Combine into PVE API token format: user@pam!tokenid=secret-uuid
-        payload.pve_token = pveTokenId + '=' + pveTokenSecret;
-        payload.pve_node_name = pveName;
-        if (pveFingerprint) payload.pve_fingerprint = pveFingerprint;
-        if (pveClusterName) payload.pve_cluster_name = pveClusterName;
-    } else {
-        // Standard WolfStack node
-        var wsClusterName = (document.getElementById('new-server-cluster-name') || {}).value.trim();
-        var joinToken = (document.getElementById('new-server-join-token') || {}).value.trim();
-        // Default to "WolfStack" if empty, as requested
-        payload.cluster_name = wsClusterName || "WolfStack";
-        if (!joinToken) {
-            showToast('Join token is required. Get it from the remote server.', 'error');
-            return;
-        }
-        payload.join_token = joinToken;
+    if (!joinToken) {
+        showToast('Join token is required. Get it from the remote server.', 'error');
+        return;
     }
+
+    const payload = {
+        address,
+        port,
+        node_type: 'wolfstack',
+        cluster_name: wsClusterName || 'WolfStack',
+        join_token: joinToken,
+    };
 
     try {
         var resp = await fetch('/api/nodes', {
@@ -7601,57 +7705,16 @@ async function addServer() {
             taskLog('Add server: ' + address, 'failed');
             return;
         }
-        if (nodeType === 'proxmox' && data.nodes_discovered) {
-            showToast('Proxmox cluster added — ' + data.nodes_discovered.length + ' node(s) discovered: ' + data.nodes_discovered.join(', '), 'success');
-            taskLog('Added Proxmox cluster: ' + address);
-        } else {
-            showToast('Server ' + address + ' added', 'success');
-            taskLog('Added server: ' + address);
-            setTimeout(() => showToast('💡 When done adding nodes, use "Update WolfNet Connections" in Cluster Settings to sync networking', 'info'), 1500);
-        }
+        showToast('Server ' + address + ' added', 'success');
+        taskLog('Added server: ' + address);
+        setTimeout(() => showToast('💡 When done adding nodes, use "Update WolfNet Connections" in Cluster Settings to sync networking', 'info'), 1500);
         closeModal();
         document.getElementById('new-server-address').value = '';
-        if (document.getElementById('new-pve-token-id')) document.getElementById('new-pve-token-id').value = '';
-        if (document.getElementById('new-pve-token-secret')) document.getElementById('new-pve-token-secret').value = '';
-        if (document.getElementById('new-pve-node-name')) document.getElementById('new-pve-node-name').value = '';
-        if (document.getElementById('new-pve-fingerprint')) document.getElementById('new-pve-fingerprint').value = '';
-        if (document.getElementById('new-pve-cluster-name')) document.getElementById('new-pve-cluster-name').value = '';
         if (document.getElementById('new-server-join-token')) document.getElementById('new-server-join-token').value = '';
         fetchNodes();
     } catch (e) {
         showToast('Failed: ' + e.message, 'error');
         taskLog('Add server: ' + address, 'failed');
-    }
-}
-
-function updateServerForm() {
-    var sel = (document.getElementById('new-server-type') || {}).value;
-    var pveFields = document.getElementById('pve-fields');
-    var wsClusterField = document.getElementById('ws-cluster-field');
-    var wsHint = document.getElementById('wolfstack-hint');
-    var portLabel = document.getElementById('new-server-port-label');
-    var portInput = document.getElementById('new-server-port');
-
-    if (sel === 'proxmox') {
-        if (pveFields) pveFields.style.display = 'block';
-        if (wsClusterField) wsClusterField.style.display = 'none';
-        if (wsHint) wsHint.style.display = 'none';
-        if (portLabel) portLabel.textContent = 'Port (default: 8006)';
-        if (portInput) portInput.value = '8006';
-        var joinField = document.getElementById('ws-join-token-field');
-        var ownTokenDisplay = document.getElementById('ws-own-token-display');
-        if (joinField) joinField.style.display = 'none';
-        if (ownTokenDisplay) ownTokenDisplay.style.display = 'none';
-    } else {
-        if (pveFields) pveFields.style.display = 'none';
-        if (wsClusterField) wsClusterField.style.display = 'block';
-        if (wsHint) wsHint.style.display = 'block';
-        if (portLabel) portLabel.textContent = 'Port (default: 8553)';
-        if (portInput) portInput.value = '8553';
-        var joinField = document.getElementById('ws-join-token-field');
-        var ownTokenDisplay = document.getElementById('ws-own-token-display');
-        if (joinField) joinField.style.display = 'block';
-        if (ownTokenDisplay) ownTokenDisplay.style.display = 'block';
     }
 }
 
@@ -9283,9 +9346,28 @@ function showToast(message, type = 'info', duration = 5000, id = null) {
         transform: 'translateX(120%)', opacity: '0',
         transition: 'opacity 0.35s ease, transform 0.35s cubic-bezier(0.21,1.02,0.73,1)'
     });
-    toast.innerHTML = `<span style="font-size:18px; flex-shrink:0;">${icons[type] || 'ℹ️'}</span>
-        <span class="toast-message" style="flex:1;">${message}</span>
-        <span onclick="this.parentElement.remove()" style="cursor:pointer; opacity:0.7; font-size:18px; flex-shrink:0; margin-left:8px; line-height:1;" title="Dismiss">&times;</span>`;
+    // Build toast contents safely. The icon and dismiss-X are
+    // hardcoded markup (trusted), but `message` is operator- or
+    // server-controlled — a peer responding with `{"error": "<img
+    // onerror=…>"}` would otherwise inject script. Build the message
+    // span as a text node so any HTML in `message` renders verbatim
+    // rather than executing. Audit (2026-05-01): zero callers
+    // intentionally pass HTML through showToast across app.js +
+    // wolfrouter.js, so this hardens 1000+ call sites with no
+    // behaviour regression.
+    const iconSpan = document.createElement('span');
+    iconSpan.style.cssText = 'font-size:18px; flex-shrink:0;';
+    iconSpan.textContent = icons[type] || 'ℹ️';
+    const msgSpan = document.createElement('span');
+    msgSpan.className = 'toast-message';
+    msgSpan.style.cssText = 'flex:1;';
+    msgSpan.textContent = String(message ?? '');
+    const dismissSpan = document.createElement('span');
+    dismissSpan.style.cssText = 'cursor:pointer; opacity:0.7; font-size:18px; flex-shrink:0; margin-left:8px; line-height:1;';
+    dismissSpan.title = 'Dismiss';
+    dismissSpan.textContent = '×';
+    dismissSpan.onclick = () => toast.remove();
+    toast.replaceChildren(iconSpan, msgSpan, dismissSpan);
     container.appendChild(toast);
     // Trigger slide-in via transition (not @keyframes — works without stylesheet)
     requestAnimationFrame(() => {
@@ -11264,6 +11346,7 @@ try {
 
 loadUserPreferences().then(loadHiddenFeatures); // sync prefs then apply sidebar hides
 fetchNodes();
+refreshProxmoxCleanupBanner(); // show deprecation banner if startup auto-cleanup ran
 fetchMetricsHistory(); // Initial history load
 loadTaskLog(); // Restore task log from localStorage
 checkWolfNoteTopBar(); // Show WolfNote button if connected
@@ -26660,6 +26743,8 @@ function switchSettingsTab(tabName) {
         loadAlertingConfig();
     } else if (tabName === 'security') {
         loadClusterSecretStatus();
+    } else if (tabName === 'passkeys') {
+        loadPasskeys();
     } else if (tabName === 'paths') {
         loadFileLocations();
     } else if (tabName === 'reverseproxy') {
@@ -27283,20 +27368,14 @@ function addPluginNavItem(manifest) {
         document.querySelector('.main-content')?.appendChild(page);
     }
 
-    // Add to the datacenter icon row (first .nav-section in .sidebar-nav)
-    if (menu.section === 'datacenter') {
-        const iconRow = document.querySelector('.sidebar-nav > .nav-section');
-        if (iconRow) {
-            const item = document.createElement('a');
-            item.className = 'nav-item';
-            item.dataset.page = viewId;
-            item.title = menu.label;
-            item.onclick = () => selectView(viewId);
-            item.style.cssText = 'display:flex;align-items:center;justify-content:center;width:40px;height:40px;padding:0;border-radius:10px;';
-            item.innerHTML = `<span class="icon" style="margin:0;font-size:20px;">${manifest.icon || '🔌'}</span>`;
-            iconRow.appendChild(item);
-        }
-    }
+    // Plugins with `menu.section === 'datacenter'` are now surfaced
+    // through the Apps & Tools drawer (⊞ button) instead of getting
+    // their own top-strip icon. Same navigation works (selectView
+    // with `plugin-{view}`); the launcher just builds the tile from
+    // /api/plugins on open. Keeps the top strip from re-cluttering
+    // every time a plugin is installed. The `page-` container
+    // creation above still runs so navigation works the moment the
+    // tile is clicked.
 
     // Add as a settings tab (appears inside Settings page, before Plugins tab)
     if (menu.section === 'settings') {
@@ -28557,6 +28636,14 @@ document.addEventListener('DOMContentLoaded', function() {
 // render of the status-page list.
 document.addEventListener('DOMContentLoaded', fetchReverseProxyConfigSilent);
 
+// Predictive Inbox — start the badge poll once the dashboard is up so
+// the 🔮 nav icon shows pending-count without the user having to open
+// the Inbox page first. The poll itself silently swallows 401s so it
+// won't toast-spam the login screen.
+document.addEventListener('DOMContentLoaded', () => {
+    if (typeof predictiveStartBadgePoll === 'function') predictiveStartBadgePoll();
+});
+
 // ─── GitHub Backup (Settings → 📤 GitHub Backup) ───
 //
 // All state lives server-side (the token is stored in a 0600 file).
@@ -28731,21 +28818,59 @@ async function loadSponsorHeaderBadge() {
     var badgeEl = document.getElementById('sponsor-header-badge');
     if (!badgeEl) return;
 
-    // Check enterprise license first — takes priority over sponsor tier
+    // Check WolfStack licence first — takes priority over sponsor tier
     try {
         var licResp = await fetch(apiUrl('/api/platform/status'));
         if (licResp.ok) {
             var lic = await licResp.json();
             if (lic.valid) {
-                badgeEl.style.background = 'linear-gradient(135deg, #dc2626, #ef4444)';
-                badgeEl.textContent = 'Enterprise';
-                if (textEl) textEl.textContent = lic.customer || 'Enterprise License';
+                var tierLabels = { homelab: 'Homelab', pro: 'Pro', enterprise: 'Enterprise' };
+                var tierGradients = {
+                    homelab: 'linear-gradient(135deg, #2563eb, #3b82f6)',
+                    pro: 'linear-gradient(135deg, #7c3aed, #a855f7)',
+                    enterprise: 'linear-gradient(135deg, #dc2626, #ef4444)'
+                };
+                var tierBg = {
+                    homelab: 'linear-gradient(135deg, rgba(37,99,235,0.12), rgba(59,130,246,0.08))',
+                    pro: 'linear-gradient(135deg, rgba(124,58,237,0.12), rgba(168,85,247,0.08))',
+                    enterprise: 'linear-gradient(135deg, rgba(220,38,38,0.12), rgba(239,68,68,0.08))'
+                };
+                var tierBorder = {
+                    homelab: 'rgba(37,99,235,0.25)',
+                    pro: 'rgba(124,58,237,0.25)',
+                    enterprise: 'rgba(220,38,38,0.25)'
+                };
+                var tier = lic.tier || 'enterprise';
+                var label = tierLabels[tier] || 'Licensed';
+                // When over the host cap we paint the badge amber to flag
+                // it without breaking the operator's flow — usage is never
+                // hard-blocked, this is just a visible "you owe us a chat"
+                // signal.
+                var amberGrad = 'linear-gradient(135deg, #d97706, #f59e0b)';
+                var amberBg   = 'linear-gradient(135deg, rgba(217,119,6,0.14), rgba(245,158,11,0.10))';
+                var amberBorder = 'rgba(217,119,6,0.35)';
+                var overCap = !!lic.over_cap;
+                badgeEl.style.background = overCap ? amberGrad : (tierGradients[tier] || tierGradients.enterprise);
+                badgeEl.textContent = overCap ? (label + ' · over cap') : label;
+                var detail = lic.customer || 'Licensed';
+                if (typeof lic.current_nodes === 'number') {
+                    if (lic.max_nodes && lic.max_nodes > 0) {
+                        detail += ' — ' + lic.current_nodes + '/' + lic.max_nodes + ' hosts';
+                    } else {
+                        detail += ' — ' + lic.current_nodes + ' host' + (lic.current_nodes === 1 ? '' : 's');
+                    }
+                }
+                if (textEl) textEl.textContent = detail;
                 if (linkEl) {
-                    linkEl.style.background = 'linear-gradient(135deg, rgba(220,38,38,0.12), rgba(239,68,68,0.08))';
-                    linkEl.style.borderColor = 'rgba(220,38,38,0.25)';
-                    linkEl.removeAttribute('href');
-                    linkEl.removeAttribute('target');
-                    linkEl.style.cursor = 'default';
+                    linkEl.style.background  = overCap ? amberBg     : (tierBg[tier]     || tierBg.enterprise);
+                    linkEl.style.borderColor = overCap ? amberBorder : (tierBorder[tier] || tierBorder.enterprise);
+                    linkEl.style.cursor = 'pointer';
+                    linkEl.setAttribute('href', 'https://wolfstack.org/enterprise-portal.php');
+                    linkEl.setAttribute('target', '_blank');
+                    linkEl.setAttribute('rel', 'noopener');
+                    linkEl.title = overCap
+                        ? 'Cluster exceeds the ' + tier + ' tier — click to upgrade'
+                        : 'Click to manage your WolfStack subscription';
                 }
                 return; // Skip sponsor check
             }
@@ -28774,6 +28899,630 @@ async function loadSponsorHeaderBadge() {
 }
 // Load on page startup
 document.addEventListener('DOMContentLoaded', loadSponsorHeaderBadge);
+
+// ─── Passkeys (WebAuthn) ───
+
+function _b64uToBuf(s) {
+    s = String(s).replace(/-/g, '+').replace(/_/g, '/');
+    const pad = s.length % 4; if (pad) s += '='.repeat(4 - pad);
+    const bin = atob(s);
+    const buf = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+    return buf.buffer;
+}
+function _bufToB64u(buf) {
+    const bytes = new Uint8Array(buf);
+    let s = ''; for (const b of bytes) s += String.fromCharCode(b);
+    return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function loadPasskeys() {
+    const list = document.getElementById('passkeys-list');
+    const warn = document.getElementById('passkeys-warning');
+    if (!list) return;
+    if (warn) {
+        warn.style.display = 'none';
+        const host = window.location.hostname;
+        const isIp = /^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes(':');
+        if (!window.PublicKeyCredential) {
+            warn.textContent = 'Your browser does not support WebAuthn.';
+            warn.style.display = '';
+        } else if (isIp) {
+            warn.textContent = 'Passkeys require accessing WolfStack via a hostname, not an IP. Add a /etc/hosts entry or DNS record, then revisit this page over the hostname URL.';
+            warn.style.display = '';
+        }
+    }
+    list.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:12px 0;">Loading…</div>';
+    try {
+        const resp = await fetch('/api/auth/passkeys');
+        if (!resp.ok) { list.innerHTML = '<div style="color:var(--danger);font-size:13px;">Failed to load passkeys.</div>'; return; }
+        const data = await resp.json();
+        const items = data.passkeys || [];
+        if (items.length === 0) {
+            list.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:12px 0;">No passkeys registered yet. Add one above to enable passwordless sign-in.</div>';
+            return;
+        }
+        list.innerHTML = items.map(pk => {
+            const label = (pk.label || 'Passkey').replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+            const reg = pk.registered_at ? new Date(pk.registered_at).toLocaleString() : '—';
+            const used = pk.last_used_at ? new Date(pk.last_used_at).toLocaleString() : 'never';
+            const id = encodeURIComponent(pk.credential_id);
+            return `<div style="display:flex;align-items:center;gap:12px;padding:12px 14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;margin-bottom:8px;">
+                <div style="flex:1;">
+                    <div style="font-weight:600;font-size:13px;">🔑 ${label}</div>
+                    <div style="font-size:11px;color:var(--text-muted);margin-top:2px;">Registered ${reg} &middot; Last used ${used}</div>
+                </div>
+                <button class="btn btn-sm" onclick="passkeyDelete('${id}', this)" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);font-size:11px;">🗑 Remove</button>
+            </div>`;
+        }).join('');
+    } catch (e) {
+        list.innerHTML = '<div style="color:var(--danger);font-size:13px;">Failed to load passkeys: ' + (e.message || e) + '</div>';
+    }
+}
+
+async function passkeyAdd() {
+    const labelEl = document.getElementById('new-passkey-label');
+    const btn = document.getElementById('btn-passkey-add');
+    const label = (labelEl && labelEl.value.trim()) || ('Passkey ' + new Date().toLocaleDateString());
+    if (!window.PublicKeyCredential) { showToast('Your browser does not support WebAuthn', 'error'); return; }
+    btn.disabled = true;
+    const orig = btn.innerHTML;
+    btn.innerHTML = 'Waiting for authenticator…';
+    try {
+        const startResp = await fetch('/api/auth/passkey/register/start', {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ label }),
+        });
+        if (!startResp.ok) {
+            const data = await startResp.json().catch(() => ({}));
+            throw new Error(data.error || ('Server returned ' + startResp.status));
+        }
+        const { challenge, ceremony_id } = await startResp.json();
+        const pk = challenge.publicKey || challenge;
+        const opts = { ...pk };
+        opts.challenge = _b64uToBuf(opts.challenge);
+        opts.user = { ...opts.user, id: _b64uToBuf(opts.user.id) };
+        if (Array.isArray(opts.excludeCredentials)) {
+            opts.excludeCredentials = opts.excludeCredentials.map(c => ({ ...c, id: _b64uToBuf(c.id) }));
+        }
+        const cred = await navigator.credentials.create({ publicKey: opts });
+        if (!cred) throw new Error('No credential returned');
+        const r = cred.response;
+        const credJson = {
+            id: cred.id,
+            rawId: _bufToB64u(cred.rawId),
+            type: cred.type,
+            response: {
+                attestationObject: _bufToB64u(r.attestationObject),
+                clientDataJSON: _bufToB64u(r.clientDataJSON),
+            },
+            extensions: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {},
+        };
+        const finishResp = await fetch('/api/auth/passkey/register/finish', {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ ceremony_id, label, response: credJson }),
+        });
+        if (!finishResp.ok) {
+            const data = await finishResp.json().catch(() => ({}));
+            throw new Error(data.error || ('Server returned ' + finishResp.status));
+        }
+        showToast('Passkey added', 'success');
+        if (labelEl) labelEl.value = '';
+        loadPasskeys();
+    } catch (err) {
+        showToast('Failed to add passkey: ' + (err.message || err), 'error');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = orig;
+    }
+}
+
+async function passkeyDelete(credentialId, btn) {
+    if (!await wolfConfirm('Remove this passkey? You will not be able to use it for sign-in any more.', 'Remove passkey')) return;
+    if (btn) { btn.disabled = true; btn.innerHTML = '…'; }
+    try {
+        const resp = await fetch('/api/auth/passkeys/' + credentialId, { method: 'DELETE' });
+        if (!resp.ok) {
+            const data = await resp.json().catch(() => ({}));
+            throw new Error(data.error || ('Server returned ' + resp.status));
+        }
+        showToast('Passkey removed', 'success');
+        loadPasskeys();
+    } catch (err) {
+        showToast('Failed to remove passkey: ' + (err.message || err), 'error');
+        if (btn) { btn.disabled = false; btn.innerHTML = '🗑 Remove'; }
+    }
+}
+
+// ─── Threat Intelligence (WolfRouter tab) ───
+//
+// Lives in app.js (rather than wolfrouter.js) so it shares the global
+// showToast / wolfConfirm primitives and the same fetch error handling
+// the rest of the SPA uses.
+
+// Cached config so per-field toggles don't have to round-trip the entire
+// config object back and forth on every change.
+var _tiCachedConfig = null;
+var _tiCachedStatus = null;
+
+// Per-provider delisting / lookup info used by the self-blacklist banner.
+// Keep in sync with the provider IDs in src/threat_intel/feeds.rs.
+const TI_DELISTING = {
+    spamhaus_drop: {
+        name: 'Spamhaus DROP / EDROP',
+        lookup: ip => 'https://check.spamhaus.org/results/?query=' + encodeURIComponent(ip),
+        delisting: 'https://www.spamhaus.org/lookup/',
+        notes: 'Spamhaus DROP/EDROP lists hijacked netblocks and ranges allocated to criminals. Delisting usually requires your hosting provider to push the request upstream — once the LIR confirms the issue is fixed, Spamhaus removes the range quickly.',
+    },
+    firehol_level1: {
+        name: 'FireHOL Level 1',
+        lookup: () => 'https://iplists.firehol.org/?ipset=firehol_level1',
+        delisting: 'https://iplists.firehol.org/',
+        notes: 'FireHOL Level 1 is an aggregate of other feeds. Search at iplists.firehol.org to find which child feed lists the IP, submit delisting there, and FireHOL re-syncs automatically (usually within a day).',
+    },
+    crowdsec_community: {
+        name: 'CrowdSec community blocklist',
+        lookup: ip => 'https://app.crowdsec.net/cti/' + encodeURIComponent(ip),
+        delisting: 'https://app.crowdsec.net/',
+        notes: 'CrowdSec listings are reported by community members. If you control the IP, sign in to your CrowdSec account, look up the IP, and submit a delisting request from the CTI page.',
+    },
+    abuseipdb: {
+        name: 'AbuseIPDB',
+        lookup: ip => 'https://www.abuseipdb.com/check/' + encodeURIComponent(ip),
+        delisting: 'https://www.abuseipdb.com/edit-account',
+        notes: 'AbuseIPDB tracks user-reported abuse. Check current reports via the lookup link, then dispute false reports through the AbuseIPDB account portal.',
+    },
+};
+
+function tiRenderTab() {
+    tiLoadConfig();
+    tiLoadStatus();
+    tiLoadClusterStatus();
+    tiStartClusterPolling();
+}
+
+// Poll cluster status every 30s while the Threat Intel tab is the
+// active WolfRouter tab. Stops automatically when user switches tabs.
+var _tiClusterPollTimer = null;
+function tiStartClusterPolling() {
+    if (_tiClusterPollTimer) return; // already running
+    _tiClusterPollTimer = setInterval(() => {
+        // Only poll if the Threat Intel panel is currently visible —
+        // otherwise we'd keep hammering the cluster aggregator while
+        // the user is on a different tab.
+        const panel = document.getElementById('wr-tab-threat-intel');
+        if (!panel || panel.style.display === 'none') return;
+        tiLoadClusterStatus();
+    }, 30000);
+}
+
+function tiEsc(s) {
+    return String(s).replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+}
+
+async function tiLoadConfig() {
+    try {
+        const resp = await fetch('/api/threat-intel/config');
+        if (!resp.ok) throw new Error('Failed to load config');
+        const cfg = await resp.json();
+        _tiCachedConfig = cfg;
+        // Master toggles
+        document.getElementById('ti-cfg-enabled').checked = !!cfg.enabled;
+        document.getElementById('ti-cfg-dry-run').checked = !!cfg.dry_run;
+        document.getElementById('ti-cfg-refresh-hours').value = cfg.refresh_hours || 6;
+        document.getElementById('ti-cfg-allowlist').value = (cfg.allowlist || []).join('\n');
+        // Render provider rows
+        tiRenderProviders(cfg.providers || {});
+    } catch (e) {
+        showToast('Failed to load threat-intel config: ' + (e.message || e), 'error');
+    }
+}
+
+function tiRenderProviders(providers) {
+    const list = document.getElementById('ti-providers-list');
+    if (!list) return;
+    // Stable display order
+    const known = [
+        ['spamhaus_drop',       'Spamhaus DROP / EDROP / dropv6', false, 'https://www.spamhaus.org/drop/'],
+        ['firehol_level1',      'FireHOL Level 1',                false, 'https://iplists.firehol.org/'],
+        ['crowdsec_community',  'CrowdSec community blocklist',   true,  'https://app.crowdsec.net/'],
+        ['abuseipdb',           'AbuseIPDB',                      true,  'https://www.abuseipdb.com/account/api'],
+    ];
+    list.innerHTML = known.map(([id, name, needsKey, url]) => {
+        const cur = providers[id] || { enabled: false, api_key: '', url_override: '' };
+        const enabledChecked = cur.enabled ? 'checked' : '';
+        const keyVal = (cur.api_key || '').replace(/"/g, '&quot;');
+        const keyField = needsKey
+            ? `<input type="password" id="ti-prov-key-${id}" placeholder="API key" value="${keyVal}" style="flex:1; min-width:160px; padding:5px 8px; font-family:var(--font-mono); font-size:12px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:4px; color:var(--text);">`
+            : '';
+        const linkText = needsKey ? '🔑 Get key' : '🔗 Source';
+        return `<div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center; padding:10px 12px; border:1px solid var(--border); border-radius:8px; margin-bottom:8px; background:var(--bg-secondary);">
+            <label style="display:flex; align-items:center; gap:8px; min-width:280px; cursor:pointer; flex:1;">
+                <input type="checkbox" id="ti-prov-en-${id}" ${enabledChecked}>
+                <span><strong>${tiEsc(name)}</strong></span>
+            </label>
+            ${keyField}
+            <a href="${tiEsc(url)}" target="_blank" rel="noopener" style="font-size:11px; color:var(--accent-primary); text-decoration:none; white-space:nowrap;">${linkText}</a>
+            <button class="btn btn-sm" onclick="tiSaveProvider('${id}', ${needsKey})">💾 Save</button>
+        </div>`;
+    }).join('');
+}
+
+async function tiLoadClusterStatus() {
+    const target = document.getElementById('ti-cluster-status-table');
+    if (!target) return;
+    // Threat Intel lives as a tab inside WolfRouter, which is
+    // per-cluster. Pass the active cluster name so the backend's
+    // /api/threat-intel/cluster-status only returns peers in THIS
+    // cluster — without the filter, a bastion managing 5 clusters /
+    // 14 servers shows all 14 in every cluster's view. (Adam Cogswell
+    // 2026-04-29: confirmed the panel was leaking other clusters'
+    // nodes after v22.6.2's backend filter landed but the frontend
+    // wasn't passing the param.)
+    const cluster = (typeof window.wrState === 'object' && window.wrState && window.wrState.cluster) || null;
+    const url = cluster
+        ? '/api/threat-intel/cluster-status?cluster=' + encodeURIComponent(cluster)
+        : '/api/threat-intel/cluster-status';
+    try {
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data = await resp.json();
+        tiRenderClusterStatusTable(data.nodes || []);
+    } catch (e) {
+        target.innerHTML = `<div style="color:var(--danger); font-size:12px;">Failed to load cluster status: ${tiEsc(e.message || e)}</div>`;
+    }
+}
+
+function tiBadgeForNode(s) {
+    // Mirror the colours used in the local-node status badge so the
+    // cluster table reads the same way.
+    if (!s) return '<span style="font-size:11px; padding:3px 8px; border-radius:4px; background:var(--bg-tertiary); color:var(--text-muted);">UNKNOWN</span>';
+    if (s.paused) return '<span style="font-size:11px; padding:3px 8px; border-radius:4px; background:rgba(220,38,38,0.18); color:#fca5a5;">PAUSED</span>';
+    if (s.enforcement_active && s.applied) return '<span style="font-size:11px; padding:3px 8px; border-radius:4px; background:rgba(16,185,129,0.18); color:#6ee7b7;">ENFORCING</span>';
+    if (s.enabled && s.dry_run) return '<span style="font-size:11px; padding:3px 8px; border-radius:4px; background:rgba(234,179,8,0.18); color:#fde68a;">DRY-RUN</span>';
+    if (s.enabled) return '<span style="font-size:11px; padding:3px 8px; border-radius:4px; background:rgba(99,102,241,0.18); color:#a5b4fc;">ENABLED</span>';
+    return '<span style="font-size:11px; padding:3px 8px; border-radius:4px; background:var(--bg-tertiary); color:var(--text-muted);">OFF</span>';
+}
+
+function tiRenderClusterStatusTable(rows) {
+    const target = document.getElementById('ti-cluster-status-table');
+    if (!target) return;
+    if (!rows || rows.length === 0) {
+        target.innerHTML = '<div style="color:var(--text-muted); font-size:13px; padding:8px 0;">No nodes in this cluster.</div>';
+        return;
+    }
+    // Sort: self first, then by hostname ascending.
+    rows.sort((a, b) => {
+        if (a.is_self && !b.is_self) return -1;
+        if (b.is_self && !a.is_self) return 1;
+        return String(a.hostname || '').localeCompare(String(b.hostname || ''));
+    });
+    const html = `<table style="width:100%; border-collapse:collapse; font-size:12px;">
+        <thead>
+            <tr style="border-bottom:1px solid var(--border); text-align:left;">
+                <th style="padding:6px 8px; font-weight:600; color:var(--text-secondary);">Node</th>
+                <th style="padding:6px 8px; font-weight:600; color:var(--text-secondary);">Status</th>
+                <th style="padding:6px 8px; font-weight:600; color:var(--text-secondary);">Blocklist</th>
+                <th style="padding:6px 8px; font-weight:600; color:var(--text-secondary);">Last refresh</th>
+                <th style="padding:6px 8px; font-weight:600; color:var(--text-secondary);">Notes</th>
+            </tr>
+        </thead>
+        <tbody>${rows.map(row => {
+            const dot = row.online ? '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#22c55e;margin-right:6px;"></span>' : '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#ef4444;margin-right:6px;"></span>';
+            const selfTag = row.is_self ? ' <span style="font-size:10px; padding:1px 4px; border-radius:3px; background:var(--bg-tertiary); color:var(--text-muted);">this node</span>' : '';
+            const s = row.status;
+            const blocklistCell = s
+                ? `<strong>${(s.blocklist_size || 0).toLocaleString()}</strong> <span style="color:var(--text-muted); font-size:11px;">(${(s.blocklist_v4_count||0).toLocaleString()} v4 / ${(s.blocklist_v6_count||0).toLocaleString()} v6)</span>`
+                : '<span style="color:var(--text-muted);">—</span>';
+            const lastCell = s && s.last_refresh_secs
+                ? new Date(s.last_refresh_secs * 1000).toLocaleString()
+                : '<span style="color:var(--text-muted);">never</span>';
+            // Notes column: explicit error from aggregator (offline / unreachable),
+            // or per-provider error counts when reachable.
+            let notes = '';
+            if (row.error) {
+                notes = `<span style="color:var(--warning);">${tiEsc(row.error)}</span>`;
+            } else if (s) {
+                const providerErrors = Object.entries(s.providers || {}).filter(([_, p]) => p && p.last_error);
+                if (providerErrors.length > 0) {
+                    notes = `<span style="color:var(--warning);" title="${providerErrors.map(([id, p]) => tiEsc(id + ': ' + p.last_error)).join('\n')}">${providerErrors.length} feed error(s)</span>`;
+                } else if (s.ipset_available === false) {
+                    notes = '<span style="color:var(--warning);">ipset not installed</span>';
+                } else {
+                    notes = '<span style="color:var(--text-muted);">—</span>';
+                }
+            }
+            return `<tr style="border-bottom:1px solid var(--border);">
+                <td style="padding:6px 8px;">${dot}<strong>${tiEsc(row.hostname || row.address)}</strong>${selfTag}<br><span style="font-size:10px;color:var(--text-muted);font-family:var(--font-mono);">${tiEsc(row.address)}</span></td>
+                <td style="padding:6px 8px;">${tiBadgeForNode(s)}</td>
+                <td style="padding:6px 8px;">${blocklistCell}</td>
+                <td style="padding:6px 8px;">${lastCell}</td>
+                <td style="padding:6px 8px;">${notes}</td>
+            </tr>`;
+        }).join('')}</tbody>
+    </table>`;
+    target.innerHTML = html;
+}
+
+function tiRenderSelfBanner(self_blacklisted) {
+    const banner = document.getElementById('ti-self-banner');
+    if (!banner) return;
+    if (!self_blacklisted || self_blacklisted.length === 0) {
+        banner.style.display = 'none';
+        banner.innerHTML = '';
+        return;
+    }
+    // Build per-IP rows. Each row: IP + hostname, listing summary, and a
+    // collapsible "How to get delisted" details block per provider.
+    const rows = self_blacklisted.map(entry => {
+        const ip = entry.ip;
+        const host = entry.hostname ? ` <span style="color:var(--text-muted); font-weight:400;">(${tiEsc(entry.hostname)})</span>` : '';
+        const listed = (entry.listed_by || []).map(pid => {
+            const info = TI_DELISTING[pid];
+            return info ? tiEsc(info.name) : tiEsc(pid);
+        }).join(', ');
+
+        // Per-provider action block
+        const actions = (entry.listed_by || []).map(pid => {
+            const info = TI_DELISTING[pid];
+            if (!info) return '';
+            const lookupUrl = typeof info.lookup === 'function' ? info.lookup(ip) : info.lookup;
+            return `<div style="padding:10px 12px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:6px; margin-bottom:8px;">
+                <div style="font-weight:600; font-size:13px; margin-bottom:4px;">${tiEsc(info.name)}</div>
+                <div style="font-size:12px; color:var(--text-secondary); margin-bottom:8px; line-height:1.55;">${tiEsc(info.notes)}</div>
+                <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                    <a href="${tiEsc(lookupUrl)}" target="_blank" rel="noopener" class="btn btn-sm" style="text-decoration:none;">🔍 Check this IP</a>
+                    <a href="${tiEsc(info.delisting)}" target="_blank" rel="noopener" class="btn btn-sm" style="text-decoration:none;">📤 Submit delisting</a>
+                </div>
+            </div>`;
+        }).join('');
+
+        return `<div style="padding:12px 14px; background:rgba(220,38,38,0.08); border:1px solid rgba(220,38,38,0.25); border-radius:8px; margin-top:10px;">
+            <div style="font-size:14px; margin-bottom:8px;">
+                <strong style="color:#fca5a5; font-family:var(--font-mono);">${tiEsc(ip)}</strong>${host}
+                — listed by <strong>${listed}</strong>
+            </div>
+            ${actions}
+        </div>`;
+    }).join('');
+
+    banner.innerHTML = `
+        <div style="display:flex; align-items:flex-start; gap:12px;">
+            <div style="font-size:24px; line-height:1;">⚠️</div>
+            <div style="flex:1;">
+                <div style="font-weight:700; font-size:14px; color:#fca5a5; margin-bottom:4px;">One of your own server IPs is on a public blocklist</div>
+                <div style="font-size:13px; color:var(--text-secondary); line-height:1.55;">
+                    This usually means the previous owner of this IP misused it, leaving residual reputation behind.
+                    WolfStack is automatically exempting your IP from <em>your own</em> blocklist so cluster traffic still flows —
+                    but other networks pulling the same feeds may silently drop traffic <em>to</em> your server, which can
+                    cause hard-to-diagnose problems for your own users.
+                </div>
+            </div>
+        </div>
+        ${rows}
+        <details style="margin-top:12px; padding:10px 12px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px;">
+            <summary style="cursor:pointer; font-weight:600; font-size:13px; user-select:none;">⚡ Faster path — request a clean IP from your hosting provider</summary>
+            <div style="margin-top:8px; font-size:12px; color:var(--text-secondary); line-height:1.7;">
+                Most major hosts will swap you to a different IP on request &mdash; usually faster than waiting for delisting.
+                <ul style="margin:6px 0 0 18px; padding:0;">
+                    <li><strong>Hetzner:</strong> Robot &rarr; Server &rarr; IPs &rarr; request additional / change IP (often instant for Cloud, ticket for dedicated)</li>
+                    <li><strong>OVH:</strong> Manager &rarr; Bare Metal Cloud &rarr; IP services &rarr; order replacement IP</li>
+                    <li><strong>DigitalOcean / Linode / Vultr:</strong> open a support ticket explaining the IP is on a public blocklist</li>
+                    <li><strong>AWS:</strong> release the Elastic IP and allocate a new one</li>
+                    <li><strong>Self-hosted / colo:</strong> contact your ISP's abuse desk &mdash; they can usually rotate a static IP within a day</li>
+                </ul>
+                Mention &ldquo;the IP is listed on Spamhaus / FireHOL with residual reputation from the previous tenant&rdquo; &mdash; that phrasing typically gets the fastest response.
+            </div>
+        </details>`;
+    banner.style.display = '';
+}
+
+async function tiLoadStatus() {
+    try {
+        const resp = await fetch('/api/threat-intel/status');
+        if (!resp.ok) throw new Error('Failed to load status');
+        const s = await resp.json();
+        _tiCachedStatus = s;
+        tiRenderSelfBanner(s.self_blacklisted);
+        // Status badge
+        const badge = document.getElementById('ti-status-badge');
+        if (badge) {
+            let label, bg, fg;
+            if (s.paused) { label = 'PAUSED'; bg = 'rgba(220,38,38,0.18)'; fg = '#fca5a5'; }
+            else if (s.enforcement_active && s.applied) { label = 'ENFORCING'; bg = 'rgba(16,185,129,0.18)'; fg = '#6ee7b7'; }
+            else if (s.enabled && s.dry_run) { label = 'DRY-RUN'; bg = 'rgba(234,179,8,0.18)'; fg = '#fde68a'; }
+            else if (s.enabled) { label = 'ENABLED'; bg = 'rgba(99,102,241,0.18)'; fg = '#a5b4fc'; }
+            else { label = 'OFF'; bg = 'var(--bg-tertiary)'; fg = 'var(--text-muted)'; }
+            badge.textContent = label;
+            badge.style.background = bg;
+            badge.style.color = fg;
+        }
+        // Status summary text
+        const last = s.last_refresh_secs ? new Date(s.last_refresh_secs * 1000).toLocaleString() : 'never';
+        const summary = document.getElementById('ti-status-summary');
+        if (summary) {
+            const ipsetMsg = s.ipset_available ? '' : ' <span style="color:var(--warning);">⚠ <code>ipset</code> isn\'t installed yet — WolfStack will try to install it automatically the first time you flip to enforce mode.</span>';
+            summary.innerHTML = `Blocklist size: <strong>${s.blocklist_size.toLocaleString()}</strong> entries
+                (${s.blocklist_v4_count.toLocaleString()} IPv4 / ${s.blocklist_v6_count.toLocaleString()} IPv6).
+                Last refresh: <strong>${last}</strong>.${ipsetMsg}`;
+        }
+        // Pause / resume button visibility
+        const pauseBtn = document.getElementById('ti-pause-btn');
+        const resumeBtn = document.getElementById('ti-resume-btn');
+        if (pauseBtn && resumeBtn) {
+            if (s.paused) { pauseBtn.style.display = 'none'; resumeBtn.style.display = ''; }
+            else          { pauseBtn.style.display = '';     resumeBtn.style.display = 'none'; }
+        }
+        // Provider row state lines (success / error / count)
+        Object.keys(s.providers || {}).forEach(id => {
+            const ps = s.providers[id];
+            const row = document.querySelector(`#ti-prov-en-${id}`)?.closest('div');
+            if (!row) return;
+            // Append/replace a small status line — keyed by class so we don't duplicate.
+            let line = row.querySelector('.ti-prov-status');
+            if (!line) {
+                line = document.createElement('div');
+                line.className = 'ti-prov-status';
+                line.style.cssText = 'flex-basis:100%; font-size:11px; color:var(--text-muted); margin-top:4px;';
+                row.appendChild(line);
+            }
+            const when = ps.last_attempt_secs ? new Date(ps.last_attempt_secs * 1000).toLocaleString() : 'never';
+            if (ps.last_error) {
+                line.innerHTML = `<span style="color:var(--danger);">⚠ ${tiEsc(ps.last_error)}</span> &middot; last attempt ${when}`;
+            } else if (ps.last_count) {
+                line.textContent = `Last fetch: ${ps.last_count.toLocaleString()} entries at ${when}`;
+            } else {
+                line.textContent = `No fetch yet`;
+            }
+        });
+        // Blocklist preview
+        const preview = document.getElementById('ti-blocklist-preview');
+        if (preview) {
+            const v4 = (s.sample_v4 || []).map(tiEsc).join('\n');
+            const v6 = (s.sample_v6 || []).map(tiEsc).join('\n');
+            if (!v4 && !v6) {
+                preview.innerHTML = '<em style="color:var(--text-muted);">Empty &mdash; run a refresh to populate.</em>';
+            } else {
+                preview.innerHTML = `<div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+                    <div><div style="font-weight:600; margin-bottom:4px;">IPv4 (first ${s.sample_v4.length} of ${s.blocklist_v4_count.toLocaleString()})</div><pre style="margin:0; white-space:pre-wrap; word-break:break-all;">${v4 || '<em>—</em>'}</pre></div>
+                    <div><div style="font-weight:600; margin-bottom:4px;">IPv6 (first ${s.sample_v6.length} of ${s.blocklist_v6_count.toLocaleString()})</div><pre style="margin:0; white-space:pre-wrap; word-break:break-all;">${v6 || '<em>—</em>'}</pre></div>
+                </div>`;
+            }
+        }
+    } catch (e) {
+        showToast('Failed to load threat-intel status: ' + (e.message || e), 'error');
+    }
+}
+
+async function tiPatchEnableTriple() {
+    // Called when the user toggles "Enabled" or "Dry-run" — both go in
+    // a single PATCH so the backend's apply_state_change runs at most
+    // once for the change pair.
+    const enabled = document.getElementById('ti-cfg-enabled').checked;
+    const dry_run = document.getElementById('ti-cfg-dry-run').checked;
+    const body = { enabled, dry_run };
+    try {
+        const resp = await fetch('/api/threat-intel/config', {
+            method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            showToast(data.error || 'Failed to update config', 'error');
+            // Reload to re-sync the UI with whatever the backend rolled to.
+            tiLoadConfig();
+            return;
+        }
+        showToast('Threat intel updated', 'success');
+        _tiCachedConfig = data;
+        tiLoadStatus();
+    } catch (e) {
+        showToast('Update failed: ' + e.message, 'error');
+        tiLoadConfig();
+    }
+}
+
+async function tiSaveRefreshHours() {
+    const v = parseInt(document.getElementById('ti-cfg-refresh-hours').value, 10);
+    if (isNaN(v) || v < 1 || v > 168) { showToast('Refresh hours must be 1–168', 'error'); return; }
+    try {
+        const resp = await fetch('/api/threat-intel/config', {
+            method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ refresh_hours: v }),
+        });
+        if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Server error');
+        showToast('Refresh interval saved', 'success');
+    } catch (e) { showToast(e.message, 'error'); }
+}
+
+async function tiSaveAllowlist() {
+    const lines = document.getElementById('ti-cfg-allowlist').value.split('\n').map(s => s.trim()).filter(Boolean);
+    try {
+        const resp = await fetch('/api/threat-intel/config', {
+            method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ allowlist: lines }),
+        });
+        if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Server error');
+        showToast('Allowlist saved', 'success');
+    } catch (e) { showToast(e.message, 'error'); }
+}
+
+async function tiSaveProvider(id, needsKey) {
+    const enabled = document.getElementById('ti-prov-en-' + id).checked;
+    const keyEl = document.getElementById('ti-prov-key-' + id);
+    let useKey;
+    if (!needsKey) {
+        useKey = '';
+    } else if (!keyEl) {
+        useKey = '';
+    } else if (keyEl.value === '***') {
+        // User left the masked value as-is → preserve the on-disk key.
+        useKey = '***';
+    } else {
+        // Anything else (including an empty string) is what the user
+        // wants stored — empty means "clear the key on disk".
+        useKey = keyEl.value.trim();
+    }
+    const body = { providers: { [id]: { enabled, api_key: useKey, url_override: '' } } };
+    try {
+        const resp = await fetch('/api/threat-intel/config', {
+            method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body),
+        });
+        if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Server error');
+        showToast('Provider saved', 'success');
+        tiLoadConfig();
+    } catch (e) { showToast(e.message, 'error'); }
+}
+
+async function tiRefreshNow() {
+    const btn = document.getElementById('ti-refresh-now-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Refreshing…'; }
+    try {
+        const resp = await fetch('/api/threat-intel/refresh', { method: 'POST' });
+        if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Server error');
+        showToast('Refreshed', 'success');
+        tiLoadStatus();
+    } catch (e) {
+        showToast('Refresh failed: ' + e.message, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.innerHTML = '↻ Refresh now'; }
+    }
+}
+
+async function tiPause() {
+    if (!await wolfConfirm('Pause threat-intel enforcement? The kernel rule will be removed immediately. Configuration is preserved — click Resume to re-activate.', 'Pause enforcement')) return;
+    try {
+        const resp = await fetch('/api/threat-intel/pause', { method: 'POST' });
+        if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Server error');
+        showToast('Enforcement paused', 'success');
+        tiLoadStatus();
+        tiLoadConfig();
+    } catch (e) { showToast(e.message, 'error'); }
+}
+
+async function tiResume() {
+    try {
+        const resp = await fetch('/api/threat-intel/resume', { method: 'POST' });
+        if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Server error');
+        showToast('Enforcement resumed', 'success');
+        tiLoadStatus();
+        tiLoadConfig();
+    } catch (e) { showToast(e.message, 'error'); }
+}
+
+async function tiLookup() {
+    const ip = document.getElementById('ti-lookup-ip').value.trim();
+    const out = document.getElementById('ti-lookup-result');
+    if (!ip) { out.textContent = 'Enter an IP to check.'; return; }
+    try {
+        const resp = await fetch('/api/threat-intel/lookup/' + encodeURIComponent(ip));
+        const data = await resp.json();
+        if (!resp.ok) { out.innerHTML = '<span style="color:var(--danger);">' + tiEsc(data.error || 'Lookup failed') + '</span>'; return; }
+        if (data.blocked) {
+            const m = data.matches.map(tiEsc).join(', ');
+            out.innerHTML = `<span style="color:var(--danger); font-weight:600;">🚫 BLOCKED</span> by: <code>${m}</code>`;
+        } else {
+            out.innerHTML = `<span style="color:var(--success); font-weight:600;">✓ Not blocked</span>`;
+        }
+    } catch (e) { out.innerHTML = '<span style="color:var(--danger);">' + tiEsc(e.message) + '</span>'; }
+}
 
 // ─── Cluster Secret Management ───
 
@@ -38864,10 +39613,10 @@ function wfRenderInfraTree(div, infra) {
     Object.keys(infra).sort().forEach(clusterName => {
         html += `<div style="font-size:11px;font-weight:700;color:var(--text-secondary);margin:8px 0 4px;border-bottom:1px solid var(--border);padding-bottom:2px;">${escapeHtml(clusterName)}</div>`;
         (infra[clusterName] || []).forEach(node => {
+            if (node.node_type === 'proxmox') return;
             const nodeLabel = node.hostname || node.id;
-            const type = node.node_type === 'proxmox' ? ' (PVE)' : '';
             const dot = node.online ? '<span style="color:#22c55e;">&#9679;</span>' : '<span style="color:#ef4444;">&#9679;</span>';
-            html += `<div style="margin-left:4px;margin-bottom:2px;font-size:11px;color:var(--text-primary);">${dot} <strong>${escapeHtml(nodeLabel)}</strong>${type}</div>`;
+            html += `<div style="margin-left:4px;margin-bottom:2px;font-size:11px;color:var(--text-primary);">${dot} <strong>${escapeHtml(nodeLabel)}</strong></div>`;
             // Docker containers
             (node.docker || []).forEach(c => {
                 const stDot = c.state === 'running' ? '<span style="color:#22c55e;font-size:8px;">&#9679;</span>' : '<span style="color:#888;font-size:8px;">&#9679;</span>';
@@ -46819,3 +47568,817 @@ function dbCopyMarkdown() {
     );
 }
 
+
+// ─── Predictive Inbox ───────────────────────────────────────────
+//
+// Renders the proposal inbox surfaced by `src/predictive/`. The
+// backend handlers live near "Predictive ops" in `src/api/mod.rs`.
+//
+// State model:
+//   predictiveState.proposals — the most recent inbox snapshot.
+// Calls go to /api/proposals* and /api/proposal-acks*. All cookie-
+// authed; no Authorization header.
+//
+// UI rules followed here:
+//   • visible feedback for every user action (toast on success/error)
+//   • dismiss requires a reason — matches the backend 400 contract
+//     so the UI never lets the user submit something the server will
+//     reject
+//   • approve is a confirmation, not a one-click — v1 proposals are
+//     `Manual` plans, "approve" only records that the operator
+//     applied the suggested commands themselves
+//   • snooze options are presets (4 h / 24 h / 1 w / 30 d) so the
+//     common case is one click, not a date picker
+
+// `predictiveState.proposals` is the flat list rendered by
+// `predictiveRender()`. `nodes` carries per-node responded/failed
+// status (with cluster_name) from the cluster aggregator so we can
+// warn the operator when the Inbox is incomplete instead of silently
+// showing partial data and so the UI can group by cluster. Filters
+// stack: clusterFilter narrows to one cluster, nodeFilter narrows
+// to a single node within whatever cluster is selected.
+const predictiveState = {
+    proposals: [], nodes: [], cachedForSeconds: 0,
+    clusterFilter: null,  // null → all clusters
+    nodeFilter: null,     // null → all nodes within the cluster filter
+    loading: false,
+};
+let predictiveBadgeTimer = null;
+
+function renderPredictiveInbox() {
+    const container = document.getElementById('page-inbox');
+    if (!container) return;
+    if (!container.querySelector('.predictive-shell')) {
+        container.innerHTML = `
+            <div class="predictive-shell" style="padding:20px 24px;max-width:1100px;margin:0 auto;">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;gap:16px;flex-wrap:wrap;">
+                    <div style="flex:1;min-width:280px;">
+                        <h2 style="margin:0 0 6px 0;font-size:22px;color:var(--text-primary);">🔮 Predictive Inbox</h2>
+                        <div style="font-size:13px;color:var(--text-muted);line-height:1.5;">
+                            Forward-looking findings the analyzer surfaces before they become incidents.
+                            Every proposal carries the evidence used to produce it; nothing here executes
+                            until you choose to apply it.
+                        </div>
+                    </div>
+                    <div style="display:flex;gap:8px;">
+                        <button class="btn btn-sm" onclick="predictiveRunNow()" id="predictive-run-now">🔄 Run analyzer now</button>
+                    </div>
+                </div>
+                <div id="predictive-list">
+                    <div style="color:var(--text-muted);padding:40px;text-align:center;">Loading…</div>
+                </div>
+                <details style="margin-top:24px;background:rgba(96,165,250,0.05);border:1px solid rgba(96,165,250,0.2);border-radius:8px;padding:0;">
+                    <summary style="padding:10px 14px;cursor:pointer;font-size:12px;color:#60a5fa;font-weight:600;">ℹ How this works</summary>
+                    <div style="padding:0 14px 12px 14px;font-size:12px;color:var(--text-secondary);line-height:1.55;">
+                        The analyzer needs at least
+                        <strong>3 samples spanning ≥30 minutes</strong> of history before it can fit a trend
+                        line, and only emits a proposal when a resource is in a state worth flagging
+                        (e.g. for disk-fill: ≥50% used <em>and</em> growing toward 95%). On a healthy
+                        cluster, &quot;No predictions right now&quot; is the correct answer and clicking
+                        <em>Run analyzer now</em> may produce nothing visible — that's working as
+                        intended, not a bug.
+                    </div>
+                </details>
+                <details style="margin-top:8px;background:rgba(168,85,247,0.04);border:1px solid rgba(168,85,247,0.2);border-radius:8px;padding:0;">
+                    <summary style="padding:10px 14px;cursor:pointer;font-size:12px;color:#c084fc;font-weight:600;">📡 What's currently watched</summary>
+                    <div style="padding:0 14px 12px 14px;font-size:12px;color:var(--text-secondary);line-height:1.55;">
+                        Sampled every 5 minutes on each cluster node:
+                        <ul style="margin:6px 0 6px 18px;padding:0;">
+                            <li><strong>Host filesystem usage</strong> — every real mount via <code>df</code> (pseudo-filesystems filtered)</li>
+                            <li><strong>Docker container storage</strong> — per running container, runtime-specific finding type so acks are scope-precise</li>
+                            <li><strong>LXC container storage</strong> — per running container; same shared linear-fit logic</li>
+                            <li><strong>Docker restart-loops</strong> — flags containers whose <code>RestartCount</code> climbs ≥3 in 10 min (or ≥5 = Critical); &quot;restarting&quot; state bumps severity one tier</li>
+                            <li><strong>Host thresholds</strong> — CPU / memory / disk-free / swap / load / failed-systemd via the unified threshold analyzer (replaces the legacy per-2s Issues-page dispatch for these conditions)</li>
+                            <li><strong>Certificate expiry</strong> — Let's Encrypt certs (via certbot) and WolfStack-managed TLS files in <code>/etc/wolfstack/tls/</code>: Warn at &lt;14 d, High at &lt;7 d, Critical at &lt;3 d or already expired</li>
+                            <li><strong>Container memory pressure</strong> — Docker + LXC, Warn ≥80 % of cgroup limit, High ≥90 %, Critical ≥95 %; runtime-specific finding types so acks scope precisely</li>
+                            <li><strong>Backup freshness</strong> — every enabled schedule: Warn at 2× interval missed, High at 4×, Critical at 7× (or never-ran)</li>
+                            <li><strong>VM disk-fill</strong> — qcow2 sparse-file size vs allocated, per WolfStack-managed VM (Proxmox-managed VMs and raw disks need qemu-guest-agent — flagged when added)</li>
+                            <li><strong>Security posture</strong> — services bound on publicly-routable interfaces (Docker API plain on public IP = Critical, MariaDB on RFC1918-only LAN = Warn, etc.); sshd <code>PermitRootLogin yes</code> / <code>PasswordAuthentication yes</code> with severity scaled by sshd's actual reachability — first analyzer to consume the unified <code>NetworkReachability</code> classifier</li>
+                        </ul>
+                        Cluster-wide already: this Inbox aggregates findings from every reachable peer
+                        across every cluster (cached 30 s server-side; per-peer fetch failures surface as a yellow warning above
+                        the list — never silent gaps; multi-cluster setups get a cluster filter and grouped headers).
+                        First-appearance Critical/High findings dispatch via the existing Discord/Slack/Telegram/email channels —
+                        once per finding, not on every refresh, and auto-resolved findings don't re-page.
+                        Stale findings auto-resolve when the analyzer no longer sees the condition
+                        (audit-logged as <code>condition_cleared</code>, distinct from operator-applied).
+                        The plan is complete: every analyzer item from the original roadmap is live.
+                        Active-attack scans (SSH brute-force, crypto miners, /tmp binaries, suspicious outbound)
+                        remain in <code>security.rs</code> for now — they're event-detection at a different cadence
+                        and the convergence shape is non-trivial; surfaced via the System Check page.
+                        Future iterations: AI-source proposals using the same Inbox surface,
+                        OneClick remediation handlers (today's plans are all Manual = operator runs the commands themselves),
+                        and per-tenant RBAC for the multi-operator case.
+                        Each ships as a complete, tested, banner-updated delta — never half-done.
+                    </div>
+                </details>
+            </div>
+        `;
+    }
+    predictiveLoad();
+}
+
+async function predictiveLoad() {
+    predictiveState.loading = true;
+    try {
+        // Use the cluster-aggregating endpoint by default — every
+        // node's orchestrator runs locally, this fan-outs to all
+        // peers (cached 30s server-side so badge-polling doesn't
+        // hammer peers per refresh).
+        const r = await fetch('/api/proposals/cluster');
+        if (r.status === 401) {
+            showToast('Session expired — please log in', 'error');
+            predictiveState.proposals = [];
+            predictiveState.nodes = [];
+            return;
+        }
+        if (!r.ok) {
+            const data = await r.json().catch(() => ({}));
+            const list = document.getElementById('predictive-list');
+            if (list) list.innerHTML = `<div style="color:#fbbf24;padding:24px;text-align:center;">Failed to load proposals: ${escapeHtml(data.error || r.statusText)}</div>`;
+            return;
+        }
+        const body = await r.json();
+        predictiveState.proposals = body.proposals || [];
+        predictiveState.nodes = body.nodes || [];
+        predictiveState.cachedForSeconds = body.cached_for_seconds || 0;
+        predictiveRender();
+        predictiveBadgeUpdate();
+    } catch (e) {
+        const list = document.getElementById('predictive-list');
+        if (list) list.innerHTML = `<div style="color:#f87171;padding:24px;text-align:center;">Network error: ${escapeHtml(e.message || String(e))}</div>`;
+    } finally {
+        predictiveState.loading = false;
+    }
+}
+
+function predictiveRender() {
+    const list = document.getElementById('predictive-list');
+    if (!list) return;
+
+    // Build the node→cluster lookup once per render.
+    const nodes = predictiveState.nodes || [];
+    const clusterByNode = {};
+    nodes.forEach(n => { clusterByNode[n.node_id] = n.cluster_name || 'WolfStack'; });
+
+    // Apply filters in order: cluster, then node.
+    const all = predictiveState.proposals || [];
+    let filtered = all;
+    if (predictiveState.clusterFilter) {
+        filtered = filtered.filter(p =>
+            (clusterByNode[p.scope?.node_id] || 'WolfStack') === predictiveState.clusterFilter
+        );
+    }
+    if (predictiveState.nodeFilter) {
+        filtered = filtered.filter(p => p.scope && p.scope.node_id === predictiveState.nodeFilter);
+    }
+
+    let html = '';
+
+    // Per-peer warning, grouped by cluster so a multi-cluster
+    // operator can see "all of staging is unreachable" at a glance.
+    const failed = nodes.filter(n => !n.responded);
+    if (failed.length > 0) {
+        const total = nodes.length;
+        const responded = total - failed.length;
+        const byCluster = {};
+        failed.forEach(n => {
+            const c = n.cluster_name || 'WolfStack';
+            (byCluster[c] = byCluster[c] || []).push(n);
+        });
+        const summary = Object.entries(byCluster).map(([c, ns]) =>
+            `<strong>${escapeHtml(c)}</strong>: ${ns.map(n =>
+                `${escapeHtml(n.hostname || n.node_id)} (${escapeHtml(n.error || 'unreachable')})`
+            ).join(', ')}`
+        ).join(' · ');
+        html += `
+            <div style="background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.3);border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:12px;color:var(--text-secondary);line-height:1.5;">
+                <strong style="color:#fbbf24;">⚠ Inbox may be incomplete</strong> — ${responded} of ${total} cluster node${total === 1 ? '' : 's'} responded. Unreachable: ${summary}.
+            </div>
+        `;
+    }
+
+    // Filter row — cluster + node. Cluster filter only renders when
+    // there's more than one cluster in the response; node filter
+    // only renders when there's more than one node in the currently-
+    // selected cluster (so single-node clusters don't get clutter).
+    const clusters = Array.from(new Set(nodes.map(n => n.cluster_name || 'WolfStack'))).sort();
+    const nodesInScope = predictiveState.clusterFilter
+        ? nodes.filter(n => (n.cluster_name || 'WolfStack') === predictiveState.clusterFilter)
+        : nodes;
+
+    if (clusters.length > 1 || nodesInScope.length > 1) {
+        let row = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;font-size:12px;color:var(--text-secondary);flex-wrap:wrap;">';
+        row += '<span>Filter:</span>';
+        if (clusters.length > 1) {
+            const clusterOpts = clusters.map(c => {
+                const sel = predictiveState.clusterFilter === c ? ' selected' : '';
+                const count = all.filter(p => (clusterByNode[p.scope?.node_id] || 'WolfStack') === c).length;
+                return `<option value="${escapeAttr(c)}"${sel}>${escapeHtml(c)} (${count})</option>`;
+            }).join('');
+            row += `<select onchange="predictiveSetClusterFilter(this.value)" style="background:var(--bg-tertiary,#2d2f3a);color:var(--text-primary);border:1px solid var(--border-color);border-radius:6px;padding:4px 8px;font-size:12px;">
+                <option value=""${predictiveState.clusterFilter ? '' : ' selected'}>All clusters (${all.length})</option>
+                ${clusterOpts}
+            </select>`;
+        }
+        if (nodesInScope.length > 1) {
+            const nodeOpts = nodesInScope.map(n => {
+                const label = n.hostname ? `${n.hostname} (${n.node_id})` : n.node_id;
+                const sel = predictiveState.nodeFilter === n.node_id ? ' selected' : '';
+                return `<option value="${escapeAttr(n.node_id)}"${sel}>${escapeHtml(label)}${n.is_self ? ' — this node' : ''}${n.responded ? '' : ' — unreachable'}</option>`;
+            }).join('');
+            row += `<select onchange="predictiveSetNodeFilter(this.value)" style="background:var(--bg-tertiary,#2d2f3a);color:var(--text-primary);border:1px solid var(--border-color);border-radius:6px;padding:4px 8px;font-size:12px;">
+                <option value=""${predictiveState.nodeFilter ? '' : ' selected'}>All nodes${predictiveState.clusterFilter ? ' in ' + escapeHtml(predictiveState.clusterFilter) : ''}</option>
+                ${nodeOpts}
+            </select>`;
+        }
+        row += predictiveState.cachedForSeconds > 0
+            ? `<span style="color:var(--text-muted);margin-left:auto;">cached ${predictiveState.cachedForSeconds}s ago</span>`
+            : `<span style="color:#34d399;margin-left:auto;">fresh</span>`;
+        row += '</div>';
+        html += row;
+    }
+
+    if (filtered.length === 0) {
+        const filterMsg = (predictiveState.clusterFilter || predictiveState.nodeFilter)
+            ? `<div style="font-size:13px;line-height:1.55;max-width:520px;margin:0 auto;">No proposals match the current filter. Clear it to see findings from the rest of the cluster.</div>`
+            : `<div style="font-size:13px;line-height:1.55;max-width:520px;margin:0 auto;">This is the correct state for a healthy cluster — see the <em>How this works</em> note above. Analyzers run every 5 minutes; the inbox will populate here when a resource enters a worth-surfacing state.</div>`;
+        html += `
+            <div style="text-align:center;padding:48px 20px;color:var(--text-muted);">
+                <div style="font-size:48px;margin-bottom:12px;color:#34d399;">✓</div>
+                <div style="font-size:16px;color:var(--text-primary);margin-bottom:6px;">No predictions right now.</div>
+                ${filterMsg}
+            </div>
+        `;
+    } else if (clusters.length > 1 && !predictiveState.clusterFilter && !predictiveState.nodeFilter) {
+        // Multi-cluster, no filter — group by cluster header so the
+        // operator's eye can split prod from staging from homelab
+        // immediately.
+        const groups = {};
+        filtered.forEach(p => {
+            const c = clusterByNode[p.scope?.node_id] || 'WolfStack';
+            (groups[c] = groups[c] || []).push(p);
+        });
+        const orderedClusters = Object.keys(groups).sort();
+        for (const c of orderedClusters) {
+            html += `<div style="margin-top:18px;margin-bottom:8px;font-size:13px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">${escapeHtml(c)} — ${groups[c].length} finding${groups[c].length === 1 ? '' : 's'}</div>`;
+            html += groups[c].map(predictiveCardHtml).join('');
+        }
+    } else {
+        html += filtered.map(predictiveCardHtml).join('');
+    }
+
+    list.innerHTML = html;
+}
+
+function predictiveSetClusterFilter(clusterName) {
+    predictiveState.clusterFilter = clusterName || null;
+    // Clear the node filter when changing clusters — a node id from
+    // the previous cluster wouldn't be a valid match in the new one.
+    predictiveState.nodeFilter = null;
+    predictiveRender();
+}
+
+function predictiveSetNodeFilter(nodeId) {
+    predictiveState.nodeFilter = nodeId || null;
+    predictiveRender();
+}
+
+// Map a proposal's finding_type + scope to a (label, icon, color)
+// tuple identifying *what* (host / Docker / LXC / VM / cert / …) so
+// every card carries an at-a-glance "this is on Server X, in
+// runtime Y" badge. Operators stop having to read the title to know
+// where a problem lives.
+function predictiveRuntimeBadge(p) {
+    const ft = p.finding_type || '';
+    const rid = (p.scope && p.scope.resource_id) || '';
+    if (ft.startsWith('docker_'))         return { label: 'DOCKER',   icon: '🐳', color: '#06b6d4' };
+    if (ft.startsWith('lxc_'))            return { label: 'LXC',      icon: '📦', color: '#a855f7' };
+    if (ft === 'vm_disk_fill')            return { label: 'VM',       icon: '💻', color: '#f59e0b' };
+    if (ft === 'cert_expiry_window')      return { label: 'CERT',     icon: '🔒', color: '#10b981' };
+    if (ft === 'backup_stale')            return { label: 'BACKUP',   icon: '💾', color: '#8b5cf6' };
+    if (ft.startsWith('sshd_'))           return { label: 'SSH',      icon: '🔑', color: '#ef4444' };
+    if (ft === 'service_bound_publicly')  return { label: 'NETWORK',  icon: '🌐', color: '#ef4444' };
+    if (ft === 'systemd_unit_failed')     return { label: 'SERVICE',  icon: '⚙️', color: '#f97316' };
+    if (ft.startsWith('host_'))           return { label: 'HOST',     icon: '🖥️', color: '#64748b' };
+    if (ft === 'disk_fill_eta')           return { label: 'HOST',     icon: '🖥️', color: '#64748b' };
+    // Fallback: surface the resource_id prefix so unknown finding
+    // types still get *some* attribution — better than a blank.
+    if (rid.includes(':')) return { label: rid.split(':')[0].toUpperCase(), icon: '📌', color: '#64748b' };
+    return { label: 'FINDING', icon: '📌', color: '#64748b' };
+}
+
+function predictiveCardHtml(p) {
+    const sev = p.severity || 'info';
+    const colors = { critical: '#ef4444', high: '#f97316', warn: '#fbbf24', info: '#60a5fa' };
+    const labels = { critical: 'CRITICAL', high: 'HIGH', warn: 'WARN', info: 'INFO' };
+    const c = colors[sev] || '#94a3b8';
+    const sourceBadge = p.source === 'ai'
+        ? '<span style="background:rgba(168,85,247,0.18);color:#c084fc;padding:1px 7px;border-radius:4px;font-size:10px;font-weight:600;margin-left:6px;">🤖 AI</span>'
+        : '';
+
+    const runtime = predictiveRuntimeBadge(p);
+
+    const evidence = (p.evidence || []).map(e => `
+        <div style="display:inline-block;background:var(--bg-tertiary,#2d2f3a);padding:4px 10px;border-radius:6px;margin-right:6px;margin-bottom:6px;font-size:12px;">
+            <span style="color:var(--text-muted);">${escapeHtml(e.label)}:</span>
+            <strong style="color:var(--text-primary);margin-left:4px;">${escapeHtml(e.value)}</strong>
+            ${e.detail ? `<span style="color:var(--text-muted);margin-left:8px;font-size:11px;">${escapeHtml(e.detail)}</span>` : ''}
+        </div>
+    `).join('');
+
+    const remediation = predictiveRemediationHtml(p.remediation, p.id);
+
+    let snoozeNotice = '';
+    if (p.status && p.status.kind === 'snoozed') {
+        const until = new Date(p.status.until);
+        const untilStr = isNaN(until.getTime()) ? p.status.until : until.toLocaleString();
+        snoozeNotice = `<div style="background:rgba(96,165,250,0.1);padding:8px 12px;border-radius:6px;font-size:12px;color:#60a5fa;margin-bottom:12px;">⏰ Snoozed until ${escapeHtml(untilStr)} — will re-fire after.</div>`;
+    }
+
+    // Resolve cluster_name + hostname for this proposal's node.
+    // Hostname is the human-friendly answer to "which server?";
+    // cluster groups it; resource_id (e.g. "docker:postgres", "/var/log",
+    // "vm:opnsense:...") finishes the address.
+    const clusterByNode = {};
+    const hostnameByNode = {};
+    (predictiveState.nodes || []).forEach(n => {
+        clusterByNode[n.node_id] = n.cluster_name || 'WolfStack';
+        if (n.hostname) hostnameByNode[n.node_id] = n.hostname;
+    });
+    const cluster = clusterByNode[p.scope.node_id] || '';
+    const host = hostnameByNode[p.scope.node_id] || p.scope.node_id;
+    const resource = p.scope.resource_id || '';
+
+    return `
+        <div style="background:var(--bg-card,#1e2028);border:1px solid var(--border-color,#2d2f3a);border-left:4px solid ${c};border-radius:10px;padding:16px 18px;margin-bottom:12px;">
+            <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:10px;gap:12px;">
+                <div style="flex:1;min-width:0;">
+                    <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:6px;">
+                        <span style="background:${c};color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;letter-spacing:0.5px;">${labels[sev] || sev.toUpperCase()}</span>
+                        <span style="background:${runtime.color};color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;letter-spacing:0.5px;display:inline-flex;align-items:center;gap:4px;">${runtime.icon} ${runtime.label}</span>
+                        ${sourceBadge}
+                    </div>
+                    <div style="font-size:15px;font-weight:600;color:var(--text-primary);margin-bottom:4px;">${escapeHtml(p.title)}</div>
+                    <div style="font-size:12px;color:var(--text-muted);display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                        ${cluster ? `<span style="color:#c084fc;font-weight:500;">${escapeHtml(cluster)}</span><span>·</span>` : ''}
+                        <span title="${escapeAttr(p.scope.node_id)}" style="color:var(--text-secondary);font-weight:500;">🖥️ ${escapeHtml(host)}</span>
+                        ${resource ? `<span>·</span><code style="background:var(--bg-tertiary,#2d2f3a);padding:1px 6px;border-radius:4px;font-size:11px;">${escapeHtml(resource)}</code>` : ''}
+                        <span style="opacity:0.5;margin-left:6px;">${escapeHtml(p.finding_type)}</span>
+                    </div>
+                </div>
+            </div>
+            ${snoozeNotice}
+            <div style="font-size:13px;color:var(--text-secondary);line-height:1.55;margin-bottom:12px;">${escapeHtml(p.why)}</div>
+            ${evidence ? `<div style="margin-bottom:12px;">${evidence}</div>` : ''}
+            ${remediation}
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <button class="btn btn-sm btn-primary" onclick="predictiveApprove('${escapeAttr(p.id)}')">✓ Mark applied</button>
+                <button class="btn btn-sm" onclick="predictiveSnoozeMenu('${escapeAttr(p.id)}', this)">⏰ Snooze</button>
+                <button class="btn btn-sm" onclick="predictiveDismiss('${escapeAttr(p.id)}')">✗ Dismiss</button>
+                <button class="btn btn-sm" onclick="predictiveAck('${escapeAttr(p.finding_type)}', '${escapeAttr(p.scope.node_id)}', '${escapeAttr(p.scope.resource_id || '')}')">🛡 Ack as intentional</button>
+            </div>
+        </div>
+    `;
+}
+
+function predictiveRemediationHtml(r, proposalId) {
+    if (!r) return '';
+    if (r.kind === 'manual') {
+        const cmds = (r.commands || []).map((cmd, idx) => {
+            // Comments and informational lines (lines starting with `#`)
+            // get Copy but no Run — running a comment line is silly.
+            const isComment = cmd.trim().startsWith('#');
+            const runBtn = isComment ? '' :
+                `<button class="btn btn-sm btn-primary" style="font-size:11px;padding:2px 8px;flex-shrink:0;" onclick="predictiveRunCmd('${escapeAttr(proposalId)}', ${idx})">▶ Run</button>`;
+            return `
+                <div style="display:flex;align-items:center;gap:8px;background:var(--bg-tertiary,#2d2f3a);padding:6px 10px;border-radius:6px;margin-bottom:4px;">
+                    <code style="flex:1;font-family:var(--font-mono,monospace);font-size:12px;color:var(--text-primary);overflow-x:auto;white-space:nowrap;">${escapeHtml(cmd)}</code>
+                    ${runBtn}
+                    <button class="btn btn-sm" style="font-size:11px;padding:2px 8px;flex-shrink:0;" onclick="predictiveCopyCmd(this)" data-cmd="${escapeAttr(cmd)}">📋 Copy</button>
+                </div>
+            `;
+        }).join('');
+        return `
+            <div style="background:var(--bg-secondary,#16181f);padding:12px;border-radius:8px;margin-bottom:12px;border:1px solid var(--border-color,#2d2f3a);">
+                <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:0.5px;font-weight:600;">Suggested remediation</div>
+                <div style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:10px;">${escapeHtml(r.instructions)}</div>
+                ${cmds}
+            </div>
+        `;
+    }
+    return `<div style="font-size:12px;color:var(--text-muted);font-style:italic;margin-bottom:12px;">[Remediation kind "${escapeHtml(r.kind)}" — UI pending]</div>`;
+}
+
+/// Open a console connected to the right target (host/docker/lxc/vm)
+/// for the proposal's scope, with the indexed command pre-run via
+/// `console.html`'s proposal_id+cmd_idx fetch path. The console
+/// resolves the target server-side from the proposal store, so the
+/// browser doesn't need to know where the finding lives.
+async function predictiveRunCmd(proposalId, cmdIdx) {
+    try {
+        // Pre-flight the metadata so we can pick the right console
+        // type and surface a useful error if the target's wrong.
+        const r = await fetch(`/api/proposals/${encodeURIComponent(proposalId)}/command/${encodeURIComponent(cmdIdx)}`);
+        if (!r.ok) {
+            const data = await r.json().catch(() => ({}));
+            showToast(`Couldn't open terminal: ${data.error || r.statusText}`, 'error');
+            return;
+        }
+        const meta = await r.json();
+        let url = '/console.html?type=' + encodeURIComponent(meta.console_type)
+            + '&name=' + encodeURIComponent(meta.console_name)
+            + '&proposal_id=' + encodeURIComponent(proposalId)
+            + '&cmd_idx=' + encodeURIComponent(cmdIdx);
+        if (meta.remote_node_id) {
+            url += '&node_id=' + encodeURIComponent(meta.remote_node_id);
+        }
+        window.open(url, 'console_predictive_' + proposalId + '_' + cmdIdx,
+            'width=960,height=600,menubar=no,toolbar=no');
+    } catch (e) {
+        showToast(`Open terminal errored: ${e.message || String(e)}`, 'error');
+    }
+}
+
+function predictiveCopyCmd(btn) {
+    const cmd = btn.dataset.cmd || '';
+    navigator.clipboard.writeText(cmd).then(
+        () => showToast('Command copied', 'success', 1500),
+        () => showToast('Clipboard write failed', 'error'),
+    );
+}
+
+function predictiveSnoozeMenu(id, btn) {
+    const existing = document.getElementById('predictive-snooze-menu');
+    if (existing) existing.remove();
+    const menu = document.createElement('div');
+    menu.id = 'predictive-snooze-menu';
+    menu.style.cssText = 'position:absolute;background:var(--bg-card,#1e2028);border:1px solid var(--border-color,#2d2f3a);border-radius:8px;padding:6px;box-shadow:0 8px 24px rgba(0,0,0,0.5);z-index:1000;min-width:140px;';
+    const opts = [['4 hours', 4], ['24 hours', 24], ['1 week', 168], ['30 days', 720]];
+    menu.innerHTML = opts.map(([label, h]) =>
+        `<button class="btn btn-sm" style="display:block;width:100%;text-align:left;margin-bottom:2px;background:transparent;" onclick="predictiveSnooze('${escapeAttr(id)}', ${h})">${label}</button>`
+    ).join('');
+    document.body.appendChild(menu);
+    const r = btn.getBoundingClientRect();
+    menu.style.top = (r.bottom + window.scrollY + 4) + 'px';
+    menu.style.left = (r.left + window.scrollX) + 'px';
+    setTimeout(() => {
+        const close = (e) => {
+            if (!menu.contains(e.target) && e.target !== btn) {
+                menu.remove();
+                document.removeEventListener('click', close);
+            }
+        };
+        document.addEventListener('click', close);
+    }, 50);
+}
+
+async function predictiveSnooze(id, hours) {
+    document.getElementById('predictive-snooze-menu')?.remove();
+    try {
+        const r = await fetch(`/api/proposals/${encodeURIComponent(id)}/snooze`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ hours }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            showToast(`Snooze failed: ${data.error || r.statusText}`, 'error');
+            return;
+        }
+        showToast(`Snoozed for ${hours} hour${hours === 1 ? '' : 's'}`, 'success', 2000);
+        predictiveLoad();
+    } catch (e) {
+        showToast(`Snooze errored: ${e.message || String(e)}`, 'error');
+    }
+}
+
+async function predictiveDismiss(id) {
+    const reason = await showPrompt(
+        'Why are you dismissing this proposal? The reason is logged for the audit trail and helps the analyzer learn (eg. "false positive — this disk fills weekly and a cron clears it").',
+        'Dismiss proposal',
+        '',
+    );
+    if (reason === null) return;  // cancelled
+    if (!reason.trim()) {
+        showToast('A reason is required so the dismissal is auditable', 'warning', 3500);
+        return;
+    }
+    try {
+        const r = await fetch(`/api/proposals/${encodeURIComponent(id)}/dismiss`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reason: reason.trim() }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            showToast(`Dismiss failed: ${data.error || r.statusText}`, 'error');
+            return;
+        }
+        showToast('Dismissed', 'success', 1800);
+        predictiveLoad();
+    } catch (e) {
+        showToast(`Dismiss errored: ${e.message || String(e)}`, 'error');
+    }
+}
+
+async function predictiveApprove(id) {
+    const ok = await showConfirm(
+        'Mark this proposal as applied? This records that you ran the suggested remediation; it does not execute anything itself.',
+        'Mark applied',
+    );
+    if (!ok) return;
+    try {
+        const r = await fetch(`/api/proposals/${encodeURIComponent(id)}/approve`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            showToast(`Mark applied failed: ${data.error || r.statusText}`, 'error');
+            return;
+        }
+        showToast('Marked applied', 'success', 1800);
+        predictiveLoad();
+    } catch (e) {
+        showToast(`Mark applied errored: ${e.message || String(e)}`, 'error');
+    }
+}
+
+async function predictiveAck(findingType, nodeId, resourceId) {
+    const reason = await showPrompt(
+        `Acknowledge "${findingType}" as intentional for this resource? Future findings of this exact type and scope will be suppressed for 180 days. The reason becomes part of the audit trail.`,
+        'Permanent acknowledgement',
+        '',
+    );
+    if (reason === null) return;
+    if (!reason.trim()) {
+        showToast('A reason is required for an acknowledgement', 'warning', 3500);
+        return;
+    }
+    const scope = resourceId
+        ? { kind: 'resource', node_id: nodeId, resource_id: resourceId }
+        : { kind: 'node', node_id: nodeId };
+    try {
+        const r = await fetch('/api/proposal-acks', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                finding_type: findingType,
+                scope,
+                reason: reason.trim(),
+            }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            showToast(`Ack failed: ${data.error || r.statusText}`, 'error');
+            return;
+        }
+        showToast('Acknowledged for 180 days', 'success', 2200);
+        predictiveLoad();
+    } catch (e) {
+        showToast(`Ack errored: ${e.message || String(e)}`, 'error');
+    }
+}
+
+async function predictiveRunNow() {
+    const btn = document.getElementById('predictive-run-now');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Running…'; }
+    const before = (predictiveState.proposals || []).length;
+    try {
+        const r = await fetch('/api/proposals/run-now', { method: 'POST' });
+        if (!r.ok) {
+            const data = await r.json().catch(() => ({}));
+            showToast(`Run failed: ${data.error || r.statusText}`, 'error');
+            return;
+        }
+        await predictiveLoad();
+        const after = (predictiveState.proposals || []).length;
+        if (after === before && after === 0) {
+            // Differentiate "ran cleanly, found nothing" from "ran and
+            // surfaced new findings" — the first case is what an idle
+            // healthy cluster always looks like, and operators expect
+            // visible feedback that the click did something.
+            showToast('Analyzer ran — no new findings (this is normal)', 'success', 2500);
+        } else if (after > before) {
+            showToast(`Analyzer ran — ${after - before} new finding${after - before === 1 ? '' : 's'}`, 'success', 2500);
+        } else {
+            showToast('Analyzer run complete', 'success', 1500);
+        }
+    } catch (e) {
+        showToast(`Run errored: ${e.message || String(e)}`, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '🔄 Run analyzer now'; }
+    }
+}
+
+function predictiveBadgeUpdate() {
+    const badge = document.getElementById('predictive-badge');
+    if (!badge) return;
+    const count = (predictiveState.proposals || []).filter(p =>
+        p.status && p.status.kind === 'pending'
+    ).length;
+    if (count > 0) {
+        badge.textContent = count > 99 ? '99+' : String(count);
+        badge.style.display = 'inline-block';
+    } else {
+        badge.style.display = 'none';
+    }
+}
+
+// Background poll so the badge updates even when the user isn't on
+// the Inbox page. Keep cadence slow — 60s — so we don't burn the
+// orchestrator's read locks. The orchestrator itself runs the
+// analyzer every 5 min; checking the resulting state every 60 s
+// gives near-real-time badge updates.
+function predictiveStartBadgePoll() {
+    if (predictiveBadgeTimer) return;
+    const tick = async () => {
+        try {
+            // Cluster endpoint — server caches for 30s so this 60s
+            // poll across N operators only costs at most two peer
+            // round-trips per minute regardless of operator count.
+            const r = await fetch('/api/proposals/cluster');
+            if (r.ok) {
+                const body = await r.json();
+                predictiveState.proposals = body.proposals || [];
+                predictiveState.nodes = body.nodes || [];
+                predictiveBadgeUpdate();
+            }
+        } catch (_) { /* network blips are silent — the next tick retries */ }
+    };
+    tick();
+    predictiveBadgeTimer = setInterval(tick, 60000);
+}
+
+window.renderPredictiveInbox = renderPredictiveInbox;
+window.predictiveRunNow = predictiveRunNow;
+window.predictiveSnooze = predictiveSnooze;
+window.predictiveSnoozeMenu = predictiveSnoozeMenu;
+window.predictiveDismiss = predictiveDismiss;
+window.predictiveApprove = predictiveApprove;
+window.predictiveAck = predictiveAck;
+window.predictiveCopyCmd = predictiveCopyCmd;
+window.predictiveStartBadgePoll = predictiveStartBadgePoll;
+window.predictiveSetNodeFilter = predictiveSetNodeFilter;
+window.predictiveSetClusterFilter = predictiveSetClusterFilter;
+window.predictiveRunCmd = predictiveRunCmd;
+
+// ─── Apps & Tools drawer ──────────────────────────────────────────
+//
+// Slide-out launcher containing the secondary nav items that used to
+// crowd the top icon strip. The list lives here (single source of
+// truth) so adding/removing a tile is a one-line edit. Each tile
+// click navigates via the existing `selectView` and auto-closes the
+// drawer.
+
+const APP_DRAWER_TILES = [
+    {
+        id: 'control-panel', icon: '🎛️', name: 'Control Panel',
+        desc: 'Every VM, LXC and Docker across the cluster, one view.',
+    },
+    {
+        id: 'global-wolfnet', icon: '🌐', name: 'Global View',
+        desc: 'World map of every cluster you manage.',
+    },
+    {
+        id: 'topology', icon: '🖥️', name: '3D Server Room',
+        desc: 'Immersive 3D topology of every host.',
+    },
+    {
+        id: 'wolfflow', icon: '⚡', name: 'WolfFlow',
+        desc: 'Build and run automation flows across the cluster.',
+    },
+    {
+        id: 'wolfagents', icon: '🐺', name: 'WolfAgents',
+        desc: 'Named AI agents with persistent memory.',
+    },
+    {
+        id: 'cluster-browser', icon: '🔗', name: 'Cluster Browser',
+        desc: 'Open cluster web apps without a VPN.',
+    },
+    {
+        id: 'databases', icon: '🗄️', name: 'Databases',
+        desc: 'Query any configured SQL connection across the cluster.',
+    },
+    {
+        id: 'appstore', icon: '🛍️', name: 'App Store',
+        desc: 'Browse and install applications onto any host.',
+    },
+];
+
+function appDrawerTileHtml(t) {
+    return `
+        <button class="app-drawer-tile" onclick="appDrawerNav('${escapeAttr(t.id)}')"
+            style="background:var(--bg-secondary,#16181f);border:1px solid var(--border-color,#2d2f3a);border-radius:10px;padding:14px 12px;cursor:pointer;text-align:left;color:var(--text-primary);font-family:inherit;display:flex;flex-direction:column;gap:6px;transition:transform 0.12s ease, border-color 0.12s ease, background 0.12s ease;"
+            onmouseenter="this.style.borderColor='var(--accent,#3b82f6)';this.style.background='var(--bg-tertiary,#2d2f3a)';this.style.transform='translateY(-1px)';"
+            onmouseleave="this.style.borderColor='var(--border-color,#2d2f3a)';this.style.background='var(--bg-secondary,#16181f)';this.style.transform='translateY(0)';">
+            <div style="font-size:28px;line-height:1;">${escapeHtml(t.icon || '🧩')}</div>
+            <div style="font-size:14px;font-weight:600;">${escapeHtml(t.name)}</div>
+            <div style="font-size:11px;color:var(--text-muted);line-height:1.4;">${escapeHtml(t.desc || '')}</div>
+        </button>
+    `;
+}
+
+function renderAppDrawer(pluginTiles) {
+    const grid = document.getElementById('app-drawer-grid');
+    if (!grid) return;
+    let html = `<div style="grid-column:1/-1;font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin:4px 0 -4px 4px;">Built-in views</div>`;
+    html += APP_DRAWER_TILES.map(appDrawerTileHtml).join('');
+    if (pluginTiles && pluginTiles.length > 0) {
+        html += `<div style="grid-column:1/-1;font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin:18px 0 -4px 4px;">Plugins</div>`;
+        html += pluginTiles.map(appDrawerTileHtml).join('');
+    }
+    grid.innerHTML = html;
+}
+
+/// Fetch enabled plugins that expose a top-level menu entry, normalise
+/// to the same `{id, icon, name, desc}` shape the built-in tiles use.
+/// Returns [] silently on any error so a broken plugin endpoint never
+/// breaks the launcher.
+async function loadAppDrawerPluginTiles() {
+    try {
+        const r = await fetch('/api/plugins');
+        if (!r.ok) return [];
+        const all = await r.json();
+        if (!Array.isArray(all)) return [];
+        return all
+            .filter(p => p && p.manifest && p.manifest.enabled !== false)
+            .filter(p => p.manifest.menu && p.manifest.menu.view)
+            .map(p => ({
+                // Plugin pages live under `page-plugin-{view}` per
+                // `addPluginNavItem` — match that convention so the
+                // drawer click navigates to the correct DOM container.
+                id:   `plugin-${p.manifest.menu.view}`,
+                icon: p.manifest.icon || '🧩',
+                name: p.manifest.menu.label || p.manifest.name || p.manifest.id,
+                desc: p.manifest.description || '',
+            }));
+    } catch (_) { return []; }
+}
+
+function openAppDrawer() {
+    console.log('[apps-drawer] openAppDrawer() called');
+    const backdrop = document.getElementById('app-drawer-backdrop');
+    const drawer = document.getElementById('app-drawer');
+    console.log('[apps-drawer] elements:', { backdrop: !!backdrop, drawer: !!drawer });
+    if (!backdrop || !drawer) {
+        console.warn('[apps-drawer] elements missing — index.html out of sync? Hard-refresh.');
+        return;
+    }
+
+    // Defensively re-parent the drawer + backdrop to <body> so any
+    // ancestor with `transform`/`filter`/`will-change` (which breaks
+    // `position: fixed` per the CSS containing-block spec) can't clip
+    // them. This is the most common cause of "the drawer is in the
+    // DOM but invisible" — the .main-content or .sidebar parent
+    // creates a containing block and the fixed-positioned drawer
+    // anchors to that instead of the viewport.
+    if (drawer.parentElement !== document.body) {
+        document.body.appendChild(drawer);
+    }
+    if (backdrop.parentElement !== document.body) {
+        document.body.appendChild(backdrop);
+    }
+
+    // Render built-ins immediately so the drawer feels responsive.
+    renderAppDrawer([]);
+
+    backdrop.style.display = 'block';
+    // Trigger transition on next frame so the opacity/transform
+    // animations actually run instead of jumping.
+    requestAnimationFrame(() => {
+        backdrop.style.opacity = '1';
+        drawer.style.transform = 'translateX(0)';
+    });
+    document.addEventListener('keydown', appDrawerEscHandler);
+
+    // Enrich with plugins (async, fire-and-forget).
+    loadAppDrawerPluginTiles().then(plugins => renderAppDrawer(plugins));
+}
+
+function closeAppDrawer() {
+    const backdrop = document.getElementById('app-drawer-backdrop');
+    const drawer = document.getElementById('app-drawer');
+    if (!backdrop || !drawer) return;
+    backdrop.style.opacity = '0';
+    drawer.style.transform = 'translateX(100%)';
+    document.removeEventListener('keydown', appDrawerEscHandler);
+    setTimeout(() => { backdrop.style.display = 'none'; }, 220);
+}
+
+function appDrawerEscHandler(e) {
+    if (e.key === 'Escape') closeAppDrawer();
+}
+
+function appDrawerNav(pageId) {
+    closeAppDrawer();
+    // Tiny delay so the drawer's slide-out animation starts before
+    // selectView re-renders the underlying view — feels less jarring
+    // than the two transitions racing.
+    setTimeout(() => selectView(pageId), 60);
+}
+
+window.openAppDrawer = openAppDrawer;
+window.closeAppDrawer = closeAppDrawer;
+window.appDrawerNav = appDrawerNav;

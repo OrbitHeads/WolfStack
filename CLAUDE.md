@@ -67,6 +67,21 @@ All frontend code lives in `web/`:
 
 **Serde conventions**: All structs use `#[serde(rename_all = "snake_case")]` for enums. Fields that may be absent from older JSON configs need `#[serde(default)]`. The frontend sends/receives snake_case JSON matching Rust field names.
 
+## Quality Bar — The Anthropic Test
+
+**Every change must meet the bar Anthropic PBC themselves would hold this code to if they were shipping it.** Before declaring any work done, ask: *"If Anthropic engineers had to ship this exact diff under their name, would they?"* If the honest answer is "no" or "not quite", the work is not done.
+
+Concretely, this means:
+- **No half-measures.** All branches implemented, all error paths handled, all edge cases addressed. If three platforms exist (Proxmox/libvirt/native), all three work — not two-and-a-stub.
+- **No guessed values.** Every constant, ID, format, and protocol detail comes from reading the source — never from memory or "this looks right".
+- **No dead code, no TODOs, no "follow-up later".** Finish the work or raise the scope question explicitly *before* writing the partial version.
+- **Re-read the diff before declaring done.** Closure bugs, async-without-await, dead variables, unused branches — catch them yourself, don't ship them for Codex/review to find.
+- **Be honest about what was tested.** Compile-passes ≠ feature-works. Don't claim "production-ready" without exercising the actual code path. Surface known untested paths in the closing summary.
+- **The user-facing surface matters as much as the code.** Visible feedback for user actions, accessible interactions, no silent failures. A correct backend with a broken UX is not shipped quality.
+- **Defaults must be safe.** Public surfaces (status pages, logs, error messages) never leak internals, credentials, AI output, or host data unless explicitly intended.
+
+This rule overrides "ship it fast" instincts. If the bar isn't met, say so plainly and either finish the work or stop and ask.
+
 ## Important Conventions
 
 - All Rust source files start with the copyright header (`// Written by Paul Clevett` / `// (C)Copyright Wolf Software Systems Ltd`)

@@ -138,6 +138,8 @@ impl ClusterState {
         // Load persisted state
         state.load_deleted_ids();
         state.load_nodes();
+        // Auto-remove legacy Proxmox-API entries (writes a one-shot notice for the UI)
+        state.cleanup_proxmox_legacy();
         // Remove ghost nodes (same IP/port but different ID)
         state.cleanup_ghosts();
         // Purge unverified wolfstack nodes (except self)
@@ -339,6 +341,7 @@ impl ClusterState {
     }
 
     /// Add a Proxmox server (always verified — PVE API token is its own auth)
+    #[allow(dead_code)]
     pub fn add_proxmox_server(&self, address: String, port: u16, token: String, fingerprint: Option<String>, node_name: String, pve_cluster_name: Option<String>) -> String {
         // Use pve_cluster_name as the generic cluster_name too
         let id = self.add_server_full(address, port, "proxmox".to_string(), Some(token), fingerprint, Some(node_name), pve_cluster_name.clone(), pve_cluster_name);
@@ -495,6 +498,115 @@ impl ClusterState {
         }
     }
 
+    /// On startup, purge any legacy Proxmox-API entries from nodes.json.
+    /// Backs the file up first so the user can recover if needed, then writes
+    /// a small notice file the UI reads to render the deprecation banner.
+    fn cleanup_proxmox_legacy(&self) {
+        let proxmox_entries: Vec<Node> = {
+            let nodes = self.nodes.read().unwrap();
+            nodes.values().filter(|n| n.node_type == "proxmox").cloned().collect()
+        };
+        if proxmox_entries.is_empty() {
+            return;
+        }
+
+        let nodes_path = Self::nodes_file();
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let backup_path = format!("{}.proxmox-backup-{}", nodes_path, timestamp);
+        if let Err(e) = std::fs::copy(&nodes_path, &backup_path) {
+            warn!("Failed to back up nodes.json before Proxmox cleanup: {}", e);
+            // Don't proceed with deletion if we can't back up.
+            return;
+        }
+
+        {
+            let mut nodes = self.nodes.write().unwrap();
+            let mut deleted = self.deleted_ids.write().unwrap();
+            for n in &proxmox_entries {
+                nodes.remove(&n.id);
+                deleted.insert(n.id.clone());
+            }
+        }
+        self.save_nodes();
+        self.save_deleted_ids();
+
+        let addresses: Vec<String> = proxmox_entries.iter()
+            .map(|n| {
+                let label = n.pve_node_name.clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| n.hostname.clone());
+                if label.is_empty() {
+                    n.address.clone()
+                } else {
+                    format!("{} ({})", label, n.address)
+                }
+            })
+            .collect();
+
+        let notice = ProxmoxCleanupNotice {
+            removed_count: proxmox_entries.len(),
+            addresses,
+            backup_path,
+            timestamp,
+        };
+        if let Err(e) = notice.save() {
+            warn!("Failed to write Proxmox cleanup notice: {}", e);
+        }
+        tracing::info!(
+            "Removed {} legacy Proxmox-API entries from nodes.json (backed up to {})",
+            notice.removed_count, notice.backup_path
+        );
+    }
+}
+
+/// Notice written once on startup when legacy Proxmox-API entries are auto-removed.
+/// The UI reads this to render the deprecation banner; deleting the file dismisses it.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ProxmoxCleanupNotice {
+    pub removed_count: usize,
+    pub addresses: Vec<String>,
+    pub backup_path: String,
+    pub timestamp: u64,
+}
+
+impl ProxmoxCleanupNotice {
+    fn notice_file() -> String {
+        let nodes_path = crate::paths::get().nodes_config.clone();
+        // Sit alongside nodes.json: same directory, dedicated name.
+        let dir = std::path::Path::new(&nodes_path)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "/etc/wolfstack".to_string());
+        format!("{}/proxmox-cleanup.json", dir)
+    }
+
+    pub fn load() -> Option<Self> {
+        let data = std::fs::read_to_string(Self::notice_file()).ok()?;
+        serde_json::from_str(&data).ok()
+    }
+
+    fn save(&self) -> std::io::Result<()> {
+        let path = Self::notice_file();
+        if let Some(dir) = std::path::Path::new(&path).parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        std::fs::write(&path, json)
+    }
+
+    pub fn dismiss() -> std::io::Result<()> {
+        let path = Self::notice_file();
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl ClusterState {
+
     /// Update node settings (hostname, address, port, token, fingerprint, cluster name)
     pub fn update_node_settings(&self, id: &str, hostname: Option<String>, address: Option<String>, port: Option<u16>, pve_token: Option<String>, pve_fingerprint: Option<Option<String>>, cluster_name: Option<String>, login_disabled: Option<bool>, update_script: Option<String>) -> bool {
         let mut nodes = self.nodes.write().unwrap();
@@ -644,109 +756,9 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
         if node.is_self { continue; }
 
         if node.node_type == "proxmox" {
-            // ── Poll Proxmox node via PVE API ──
-            let token = match &node.pve_token {
-                Some(t) if !t.is_empty() => t.clone(),
-                _ => { continue; }
-            };
-            let pve_name = node.pve_node_name.clone().unwrap_or_else(|| node.hostname.clone());
-            let fp = node.pve_fingerprint.as_deref();
-
-            match crate::proxmox::poll_pve_node(&node.address, node.port, &token, fp, &pve_name).await {
-                Ok((status, lxc_count, vm_count, fetched_cluster_name, _guests)) => {
-                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                    let mem_pct = if status.mem_total > 0 {
-                        (status.mem_used as f32 / status.mem_total as f32) * 100.0
-                    } else { 0.0 };
-                    let disk_avail = status.disk_total.saturating_sub(status.disk_used);
-                    let disk_pct = if status.disk_total > 0 {
-                        (status.disk_used as f32 / status.disk_total as f32) * 100.0
-                    } else { 0.0 };
-
-                    let metrics = crate::monitoring::SystemMetrics {
-                        hostname: status.hostname.clone(),
-                        cpu_usage_percent: status.cpu * 100.0,
-                        cpu_count: status.maxcpu as usize,
-                        cpu_model: "Proxmox VE".to_string(),
-                        memory_total_bytes: status.mem_total,
-                        memory_used_bytes: status.mem_used,
-                        memory_percent: mem_pct,
-                        swap_total_bytes: 0,
-                        swap_used_bytes: 0,
-                        disks: vec![crate::monitoring::DiskMetrics {
-                            name: "rootfs".to_string(),
-                            mount_point: "/".to_string(),
-                            fs_type: "".to_string(),
-                            total_bytes: status.disk_total,
-                            used_bytes: status.disk_used,
-                            available_bytes: disk_avail,
-                            usage_percent: disk_pct,
-                        }],
-                        network: vec![],
-                        load_avg: crate::monitoring::LoadAverage { one: 0.0, five: 0.0, fifteen: 0.0 },
-                        processes: 0,
-                        uptime_secs: status.uptime,
-                        os_name: Some("Proxmox VE".to_string()),
-                        os_version: None,
-                        kernel_version: None,
-                        hardware_tier: crate::monitoring::classify_hardware(status.maxcpu as usize, status.mem_total),
-                    };
-
-                    // Prefer user's saved cluster name; only use API-fetched name as initial fallback
-                    let final_cluster_name = node.pve_cluster_name.clone().or(fetched_cluster_name);
-
-                    cluster.update_remote(Node {
-                        id: node.id.clone(),
-                        hostname: status.hostname,
-                        address: node.address.clone(),
-                        port: node.port,
-                        last_seen: now,
-                        metrics: Some(metrics),
-                        components: vec![],
-                        online: true,
-                        is_self: false,
-                        docker_count: 0,
-                        lxc_count,
-                        vm_count,
-                        public_ip: None,
-                        node_type: "proxmox".to_string(),
-                        pve_token: node.pve_token.clone(),
-                        pve_fingerprint: node.pve_fingerprint.clone(),
-                        pve_node_name: node.pve_node_name.clone(),
-                        pve_cluster_name: final_cluster_name.clone(),
-                        cluster_name: final_cluster_name,
-                        join_verified: node.join_verified,
-                        has_docker: true,  // Proxmox always has container/VM support
-                        has_lxc: true,
-                        has_kvm: true,
-                        login_disabled: node.login_disabled,
-                        tls: true, // Proxmox always serves HTTPS
-                        update_script: node.update_script.clone(),
-                        // Proxmox nodes don't expose a WolfStack-style self_id;
-                        // their canonical identifier is the locally-assigned
-                        // cluster key, which is what gets used everywhere.
-                        self_id: None,
-                    });
-
-                    // Reset fail count on success
-                    POLL_FAIL_COUNTS.lock().unwrap().remove(&node.id);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to poll PVE node {} (pve_name={}, addr={}): {}", node.id, pve_name, node.address, e);
-                    // Increment fail count; keep node online until 2 consecutive failures
-                    let mut fails = POLL_FAIL_COUNTS.lock().unwrap();
-                    let count = fails.entry(node.id.clone()).or_insert(0);
-                    *count += 1;
-                    if *count < 2 {
-                        // First failure — refresh last_seen to keep node online
-                        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                        let mut nodes = cluster.nodes.write().unwrap();
-                        if let Some(n) = nodes.get_mut(&node.id) {
-                            n.last_seen = now;
-                        }
-                    }
-                }
-            }
+            // Deprecated: the standalone Proxmox API integration is no longer supported.
+            // These entries are surfaced through the deprecation banner so the user can
+            // remove them and re-add the hosts as full WolfStack nodes. Do not poll.
             continue;
         }
 
