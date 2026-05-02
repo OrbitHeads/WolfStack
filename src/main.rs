@@ -28,6 +28,7 @@ mod proxmox;
 mod mysql_editor;
 mod appstore;
 mod alerting;
+mod predictive;
 mod wolfrun;
 mod statuspage;
 mod ceph;
@@ -60,6 +61,7 @@ mod plugins;
 mod sql_connections;
 mod netguard;
 mod certbot;
+mod threat_intel;
 #[allow(dead_code)]
 mod integrations;
 
@@ -101,11 +103,56 @@ struct Cli {
     /// Print this server's join token and exit
     #[arg(long)]
     show_token: bool,
+
+    /// Run in agent-only mode — exposes the cluster API for a master node to
+    /// proxy through, but does NOT serve the management SPA. Use this on
+    /// every node except the one you want to log into. Persisted via the
+    /// systemd ExecStart line written by setup.sh --agent.
+    #[arg(long)]
+    agent: bool,
 }
 
 /// Serve the login page for unauthenticated requests to /
 /// Version string used as cache-buster for static assets.
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Agent-mode root handler — returned for any path the SPA would normally
+/// serve. The node is functional (cluster API still bound) but this user
+/// hit the wrong door: they should manage it from the cluster's master
+/// node UI, not by hitting this node directly.
+async fn agent_index_handler() -> HttpResponse {
+    let html = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WolfStack Agent Node</title>
+<style>
+body { font-family: system-ui, -apple-system, sans-serif; max-width: 640px; margin: 8vh auto; padding: 0 24px; color: #1a1a1a; line-height: 1.55; }
+h1 { color: #dc2626; margin-bottom: 4px; }
+.muted { color: #666; font-size: 14px; }
+.box { background: #f5f5f5; border-left: 3px solid #dc2626; padding: 16px 20px; border-radius: 4px; margin: 24px 0; }
+code { background: #ececec; padding: 2px 6px; border-radius: 3px; font-size: 13px; }
+ol { padding-left: 22px; }
+ol li { margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<h1>WolfStack Agent Node</h1>
+<p class="muted">This server is running in agent-only mode &mdash; the cluster API is up but the management UI is intentionally not served from this node.</p>
+<div class="box">
+<strong>Manage this node from your master server&rsquo;s UI.</strong> Log into the management node you set up first, then add this server via <em>Add Node</em> using its hostname or IP and the join token below.
+</div>
+<ol>
+<li>Find this node&rsquo;s join token: <code>sudo cat /etc/wolfstack/join-token</code></li>
+<li>Open the management UI on your master server (port 8553).</li>
+<li>Cluster &rarr; Add Node &rarr; paste the token, hostname, and IP.</li>
+</ol>
+<p class="muted"><strong>If you rotated the cluster secret</strong> on the master (Settings &rarr; Security), copy <code>/etc/wolfstack/custom-cluster-secret</code> from the master to this node before the first connection &mdash; otherwise inter-node calls will fail X-WolfStack-Secret authentication.</p>
+<p class="muted">To convert this node into a full management server, edit the systemd unit at <code>/etc/systemd/system/wolfstack.service</code>, remove the <code>--agent</code> flag from <code>ExecStart=</code>, then run <code>sudo systemctl daemon-reload &amp;&amp; sudo systemctl restart wolfstack</code>.</p>
+</body>
+</html>"#;
+    HttpResponse::Ok().content_type("text/html").body(html)
+}
 
 async fn index_handler(req: HttpRequest, state: web::Data<api::AppState>) -> HttpResponse {
     // Check if authenticated
@@ -341,9 +388,26 @@ async fn main() -> std::io::Result<()> {
         // Initialize Status Page monitoring state
         let statuspage_state = Arc::new(statuspage::StatusPageState::new());
 
+        // Predictive ops — load proposals/acks/history from disk so a
+        // restart doesn't blind the analyzer for 24 hours. Acks get
+        // an immediate prune of any expired entries to keep the file
+        // bounded over years of operator use.
+        let predictive_proposals = Arc::new(std::sync::RwLock::new(
+            predictive::ProposalStore::load(),
+        ));
+        let predictive_acks = Arc::new(std::sync::RwLock::new({
+            let mut a = predictive::AckStore::load();
+            a.prune_expired();
+            a
+        }));
+        let predictive_metrics = Arc::new(std::sync::RwLock::new(
+            predictive::MetricsHistory::load(),
+        ));
+
         // Create app state
+        let monitor_arc = Arc::new(Mutex::new(mon));
         let app_state = web::Data::new(api::AppState {
-            monitor: Mutex::new(mon),
+            monitor: monitor_arc.clone(),
             metrics_history: Mutex::new(monitoring::MetricsHistory::new()),
             cluster: cluster.clone(),
             sessions: sessions.clone(),
@@ -367,7 +431,28 @@ async fn main() -> std::io::Result<()> {
             image_watcher_cache: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             integrations: Arc::new(crate::integrations::IntegrationState::new(&cluster_secret)),
             router: Arc::new(crate::networking::router::RouterState::new()),
+            predictive_proposals: predictive_proposals.clone(),
+            predictive_acks: predictive_acks.clone(),
+            predictive_metrics: predictive_metrics.clone(),
+            predictive_cluster_cache: Arc::new(std::sync::Mutex::new(None)),
+            node_id: node_id.clone(),
         });
+
+        // Predictive ops orchestrator — 5-min loop that samples
+        // disks, records into history, runs analyzers, and upserts
+        // proposals into the inbox. Ack/snooze/dismiss are honoured
+        // before any proposal is materialised. Threshold + first-
+        // appearance notification dispatch landed in convergence
+        // A+B — orchestrator now reads SystemMetrics off the shared
+        // monitor and fires alerting channels on Critical/High.
+        {
+            let p = predictive_proposals.clone();
+            let a = predictive_acks.clone();
+            let m = predictive_metrics.clone();
+            let mon = monitor_arc.clone();
+            let n = node_id.clone();
+            tokio::spawn(predictive::orchestrator::run_loop(p, a, m, mon, n));
+        }
 
         // Start the WolfRouter safe-mode watcher — auto-reverts firewall
         // changes if the user doesn't confirm within the safe-mode window.
@@ -470,10 +555,26 @@ async fn main() -> std::io::Result<()> {
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 tokio::task::spawn_blocking(move || {
+                    // Restore threat-intel ipsets BEFORE the router applies its
+                    // ruleset. Without this, a host reboot would leave the
+                    // ipsets empty/missing and `iptables-restore --test` would
+                    // reject the rule that references them, leaving the user
+                    // un-protected until they re-enable from the UI.
+                    crate::threat_intel::startup();
                     crate::networking::router::apply_on_startup(router_state, &nid);
                 }).await.ok();
             });
         }
+
+        // Background dnsmasq watchdog. Re-applies any LAN whose dnsmasq
+        // crashed / was killed / never bound :53 to router_ip. Per-LAN
+        // circuit breaker stops loops on permanently broken configs.
+        // First tick is ~90s after spawn so the startup apply above has
+        // settled.
+        crate::networking::router::spawn_dnsmasq_watchdog(
+            app_state.router.clone(),
+            node_id.clone(),
+        );
 
         // WolfAgents: one-shot migration for pre-v18.6.1 agents that
         // were created with an empty allowed_tools list. Runs before
@@ -509,6 +610,18 @@ async fn main() -> std::io::Result<()> {
                 tokio::task::spawn_blocking(danger::tick).await.ok();
             }
         });
+
+        // Threat-intel scheduler: every minute, refresh feeds when the
+        // configured interval has elapsed. No-op when disabled (~1µs config
+        // file read). Lives separate from the WolfRouter apply path —
+        // refresh_all updates the cache + ipset, build_ruleset's hook
+        // picks the result up on the next firewall apply.
+        {
+            let cluster_for_ti = cluster.clone();
+            tokio::spawn(async move {
+                threat_intel::scheduler_loop(cluster_for_ti).await;
+            });
+        }
 
         // Daily certbot renewal. Runs certbot's own `renew --quiet`
         // which is a no-op for any cert with >30 days left, so it's
@@ -1099,28 +1212,8 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                                     if n.has_kvm { format!("{}", n.vm_count) } else { "—".to_string() },
                                 ));
                             }
-                            // PVE nodes as separate rows
-                            for n in all_nodes.iter().filter(|n| n.node_type == "proxmox") {
-                                let status_class = if n.online { "online" } else { "offline" };
-                                let status_text = if n.online { "Online" } else { "Offline" };
-                                let (cpu_str, mem_str) = if let Some(ref m) = n.metrics {
-                                    let cpu = m.cpu_usage_percent;
-                                    let mem_pct = if m.memory_total_bytes > 0 { (m.memory_used_bytes as f64 / m.memory_total_bytes as f64 * 100.0) as u64 } else { 0 };
-                                    let cpu_color = if cpu > 80.0 { "#dc2626" } else if cpu > 50.0 { "#d97706" } else { "#16a34a" };
-                                    let mem_color = if mem_pct > 90 { "#dc2626" } else if mem_pct > 70 { "#d97706" } else { "#16a34a" };
-                                    (
-                                        format!(r#"<div class="bar"><div class="bar-fill" style="width:{}%;background:{}"></div></div><span class="meta">{:.0}%</span>"#, cpu.min(100.0), cpu_color, cpu),
-                                        format!(r#"<div class="bar"><div class="bar-fill" style="width:{}%;background:{}"></div></div><span class="meta">{} / {}</span>"#, mem_pct.min(100), mem_color, fmt_bytes(m.memory_used_bytes), fmt_bytes(m.memory_total_bytes)),
-                                    )
-                                } else {
-                                    ("—".to_string(), "—".to_string())
-                                };
-                                let pve_name = if n.hostname.is_empty() { &n.address } else { &n.hostname };
-                                html.push_str(&format!(
-                                    r#"<tr><td><strong>{}</strong> <span class="badge info">PVE</span><br><span class="meta">{} &bull; port {}</span></td><td><span class="badge {}">{}</span></td><td>{}</td><td>{}</td><td>—</td><td>{}</td><td>{}</td></tr>"#,
-                                    pve_name, n.address, n.port, status_class, status_text, cpu_str, mem_str, n.lxc_count, n.vm_count,
-                                ));
-                            }
+                            // (Legacy Proxmox-API entries are no longer rendered — they're surfaced
+                            // through the deprecation banner so the user can remove them.)
                             html.push_str("</tbody></table>");
 
                             // ─── Docker Containers Table ───
@@ -1312,43 +1405,6 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                                 }
                             }
 
-                            // ─── Proxmox VE Guests Table ───
-                            {
-                                let mut pve_guests: Vec<(String, crate::proxmox::PveGuest)> = Vec::new();
-                                for node in all_nodes.iter().filter(|n| n.node_type == "proxmox" && n.online) {
-                                    if let (Some(token), Some(pve_name)) = (&node.pve_token, &node.pve_node_name) {
-                                        let fp = node.pve_fingerprint.as_deref();
-                                        if let Ok((_status, _lc, _vc, _cn, guests)) = crate::proxmox::poll_pve_node(&node.address, node.port, token, fp, pve_name).await {
-                                            let label = node.pve_cluster_name.as_deref().unwrap_or(&node.hostname);
-                                            for g in guests {
-                                                pve_guests.push((label.to_string(), g));
-                                            }
-                                        }
-                                    }
-                                }
-                                if !pve_guests.is_empty() {
-                                    html.push_str(r#"<h2>Proxmox VE Guests</h2>
-                                    <table><thead><tr><th>Guest</th><th>PVE Node</th><th>Type</th><th>State</th><th>CPUs</th><th>Memory</th><th>Disk</th><th>Uptime</th></tr></thead><tbody>"#);
-                                    for (label, g) in &pve_guests {
-                                        let state_class = match g.status.as_str() { "running" => "running", "paused" => "paused", _ => "stopped" };
-                                        let type_label = if g.guest_type == "qemu" { "VM" } else { "CT" };
-                                        let uptime_str = if g.uptime == 0 { "—".to_string() } else {
-                                            let d = g.uptime / 86400; let h = (g.uptime % 86400) / 3600;
-                                            if d > 0 { format!("{}d {}h", d, h) } else { format!("{}h", h) }
-                                        };
-                                        let mem_pct = if g.maxmem > 0 { (g.mem as f64 / g.maxmem as f64 * 100.0) as u64 } else { 0 };
-                                        let disk_pct = if g.maxdisk > 0 { (g.disk as f64 / g.maxdisk as f64 * 100.0) as u64 } else { 0 };
-                                        html.push_str(&format!(
-                                            r#"<tr><td><strong>{}</strong><br><span class="meta">ID {}</span></td><td class="meta">{}</td><td><span class="badge info">{}</span></td><td><span class="badge {}">{}</span></td><td>{}</td><td>{} / {}<br><span class="meta">{}%</span></td><td>{} / {}<br><span class="meta">{}%</span></td><td>{}</td></tr>"#,
-                                            g.name, g.vmid, label, type_label, state_class, g.status, g.cpus,
-                                            fmt_bytes(g.mem), fmt_bytes(g.maxmem), mem_pct,
-                                            fmt_bytes(g.disk), fmt_bytes(g.maxdisk), disk_pct,
-                                            uptime_str,
-                                        ));
-                                    }
-                                    html.push_str("</tbody></table>");
-                                }
-                            }
 
                             // ─── Issues Table ───
                             if all_issues.is_empty() {
@@ -1447,34 +1503,9 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                              disk_used, disk_total, docker_count, lxc_count, vm_count, m.uptime_secs)
                         }).await.unwrap();
 
-                    // Collect per-guest CPU stats from Proxmox nodes in the cluster
-                    let pve_nodes: Vec<_> = ai_state.cluster.get_all_nodes().into_iter()
-                        .filter(|n| n.node_type == "proxmox" && n.online && n.pve_token.is_some())
-                        .collect();
-
-                    let mut guest_stats_owned: Vec<(String, String, u64, String, f32)> = Vec::new();
-                    for pve_node in &pve_nodes {
-                        let token = pve_node.pve_token.as_deref().unwrap_or("");
-                        let pve_name = pve_node.pve_node_name.as_deref().unwrap_or(&pve_node.hostname);
-                        let fp = pve_node.pve_fingerprint.as_deref();
-                        if let Ok((_status, _lxc, _vm, _cluster, guests)) =
-                            crate::proxmox::poll_pve_node(&pve_node.address, pve_node.port, token, fp, pve_name).await
-                        {
-                            for g in guests.iter().filter(|g| g.status == "running") {
-                                guest_stats_owned.push((
-                                    pve_name.to_string(),
-                                    g.guest_type.clone(),
-                                    g.vmid,
-                                    g.name.clone(),
-                                    g.cpu,
-                                ));
-                            }
-                        }
-                    }
-
-                    let guest_stats_refs: Vec<(&str, &str, u64, &str, f32)> = guest_stats_owned.iter()
-                        .map(|(node, gtype, vmid, name, cpu)| (node.as_str(), gtype.as_str(), *vmid, name.as_str(), *cpu))
-                        .collect();
+                    // Legacy Proxmox-API guests no longer feed AI metrics — those entries are
+                    // surfaced via the deprecation banner and not polled.
+                    let guest_stats_refs: Vec<(&str, &str, u64, &str, f32)> = Vec::new();
 
                     // Gather Kubernetes cluster health (blocking kubectl calls)
                     let k8s_health = tokio::task::spawn_blocking(|| {
@@ -1563,8 +1594,32 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
 
                             let display_name = if node.hostname.is_empty() { &node.address } else { &node.hostname };
 
-                            // Check thresholds
-                            let triggered = alerting::check_thresholds(&config, cpu_pct, mem_pct, disk_pct);
+                            // Check thresholds.
+                            //
+                            // Convergence B (the predictive ops pipeline) now owns
+                            // first-appearance threshold dispatch via
+                            // `predictive::notify::find_first_appearance_alerts` +
+                            // `dispatch_alerts`, fired from each tick of
+                            // `predictive::orchestrator`. That layer:
+                            //   • Has a unified Severity tier with snooze/dismiss/ack
+                            //     semantics instead of the old cooldown HashMap
+                            //   • Auto-resolves on `ConditionCleared` so the recovery
+                            //     branch below isn't needed for thresholds it covers
+                            //   • Surfaces in the Predictive Inbox alongside trend-based
+                            //     findings (disk-fill ETA, container restart-loops, etc.)
+                            //
+                            // We keep this `triggered` binding *only* so the recovery-
+                            // notification branch downstream still executes on legacy
+                            // signals — it's harmless when `triggered` is empty. The
+                            // primary alert-fire loop below sees zero entries and
+                            // becomes a no-op.
+                            //
+                            // Per-node remote-peer dispatch: each cluster node runs its
+                            // own predictive orchestrator; remote peers' findings are
+                            // surfaced via `/api/proposals/cluster` aggregation in the
+                            // Inbox UI.
+                            let _ = (cpu_pct, mem_pct, disk_pct, &config);  // signal: kept for the recovery branch
+                            let triggered: Vec<alerting::ThresholdAlert> = Vec::new();
 
                             for alert in &triggered {
                                 if !alerting::is_in_cooldown(&cooldowns, &node.id, &alert.alert_type) {
@@ -1739,8 +1794,22 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
                         let docker_stats = tokio::task::spawn_blocking(|| containers::docker_stats()).await.unwrap_or_default();
                         let lxc_stats = tokio::task::spawn_blocking(|| containers::lxc_stats()).await.unwrap_or_default();
 
-                        let docker_alerts = alerting::check_container_thresholds(&config, &docker_stats, "docker");
-                        let lxc_alerts = alerting::check_container_thresholds(&config, &lxc_stats, "lxc");
+                        // Container memory threshold dispatch — RETIRED.
+                        //
+                        // Predictive item 5 (`predictive::container_memory`) is the
+                        // canonical source for per-container memory findings. It uses
+                        // the same `containers::*_stats_cached()` data this loop did,
+                        // but routes through the unified Inbox with snooze/dismiss/ack
+                        // semantics instead of the legacy cooldown HashMap. The
+                        // first-appearance dispatch in `predictive::notify` fires the
+                        // Discord/Slack/Telegram/email channels with stable severity
+                        // and per-finding dedup.
+                        //
+                        // Keep these `_stats` bindings — they're consumed by the
+                        // top-N renderer below, which is unrelated to thresholds.
+                        let _ = (&docker_stats, &lxc_stats, &config);
+                        let docker_alerts: Vec<alerting::ContainerAlert> = Vec::new();
+                        let lxc_alerts: Vec<alerting::ContainerAlert> = Vec::new();
 
                         let all_container_alerts: Vec<_> = docker_alerts.into_iter().chain(lxc_alerts.into_iter()).collect();
 
@@ -2025,7 +2094,13 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
 
         // Determine web directory
         let web_dir = find_web_dir();
-        info!("  Serving web UI from: {}", web_dir);
+        let agent_mode = cli.agent;
+        if agent_mode {
+            info!("  ⚙ Agent-only mode — management SPA disabled, cluster API only");
+            info!("    Manage this node from the master server's UI (Add Node).");
+        } else {
+            info!("  Serving web UI from: {}", web_dir);
+        }
         info!("");
 
         // Resolve TLS certificate paths
@@ -2080,13 +2155,18 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
             // Start HTTPS server on main port + HTTP server on port+1 for inter-node
             let https_bind = format!("{}:{}", cli.bind, api_port);
             let https_server = HttpServer::new(move || {
-                App::new()
+                let app = App::new()
                     .app_data(app_state.clone())
                     .app_data(actix_multipart::form::MultipartFormConfig::default().total_limit(2 * 1024 * 1024 * 1024))
                     .app_data(actix_web::web::PayloadConfig::new(2 * 1024 * 1024 * 1024))
-                    .configure(api::configure)
-                    .route("/", web::get().to(index_handler))
-                    .service(actix_files::Files::new("/", &web_dir).index_file("login.html"))
+                    .configure(api::configure);
+                if agent_mode {
+                    app.default_service(web::to(agent_index_handler))
+                } else {
+                    app
+                        .route("/", web::get().to(index_handler))
+                        .service(actix_files::Files::new("/", &web_dir).index_file("login.html"))
+                }
             })
             // Tighten the lifecycle so peers churning connections (cluster
             // polling, wolfrun/statuspage broadcasts from older peers)
@@ -2106,13 +2186,18 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
 
             let http_bind = format!("{}:{}", cli.bind, inter_node_port);
             let http_server = HttpServer::new(move || {
-                App::new()
+                let app = App::new()
                     .app_data(app_state2.clone())
                     .app_data(actix_multipart::form::MultipartFormConfig::default().total_limit(2 * 1024 * 1024 * 1024))
                     .app_data(actix_web::web::PayloadConfig::new(2 * 1024 * 1024 * 1024))
-                    .configure(api::configure)
-                    .route("/", web::get().to(index_handler))
-                    .service(actix_files::Files::new("/", &web_dir2).index_file("login.html"))
+                    .configure(api::configure);
+                if agent_mode {
+                    app.default_service(web::to(agent_index_handler))
+                } else {
+                    app
+                        .route("/", web::get().to(index_handler))
+                        .service(actix_files::Files::new("/", &web_dir2).index_file("login.html"))
+                }
             })
             .keep_alive(std::time::Duration::from_secs(2))
             .client_request_timeout(std::time::Duration::from_secs(3))
@@ -2166,13 +2251,18 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
 
             // Start HTTP server (same as before — no breaking changes)
             let main_server = HttpServer::new(move || {
-                App::new()
+                let app = App::new()
                     .app_data(app_state.clone())
                     .app_data(actix_multipart::form::MultipartFormConfig::default().total_limit(2 * 1024 * 1024 * 1024))
                     .app_data(actix_web::web::PayloadConfig::new(2 * 1024 * 1024 * 1024))
-                    .configure(api::configure)
-                    .route("/", web::get().to(index_handler))
-                    .service(actix_files::Files::new("/", &web_dir).index_file("login.html"))
+                    .configure(api::configure);
+                if agent_mode {
+                    app.default_service(web::to(agent_index_handler))
+                } else {
+                    app
+                        .route("/", web::get().to(index_handler))
+                        .service(actix_files::Files::new("/", &web_dir).index_file("login.html"))
+                }
             })
             // See matching block above on the TLS path for why these
             // lifecycle knobs matter. Keep-alive / disconnect tuning

@@ -192,14 +192,92 @@
     // block the page — wrLoadAll handles its own errors and the
     // per-endpoint fetch-report already exists).
     async function wrRunPreflight() {
+        // Fetch local + cluster preflight in parallel. The cluster
+        // variant fans out to every node — that's the user's "check
+        // every node in the cluster that WolfRouter is on" ask. If
+        // any peer reports errors/warnings, we lift them into the
+        // local checks list with a `[<node_id>] ` prefix on the name
+        // so the existing renderer surfaces them — no new UI needed
+        // for the cluster fan-out.
+        const [localRes, clusterRes] = await Promise.allSettled([
+            fetch(wrUrl('/api/router/preflight')),
+            fetch(wrUrl('/api/router/preflight-cluster')),
+        ]);
+        let local = null;
         try {
-            const r = await fetch(wrUrl('/api/router/preflight'));
-            if (!r.ok) return null;
-            return await r.json();
-        } catch (e) {
-            console.error('wolfrouter preflight failed', e);
+            if (localRes.status === 'fulfilled' && localRes.value.ok) {
+                local = await localRes.value.json();
+            }
+        } catch (e) {}
+        if (!local) {
+            // Local fetch failed entirely — fall through; caller treats
+            // null as "skip preflight gating".
             return null;
         }
+        local.actions = local.actions || {};
+        local.checks  = local.checks || [];
+        try {
+            if (clusterRes.status === 'fulfilled' && clusterRes.value.ok) {
+                const data = await clusterRes.value.json();
+                const peers = (data && Array.isArray(data.nodes)) ? data.nodes : [];
+                for (const peer of peers) {
+                    if (peer.is_self) continue; // already in `local`
+                    if (peer.error) {
+                        local.checks.push({
+                            id: 'peer_' + (peer.node_id || 'unknown'),
+                            name: 'Peer ' + (peer.node_id || 'unknown'),
+                            ok: false,
+                            severity: 'warning',
+                            message: 'Could not fetch this node\'s preflight: ' + (peer.error || 'unknown error') + '. The node may be offline or its API unreachable. Configs on this node have NOT been validated this run.',
+                        });
+                        continue;
+                    }
+                    const pf = peer.preflight || {};
+                    const pchecks = pf.checks || [];
+                    const pactions = pf.actions || {};
+                    for (const c of pchecks) {
+                        if (c.ok) continue; // skip ok rows from peers
+                        const tag = '[' + (peer.node_id || '') + (peer.cluster_name ? ' / ' + peer.cluster_name : '') + ']';
+                        const newId = 'peer_' + peer.node_id + '_' + c.id;
+                        local.checks.push({
+                            id: newId,
+                            name: tag + ' ' + c.name,
+                            ok: c.ok,
+                            severity: c.severity,
+                            message: c.message,
+                            fix: c.fix,
+                        });
+                        // Re-key the action under the new id so the UI
+                        // wires up its Fix button to the same handler.
+                        // Note: action URL still points at the local
+                        // node's API surface — the fix endpoints proxy
+                        // cross-node where it matters (set-interface,
+                        // wan/{id}/reapply, tick-pppoe-default-route).
+                        // A few (enable-ip-forward,
+                        // purge-self-loop-routes, dhclient) DON'T
+                        // proxy and would land on the wrong host —
+                        // strip those so we don't fix the wrong box.
+                        const a = pactions[c.id];
+                        const isLocalOnlyHostFix = a && (
+                            a.url === '/api/router/fix/enable-ip-forward' ||
+                            a.url === '/api/router/fix/purge-self-loop-routes' ||
+                            a.url === '/api/router/fix/dhclient'
+                        );
+                        if (a && !isLocalOnlyHostFix) {
+                            local.actions[newId] = a;
+                        }
+                    }
+                }
+                // Recompute aggregate status if peer rows pushed it.
+                const hasError = local.checks.some(c => !c.ok && c.severity === 'error');
+                const hasWarn  = local.checks.some(c => !c.ok && c.severity === 'warning');
+                local.status = hasError ? 'error' : (hasWarn ? 'warning' : 'ok');
+                local.ok = !hasError;
+            }
+        } catch (e) {
+            console.warn('cluster preflight fan-out failed', e);
+        }
+        return local;
     }
 
     // Diagnostic panel shown in the canvas when one or more preflight
@@ -218,6 +296,7 @@
             title: 'WolfRouter preflight found blocking issues',
             subtitle: `Cluster: <code>${escHtml(clusterName || '')}</code>. Items marked 🛑 must be fixed before the rack view can render reliably; the diagram above shows whatever topology data is currently reachable.`,
             checks: pf.checks || [],
+            checkActions: pf.actions || {},
             actions: `
                 <button onclick="(async () => { wrClearDiagnosticsPanel(); const pf = await (window.wrRunPreflight ? window.wrRunPreflight() : null); await wrLoadAll(); if (pf && pf.status === 'error') { wrRenderPreflight(pf, '${safeName}'); } else if (pf && pf.status === 'warning') { wrRenderPreflightBanner(pf); } })()" class="btn btn-primary btn-sm">🔄 Re-run preflight</button>
             `,
@@ -229,6 +308,46 @@
         window.wrClearDiagnosticsPanel = wrClearDiagnosticsPanel;
     }
 
+    /// One-click Fix button handler shared by every preflight row + the
+    /// LAN Health tab. Confirms (when the action requested it),
+    /// POSTs to the action URL, surfaces success/error, then triggers a
+    /// re-render so the panel reflects the new state.
+    async function wrRunPreflightFix(action) {
+        try {
+            if (action.confirm && !confirm(action.confirm)) return;
+            const r = await fetch(wrUrl(action.url), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(action.body || {}),
+            });
+            let payload = null;
+            try { payload = await r.json(); } catch (e) {}
+            if (!r.ok || (payload && payload.success === false)) {
+                const msg = (payload && (payload.error || payload.message)) || ('HTTP ' + r.status);
+                alert('Fix failed: ' + msg);
+                return;
+            }
+            const ok = (payload && payload.message) || 'Done.';
+            alert('✅ ' + ok);
+            // Re-run whichever panel is currently open: preflight,
+            // health, or both. Cheap on a small cluster; the user gets
+            // immediate feedback that the issue cleared.
+            try {
+                const pf = await wrRunPreflight();
+                wrClearDiagnosticsPanel();
+                if (pf && pf.status === 'error') {
+                    wrRenderPreflight(pf, wrState.cluster || '');
+                } else if (pf && pf.status === 'warning') {
+                    wrRenderPreflightBanner(pf);
+                }
+            } catch (e) {}
+            try { if (typeof wrRenderLanHealth === 'function') await wrRenderLanHealth(); } catch (e) {}
+        } catch (e) {
+            alert('Fix failed: ' + String(e));
+        }
+    }
+    window.wrRunPreflightFix = wrRunPreflightFix;
+
     // Shared renderer for the below-rack diagnostics panel. Accepts a
     // severity ('error' | 'warning' | 'info'), a title/subtitle header,
     // a list of preflight `checks`, optional raw `failures` (fetch-fail
@@ -236,20 +355,35 @@
     // trailing actions row. Multiple calls in one render pass are
     // additive — later blocks append so the user sees preflight + fetch
     // diagnostics together without one wiping the other out.
-    function wrShowDiagnosticsPanel({ severity, title, subtitle, checks, failures, actions, replace }) {
+    function wrShowDiagnosticsPanel({ severity, title, subtitle, checks, failures, actions, replace, checkActions }) {
         const panel = document.getElementById('wr-diagnostics-panel');
         const content = document.getElementById('wr-diagnostics-content');
         if (!panel || !content) return;
         const accent = severity === 'error' ? '#ef4444' : severity === 'warning' ? '#eab308' : '#60a5fa';
+        // Per-row Fix actions, keyed by check id, supplied by the
+        // backend preflight response. Each entry has {label, url,
+        // detail, confirm, body?}. Renders a clickable button under the
+        // row's message when present, so the operator doesn't have to
+        // copy-paste shell commands.
+        const actionMap = checkActions || {};
         const checkRows = (checks || []).map(c => {
             const icon  = c.ok ? '✅' : (c.severity === 'error' ? '🛑' : c.severity === 'warning' ? '⚠️' : 'ℹ️');
             const color = c.ok ? '#10b981' : (c.severity === 'error' ? '#ef4444' : '#eab308');
+            const action = (!c.ok && actionMap[c.id]) ? actionMap[c.id] : null;
+            const actionBtn = action ? `
+                <div style="margin-top:8px;">
+                    <button class="btn btn-primary btn-sm" title="${escHtml(action.detail || '')}"
+                            onclick='wrRunPreflightFix(${JSON.stringify(action).replace(/'/g, "&#39;")})'>
+                        🔧 ${escHtml(action.label)}
+                    </button>
+                </div>` : '';
             return `
                 <tr>
                     <td style="padding:10px 12px; border-bottom:1px solid var(--border); vertical-align:top; width:220px;">${icon} <strong style="color:${color};">${escHtml(c.name)}</strong></td>
                     <td style="padding:10px 12px; border-bottom:1px solid var(--border); vertical-align:top;">
                         <div>${escHtml(c.message || '')}</div>
                         ${c.fix ? `<pre style="margin:8px 0 0 0; padding:8px 10px; background:var(--bg-primary); border:1px solid var(--border); border-radius:4px; font-size:11px; white-space:pre-wrap;">${escHtml(c.fix)}</pre>` : ''}
+                        ${actionBtn}
                     </td>
                 </tr>`;
         }).join('');
@@ -305,6 +439,7 @@
             title: 'Preflight warnings',
             subtitle: 'The rack view loaded, but these checks flagged issues that may affect reliability.',
             checks: warnings,
+            checkActions: pf.actions || {},
         });
     }
 
@@ -480,6 +615,13 @@
                 if (wrState.activeTab === 'connections' && wrState.view === 'table') {
                     wrRenderConnections();
                 }
+                if (wrState.activeTab === 'health' && wrState.view === 'table') {
+                    // Health endpoint fans out to every node — heavier
+                    // than a topology poll, so don't spam at 3s. Tick at
+                    // every 4th cycle (~12s).
+                    wrState._healthTick = ((wrState._healthTick || 0) + 1) % 4;
+                    if (wrState._healthTick === 0) wrRenderLanHealth();
+                }
             } catch (e) {}
         }, 3000);
     }
@@ -534,6 +676,7 @@
         if (tab === 'firewall')     wrRenderRules();
         if (tab === 'lans')         wrRenderLans();
         if (tab === 'leases')       wrRenderLeases();
+        if (tab === 'health')       wrRenderLanHealth();
         if (tab === 'zones')        wrRenderZones();
         if (tab === 'policy')       wrRenderPolicyMap();
         if (tab === 'wan')          wrRenderWan();
@@ -544,6 +687,10 @@
         if (tab === 'tools')        wrRenderDnsTools();
         if (tab === 'traceroute')   wrRenderTraceroute();
         if (tab === 'logs')         wrRenderLogs();
+        if (tab === 'threat-intel') {
+            // Defined in app.js (so it shares the toast/dialog primitives).
+            if (typeof tiRenderTab === 'function') tiRenderTab();
+        }
     }
 
     // ─── Master render ───
@@ -1585,7 +1732,10 @@
             unlock(); return;
         }
         if (dnsMode === 'wolf_router' && listenPort !== 53 && !extServerRaw) {
-            say('❌', 'Listen port isn\'t 53, so clients need another DNS IP to use — fill in the "DNS server advertised to clients" field (Advanced section). Save aborted.', '#ef4444');
+            say('❌',
+                'Listen port isn\'t 53, so clients need a DNS IP they can reach on :53 — fill in the "DNS server advertised to clients" field (Advanced section).<br><br>' +
+                '<strong>This is just a reference IP — it doesn\'t need to be running yet.</strong> Set it to your AdGuard/Pi-hole container\'s planned IP (e.g. <code>172.17.0.5</code>). Save will move dnsmasq off :53, freeing it for AdGuard to bind. Only then does AdGuard need to actually be up.',
+                '#ef4444');
             unlock(); return;
         }
         lan.dns = Object.assign(lan.dns || {}, {
@@ -2084,6 +2234,243 @@
             body: JSON.stringify({ node_id, interface: iface, zone }),
         });
         await wrLoadAll();
+    }
+
+    // ─── LAN runtime health ─────────────────────────────────────────
+    //
+    // Per-LAN runtime health for the WolfRouter "Health" tab. Renders
+    // every LAN owned anywhere in the cluster and surfaces:
+    //   • interface state, dnsmasq alive, :53 bound to router_ip
+    //   • live UDP DNS probe round-trip
+    //   • watchdog circuit-breaker state
+    // Plus one-click "Restart dnsmasq" and "Use <iface>" actions wired
+    // to the backend self-heal endpoints.
+
+    window.wrRenderLanHealth = wrRenderLanHealth;
+    window.wrLanHealthRestart = wrLanHealthRestart;
+    window.wrLanHealthSetInterface = wrLanHealthSetInterface;
+
+    async function wrRenderLanHealth() {
+        const container = document.getElementById('wr-health-container');
+        if (!container) return;
+        // Preserve the user's open/closed toggle on the cluster
+        // validation banner across the 12s auto-refresh — without this,
+        // every poll re-renders the DOM and re-collapses whatever the
+        // user had expanded. Saved before the fetch so the new HTML
+        // can restore it after.
+        const existingBanner = container.querySelector('details.wr-cluster-banner');
+        const savedBannerOpen = existingBanner ? existingBanner.open : null;
+        // Fetch in parallel: cluster-wide config validation banner +
+        // per-LAN health cards. Either one independently failing leaves
+        // the other rendered.
+        const [validationRes, lansRes] = await Promise.allSettled([
+            fetch(wrUrl('/api/router/validation-cluster')),
+            fetch(wrUrl('/api/router/health')),
+        ]);
+
+        let banner = '';
+        try {
+            if (validationRes.status === 'fulfilled' && validationRes.value.ok) {
+                const v = await validationRes.value.json();
+                banner = renderValidationBanner(v);
+            }
+        } catch (e) {}
+
+        let body = '';
+        try {
+            if (lansRes.status === 'fulfilled' && lansRes.value.ok) {
+                const data = await lansRes.value.json();
+                const lans = (data && Array.isArray(data.lans)) ? data.lans : [];
+                if (!lans.length) {
+                    body = `<div class="card-body" style="color:var(--text-muted);">No LANs configured anywhere in the cluster.</div>`;
+                } else {
+                    body = lans.map(renderLanHealthCard).join('');
+                }
+            } else {
+                const status = lansRes.status === 'fulfilled'
+                    ? `HTTP ${lansRes.value.status}`
+                    : String(lansRes.reason);
+                body = `<div class="card-body" style="color:var(--accent-red);">Failed to load LAN health: ${escHtml(status)}</div>`;
+            }
+        } catch (e) {
+            body = `<div class="card-body" style="color:var(--accent-red);">Failed to load health: ${escHtml(String(e))}</div>`;
+        }
+
+        container.innerHTML = banner + body;
+        // Restore the user's toggle if they had one. New banners
+        // (first render, or when payload shape changes) fall through to
+        // the default open/closed driven by severity.
+        if (savedBannerOpen !== null) {
+            const newBanner = container.querySelector('details.wr-cluster-banner');
+            if (newBanner) newBanner.open = savedBannerOpen;
+        }
+    }
+
+    function renderValidationBanner(payload) {
+        const nodes = (payload && Array.isArray(payload.nodes)) ? payload.nodes : [];
+        if (!nodes.length) return '';
+        // Count NODES by status (not findings). A node is:
+        //   • err  if any of its findings is an error
+        //   • warn if any warning and no errors
+        //   • ok   if all findings are ok (or it has no findings yet)
+        // The summary line is "N nodes · X ok · Y warn · Z err" where
+        // X+Y+Z+unreachable = N — operator's mental model is "how
+        // many of my nodes are healthy", not "how many checks
+        // succeeded across the fleet".
+        let nodesOk = 0, nodesWarn = 0, nodesErr = 0;
+        let unreachable = 0;
+        const rows = nodes.map(n => {
+            if (n.error) {
+                unreachable++;
+                return `<li><strong>${escHtml(n.node_id)}</strong>${n.cluster_name ? ` <span style="color:var(--text-muted);">(${escHtml(n.cluster_name)})</span>` : ''} — <span style="color:#f59e0b;">unreachable: ${escHtml(n.error)}</span></li>`;
+            }
+            const r = n.report || {};
+            const errC  = r.error_count   || 0;
+            const warnC = r.warning_count || 0;
+            const okC   = r.ok_count      || 0;
+            if (errC > 0) {
+                nodesErr++;
+            } else if (warnC > 0) {
+                nodesWarn++;
+            } else {
+                nodesOk++;
+            }
+            const colour = errC > 0 ? '#ef4444' : (warnC > 0 ? '#f59e0b' : '#22c55e');
+            const ts = r.generated_at ? new Date(r.generated_at * 1000).toLocaleString() : '—';
+            const findings = okC + warnC + errC;
+            // Per-row detail still shows the breakdown of findings
+            // (informational), but the summary uses node counts.
+            const inner = findings === 0
+                ? `<span style="color:var(--text-muted);">no WolfRouter config on this node</span>`
+                : `<span style="color:${colour};">${okC} ok · ${warnC} warn · ${errC} err checks</span>`;
+            return `<li><strong>${escHtml(n.node_id)}</strong>${n.is_self ? ' <span style="color:var(--text-muted);">(this node)</span>' : ''} — ${inner} <span style="color:var(--text-muted);">@ ${escHtml(ts)}</span></li>`;
+        }).join('');
+        const summaryColour = nodesErr > 0 ? '#ef4444' : (nodesWarn > 0 || unreachable > 0 ? '#f59e0b' : '#22c55e');
+        const summary = `${nodes.length} node(s) · ${nodesOk} ok · ${nodesWarn} warn · ${nodesErr} err${unreachable > 0 ? ` · ${unreachable} unreachable` : ''}`;
+        // Only auto-open when there's something the operator should
+        // act on. The wrRenderLanHealth caller preserves the user's
+        // manual toggle across refreshes via the `wr-cluster-banner`
+        // class — tagging it here so the selector finds it.
+        return `
+            <details ${(totalErr > 0 || totalWarn > 0 || unreachable > 0) ? 'open' : ''} class="card wr-cluster-banner" style="margin-bottom:12px;">
+                <summary class="card-header" style="cursor:pointer; display:flex; gap:10px; align-items:center;">
+                    <span style="color:${summaryColour}; font-weight:600;">Cluster validation:</span>
+                    <span>${escHtml(summary)}</span>
+                </summary>
+                <div class="card-body" style="font-size:12px;">
+                    <ul style="margin:0; padding-left:18px;">${rows}</ul>
+                    <div style="margin-top:8px; color:var(--text-muted);">Updated at startup and every 5 minutes by the watchdog. Click "Refresh" to re-fan-out now.</div>
+                </div>
+            </details>
+        `;
+    }
+
+    function statusPill(status) {
+        const map = {
+            ok:      { color:'#22c55e', label:'OK' },
+            warning: { color:'#f59e0b', label:'WARN' },
+            error:   { color:'#ef4444', label:'ERROR' },
+            remote:  { color:'#64748b', label:'REMOTE' },
+        };
+        const v = map[status] || map.remote;
+        return `<span style="display:inline-block; padding:2px 8px; border-radius:10px; background:${v.color}22; color:${v.color}; font-size:11px; font-weight:600; letter-spacing:.4px;">${v.label}</span>`;
+    }
+
+    function severityDot(sev, ok) {
+        if (ok) return `<span style="color:#22c55e;">●</span>`;
+        if (sev === 'warning') return `<span style="color:#f59e0b;">●</span>`;
+        return `<span style="color:#ef4444;">●</span>`;
+    }
+
+    function renderLanHealthCard(lan) {
+        const isRemote = lan.status === 'remote';
+        const breakerHtml = lan.breaker
+            ? renderBreaker(lan.breaker)
+            : '';
+        const checks = (lan.checks || []).map(c => `
+            <div style="display:flex; gap:10px; padding:8px 10px; border-bottom:1px solid var(--border);">
+                <div style="flex:0 0 14px; padding-top:2px;">${severityDot(c.severity, c.ok)}</div>
+                <div style="flex:1; min-width:0;">
+                    <div style="font-weight:600; font-size:13px;">${escHtml(c.name)}</div>
+                    <div style="font-size:12px; color:var(--text-muted); margin-top:2px; white-space:pre-wrap;">${escHtml(c.message || '')}</div>
+                    ${c.fix ? `<details style="margin-top:6px;"><summary style="cursor:pointer; font-size:11px; color:#60a5fa;">Show fix</summary><pre style="white-space:pre-wrap; font-size:11px; background:var(--bg-input); padding:8px; border-radius:4px; margin-top:4px;">${escHtml(c.fix)}</pre></details>` : ''}
+                    ${c.action === 'restart_dnsmasq' ? `<button class="btn btn-sm" style="margin-top:6px;" onclick="wrLanHealthRestart('${escHtml(lan.lan_id)}')">↻ Restart dnsmasq</button>` : ''}
+                    ${c.action === 'set_lan_interface' && lan.apply_resolution && lan.apply_resolution.kind === 'bound_to_actual_interface' ? `<button class="btn btn-sm" style="margin-top:6px;" onclick="wrLanHealthSetInterface('${escHtml(lan.lan_id)}','${escHtml(lan.apply_resolution.actual)}')">Use ${escHtml(lan.apply_resolution.actual)} as the saved interface</button>` : ''}
+                </div>
+            </div>
+        `).join('');
+        const remoteNote = isRemote
+            ? `<div style="padding:10px; color:var(--text-muted); font-size:12px;">Owned by node <code>${escHtml(lan.node_id)}</code> — runtime checks proxy through that node. <button class="btn btn-sm" onclick="wrLoadLanHealthForLan('${escHtml(lan.lan_id)}')">Load checks</button></div>`
+            : '';
+        return `
+            <div class="card" style="margin-bottom:12px;">
+                <div class="card-header" style="display:flex; justify-content:space-between; align-items:center; gap:12px;">
+                    <div style="display:flex; gap:10px; align-items:center;">
+                        ${statusPill(lan.status)}
+                        <strong style="font-size:14px;">${escHtml(lan.lan_name)}</strong>
+                        <span style="color:var(--text-muted); font-size:12px;">on <code>${escHtml(lan.node_id)}</code></span>
+                    </div>
+                </div>
+                <div class="card-body" style="padding:0;">
+                    ${breakerHtml}
+                    ${checks || remoteNote}
+                </div>
+            </div>
+        `;
+    }
+
+    function renderBreaker(b) {
+        if (!b.open && (!b.recent_failure_count || b.recent_failure_count === 0)) return '';
+        const color = b.open ? '#ef4444' : '#f59e0b';
+        const lastErr = b.last_error ? `<div style="margin-top:4px; font-family:monospace; font-size:11px; color:var(--text-muted);">${escHtml(b.last_error)}</div>` : '';
+        const state = b.open
+            ? `Watchdog circuit OPEN — ${b.recent_failure_count} restart failures in the last 5 minutes; auto-restart paused. Click "Restart dnsmasq" to retry now.`
+            : `${b.recent_failure_count} recent restart failure(s) tracked.`;
+        return `<div style="background:${color}22; color:${color}; padding:8px 10px; font-size:12px; border-bottom:1px solid var(--border);">⚠ ${escHtml(state)}${lastErr}</div>`;
+    }
+
+    async function wrLoadLanHealthForLan(lanId) {
+        try {
+            const r = await fetch(wrUrl('/api/router/segments/' + encodeURIComponent(lanId) + '/health'));
+            if (!r.ok) {
+                alert('HTTP ' + r.status + ': ' + (await r.text()));
+                return;
+            }
+            // Re-fetch the whole list so the cards refresh in place. The
+            // remote node's health is now fresh in cache.
+            await wrRenderLanHealth();
+        } catch (e) {
+            alert(String(e));
+        }
+    }
+    window.wrLoadLanHealthForLan = wrLoadLanHealthForLan;
+
+    async function wrLanHealthRestart(lanId) {
+        if (!confirm('Restart dnsmasq for this LAN? DHCP/DNS will drop for ~1s while it respawns.')) return;
+        try {
+            const r = await fetch(wrUrl('/api/router/segments/' + encodeURIComponent(lanId) + '/restart-dnsmasq'), { method: 'POST' });
+            const txt = await r.text();
+            if (!r.ok) { alert('Restart failed: ' + txt); return; }
+            await wrRenderLanHealth();
+        } catch (e) {
+            alert('Restart failed: ' + String(e));
+        }
+    }
+
+    async function wrLanHealthSetInterface(lanId, iface) {
+        if (!confirm('Update the LAN to use interface "' + iface + '"? Saves the config and re-applies dnsmasq.')) return;
+        try {
+            const r = await fetch(wrUrl('/api/router/segments/' + encodeURIComponent(lanId) + '/set-interface'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ interface: iface }),
+            });
+            const txt = await r.text();
+            if (!r.ok) { alert('Update failed: ' + txt); return; }
+            await wrRenderLanHealth();
+        } catch (e) {
+            alert('Update failed: ' + String(e));
+        }
     }
 
     // ─── Connections + Logs ───
@@ -3801,10 +4188,15 @@
 
         try {
             let result = await runCapture();
-            // Auto-install tcpdump if missing and retry once.
-            if (result.data?.error && /tcpdump/i.test(result.data.error)
-                && /no such file|not found|couldn't run/i.test(result.data.error))
-            {
+            // Auto-install tcpdump if the backend tagged the response
+            // with `missing_tool: "tcpdump"`, then retry once. Backend
+            // and frontend ship in the same binary so we always get
+            // the structured key — no legacy regex fallback needed.
+            if (result.data?.missing_tool === 'tcpdump') {
+                const manualCmd = result.data.install_command;
+                const manualHelp = manualCmd
+                    ? `Try manually: <code>${escHtml(manualCmd)}</code>`
+                    : `Install <code>tcpdump</code> with your distro's package manager and try again.`;
                 showStatus('📦 Installing tcpdump on this host (one-time)…');
                 setBtn(true, '📦 Installing tcpdump…');
                 const inst = await fetch(wrUrl('/api/router/install-tool'), {
@@ -3814,7 +4206,7 @@
                 });
                 const instData = await inst.json();
                 if (!instData.success) {
-                    showStatus(`✗ Couldn't install tcpdump automatically: ${escHtml(instData.error || 'unknown error')}`);
+                    showStatus(`✗ Couldn't install tcpdump automatically: ${escHtml(instData.error || 'unknown error')}. ${manualHelp}`);
                     showPlaceholder('Install tcpdump manually with your package manager and try again.');
                     return;
                 }
@@ -3949,6 +4341,51 @@
             return;
         }
         if (!resp.ok) {
+            // When traceroute itself isn't installed the backend tags
+            // the response with `missing_tool`. Surface an inline
+            // install button instead of a dead-end error so the user
+            // doesn't have to leave the tab to fix it.
+            // Adam Cogswell 2026-04-30: Ubuntu minimal ships without
+            // traceroute; previous flow had no in-app remedy.
+            if (data && data.missing_tool === 'traceroute') {
+                const pkg = data.install_package || 'traceroute';
+                // Distro-aware manual-install command from the backend.
+                // null when the host's distro couldn't be identified —
+                // we then show a generic "use your package manager"
+                // message rather than guessing at a wrong shell.
+                const manualCmd = data.install_command;
+                const manualHelp = manualCmd
+                    ? `Try the package manager directly: <code>${wrEsc(manualCmd)}</code>.`
+                    : `Install <code>${wrEsc(pkg)}</code> with your distro's package manager and try again.`;
+                if (status) {
+                    status.innerHTML = `❌ ${wrEsc(data.error || 'traceroute is not installed')} ` +
+                        `<button id="wr-tr-install" class="btn btn-sm btn-primary" style="margin-left:8px;">📦 Install ${wrEsc(pkg)}</button>`;
+                    const btn = document.getElementById('wr-tr-install');
+                    if (btn) btn.onclick = async () => {
+                        btn.disabled = true;
+                        btn.textContent = '⏳ Installing…';
+                        try {
+                            const ir = await fetch('/api/system/install-package', {
+                                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ package: pkg }),
+                            });
+                            const idata = await ir.json().catch(() => ({}));
+                            if (!ir.ok || idata.success === false) {
+                                status.innerHTML = `❌ Install failed: ${wrEsc(idata.error || ir.statusText || 'unknown')}. ${manualHelp}`;
+                                return;
+                            }
+                            status.textContent = '✅ Installed — re-running trace…';
+                            // Re-fire the original Trace flow so the user
+                            // doesn't have to click again.
+                            wrTracerouteGo();
+                        } catch (e) {
+                            status.innerHTML = `❌ Install errored: ${wrEsc(e.message || String(e))}. ${manualHelp}`;
+                        }
+                    };
+                }
+                if (goBtn) { goBtn.disabled = false; goBtn.textContent = '🛰 Trace'; }
+                return;
+            }
             if (status) status.textContent = '❌ ' + (data.error || resp.statusText);
             if (goBtn) { goBtn.disabled = false; goBtn.textContent = '🛰 Trace'; }
             return;
@@ -5536,9 +5973,15 @@
             let anyFailed = false;
             for (const cl of createdLans) {
                 try {
+                    // Pass the LAN's actual listen_port so we don't hit
+                    // the misleading "Connection refused on :53" error
+                    // when the LAN is on a non-standard port (5353
+                    // etc., when AdGuard/Pi-hole takes :53). Default
+                    // to 53 when not set.
+                    const probePort = (cl.listenPort && cl.listenPort > 0) ? cl.listenPort : 53;
                     const r = await fetch(wrUrl('/api/router/test-dns'), {
                         method: 'POST', headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ router_ip: cl.routerIp, hostname: 'cloudflare.com' }),
+                        body: JSON.stringify({ router_ip: cl.routerIp, hostname: 'cloudflare.com', port: probePort }),
                     });
                     const j = await r.json();
                     if (j.success) {
@@ -5907,6 +6350,9 @@
                 ${head}
                 <div style="font-size:12px; margin-top:6px;">
                     dnsmasq is on :53 for this LAN. Move it off to let a container own :53 on <code>${escHtml(lan.interface)}</code>.
+                </div>
+                <div style="font-size:11px; color:var(--text-muted); margin-top:4px; line-height:1.5;">
+                    💡 The "Advertise DNS" IP doesn't need to be running yet — it's just a future reference DHCP will hand out to clients. Set it to your AdGuard/Pi-hole container's planned IP, click Apply, and dnsmasq will move off :53 — freeing it for AdGuard to bind. <strong>Then</strong> start AdGuard on that IP.
                 </div>
                 <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:6px;">
                     <label style="font-size:12px; color:var(--text-muted); display:flex; gap:6px; align-items:center;">

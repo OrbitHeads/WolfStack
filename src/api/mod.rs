@@ -201,7 +201,10 @@ pub struct PbsRestoreProgress {
 
 /// Shared application state
 pub struct AppState {
-    pub monitor: std::sync::Mutex<SystemMonitor>,
+    /// `Arc<Mutex<…>>` so the predictive orchestrator can clone a
+    /// reference and call `collect()` on its own cadence without
+    /// blocking the high-frequency `cached_status_bg` task.
+    pub monitor: Arc<std::sync::Mutex<SystemMonitor>>,
     pub metrics_history: std::sync::Mutex<MetricsHistory>,
     pub cluster: Arc<ClusterState>,
     pub sessions: Arc<SessionManager>,
@@ -239,6 +242,22 @@ pub struct AppState {
     pub integrations: Arc<crate::integrations::IntegrationState>,
     /// WolfRouter (native firewall/DHCP/DNS) state
     pub router: Arc<crate::networking::router::RouterState>,
+    /// Predictive ops — pending/snoozed/dismissed proposals.
+    pub predictive_proposals: Arc<std::sync::RwLock<crate::predictive::ProposalStore>>,
+    /// Predictive ops — operator-declared "this is intentional" suppressions.
+    pub predictive_acks: Arc<std::sync::RwLock<crate::predictive::AckStore>>,
+    /// Predictive ops — rolling per-resource sample history.
+    pub predictive_metrics: Arc<std::sync::RwLock<crate::predictive::MetricsHistory>>,
+    /// 30-second aggregation cache for `/api/proposals/cluster`. Stores
+    /// the most-recent fan-out result so dashboards refreshing every
+    /// few seconds don't make N peers each round-trip per refresh.
+    /// Invalidated on every state-changing predictive endpoint (snooze /
+    /// dismiss / approve / run-now / ack create+delete) so operator
+    /// actions produce immediately-visible feedback.
+    pub predictive_cluster_cache: Arc<std::sync::Mutex<Option<(crate::predictive::cluster::ClusterProposalsResponse, std::time::Instant)>>>,
+    /// This node's identifier — copied here so predictive handlers
+    /// can build proposal scopes without threading it from main.
+    pub node_id: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -582,6 +601,863 @@ pub async fn auth_check(req: HttpRequest, state: web::Data<AppState>) -> HttpRes
             "authenticated": false
         })),
     }
+}
+
+// ─── Passkey / WebAuthn (additive — coexists with PAM/WolfStack login) ───
+
+/// Derive (rp_id, origin) from the inbound request's Host header. Strips the
+/// port for the RP ID; the origin keeps it. Returns an error if the host
+/// header is missing or unparseable.
+///
+/// Reverse-proxy compatibility: when X-Forwarded-Proto is present we trust
+/// it for the scheme (and X-Forwarded-Host for the hostname when set), so
+/// a wolfstack behind nginx/Caddy/Traefik that terminates TLS reports
+/// `https://...` to webauthn-rs even though wolfstack itself only sees a
+/// plain HTTP connection. Without this, the browser presents
+/// origin=https://example.com and we expect origin=http://example.com →
+/// webauthn-rs rejects with an origin mismatch and the user gets a
+/// "host header is incorrect for passkeys" failure.
+fn passkey_rp_origin(req: &HttpRequest, state: &web::Data<AppState>) -> Result<(String, String), String> {
+    let fwd_host  = req.headers().get("X-Forwarded-Host").and_then(|v| v.to_str().ok());
+    let host      = req.headers().get("Host").and_then(|v| v.to_str().ok());
+    let fwd_proto = req.headers().get("X-Forwarded-Proto").and_then(|v| v.to_str().ok());
+    derive_passkey_rp_origin(host, fwd_host, fwd_proto, state.tls_enabled)
+}
+
+/// Pure function that derives (rp_id, origin) from raw header values.
+/// Factored out of `passkey_rp_origin` so it's unit-testable without
+/// constructing an HttpRequest + full AppState. Behaviour:
+///
+/// - Host comes from X-Forwarded-Host first (reverse proxy preserves original
+///   client Host here), falling back to the Host header.
+/// - Multi-hop proxies produce comma-separated values — take the first entry,
+///   which is the original client-facing value.
+/// - Scheme comes from X-Forwarded-Proto when present and valid (http|https),
+///   otherwise from the local TLS state.
+/// - rp_id is the host with the port stripped; origin keeps the port.
+pub fn derive_passkey_rp_origin(
+    host: Option<&str>,
+    fwd_host: Option<&str>,
+    fwd_proto: Option<&str>,
+    tls_enabled: bool,
+) -> Result<(String, String), String> {
+    let host_hdr = fwd_host
+        .filter(|s| !s.is_empty())
+        .or(host)
+        .ok_or_else(|| "Missing Host header".to_string())?;
+    let host_hdr = host_hdr.split(',').next().unwrap_or("").trim();
+    if host_hdr.is_empty() {
+        return Err("Missing Host header".to_string());
+    }
+
+    let host_no_port = match host_hdr.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => h,
+        _ => host_hdr,
+    };
+
+    let scheme = fwd_proto
+        .map(|s| s.split(',').next().unwrap_or("").trim())
+        .filter(|s| *s == "http" || *s == "https")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| if tls_enabled { "https".into() } else { "http".into() });
+
+    let origin = format!("{}://{}", scheme, host_hdr);
+    Ok((host_no_port.to_string(), origin))
+}
+
+#[derive(Deserialize)]
+pub struct PasskeyRegisterStartRequest {
+    #[serde(default)]
+    pub label: String,
+}
+
+/// POST /api/auth/passkey/register/start — issue a registration challenge for the
+/// currently-logged-in user. Requires an existing session.
+pub async fn passkey_register_start(req: HttpRequest, state: web::Data<AppState>, body: web::Json<PasskeyRegisterStartRequest>) -> HttpResponse {
+    let username = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
+    if username == "cluster-node" {
+        return HttpResponse::Forbidden().json(serde_json::json!({ "error": "Inter-node calls cannot register passkeys" }));
+    }
+    let (rp_id, origin) = match passkey_rp_origin(&req, &state) {
+        Ok(p) => p, Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    };
+    let display_name = if body.label.is_empty() { username.as_str() } else { body.label.as_str() };
+    let config = crate::auth::webauthn::WebAuthnConfig::load();
+    match crate::auth::webauthn::start_registration(&config, &rp_id, &origin, &username, display_name) {
+        Ok((challenge, ceremony_id)) => HttpResponse::Ok().json(serde_json::json!({
+            "challenge": challenge,
+            "ceremony_id": ceremony_id,
+        })),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PasskeyRegisterFinishRequest {
+    pub ceremony_id: String,
+    #[serde(default)]
+    pub label: String,
+    pub response: serde_json::Value,
+}
+
+/// POST /api/auth/passkey/register/finish — verify the attestation and persist the credential.
+pub async fn passkey_register_finish(req: HttpRequest, state: web::Data<AppState>, body: web::Json<PasskeyRegisterFinishRequest>) -> HttpResponse {
+    let username = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
+    if username == "cluster-node" {
+        return HttpResponse::Forbidden().json(serde_json::json!({ "error": "Inter-node calls cannot register passkeys" }));
+    }
+    let (rp_id, origin) = match passkey_rp_origin(&req, &state) {
+        Ok(p) => p, Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    };
+    let label = if body.label.is_empty() { "Passkey".to_string() } else { body.label.clone() };
+    let mut config = crate::auth::webauthn::WebAuthnConfig::load();
+    match crate::auth::webauthn::finish_registration(&mut config, &rp_id, &origin, &body.ceremony_id, &username, &label, &body.response) {
+        Ok(stored) => HttpResponse::Ok().json(serde_json::json!({
+            "credential_id": stored.credential_id,
+            "label": stored.label,
+            "registered_at": stored.registered_at,
+        })),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// GET /api/auth/passkey/available — anonymous lightweight probe used by the
+/// login page to decide whether to render the "Sign in with passkey" button.
+/// Returns `{available: bool}` without creating any ceremony state.
+pub async fn passkey_available(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    let config = crate::auth::webauthn::WebAuthnConfig::load();
+    if config.credentials.is_empty() {
+        return HttpResponse::Ok().json(serde_json::json!({ "available": false }));
+    }
+    // Verify the request hostname can actually do WebAuthn — bare-IP
+    // origins will fail at registration/auth time, so don't pretend
+    // they can sign in.
+    let hostname_ok = match passkey_rp_origin(&req, &state) {
+        Ok((rp_id, _)) => rp_id.parse::<std::net::IpAddr>().is_err(),
+        Err(_) => false,
+    };
+    HttpResponse::Ok().json(serde_json::json!({ "available": hostname_ok }))
+}
+
+/// POST /api/auth/passkey/login/start — issue a discoverable-credential challenge.
+/// Anonymous endpoint — does NOT require a session.
+pub async fn passkey_login_start(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    // If passkey login is unconfigured (no credentials registered) return 404
+    // so the frontend can hide the "Sign in with passkey" button quickly.
+    let config = crate::auth::webauthn::WebAuthnConfig::load();
+    if config.credentials.is_empty() {
+        return HttpResponse::NotFound().json(serde_json::json!({ "error": "No passkeys registered on this server" }));
+    }
+    // Check rate limit on this IP — same budget as the password login.
+    let client_ip = req.connection_info().peer_addr().unwrap_or("unknown").to_string();
+    if state.login_limiter.is_locked_out(&client_ip) {
+        return HttpResponse::TooManyRequests().json(serde_json::json!({
+            "error": "Too many failed login attempts. Please try again later."
+        }));
+    }
+    let (rp_id, origin) = match passkey_rp_origin(&req, &state) {
+        Ok(p) => p, Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    };
+    match crate::auth::webauthn::start_authentication(&rp_id, &origin) {
+        Ok((challenge, ceremony_id)) => HttpResponse::Ok().json(serde_json::json!({
+            "challenge": challenge,
+            "ceremony_id": ceremony_id,
+        })),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PasskeyLoginFinishRequest {
+    pub ceremony_id: String,
+    pub response: serde_json::Value,
+}
+
+/// POST /api/auth/passkey/login/finish — verify the assertion, create a session, set cookie.
+/// Anonymous endpoint.
+pub async fn passkey_login_finish(req: HttpRequest, state: web::Data<AppState>, body: web::Json<PasskeyLoginFinishRequest>) -> HttpResponse {
+    let client_ip = req.connection_info().peer_addr().unwrap_or("unknown").to_string();
+    if state.login_limiter.is_locked_out(&client_ip) {
+        return HttpResponse::TooManyRequests().json(serde_json::json!({
+            "error": "Too many failed login attempts. Please try again later."
+        }));
+    }
+    // Same direct-login-disabled check the password endpoint does.
+    {
+        let nodes = state.cluster.nodes.read().unwrap();
+        if let Some(self_node) = nodes.get(&state.cluster.self_id) {
+            if self_node.login_disabled {
+                return HttpResponse::Forbidden().json(serde_json::json!({
+                    "error": "Direct login is disabled on this server. Access it via the primary dashboard."
+                }));
+            }
+        }
+    }
+    let (rp_id, origin) = match passkey_rp_origin(&req, &state) {
+        Ok(p) => p, Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    };
+    let mut config = crate::auth::webauthn::WebAuthnConfig::load();
+    match crate::auth::webauthn::finish_authentication(&mut config, &rp_id, &origin, &body.ceremony_id, &body.response) {
+        Ok(username) => {
+            state.login_limiter.clear(&client_ip);
+            let token = state.sessions.create_session(&username);
+            let mut cookie = Cookie::build("wolfstack_session", &token)
+                .path("/")
+                .http_only(true)
+                .same_site(actix_web::cookie::SameSite::Strict)
+                .max_age(actix_web::cookie::time::Duration::hours(8))
+                .finish();
+            if state.tls_enabled { cookie.set_secure(true); }
+            HttpResponse::Ok()
+                .cookie(cookie)
+                .json(serde_json::json!({ "success": true, "username": username }))
+        }
+        Err(e) => {
+            state.login_limiter.record_failure(&client_ip);
+            HttpResponse::Unauthorized().json(serde_json::json!({ "success": false, "error": e }))
+        }
+    }
+}
+
+/// GET /api/auth/passkeys — list the current user's registered passkeys.
+pub async fn passkey_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    let username = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
+    if username == "cluster-node" {
+        return HttpResponse::Forbidden().json(serde_json::json!({ "error": "Inter-node calls cannot list passkeys" }));
+    }
+    let config = crate::auth::webauthn::WebAuthnConfig::load();
+    let creds = crate::auth::webauthn::list_credentials(&config, &username);
+    let out: Vec<serde_json::Value> = creds.iter().map(|c| serde_json::json!({
+        "credential_id": c.credential_id,
+        "label": c.label,
+        "registered_at": c.registered_at,
+        "last_used_at": c.last_used_at,
+    })).collect();
+    HttpResponse::Ok().json(serde_json::json!({ "passkeys": out }))
+}
+
+/// DELETE /api/auth/passkeys/{id} — remove a passkey owned by the current user.
+pub async fn passkey_delete(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let username = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
+    if username == "cluster-node" {
+        return HttpResponse::Forbidden().json(serde_json::json!({ "error": "Inter-node calls cannot delete passkeys" }));
+    }
+    let credential_id = path.into_inner();
+    let mut config = crate::auth::webauthn::WebAuthnConfig::load();
+    // Ownership check — only the owning user can delete their own passkeys.
+    let owns = config.credentials.iter().any(|c| c.credential_id == credential_id && c.username == username);
+    if !owns {
+        return HttpResponse::NotFound().json(serde_json::json!({ "error": "Passkey not found" }));
+    }
+    match crate::auth::webauthn::remove_credential(&mut config, &credential_id) {
+        Ok(true) => HttpResponse::Ok().json(serde_json::json!({ "removed": true })),
+        Ok(false) => HttpResponse::NotFound().json(serde_json::json!({ "error": "Passkey not found" })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
+// ─── Threat Intelligence (WolfRouter integration) ───
+
+/// Helper: collect the cluster's known node addresses for the safe-filter.
+/// Filters out the unspecified address (0.0.0.0 / ::) — that's the
+/// "listen on all interfaces" sentinel some nodes report instead of a
+/// real public address; passing it to threat-intel as an exempt creates
+/// no value and confuses the self-blacklist scan.
+fn ti_cluster_node_ips(state: &web::Data<AppState>) -> Vec<String> {
+    state.cluster.get_all_nodes().iter()
+        .map(|n| n.address.clone())
+        .filter(|a| {
+            match a.parse::<std::net::IpAddr>() {
+                Ok(ip) => !ip.is_unspecified(),
+                Err(_) => false,  // unparseable strings are useless to safe-filter
+            }
+        })
+        .collect()
+}
+
+/// Helper: best-effort extraction of the requesting client's IP. Used as a
+/// transient exemption so an admin can't accidentally lock themselves out
+/// of their own dashboard if their public IP appears on a feed.
+fn ti_request_client_ip(req: &HttpRequest) -> Vec<String> {
+    let raw = req.connection_info().peer_addr().unwrap_or("").to_string();
+    // peer_addr is "ip:port" — strip the port for the safe-filter compare.
+    let ip = match raw.rsplit_once(':') {
+        Some((host, _)) => host.to_string(),
+        None => raw,
+    };
+    if ip.is_empty() { Vec::new() } else { vec![ip] }
+}
+
+/// Fan out an `ipset` install request to every online WolfStack peer
+/// in the cluster, in the background. Used when the local admin flips
+/// Threat Intel to enforce mode — peers will need ipset present when
+/// their own admin (or our future cluster-wide propagation) enables
+/// enforcement there too. Best effort: per-peer 90-second timeout,
+/// failures logged but never propagated to the user.
+///
+/// Skips: this node, offline nodes, non-wolfstack nodes (Proxmox-only
+/// entries can't install packages).
+fn ti_install_ipset_on_peers(state: &web::Data<AppState>) {
+    let nodes = state.cluster.get_all_nodes();
+    let secret = state.cluster_secret.clone();
+    let self_id = state.cluster.self_id.clone();
+    let peers: Vec<(String, String, u16)> = nodes.iter()
+        .filter(|n| !n.is_self && n.id != self_id && n.online && n.node_type == "wolfstack")
+        .map(|n| (n.hostname.clone(), n.address.clone(), n.port))
+        .collect();
+    if peers.is_empty() { return; }
+
+    tokio::spawn(async move {
+        let client = &*API_HTTP_CLIENT;
+        let body = serde_json::json!({ "package": "ipset" });
+        for (hostname, address, port) in &peers {
+            let urls = build_node_urls(address, *port, "/api/system/install-package");
+            let mut delivered = false;
+            for url in &urls {
+                match client.post(url)
+                    .timeout(std::time::Duration::from_secs(90))
+                    .header("X-WolfStack-Secret", &secret)
+                    .json(&body)
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        if let Ok(data) = resp.json::<serde_json::Value>().await {
+                            let ok = data.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+                            let msg = data.get("message").and_then(|v| v.as_str())
+                                .or_else(|| data.get("error").and_then(|v| v.as_str()))
+                                .unwrap_or("(no message)").to_string();
+                            if ok {
+                                tracing::info!("threat-intel: ipset installed on peer '{}' ({}): {}", hostname, address, msg);
+                            } else {
+                                tracing::warn!("threat-intel: ipset install on peer '{}' ({}) reported failure: {}", hostname, address, msg);
+                            }
+                        }
+                        delivered = true;
+                        break;
+                    }
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let _ = resp.bytes().await;
+                        tracing::warn!("threat-intel: ipset install on peer '{}' ({}) returned HTTP {}", hostname, address, status);
+                        delivered = true;
+                        break;
+                    }
+                    Err(_) => continue,
+                }
+            }
+            if !delivered {
+                tracing::warn!("threat-intel: could not reach peer '{}' ({}) for ipset install — try manually or wait until next enable", hostname, address);
+            }
+        }
+    });
+}
+
+/// Push the local Threat Intel config to every online WolfStack peer
+/// in the cluster, in the background. Peers receive the unmasked config
+/// (real API keys, not "***") so their own scheduler can actually fetch
+/// feeds. Best effort: per-peer 30s timeout; failures logged.
+///
+/// Cycle-breaker: peers that receive this call have caller == "cluster-node"
+/// in their PATCH handler, which skips the re-propagation step.
+fn ti_propagate_config_to_peers(state: &web::Data<AppState>) {
+    let nodes = state.cluster.get_all_nodes();
+    let secret = state.cluster_secret.clone();
+    let self_id = state.cluster.self_id.clone();
+    let peers: Vec<(String, String, u16)> = nodes.iter()
+        .filter(|n| !n.is_self && n.id != self_id && n.online && n.node_type == "wolfstack")
+        .map(|n| (n.hostname.clone(), n.address.clone(), n.port))
+        .collect();
+    if peers.is_empty() { return; }
+
+    // Read the unmasked on-disk config and serialise the full struct.
+    // The receiving peer's PATCH handler will use its own ProviderConfig
+    // sentinel logic — including a real key value (not "***") replaces
+    // the on-disk key.
+    let cfg = crate::threat_intel::ThreatIntelConfig::load();
+    let payload = serde_json::json!({
+        "enabled": cfg.enabled,
+        "dry_run": cfg.dry_run,
+        "paused": cfg.paused,
+        "refresh_hours": cfg.refresh_hours,
+        "providers": cfg.providers,
+        "allowlist": cfg.allowlist,
+    });
+
+    tokio::spawn(async move {
+        let client = &*API_HTTP_CLIENT;
+        for (hostname, address, port) in &peers {
+            let urls = build_node_urls(address, *port, "/api/threat-intel/config");
+            let mut delivered = false;
+            for url in &urls {
+                match client.patch(url)
+                    .timeout(std::time::Duration::from_secs(30))
+                    .header("X-WolfStack-Secret", &secret)
+                    .json(&payload)
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        let _ = resp.bytes().await;
+                        tracing::info!("threat-intel: config propagated to peer '{}' ({})", hostname, address);
+                        delivered = true;
+                        break;
+                    }
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let _ = resp.bytes().await;
+                        tracing::warn!("threat-intel: config push to peer '{}' ({}) returned HTTP {}", hostname, address, status);
+                        delivered = true;
+                        break;
+                    }
+                    Err(_) => continue,
+                }
+            }
+            if !delivered {
+                tracing::warn!("threat-intel: could not reach peer '{}' ({}) for config propagation", hostname, address);
+            }
+        }
+    });
+}
+
+/// Mask API keys before returning a config to the frontend. Empty fields
+/// stay empty; non-empty fields become "***" so the UI knows a key is
+/// configured without seeing the value.
+fn ti_mask_keys(mut cfg: crate::threat_intel::ThreatIntelConfig) -> crate::threat_intel::ThreatIntelConfig {
+    for (_, p) in cfg.providers.iter_mut() {
+        if !p.api_key.is_empty() {
+            p.api_key = "***".to_string();
+        }
+    }
+    cfg
+}
+
+/// GET /api/threat-intel/config — return the persisted config (API keys masked).
+pub async fn threat_intel_get_config(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let cfg = crate::threat_intel::ThreatIntelConfig::load();
+    HttpResponse::Ok().json(ti_mask_keys(cfg))
+}
+
+#[derive(Deserialize)]
+pub struct ThreatIntelPatchRequest {
+    #[serde(default)] pub enabled: Option<bool>,
+    #[serde(default)] pub dry_run: Option<bool>,
+    #[serde(default)] pub paused: Option<bool>,
+    #[serde(default)] pub refresh_hours: Option<u64>,
+    #[serde(default)] pub providers: Option<std::collections::HashMap<String, crate::threat_intel::ProviderConfig>>,
+    #[serde(default)] pub allowlist: Option<Vec<String>>,
+}
+
+/// PATCH /api/threat-intel/config — partial update. If the enabled / dry_run /
+/// paused triplet changes, runs `apply_state_change()` to make the kernel
+/// state catch up.
+///
+/// API key sentinel: a provider value of `"***"` means "don't change",
+/// preserving the existing on-disk key. Anything else (including empty
+/// string to clear) is used verbatim.
+pub async fn threat_intel_patch_config(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<ThreatIntelPatchRequest>,
+) -> HttpResponse {
+    let caller = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
+    // Cycle-breaker: when a peer receives a propagated config push, the
+    // caller is "cluster-node" (X-WolfStack-Secret auth). Don't re-propagate
+    // back out — the originating bastion is already fanning to every node.
+    let from_peer = caller == "cluster-node";
+    let mut cfg = crate::threat_intel::ThreatIntelConfig::load();
+    let prev_enforcement = crate::threat_intel::enforcement_active(&cfg);
+
+    if let Some(v) = body.enabled { cfg.enabled = v; }
+    if let Some(v) = body.dry_run { cfg.dry_run = v; }
+    if let Some(v) = body.paused { cfg.paused = v; }
+    if let Some(v) = body.refresh_hours {
+        // Clamp at the API boundary too so the saved config matches what the
+        // scheduler will actually use.
+        cfg.refresh_hours = v.clamp(1, 168);
+    }
+    if let Some(allowlist) = &body.allowlist { cfg.allowlist = allowlist.clone(); }
+    if let Some(providers) = &body.providers {
+        for (id, incoming) in providers.iter() {
+            let entry = cfg.providers.entry(id.clone()).or_insert_with(|| crate::threat_intel::ProviderConfig {
+                enabled: false, api_key: String::new(), url_override: String::new(),
+            });
+            entry.enabled = incoming.enabled;
+            // Sentinel "***" means "don't change". Anything else replaces.
+            if incoming.api_key != "***" {
+                entry.api_key = incoming.api_key.clone();
+            }
+            entry.url_override = incoming.url_override.clone();
+        }
+    }
+
+    if let Err(e) = cfg.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+
+    let new_enforcement = crate::threat_intel::enforcement_active(&cfg);
+    let mut apply_error: Option<String> = None;
+    if new_enforcement != prev_enforcement {
+        // The kernel state needs to catch up. Run on a blocking thread —
+        // apply_state_change shells out to ipset/iptables-restore.
+        match tokio::task::spawn_blocking(crate::threat_intel::apply_state_change).await {
+            Ok(Ok(())) => {
+                // Local enforcement just activated — fan out an ipset
+                // install to every online WolfStack peer in the cluster
+                // so they're ready when their own admin enables it. Runs
+                // in the background; we don't block the user's API call
+                // on per-peer install timing.
+                if new_enforcement && !from_peer {
+                    ti_install_ipset_on_peers(&state);
+                }
+            }
+            Ok(Err(e)) => apply_error = Some(e),
+            Err(e) => apply_error = Some(format!("apply task panicked: {}", e)),
+        }
+        // If the apply failed, roll the config back so on-disk state matches kernel state.
+        if apply_error.is_some() {
+            let mut rolled = crate::threat_intel::ThreatIntelConfig::load();
+            // Easiest rollback: flip the enable/dry_run/paused fields back.
+            // We do NOT touch other fields the user changed (allowlist, providers) —
+            // only the enforcement transition that just failed.
+            rolled.enabled = if prev_enforcement { true } else { rolled.enabled && false };
+            // Simpler: just restore the prior enforcement triplet by inverting our last change.
+            // Reload and undo via the prev value.
+            // To keep this readable: load latest, then set the three flags to whatever
+            // produced prev_enforcement. We don't know the exact prev triplet without
+            // re-reading earlier state — so just clear `enabled` and `paused`, set
+            // `dry_run = true`. This is the conservative "off" state.
+            rolled.enabled = false;
+            rolled.dry_run = true;
+            rolled.paused = false;
+            let _ = rolled.save();
+        }
+    }
+
+    if let Some(e) = apply_error {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": format!("Config saved, but enforcement could not be activated: {}. Configuration was rolled back to a safe state.", e),
+        }));
+    }
+
+    // Cluster-wide propagation. Fire-and-forget — peers process the same
+    // PATCH (with caller=cluster-node) which short-circuits their own
+    // re-propagation, so we won't loop.
+    if !from_peer {
+        ti_propagate_config_to_peers(&state);
+    }
+
+    HttpResponse::Ok().json(ti_mask_keys(crate::threat_intel::ThreatIntelConfig::load()))
+}
+
+/// POST /api/threat-intel/refresh — trigger an immediate refresh.
+pub async fn threat_intel_refresh(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let cluster_ips = ti_cluster_node_ips(&state);
+    let admin_ip = ti_request_client_ip(&req);
+    let new_state = crate::threat_intel::refresh_all(cluster_ips, admin_ip).await;
+    HttpResponse::Ok().json(new_state)
+}
+
+/// POST /api/threat-intel/pause — emergency-off. Drops the kernel rule
+/// immediately while preserving config + ipset state for a one-click
+/// resume. Cluster-wide: propagates pause to every online peer.
+pub async fn threat_intel_pause(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    let caller = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
+    let from_peer = caller == "cluster-node";
+    let mut cfg = crate::threat_intel::ThreatIntelConfig::load();
+    if cfg.paused {
+        return HttpResponse::Ok().json(serde_json::json!({ "paused": true, "no_op": true }));
+    }
+    cfg.paused = true;
+    if let Err(e) = cfg.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+    match tokio::task::spawn_blocking(crate::threat_intel::apply_state_change).await {
+        Ok(Ok(())) => {
+            if !from_peer { ti_propagate_config_to_peers(&state); }
+            HttpResponse::Ok().json(serde_json::json!({ "paused": true }))
+        }
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("apply task panicked: {}", e) })),
+    }
+}
+
+/// POST /api/threat-intel/resume — undo a pause. Cluster-wide.
+pub async fn threat_intel_resume(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    let caller = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
+    let from_peer = caller == "cluster-node";
+    let mut cfg = crate::threat_intel::ThreatIntelConfig::load();
+    if !cfg.paused {
+        return HttpResponse::Ok().json(serde_json::json!({ "paused": false, "no_op": true }));
+    }
+    cfg.paused = false;
+    if let Err(e) = cfg.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+    match tokio::task::spawn_blocking(crate::threat_intel::apply_state_change).await {
+        Ok(Ok(())) => {
+            // If unpausing actually re-activated enforcement (the common
+            // case — pause was the only thing turning it off), make sure
+            // peers have ipset and the same config.
+            if !from_peer
+                && crate::threat_intel::enforcement_active(&crate::threat_intel::ThreatIntelConfig::load())
+            {
+                ti_install_ipset_on_peers(&state);
+                ti_propagate_config_to_peers(&state);
+            }
+            HttpResponse::Ok().json(serde_json::json!({ "paused": false }))
+        }
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("apply task panicked: {}", e) })),
+    }
+}
+
+/// GET /api/threat-intel/status — current state for the UI: per-provider
+/// fetch status, total blocklist size, applied flag, sample of recently
+/// added IPs (first 50 of each family — the UI uses these for "preview"
+/// rendering without shipping 200k entries to the browser).
+pub async fn threat_intel_status(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let snapshot = crate::threat_intel::snapshot_cache();
+    let cfg = crate::threat_intel::ThreatIntelConfig::load();
+
+    let sample_v4: Vec<String> = snapshot.blocklist_v4.iter().take(50).cloned().collect();
+    let sample_v6: Vec<String> = snapshot.blocklist_v6.iter().take(50).cloned().collect();
+
+    // Annotate self-blacklisted entries with hostnames for the UI banner.
+    // Mapping IP → hostname is best-effort: we look in the cluster node
+    // list. If the mapping fails (IP not in cluster, race during node
+    // removal), the UI just shows "(unknown)" — non-blocking.
+    //
+    // Filter unspecified addresses (0.0.0.0 / ::) at read time too —
+    // covers the in-memory cache when it was populated from a state file
+    // written by an older release before the upstream filter existed.
+    let nodes = state.cluster.get_all_nodes();
+    let self_blacklisted: Vec<serde_json::Value> = snapshot.self_blacklisted.iter()
+        .filter(|(ip, _)| {
+            match ip.parse::<std::net::IpAddr>() {
+                Ok(p) => !p.is_unspecified(),
+                Err(_) => false,
+            }
+        })
+        .map(|(ip, providers)| {
+            let hostname = nodes.iter()
+                .find(|n| n.address == *ip)
+                .map(|n| n.hostname.clone())
+                .unwrap_or_default();
+            serde_json::json!({
+                "ip": ip,
+                "hostname": hostname,
+                "listed_by": providers,
+            })
+        }).collect();
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "enabled": cfg.enabled,
+        "dry_run": cfg.dry_run,
+        "paused": cfg.paused,
+        "enforcement_active": crate::threat_intel::enforcement_active(&cfg),
+        "applied": snapshot.applied,
+        "last_refresh_secs": snapshot.last_refresh_secs,
+        "blocklist_size": snapshot.blocklist_size,
+        "blocklist_v4_count": snapshot.blocklist_v4.len(),
+        "blocklist_v6_count": snapshot.blocklist_v6.len(),
+        "sample_v4": sample_v4,
+        "sample_v6": sample_v6,
+        "providers": snapshot.providers,
+        "self_blacklisted": self_blacklisted,
+        "ipset_available": crate::threat_intel::ipset::ipset_available(),
+        "max_blocklist_size": crate::threat_intel::MAX_BLOCKLIST_SIZE,
+    }))
+}
+
+/// GET /api/threat-intel/cluster-status — aggregate Threat Intel status
+/// across every WolfStack node in the cluster, so the bastion's UI can
+/// show "node X is enforcing 12k entries, last refresh 5min ago" for
+/// every peer at once instead of just the local node.
+///
+/// Self status comes from in-memory cache (cheap). Online peers are
+/// queried in parallel via the inter-node HTTP channel with a 4-second
+/// timeout each — slow peers don't block the response. Offline /
+/// non-WolfStack nodes are listed with status: null and a reason.
+pub async fn threat_intel_cluster_status(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    // WolfRouter (and its Threat Intel tab) is per-cluster — a bastion
+    // managing 5 clusters across 14 servers should NOT see every cluster's
+    // peers lumped into every cluster view. Honour the same `?cluster=NAME`
+    // filter the topology endpoint uses; nameless nodes normalise to
+    // "WolfStack". Caveat (intentional, surfaced via the UI): the actual
+    // ThreatIntelConfig is one global file at /etc/wolfstack/threat-intel.json
+    // — propagation is cluster-wide. Adam Cogswell 2026-04-29: noticed
+    // the status panel was showing all 14 servers regardless of which
+    // cluster's WolfRouter view was open.
+    let cluster_filter = req.uri().query()
+        .and_then(|q| {
+            for pair in q.split('&') {
+                if let Some(rest) = pair.strip_prefix("cluster=") {
+                    return urlencoding::decode(rest).ok().map(|s| s.into_owned());
+                }
+            }
+            None
+        });
+    let normalize = |n: Option<&str>| -> String {
+        match n {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => "WolfStack".into(),
+        }
+    };
+    let self_cluster_raw = state.cluster.get_self_cluster_name();
+    let self_cluster_norm = normalize(
+        if self_cluster_raw.is_empty() { None } else { Some(self_cluster_raw.as_str()) }
+    );
+    let include_self = match &cluster_filter {
+        Some(want) => &self_cluster_norm == want,
+        None => true,
+    };
+
+    let all_nodes = state.cluster.get_all_nodes();
+    let nodes: Vec<_> = all_nodes.into_iter()
+        .filter(|n| {
+            if n.is_self || n.id == state.cluster.self_id {
+                include_self
+            } else {
+                match &cluster_filter {
+                    Some(want) => &normalize(n.cluster_name.as_deref()) == want,
+                    None => true,
+                }
+            }
+        })
+        .collect();
+    let secret = state.cluster_secret.clone();
+    let self_id = state.cluster.self_id.clone();
+
+    // Build the local node's summary up front from the in-memory cache.
+    // Cheap; doesn't do any HTTP. Same shape as the per-peer fetch result
+    // so the aggregator stays uniform.
+    let local_summary = {
+        let cfg = crate::threat_intel::ThreatIntelConfig::load();
+        let snapshot = crate::threat_intel::snapshot_cache();
+        serde_json::json!({
+            "enabled": cfg.enabled,
+            "dry_run": cfg.dry_run,
+            "paused": cfg.paused,
+            "enforcement_active": crate::threat_intel::enforcement_active(&cfg),
+            "applied": snapshot.applied,
+            "last_refresh_secs": snapshot.last_refresh_secs,
+            "blocklist_size": snapshot.blocklist_size,
+            "blocklist_v4_count": snapshot.blocklist_v4.len(),
+            "blocklist_v6_count": snapshot.blocklist_v6.len(),
+            "providers": snapshot.providers,
+            "ipset_available": crate::threat_intel::ipset::ipset_available(),
+        })
+    };
+
+    // Fetch peer statuses concurrently. Each fetch has its own short
+    // timeout; one slow peer doesn't drag the whole aggregation.
+    let client = &*API_HTTP_CLIENT;
+    let mut futures: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = serde_json::Value> + Send>>> = Vec::new();
+    for node in nodes.iter() {
+        if node.is_self || node.id == self_id {
+            // Local entry — emit synchronously.
+            let entry = serde_json::json!({
+                "id": node.id,
+                "hostname": node.hostname,
+                "address": node.address,
+                "is_self": true,
+                "online": true,
+                "reachable": true,
+                "status": local_summary.clone(),
+                "error": serde_json::Value::Null,
+            });
+            futures.push(Box::pin(async move { entry }));
+            continue;
+        }
+        if !node.online {
+            let entry = serde_json::json!({
+                "id": node.id, "hostname": node.hostname, "address": node.address,
+                "is_self": false, "online": false, "reachable": false,
+                "status": serde_json::Value::Null,
+                "error": "Node is offline",
+            });
+            futures.push(Box::pin(async move { entry }));
+            continue;
+        }
+        if node.node_type != "wolfstack" {
+            let entry = serde_json::json!({
+                "id": node.id, "hostname": node.hostname, "address": node.address,
+                "is_self": false, "online": node.online, "reachable": false,
+                "status": serde_json::Value::Null,
+                "error": format!("Node type '{}' does not run threat-intel", node.node_type),
+            });
+            futures.push(Box::pin(async move { entry }));
+            continue;
+        }
+        // Online wolfstack peer — fetch over inter-node.
+        let id = node.id.clone();
+        let hostname = node.hostname.clone();
+        let address = node.address.clone();
+        let port = node.port;
+        let secret = secret.clone();
+        let client = client.clone();
+        futures.push(Box::pin(async move {
+            let urls = build_node_urls(&address, port, "/api/threat-intel/status");
+            for url in &urls {
+                match client.get(url)
+                    .timeout(std::time::Duration::from_secs(4))
+                    .header("X-WolfStack-Secret", &secret)
+                    .send().await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        if let Ok(body) = resp.json::<serde_json::Value>().await {
+                            return serde_json::json!({
+                                "id": id, "hostname": hostname, "address": address,
+                                "is_self": false, "online": true, "reachable": true,
+                                "status": body, "error": serde_json::Value::Null,
+                            });
+                        }
+                    }
+                    Ok(resp) => {
+                        let code = resp.status();
+                        let _ = resp.bytes().await;
+                        return serde_json::json!({
+                            "id": id, "hostname": hostname, "address": address,
+                            "is_self": false, "online": true, "reachable": false,
+                            "status": serde_json::Value::Null,
+                            "error": format!("Peer returned HTTP {}", code),
+                        });
+                    }
+                    Err(_) => continue,
+                }
+            }
+            serde_json::json!({
+                "id": id, "hostname": hostname, "address": address,
+                "is_self": false, "online": true, "reachable": false,
+                "status": serde_json::Value::Null,
+                "error": "Could not reach peer (timeout / network)",
+            })
+        }));
+    }
+
+    let results = futures::future::join_all(futures).await;
+    HttpResponse::Ok().json(serde_json::json!({ "nodes": results }))
+}
+
+/// GET /api/threat-intel/lookup/{ip} — is this IP currently blocked, and which feed CIDRs match?
+pub async fn threat_intel_lookup(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let ip = path.into_inner();
+    if ip.parse::<std::net::IpAddr>().is_err() {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Not a valid IP address" }));
+    }
+    let matches = crate::threat_intel::lookup_ip(&ip);
+    HttpResponse::Ok().json(serde_json::json!({
+        "ip": ip,
+        "blocked": !matches.is_empty(),
+        "matches": matches,
+    }))
 }
 
 // ─── Password Reset API (no auth required) ───
@@ -1115,6 +1991,31 @@ pub async fn systemd_service_action(req: HttpRequest, state: web::Data<AppState>
     }
 }
 
+/// GET /api/cluster/proxmox-cleanup — return the notice (if any) of legacy
+/// Proxmox-API entries that were auto-removed on startup. The UI shows a
+/// banner while this exists.
+pub async fn proxmox_cleanup_notice(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match crate::agent::ProxmoxCleanupNotice::load() {
+        Some(notice) => HttpResponse::Ok().json(serde_json::json!({
+            "removed_count": notice.removed_count,
+            "addresses": notice.addresses,
+            "backup_path": notice.backup_path,
+            "timestamp": notice.timestamp,
+        })),
+        None => HttpResponse::Ok().json(serde_json::json!({ "removed_count": 0 })),
+    }
+}
+
+/// POST /api/cluster/proxmox-cleanup/dismiss — dismiss the banner (deletes notice file)
+pub async fn proxmox_cleanup_dismiss(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match crate::agent::ProxmoxCleanupNotice::dismiss() {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "dismissed": true })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
 /// GET /api/nodes — all cluster nodes
 pub async fn get_nodes(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     let caller = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
@@ -1327,21 +2228,24 @@ pub async fn cluster_secret_receive(req: HttpRequest, state: web::Data<AppState>
 
 /// POST /api/nodes — add a server to the cluster
 #[derive(Deserialize)]
+#[allow(dead_code)]
 pub struct AddServerRequest {
     pub address: String,
     pub port: Option<u16>,
     #[serde(default)]
-    pub node_type: Option<String>,       // "wolfstack" (default) or "proxmox"
+    pub node_type: Option<String>,       // "wolfstack" (default) or "proxmox" (rejected with 410)
     #[serde(default)]
     pub join_token: Option<String>,      // Required for WolfStack nodes — validates against remote
+    // Legacy Proxmox-only fields: kept on the struct so old clients still get parsed
+    // (and answered with a friendly 410) instead of a JSON deserialisation error.
     #[serde(default)]
-    pub pve_token: Option<String>,       // PVEAPIToken=user@realm!tokenid=uuid
+    pub pve_token: Option<String>,
     #[serde(default)]
     pub pve_fingerprint: Option<String>,
     #[serde(default)]
     pub pve_node_name: Option<String>,
     #[serde(default)]
-    pub pve_cluster_name: Option<String>, // User-friendly cluster name for sidebar
+    pub pve_cluster_name: Option<String>,
     #[serde(default)]
     pub cluster_name: Option<String>,     // Generic cluster name for WolfStack nodes
 }
@@ -1356,242 +2260,208 @@ pub async fn add_node(req: HttpRequest, state: web::Data<AppState>, body: web::J
         }));
     }
 
+    // Licence host-cap policy: SOFT cap, never hard block.
+    //
+    // Going over your tier's host count gets you a warning attached to
+    // the response (and a banner in the dashboard) but the join still
+    // succeeds. Reconciliation happens server-side via the daily licence
+    // heartbeat. We never block someone from using WolfStack because
+    // they outgrew their tier — that's a sales conversation, not an
+    // outage.
+    let cap_warning: Option<serde_json::Value> = if let Some(dm) = crate::compat::license_manifest() {
+        let tier = crate::compat::resolve_tier(&dm);
+        let cap = crate::compat::effective_cap(tier, dm.max_nodes);
+        if cap > 0 {
+            let current = state.cluster.get_all_nodes().len() as u32;
+            if current + 1 > cap {
+                let upgrade = match tier {
+                    "homelab" => "Upgrade to Pro (£49/mo, 25 hosts) at https://wolfstack.org/enterprise.php",
+                    "pro"     => "Upgrade to Enterprise (unlimited hosts) at https://wolfstack.org/enterprise.php",
+                    _         => "Contact sales@wolf.uk.com to raise the cap",
+                };
+                Some(serde_json::json!({
+                    "message": format!(
+                        "Host added — but your cluster now exceeds the {} tier ({} of {} hosts). {}",
+                        tier, current + 1, cap, upgrade
+                    ),
+                    "tier": tier,
+                    "max_nodes": cap,
+                    "current_nodes": current + 1,
+                    "feature": "host_cap",
+                }))
+            } else { None }
+        } else { None }
+    } else { None };
+
     let node_type = body.node_type.as_deref().unwrap_or("wolfstack");
 
     if node_type == "proxmox" {
-        let port = body.port.unwrap_or(8006);
-        let token = body.pve_token.clone().unwrap_or_default();
-        let fingerprint = body.pve_fingerprint.clone();
-        let pve_node_name = body.pve_node_name.clone().unwrap_or_default();
-        let cluster_name = body.pve_cluster_name.clone();
-
-        if token.is_empty() || pve_node_name.is_empty() {
-            return HttpResponse::BadRequest().json(serde_json::json!({
-                "error": "Proxmox nodes require pve_token and pve_node_name"
-            }));
-        }
-
-        // Block duplicate Proxmox nodes — check if this address+port+node_name already exists
-        let existing_nodes = state.cluster.get_all_nodes();
-        for existing in &existing_nodes {
-            if existing.address == body.address && existing.port == port
-                && existing.pve_node_name.as_deref() == Some(&pve_node_name)
-            {
-                return HttpResponse::Conflict().json(serde_json::json!({
-                    "error": format!(
-                        "Proxmox node '{}' at {}:{} already exists in the cluster (id: '{}'). \
-                         Remove the existing node first if you want to re-add it.",
-                        pve_node_name, body.address, port, existing.id
-                    )
-                }));
-            }
-        }
-
-        // Try to discover all nodes in the cluster
-        let client = crate::proxmox::PveClient::new(&body.address, port, &token, fingerprint.as_deref(), &pve_node_name);
-        let discovered = client.discover_nodes().await.unwrap_or_default();
-
-        let mut added_ids = Vec::new();
-        let mut added_nodes = Vec::new();
-        let mut skipped_nodes = Vec::new();
-
-        if discovered.len() > 1 {
-            // Multi-node cluster — add each discovered node (skip duplicates)
-            for node_name in &discovered {
-                // Skip if this node already exists
-                let already_exists = existing_nodes.iter().any(|n|
-                    n.address == body.address && n.port == port
-                    && n.pve_node_name.as_deref() == Some(node_name)
-                );
-                if already_exists {
-                    skipped_nodes.push(node_name.clone());
-                    continue;
-                }
-                let id = state.cluster.add_proxmox_server(
-                    body.address.clone(), port, token.clone(),
-                    fingerprint.clone(), node_name.clone(), cluster_name.clone(),
-                );
-
-                added_ids.push(id);
-                added_nodes.push(node_name.clone());
-            }
-        } else {
-            // Single node or discovery failed — add just the specified node
-            let id = state.cluster.add_proxmox_server(
-                body.address.clone(), port, token, fingerprint,
-                pve_node_name.clone(), cluster_name.clone(),
-            );
-
-            added_ids.push(id);
-            added_nodes.push(pve_node_name.clone());
-        }
-
-        HttpResponse::Ok().json(serde_json::json!({
-            "ids": added_ids,
-            "address": body.address,
-            "port": port,
-            "node_type": "proxmox",
-            "nodes_discovered": added_nodes,
-            "nodes_skipped": skipped_nodes,
-            "cluster_name": cluster_name,
-        }))
-    } else {
-        let port = body.port.unwrap_or(8553);
-        let cluster_name = body.cluster_name.clone();
-
-        // Validate join token against the remote server
-        let join_token = body.join_token.clone().unwrap_or_default();
-        if join_token.is_empty() {
-            return HttpResponse::BadRequest().json(serde_json::json!({
-                "error": "Join token is required. Get it from the remote server's dashboard."
-            }));
-        }
-
-        // Call the remote server to verify the token
-        // Try HTTPS on the given port first (accept self-signed certs), then HTTP on port+1 (inter-node port)
-        let verify_path = format!("/api/cluster/verify-token?token={}", join_token);
-        let urls = vec![
-            format!("https://{}:{}{}", body.address, port, verify_path),
-            format!("http://{}:{}{}", body.address, port + 1, verify_path),
-            format!("http://{}:{}{}", body.address, port, verify_path),
-        ];
-
-        let client = &*API_HTTP_CLIENT;
-
-        let mut last_error = String::new();
-        let mut verified = false;
-        for url in &urls {
-            match client.get(url).timeout(std::time::Duration::from_secs(5)).send().await {
-                Ok(resp) => {
-                    if let Ok(data) = resp.json::<serde_json::Value>().await {
-                        if data.get("valid").and_then(|v| v.as_bool()) == Some(true) {
-
-                            verified = true;
-                            break;
-                        } else {
-                            let err_msg = data.get("error").and_then(|v| v.as_str()).unwrap_or("Invalid join token");
-                            return HttpResponse::Forbidden().json(serde_json::json!({
-                                "error": err_msg
-                            }));
-                        }
-                    }
-                    // Got a response but couldn't parse — try next URL
-                    last_error = format!("Unparseable response from {}", url);
-                }
-                Err(e) => {
-                    last_error = format!("{}", e);
-                    // Connection failed — try next URL
-                }
-            }
-        }
-
-        if !verified {
-            return HttpResponse::BadGateway().json(serde_json::json!({
-                "error": format!("Cannot reach remote server at {}:{} — {}", body.address, port, last_error)
-            }));
-        }
-
-        // Check for WolfNet IP conflicts before adding the node.
-        // Fetch the remote node's status to get its wolfnet_ips, then compare
-        // against all IPs known in this cluster (local + remote via route cache).
-        let status_urls = build_node_urls(&body.address, port, "/api/agent/status");
-        let cluster_secret = crate::auth::load_cluster_secret();
-        let default_secret = crate::auth::default_cluster_secret();
-        let mut remote_wolfnet_ips: Vec<String> = Vec::new();
-        for url in &status_urls {
-            // Try the active cluster secret first, then the default (new node may not have received custom secret yet)
-            for secret in [&cluster_secret, &default_secret.to_string()] {
-                if let Ok(resp) = client.get(url)
-                    .timeout(std::time::Duration::from_secs(5))
-                    .header("X-WolfStack-Secret", secret)
-                    .send().await
-                {
-                    if resp.status().is_success() {
-                        if let Ok(data) = resp.json::<serde_json::Value>().await {
-                            if let Some(ips) = data.get("wolfnet_ips").and_then(|v| v.as_array()) {
-                                remote_wolfnet_ips = ips.iter()
-                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                    .collect();
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-            if !remote_wolfnet_ips.is_empty() { break; }
-        }
-
-        if !remote_wolfnet_ips.is_empty() {
-            // Collect all WolfNet IPs known in this cluster
-            let local_ips = containers::wolfnet_used_ips();
-            let route_ips: Vec<String> = containers::WOLFNET_ROUTES.lock().unwrap()
-                .keys().cloned().collect();
-
-            let mut conflicts = Vec::new();
-            for ip in &remote_wolfnet_ips {
-                if local_ips.contains(ip) || route_ips.contains(ip) {
-                    conflicts.push(ip.clone());
-                }
-            }
-            if !conflicts.is_empty() {
-                return HttpResponse::Conflict().json(serde_json::json!({
-                    "error": format!(
-                        "Cannot join node: WolfNet IP conflict — {} is already in use in this cluster. \
-                         Change the node's IP in /etc/wolfnet/config.toml and restart wolfnet before joining.",
-                        conflicts.join(", ")
-                    )
-                }));
-            }
-        }
-
-        // Block duplicate nodes — check if a node with this address:port already exists
-        let existing_nodes = state.cluster.get_all_nodes();
-        for existing in &existing_nodes {
-            if existing.address == body.address && existing.port == port {
-                return HttpResponse::Conflict().json(serde_json::json!({
-                    "error": format!(
-                        "A node at {}:{} already exists in the cluster (hostname: '{}', id: '{}'). \
-                         Remove the existing node first if you want to re-add it.",
-                        body.address, port, existing.hostname, existing.id
-                    )
-                }));
-            }
-        }
-
-        let id = state.cluster.add_server(body.address.clone(), port, cluster_name.clone());
-
-        // If we have a custom cluster secret (on disk), push it to the new node
-        let active_secret = crate::auth::load_cluster_secret();
-        if active_secret != crate::auth::default_cluster_secret() {
-            let addr = body.address.clone();
-            let secret = active_secret;
-            tokio::spawn(async move {
-                let client = &*API_HTTP_CLIENT;
-                let urls = build_node_urls(&addr, port, "/api/cluster/secret/receive");
-                for url in &urls {
-                    if let Ok(resp) = client.post(url)
-                        .timeout(std::time::Duration::from_secs(10))
-                        .header("X-WolfStack-Secret", crate::auth::default_cluster_secret())
-                        .json(&serde_json::json!({ "secret": secret }))
-                        .send()
-                        .await
-                    {
-                        let success = resp.status().is_success();
-                        let _ = resp.bytes().await;
-                        if success { break; }
-                    }
-                }
-            });
-        }
-
-        HttpResponse::Ok().json(serde_json::json!({
-            "id": id,
-            "address": body.address,
-            "port": port,
-            "node_type": "wolfstack",
-            "cluster_name": cluster_name,
-        }))
+        return HttpResponse::Gone().json(serde_json::json!({
+            "error": "Proxmox API nodes have been deprecated, please install WolfStack on each node and then add them as WolfStack nodes to the main cluster — see our install page at https://wolfstack.org/download.php"
+        }));
     }
+
+    let port = body.port.unwrap_or(8553);
+    let cluster_name = body.cluster_name.clone();
+
+    // Validate join token against the remote server
+    let join_token = body.join_token.clone().unwrap_or_default();
+    if join_token.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "Join token is required. Get it from the remote server's dashboard."
+        }));
+    }
+
+    // Call the remote server to verify the token
+    // Try HTTPS on the given port first (accept self-signed certs), then HTTP on port+1 (inter-node port)
+    let verify_path = format!("/api/cluster/verify-token?token={}", join_token);
+    let urls = vec![
+        format!("https://{}:{}{}", body.address, port, verify_path),
+        format!("http://{}:{}{}", body.address, port + 1, verify_path),
+        format!("http://{}:{}{}", body.address, port, verify_path),
+    ];
+
+    let client = &*API_HTTP_CLIENT;
+
+    let mut last_error = String::new();
+    let mut verified = false;
+    for url in &urls {
+        match client.get(url).timeout(std::time::Duration::from_secs(5)).send().await {
+            Ok(resp) => {
+                if let Ok(data) = resp.json::<serde_json::Value>().await {
+                    if data.get("valid").and_then(|v| v.as_bool()) == Some(true) {
+
+                        verified = true;
+                        break;
+                    } else {
+                        let err_msg = data.get("error").and_then(|v| v.as_str()).unwrap_or("Invalid join token");
+                        return HttpResponse::Forbidden().json(serde_json::json!({
+                            "error": err_msg
+                        }));
+                    }
+                }
+                // Got a response but couldn't parse — try next URL
+                last_error = format!("Unparseable response from {}", url);
+            }
+            Err(e) => {
+                last_error = format!("{}", e);
+                // Connection failed — try next URL
+            }
+        }
+    }
+
+    if !verified {
+        return HttpResponse::BadGateway().json(serde_json::json!({
+            "error": format!("Cannot reach remote server at {}:{} — {}", body.address, port, last_error)
+        }));
+    }
+
+    // Check for WolfNet IP conflicts before adding the node.
+    // Fetch the remote node's status to get its wolfnet_ips, then compare
+    // against all IPs known in this cluster (local + remote via route cache).
+    let status_urls = build_node_urls(&body.address, port, "/api/agent/status");
+    let cluster_secret = crate::auth::load_cluster_secret();
+    let default_secret = crate::auth::default_cluster_secret();
+    let mut remote_wolfnet_ips: Vec<String> = Vec::new();
+    for url in &status_urls {
+        // Try the active cluster secret first, then the default (new node may not have received custom secret yet)
+        for secret in [&cluster_secret, &default_secret.to_string()] {
+            if let Ok(resp) = client.get(url)
+                .timeout(std::time::Duration::from_secs(5))
+                .header("X-WolfStack-Secret", secret)
+                .send().await
+            {
+                if resp.status().is_success() {
+                    if let Ok(data) = resp.json::<serde_json::Value>().await {
+                        if let Some(ips) = data.get("wolfnet_ips").and_then(|v| v.as_array()) {
+                            remote_wolfnet_ips = ips.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect();
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        if !remote_wolfnet_ips.is_empty() { break; }
+    }
+
+    if !remote_wolfnet_ips.is_empty() {
+        // Collect all WolfNet IPs known in this cluster
+        let local_ips = containers::wolfnet_used_ips();
+        let route_ips: Vec<String> = containers::WOLFNET_ROUTES.lock().unwrap()
+            .keys().cloned().collect();
+
+        let mut conflicts = Vec::new();
+        for ip in &remote_wolfnet_ips {
+            if local_ips.contains(ip) || route_ips.contains(ip) {
+                conflicts.push(ip.clone());
+            }
+        }
+        if !conflicts.is_empty() {
+            return HttpResponse::Conflict().json(serde_json::json!({
+                "error": format!(
+                    "Cannot join node: WolfNet IP conflict — {} is already in use in this cluster. \
+                     Change the node's IP in /etc/wolfnet/config.toml and restart wolfnet before joining.",
+                    conflicts.join(", ")
+                )
+            }));
+        }
+    }
+
+    // Block duplicate nodes — check if a node with this address:port already exists
+    let existing_nodes = state.cluster.get_all_nodes();
+    for existing in &existing_nodes {
+        if existing.address == body.address && existing.port == port {
+            return HttpResponse::Conflict().json(serde_json::json!({
+                "error": format!(
+                    "A node at {}:{} already exists in the cluster (hostname: '{}', id: '{}'). \
+                     Remove the existing node first if you want to re-add it.",
+                    body.address, port, existing.hostname, existing.id
+                )
+            }));
+        }
+    }
+
+    let id = state.cluster.add_server(body.address.clone(), port, cluster_name.clone());
+
+    // If we have a custom cluster secret (on disk), push it to the new node
+    let active_secret = crate::auth::load_cluster_secret();
+    if active_secret != crate::auth::default_cluster_secret() {
+        let addr = body.address.clone();
+        let secret = active_secret;
+        tokio::spawn(async move {
+            let client = &*API_HTTP_CLIENT;
+            let urls = build_node_urls(&addr, port, "/api/cluster/secret/receive");
+            for url in &urls {
+                if let Ok(resp) = client.post(url)
+                    .timeout(std::time::Duration::from_secs(10))
+                    .header("X-WolfStack-Secret", crate::auth::default_cluster_secret())
+                    .json(&serde_json::json!({ "secret": secret }))
+                    .send()
+                    .await
+                {
+                    let success = resp.status().is_success();
+                    let _ = resp.bytes().await;
+                    if success { break; }
+                }
+            }
+        });
+    }
+
+    let mut response = serde_json::json!({
+        "id": id,
+        "address": body.address,
+        "port": port,
+        "node_type": "wolfstack",
+        "cluster_name": cluster_name,
+    });
+    if let Some(warning) = cap_warning {
+        if let Some(obj) = response.as_object_mut() {
+            obj.insert("warning".to_string(), warning);
+        }
+    }
+    HttpResponse::Ok().json(response)
 }
 
 /// DELETE /api/nodes/{id} — remove a server
@@ -2956,6 +3826,110 @@ pub async fn list_certificates(req: HttpRequest, state: web::Data<AppState>) -> 
     HttpResponse::Ok().json(certs)
 }
 
+#[derive(Deserialize)]
+pub struct CertInstallRequest {
+    pub cert_pem: String,
+    pub key_pem: String,
+    #[serde(default)]
+    pub cert_path: Option<String>,
+    #[serde(default)]
+    pub key_path: Option<String>,
+    /// Passphrase for an encrypted private key (PKCS#8 ENCRYPTED PRIVATE KEY
+    /// or legacy Proc-Type: ENCRYPTED). Optional — required only when the
+    /// pasted key is passphrase-protected. Stored only as long as it takes
+    /// openssl to decrypt the key, never persisted to disk.
+    #[serde(default)]
+    pub key_passphrase: Option<String>,
+}
+
+/// POST /api/certificates/install — write user-supplied PEM cert+key to disk.
+/// Used for both fresh installs and replacing/updating existing certs (e.g.
+/// overwriting the Proxmox pveproxy-ssl pair).
+///
+/// Response includes `restart_service`: the systemd unit the user should
+/// be prompted to restart for the new cert to take effect (`wolfstack` or
+/// `pveproxy`). The frontend opens a confirm modal — we never auto-restart.
+pub async fn install_certificate(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<CertInstallRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let target_cert = body.cert_path.clone().unwrap_or_else(|| "/etc/wolfstack/cert.pem".to_string());
+    let restart_service = installer::restart_service_name_for_cert(&target_cert);
+    match installer::install_certificate_files(
+        &body.cert_pem,
+        &body.key_pem,
+        body.cert_path.as_deref(),
+        body.key_path.as_deref(),
+        body.key_passphrase.as_deref(),
+    ) {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({
+            "message": msg,
+            "restart_service": restart_service,
+        })),
+        Err(e)  => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CertSelfSignedRequest {
+    pub host: String,
+    #[serde(default)]
+    pub alt_names: Vec<String>,
+    #[serde(default)]
+    pub cert_path: Option<String>,
+    #[serde(default)]
+    pub key_path: Option<String>,
+    #[serde(default)]
+    pub days: Option<u32>,
+}
+
+/// POST /api/certificates/self-signed — generate a self-signed cert via openssl.
+pub async fn create_self_signed_certificate(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<CertSelfSignedRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let target_cert = body.cert_path.clone().unwrap_or_else(|| "/etc/wolfstack/cert.pem".to_string());
+    let restart_service = installer::restart_service_name_for_cert(&target_cert);
+    match installer::generate_self_signed_certificate(
+        &body.host,
+        &body.alt_names,
+        body.cert_path.as_deref(),
+        body.key_path.as_deref(),
+        body.days.unwrap_or(825),
+    ) {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({
+            "message": msg,
+            "restart_service": restart_service,
+        })),
+        Err(e)  => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CertRestartRequest {
+    pub service: String,
+}
+
+/// POST /api/certificates/restart-service — explicitly restart wolfstack
+/// or pveproxy after a cert install. Called by the frontend's confirm
+/// modal so the user controls the restart timing. Validated against a
+/// fixed allowlist; arbitrary services are rejected.
+pub async fn cert_restart_service(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<CertRestartRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match installer::restart_cert_service(&body.service) {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+        Err(e)  => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
 // ─── Agent API (server-to-server, no auth required) ───
 
 /// GET /api/agent/status — return this node's status (for remote polling)
@@ -3213,8 +4187,37 @@ pub async fn traceroute_handler(
     let output = match output {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => {
+            // Distinguish "traceroute isn't installed" from any other
+            // spawn failure — the frontend uses `missing_tool` to show
+            // an inline install button instead of a generic error.
+            // Adam Cogswell 2026-04-30: Ubuntu minimal images ship
+            // without traceroute and the previous error gave the user
+            // no in-app remedy.
+            let is_missing = e.kind() == std::io::ErrorKind::NotFound
+                || e.raw_os_error() == Some(2 /* ENOENT */);
+            // Manual-install command for THIS host's distro. None when
+            // we can't identify the distro — better than guessing
+            // `apt-get` on Gentoo/Alpine/etc., which would mislead the
+            // user. The frontend renders a generic "install with your
+            // package manager" message in that case.
+            let install_command = if is_missing {
+                let distro = crate::installer::detect_distro();
+                if matches!(distro, crate::installer::DistroFamily::Unknown) {
+                    None
+                } else {
+                    let (mgr, args) = crate::installer::pkg_install_cmd(distro);
+                    Some(format!("sudo {} {} traceroute", mgr, args))
+                }
+            } else { None };
             return HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": format!("Failed to run traceroute: {}. Install with: apt install traceroute (Debian/Ubuntu) or dnf install traceroute (RHEL).", e)
+                "error": if is_missing {
+                    "traceroute isn't installed on this host. Click the button below to install it, or run the install manually.".to_string()
+                } else {
+                    format!("Failed to run traceroute: {}", e)
+                },
+                "missing_tool": if is_missing { Some("traceroute") } else { None },
+                "install_package": if is_missing { Some("traceroute") } else { None },
+                "install_command": install_command,
             }));
         }
         Err(e) => {
@@ -11697,8 +12700,10 @@ pub async fn wolfflow_infrastructure(req: HttpRequest, state: web::Data<AppState
     let mut clusters: std::collections::HashMap<String, Vec<serde_json::Value>> = std::collections::HashMap::new();
 
     for node in &nodes {
+        // Skip legacy Proxmox-API-only entries — they're surfaced via the deprecation banner.
+        if node.node_type == "proxmox" { continue; }
+
         let cluster_name = node.cluster_name.clone()
-            .or(node.pve_cluster_name.clone())
             .unwrap_or_else(|| "Default".to_string());
 
         let mut node_data = serde_json::json!({
@@ -16249,6 +17254,578 @@ pub async fn system_install_package(
     }
 }
 
+// ─── Predictive ops: Inbox + Acknowledgements ────────────────────
+//
+// Surfaces the proposal store (analyzer findings) and the ack store
+// (operator-declared "this is intentional, stop firing") to the
+// frontend Inbox view. All endpoints require a session cookie; the
+// underlying store is `Arc<RwLock<...>>` in AppState so reads and
+// writes are cheap and the orchestrator background loop owns
+// long-held locks only inside spawn_blocking.
+
+/// GET /api/proposals — inbox view (Pending + active Snoozed),
+/// sorted Critical→Info, then most-recently-updated first.
+pub async fn predictive_proposals_list(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let store = match state.predictive_proposals.read() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let inbox: Vec<&crate::predictive::Proposal> = store.inbox();
+    HttpResponse::Ok().json(inbox)
+}
+
+/// GET /api/proposals/cluster — aggregated inbox across this node
+/// and every reachable cluster peer.
+///
+/// Cached for 30 s (`cluster::CACHE_TTL_SECS`) so a dashboard
+/// refresh doesn't translate into one HTTP fan-out per peer per
+/// refresh. Cache is invalidated on every state-changing predictive
+/// endpoint so operator actions produce immediately-visible
+/// feedback.
+///
+/// Per-peer fetch failures are surfaced in the `nodes` field so the
+/// UI can warn that the Inbox is incomplete instead of silently
+/// showing partial data.
+pub async fn predictive_proposals_cluster(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    // Cache hit?
+    {
+        let cache = state.predictive_cluster_cache.lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((value, ts)) = &*cache {
+            let age = ts.elapsed().as_secs();
+            if age < crate::predictive::cluster::CACHE_TTL_SECS {
+                let mut response = value.clone();
+                response.cached_for_seconds = age;
+                return HttpResponse::Ok().json(response);
+            }
+        }
+    }
+
+    // Cache miss — fan out.
+    let response = build_cluster_response(&state).await;
+
+    // Save back. Stale-on-poison falls through to a fresh build next
+    // time, which is the conservative choice.
+    {
+        let mut cache = state.predictive_cluster_cache.lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *cache = Some((response.clone(), std::time::Instant::now()));
+    }
+
+    HttpResponse::Ok().json(response)
+}
+
+async fn build_cluster_response(
+    state: &web::Data<AppState>,
+) -> crate::predictive::cluster::ClusterProposalsResponse {
+    use crate::predictive::cluster::{
+        ClusterProposalsResponse, NodeAggregateStatus, sort_proposals,
+    };
+
+    // Self proposals — clone out under a brief read lock.
+    let self_proposals: Vec<crate::predictive::Proposal> = {
+        let store = state.predictive_proposals.read()
+            .unwrap_or_else(|e| e.into_inner());
+        store.inbox().into_iter().cloned().collect()
+    };
+
+    // Self status — for the nodes list. We always responded to
+    // ourselves; that's a tautology worth surfacing so the UI never
+    // shows fewer entries than the cluster has nodes.
+    let nodes_snapshot = state.cluster.get_all_nodes();
+    let self_node = nodes_snapshot.iter().find(|n| n.is_self).cloned();
+    let self_status = NodeAggregateStatus {
+        node_id: state.node_id.clone(),
+        hostname: self_node.as_ref().map(|n| n.hostname.clone()).unwrap_or_default(),
+        is_self: true,
+        responded: true,
+        error: None,
+        cluster_name: self_node.as_ref().map(|n| resolve_cluster_label(n)).unwrap_or_default(),
+    };
+
+    // Peers — only online wolfstack nodes that aren't ourselves.
+    // Proxmox-typed nodes don't run our analyzer so we skip them.
+    let peers: Vec<_> = nodes_snapshot.into_iter()
+        .filter(|n| !n.is_self && n.node_type == "wolfstack" && n.online)
+        .collect();
+
+    // Fan-out — one task per peer, each with its own timeout. We
+    // collect the JoinHandles then await them with `tokio::join!` /
+    // `futures::join_all`-style sequence. Using FuturesUnordered
+    // would be tidier; for a small N this is fine.
+    // Each handle carries (node_id, hostname, cluster) so panics
+    // still identify the peer. The `node_id` here MUST match what
+    // the peer's own predictive orchestrator stamps onto
+    // `Proposal.scope.node_id` — otherwise the cluster filter in
+    // the Inbox UI maps the proposal to the wrong cluster and the
+    // list goes empty when the operator picks a non-default
+    // cluster.
+    //
+    // Each peer's orchestrator uses the local `state.node_id`,
+    // which is the value of `/etc/wolfstack/node_id` (the peer's
+    // *self_id*). Locally we know that as `peer.self_id` (Option),
+    // populated when the peer first reports. Falls back to
+    // `peer.id` (the locally-assigned cluster key) for peers that
+    // haven't reported a self_id yet.
+    let secret = state.cluster_secret.clone();
+    let mut handles: Vec<(String, String, String, tokio::task::JoinHandle<Result<Vec<crate::predictive::Proposal>, String>>)> =
+        Vec::with_capacity(peers.len());
+    for peer in &peers {
+        let urls = build_node_urls(&peer.address, peer.port, "/api/proposals");
+        let secret = secret.clone();
+        let cluster = resolve_cluster_label(peer);
+        let canonical_id = peer.self_id.clone().unwrap_or_else(|| peer.id.clone());
+        let handle = tokio::spawn(async move {
+            fetch_peer_proposals(&urls, &secret).await
+        });
+        handles.push((canonical_id, peer.hostname.clone(), cluster, handle));
+    }
+
+    let mut all_proposals = self_proposals;
+    let mut node_status: Vec<NodeAggregateStatus> = vec![self_status];
+
+    for (id, hostname, cluster_name, h) in handles {
+        match h.await {
+            Ok(Ok(proposals)) => {
+                all_proposals.extend(proposals);
+                node_status.push(NodeAggregateStatus {
+                    node_id: id, hostname, is_self: false,
+                    responded: true, error: None, cluster_name,
+                });
+            }
+            Ok(Err(e)) => {
+                node_status.push(NodeAggregateStatus {
+                    node_id: id, hostname, is_self: false,
+                    responded: false, error: Some(e), cluster_name,
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "predictive cluster: peer task for {} ({}) panicked: {}",
+                    id, hostname, e,
+                );
+                node_status.push(NodeAggregateStatus {
+                    node_id: id, hostname, is_self: false,
+                    responded: false,
+                    error: Some(format!("task panic: {}", e)),
+                    cluster_name,
+                });
+            }
+        }
+    }
+
+    sort_proposals(&mut all_proposals);
+
+    ClusterProposalsResponse {
+        proposals: all_proposals,
+        nodes: node_status,
+        cached_for_seconds: 0,
+    }
+}
+
+/// Fetch a peer's `/api/proposals` using inter-node auth. Returns a
+/// short, operator-readable error string on any failure mode so the
+/// UI's "node not responded" tooltip is meaningful.
+async fn fetch_peer_proposals(
+    urls: &[String],
+    secret: &str,
+) -> Result<Vec<crate::predictive::Proposal>, String> {
+    let mut last_status_err: Option<String> = None;
+    for url in urls {
+        let send = API_HTTP_CLIENT
+            .get(url)
+            .header("X-WolfStack-Secret", secret)
+            .send();
+        match tokio::time::timeout(crate::predictive::cluster::PEER_FETCH_TIMEOUT, send).await {
+            Err(_) => return Err("timeout".to_string()),
+            Ok(Err(_)) => continue,  // connection refused / TLS fail / etc — try next URL
+            Ok(Ok(resp)) => {
+                let status = resp.status();
+                if status.is_success() {
+                    return resp.json::<Vec<crate::predictive::Proposal>>().await
+                        .map_err(|e| format!("invalid response shape: {}", e));
+                }
+                if status == 401 || status == 403 {
+                    return Err(format!("auth rejected (HTTP {})", status.as_u16()));
+                }
+                if status == 404 {
+                    return Err("peer doesn't expose /api/proposals (older version?)".to_string());
+                }
+                last_status_err = Some(format!("HTTP {}", status.as_u16()));
+                continue;
+            }
+        }
+    }
+    Err(last_status_err.unwrap_or_else(|| "no URL reachable".to_string()))
+}
+
+/// Resolve a `Node` to the cluster grouping label used by the
+/// dashboard. Mirrors the rule in `web/js/app.js`:
+///
+/// - Proxmox-typed nodes prefer `pve_cluster_name`, then their
+///   own `cluster_name`, then their `address` (so a standalone
+///   PVE host shows under its hostname/IP).
+/// - WolfStack-typed nodes use `cluster_name` falling back to
+///   `"WolfStack"` for older nodes that never set one.
+///
+/// Lifted into Rust so the predictive Inbox aggregator groups by
+/// cluster the same way the rest of the UI does.
+fn resolve_cluster_label(node: &crate::agent::Node) -> String {
+    if node.node_type == "proxmox" {
+        node.pve_cluster_name.clone()
+            .or_else(|| node.cluster_name.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| node.address.clone())
+    } else {
+        node.cluster_name.clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "WolfStack".to_string())
+    }
+}
+
+/// Drop the cluster-aggregation cache so the next
+/// `/api/proposals/cluster` call rebuilds from scratch. Called from
+/// every state-changing predictive endpoint.
+fn invalidate_cluster_cache(state: &web::Data<AppState>) {
+    if let Ok(mut g) = state.predictive_cluster_cache.lock() {
+        *g = None;
+    }
+}
+
+/// GET /api/proposals/history — every proposal regardless of status
+/// (for the audit/history view).
+pub async fn predictive_proposals_history(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let store = match state.predictive_proposals.read() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    HttpResponse::Ok().json(&store.proposals)
+}
+
+/// GET /api/proposals/{id} — single proposal detail.
+pub async fn predictive_proposal_get(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let store = match state.predictive_proposals.read() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    match store.get(&id) {
+        Some(p) => HttpResponse::Ok().json(p),
+        None => HttpResponse::NotFound().json(serde_json::json!({ "error": "proposal not found" })),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SnoozeProposalRequest {
+    /// Snooze duration. Clamped to 1h..720h (30d) — silent forever
+    /// is what Dismiss is for.
+    pub hours: i64,
+}
+
+pub async fn predictive_proposal_snooze(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<SnoozeProposalRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let hours = body.into_inner().hours.clamp(1, 24 * 30);
+    let until = chrono::Utc::now() + chrono::Duration::hours(hours);
+    let mut store = match state.predictive_proposals.write() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    match store.snooze(&id, until) {
+        Ok(()) => {
+            let _ = store.save();
+            // Order matters: save first (so on-disk is fresh), then
+            // invalidate the cluster cache. The opposite order races
+            // — a concurrent /api/proposals/cluster could rebuild
+            // and re-cache the stale state in the gap.
+            drop(store);
+            invalidate_cluster_cache(&state);
+            HttpResponse::Ok().json(serde_json::json!({
+                "success": true,
+                "until": until.to_rfc3339(),
+            }))
+        }
+        Err(e) => HttpResponse::NotFound().json(serde_json::json!({ "error": e })),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct DismissProposalRequest {
+    /// Reason captured for audit + AI feedback. Required (non-empty
+    /// after trim) so dismissals carry context the next analyzer
+    /// run can learn from.
+    pub reason: String,
+}
+
+pub async fn predictive_proposal_dismiss(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<DismissProposalRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let reason = body.into_inner().reason.trim().to_string();
+    if reason.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "dismiss reason is required so the audit trail \
+                      and AI feedback have something to learn from",
+        }));
+    }
+    let mut store = match state.predictive_proposals.write() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    match store.dismiss(&id, reason) {
+        Ok(()) => {
+            let _ = store.save();
+            drop(store);
+            invalidate_cluster_cache(&state);
+            HttpResponse::Ok().json(serde_json::json!({ "success": true }))
+        }
+        Err(e) => HttpResponse::NotFound().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// POST /api/proposals/{id}/approve — record that the operator
+/// applied the remediation. v1 proposals are always
+/// `RemediationPlan::Manual`, so "approve" means "I ran the
+/// commands, mark this done"; v2 OneClick proposals will dispatch
+/// to a handler instead.
+pub async fn predictive_proposal_approve(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let mut store = match state.predictive_proposals.write() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    match store.record_approval(&id, crate::predictive::ApprovalOutcome::Applied) {
+        Ok(()) => {
+            let _ = store.save();
+            drop(store);
+            invalidate_cluster_cache(&state);
+            HttpResponse::Ok().json(serde_json::json!({ "success": true }))
+        }
+        Err(e) => HttpResponse::NotFound().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// GET /api/proposals/{id}/command/{idx} — return one of a
+/// proposal's `Manual` remediation commands plus the resolved
+/// console target (type + name, plus remote `node_id` when the
+/// finding lives on a peer). Used by the Inbox UI's Run button:
+/// the dashboard opens `console.html` with these values, the page
+/// fetches the command via this endpoint, and writes it to the
+/// PTY's stdin so the operator drops into an interactive session
+/// with the suggested command pre-run.
+///
+/// Auth-gated. The command itself comes from the analyzer's
+/// proposal store on disk (never user-supplied), so URL injection
+/// can't smuggle in arbitrary shell — the command index is bounded
+/// by the proposal's recorded list.
+pub async fn predictive_proposal_command(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<(String, usize)>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let (id, idx) = path.into_inner();
+
+    let store = match state.predictive_proposals.read() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let Some(p) = store.get(&id) else {
+        return HttpResponse::NotFound().json(serde_json::json!({
+            "error": "proposal not found",
+        }));
+    };
+    let cmds = match &p.remediation {
+        crate::predictive::RemediationPlan::Manual { commands, .. } => commands,
+        _ => return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "proposal has no Manual remediation commands",
+        })),
+    };
+    let Some(command) = cmds.get(idx) else {
+        return HttpResponse::NotFound().json(serde_json::json!({
+            "error": "command index out of range",
+        }));
+    };
+
+    // Resolve the console target from scope.resource_id. The format
+    // mirrors the resource-id conventions each analyzer uses, so a
+    // finding on `docker:postgres` opens a docker exec session into
+    // postgres; `lxc:web` → lxc-attach; `vm:opnsense:...` → VM
+    // serial console; everything else → host shell on the node the
+    // finding lives on.
+    let (console_type, console_name) = resolve_console_target(p);
+
+    // Cross-node: if the finding is on a peer (scope.node_id !=
+    // this server's node_id), surface the peer's locally-assigned
+    // cluster-key id so console.html can use the existing
+    // remote-console proxy. Console.html accepts both peer.id and
+    // peer.self_id via `cluster.get_node`'s fallback scan.
+    let remote_node_id: Option<String> = if p.scope.node_id != state.node_id {
+        Some(p.scope.node_id.clone())
+    } else {
+        None
+    };
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "command": command,
+        "console_type": console_type,
+        "console_name": console_name,
+        "remote_node_id": remote_node_id,
+        "title": p.title,
+    }))
+}
+
+/// Map a proposal's `scope.resource_id` to a `(console_type,
+/// console_name)` pair compatible with the existing `/ws/console/
+/// {type}/{name}` route + `console.html?type=...&name=...` URL.
+/// Conventions match what each analyzer writes into resource_id.
+fn resolve_console_target(p: &crate::predictive::Proposal) -> (String, String) {
+    let rid = p.scope.resource_id.as_deref().unwrap_or("");
+    if let Some(name) = rid.strip_prefix("docker:") {
+        return ("docker".into(), name.to_string());
+    }
+    if let Some(name) = rid.strip_prefix("lxc:") {
+        return ("lxc".into(), name.to_string());
+    }
+    if let Some(rest) = rid.strip_prefix("vm:") {
+        // vm scope is `vm:<name>:<disk_path>` — take the name only.
+        let name = rest.split(':').next().unwrap_or(rest);
+        return ("vm".into(), name.to_string());
+    }
+    // host shell for everything else: filesystem mounts (`/var/log`),
+    // certs (`letsencrypt:...`, `wolfstack-tls:...`), backup
+    // schedules (`backup:<id>`), node-level findings (`host`,
+    // `sshd`), and per-unit findings (`my-unit.service`).
+    ("host".into(), "host".into())
+}
+
+/// POST /api/proposals/run-now — synchronously run one orchestrator
+/// tick instead of waiting for the next 5-min cadence. Useful right
+/// after the operator clears a finding to refresh the inbox.
+pub async fn predictive_proposals_run_now(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let proposals = state.predictive_proposals.clone();
+    let acks = state.predictive_acks.clone();
+    let metrics = state.predictive_metrics.clone();
+    let monitor = state.monitor.clone();
+    let node_id = state.node_id.clone();
+    crate::predictive::orchestrator::tick(&proposals, &acks, &metrics, &monitor, &node_id).await;
+    invalidate_cluster_cache(&state);
+    HttpResponse::Ok().json(serde_json::json!({ "success": true }))
+}
+
+// ─── Acks (operator suppressions) ─────────────────────────────────
+
+pub async fn predictive_acks_list(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let store = match state.predictive_acks.read() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    HttpResponse::Ok().json(&store.acks)
+}
+
+#[derive(Deserialize)]
+pub struct CreateAckRequest {
+    pub finding_type: String,
+    pub scope: crate::predictive::AckScope,
+    pub reason: String,
+    /// `None` → 180-day default. `Some(n)` clamped to 1..3650.
+    pub lifetime_days: Option<i64>,
+}
+
+pub async fn predictive_acks_create(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<CreateAckRequest>,
+) -> HttpResponse {
+    let user = match require_auth(&req, &state) {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+    let r = body.into_inner();
+    if r.reason.trim().is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "ack reason is required — it's what makes the \
+                      suppression auditable later",
+        }));
+    }
+    let lifetime = r.lifetime_days
+        .map(|d| chrono::Duration::days(d.clamp(1, 3650)));
+    let ack = crate::predictive::Ack::new(
+        r.finding_type, r.scope, r.reason, user, lifetime,
+    );
+    let id = ack.id.clone();
+    let mut store = match state.predictive_acks.write() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    store.add(ack);
+    let _ = store.save();
+    drop(store);
+    invalidate_cluster_cache(&state);
+    HttpResponse::Ok().json(serde_json::json!({ "success": true, "id": id }))
+}
+
+pub async fn predictive_acks_remove(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let mut store = match state.predictive_acks.write() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    if store.remove(&id) {
+        let _ = store.save();
+        drop(store);
+        invalidate_cluster_cache(&state);
+        HttpResponse::Ok().json(serde_json::json!({ "success": true }))
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({ "error": "ack not found" }))
+    }
+}
+
 // ─── WhatsApp webhook (inbound via Twilio) ───
 
 /// POST /api/whatsapp/webhook — Twilio delivers inbound WhatsApp
@@ -19360,12 +20937,12 @@ pub async fn plugins_reload(req: HttpRequest, state: web::Data<AppState>) -> Htt
 
 const PLUGIN_INDEX_URL: &str = "https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfStack/master/pkg/index.json";
 
-/// GET /api/plugins/store — fetch available plugins from the plugin store (Enterprise only)
+/// GET /api/plugins/store — fetch available plugins from the plugin store (Pro+ only)
 pub async fn plugins_store(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    if !crate::compat::platform_ready() {
+    if !crate::compat::has_feature("plugins") {
         return HttpResponse::Forbidden().json(serde_json::json!({
-            "error": "Plugin store requires an Enterprise license",
+            "error": "Plugins require a Pro or Enterprise licence — upgrade at https://wolfstack.org/enterprise.php",
             "feature": "plugins"
         }));
     }
@@ -19423,12 +21000,12 @@ pub struct PluginInstallRequest {
     pub url: String,
 }
 
-/// POST /api/plugins/install — install a plugin from URL (Enterprise only)
+/// POST /api/plugins/install — install a plugin from URL (Pro+ only)
 pub async fn plugins_install(req: HttpRequest, state: web::Data<AppState>, body: web::Json<PluginInstallRequest>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    if !crate::compat::platform_ready() {
+    if !crate::compat::has_feature("plugins") {
         return HttpResponse::Forbidden().json(serde_json::json!({
-            "error": "Plugins require an Enterprise license",
+            "error": "Plugins require a Pro or Enterprise licence — upgrade at https://wolfstack.org/enterprise.php",
             "feature": "plugins"
         }));
     }
@@ -19464,11 +21041,11 @@ pub async fn plugins_toggle(req: HttpRequest, state: web::Data<AppState>, path: 
     }
 }
 
-/// GET /api/plugins/{id}/file/{path} — serve plugin web assets (JS/CSS) (Enterprise only)
+/// GET /api/plugins/{id}/file/{path} — serve plugin web assets (JS/CSS) (Pro+ only)
 pub async fn plugins_file(_req: HttpRequest, path: web::Path<(String, String)>) -> HttpResponse {
     // No auth required for static assets (they're loaded by the browser)
-    // But plugins are an Enterprise feature — don't serve assets without a license
-    if !crate::compat::platform_ready() {
+    // But plugins are gated to Pro+ — don't serve assets without that feature
+    if !crate::compat::has_feature("plugins") {
         return HttpResponse::Forbidden().finish();
     }
     let (plugin_id, file_path) = path.into_inner();
@@ -19591,10 +21168,21 @@ pub async fn plugin_data_file(req: HttpRequest, state: web::Data<AppState>, path
 
 // ─── Access Token Management ───
 
-/// GET /api/platform/status
+/// GET /api/platform/status — licence status + current host count.
+/// Used by the dashboard tier badge and the Settings → License view.
 pub async fn platform_status(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    HttpResponse::Ok().json(crate::compat::runtime_status())
+
+    let mut status = crate::compat::runtime_status();
+    let current_nodes = state.cluster.get_all_nodes().len() as u32;
+    if let Some(obj) = status.as_object_mut() {
+        obj.insert("current_nodes".to_string(), serde_json::json!(current_nodes));
+        // over_cap is informational — usage is never hard-blocked.
+        let cap = obj.get("max_nodes").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let over = cap > 0 && current_nodes > cap;
+        obj.insert("over_cap".to_string(), serde_json::json!(over));
+    }
+    HttpResponse::Ok().json(status)
 }
 
 #[derive(Deserialize)]
@@ -20087,6 +21675,21 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/auth/login", web::post().to(login))
         .route("/api/auth/logout", web::post().to(logout))
         .route("/api/auth/check", web::get().to(auth_check))
+        .route("/api/auth/passkey/available", web::get().to(passkey_available))
+        .route("/api/auth/passkey/register/start", web::post().to(passkey_register_start))
+        .route("/api/auth/passkey/register/finish", web::post().to(passkey_register_finish))
+        .route("/api/auth/passkey/login/start", web::post().to(passkey_login_start))
+        .route("/api/auth/passkey/login/finish", web::post().to(passkey_login_finish))
+        .route("/api/auth/passkeys", web::get().to(passkey_list))
+        .route("/api/auth/passkeys/{id}", web::delete().to(passkey_delete))
+        .route("/api/threat-intel/config", web::get().to(threat_intel_get_config))
+        .route("/api/threat-intel/config", web::patch().to(threat_intel_patch_config))
+        .route("/api/threat-intel/refresh", web::post().to(threat_intel_refresh))
+        .route("/api/threat-intel/pause", web::post().to(threat_intel_pause))
+        .route("/api/threat-intel/resume", web::post().to(threat_intel_resume))
+        .route("/api/threat-intel/status", web::get().to(threat_intel_status))
+        .route("/api/threat-intel/cluster-status", web::get().to(threat_intel_cluster_status))
+        .route("/api/threat-intel/lookup/{ip}", web::get().to(threat_intel_lookup))
         .route("/api/settings/login-disabled", web::get().to(login_disabled_status))
         .route("/api/settings/login-disabled", web::post().to(set_login_disabled))
         .route("/api/auth/smtp-configured", web::get().to(smtp_configured))
@@ -20125,6 +21728,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/cluster/diagnose", web::post().to(cluster_diagnose))
         .route("/api/nodes", web::get().to(get_nodes))
         .route("/api/nodes", web::post().to(add_node))
+        .route("/api/cluster/proxmox-cleanup", web::get().to(proxmox_cleanup_notice))
+        .route("/api/cluster/proxmox-cleanup/dismiss", web::post().to(proxmox_cleanup_dismiss))
         .route("/api/nodes/{id}", web::get().to(get_node))
         .route("/api/nodes/{id}", web::delete().to(remove_node))
         .route("/api/nodes/{id}/settings", web::patch().to(update_node_settings))
@@ -20161,6 +21766,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // Certificates
         .route("/api/certificates", web::post().to(request_certificate))
         .route("/api/certificates/list", web::get().to(list_certificates))
+        .route("/api/certificates/install", web::post().to(install_certificate))
+        .route("/api/certificates/self-signed", web::post().to(create_self_signed_certificate))
+        .route("/api/certificates/restart-service", web::post().to(cert_restart_service))
         // Containers
         .route("/api/containers/status", web::get().to(container_runtime_status))
         .route("/api/containers/install", web::post().to(install_container_runtime))
@@ -20591,6 +22199,20 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/alerts/config", web::post().to(alerts_config_save))
         .route("/api/alerts/test", web::post().to(alerts_test))
         .route("/api/system/install-package", web::post().to(system_install_package))
+        // Predictive ops — Inbox + Acks. Static segments before
+        // {id} so actix doesn't swallow them as ids.
+        .route("/api/proposals", web::get().to(predictive_proposals_list))
+        .route("/api/proposals/cluster", web::get().to(predictive_proposals_cluster))
+        .route("/api/proposals/history", web::get().to(predictive_proposals_history))
+        .route("/api/proposals/run-now", web::post().to(predictive_proposals_run_now))
+        .route("/api/proposals/{id}", web::get().to(predictive_proposal_get))
+        .route("/api/proposals/{id}/command/{idx}", web::get().to(predictive_proposal_command))
+        .route("/api/proposals/{id}/snooze", web::post().to(predictive_proposal_snooze))
+        .route("/api/proposals/{id}/dismiss", web::post().to(predictive_proposal_dismiss))
+        .route("/api/proposals/{id}/approve", web::post().to(predictive_proposal_approve))
+        .route("/api/proposal-acks", web::get().to(predictive_acks_list))
+        .route("/api/proposal-acks", web::post().to(predictive_acks_create))
+        .route("/api/proposal-acks/{id}", web::delete().to(predictive_acks_remove))
         // WolfAgents — named AI agents with persistent memory.
         .route("/api/agents", web::get().to(agents_list))
         .route("/api/agents", web::post().to(agents_create))
@@ -21562,4 +23184,118 @@ pub fn configure_statuspage_only(cfg: &mut web::ServiceConfig) {
         .route("/", web::get().to(statuspage_public_index))
         .route("/status", web::get().to(statuspage_public_index))
         .route("/status/{slug}", web::get().to(statuspage_public_page_dedicated));
+}
+
+#[cfg(test)]
+mod passkey_origin_tests {
+    use super::derive_passkey_rp_origin;
+
+    // Direct local access (no reverse proxy)
+    #[test]
+    fn direct_http_local_no_tls() {
+        let r = derive_passkey_rp_origin(Some("192.168.1.10:8553"), None, None, false).unwrap();
+        assert_eq!(r.0, "192.168.1.10");
+        assert_eq!(r.1, "http://192.168.1.10:8553");
+    }
+    #[test]
+    fn direct_https_local_with_tls() {
+        let r = derive_passkey_rp_origin(Some("wolfstack.local:8553"), None, None, true).unwrap();
+        assert_eq!(r.0, "wolfstack.local");
+        assert_eq!(r.1, "https://wolfstack.local:8553");
+    }
+
+    // Reverse proxy terminating TLS (the bug we just fixed) — wolfstack
+    // itself runs HTTP (tls_enabled=false) but X-Forwarded-Proto says https.
+    // Without the fix, origin would be http:// and webauthn-rs rejects.
+    #[test]
+    fn reverse_proxy_terminating_tls() {
+        let r = derive_passkey_rp_origin(
+            Some("10.0.0.5:8553"),         // wolfstack sees Host as the proxy's upstream
+            Some("wolfstack.example.com"), // X-Forwarded-Host preserved by nginx
+            Some("https"),                 // X-Forwarded-Proto from nginx
+            false,                         // wolfstack itself isn't running TLS
+        ).unwrap();
+        assert_eq!(r.0, "wolfstack.example.com");
+        assert_eq!(r.1, "https://wolfstack.example.com");
+    }
+
+    // Reverse proxy without X-Forwarded-Host (some setups only set proto).
+    #[test]
+    fn reverse_proxy_only_proto() {
+        let r = derive_passkey_rp_origin(
+            Some("wolfstack.example.com"), // proxy has rewritten Host to upstream
+            None,
+            Some("https"),
+            false,
+        ).unwrap();
+        assert_eq!(r.0, "wolfstack.example.com");
+        assert_eq!(r.1, "https://wolfstack.example.com");
+    }
+
+    // Multi-hop proxy chain: X-Forwarded-Host has comma-separated values,
+    // the first is the original client-facing host.
+    #[test]
+    fn multi_hop_takes_first_value() {
+        let r = derive_passkey_rp_origin(
+            Some("internal:8553"),
+            Some("external.example.com, edge-proxy.internal"),
+            Some("https, http"),
+            false,
+        ).unwrap();
+        assert_eq!(r.0, "external.example.com");
+        assert_eq!(r.1, "https://external.example.com");
+    }
+
+    // X-Forwarded-Host empty (some proxies set it to "" rather than dropping it).
+    #[test]
+    fn empty_forwarded_host_falls_back_to_host() {
+        let r = derive_passkey_rp_origin(Some("ws.local:8553"), Some(""), None, false).unwrap();
+        assert_eq!(r.0, "ws.local");
+        assert_eq!(r.1, "http://ws.local:8553");
+    }
+
+    // Bogus X-Forwarded-Proto values are ignored — fall back to local TLS.
+    #[test]
+    fn bogus_proto_falls_back() {
+        let r = derive_passkey_rp_origin(Some("ws.local"), None, Some("garbage"), true).unwrap();
+        assert_eq!(r.1, "https://ws.local");
+        let r = derive_passkey_rp_origin(Some("ws.local"), None, Some("ftp"), false).unwrap();
+        assert_eq!(r.1, "http://ws.local");
+    }
+
+    // Strip port for rp_id, keep port in origin.
+    #[test]
+    fn port_handling() {
+        let r = derive_passkey_rp_origin(Some("host.example.com:8553"), None, None, true).unwrap();
+        assert_eq!(r.0, "host.example.com");
+        assert_eq!(r.1, "https://host.example.com:8553");
+    }
+
+    // No Host at all → error (we can't construct an origin without one).
+    #[test]
+    fn missing_host_errors() {
+        let r = derive_passkey_rp_origin(None, None, None, false);
+        assert!(r.is_err());
+    }
+    #[test]
+    fn empty_host_errors() {
+        let r = derive_passkey_rp_origin(Some(""), Some(""), None, false);
+        assert!(r.is_err());
+    }
+
+    // IPv6 in host: rsplit_once(':') would chop on every colon. Verify the
+    // "all-digits port" check protects IPv6 literals like [::1]:8553 from
+    // being mangled. (The Host header for IPv6 is bracketed.)
+    #[test]
+    fn ipv6_host_with_port() {
+        let r = derive_passkey_rp_origin(Some("[::1]:8553"), None, None, false).unwrap();
+        assert_eq!(r.0, "[::1]");
+        assert_eq!(r.1, "http://[::1]:8553");
+    }
+    #[test]
+    fn ipv6_host_no_port() {
+        let r = derive_passkey_rp_origin(Some("[fe80::1]"), None, None, false).unwrap();
+        assert_eq!(r.0, "[fe80::1]");
+        assert_eq!(r.1, "http://[fe80::1]");
+    }
 }

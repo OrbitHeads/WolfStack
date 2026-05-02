@@ -654,14 +654,31 @@ fn scan_pve_certificates() -> Vec<(String, String, String)> {
     results
 }
 
+/// Locations under /etc/wolfstack where a user might naturally place their
+/// own cert+key. We probe all of these on startup and from the
+/// Certificates page so a manual `cp cert.pem /etc/wolfstack/tls/` works
+/// without an explicit ExecStart override (NyvenZA's v22.6.8 issue).
+///
+/// Each entry is (label, cert_path, key_path). Order matters — the first
+/// pair where BOTH files exist is what gets used by `find_tls_certificate`.
+fn wolfstack_local_cert_paths() -> &'static [(&'static str, &'static str, &'static str)] {
+    &[
+        ("wolfstack (custom)",         "/etc/wolfstack/cert.pem",            "/etc/wolfstack/key.pem"),
+        ("wolfstack (tls/)",           "/etc/wolfstack/tls/cert.pem",        "/etc/wolfstack/tls/key.pem"),
+        ("wolfstack (tls/ fullchain)", "/etc/wolfstack/tls/fullchain.pem",   "/etc/wolfstack/tls/privkey.pem"),
+        ("wolfstack (ssl/)",           "/etc/wolfstack/ssl/cert.pem",        "/etc/wolfstack/ssl/key.pem"),
+        ("wolfstack (ssl/ fullchain)", "/etc/wolfstack/ssl/fullchain.pem",   "/etc/wolfstack/ssl/privkey.pem"),
+    ]
+}
+
 /// Find TLS certificate files for a domain (Let's Encrypt or /etc/wolfstack/)
 /// Returns (cert_path, key_path) if both exist
 pub fn find_tls_certificate(domain: Option<&str>) -> Option<(String, String)> {
-    // Check explicit /etc/wolfstack/ paths first
-    let ws_cert = "/etc/wolfstack/cert.pem";
-    let ws_key = "/etc/wolfstack/key.pem";
-    if std::path::Path::new(ws_cert).exists() && std::path::Path::new(ws_key).exists() {
-        return Some((ws_cert.to_string(), ws_key.to_string()));
+    // Check the WolfStack-local cert locations first (cert.pem, tls/, ssl/, etc.)
+    for (_label, cert, key) in wolfstack_local_cert_paths() {
+        if std::path::Path::new(cert).exists() && std::path::Path::new(key).exists() {
+            return Some((cert.to_string(), key.to_string()));
+        }
     }
 
     // Try certbot CLI first
@@ -708,19 +725,32 @@ pub fn find_tls_certificate(domain: Option<&str>) -> Option<(String, String)> {
 pub fn list_certificates() -> serde_json::Value {
     let mut results = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let mut diagnostics: Vec<String> = Vec::new();
 
-    // 1. Check /etc/wolfstack/ custom certs
-    let ws_cert = "/etc/wolfstack/cert.pem";
-    let ws_key = "/etc/wolfstack/key.pem";
-    if std::path::Path::new(ws_cert).exists() && std::path::Path::new(ws_key).exists() {
-        seen.insert(ws_cert.to_string());
-        results.push(serde_json::json!({
-            "domain": "wolfstack (custom)",
-            "cert_path": ws_cert,
-            "key_path": ws_key,
-            "source": "custom",
-            "valid": true,
-        }));
+    // 1. Check every WolfStack-local cert location (cert.pem, tls/, ssl/, etc.)
+    // — both files of each pair required. For pairs where only one of the
+    // two files exists, surface a diagnostic so the user knows the partial
+    // install isn't being silently ignored.
+    for (label, cert_path, key_path) in wolfstack_local_cert_paths() {
+        let cert_exists = std::path::Path::new(cert_path).exists();
+        let key_exists  = std::path::Path::new(key_path).exists();
+        if cert_exists && key_exists {
+            if seen.contains(*cert_path) { continue; }
+            seen.insert(cert_path.to_string());
+            results.push(serde_json::json!({
+                "domain": label,
+                "cert_path": cert_path,
+                "key_path": key_path,
+                "source": "custom",
+                "valid": true,
+            }));
+        } else if cert_exists != key_exists {
+            let missing = if cert_exists { key_path } else { cert_path };
+            diagnostics.push(format!(
+                "⚠️ Found one of {} and {} but not both — missing {}. The cert will not be loaded until both files exist.",
+                cert_path, key_path, missing
+            ));
+        }
     }
 
     // 2. Certbot CLI
@@ -766,12 +796,815 @@ pub fn list_certificates() -> serde_json::Value {
         }));
     }
 
+    if results.is_empty() {
+        diagnostics.insert(0, "ℹ️ No TLS certificates found on this server".to_string());
+    } else {
+        diagnostics.insert(0, format!("✅ Found {} certificate(s)", results.len()));
+    }
+
     serde_json::json!({
         "certs": results,
-        "diagnostics": if results.is_empty() {
-            vec!["ℹ️ No TLS certificates found on this server".to_string()]
-        } else {
-            vec![format!("✅ Found {} certificate(s)", results.len())]
-        },
+        "diagnostics": diagnostics,
     })
+}
+
+/// Whitelist of directories the user may install/update a certificate into.
+/// Anything else is rejected to prevent path traversal or accidental writes
+/// to arbitrary locations like /etc/ssl/certs which are managed by the OS.
+fn cert_target_allowed(cert_path: &str, key_path: &str) -> Result<(), String> {
+    // /etc/wolfstack/ already covers /etc/wolfstack/tls/ and /etc/wolfstack/ssl/
+    // because the prefix match accepts subdirectories. We list it here for
+    // clarity; both `find_tls_certificate` and `list_certificates` actively
+    // probe those subdirectories so the cert-install UI can target them.
+    #[cfg(not(test))]
+    let allowed_prefixes: &[&str] = &[
+        "/etc/wolfstack/",
+        "/etc/pve/local/",
+        "/etc/pve/nodes/",
+    ];
+    // Test builds also accept /tmp/wolfstack-test/ so the cert flow can be
+    // exercised end-to-end without root or production paths.
+    #[cfg(test)]
+    let allowed_prefixes: &[&str] = &[
+        "/etc/wolfstack/",
+        "/etc/pve/local/",
+        "/etc/pve/nodes/",
+        "/tmp/wolfstack-test/",
+    ];
+    let ok = |p: &str| -> bool {
+        if p.contains("..") { return false; }
+        allowed_prefixes.iter().any(|prefix| p.starts_with(prefix))
+    };
+    if !ok(cert_path) {
+        return Err(format!("cert_path not in allowed locations: {}", cert_path));
+    }
+    if !ok(key_path) {
+        return Err(format!("key_path not in allowed locations: {}", key_path));
+    }
+    Ok(())
+}
+
+/// Validate that a PEM blob parses as an X.509 certificate (cert) or RSA/EC key.
+fn validate_pem(pem: &str, kind: &str) -> Result<(), String> {
+    let trimmed = pem.trim();
+    let header_ok = match kind {
+        "cert" => trimmed.starts_with("-----BEGIN CERTIFICATE-----"),
+        "key"  => trimmed.starts_with("-----BEGIN ")
+            && (trimmed.contains("PRIVATE KEY-----")),
+        _ => false,
+    };
+    if !header_ok {
+        return Err(format!("Provided {} does not look like a PEM block", kind));
+    }
+    if !trimmed.ends_with("-----") {
+        return Err(format!("Provided {} PEM is truncated", kind));
+    }
+    Ok(())
+}
+
+/// True if this PEM is a passphrase-protected private key. Detects both
+/// the modern PKCS#8 form (`-----BEGIN ENCRYPTED PRIVATE KEY-----`) and
+/// the legacy "traditional" PEM form which advertises encryption via a
+/// `Proc-Type: 4,ENCRYPTED` header inside an otherwise normal RSA/EC
+/// PRIVATE KEY block.
+fn is_encrypted_key_pem(pem: &str) -> bool {
+    let t = pem.trim();
+    if t.starts_with("-----BEGIN ENCRYPTED PRIVATE KEY-----") {
+        return true;
+    }
+    // Legacy: BEGIN RSA PRIVATE KEY + Proc-Type: 4,ENCRYPTED + DEK-Info
+    if t.contains("Proc-Type: 4,ENCRYPTED") {
+        return true;
+    }
+    false
+}
+
+/// Decrypt a passphrase-protected private key in place at `path`. The
+/// passphrase is passed via env var (visible only to root and the
+/// child process for its lifetime) — never via argv, where it would
+/// leak to anyone who can read /proc/<pid>/cmdline.
+fn decrypt_key_in_place(path: &str, passphrase: &str) -> Result<(), String> {
+    if !binary_exists("openssl") {
+        return Err("openssl binary not found — cannot decrypt key".into());
+    }
+    let tmp_out = format!("{}.dec", path);
+    let output = Command::new("openssl")
+        .args(["pkey", "-in", path, "-passin", "env:WS_KEY_PASS", "-out", &tmp_out])
+        .env("WS_KEY_PASS", passphrase)
+        .output()
+        .map_err(|e| format!("Failed to run openssl pkey: {}", e))?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&tmp_out);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let lower = stderr.to_lowercase();
+        if lower.contains("bad decrypt")
+            || lower.contains("bad password")
+            || lower.contains("wrong password")
+        {
+            return Err("Wrong passphrase for the supplied private key.".into());
+        }
+        return Err(format!("Key decryption failed: {}", stderr.trim()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp_out, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp_out, path)
+        .map_err(|e| format!("Failed to replace encrypted key with decrypted version: {}", e))
+}
+
+/// Confirm cert and key actually pair up by comparing their public-key moduli.
+/// Uses openssl, which is present on every distro WolfStack supports.
+fn verify_cert_key_pair(cert_path: &str, key_path: &str) -> Result<(), String> {
+    if !binary_exists("openssl") {
+        return Err("openssl binary not found — cannot verify certificate".into());
+    }
+    let cert_mod = Command::new("openssl")
+        .args(["x509", "-noout", "-modulus", "-in", cert_path])
+        .output()
+        .map_err(|e| format!("openssl x509 failed: {}", e))?;
+    if !cert_mod.status.success() {
+        return Err(format!(
+            "Certificate parse failed: {}",
+            String::from_utf8_lossy(&cert_mod.stderr).trim()
+        ));
+    }
+    // Try RSA first, fall back to generic pkey for EC keys.
+    let key_mod = Command::new("openssl")
+        .args(["rsa", "-noout", "-modulus", "-in", key_path])
+        .output()
+        .map_err(|e| format!("openssl rsa failed: {}", e))?;
+    if key_mod.status.success() {
+        if cert_mod.stdout != key_mod.stdout {
+            return Err("Certificate and private key do not match (modulus mismatch)".into());
+        }
+        return Ok(());
+    }
+    // EC key — compare public keys instead of moduli.
+    let cert_pub = Command::new("openssl")
+        .args(["x509", "-pubkey", "-noout", "-in", cert_path])
+        .output()
+        .map_err(|e| format!("openssl x509 pubkey failed: {}", e))?;
+    let key_pub = Command::new("openssl")
+        .args(["pkey", "-pubout", "-in", key_path])
+        .output()
+        .map_err(|e| format!("openssl pkey failed: {}", e))?;
+    if !cert_pub.status.success() || !key_pub.status.success() {
+        return Err("Could not extract public keys from cert/key for comparison".into());
+    }
+    if cert_pub.stdout != key_pub.stdout {
+        return Err("Certificate and private key do not match (public key mismatch)".into());
+    }
+    Ok(())
+}
+
+/// Install or update a certificate by writing user-supplied PEM blobs to disk.
+/// Defaults to /etc/wolfstack/{cert,key}.pem when target paths are not given.
+///
+/// The new files are written to `<path>.new` and validated against each other
+/// (cert <-> key modulus match) before being atomically renamed into place,
+/// so a bad upload never overwrites a working certificate.
+///
+/// `key_passphrase`: if the supplied private key is passphrase-protected
+/// (PKCS#8 ENCRYPTED PRIVATE KEY or legacy Proc-Type: ENCRYPTED), the
+/// passphrase is used to decrypt the key in place before validation. The
+/// stored key on disk is always unencrypted — wolfstack/pveproxy don't
+/// support prompting for a passphrase at startup.
+pub fn install_certificate_files(
+    cert_pem: &str,
+    key_pem: &str,
+    cert_path: Option<&str>,
+    key_path: Option<&str>,
+    key_passphrase: Option<&str>,
+) -> Result<String, String> {
+    let cert_path = cert_path.unwrap_or("/etc/wolfstack/cert.pem").to_string();
+    let key_path  = key_path.unwrap_or("/etc/wolfstack/key.pem").to_string();
+    cert_target_allowed(&cert_path, &key_path)?;
+    validate_pem(cert_pem, "cert")?;
+    validate_pem(key_pem, "key")?;
+
+    let key_is_encrypted = is_encrypted_key_pem(key_pem);
+    if key_is_encrypted && key_passphrase.map(|p| p.is_empty()).unwrap_or(true) {
+        return Err(
+            "Private key is passphrase-protected. Provide the passphrase in the \"Key passphrase\" field, or decrypt the key with `openssl pkey -in key.pem -out decrypted.pem` first."
+                .into(),
+        );
+    }
+
+    if let Some(parent) = std::path::Path::new(&cert_path).parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+    }
+    if let Some(parent) = std::path::Path::new(&key_path).parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+    }
+
+    let cert_tmp = format!("{}.new", cert_path);
+    let key_tmp  = format!("{}.new", key_path);
+
+    let cleanup = |paths: &[&str]| {
+        for p in paths { let _ = std::fs::remove_file(p); }
+    };
+
+    if let Err(e) = std::fs::write(&cert_tmp, cert_pem.trim_end().to_string() + "\n") {
+        cleanup(&[&cert_tmp]);
+        return Err(format!("Failed to write {}: {}", cert_tmp, e));
+    }
+    if let Err(e) = std::fs::write(&key_tmp, key_pem.trim_end().to_string() + "\n") {
+        cleanup(&[&cert_tmp, &key_tmp]);
+        return Err(format!("Failed to write {}: {}", key_tmp, e));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&cert_tmp, std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::set_permissions(&key_tmp,  std::fs::Permissions::from_mode(0o600));
+    }
+
+    // If the key is encrypted, decrypt it on disk now that it's at .new.
+    // The decrypted version replaces the .new file; the unencrypted form
+    // is what gets atomically renamed into place at the end.
+    if key_is_encrypted {
+        if let Err(e) = decrypt_key_in_place(&key_tmp, key_passphrase.unwrap_or("")) {
+            cleanup(&[&cert_tmp, &key_tmp]);
+            return Err(e);
+        }
+    }
+
+    if let Err(e) = verify_cert_key_pair(&cert_tmp, &key_tmp) {
+        cleanup(&[&cert_tmp, &key_tmp]);
+        return Err(e);
+    }
+
+    if let Err(e) = std::fs::rename(&cert_tmp, &cert_path) {
+        cleanup(&[&cert_tmp, &key_tmp]);
+        return Err(format!("Failed to move cert into place ({}): {}", cert_path, e));
+    }
+    if let Err(e) = std::fs::rename(&key_tmp, &key_path) {
+        cleanup(&[&key_tmp]);
+        return Err(format!("Failed to move key into place ({}): {}", key_path, e));
+    }
+
+    let restart_hint = cert_restart_hint(&cert_path);
+    Ok(format!(
+        "Certificate installed to {} (key: {}). {}",
+        cert_path, key_path, restart_hint
+    ))
+}
+
+/// What service needs reloading after writing to this cert path.
+fn cert_restart_hint(cert_path: &str) -> &'static str {
+    if cert_path.starts_with("/etc/pve/") {
+        "Restart pveproxy on the Proxmox host to activate."
+    } else {
+        "Restart WolfStack to activate."
+    }
+}
+
+/// Which systemd unit needs reloading for a given cert path.
+/// Proxmox certs → `pveproxy`; everything else → `wolfstack`.
+pub fn restart_service_name_for_cert(cert_path: &str) -> &'static str {
+    if cert_path.starts_with("/etc/pve/") { "pveproxy" } else { "wolfstack" }
+}
+
+/// Schedule a deferred restart of one of the two services we touch from
+/// the cert flow. The restart runs in a detached thread after a short
+/// delay so the HTTP response that triggered it can flush back to the
+/// caller before systemd kills us. Only `wolfstack` and `pveproxy` are
+/// accepted — arbitrary unit names are rejected so this can't be used
+/// as a generic systemctl-restart wrapper.
+pub fn restart_cert_service(service: &str) -> Result<String, String> {
+    let delay_ms = match service {
+        "wolfstack" => 1500u64, // we're being killed — flush response first
+        "pveproxy"  => 100u64,  // separate process, no flush concern
+        other => return Err(format!("Refusing to restart unexpected service '{}'", other)),
+    };
+    let svc = service.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        let _ = Command::new("systemctl")
+            .args(["restart", &svc])
+            .output();
+    });
+    Ok(format!("Restart of {} scheduled (in {}ms).", service, delay_ms))
+}
+
+/// Generate a self-signed certificate via openssl and install it.
+/// `host` is the primary CN; `alt_names` may add additional DNS/IP SANs.
+pub fn generate_self_signed_certificate(
+    host: &str,
+    alt_names: &[String],
+    cert_path: Option<&str>,
+    key_path: Option<&str>,
+    days: u32,
+) -> Result<String, String> {
+    if host.trim().is_empty() {
+        return Err("Hostname / CN is required".into());
+    }
+    if !binary_exists("openssl") {
+        return Err("openssl binary not found — install openssl to generate self-signed certs".into());
+    }
+    let cert_path = cert_path.unwrap_or("/etc/wolfstack/cert.pem").to_string();
+    let key_path  = key_path.unwrap_or("/etc/wolfstack/key.pem").to_string();
+    cert_target_allowed(&cert_path, &key_path)?;
+
+    if let Some(parent) = std::path::Path::new(&cert_path).parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+    }
+    if let Some(parent) = std::path::Path::new(&key_path).parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+    }
+
+    // Build the SAN list — always include the CN, plus any user-supplied alt names.
+    let mut sans: Vec<String> = Vec::new();
+    let push_san = |sans: &mut Vec<String>, v: &str| {
+        let v = v.trim();
+        if v.is_empty() { return; }
+        let entry = if v.parse::<std::net::IpAddr>().is_ok() {
+            format!("IP:{}", v)
+        } else {
+            format!("DNS:{}", v)
+        };
+        if !sans.contains(&entry) { sans.push(entry); }
+    };
+    push_san(&mut sans, host);
+    for n in alt_names { push_san(&mut sans, n); }
+    let san_arg = format!("subjectAltName={}", sans.join(","));
+    let subj = format!("/CN={}", host);
+    let days_str = days.max(1).to_string();
+
+    // Generate to .new and atomically rename, so a failed openssl invocation
+    // doesn't clobber an existing certificate.
+    let cert_tmp = format!("{}.new", cert_path);
+    let key_tmp  = format!("{}.new", key_path);
+
+    let output = Command::new("openssl")
+        .args([
+            "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-sha256",
+            "-keyout", &key_tmp,
+            "-out",    &cert_tmp,
+            "-days",   &days_str,
+            "-subj",   &subj,
+            "-addext", &san_arg,
+        ])
+        .output()
+        .map_err(|e| format!("Failed to run openssl: {}", e))?;
+
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&cert_tmp);
+        let _ = std::fs::remove_file(&key_tmp);
+        return Err(format!(
+            "openssl req failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&cert_tmp, std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::set_permissions(&key_tmp,  std::fs::Permissions::from_mode(0o600));
+    }
+
+    if let Err(e) = std::fs::rename(&cert_tmp, &cert_path) {
+        let _ = std::fs::remove_file(&cert_tmp);
+        let _ = std::fs::remove_file(&key_tmp);
+        return Err(format!("Failed to move cert into place ({}): {}", cert_path, e));
+    }
+    if let Err(e) = std::fs::rename(&key_tmp, &key_path) {
+        let _ = std::fs::remove_file(&key_tmp);
+        return Err(format!("Failed to move key into place ({}): {}", key_path, e));
+    }
+
+    Ok(format!(
+        "Self-signed certificate for {} generated at {} (key: {}). {}",
+        host, cert_path, key_path, cert_restart_hint(&cert_path)
+    ))
+}
+
+#[cfg(test)]
+mod cert_tests {
+    use super::*;
+    use std::process::Command;
+
+    /// Each test gets its own isolated subdirectory under /tmp/wolfstack-test/
+    /// so they can run in parallel without trampling each other's files.
+    /// Returns (cert_path, key_path) for the test to use.
+    fn isolated_paths(test_name: &str) -> (String, String) {
+        let dir = format!("/tmp/wolfstack-test/{}", test_name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        (format!("{}/cert.pem", dir), format!("{}/key.pem", dir))
+    }
+
+    fn cleanup(test_name: &str) {
+        let dir = format!("/tmp/wolfstack-test/{}", test_name);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Monotonic counter so each helper invocation gets a unique scratch dir.
+    /// Tests within one process all share PID, so basing the dir name on
+    /// PID + counter avoids collisions when tests run in parallel and
+    /// stops the dir-deleted-by-one-test-while-another-uses-it race.
+    fn unique_id() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        N.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Helper: generate a real RSA key + self-signed cert pair via openssl,
+    /// return (cert_pem, key_pem) strings.
+    fn make_rsa_pair(cn: &str) -> (String, String) {
+        let dir = format!("/tmp/wolfstack-test/_helper-{}-{}", std::process::id(), unique_id());
+        std::fs::create_dir_all(&dir).expect("create helper dir");
+        let key_path = format!("{}/k.pem", dir);
+        let cert_path = format!("{}/c.pem", dir);
+        let out = Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-sha256",
+                   "-keyout", &key_path, "-out", &cert_path,
+                   "-days", "1", "-subj", &format!("/CN={}", cn)])
+            .output().unwrap();
+        assert!(out.status.success(), "openssl req failed: {}", String::from_utf8_lossy(&out.stderr));
+        let cert_pem = std::fs::read_to_string(&cert_path).unwrap();
+        let key_pem = std::fs::read_to_string(&key_path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        (cert_pem, key_pem)
+    }
+
+    fn make_encrypted_pkcs8_key(passphrase: &str) -> String {
+        let dir = format!("/tmp/wolfstack-test/_helper-enc-{}-{}", std::process::id(), unique_id());
+        std::fs::create_dir_all(&dir).expect("create helper dir");
+        let plain = format!("{}/plain.pem", dir);
+        let enc = format!("{}/enc.pem", dir);
+        let out = Command::new("openssl").args(["genrsa", "-out", &plain, "2048"]).output().unwrap();
+        assert!(out.status.success(), "openssl genrsa failed: {}", String::from_utf8_lossy(&out.stderr));
+        let out = Command::new("openssl")
+            .args(["pkcs8", "-topk8", "-in", &plain,
+                   "-passout", &format!("pass:{}", passphrase),
+                   "-out", &enc])
+            .output().unwrap();
+        assert!(out.status.success(), "openssl pkcs8 failed: {}", String::from_utf8_lossy(&out.stderr));
+        let pem = std::fs::read_to_string(&enc).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        pem
+    }
+
+    // ─── validate_pem ─────────────────────────────────────────────────────
+    #[test]
+    fn validate_pem_accepts_valid_cert() {
+        let (cert, _) = make_rsa_pair("validate-cert.test");
+        assert!(validate_pem(&cert, "cert").is_ok());
+    }
+    #[test]
+    fn validate_pem_accepts_valid_key() {
+        let (_, key) = make_rsa_pair("validate-key.test");
+        assert!(validate_pem(&key, "key").is_ok());
+    }
+    #[test]
+    fn validate_pem_rejects_garbage() {
+        assert!(validate_pem("not a pem block", "cert").is_err());
+        assert!(validate_pem("not a pem block", "key").is_err());
+    }
+    #[test]
+    fn validate_pem_rejects_truncated() {
+        assert!(validate_pem("-----BEGIN CERTIFICATE-----\nMIIBIj", "cert").is_err());
+    }
+    #[test]
+    fn validate_pem_accepts_encrypted_key() {
+        let pem = make_encrypted_pkcs8_key("hunter2");
+        // Encrypted PKCS#8 starts with BEGIN ENCRYPTED PRIVATE KEY which still
+        // matches the "PRIVATE KEY-----" substring rule.
+        assert!(validate_pem(&pem, "key").is_ok());
+    }
+
+    // ─── is_encrypted_key_pem ─────────────────────────────────────────────
+    #[test]
+    fn detects_pkcs8_encrypted() {
+        let pem = make_encrypted_pkcs8_key("foo");
+        assert!(is_encrypted_key_pem(&pem));
+    }
+    #[test]
+    fn detects_legacy_proc_type_encrypted() {
+        // Hand-crafted minimal PEM with the legacy header. We don't need a
+        // real key body — is_encrypted_key_pem only inspects headers.
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,1234\n\nABCD\n-----END RSA PRIVATE KEY-----\n";
+        assert!(is_encrypted_key_pem(pem));
+    }
+    #[test]
+    fn unencrypted_key_not_detected_as_encrypted() {
+        let (_, key) = make_rsa_pair("unenc.test");
+        assert!(!is_encrypted_key_pem(&key));
+    }
+
+    // ─── verify_cert_key_pair ─────────────────────────────────────────────
+    #[test]
+    fn verify_matching_rsa_pair() {
+        let (cert_path, key_path) = isolated_paths("verify-rsa-match");
+        let (cert, key) = make_rsa_pair("verify-rsa.test");
+        std::fs::write(&cert_path, cert).unwrap();
+        std::fs::write(&key_path, key).unwrap();
+        assert!(verify_cert_key_pair(&cert_path, &key_path).is_ok());
+        cleanup("verify-rsa-match");
+    }
+    #[test]
+    fn verify_mismatched_rsa_pair_rejects() {
+        let (cert_path, key_path) = isolated_paths("verify-rsa-mismatch");
+        let (cert_a, _) = make_rsa_pair("a.test");
+        let (_, key_b) = make_rsa_pair("b.test");
+        std::fs::write(&cert_path, cert_a).unwrap();
+        std::fs::write(&key_path, key_b).unwrap();
+        let r = verify_cert_key_pair(&cert_path, &key_path);
+        assert!(r.is_err(), "expected mismatch rejection");
+        assert!(r.unwrap_err().to_lowercase().contains("do not match"));
+        cleanup("verify-rsa-mismatch");
+    }
+
+    // ─── decrypt_key_in_place ─────────────────────────────────────────────
+    #[test]
+    fn decrypt_with_correct_passphrase() {
+        let dir = "/tmp/wolfstack-test/decrypt-ok";
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let path = format!("{}/key.pem", dir);
+        std::fs::write(&path, make_encrypted_pkcs8_key("rightpass")).unwrap();
+        assert!(decrypt_key_in_place(&path, "rightpass").is_ok());
+        // After decrypt, file should now be a plain (unencrypted) PRIVATE KEY.
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("-----BEGIN PRIVATE KEY-----"));
+        assert!(!after.contains("ENCRYPTED PRIVATE KEY"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn decrypt_with_wrong_passphrase_errors() {
+        let dir = "/tmp/wolfstack-test/decrypt-bad";
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let path = format!("{}/key.pem", dir);
+        std::fs::write(&path, make_encrypted_pkcs8_key("rightpass")).unwrap();
+        let r = decrypt_key_in_place(&path, "wrongpass");
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_lowercase().contains("wrong passphrase"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ─── cert_target_allowed ──────────────────────────────────────────────
+    #[test]
+    fn whitelist_accepts_wolfstack_paths() {
+        assert!(cert_target_allowed(
+            "/etc/wolfstack/cert.pem", "/etc/wolfstack/key.pem"
+        ).is_ok());
+    }
+    #[test]
+    fn whitelist_accepts_proxmox_paths() {
+        assert!(cert_target_allowed(
+            "/etc/pve/local/pveproxy-ssl.pem", "/etc/pve/local/pveproxy-ssl.key"
+        ).is_ok());
+        assert!(cert_target_allowed(
+            "/etc/pve/nodes/pve1/pveproxy-ssl.pem", "/etc/pve/nodes/pve1/pveproxy-ssl.key"
+        ).is_ok());
+    }
+    #[test]
+    fn whitelist_rejects_arbitrary_paths() {
+        assert!(cert_target_allowed("/etc/passwd", "/etc/wolfstack/key.pem").is_err());
+        assert!(cert_target_allowed("/var/lib/cert.pem", "/var/lib/key.pem").is_err());
+    }
+    #[test]
+    fn whitelist_rejects_path_traversal() {
+        assert!(cert_target_allowed(
+            "/etc/wolfstack/../passwd", "/etc/wolfstack/key.pem"
+        ).is_err());
+    }
+    #[test]
+    fn whitelist_accepts_wolfstack_subdirectories() {
+        // NyvenZA's path — /etc/wolfstack/tls/ is a natural place users put
+        // certs and the cert-install UI must accept it as a write target.
+        assert!(cert_target_allowed(
+            "/etc/wolfstack/tls/cert.pem", "/etc/wolfstack/tls/key.pem"
+        ).is_ok());
+        assert!(cert_target_allowed(
+            "/etc/wolfstack/ssl/fullchain.pem", "/etc/wolfstack/ssl/privkey.pem"
+        ).is_ok());
+    }
+
+    #[test]
+    fn local_cert_paths_table_includes_tls_and_ssl_subdirs() {
+        // Regression test for NyvenZA — the bug was that the discovery code
+        // only looked at /etc/wolfstack/cert.pem and /etc/wolfstack/key.pem,
+        // ignoring /etc/wolfstack/tls/ entirely. Verify the path table that
+        // both find_tls_certificate and list_certificates iterate over now
+        // includes the tls/ and ssl/ subdirectories.
+        let paths = wolfstack_local_cert_paths();
+        let cert_paths: Vec<&str> = paths.iter().map(|(_, c, _)| *c).collect();
+        assert!(cert_paths.contains(&"/etc/wolfstack/cert.pem"),
+            "must keep the original /etc/wolfstack/cert.pem entry");
+        assert!(cert_paths.contains(&"/etc/wolfstack/tls/cert.pem"),
+            "must probe /etc/wolfstack/tls/cert.pem (NyvenZA's path)");
+        assert!(cert_paths.contains(&"/etc/wolfstack/tls/fullchain.pem"),
+            "must probe /etc/wolfstack/tls/fullchain.pem (Let's-Encrypt-style naming)");
+        assert!(cert_paths.contains(&"/etc/wolfstack/ssl/cert.pem"),
+            "must probe /etc/wolfstack/ssl/cert.pem (alt convention)");
+    }
+
+    // ─── generate_self_signed_certificate ─────────────────────────────────
+    #[test]
+    fn self_signed_end_to_end() {
+        let (cert_path, key_path) = isolated_paths("self-signed-e2e");
+        let r = generate_self_signed_certificate(
+            "test.lan",
+            &["test".to_string(), "192.168.1.10".to_string()],
+            Some(&cert_path),
+            Some(&key_path),
+            30,
+        );
+        assert!(r.is_ok(), "{:?}", r);
+        // Cert exists, key exists, modulus matches.
+        assert!(std::path::Path::new(&cert_path).exists());
+        assert!(std::path::Path::new(&key_path).exists());
+        assert!(verify_cert_key_pair(&cert_path, &key_path).is_ok());
+        // SANs include both the DNS name and the IP.
+        let san_out = Command::new("openssl")
+            .args(["x509", "-in", &cert_path, "-noout", "-ext", "subjectAltName"])
+            .output().unwrap();
+        let san = String::from_utf8_lossy(&san_out.stdout);
+        assert!(san.contains("DNS:test.lan"), "expected DNS:test.lan in SANs, got: {}", san);
+        assert!(san.contains("DNS:test"), "expected DNS:test in SANs, got: {}", san);
+        assert!(san.contains("IP Address:192.168.1.10"), "expected IP SAN, got: {}", san);
+        cleanup("self-signed-e2e");
+    }
+    #[test]
+    fn self_signed_rejects_empty_host() {
+        let (cert_path, key_path) = isolated_paths("self-signed-empty");
+        let r = generate_self_signed_certificate("", &[], Some(&cert_path), Some(&key_path), 30);
+        assert!(r.is_err());
+        cleanup("self-signed-empty");
+    }
+    #[test]
+    fn self_signed_rejects_bad_path() {
+        let r = generate_self_signed_certificate(
+            "test.lan", &[],
+            Some("/etc/passwd"), Some("/etc/wolfstack/key.pem"),
+            30,
+        );
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("not in allowed"));
+    }
+
+    // ─── install_certificate_files ────────────────────────────────────────
+    #[test]
+    fn install_unencrypted_pair() {
+        let (cert_path, key_path) = isolated_paths("install-plain");
+        let (cert, key) = make_rsa_pair("install-plain.test");
+        let r = install_certificate_files(
+            &cert, &key, Some(&cert_path), Some(&key_path), None,
+        );
+        assert!(r.is_ok(), "{:?}", r);
+        assert!(std::path::Path::new(&cert_path).exists());
+        assert!(std::path::Path::new(&key_path).exists());
+        // Modes: cert 0644, key 0600.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let cert_mode = std::fs::metadata(&cert_path).unwrap().permissions().mode() & 0o777;
+            let key_mode  = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(cert_mode, 0o644, "cert mode should be 0644");
+            assert_eq!(key_mode,  0o600, "key mode should be 0600");
+        }
+        cleanup("install-plain");
+    }
+    #[test]
+    fn install_mismatched_pair_does_not_overwrite_existing() {
+        let (cert_path, key_path) = isolated_paths("install-mismatch");
+        // Pre-populate with a known-good pair.
+        let (good_cert, good_key) = make_rsa_pair("good.test");
+        std::fs::write(&cert_path, &good_cert).unwrap();
+        std::fs::write(&key_path,  &good_key).unwrap();
+        // Try to install a mismatched pair (cert from A, key from B).
+        let (bad_cert, _) = make_rsa_pair("bad-A.test");
+        let (_, bad_key)  = make_rsa_pair("bad-B.test");
+        let r = install_certificate_files(
+            &bad_cert, &bad_key, Some(&cert_path), Some(&key_path), None,
+        );
+        assert!(r.is_err());
+        // Original files MUST be untouched.
+        assert_eq!(std::fs::read_to_string(&cert_path).unwrap(), good_cert);
+        assert_eq!(std::fs::read_to_string(&key_path).unwrap(),  good_key);
+        // No leftover .new files.
+        assert!(!std::path::Path::new(&format!("{}.new", cert_path)).exists());
+        assert!(!std::path::Path::new(&format!("{}.new", key_path)).exists());
+        cleanup("install-mismatch");
+    }
+    #[test]
+    fn install_encrypted_key_without_passphrase_errors() {
+        let (cert_path, key_path) = isolated_paths("install-enc-no-pass");
+        let (cert, _) = make_rsa_pair("enc-no-pass.test");
+        let enc_key = make_encrypted_pkcs8_key("secret");
+        let r = install_certificate_files(
+            &cert, &enc_key, Some(&cert_path), Some(&key_path), None,
+        );
+        assert!(r.is_err());
+        let msg = r.unwrap_err();
+        assert!(msg.to_lowercase().contains("passphrase-protected") || msg.to_lowercase().contains("passphrase"),
+            "expected passphrase prompt message, got: {}", msg);
+        cleanup("install-enc-no-pass");
+    }
+    #[test]
+    fn install_encrypted_key_with_correct_passphrase_works() {
+        // Generate a real keypair, encrypt the key, then install with passphrase.
+        // The decrypted key must match the cert.
+        let dir = "/tmp/wolfstack-test/install-enc-ok";
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+
+        let plain_key_path = format!("{}/plain.key", dir);
+        let cert_path_helper = format!("{}/c.pem", dir);
+        // Make matching cert+key in one shot.
+        let out = Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-sha256",
+                   "-keyout", &plain_key_path, "-out", &cert_path_helper,
+                   "-days", "1", "-subj", "/CN=enc-install.test"])
+            .output().unwrap();
+        assert!(out.status.success());
+        let cert_pem = std::fs::read_to_string(&cert_path_helper).unwrap();
+        // Encrypt the key.
+        let enc_key_path = format!("{}/enc.key", dir);
+        let out = Command::new("openssl")
+            .args(["pkcs8", "-topk8", "-in", &plain_key_path,
+                   "-passout", "pass:s3cret", "-out", &enc_key_path])
+            .output().unwrap();
+        assert!(out.status.success());
+        let enc_key_pem = std::fs::read_to_string(&enc_key_path).unwrap();
+
+        // Install target paths.
+        let install_cert = format!("{}/installed.pem", dir);
+        let install_key  = format!("{}/installed.key", dir);
+        let r = install_certificate_files(
+            &cert_pem, &enc_key_pem,
+            Some(&install_cert), Some(&install_key),
+            Some("s3cret"),
+        );
+        assert!(r.is_ok(), "{:?}", r);
+        // Installed key on disk is now unencrypted (nothing supports prompting).
+        let installed_key = std::fs::read_to_string(&install_key).unwrap();
+        assert!(installed_key.contains("-----BEGIN PRIVATE KEY-----"));
+        assert!(!installed_key.contains("ENCRYPTED"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn install_encrypted_key_with_wrong_passphrase_errors_and_preserves_existing() {
+        let dir = "/tmp/wolfstack-test/install-enc-bad";
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let cert_path = format!("{}/cert.pem", dir);
+        let key_path  = format!("{}/key.pem", dir);
+        // Pre-existing valid pair.
+        let (good_cert, good_key) = make_rsa_pair("preserve.test");
+        std::fs::write(&cert_path, &good_cert).unwrap();
+        std::fs::write(&key_path,  &good_key).unwrap();
+        // Try install with encrypted key + wrong passphrase.
+        let (new_cert, _) = make_rsa_pair("new.test");
+        let enc_key = make_encrypted_pkcs8_key("rightpass");
+        let r = install_certificate_files(
+            &new_cert, &enc_key, Some(&cert_path), Some(&key_path), Some("WRONG"),
+        );
+        assert!(r.is_err());
+        // Existing files preserved.
+        assert_eq!(std::fs::read_to_string(&cert_path).unwrap(), good_cert);
+        assert_eq!(std::fs::read_to_string(&key_path).unwrap(),  good_key);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ─── restart_service_name_for_cert ────────────────────────────────────
+    #[test]
+    fn restart_name_for_pve_paths() {
+        assert_eq!(restart_service_name_for_cert("/etc/pve/local/x.pem"), "pveproxy");
+        assert_eq!(restart_service_name_for_cert("/etc/pve/nodes/pve1/x.pem"), "pveproxy");
+    }
+    #[test]
+    fn restart_name_for_wolfstack_paths() {
+        assert_eq!(restart_service_name_for_cert("/etc/wolfstack/cert.pem"), "wolfstack");
+    }
+
+    // ─── restart_cert_service ─────────────────────────────────────────────
+    #[test]
+    fn restart_cert_service_rejects_arbitrary_unit() {
+        let r = restart_cert_service("nginx");
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("Refusing"));
+    }
+    #[test]
+    fn restart_cert_service_accepts_known_units() {
+        // We don't actually want to restart these in the test env. The
+        // function spawns a thread with a delay; we verify it returns Ok
+        // without waiting for the thread (the systemctl call inside the
+        // thread will fail without root, but we don't care — we're testing
+        // input validation, not the thread side-effect).
+        assert!(restart_cert_service("wolfstack").is_ok());
+        assert!(restart_cert_service("pveproxy").is_ok());
+    }
 }

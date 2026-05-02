@@ -117,7 +117,9 @@ pub async fn dispatch(
 
 fn tool_list_nodes(state: &crate::api::AppState) -> Result<serde_json::Value, String> {
     let nodes = state.cluster.get_all_nodes();
-    let out: Vec<serde_json::Value> = nodes.iter().map(|n| serde_json::json!({
+    let out: Vec<serde_json::Value> = nodes.iter()
+        .filter(|n| n.node_type != "proxmox")
+        .map(|n| serde_json::json!({
         "id": n.id,
         "hostname": n.hostname,
         "address": n.address,

@@ -66,6 +66,12 @@ pub fn build_ruleset(config: &RouterConfig, self_node_id: &str) -> String {
         out.push_str(&format!("-A {} -i lo -j ACCEPT\n", ch));
     }
 
+    // Threat Intel — when enabled and not in dry-run, inject a chain that
+    // matches against the wolfstack-threat-intel ipset and DROPs. Empty
+    // string when threat-intel is off or dry-running, so the ruleset is
+    // unchanged for users not opting in.
+    out.push_str(&crate::threat_intel::firewall::iptables_lines_v4());
+
     // User rules in order. Rules without a node_id match on any node;
     // rules with node_id set only apply on that node.
     let mut rules: Vec<&FirewallRule> = config.rules.iter()

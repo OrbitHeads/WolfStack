@@ -258,6 +258,68 @@ async fn proxy_router_get_to_node(
         .body(format!("all upstream URLs failed, last error: {}", last_err))
 }
 
+/// Sibling of `proxy_router_get_to_node` for POST routes. Used by the
+/// LAN Health one-click actions (`restart-dnsmasq`, `set-interface`)
+/// when the target LAN is owned by a remote node — the operator
+/// triggered the action from any cluster node, but the actual side
+/// effect (`dhcp::start`, write to `/etc/wolfstack/router.json`) only
+/// makes sense on the owner.
+///
+/// Same URL fallback ladder as the GET variant. Body is JSON-encoded.
+async fn proxy_router_post_to_node(
+    state: S,
+    node_id: &str,
+    api_path: &str,
+    body: serde_json::Value,
+) -> HttpResponse {
+    let node = match state.cluster.get_node(node_id) {
+        Some(n) => n,
+        None => return HttpResponse::NotFound().body(format!("node {} not found", node_id)),
+    };
+    if node.is_self {
+        return HttpResponse::BadRequest().body("refusing to proxy to self");
+    }
+    let internal_port = node.port + 1;
+    let host = resolve_node_address(&node.address);
+    let urls = [
+        format!("https://{}:{}/api/{}", host, node.port, api_path),
+        format!("http://{}:{}/api/{}", host, internal_port, api_path),
+        format!("http://{}:{}/api/{}", host, node.port, api_path),
+    ];
+    let client = &*ROUTER_RPC_CLIENT;
+    let mut last_err = String::new();
+    for url in &urls {
+        let res = client.post(url)
+            .header("X-WolfStack-Secret", &state.cluster_secret)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(30))
+            .send().await;
+        match res {
+            Ok(r) => {
+                let status = r.status();
+                let actix_status = actix_web::http::StatusCode::from_u16(status.as_u16())
+                    .unwrap_or(actix_web::http::StatusCode::BAD_GATEWAY);
+                let content_type = r.headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("application/json")
+                    .to_string();
+                match r.bytes().await {
+                    Ok(body) => {
+                        return HttpResponse::build(actix_status)
+                            .insert_header(("content-type", content_type))
+                            .body(body);
+                    }
+                    Err(e) => { last_err = format!("read body: {}", e); continue; }
+                }
+            }
+            Err(e) => { last_err = format!("{} → {}", url, e); continue; }
+        }
+    }
+    HttpResponse::BadGateway()
+        .body(format!("all upstream URLs failed, last error: {}", last_err))
+}
+
 /// Minimal query-param encoder — only escapes the handful of bytes that
 /// actually break a URL. Sufficient for passing through `?lines=N`
 /// style values we control on both ends.
@@ -481,6 +543,37 @@ pub async fn config_receive(
     HttpResponse::Ok().body("synced")
 }
 
+/// Verify `value` is a syntactically valid IPv4 dotted-quad AND falls
+/// inside `cidr`. Returns a descriptive error keyed by field name when
+/// either check fails. Catches:
+///   • typos like "10.1010.100" or "192.168..1" (parse failure)
+///   • configurations like router_ip=10.0.0.1 with subnet 192.168.1.0/24
+///     (parses but isn't in the network — clients DHCP'd in would have a
+///     gateway off-segment, traffic gets routed but ARP fails)
+fn validate_ipv4_in_cidr(field: &str, value: &str, cidr: &str) -> Result<(), String> {
+    let value_trimmed = value.trim();
+    let ip: std::net::Ipv4Addr = value_trimmed.parse()
+        .map_err(|_| format!("'{}' = '{}' is not a valid IPv4 address", field, value_trimmed))?;
+    let (net_str, prefix_str) = cidr.split_once('/')
+        .ok_or_else(|| format!("subnet_cidr '{}' is malformed (missing '/')", cidr))?;
+    let net: std::net::Ipv4Addr = net_str.parse()
+        .map_err(|_| format!("subnet_cidr '{}' has invalid network part", cidr))?;
+    let prefix: u8 = prefix_str.parse()
+        .map_err(|_| format!("subnet_cidr '{}' has invalid prefix", cidr))?;
+    if prefix > 32 {
+        return Err(format!("subnet_cidr '{}' prefix > 32", cidr));
+    }
+    let mask: u32 = if prefix == 0 { 0 } else { (!0u32) << (32 - prefix) };
+    if (u32::from(ip) & mask) != (u32::from(net) & mask) {
+        return Err(format!(
+            "'{}' = {} is not inside the LAN's subnet {} — \
+             clients leased an IP from this LAN would have an off-segment gateway and traffic would silently fail",
+            field, value_trimmed, cidr
+        ));
+    }
+    Ok(())
+}
+
 /// Reject a LanSegment whose user-supplied fields contain newlines or
 /// other dnsmasq directive separators. dhcp::render_config writes these
 /// into a config file unescaped — without this guard a maliciously
@@ -523,10 +616,25 @@ fn validate_segment(seg: &LanSegment) -> Result<(), String> {
         check("dhcp.pool_end", &seg.dhcp.pool_end)?;
         check("dhcp.lease_time", &seg.dhcp.lease_time)?;
     }
+    // Format-level validation for IP-bearing fields. Without this, typos
+    // like "10.1010.100" (missing dot) parse as plausible-looking strings,
+    // sail through the empty/newline check, and only blow up later when
+    // dnsmasq silently rejects the rendered config and starts with no
+    // socket. Catch the typo at Save where the user's still in the form
+    // and can fix it immediately.
+    validate_ipv4_in_cidr("router_ip", &seg.router_ip, &seg.subnet_cidr)?;
+    if seg.dhcp.enabled {
+        validate_ipv4_in_cidr("dhcp.pool_start", &seg.dhcp.pool_start, &seg.subnet_cidr)?;
+        validate_ipv4_in_cidr("dhcp.pool_end",   &seg.dhcp.pool_end,   &seg.subnet_cidr)?;
+    }
+
     for (i, r) in seg.dhcp.reservations.iter().enumerate() {
         check(&format!("reservations[{}].mac", i), &r.mac)?;
         check(&format!("reservations[{}].ip", i), &r.ip)?;
         if let Some(h) = &r.hostname { check(&format!("reservations[{}].hostname", i), h)?; }
+        // Reservation IP must be a real IPv4 inside the subnet — otherwise
+        // dnsmasq accepts the line but never matches the lease request.
+        validate_ipv4_in_cidr(&format!("reservations[{}].ip", i), &r.ip, &seg.subnet_cidr)?;
         // dnsmasq renders reservations as `dhcp-host=<mac>,<ip>[,<hostname>]`
         // — a literal comma in any field would inject an extra dnsmasq
         // option (e.g. `tag:foo`, `set:group`, `interface=eth0`). The
@@ -588,10 +696,16 @@ fn validate_segment(seg: &LanSegment) -> Result<(), String> {
                 && seg.dns.external_server.as_deref().map(str::trim).unwrap_or("").is_empty()
             {
                 return Err(
-                    "When listen_port isn't 53, external_server must be set so \
-                     DHCP can advertise a DNS server clients can reach on the \
-                     standard port. (WolfRouter's own DNS would be on a \
-                     non-standard port that DHCP option 6 can't signal.)"
+                    "When listen_port isn't 53, external_server must be set — DHCP option 6 \
+                     can only advertise a DNS resolver on the standard port :53, so clients \
+                     need to be pointed at a separate resolver IP they can reach there. \
+                     Typical setup: AdGuard Home or Pi-hole running in a container on this \
+                     host with port 53 mapped, e.g. 172.17.0.5. \n\n\
+                     IMPORTANT: this IP doesn't have to be running yet — it's just a string \
+                     reference DHCP will hand out to clients. Set it to your AdGuard/Pi-hole \
+                     container's planned IP, save this LAN, and dnsmasq will move off :53 — \
+                     freeing it for AdGuard. Only THEN does AdGuard need to actually be up. \
+                     (PapaSchlumpf 2026-04-30: this resolves the chicken-and-egg.)"
                         .into(),
                 );
             }
@@ -896,6 +1010,29 @@ struct PreflightCheck {
     fix: Option<String>,
 }
 
+/// One-click Fix action returned alongside the checks list, keyed by
+/// check id. The UI looks each row up by `c.id`; if there's a matching
+/// entry it renders a "Fix" button that POSTs to `url`. Only safe
+/// actions get attached — anything that could lock the operator out
+/// (UDP/53 host-firewall edits on the management interface, etc.)
+/// stays instructions-only.
+#[derive(serde::Serialize, Clone)]
+pub struct PreflightAction {
+    /// Human label shown on the button (e.g. "Enable IP forwarding").
+    pub label: String,
+    /// API path. UI POSTs JSON `{}` (or the `body` field, if present).
+    pub url: String,
+    /// Short tooltip explaining what the action will do.
+    pub detail: String,
+    /// Confirmation text shown in `confirm()` before the POST. Empty
+    /// for trivially safe actions.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub confirm: String,
+    /// Optional JSON body to POST. Default is `{}`.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub body: serde_json::Value,
+}
+
 pub async fn preflight(
     req: HttpRequest,
     state: S,
@@ -904,6 +1041,8 @@ pub async fn preflight(
     auth_or_return!(req, state);
 
     let mut checks: Vec<PreflightCheck> = Vec::new();
+    let mut actions: std::collections::HashMap<&'static str, PreflightAction>
+        = std::collections::HashMap::new();
 
     // 1) /etc/hosts — needed for hostname resolution on most distros.
     // Allow for hosts files without an explicit entry for the local
@@ -1272,8 +1411,17 @@ pub async fn preflight(
             name: "IPv4 forwarding",
             ok: false,
             severity: "warning",
-            message: "net.ipv4.ip_forward = 0. Firewall rules and LAN segments won't actually route traffic until this is enabled.".into(),
-            fix: Some("Enable persistently with:\n  echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-wolfrouter.conf\n  sudo sysctl --system".into()),
+            message: "net.ipv4.ip_forward = 0. Firewall rules and LAN segments won't actually route traffic until this is enabled. \
+                      Why it matters: when forwarding is off, the kernel drops every packet whose destination isn't *this* host — including LAN-client traffic to the internet through your WAN. Symptom: clients get DHCP leases, ping the router, but `ping 1.1.1.1` times out. \
+                      Safe to enable everywhere — Proxmox, libvirt, Docker, and LXC bridges all expect `ip_forward=1` themselves; this is the default on any box that routes for anything.".into(),
+            fix: Some("Enable persistently with:\n  echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-wolfrouter.conf\n  sudo sysctl --system\n\nOr click the Fix button — WolfStack writes the same drop-in and reloads sysctl.".into()),
+        });
+        actions.insert("ip_forward", PreflightAction {
+            label: "Enable IP forwarding".into(),
+            url: "/api/router/fix/enable-ip-forward".into(),
+            detail: "Writes net.ipv4.ip_forward=1 to /etc/sysctl.d/99-wolfrouter.conf and reloads sysctl. Idempotent. Proxmox/libvirt/Docker bridges all need this on too — never breaks them.".into(),
+            confirm: String::new(),
+            body: serde_json::Value::Null,
         });
     } else {
         checks.push(PreflightCheck {
@@ -1286,8 +1434,434 @@ pub async fn preflight(
         });
     }
 
-    // self_id resolved earlier for future checks; silence unused lint.
-    let _ = self_id;
+    // 8) WAN routing & default route — without these the node itself
+    // can't egress, and LAN clients masqueraded through it can't reach
+    // anything either. The exact symptom that motivated this section:
+    // PPPoE WAN dialed up fine, but `use_default_route` defaulted off
+    // (sane default on a mixed box, lethal on a dedicated router) and
+    // the box ended up with `nodefaultroute` written into the peer
+    // file. `traceroute` from the router returned `!H` from its own
+    // LAN IP because the kernel had no usable egress.
+    //
+    // Source: networking/router/wan.rs:227-228, 444-453 — the
+    // use_default_route default and the resulting peer-file branch.
+    let default_route_text = std::process::Command::new("ip")
+        .args(["-4", "route", "show", "default"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let has_default_route = !default_route_text.is_empty();
+
+    // Snapshot enabled WAN connections owned by this node. Remote-node
+    // WAN connections are checked when the user opens preflight against
+    // that node — we can't read its iptables/ppp state from here.
+    let local_wans: Vec<wan::WanConnection> = {
+        let cfg = state.router.config.read().unwrap();
+        cfg.wan_connections.iter()
+            .filter(|w| w.enabled && w.node_id == self_id)
+            .cloned()
+            .collect()
+    };
+
+    if has_default_route {
+        let first = default_route_text.lines().next().unwrap_or("").trim();
+        checks.push(PreflightCheck {
+            id: "default_route",
+            name: "Default IPv4 route",
+            ok: true,
+            severity: "info",
+            message: format!("Present: {}", first),
+            fix: None,
+        });
+    } else if local_wans.is_empty() {
+        checks.push(PreflightCheck {
+            id: "default_route",
+            name: "Default IPv4 route",
+            ok: false,
+            severity: "warning",
+            message: "No default IPv4 route on this node, and no WolfRouter WAN connection is configured here. The node can't reach the internet, and any LAN clients routed through it will get host-unreachable.".into(),
+            fix: Some("Either add a WAN connection in WolfRouter → WAN connections (DHCP / Static / PPPoE), or configure a default route via the host's network config.".into()),
+        });
+    } else {
+        // There IS a WAN configured here but no default route. Almost
+        // always either (a) PPPoE with `use_default_route` unticked, or
+        // (b) the WAN link itself didn't come up. Pull out (a) so the
+        // fix instructions point at the exact UI checkbox.
+        let pppoe_no_default: Vec<&wan::WanConnection> = local_wans.iter()
+            .filter(|w| matches!(&w.mode, wan::WanMode::Pppoe(p) if !p.use_default_route))
+            .collect();
+        if !pppoe_no_default.is_empty() {
+            let names = pppoe_no_default.iter()
+                .map(|w| format!("'{}'", w.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            checks.push(PreflightCheck {
+                id: "default_route",
+                name: "Default IPv4 route",
+                ok: false,
+                severity: "error",
+                message: format!(
+                    "No default IPv4 route. PPPoE WAN(s) {} have 'Use as default route' unticked, so pppd writes `nodefaultroute` to the peer file. \
+                     Why this kills you: without a default route, the kernel doesn't know where to send packets that aren't on a directly-connected subnet. The router itself can't reach the internet, and every LAN client masqueraded through it gets host-unreachable on anything outside its own LAN.",
+                    names
+                ),
+                fix: Some("WolfRouter → WAN connections → edit each PPPoE entry → tick 'Use as default route' (and 'Use ISP DNS' unless you've configured DNS yourself), then Save. WolfRouter rewrites the peer file with `defaultroute replacedefaultroute` and redials.\n\nOr click the Fix button — WolfStack ticks the flag, saves, and redials pppd for you.".into()),
+            });
+            // Action targets the FIRST offending PPPoE — multi-PPPoE
+            // setups are rare; the operator can repeat for any others.
+            if let Some(w) = pppoe_no_default.first() {
+                actions.insert("default_route", PreflightAction {
+                    label: "Tick 'Use as default route' & redial".into(),
+                    url: format!("/api/router/fix/wan/{}/tick-pppoe-default-route", w.id),
+                    detail: "Sets use_default_route=true on this PPPoE WAN, saves, and redials pppd so the peer-file change takes effect.".into(),
+                    confirm: "Redial PPPoE? You'll lose the WAN link for ~5–10s while pppd reconnects.".into(),
+                    body: serde_json::Value::Null,
+                });
+            }
+        } else {
+            checks.push(PreflightCheck {
+                id: "default_route",
+                name: "Default IPv4 route",
+                ok: false,
+                severity: "error",
+                message: "No default IPv4 route on this node, despite WAN connection(s) being configured here. The router itself has no internet and LAN clients routed through it can't reach anything either.".into(),
+                fix: Some("The configured WAN link probably didn't come up. Check:\n  • PPPoE: `pgrep -af pppd` and `journalctl -u pppd -n 50`\n  • DHCP:  `ip -4 addr show <wan-iface>` should show a public IP\n  • Static: `ping <gateway>` should answer".into()),
+            });
+        }
+    }
+
+    // 8a') Self-loop default route — if a `default via X` route's
+    // next-hop X is one of THIS host's own IPs, the kernel either
+    // returns ENETUNREACH or emits ICMP host-unreachable from that
+    // local IP, and traceroute/ping report `!H`.
+    //
+    // Real failure mode that motivated this check (PapaSchlumpf, April
+    // 2026): on a router box with WolfRouter serving 10.10.10.0/24,
+    // ens1 had primary 10.10.10.2 (the host's own LAN IP) AND
+    // secondary 10.10.10.1 (the LAN gateway address dnsmasq listens
+    // on). /etc/network/interfaces had `gateway 10.10.10.1`, so ifup
+    // installed `default via 10.10.10.1 dev ens1 proto static`. With
+    // metric 0 it beat the working Starlink DHCP default (metric 100),
+    // and every egress packet from the router got rejected because the
+    // gateway was the box itself. LAN clients masqueraded through the
+    // box hit the same dead route.
+    //
+    // We catch this by collecting every IPv4 address on the host and
+    // checking each `default via …` line against that set. A
+    // next-hop matching a local IP is unambiguous misconfig — never a
+    // legitimate setup.
+    if has_default_route {
+        // All non-loopback local IPv4s on this host.
+        let mut local_ips: Vec<String> = Vec::new();
+        if let Ok(out) = std::process::Command::new("ip")
+            .args(["-j", "-4", "addr"])
+            .output()
+        {
+            if out.status.success() {
+                if let Ok(arr) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout) {
+                    for entry in arr {
+                        if let Some(addrs) = entry.get("addr_info").and_then(|v| v.as_array()) {
+                            for ai in addrs {
+                                if ai.get("family").and_then(|v| v.as_str()) != Some("inet") { continue; }
+                                if ai.get("scope").and_then(|v| v.as_str()) == Some("host") { continue; }
+                                if let Some(ip) = ai.get("local").and_then(|v| v.as_str()) {
+                                    local_ips.push(ip.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Walk each default route line; flag any whose `via` is local.
+        let mut self_loops: Vec<(String, String)> = Vec::new(); // (via_ip, full_line)
+        for line in default_route_text.lines() {
+            let line = line.trim();
+            if !line.starts_with("default") { continue; }
+            // Parse `via <ip>` — token after "via".
+            let via = line.split_whitespace()
+                .skip_while(|t| *t != "via")
+                .nth(1)
+                .unwrap_or("");
+            if !via.is_empty() && local_ips.iter().any(|ip| ip == via) {
+                self_loops.push((via.to_string(), line.to_string()));
+            }
+        }
+        if !self_loops.is_empty() {
+            // Build a fix that lists every offending route + the explicit
+            // `ip route del` for each, so the user can copy-paste exactly
+            // what to remove. Then point at the persistent source.
+            let mut bad = String::new();
+            let mut del_cmds = String::new();
+            for (via, line) in &self_loops {
+                bad.push_str(&format!("\n  • {}", line));
+                del_cmds.push_str(&format!("\n  sudo ip route del {}", line));
+                let _ = via;
+            }
+            let total_defaults = default_route_text.lines()
+                .filter(|l| l.trim().starts_with("default")).count();
+            let context = if total_defaults > self_loops.len() {
+                format!(
+                    "\n\nThere are {} default route(s) total — at least one of them is real (e.g. your DHCP/PPPoE WAN). Removing the self-loop one(s) leaves the working route in charge.",
+                    total_defaults
+                )
+            } else {
+                "\n\nThis is your ONLY default route, so the box has no real path out. After removing it, add a WAN connection (or persist a DHCP lease on your WAN iface) so a real default route gets installed.".into()
+            };
+            checks.push(PreflightCheck {
+                id: "default_route_self_loop",
+                name: "Default route points to local IP (self-loop)",
+                ok: false,
+                severity: "error",
+                message: format!(
+                    "{} default route(s) point at this host's own IP, which the kernel rejects with ICMP host-unreachable:{}{}",
+                    self_loops.len(), bad, context
+                ),
+                fix: Some(format!(
+                    "Remove the self-loop route(s) live:{}\n\nThen find the persistent source so they don't come back on reboot. Common culprits:\n  • /etc/network/interfaces — a `gateway <local-ip>` line on a LAN-side iface (remove that line, leave `address` alone).\n  • /etc/netplan/*.yaml — a `gateway4:` or static `routes: - to: default` entry pointing at a local IP (remove it, then `sudo netplan apply`).\n  • NetworkManager — `nmcli connection show` and edit/remove the offending profile's gateway.\n\nAfter removal, run `ip route` again — only your WAN's default (DHCP / PPPoE) should remain.\n\nOr click the Fix button — WolfStack deletes them with the same `ip route del` lines.",
+                    del_cmds
+                )),
+            });
+            actions.insert("default_route_self_loop", PreflightAction {
+                label: "Delete self-loop route(s)".into(),
+                url: "/api/router/fix/purge-self-loop-routes".into(),
+                detail: "Deletes ONLY routes whose next-hop is a local IP. Such routes can never deliver a packet, so this is bounded — Proxmox/libvirt bridges never use local-IP next-hops, so they're untouched.".into(),
+                confirm: "Delete the self-loop default route(s)? This is safe — these routes can never deliver a packet, so removing them cannot make egress worse. Your WAN's real default route (if any) stays untouched.".into(),
+                body: serde_json::Value::Null,
+            });
+        }
+    }
+
+    // 8b) Egress route resolution — `ip route get 1.1.1.1` answers
+    // "if I sent to a public IP right now, which interface would the
+    // kernel pick?" Cheap, generates zero traffic, and catches the
+    // case where a default route exists but points to an iface without
+    // an IP / a dead gateway (the route is in the table but the kernel
+    // refuses to use it).
+    if has_default_route {
+        match std::process::Command::new("ip")
+            .args(["-4", "route", "get", "1.1.1.1"])
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                let txt = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                let dev = txt.split_whitespace()
+                    .skip_while(|t| *t != "dev")
+                    .nth(1)
+                    .unwrap_or("");
+                if dev.is_empty() {
+                    checks.push(PreflightCheck {
+                        id: "egress_route",
+                        name: "Egress route resolution",
+                        ok: false,
+                        severity: "error",
+                        message: format!("`ip route get 1.1.1.1` returned no egress interface: {}", txt),
+                        fix: Some("Default route exists but the kernel couldn't resolve a next-hop. Check that the WAN interface is up and has an IPv4 (`ip -4 addr`).".into()),
+                    });
+                } else {
+                    checks.push(PreflightCheck {
+                        id: "egress_route",
+                        name: "Egress route resolution",
+                        ok: true,
+                        severity: "info",
+                        message: format!("Egress via {} (kernel pick for 1.1.1.1)", dev),
+                        fix: None,
+                    });
+                }
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                checks.push(PreflightCheck {
+                    id: "egress_route",
+                    name: "Egress route resolution",
+                    ok: false,
+                    severity: "error",
+                    message: format!("`ip route get 1.1.1.1` failed: {}", stderr),
+                    fix: Some("Most often: WAN link is down. PPPoE → check `pppd` is running. DHCP → check the iface holds an IPv4. Static → check the gateway responds.".into()),
+                });
+            }
+            Err(_) => {} // ip(8) missing — covered by other checks
+        }
+    }
+
+    // 8c) Per-WAN checks for connections owned by this node. Each WAN
+    // emits a link-state check (PPPoE: pppd is dialed and ppp* exists;
+    // DHCP/Static: the configured iface has an IPv4) plus a MASQUERADE
+    // rule check on the egress iface.
+    //
+    // The DHCP branch is critical for Starlink, cable modems, and any
+    // ISP that doesn't need PPPoE — WolfRouter calls DHCP a passthrough
+    // (the host's own dhclient/networkd owns the iface), which works
+    // beautifully when the host is configured to DHCP that iface, and
+    // catastrophically when it isn't. Symptom: WAN saved fine in
+    // WolfRouter, no error, but the iface stays unconfigured because
+    // nothing on the OS side ever sent a DHCPDISCOVER. No IP → no
+    // default route → !H from the router's LAN IP on traceroute.
+    // Source: networking/router/wan.rs:681-694 — the passthrough mode.
+    let iface_has_ipv4 = |iface: &str| -> Option<String> {
+        let out = std::process::Command::new("ip")
+            .args(["-j", "-4", "addr", "show", "dev", iface])
+            .output()
+            .ok()?;
+        if !out.status.success() { return None; }
+        let arr: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).ok()?;
+        for entry in arr {
+            for ai in entry.get("addr_info")?.as_array()? {
+                if ai.get("family").and_then(|v| v.as_str()) == Some("inet") {
+                    if ai.get("scope").and_then(|v| v.as_str()) == Some("host") { continue; }
+                    let ip = ai.get("local").and_then(|v| v.as_str())?;
+                    return Some(ip.to_string());
+                }
+            }
+        }
+        None
+    };
+
+    for w in &local_wans {
+        // Resolve egress iface + link status per mode.
+        //   PPPoE: iface name is dynamic (ppp0/1/...) and only exists
+        //   once pppd has dialed up. wan::pppoe_status reads the live
+        //   state and returns the active iface + IP.
+        //
+        //   DHCP/Static: the configured physical iface IS the egress
+        //   iface. "Up" here means it has a non-loopback IPv4 — for
+        //   DHCP that's set by the host's DHCP client on lease, for
+        //   Static by /etc/network/interfaces or equivalent.
+        let mode_label = match &w.mode {
+            wan::WanMode::Pppoe(_) => "PPPoE",
+            wan::WanMode::Dhcp => "DHCP",
+            wan::WanMode::Static(_) => "Static",
+        };
+        let (egress_iface, link_status) = match &w.mode {
+            wan::WanMode::Pppoe(_) => match wan::pppoe_status(w) {
+                Some((iface, ip)) => (Some(iface.clone()), Some(Ok(format!("PPPoE link up: {} ({})", iface, ip)))),
+                None => (None, Some(Err((
+                    format!(
+                        "PPPoE link '{}' on {} is not up — no ppp* interface with the expected pid file.",
+                        w.name, w.interface
+                    ),
+                    "Check pppd:\n  • `pgrep -af pppd`\n  • `journalctl -u pppd -n 50` (or `tail -n 50 /var/log/syslog | grep pppd`)\n  • Confirm ISP credentials in WolfRouter → WAN connections → Edit.".to_string(),
+                )))),
+            },
+            wan::WanMode::Dhcp | wan::WanMode::Static(_) => match iface_has_ipv4(&w.interface) {
+                Some(ip) => (Some(w.interface.clone()), Some(Ok(format!("{} link up: {} ({})", mode_label, w.interface, ip)))),
+                None => (Some(w.interface.clone()), Some(Err((
+                    format!(
+                        "WAN '{}' ({}) on {}: interface has no IPv4 address. {}",
+                        w.name, mode_label, w.interface,
+                        if matches!(w.mode, wan::WanMode::Dhcp) {
+                            "WolfRouter's DHCP mode is a passthrough — the host's own DHCP client (dhclient / systemd-networkd / NetworkManager) is supposed to own this iface, but nothing has given it a lease."
+                        } else {
+                            "Static mode is a passthrough — the host's network config is supposed to assign this iface, but no IPv4 is present."
+                        }
+                    ),
+                    if matches!(w.mode, wan::WanMode::Dhcp) {
+                        format!(
+                            "Bring the iface up and request a lease manually to confirm the upstream is reachable:\n  sudo ip link set {iface} up\n  sudo dhclient -v {iface}\n\nIf that gets an IP, persist it. On Debian/Ubuntu (`/etc/network/interfaces`):\n  auto {iface}\n  iface {iface} inet dhcp\n\nOn netplan (`/etc/netplan/*.yaml`):\n  network:\n    ethernets:\n      {iface}:\n        dhcp4: true\n\nIf dhclient gets nothing, the upstream isn't handing out leases — for Starlink, check the dishy is online, the cable is plugged into the right WAN port, and the router boot order isn't racing the dishy bring-up.",
+                            iface = w.interface
+                        )
+                    } else {
+                        format!(
+                            "Configure a static IP on {iface} via the host's network config. On Debian/Ubuntu (`/etc/network/interfaces`):\n  auto {iface}\n  iface {iface} inet static\n      address <CIDR>\n      gateway <gateway-ip>\n\nThen `sudo systemctl restart networking` (or `netplan apply` on netplan).",
+                            iface = w.interface
+                        )
+                    },
+                )))),
+            },
+        };
+
+        if let Some(status) = link_status {
+            match status {
+                Ok(msg) => checks.push(PreflightCheck {
+                    id: "wan_link",
+                    name: "WAN link state",
+                    ok: true,
+                    severity: "info",
+                    message: format!("WAN '{}': {}", w.name, msg),
+                    fix: None,
+                }),
+                Err((msg, fix)) => {
+                    checks.push(PreflightCheck {
+                        id: "wan_link",
+                        name: "WAN link state",
+                        ok: false,
+                        severity: "error",
+                        message: msg,
+                        fix: Some(fix),
+                    });
+                    // For DHCP-mode WANs, offer a one-click "request a
+                    // lease via dhclient" — covers the Starlink boot-
+                    // race trap. For Static, no auto-fix possible
+                    // (operator must supply addresses). For PPPoE,
+                    // the redial endpoint is the right tool.
+                    match &w.mode {
+                        wan::WanMode::Dhcp => {
+                            actions.insert("wan_link", PreflightAction {
+                                label: format!("dhclient {}", w.interface),
+                                url: "/api/router/fix/dhclient".into(),
+                                detail: "Brings the iface up and requests a DHCP lease. Safe — runs the same dhclient(8) the host's own networking would. Doesn't conflict with Proxmox: if Proxmox's networkd already manages this iface, this just renews the existing lease.".into(),
+                                confirm: String::new(),
+                                body: serde_json::json!({ "iface": &w.interface }),
+                            });
+                        }
+                        wan::WanMode::Pppoe(_) => {
+                            actions.insert("wan_link", PreflightAction {
+                                label: "Re-apply WAN (redial)".into(),
+                                url: format!("/api/router/fix/wan/{}/reapply", w.id),
+                                detail: "Re-runs the WAN apply path: rewrites the pppd peer file and redials the link.".into(),
+                                confirm: "Redial PPPoE? You'll lose the WAN link for ~5–10s while pppd reconnects.".into(),
+                                body: serde_json::Value::Null,
+                            });
+                        }
+                        wan::WanMode::Static(_) => {}
+                    }
+                }
+            }
+        }
+
+        if let Some(iface) = egress_iface.as_deref() {
+            let masq_present = std::process::Command::new("iptables")
+                .args(["-t", "nat", "-C", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if masq_present {
+                checks.push(PreflightCheck {
+                    id: "wan_masquerade",
+                    name: "WAN NAT (MASQUERADE)",
+                    ok: true,
+                    severity: "info",
+                    message: format!("WAN '{}': POSTROUTING -o {} -j MASQUERADE present", w.name, iface),
+                    fix: None,
+                });
+            } else {
+                checks.push(PreflightCheck {
+                    id: "wan_masquerade",
+                    name: "WAN NAT (MASQUERADE)",
+                    ok: false,
+                    severity: "error",
+                    message: format!(
+                        "WAN '{}': no MASQUERADE rule on {}. \
+                         Why this matters: without MASQUERADE on the egress iface, packets from your LAN leave with their original private source IP (e.g. 10.10.10.50). The upstream — your ISP / the wider internet — has no route back to that, so it drops the packet. Symptom: clients ping the router fine, ping each other fine, but `ping 1.1.1.1` from a client gets nothing.",
+                        w.name, iface
+                    ),
+                    fix: Some(format!(
+                        "WolfRouter installs this on apply — re-apply the WAN entry from WolfRouter → WAN connections → '{}' → Save. As a one-shot manual fix:\n  iptables -t nat -A POSTROUTING -o {} -j MASQUERADE\n\nOr click the Fix button — WolfStack re-runs the WAN apply path which re-installs the MASQUERADE rule.",
+                        w.name, iface
+                    )),
+                });
+                actions.insert("wan_masquerade", PreflightAction {
+                    label: "Re-apply WAN".into(),
+                    url: format!("/api/router/fix/wan/{}/reapply", w.id),
+                    detail: "Re-runs the WAN apply path: re-installs MASQUERADE on the egress iface, rewrites pppd peer file if PPPoE.".into(),
+                    confirm: String::new(),
+                    body: serde_json::Value::Null,
+                });
+            }
+        }
+    }
 
     let has_error = checks.iter().any(|c| !c.ok && c.severity == "error");
     let has_warning = checks.iter().any(|c| !c.ok && c.severity == "warning");
@@ -1297,6 +1871,7 @@ pub async fn preflight(
         "ok": !has_error,
         "status": status,
         "checks": checks,
+        "actions": actions,
     }))
 }
 
@@ -1309,8 +1884,13 @@ pub struct ZoneAssignRequest {
     pub zone: Option<Zone>,  // None = remove
 }
 
-pub async fn assign_zone(req: HttpRequest, state: S, body: web::Json<ZoneAssignRequest>) -> HttpResponse {
+pub async fn assign_zone(req: HttpRequest, state: S, body: web::Json<ZoneAssignRequest>, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
+    // Cluster guard — refuse to set/clear a zone on a node that
+    // belongs to a different cluster. This is the strict-cluster
+    // isolation principle: cluster A's WolfRouter must not affect
+    // cluster B's nodes.
+    if let Some(resp) = cluster_guard_node_id(&state, &query, Some(&body.node_id)) { return resp; }
     // Apply the config change under the write lock, then release the
     // lock BEFORE shelling out to iptables-restore. Pre-v18.7.30 the
     // whole firewall apply ran with the write lock held — a slow
@@ -1341,25 +1921,44 @@ pub async fn assign_zone(req: HttpRequest, state: S, body: web::Json<ZoneAssignR
     HttpResponse::Ok().json(&zones_snapshot)
 }
 
-pub async fn get_zones(req: HttpRequest, state: S) -> HttpResponse {
+pub async fn get_zones(req: HttpRequest, state: S, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
-    HttpResponse::Ok().json(&state.router.config.read().unwrap().zones)
+    let zones = state.router.config.read().unwrap().zones.clone();
+    match cluster_node_id_set(&state, &query) {
+        None => HttpResponse::Ok().json(zones),
+        Some(set) => {
+            // ZoneAssignments outer key is node_id. Drop entries for
+            // nodes that aren't in the requested cluster.
+            let filtered = ZoneAssignments {
+                assignments: zones.assignments.into_iter()
+                    .filter(|(node_id, _)| set.contains(node_id))
+                    .collect(),
+            };
+            HttpResponse::Ok().json(filtered)
+        }
+    }
 }
 
 // ─── LAN segments ───
 
-pub async fn list_segments(req: HttpRequest, state: S) -> HttpResponse {
+pub async fn list_segments(req: HttpRequest, state: S, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
-    HttpResponse::Ok().json(&state.router.config.read().unwrap().lans)
+    let lans = state.router.config.read().unwrap().lans.clone();
+    let filtered: Vec<&LanSegment> = match cluster_node_id_set(&state, &query) {
+        None => lans.iter().collect(),
+        Some(set) => lans.iter().filter(|l| set.contains(&l.node_id)).collect(),
+    };
+    HttpResponse::Ok().json(filtered)
 }
 
-pub async fn create_segment(req: HttpRequest, state: S, body: web::Json<LanSegment>) -> HttpResponse {
+pub async fn create_segment(req: HttpRequest, state: S, body: web::Json<LanSegment>, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
     // Validate — no embedded newlines in any field that feeds into a
     // dnsmasq config line. See dhcp::render_config for the attack model.
     if let Err(e) = validate_segment(&body) {
         return HttpResponse::BadRequest().body(e);
     }
+    if let Some(resp) = cluster_guard_node_id(&state, &query, Some(&body.node_id)) { return resp; }
     let mut segment = body.into_inner();
     if segment.id.is_empty() { segment.id = gen_id("lan"); }
 
@@ -1386,6 +1985,7 @@ pub async fn update_segment(
     state: S,
     path: web::Path<String>,
     body: web::Json<LanSegment>,
+    query: web::Query<TopologyQuery>,
 ) -> HttpResponse {
     auth_or_return!(req, state);
     if let Err(e) = validate_segment(&body) {
@@ -1396,6 +1996,11 @@ pub async fn update_segment(
     if updated.id != id {
         return HttpResponse::BadRequest().body("id mismatch");
     }
+    // Both the existing item AND the new node_id must be in the
+    // active cluster — block re-pinning a LAN to a node in another
+    // cluster, and block editing a LAN that belongs to another cluster.
+    if let Some(resp) = cluster_guard_existing_lan(&state, &query, &id) { return resp; }
+    if let Some(resp) = cluster_guard_node_id(&state, &query, Some(&updated.node_id)) { return resp; }
     {
         let mut cfg = state.router.config.write().unwrap();
         let idx = match cfg.lans.iter().position(|l| l.id == id) {
@@ -1414,9 +2019,10 @@ pub async fn update_segment(
     HttpResponse::Ok().json(&updated)
 }
 
-pub async fn delete_segment(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
+pub async fn delete_segment(req: HttpRequest, state: S, path: web::Path<String>, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
+    if let Some(resp) = cluster_guard_existing_lan(&state, &query, &id) { return resp; }
     let removed = {
         let mut cfg = state.router.config.write().unwrap();
         let r = cfg.lans.iter().position(|l| l.id == id).map(|i| cfg.lans.remove(i));
@@ -1589,13 +2195,33 @@ pub async fn get_query_log(
 
 // ─── Firewall rules ───
 
-pub async fn list_rules(req: HttpRequest, state: S) -> HttpResponse {
+pub async fn list_rules(req: HttpRequest, state: S, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
-    HttpResponse::Ok().json(&state.router.config.read().unwrap().rules)
+    let rules = state.router.config.read().unwrap().rules.clone();
+    let filtered: Vec<&FirewallRule> = match cluster_node_id_set(&state, &query) {
+        None => rules.iter().collect(),
+        // Strict cluster isolation: when a cluster filter is active,
+        // ONLY show rules pinned to a node in that cluster. Rules
+        // with node_id=None ("legacy global, applies everywhere")
+        // are hidden — they would otherwise leak across cluster
+        // views since they apply to nodes the operator isn't
+        // currently managing. Operators with legacy global rules
+        // need to re-pin them to a specific node from the WolfRouter
+        // → Firewall tab. Adam Cogswell 2026-04-29: "firewall rules
+        // should be cluster only".
+        Some(set) => rules.iter()
+            .filter(|r| match &r.node_id {
+                None => false,
+                Some(nid) => set.contains(nid),
+            })
+            .collect(),
+    };
+    HttpResponse::Ok().json(filtered)
 }
 
-pub async fn create_rule(req: HttpRequest, state: S, body: web::Json<FirewallRule>) -> HttpResponse {
+pub async fn create_rule(req: HttpRequest, state: S, body: web::Json<FirewallRule>, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
+    if let Some(resp) = cluster_guard_node_id(&state, &query, body.node_id.as_deref()) { return resp; }
     let mut rule = body.into_inner();
     if rule.id.is_empty() { rule.id = gen_id("rule"); }
 
@@ -1630,6 +2256,7 @@ pub async fn update_rule(
     state: S,
     path: web::Path<String>,
     body: web::Json<FirewallRule>,
+    query: web::Query<TopologyQuery>,
 ) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
@@ -1637,6 +2264,8 @@ pub async fn update_rule(
     if updated.id != id {
         return HttpResponse::BadRequest().body("id mismatch");
     }
+    if let Some(resp) = cluster_guard_existing_rule(&state, &query, &id) { return resp; }
+    if let Some(resp) = cluster_guard_node_id(&state, &query, updated.node_id.as_deref()) { return resp; }
     let ruleset_opt = {
         let mut cfg = state.router.config.write().unwrap();
         let idx = match cfg.rules.iter().position(|r| r.id == id) {
@@ -1658,9 +2287,10 @@ pub async fn update_rule(
     HttpResponse::Ok().json(&updated)
 }
 
-pub async fn delete_rule(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
+pub async fn delete_rule(req: HttpRequest, state: S, path: web::Path<String>, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
+    if let Some(resp) = cluster_guard_existing_rule(&state, &query, &id) { return resp; }
     let ruleset_opt = {
         let mut cfg = state.router.config.write().unwrap();
         cfg.rules.retain(|r| r.id != id);
@@ -2319,8 +2949,33 @@ pub async fn packet_capture(
     let output = match tokio::time::timeout(timeout, cmd).await {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => {
+            // Distinguish "tcpdump isn't installed" from other spawn
+            // failures (permission denied, etc.) so the frontend can
+            // show an inline install button — same convention as
+            // /api/traceroute. The CAP_NET_RAW hint belongs only on
+            // the privilege-error branch; mixing it into the missing
+            // branch is noise.
+            let is_missing = e.kind() == std::io::ErrorKind::NotFound
+                || e.raw_os_error() == Some(2 /* ENOENT */);
+            let install_command = if is_missing {
+                let distro = crate::installer::detect_distro();
+                if matches!(distro, crate::installer::DistroFamily::Unknown) {
+                    None
+                } else {
+                    let (mgr, args) = crate::installer::pkg_install_cmd(distro);
+                    Some(format!("sudo {} {} tcpdump", mgr, args))
+                }
+            } else { None };
             return HttpResponse::Ok().json(serde_json::json!({
-                "lines": [], "error": format!("couldn't run 'tcpdump' — {} (install the 'tcpdump' package, and the WolfStack binary needs CAP_NET_RAW or root to capture)", e),
+                "lines": [],
+                "error": if is_missing {
+                    "tcpdump isn't installed on this host. Click the button below to install it, or run the install manually.".to_string()
+                } else {
+                    format!("couldn't run 'tcpdump' — {} (the WolfStack binary needs CAP_NET_RAW or root to capture)", e)
+                },
+                "missing_tool": if is_missing { Some("tcpdump") } else { None },
+                "install_package": if is_missing { Some("tcpdump") } else { None },
+                "install_command": install_command,
             }));
         }
         Err(_) => {
@@ -2448,22 +3103,32 @@ fn which(cmd: &str) -> bool {
 
 // ─── WAN connections (DHCP / Static / PPPoE) ───
 
-pub async fn list_wan(req: HttpRequest, state: S) -> HttpResponse {
+pub async fn list_wan(req: HttpRequest, state: S, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
-    let cfg = state.router.config.read().unwrap();
+    let conns: Vec<wan::WanConnection> = state.router.config.read().unwrap().wan_connections.clone();
+    let cluster_set = cluster_node_id_set(&state, &query);
     // Mask passwords on the way out — never roundtrip plaintext to UI.
-    let masked: Vec<wan::WanConnection> = cfg.wan_connections.iter().map(|c| {
-        let mut clone = c.clone();
-        if let wan::WanMode::Pppoe(ref mut p) = clone.mode {
-            if !p.password.is_empty() { p.password = "***".into(); }
-        }
-        clone
-    }).collect();
+    // Filter by cluster: each WAN is pinned to a specific node, so we
+    // keep only those whose node is in the active cluster.
+    let masked: Vec<wan::WanConnection> = conns.into_iter()
+        .filter(|c| match &cluster_set {
+            None => true,
+            Some(set) => set.contains(&c.node_id),
+        })
+        .map(|c| {
+            let mut clone = c;
+            if let wan::WanMode::Pppoe(ref mut p) = clone.mode {
+                if !p.password.is_empty() { p.password = "***".into(); }
+            }
+            clone
+        })
+        .collect();
     HttpResponse::Ok().json(masked)
 }
 
-pub async fn create_wan(req: HttpRequest, state: S, body: web::Json<wan::WanConnection>) -> HttpResponse {
+pub async fn create_wan(req: HttpRequest, state: S, body: web::Json<wan::WanConnection>, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
+    if let Some(resp) = cluster_guard_node_id(&state, &query, Some(&body.node_id)) { return resp; }
     let mut conn = body.into_inner();
     if conn.id.is_empty() { conn.id = gen_id("wan"); }
     if let Err(e) = wan::validate(&conn) {
@@ -2498,6 +3163,7 @@ pub async fn create_wan(req: HttpRequest, state: S, body: web::Json<wan::WanConn
 pub async fn update_wan(
     req: HttpRequest, state: S,
     path: web::Path<String>, body: web::Json<wan::WanConnection>,
+    query: web::Query<TopologyQuery>,
 ) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
@@ -2508,6 +3174,8 @@ pub async fn update_wan(
     if let Err(e) = wan::validate(&updated) {
         return HttpResponse::BadRequest().body(e);
     }
+    if let Some(resp) = cluster_guard_existing_wan(&state, &query, &id) { return resp; }
+    if let Some(resp) = cluster_guard_node_id(&state, &query, Some(&updated.node_id)) { return resp; }
     // Preserve the existing password if the UI sent the masked "***"
     // sentinel (PUT bodies don't carry plaintext passwords back).
     {
@@ -2542,9 +3210,10 @@ pub async fn update_wan(
     HttpResponse::Ok().json(&response)
 }
 
-pub async fn delete_wan(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
+pub async fn delete_wan(req: HttpRequest, state: S, path: web::Path<String>, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
+    if let Some(resp) = cluster_guard_existing_wan(&state, &query, &id) { return resp; }
     let removed = {
         let mut cfg = state.router.config.write().unwrap();
         let r = cfg.wan_connections.iter().position(|c| c.id == id)
@@ -2734,9 +3403,21 @@ pub struct TestDnsRequest {
     /// exist regardless of the user's upstream forwarder choice.
     #[serde(default = "default_test_hostname")]
     pub hostname: String,
+    /// Optional port for the dig query. Defaults to 53. Frontends that
+    /// know the LAN's `dns.listen_port` should pass it explicitly so
+    /// the test probes the actual dnsmasq listener — without this,
+    /// LANs on a non-standard port (5353 etc., common when AdGuard or
+    /// Pi-hole takes :53 in front of WolfRouter) get misleading
+    /// "Connection refused on :53" failures even though dnsmasq is
+    /// happily bound on the configured port. PapaSchlumpf 2026-04-30:
+    /// "the health check blocks it because nothing else is listening
+    /// on port 53 ... non-resolvable circle".
+    #[serde(default = "default_test_port")]
+    pub port: u16,
 }
 
 fn default_test_hostname() -> String { "cloudflare.com".into() }
+fn default_test_port() -> u16 { 53 }
 
 /// POST /api/router/test-dns — fire a single DNS query at a LAN's
 /// router IP and report whether dnsmasq is actually answering. The
@@ -2777,10 +3458,12 @@ pub async fn test_dns(
         }));
     }
 
+    let port = if r.port == 0 { 53 } else { r.port };
     let start = std::time::Instant::now();
     let out = std::process::Command::new("dig")
         .args([
             &format!("@{}", r.router_ip),
+            "-p", &port.to_string(),
             hostname,
             "+short", "+time=3", "+tries=1",
         ])
@@ -2805,11 +3488,13 @@ pub async fn test_dns(
                 // No usable answer. Craft a message that points at the
                 // likely cause: dnsmasq not bound (:53 already taken by
                 // systemd-resolved or another resolver), or upstream
-                // forwarder unreachable from the host.
+                // forwarder unreachable from the host. Reports against
+                // the actual queried port (not hardcoded :53) so LANs
+                // on a non-standard port don't get misleading errors.
                 let err = if stderr.contains("connection refused") || stdout.contains("connection refused") {
-                    format!("Connection refused on {}:53 — dnsmasq isn't listening. Likely cause: another resolver holds :53 (run `ss -tulnp | grep :53` on the host).", r.router_ip)
+                    format!("Connection refused on {}:{} — dnsmasq isn't listening on that port. Run `ss -tulnp 'sport = :{}'` on the host to see what (if anything) holds it.", r.router_ip, port, port)
                 } else if stderr.contains("timed out") || stdout.contains("timed out") || stdout.is_empty() {
-                    format!("No answer from {}:53 within 3s — dnsmasq may not be bound on the LAN interface, or a firewall rule is blocking port 53. Check `systemctl status` / `iptables -L WOLFROUTER_IN -nv`.", r.router_ip)
+                    format!("No answer from {}:{} within 3s — dnsmasq may not be bound on the LAN interface, or a firewall rule is blocking UDP/{}. Check `systemctl status` / `iptables -L WOLFROUTER_IN -nv`.", r.router_ip, port, port)
                 } else {
                     format!("DNS server responded but did not return an A record. dig output: {}", stdout)
                 };
@@ -3110,9 +3795,34 @@ pub async fn tool_install(
 /// loss if you're restoring onto the same node.
 pub async fn export_config(
     req: HttpRequest, state: S,
+    query: web::Query<TopologyQuery>,
 ) -> HttpResponse {
     auth_or_return!(req, state);
     let mut cfg = state.router.config.read().unwrap().clone();
+
+    // Cluster filter: when ?cluster=NAME is set, strip every item
+    // that doesn't belong to a node in that cluster — same strict
+    // shape as list_segments / list_rules / etc. Without this, the
+    // export from Cluster A's WolfRouter view would dump every
+    // cluster's items in one file. Adam Cogswell 2026-04-29:
+    // "wolfrouter module is cluster only nothing in it should bleed
+    // anywhere else to any other clusters".
+    if let Some(set) = cluster_node_id_set(&state, &query) {
+        cfg.lans.retain(|l| set.contains(&l.node_id));
+        cfg.wan_connections.retain(|c| set.contains(&c.node_id));
+        cfg.proxies.retain(|p| set.contains(&p.node_id));
+        cfg.rules.retain(|r| match &r.node_id {
+            None => false,
+            Some(nid) => set.contains(nid),
+        });
+        cfg.subnet_routes.retain(|r| match &r.node_id {
+            None => false,
+            Some(nid) => set.contains(nid),
+        });
+        // ZoneAssignments outer key is node_id.
+        cfg.zones.assignments.retain(|node_id, _| set.contains(node_id));
+    }
+
     // Mask PPPoE passwords in-place.
     for w in cfg.wan_connections.iter_mut() {
         if let wan::WanMode::Pppoe(ref mut p) = w.mode {
@@ -3124,7 +3834,8 @@ pub async fn export_config(
         Err(e) => return HttpResponse::InternalServerError().body(format!("serialize: {}", e)),
     };
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-    let filename = format!("wolfrouter-config-{}.json", ts);
+    let cluster_tag = query.cluster.as_deref().unwrap_or("all");
+    let filename = format!("wolfrouter-config-{}-{}.json", cluster_tag, ts);
     HttpResponse::Ok()
         .insert_header(("Content-Type", "application/json"))
         .insert_header(("Content-Disposition", format!("attachment; filename=\"{}\"", filename)))
@@ -3291,9 +4002,14 @@ pub async fn import_config(
 
 // ─── Reverse-proxy entries ───
 
-pub async fn list_proxies(req: HttpRequest, state: S) -> HttpResponse {
+pub async fn list_proxies(req: HttpRequest, state: S, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
-    HttpResponse::Ok().json(&state.router.config.read().unwrap().proxies)
+    let proxies = state.router.config.read().unwrap().proxies.clone();
+    let filtered: Vec<&proxy::ProxyEntry> = match cluster_node_id_set(&state, &query) {
+        None => proxies.iter().collect(),
+        Some(set) => proxies.iter().filter(|p| set.contains(&p.node_id)).collect(),
+    };
+    HttpResponse::Ok().json(filtered)
 }
 
 /// Returns every candidate backend the operator can point a proxy at,
@@ -3301,8 +4017,19 @@ pub async fn list_proxies(req: HttpRequest, state: S) -> HttpResponse {
 /// and containers by engine (Docker vs LXC) in separate lists. Each
 /// entry carries the pre-resolved host+port so the UI doesn't need
 /// extra round-trips to learn where the backend actually lives.
-pub async fn list_proxy_backends(req: HttpRequest, state: S) -> HttpResponse {
+pub async fn list_proxy_backends(req: HttpRequest, state: S, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
+
+    // Cluster filter: only include backends owned by a node in the
+    // requested cluster. VMs carry a host_id; local docker/lxc
+    // containers belong to the bastion, so they're included only if
+    // the bastion is in the requested cluster.
+    let cluster_set = cluster_node_id_set(&state, &query);
+    let self_id = crate::agent::self_node_id();
+    let bastion_in_cluster = match &cluster_set {
+        None => true,
+        Some(set) => set.contains(&self_id),
+    };
 
     // VMs — split by vm_type so the picker can group them. "libvirt"
     // covers WolfStack's native KVM-over-libvirt VMs; "proxmox" covers
@@ -3310,6 +4037,13 @@ pub async fn list_proxy_backends(req: HttpRequest, state: S) -> HttpResponse {
     let mut vms_libvirt = Vec::new();
     let mut vms_proxmox = Vec::new();
     for v in state.vms.lock().unwrap().list_vms() {
+        // Skip VMs whose hosting node isn't in the requested cluster.
+        if let Some(set) = &cluster_set {
+            match &v.host_id {
+                Some(hid) if set.contains(hid) => {}
+                _ => continue,
+            }
+        }
         let host = v.wolfnet_ip.clone().unwrap_or_default();
         let is_pve = v.vmid.is_some();
         let entry = serde_json::json!({
@@ -3329,28 +4063,32 @@ pub async fn list_proxy_backends(req: HttpRequest, state: S) -> HttpResponse {
     // which network the container's on; either works from the host's
     // nginx as long as it's non-empty.
     let mut containers_docker = Vec::new();
-    for c in crate::containers::docker_list_all_cached() {
-        if c.ip_address.is_empty() { continue; }
-        containers_docker.push(serde_json::json!({
-            "id": c.id,
-            "name": c.name,
-            "host": c.ip_address,
-            "running": c.state == "running",
-            "container_type": "docker",
-        }));
+    if bastion_in_cluster {
+        for c in crate::containers::docker_list_all_cached() {
+            if c.ip_address.is_empty() { continue; }
+            containers_docker.push(serde_json::json!({
+                "id": c.id,
+                "name": c.name,
+                "host": c.ip_address,
+                "running": c.state == "running",
+                "container_type": "docker",
+            }));
+        }
     }
 
     // LXC containers — same idea, different manager.
     let mut containers_lxc = Vec::new();
-    for c in crate::containers::lxc_list_all_cached() {
-        if c.ip_address.is_empty() { continue; }
-        containers_lxc.push(serde_json::json!({
-            "id": c.name,
-            "name": c.name,
-            "host": c.ip_address,
-            "running": c.state == "running",
-            "container_type": "lxc",
-        }));
+    if bastion_in_cluster {
+        for c in crate::containers::lxc_list_all_cached() {
+            if c.ip_address.is_empty() { continue; }
+            containers_lxc.push(serde_json::json!({
+                "id": c.name,
+                "name": c.name,
+                "host": c.ip_address,
+                "running": c.state == "running",
+                "container_type": "lxc",
+            }));
+        }
     }
 
     HttpResponse::Ok().json(serde_json::json!({
@@ -3365,7 +4103,7 @@ pub async fn list_proxy_backends(req: HttpRequest, state: S) -> HttpResponse {
     }))
 }
 
-pub async fn create_proxy(req: HttpRequest, state: S, body: web::Json<proxy::ProxyEntry>) -> HttpResponse {
+pub async fn create_proxy(req: HttpRequest, state: S, body: web::Json<proxy::ProxyEntry>, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
     let mut entry = body.into_inner();
     if entry.id.is_empty() { entry.id = gen_id("proxy"); }
@@ -3375,6 +4113,7 @@ pub async fn create_proxy(req: HttpRequest, state: S, body: web::Json<proxy::Pro
     if entry.node_id.is_empty() {
         entry.node_id = crate::agent::self_node_id();
     }
+    if let Some(resp) = cluster_guard_node_id(&state, &query, Some(&entry.node_id)) { return resp; }
 
     // Resolve the domain up front so the stored entry always carries a
     // pinned IP. We don't want the forward silently following DNS flaps
@@ -3410,6 +4149,7 @@ pub async fn update_proxy(
     state: S,
     path: web::Path<String>,
     body: web::Json<proxy::ProxyEntry>,
+    query: web::Query<TopologyQuery>,
 ) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
@@ -3420,6 +4160,8 @@ pub async fn update_proxy(
     if updated.node_id.is_empty() {
         updated.node_id = crate::agent::self_node_id();
     }
+    if let Some(resp) = cluster_guard_existing_proxy(&state, &query, &id) { return resp; }
+    if let Some(resp) = cluster_guard_node_id(&state, &query, Some(&updated.node_id)) { return resp; }
     if let Err(e) = proxy::resolve_entry_public_ip(&mut updated) {
         return HttpResponse::BadRequest().body(e);
     }
@@ -3449,9 +4191,10 @@ pub async fn update_proxy(
     }))
 }
 
-pub async fn delete_proxy(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
+pub async fn delete_proxy(req: HttpRequest, state: S, path: web::Path<String>, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
+    if let Some(resp) = cluster_guard_existing_proxy(&state, &query, &id) { return resp; }
     let proxies = {
         let mut cfg = state.router.config.write().unwrap();
         cfg.proxies.retain(|p| p.id != id);
@@ -3475,14 +4218,29 @@ pub async fn delete_proxy(req: HttpRequest, state: S, path: web::Path<String>) -
 
 // ─── Subnet Routing ───
 
-pub async fn list_subnet_routes(req: HttpRequest, state: S) -> HttpResponse {
+pub async fn list_subnet_routes(req: HttpRequest, state: S, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
-    let cfg = state.router.config.read().unwrap();
-    HttpResponse::Ok().json(&cfg.subnet_routes)
+    let routes = state.router.config.read().unwrap().subnet_routes.clone();
+    let filtered: Vec<&SubnetRoute> = match cluster_node_id_set(&state, &query) {
+        None => routes.iter().collect(),
+        // Strict cluster isolation, same as list_rules — a route with
+        // node_id=None ("apply cluster-wide") would leak across
+        // cluster views since it operates on nodes the operator
+        // isn't currently managing. Hide them; operators need to
+        // pin to a specific node when creating from a cluster view.
+        Some(set) => routes.iter()
+            .filter(|r| match &r.node_id {
+                None => false,
+                Some(nid) => set.contains(nid),
+            })
+            .collect(),
+    };
+    HttpResponse::Ok().json(filtered)
 }
 
-pub async fn create_subnet_route(req: HttpRequest, state: S, body: web::Json<SubnetRoute>) -> HttpResponse {
+pub async fn create_subnet_route(req: HttpRequest, state: S, body: web::Json<SubnetRoute>, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
+    if let Some(resp) = cluster_guard_node_id(&state, &query, body.node_id.as_deref()) { return resp; }
     let mut route = body.into_inner();
 
     // Generate ID if not provided
@@ -3595,6 +4353,7 @@ pub async fn update_subnet_route(
     state: S,
     path: web::Path<String>,
     body: web::Json<SubnetRoute>,
+    query: web::Query<TopologyQuery>,
 ) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
@@ -3612,6 +4371,8 @@ pub async fn update_subnet_route(
             "error": "gateway is required"
         }));
     }
+    if let Some(resp) = cluster_guard_existing_subnet_route(&state, &query, &id) { return resp; }
+    if let Some(resp) = cluster_guard_node_id(&state, &query, updated.node_id.as_deref()) { return resp; }
 
     // Capture the OLD route before overwriting so we can correctly remove
     // its kernel entry if the CIDR/gateway changed or the route flipped to
@@ -3749,9 +4510,10 @@ pub async fn update_subnet_route(
     HttpResponse::Ok().json(resp)
 }
 
-pub async fn delete_subnet_route(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
+pub async fn delete_subnet_route(req: HttpRequest, state: S, path: web::Path<String>, query: web::Query<TopologyQuery>) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
+    if let Some(resp) = cluster_guard_existing_subnet_route(&state, &query, &id) { return resp; }
 
     let deleted_route = {
         let mut cfg = state.router.config.write().unwrap();
@@ -4069,6 +4831,854 @@ pub async fn diagnostics_subnet_routes(req: HttpRequest, state: S) -> HttpRespon
     }))
 }
 
+// ─── LAN Health ───
+//
+// Per-LAN runtime health for the WolfRouter "Health" tab. Each endpoint
+// is read-only except `restart_dnsmasq` and `set_lan_interface`, which
+// are explicit one-click actions surfaced as `action: "..."` on the
+// health checks themselves. Cross-node calls proxy via the existing
+// `proxy_router_get_to_node`.
+
+/// GET /api/router/segments/{id}/health
+/// Returns a `LanHealth` for one LAN. When the LAN is owned by another
+/// node, proxies the call to the owner so the operator gets the *live*
+/// runtime state, not stale cluster cache.
+pub async fn get_lan_health(
+    req: HttpRequest, state: S, path: web::Path<String>
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let id = path.into_inner();
+    let (lan_opt, owner_id) = {
+        let cfg = state.router.config.read().unwrap();
+        let lan = cfg.lans.iter().find(|l| l.id == id).cloned();
+        let owner = lan.as_ref().map(|l| l.node_id.clone());
+        (lan, owner)
+    };
+    let Some(lan) = lan_opt else {
+        return HttpResponse::NotFound().body("LAN not found");
+    };
+    let self_id = crate::agent::self_node_id();
+    if owner_id.as_deref() != Some(&self_id) {
+        let owner = owner_id.unwrap_or_default();
+        return proxy_router_get_to_node(
+            state, &owner,
+            &format!("router/segments/{}/health", id),
+            "",
+        ).await;
+    }
+    // Local: run health checks on the blocking pool — `ss`, iptables-save
+    // and the UDP probe all do syscalls that shouldn't block the runtime.
+    let lan2 = lan.clone();
+    let report = tokio::task::spawn_blocking(move || {
+        super::health::lan_health(&lan2, &self_id)
+    }).await.unwrap_or_else(|_| super::health::lan_health(&lan, &crate::agent::self_node_id()));
+    HttpResponse::Ok().json(report)
+}
+
+/// GET /api/router/health[?cluster=NAME]
+/// Aggregate every LAN's health across the requested cluster. Used by
+/// the Health tab's overview list. **Cluster-scoped**: WolfRouter is
+/// per-cluster, so a bastion managing multiple clusters must NOT mix
+/// LANs from cluster A into cluster B's view. When `?cluster=NAME` is
+/// set, LANs whose owning node isn't in that cluster are filtered out.
+pub async fn list_lan_health(
+    req: HttpRequest, state: S,
+    query: web::Query<TopologyQuery>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let cluster_filter = query.cluster.clone();
+    let lans_all: Vec<LanSegment> = state.router.config.read().unwrap().lans.clone();
+    let self_id = crate::agent::self_node_id();
+
+    // Build a node_id → cluster_name map once so filtering N LANs is
+    // O(N) instead of O(N²) cluster lookups. Node cluster name uses the
+    // same "WolfStack" alias as the topology endpoint for nameless nodes.
+    let nodes = state.cluster.get_all_nodes();
+    let normalize = |n: Option<&str>| -> String {
+        match n {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => "WolfStack".into(),
+        }
+    };
+    let self_cluster_raw = state.cluster.get_self_cluster_name();
+    let self_cluster_norm = normalize(
+        if self_cluster_raw.is_empty() { None } else { Some(self_cluster_raw.as_str()) }
+    );
+    let mut node_cluster: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for n in &nodes {
+        // Use the canonical self_cluster for self — gossip can leave a
+        // stale name on the in-memory entry.
+        let cname = if n.is_self || n.id == self_id {
+            self_cluster_norm.clone()
+        } else {
+            normalize(n.cluster_name.as_deref())
+        };
+        node_cluster.insert(n.id.clone(), cname);
+    }
+
+    // Filter LANs by cluster_filter. LANs whose owning node we don't
+    // know about (stale config? gone-but-not-tombstoned?) fall through
+    // to "WolfStack" so they don't silently disappear.
+    let lans: Vec<LanSegment> = lans_all.into_iter()
+        .filter(|l| {
+            let lan_cluster = node_cluster.get(&l.node_id)
+                .cloned()
+                .unwrap_or_else(|| "WolfStack".into());
+            match &cluster_filter {
+                Some(want) => &lan_cluster == want,
+                None => true,
+            }
+        })
+        .collect();
+
+    let mut out: Vec<super::health::LanHealth> = Vec::with_capacity(lans.len());
+    for lan in lans {
+        if lan.node_id == self_id {
+            let lan2 = lan.clone();
+            let nid = self_id.clone();
+            let report = tokio::task::spawn_blocking(move || {
+                super::health::lan_health(&lan2, &nid)
+            }).await.unwrap_or_else(|_|
+                super::health::lan_health(&lan, &self_id)
+            );
+            out.push(report);
+        } else {
+            // Stub for remote LANs — the per-LAN endpoint can drill in.
+            out.push(super::health::LanHealth {
+                lan_id: lan.id.clone(),
+                lan_name: lan.name.clone(),
+                node_id: lan.node_id.clone(),
+                status: "remote",
+                checks: vec![],
+                apply_resolution: None,
+                breaker: None,
+            });
+        }
+    }
+    HttpResponse::Ok().json(serde_json::json!({
+        "lans": out,
+        "cluster_filter": cluster_filter,
+    }))
+}
+
+/// POST /api/router/segments/{id}/restart-dnsmasq
+/// One-click "Restart dnsmasq for this LAN". Resets the watchdog circuit
+/// breaker so the next tick gives it another chance, then runs
+/// `dhcp::start` with self-heal. Cross-node proxied to the owner.
+pub async fn restart_lan_dnsmasq(
+    req: HttpRequest, state: S, path: web::Path<String>
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let id = path.into_inner();
+    let (lan_opt, owner_id) = {
+        let cfg = state.router.config.read().unwrap();
+        let lan = cfg.lans.iter().find(|l| l.id == id).cloned();
+        let owner = lan.as_ref().map(|l| l.node_id.clone());
+        (lan, owner)
+    };
+    let Some(lan) = lan_opt else {
+        return HttpResponse::NotFound().body("LAN not found");
+    };
+    let self_id = crate::agent::self_node_id();
+    if owner_id.as_deref() != Some(&self_id) {
+        let owner = owner_id.unwrap_or_default();
+        // Reuse the GET proxy path — the inter-node port accepts POST
+        // through the same `/proxy/{path}` machinery.
+        return proxy_router_post_to_node(
+            state, &owner,
+            &format!("router/segments/{}/restart-dnsmasq", id),
+            serde_json::json!({}),
+        ).await;
+    }
+    super::health::breaker_reset(&lan.id);
+    let lan2 = lan.clone();
+    let result = tokio::task::spawn_blocking(move || dhcp::start(&lan2)).await;
+    match result {
+        Ok(Ok(resolution)) => {
+            super::health::breaker_record_success(&lan.id);
+            HttpResponse::Ok().json(serde_json::json!({
+                "success": true,
+                "resolution": resolution,
+            }))
+        }
+        Ok(Err(e)) => {
+            super::health::breaker_record_failure(&lan.id, &e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "success": false,
+                "error": e,
+            }))
+        }
+        Err(_) => HttpResponse::InternalServerError().body("blocking task panicked"),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SetLanInterfaceRequest {
+    pub interface: String,
+}
+
+/// POST /api/router/segments/{id}/set-interface
+/// One-click "Use the actual interface" from the LAN Health panel —
+/// rewrites the saved LAN config so `interface` matches the iface that
+/// actually carries `router_ip`. Validates the new value the same way
+/// PUT /segments/{id} would, then re-applies dnsmasq.
+pub async fn set_lan_interface(
+    req: HttpRequest, state: S,
+    path: web::Path<String>, body: web::Json<SetLanInterfaceRequest>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let id = path.into_inner();
+    let new_iface = body.interface.trim().to_string();
+    if new_iface.is_empty() {
+        return HttpResponse::BadRequest().body("interface must be non-empty");
+    }
+    // Same character whitelist as validate_segment uses for interfaces:
+    // letters, digits, '.', '-', '_' (Linux netdev names allow these).
+    if !new_iface.chars().all(|c|
+        c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
+    ) {
+        return HttpResponse::BadRequest().body("interface contains invalid characters");
+    }
+
+    let (lan_opt, owner_id) = {
+        let cfg = state.router.config.read().unwrap();
+        let lan = cfg.lans.iter().find(|l| l.id == id).cloned();
+        let owner = lan.as_ref().map(|l| l.node_id.clone());
+        (lan, owner)
+    };
+    let Some(_lan) = lan_opt else {
+        return HttpResponse::NotFound().body("LAN not found");
+    };
+    let self_id = crate::agent::self_node_id();
+    if owner_id.as_deref() != Some(&self_id) {
+        let owner = owner_id.unwrap_or_default();
+        return proxy_router_post_to_node(
+            state, &owner,
+            &format!("router/segments/{}/set-interface", id),
+            serde_json::json!({ "interface": new_iface }),
+        ).await;
+    }
+
+    // Mutate config under the write lock, save, then drop the lock
+    // BEFORE shelling out to dhcp::start. Same pattern as set_query_log.
+    let updated_lan = {
+        let mut cfg = state.router.config.write().unwrap();
+        let seg = match cfg.lans.iter_mut().find(|l| l.id == id) {
+            Some(s) => s,
+            None => return HttpResponse::NotFound().body("LAN not found"),
+        };
+        seg.interface = new_iface;
+        let updated = seg.clone();
+        if let Err(e) = cfg.save() {
+            return HttpResponse::InternalServerError().body(format!("save: {}", e));
+        }
+        updated
+    };
+
+    super::health::breaker_reset(&updated_lan.id);
+    let lan2 = updated_lan.clone();
+    let result = tokio::task::spawn_blocking(move || dhcp::start(&lan2)).await;
+    replicate_config_to_cluster(state.clone());
+    match result {
+        Ok(Ok(resolution)) => HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "resolution": resolution,
+            "lan": updated_lan,
+        })),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "success": false,
+            "error": e,
+        })),
+        Err(_) => HttpResponse::InternalServerError().body("blocking task panicked"),
+    }
+}
+
+// ─── Preflight one-click Fix actions ────────────────────────────────
+//
+// Each handler does exactly ONE narrowly-scoped fix surfaced as a Fix
+// button on a preflight row. Strictly safe — anything that could lock
+// the operator out (host firewall edits on the management interface,
+// say) stays instructions-only.
+
+/// POST /api/router/fix/enable-ip-forward
+/// Persist `net.ipv4.ip_forward=1` to /etc/sysctl.d/99-wolfrouter.conf
+/// and reload sysctl. Idempotent — overwriting the drop-in is the
+/// behaviour we want when a previous run wrote a stale value.
+pub async fn fix_enable_ip_forward(req: HttpRequest, state: S) -> HttpResponse {
+    auth_or_return!(req, state);
+    let res = tokio::task::spawn_blocking(|| {
+        let dropin = "/etc/sysctl.d/99-wolfrouter.conf";
+        let body = "# Written by WolfRouter — required for any LAN/firewall forwarding to work.\n\
+                    net.ipv4.ip_forward=1\n";
+        if let Err(e) = std::fs::write(dropin, body) {
+            return Err(format!("write {}: {}", dropin, e));
+        }
+        // Reload via `sysctl --system` so the change takes effect now,
+        // not just at next reboot. Fallback to a direct write if sysctl
+        // isn't available — most distros have it but containers often
+        // don't ship it.
+        let out = std::process::Command::new("sysctl").arg("--system").output();
+        match out {
+            Ok(o) if o.status.success() => Ok(format!(
+                "Wrote {} and reloaded sysctl. IP forwarding is now ON.",
+                dropin
+            )),
+            _ => {
+                // Direct kernel write — works without sysctl(8).
+                if let Err(e) = std::fs::write("/proc/sys/net/ipv4/ip_forward", "1\n") {
+                    return Err(format!(
+                        "wrote {} but couldn't apply live (`sysctl --system` failed AND direct /proc write failed: {}). \
+                         The change will take effect at next reboot.",
+                        dropin, e
+                    ));
+                }
+                Ok(format!(
+                    "Wrote {} and applied via /proc (sysctl(8) wasn't available). \
+                     IP forwarding is now ON.",
+                    dropin
+                ))
+            }
+        }
+    }).await.unwrap_or_else(|_| Err("blocking task panicked".into()));
+    match res {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "success": true, "message": msg })),
+        Err(e)  => HttpResponse::InternalServerError().json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /api/router/fix/purge-self-loop-routes
+/// Delete every `default via <local-ip>` self-loop route. Same logic
+/// the startup hook uses (`purge_self_loop_defaults`) — deletes ONLY
+/// routes whose next-hop is one of THIS host's own IPs. Such routes
+/// can never deliver a packet, so this can never make egress worse.
+pub async fn fix_purge_self_loop_routes(req: HttpRequest, state: S) -> HttpResponse {
+    auth_or_return!(req, state);
+    let removed = tokio::task::spawn_blocking(|| {
+        super::purge_self_loop_defaults()
+    }).await.unwrap_or_default();
+    if removed.is_empty() {
+        HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "message": "No self-loop default routes found — nothing to remove. \
+                        If preflight still flags this, find the persistent source \
+                        (/etc/network/interfaces, /etc/netplan/*.yaml, \
+                        NetworkManager profile) and remove it from there too.",
+            "removed": removed,
+        }))
+    } else {
+        HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "message": format!(
+                "Removed {} self-loop default route(s) live. \
+                 Edit the persistent source (e.g. `gateway <local-ip>` line in \
+                 /etc/network/interfaces) so they don't come back at next reboot.",
+                removed.len()
+            ),
+            "removed": removed,
+        }))
+    }
+}
+
+#[derive(Deserialize)]
+pub struct DhclientIfaceRequest { pub iface: String }
+
+/// POST /api/router/fix/dhclient
+/// Bring an interface up and request a DHCP lease via dhclient(8).
+/// Used by the WAN-DHCP "interface has no IPv4" preflight row when
+/// the host's own DHCP client never grabbed a lease (Starlink trap,
+/// boot-order race against the dishy bring-up).
+pub async fn fix_dhclient_iface(
+    req: HttpRequest, state: S, body: web::Json<DhclientIfaceRequest>
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let iface = body.iface.trim().to_string();
+    if iface.is_empty() || !iface.chars().all(|c|
+        c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
+    ) {
+        return HttpResponse::BadRequest().body("invalid iface");
+    }
+    let res = tokio::task::spawn_blocking(move || {
+        // Bring it up (idempotent — `set up` on an up iface is a no-op).
+        let _ = std::process::Command::new("ip")
+            .args(["link", "set", &iface, "up"]).output();
+        // dhclient -v writes verbose output to stderr; we propagate
+        // the first error line so the operator sees what happened.
+        let out = std::process::Command::new("dhclient")
+            .args(["-v", "-1", "-nw", &iface])  // -1 = exit if lease can't be obtained
+            .output()
+            .map_err(|e| format!("spawn dhclient: {} (is dhclient installed?)", e))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(format!("dhclient on {} failed: {}", iface, stderr.trim()));
+        }
+        Ok(format!(
+            "Requested a DHCP lease on {}. Re-run preflight in a few seconds — \
+             the iface should now show an IPv4 address.",
+            iface
+        ))
+    }).await.unwrap_or_else(|_| Err("blocking task panicked".into()));
+    match res {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "success": true, "message": msg })),
+        Err(e)  => HttpResponse::InternalServerError().json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /api/router/fix/wan/{id}/reapply
+/// Re-apply a WAN connection — installs MASQUERADE, redials PPPoE if
+/// needed, etc. Same logic the WAN editor's Save button runs.
+pub async fn fix_reapply_wan(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
+    auth_or_return!(req, state);
+    let id = path.into_inner();
+    let conn = {
+        let cfg = state.router.config.read().unwrap();
+        cfg.wan_connections.iter().find(|w| w.id == id).cloned()
+    };
+    let Some(conn) = conn else {
+        return HttpResponse::NotFound().body("WAN connection not found");
+    };
+    if conn.node_id != crate::agent::self_node_id() {
+        // Cross-node: proxy to the owning node so the kernel changes
+        // happen there, not here.
+        return proxy_router_post_to_node(
+            state, &conn.node_id,
+            &format!("router/fix/wan/{}/reapply", id),
+            serde_json::json!({}),
+        ).await;
+    }
+    let res = tokio::task::spawn_blocking(move || wan::apply(&conn)).await;
+    match res {
+        Ok(Ok(())) => HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "message": "WAN re-applied. MASQUERADE rule should be back; PPPoE redialed if applicable.",
+        })),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "success": false, "error": e,
+        })),
+        Err(_) => HttpResponse::InternalServerError().body("blocking task panicked"),
+    }
+}
+
+/// POST /api/router/fix/wan/{id}/tick-pppoe-default-route
+/// Set `use_default_route=true` on a PPPoE WAN, save, redial. The
+/// preflight row that asks for this exists because pppd writes
+/// `nodefaultroute` to the peer file when the flag is off — clearing
+/// it requires a redial.
+pub async fn fix_tick_pppoe_default_route(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
+    auth_or_return!(req, state);
+    let id = path.into_inner();
+    let updated = {
+        let mut cfg = state.router.config.write().unwrap();
+        let Some(conn) = cfg.wan_connections.iter_mut().find(|w| w.id == id) else {
+            return HttpResponse::NotFound().body("WAN connection not found");
+        };
+        let owner = conn.node_id.clone();
+        if owner != crate::agent::self_node_id() {
+            // Drop the lock before the proxy so we don't hold it across .await.
+            drop(cfg);
+            return proxy_router_post_to_node(
+                state, &owner,
+                &format!("router/fix/wan/{}/tick-pppoe-default-route", id),
+                serde_json::json!({}),
+            ).await;
+        }
+        match &mut conn.mode {
+            wan::WanMode::Pppoe(p) => { p.use_default_route = true; }
+            _ => return HttpResponse::BadRequest().body("WAN is not PPPoE — flag doesn't apply"),
+        }
+        let updated = conn.clone();
+        if let Err(e) = cfg.save() {
+            return HttpResponse::InternalServerError().body(format!("save: {}", e));
+        }
+        updated
+    };
+    let res = tokio::task::spawn_blocking(move || wan::apply(&updated)).await;
+    replicate_config_to_cluster(state.clone());
+    match res {
+        Ok(Ok(())) => HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "message": "Ticked 'use_default_route' on the PPPoE WAN, saved, and redialed. \
+                        pppd should now install a default route.",
+        })),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "success": false, "error": e,
+        })),
+        Err(_) => HttpResponse::InternalServerError().body("blocking task panicked"),
+    }
+}
+
+/// GET /api/router/preflight-cluster[?cluster=NAME]
+/// Fan out to every WolfStack node in the requested cluster, ask each
+/// one for its /api/router/preflight, and aggregate. **Cluster-scoped**:
+/// without `?cluster=NAME` we return every node, but the UI always
+/// passes the current cluster.
+pub async fn get_cluster_preflight(
+    req: HttpRequest, state: S,
+    query: web::Query<TopologyQuery>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let cluster_filter = query.cluster.clone();
+    let nodes = state.cluster.get_all_nodes();
+    let normalize = |n: Option<&str>| -> String {
+        match n {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => "WolfStack".into(),
+        }
+    };
+    let self_cluster_raw = state.cluster.get_self_cluster_name();
+    let self_cluster_norm = normalize(
+        if self_cluster_raw.is_empty() { None } else { Some(self_cluster_raw.as_str()) }
+    );
+    let include_self = match &cluster_filter {
+        Some(want) => &self_cluster_norm == want,
+        None => true,
+    };
+    let client = &*ROUTER_RPC_CLIENT;
+    let mut peer_futs = Vec::new();
+    let mut local_row: Option<serde_json::Value> = None;
+
+    // Local first — direct call into preflight() would need refactoring
+    // its current signature, so we just hit our own HTTP endpoint to
+    // keep one code path. 4s timeout against ourselves should never
+    // miss.
+    let self_id = crate::agent::self_node_id();
+    let self_node = nodes.iter().find(|n| n.is_self).cloned();
+    if include_self { if let Some(sn) = self_node {
+        let host = resolve_node_address(&sn.address);
+        let url = format!("http://127.0.0.1:{}/api/router/preflight", sn.port + 1);
+        let secret = state.cluster_secret.clone();
+        let res = client.get(&url)
+            .header("X-WolfStack-Secret", &secret)
+            .timeout(std::time::Duration::from_secs(8))
+            .send().await;
+        match res {
+            Ok(r) if r.status().is_success() => {
+                if let Ok(v) = r.json::<serde_json::Value>().await {
+                    local_row = Some(serde_json::json!({
+                        "node_id": self_id,
+                        "is_self": true,
+                        "preflight": v,
+                    }));
+                }
+            }
+            _ => {
+                // Loopback failed for some reason — emit an error row
+                // rather than silently dropping the local node.
+                local_row = Some(serde_json::json!({
+                    "node_id": self_id,
+                    "is_self": true,
+                    "error": format!("loopback preflight call to {} failed", url),
+                }));
+            }
+        }
+        let _ = host; // resolve_node_address result not needed for the loopback URL
+    } } // close `if include_self {` and `if let Some(sn)`
+
+    for node in &nodes {
+        if node.is_self { continue; }
+        // Skip peers whose cluster doesn't match the filter.
+        let node_cluster = normalize(node.cluster_name.as_deref());
+        if let Some(want) = &cluster_filter {
+            if &node_cluster != want { continue; }
+        }
+        let host = resolve_node_address(&node.address);
+        let urls = [
+            format!("https://{}:{}/api/router/preflight", host, node.port),
+            format!("http://{}:{}/api/router/preflight", host, node.port + 1),
+            format!("http://{}:{}/api/router/preflight", host, node.port),
+        ];
+        let secret = state.cluster_secret.clone();
+        let nid = node.id.clone();
+        let cluster = node.cluster_name.clone().unwrap_or_default();
+        peer_futs.push(async move {
+            let mut last_err = String::new();
+            for url in &urls {
+                let res = client.get(url)
+                    .header("X-WolfStack-Secret", &secret)
+                    .timeout(std::time::Duration::from_secs(8))
+                    .send().await;
+                match res {
+                    Ok(r) if r.status().is_success() => {
+                        match r.json::<serde_json::Value>().await {
+                            Ok(v) => return serde_json::json!({
+                                "node_id": nid,
+                                "cluster_name": cluster,
+                                "is_self": false,
+                                "preflight": v,
+                            }),
+                            Err(e) => { last_err = format!("decode: {}", e); continue; }
+                        }
+                    }
+                    Ok(r) => { last_err = format!("HTTP {}", r.status()); continue; }
+                    Err(e) => { last_err = format!("{}: {}", url, e); continue; }
+                }
+            }
+            serde_json::json!({
+                "node_id": nid,
+                "cluster_name": cluster,
+                "is_self": false,
+                "error": last_err,
+            })
+        });
+    }
+    let mut rows = futures::future::join_all(peer_futs).await;
+    if let Some(local) = local_row { rows.insert(0, local); }
+    HttpResponse::Ok().json(serde_json::json!({ "nodes": rows }))
+}
+
+/// GET /api/router/validation
+/// Return this node's most recent ValidationReport. If none stored yet
+/// (process just started, watchdog hasn't ticked), runs one inline so
+/// callers always get a fresh answer. Cheap — same checks the per-LAN
+/// health endpoint runs.
+pub async fn get_local_validation(req: HttpRequest, state: S) -> HttpResponse {
+    auth_or_return!(req, state);
+    let cached = state.router.last_validation.read().unwrap().clone();
+    if let Some(r) = cached {
+        return HttpResponse::Ok().json(r);
+    }
+    let state_clone = state.clone();
+    let self_id = crate::agent::self_node_id();
+    let report = tokio::task::spawn_blocking(move || {
+        super::run_validation_and_store(&state_clone.router, &self_id);
+        state_clone.router.last_validation.read().unwrap().clone()
+    }).await.ok().flatten();
+    match report {
+        Some(r) => HttpResponse::Ok().json(r),
+        None => HttpResponse::InternalServerError().body("validation produced no report"),
+    }
+}
+
+/// GET /api/router/validation-cluster[?cluster=NAME]
+/// Fan out to every peer in the requested cluster, ask for their
+/// /api/router/validation, and aggregate. **Cluster-scoped**:
+/// WolfRouter is per-cluster; without `?cluster=NAME` we return
+/// every node, but the UI always passes the current cluster.
+pub async fn get_cluster_validation(
+    req: HttpRequest, state: S,
+    query: web::Query<TopologyQuery>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let cluster_filter = query.cluster.clone();
+    let self_id = crate::agent::self_node_id();
+    let nodes = state.cluster.get_all_nodes();
+    let normalize = |n: Option<&str>| -> String {
+        match n {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => "WolfStack".into(),
+        }
+    };
+    let self_cluster_raw = state.cluster.get_self_cluster_name();
+    let self_cluster_norm = normalize(
+        if self_cluster_raw.is_empty() { None } else { Some(self_cluster_raw.as_str()) }
+    );
+    // Self is included only when its cluster matches (or no filter).
+    let include_self = match &cluster_filter {
+        Some(want) => &self_cluster_norm == want,
+        None => true,
+    };
+
+    // Local snapshot only when we'll actually include self in the
+    // result — saves a spawn_blocking when the bastion isn't in the
+    // filtered cluster.
+    let local_report = if include_self {
+        let cached = state.router.last_validation.read().unwrap().clone();
+        match cached {
+            Some(r) => Some(r),
+            None => {
+                let st = state.clone();
+                let nid = self_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    super::run_validation_and_store(&st.router, &nid);
+                    st.router.last_validation.read().unwrap().clone()
+                }).await.ok().flatten()
+            }
+        }
+    } else {
+        None
+    };
+
+    // Build per-peer futures, filtering by requested cluster. The
+    // existing topology endpoint applies the same normalisation: a
+    // node with no `cluster_name` is grouped under "WolfStack".
+    let client = &*ROUTER_RPC_CLIENT;
+    let mut peer_futs = Vec::new();
+    let mut local_row: Option<serde_json::Value> = None;
+    for node in &nodes {
+        if node.is_self {
+            if include_self {
+                local_row = Some(serde_json::json!({
+                    "node_id": node.id,
+                    "is_self": true,
+                    "report": local_report,
+                }));
+            }
+            continue;
+        }
+        // Skip peers whose cluster doesn't match the filter.
+        let node_cluster = normalize(node.cluster_name.as_deref());
+        if let Some(want) = &cluster_filter {
+            if &node_cluster != want { continue; }
+        }
+        let host = resolve_node_address(&node.address);
+        let urls = [
+            format!("https://{}:{}/api/router/validation", host, node.port),
+            format!("http://{}:{}/api/router/validation", host, node.port + 1),
+            format!("http://{}:{}/api/router/validation", host, node.port),
+        ];
+        let secret = state.cluster_secret.clone();
+        let nid = node.id.clone();
+        let cluster = node.cluster_name.clone().unwrap_or_default();
+        peer_futs.push(async move {
+            let mut last_err = String::new();
+            for url in &urls {
+                let res = client.get(url)
+                    .header("X-WolfStack-Secret", &secret)
+                    .timeout(std::time::Duration::from_secs(4))
+                    .send().await;
+                match res {
+                    Ok(r) if r.status().is_success() => {
+                        match r.json::<serde_json::Value>().await {
+                            Ok(v) => return serde_json::json!({
+                                "node_id": nid,
+                                "cluster_name": cluster,
+                                "is_self": false,
+                                "report": v,
+                            }),
+                            Err(e) => { last_err = format!("decode: {}", e); continue; }
+                        }
+                    }
+                    Ok(r) => { last_err = format!("HTTP {}", r.status()); continue; }
+                    Err(e) => { last_err = format!("{}: {}", url, e); continue; }
+                }
+            }
+            serde_json::json!({
+                "node_id": nid,
+                "cluster_name": cluster,
+                "is_self": false,
+                "error": last_err,
+            })
+        });
+    }
+    let mut rows = futures::future::join_all(peer_futs).await;
+    if let Some(local) = local_row { rows.insert(0, local); }
+    HttpResponse::Ok().json(serde_json::json!({ "nodes": rows }))
+}
+
+// ─── Cluster-scoping helper ─────────────────────────────────────────
+//
+// WolfRouter is per-cluster. Every list endpoint that returns config
+// items must filter by the active cluster — otherwise a bastion with
+// (say) 5 clusters / 14 servers shows every cluster's LANs / rules /
+// WANs / proxies / zones in every cluster's WolfRouter view, which
+// is a real cross-cluster leak (Adam Cogswell 2026-04-29: "the user
+// should NEVER EVER see anything from another cluster in wolfrouter
+// they are on distinct networks").
+//
+// `cluster_node_id_set` returns the set of node IDs that belong to
+// the requested cluster (None = no filter, return everything). Each
+// list endpoint then keeps items whose `node_id` is in that set
+// (plus optionally items with `node_id = None`, which apply globally
+// and are inherently cluster-agnostic).
+
+fn cluster_node_id_set(
+    state: &S,
+    query: &TopologyQuery,
+) -> Option<std::collections::HashSet<String>> {
+    let want = match &query.cluster {
+        Some(c) if !c.is_empty() => c.clone(),
+        _ => return None, // no filter requested
+    };
+    let normalize = |n: Option<&str>| -> String {
+        match n {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => "WolfStack".into(),
+        }
+    };
+    let self_cluster_raw = state.cluster.get_self_cluster_name();
+    let self_cluster_norm = normalize(
+        if self_cluster_raw.is_empty() { None } else { Some(self_cluster_raw.as_str()) }
+    );
+    let self_id = crate::agent::self_node_id();
+    let mut set = std::collections::HashSet::new();
+    for n in state.cluster.get_all_nodes() {
+        let cname = if n.is_self || n.id == self_id {
+            self_cluster_norm.clone()
+        } else {
+            normalize(n.cluster_name.as_deref())
+        };
+        if cname == want {
+            set.insert(n.id.clone());
+        }
+    }
+    Some(set)
+}
+
+/// Block a write that would affect a node outside the requested
+/// cluster. Returns `None` when the operation is allowed:
+///   • no `?cluster=` filter (admin / no scope) → allow
+///   • node_id is in the cluster's node set → allow
+///
+/// Returns `Some(HttpResponse)` to short-circuit the handler when:
+///   • node_id is None and a cluster filter is active (legacy
+///     "global" item — banned per strict cluster isolation)
+///   • node_id is in a different cluster (cross-cluster affect)
+///
+/// Adam Cogswell 2026-04-29: "WOLFROUTER IS cluster limited, cluster
+/// 1's wolfrouter must not display or affect anything on cluster 2".
+/// The "affect" half lives here — every create/update/delete on
+/// router config calls this before mutating.
+fn cluster_guard_node_id(state: &S, query: &TopologyQuery, node_id: Option<&str>) -> Option<HttpResponse> {
+    let set = cluster_node_id_set(state, query)?;
+    match node_id {
+        None => Some(HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "this WolfRouter view is cluster-scoped — items must be pinned to a node in this cluster (cluster-agnostic / global items aren't allowed)",
+        }))),
+        Some(nid) if set.contains(nid) => None,
+        Some(nid) => Some(HttpResponse::Forbidden().json(serde_json::json!({
+            "error": format!("node '{}' is not in this cluster — cross-cluster operations are blocked", nid),
+        }))),
+    }
+}
+
+/// Same as `cluster_guard_node_id` but resolves the node_id by
+/// looking up an existing config item by id. Used by PUT/DELETE
+/// handlers that don't carry the node_id in the URL — they need to
+/// check what node OWNS the item before allowing the operation.
+fn cluster_guard_existing_lan(state: &S, query: &TopologyQuery, lan_id: &str) -> Option<HttpResponse> {
+    let nid = state.router.config.read().unwrap()
+        .lans.iter().find(|l| l.id == lan_id).map(|l| l.node_id.clone());
+    cluster_guard_node_id(state, query, nid.as_deref())
+}
+fn cluster_guard_existing_wan(state: &S, query: &TopologyQuery, wan_id: &str) -> Option<HttpResponse> {
+    let nid = state.router.config.read().unwrap()
+        .wan_connections.iter().find(|w| w.id == wan_id).map(|w| w.node_id.clone());
+    cluster_guard_node_id(state, query, nid.as_deref())
+}
+fn cluster_guard_existing_proxy(state: &S, query: &TopologyQuery, proxy_id: &str) -> Option<HttpResponse> {
+    let nid = state.router.config.read().unwrap()
+        .proxies.iter().find(|p| p.id == proxy_id).map(|p| p.node_id.clone());
+    cluster_guard_node_id(state, query, nid.as_deref())
+}
+fn cluster_guard_existing_rule(state: &S, query: &TopologyQuery, rule_id: &str) -> Option<HttpResponse> {
+    // Rules have node_id: Option<String>. Look up the item; flatten
+    // the outer Option (item-not-found) into the inner Option that
+    // cluster_guard_node_id understands. A None node_id (legacy
+    // "global" rule) gets rejected by the strict guard.
+    let cfg = state.router.config.read().unwrap();
+    let rule = cfg.rules.iter().find(|r| r.id == rule_id);
+    let inner: Option<String> = rule.and_then(|r| r.node_id.clone());
+    drop(cfg);
+    cluster_guard_node_id(state, query, inner.as_deref())
+}
+fn cluster_guard_existing_subnet_route(state: &S, query: &TopologyQuery, route_id: &str) -> Option<HttpResponse> {
+    let cfg = state.router.config.read().unwrap();
+    let route = cfg.subnet_routes.iter().find(|r| r.id == route_id);
+    let inner: Option<String> = route.and_then(|r| r.node_id.clone());
+    drop(cfg);
+    cluster_guard_node_id(state, query, inner.as_deref())
+}
+
 // ─── Mount ───
 
 pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
@@ -4086,6 +5696,18 @@ pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
         .route("/api/router/segments/{id}/leases", web::get().to(get_leases))
         .route("/api/router/segments/{id}/query-log", web::get().to(get_query_log))
         .route("/api/router/segments/{id}/query-log", web::post().to(set_query_log))
+        .route("/api/router/segments/{id}/health", web::get().to(get_lan_health))
+        .route("/api/router/segments/{id}/restart-dnsmasq", web::post().to(restart_lan_dnsmasq))
+        .route("/api/router/segments/{id}/set-interface", web::post().to(set_lan_interface))
+        .route("/api/router/health", web::get().to(list_lan_health))
+        .route("/api/router/validation", web::get().to(get_local_validation))
+        .route("/api/router/validation-cluster", web::get().to(get_cluster_validation))
+        .route("/api/router/preflight-cluster", web::get().to(get_cluster_preflight))
+        .route("/api/router/fix/enable-ip-forward", web::post().to(fix_enable_ip_forward))
+        .route("/api/router/fix/purge-self-loop-routes", web::post().to(fix_purge_self_loop_routes))
+        .route("/api/router/fix/dhclient", web::post().to(fix_dhclient_iface))
+        .route("/api/router/fix/wan/{id}/reapply", web::post().to(fix_reapply_wan))
+        .route("/api/router/fix/wan/{id}/tick-pppoe-default-route", web::post().to(fix_tick_pppoe_default_route))
         .route("/api/router/rules", web::get().to(list_rules))
         .route("/api/router/rules", web::post().to(create_rule))
         .route("/api/router/rules/{id}", web::put().to(update_rule))
@@ -4270,7 +5892,7 @@ async fn set_lan_dns_port(
     if body.new_port != 53 && external.is_empty() {
         return actix_web::HttpResponse::BadRequest().json(serde_json::json!({
             "ok": false,
-            "error": "external_server is required when new_port isn't 53 — DHCP option 6 can only advertise a DNS server on the standard port, so clients need to be pointed at a resolver they can reach (typically the AdGuard/Pi-hole container IP).",
+            "error": "external_server is required when new_port isn't 53 — DHCP option 6 can only advertise a resolver on the standard port :53, so clients need to be pointed at a separate IP they can reach there (typically the AdGuard/Pi-hole container IP). NOTE: this IP doesn't need to be running yet — it's just a future reference. Set it now, dnsmasq will move off :53 freeing it, then start AdGuard on that IP.",
         }));
     }
     // Build the candidate LAN outside the write lock first, then
@@ -4341,4 +5963,64 @@ async fn set_lan_dns_port(
     actix_web::HttpResponse::Ok().json(serde_json::json!({
         "ok": true, "message": msg,
     }))
+}
+
+#[cfg(test)]
+mod ipv4_validation_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_missing_dot_typo() {
+        // The exact case PapaSchlumpf hit: "10.10.10.100" → "10.1010.100".
+        let r = validate_ipv4_in_cidr("dhcp.pool_start", "10.1010.100", "10.10.10.0/24");
+        assert!(r.is_err());
+        let msg = r.unwrap_err();
+        assert!(msg.contains("not a valid IPv4"), "unexpected: {}", msg);
+    }
+
+    #[test]
+    fn rejects_quad_outside_subnet() {
+        let r = validate_ipv4_in_cidr("router_ip", "192.168.1.1", "10.0.0.0/24");
+        assert!(r.is_err());
+        let msg = r.unwrap_err();
+        assert!(msg.contains("is not inside the LAN's subnet"), "unexpected: {}", msg);
+    }
+
+    #[test]
+    fn accepts_valid_in_subnet() {
+        assert!(validate_ipv4_in_cidr("router_ip", "192.168.1.1", "192.168.1.0/24").is_ok());
+        assert!(validate_ipv4_in_cidr("dhcp.pool_start", "10.10.10.100", "10.10.10.0/24").is_ok());
+    }
+
+    #[test]
+    fn rejects_malformed_cidr() {
+        // No slash.
+        assert!(validate_ipv4_in_cidr("router_ip", "192.168.1.1", "192.168.1.0").is_err());
+        // Bad prefix.
+        assert!(validate_ipv4_in_cidr("router_ip", "192.168.1.1", "192.168.1.0/abc").is_err());
+        assert!(validate_ipv4_in_cidr("router_ip", "192.168.1.1", "192.168.1.0/40").is_err());
+        // Bad network part.
+        assert!(validate_ipv4_in_cidr("router_ip", "192.168.1.1", "not.an.ip/24").is_err());
+    }
+
+    #[test]
+    fn slash_zero_accepts_anything() {
+        assert!(validate_ipv4_in_cidr("any", "8.8.8.8", "0.0.0.0/0").is_ok());
+    }
+
+    #[test]
+    fn empty_value_rejected() {
+        assert!(validate_ipv4_in_cidr("router_ip", "", "192.168.1.0/24").is_err());
+        assert!(validate_ipv4_in_cidr("router_ip", "   ", "192.168.1.0/24").is_err());
+    }
+
+    #[test]
+    fn boundary_addresses_in_24() {
+        // Network address (.0) and broadcast (.255) DO live inside the
+        // /24 mathematically — we accept them at format-validation time.
+        // Whether they make sense as router_ip / pool endpoint is a
+        // higher-level concern dnsmasq itself catches.
+        assert!(validate_ipv4_in_cidr("x", "192.168.1.0", "192.168.1.0/24").is_ok());
+        assert!(validate_ipv4_in_cidr("x", "192.168.1.255", "192.168.1.0/24").is_ok());
+    }
 }

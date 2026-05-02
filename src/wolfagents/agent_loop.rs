@@ -222,7 +222,57 @@ async fn openai_tool_loop(
         let msg = &choice["message"];
         let finish_reason = choice["finish_reason"].as_str().unwrap_or("").to_string();
         let content_text = msg["content"].as_str().unwrap_or("").to_string();
-        let tool_calls_json = msg["tool_calls"].as_array().cloned().unwrap_or_default();
+        let mut tool_calls_json = msg["tool_calls"].as_array().cloned().unwrap_or_default();
+
+        // Recover tool calls that the model emitted as JSON inside
+        // `content` instead of in the structured `tool_calls` field.
+        // Common with smaller / not-tool-fine-tuned local models
+        // (qwen2.5 below 7B, several llama-coder variants, gemma
+        // tunes). Without this, tool calls get returned to the user
+        // as raw JSON "responses" and never execute.
+        //
+        // Allowlist is the agent's own `allowed_tools` set — an
+        // extracted name not in there is dropped, preventing prose
+        // like `{"name": "some_service", "status": "x"}` from
+        // synthesising a phantom call. Tool-call IDs use the
+        // OpenAI `call_<hex>` format so a future swap to OpenAI
+        // proper (which validates ID shape) doesn't reject the
+        // recovered turn's history.
+        if tool_calls_json.is_empty() && !content_text.is_empty() {
+            let allowed: Vec<&str> = agent.allowed_tools.iter().map(|s| s.as_str()).collect();
+            if let Some(extracted) = crate::ai::extract_tool_calls_from_content(&content_text, &allowed) {
+                tracing::info!(
+                    target: "wolfstack::wolfagents",
+                    "openai_tool_loop: model emitted {} tool call(s) inside content \
+                     (no structured tool_calls field) — recovered via fallback parser. \
+                     agent={} model={} finish_reason={}",
+                    extracted.len(), agent.id, cfg.model, finish_reason,
+                );
+                for (i, (name, args)) in extracted.into_iter().enumerate() {
+                    tool_calls_json.push(serde_json::json!({
+                        "id": format!("call_{:016x}",
+                            // Mix the round counter, agent id length,
+                            // and a millisecond timestamp so two
+                            // recovered turns in the same session
+                            // never collide.
+                            (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                                .wrapping_add(agent.id.len() as u64)
+                                .wrapping_add(
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_millis() as u64)
+                                        .unwrap_or(0)
+                                )
+                        ),
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": serde_json::to_string(&args).unwrap_or_else(|_| "{}".into()),
+                        },
+                    }));
+                }
+            }
+        }
 
         // No tool calls → terminal turn. Some local servers never emit
         // tool_calls even when given tools; the content is their final

@@ -27,9 +27,17 @@ prompt_read() {
 # ─── Parse arguments ─────────────────────────────────────────────────────────
 BRANCH="master"
 CUSTOM_INSTALL_DIR=""
+ASSUME_YES=false
+AGENT_MODE=false
+SKIP_PBS_BUILD=false
+FORCE_PBS_BUILD=false
 while [ $# -gt 0 ]; do
     case "$1" in
         --beta) BRANCH="beta" ;;
+        --yes|-y|--assume-yes) ASSUME_YES=true ;;
+        --agent) AGENT_MODE=true ;;
+        --skip-pbs-build|--no-pbs-build) SKIP_PBS_BUILD=true ;;
+        --build-pbs|--pbs-from-source) FORCE_PBS_BUILD=true ;;
         --install-dir|--install)
             if [ -n "$2" ]; then
                 shift
@@ -42,6 +50,15 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+# Existing install = upgrade. The /api/upgrade endpoint in older WolfStack
+# binaries spawns this script via `curl|bash` without --yes, with stdin nulled
+# out, so any interactive prompt would block the upgrade forever. If
+# /etc/wolfstack exists this is an upgrade, not a fresh install — force
+# unattended mode so the in-app "Upgrade" button actually completes.
+if [ -d /etc/wolfstack ]; then
+    ASSUME_YES=true
+fi
 
 # Allow git to operate on repos owned by other users (setup.sh runs as root
 # but repos may have been cloned by a regular user)
@@ -105,7 +122,12 @@ fi
 echo ""
 echo "  🐺 WolfStack Installer"
 echo "  ─────────────────────────────────────"
-echo "  Server Management Platform"
+if [ "$AGENT_MODE" = true ]; then
+    echo "  Mode: Agent (cluster API only — no management UI)"
+    echo "  Manage this node from your master server's UI after install."
+else
+    echo "  Server Management Platform"
+fi
 if [ "$BRANCH" != "master" ]; then
     echo "  Branch: $BRANCH"
 fi
@@ -150,6 +172,173 @@ else
     exit 1
 fi
 
+# ─── Pre-flight: warn about services we know will collide ──────────────────
+# Adam Cogswell's feedback: WolfStack installs dnsmasq for LXC's bridge.
+# On a host that already runs an authoritative resolver (Technitium,
+# Pi-hole, AdGuard, bind, unbound), or a reverse proxy that owns :80/:443,
+# the install can break the user's existing setup. We don't fail — we
+# warn loudly and require explicit confirmation. Skip the prompt with
+# --yes for unattended installs.
+echo ""
+echo "Pre-flight checks..."
+
+WS_CONFLICT_FOUND=false
+ws_warn() {
+    WS_CONFLICT_FOUND=true
+    echo "  ⚠ $1"
+}
+
+# Helper: is a port held by a non-wolfstack process?
+ws_port_holder() {
+    local port="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -tnlp 2>/dev/null | awk -v p=":$port$" '$4 ~ p { for(i=1;i<=NF;i++) if($i ~ /users:/) print $i; exit }'
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -tnlp 2>/dev/null | awk -v p=":$port$" '$4 ~ p {print $7; exit}'
+    fi
+}
+
+# DNS-on-:53 conflicts
+DNS_HOLDER=$(ws_port_holder 53)
+if [ -n "$DNS_HOLDER" ]; then
+    case "$DNS_HOLDER" in
+        *Technitium*|*technitium*)
+            ws_warn "Technitium DNS Server is bound to :53. WolfStack installs dnsmasq for LXC; the global dnsmasq.service will be left disabled but the package install may still affect Technitium. Consider running WolfStack on a different host." ;;
+        *pihole*|*pihole-FTL*)
+            ws_warn "Pi-hole is bound to :53. Same caveat as Technitium — installing dnsmasq alongside Pi-hole's FTL can collide." ;;
+        *AdGuardHome*|*AdGuard*)
+            ws_warn "AdGuard Home is bound to :53. Installing dnsmasq alongside AdGuard can collide." ;;
+        *systemd-resolve*)
+            echo "  ℹ systemd-resolved is bound to :53 (stub listener). WolfStack handles this case automatically — leaving it alone." ;;
+        *named*|*bind*)
+            ws_warn "BIND (named) is bound to :53. Installing dnsmasq alongside BIND can collide." ;;
+        *unbound*)
+            ws_warn "Unbound is bound to :53. Installing dnsmasq alongside Unbound can collide." ;;
+        *dnsmasq*)
+            : ;; # already dnsmasq — fine
+        *)
+            ws_warn "Something is already bound to :53 ($DNS_HOLDER). Installing dnsmasq may collide." ;;
+    esac
+fi
+
+# 8553 / 8554 / 8555 — the three ports WolfStack actually binds. 8553 is the
+# management UI / API, 8554 is the inter-node HTTP listener (cluster proxy),
+# 8555 is the dedicated public status-page listener. Calling all three out
+# matters for firewall planning — users open just :8553 and wonder why
+# inter-node sync or status pages don't work.
+for port in 8553 8554 8555; do
+    HOLDER=$(ws_port_holder "$port")
+    if [ -n "$HOLDER" ] && [ "$HOLDER" != "${HOLDER#*wolfstack}" ]; then
+        : # our own previous instance — fine on upgrade
+    elif [ -n "$HOLDER" ]; then
+        case "$port" in
+            8553) ROLE="management UI / API" ;;
+            8554) ROLE="inter-node cluster API" ;;
+            8555) ROLE="public status pages" ;;
+        esac
+        ws_warn "Port $port ($ROLE) is already bound by $HOLDER. WolfStack will fail to bind it until that service is stopped or the port is moved in /etc/wolfstack/config.toml."
+    fi
+done
+
+# Reverse proxies on 80/443 (we don't install one by default but WolfProxy
+# component does — flag so the user knows).
+for port in 80 443; do
+    HOLDER=$(ws_port_holder "$port")
+    if [ -n "$HOLDER" ]; then
+        case "$HOLDER" in
+            *nginx*|*apache*|*httpd*|*caddy*|*traefik*|*haproxy*)
+                echo "  ℹ Reverse proxy detected on :$port ($HOLDER). WolfStack core will not touch :$port — only relevant if you install WolfProxy later." ;;
+        esac
+    fi
+done
+
+# Existing /etc/wolfstack/ from a prior install. The risk: re-running setup
+# preserves the OLD join-token, cluster secret, and nodes.json, which on a
+# fresh box looks like an upgrade but on a moved-disk-to-new-host can mean
+# the new node ends up trying to join its old cluster with stale state.
+if [ -d /etc/wolfstack ] && [ "$(ls -A /etc/wolfstack 2>/dev/null)" ]; then
+    echo "  ℹ /etc/wolfstack already exists with content — treating this as an upgrade. Existing config, cluster secret, and join token will be preserved."
+    if [ -f /etc/wolfstack/custom-cluster-secret ]; then
+        echo "    • Custom cluster secret is set on this node. If joining a NEW cluster, delete /etc/wolfstack/custom-cluster-secret and /etc/wolfstack/nodes.json before adding this node from the master."
+    fi
+fi
+
+# Active firewall blocking 8553? Most homelab installs don't bother, but
+# enterprise images ship with firewalld/ufw on. Surface it now so the user
+# isn't troubleshooting "can't reach :8553" after install.
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    if ! ufw status 2>/dev/null | grep -qE "8553(/tcp)?\s+ALLOW"; then
+        echo "  ℹ ufw is active and does not allow :8553. After install run: sudo ufw allow 8553/tcp 8554/tcp 8555/tcp"
+    fi
+elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+    if ! firewall-cmd --list-ports 2>/dev/null | grep -q "8553/tcp"; then
+        echo "  ℹ firewalld is running and does not allow :8553. After install run: sudo firewall-cmd --permanent --add-port=8553/tcp --add-port=8554/tcp --add-port=8555/tcp && sudo firewall-cmd --reload"
+    fi
+fi
+
+# Architecture: prebuilt binaries only ship for x86_64 / aarch64. Anything
+# else falls through to source build, which is slow and can fail. Tell the
+# user upfront so they can either accept the source-build path or bail.
+case "$HOST_ARCH" in
+    x86_64|aarch64) ;;
+    *)
+        echo "  ⚠ Architecture $HOST_ARCH has no prebuilt binary — WolfStack will be compiled from source (~10–30 min, ~3 GB free disk required in /tmp and \$HOME)."
+        ;;
+esac
+
+# Summarise what's about to happen
+echo ""
+echo "  This will install / update on this host:"
+echo "    • The wolfstack binary at /usr/local/bin/wolfstack"
+echo "    • A systemd unit (wolfstack.service)"
+echo "    • Listeners bound: :8553 (management UI), :8554 (inter-node), :8555 (status pages)"
+echo "    • Build dependencies: git, curl, build tools, openssl headers"
+echo "    • Runtime dependencies: lxc, dnsmasq (binary), bridge-utils, qemu, socat, nfs-client, fuse3, s3fs"
+if [ "$AGENT_MODE" = true ]; then
+    echo "    • Agent mode: SPA disabled, but ALL runtime deps above still installed —"
+    echo "      every node has to be able to actually run containers/VMs/storage."
+fi
+echo "    • A cluster join token at /etc/wolfstack/join-token"
+echo "    • A package manifest log at /var/log/wolfstack/install-<timestamp>.log"
+echo "    • The uninstaller at /usr/local/bin/wolfstack-uninstall"
+
+if [ "$WS_CONFLICT_FOUND" = true ]; then
+    echo ""
+    echo "  ⚠ Conflicts above were detected. Read them carefully before continuing."
+fi
+
+# Prompt unless --yes was passed or stdin isn't a tty (curl|bash case)
+if [ "$ASSUME_YES" != true ]; then
+    if [ -t 0 ] || [ -r /dev/tty ]; then
+        echo ""
+        printf "  Proceed with install? [y/N] "
+        WS_REPLY=""
+        if [ -t 0 ]; then
+            read -r WS_REPLY
+        else
+            # stdin is a pipe (curl|bash) — read from /dev/tty if we have one
+            read -r WS_REPLY < /dev/tty 2>/dev/null || WS_REPLY=""
+        fi
+        case "$WS_REPLY" in
+            y|Y|yes|YES) ;;
+            *)
+                echo "  Aborted. Re-run with --yes to skip this prompt for unattended installs."
+                exit 0
+                ;;
+        esac
+    else
+        # No tty available at all (e.g. CI without --yes). Be conservative — abort.
+        if [ "$WS_CONFLICT_FOUND" = true ]; then
+            echo ""
+            echo "  ✗ Conflicts detected and no terminal to confirm interactively."
+            echo "    Re-run with --yes to acknowledge and proceed:"
+            echo "      curl -sSL <url> | sudo bash -s -- --yes"
+            exit 1
+        fi
+    fi
+fi
+echo ""
+
 # ─── Update system packages first ─────────────────────────────────────────
 # Ensures package index is in sync and avoids dependency mismatches
 # Refresh package index (needed to install dependencies) but do NOT upgrade existing packages.
@@ -183,6 +372,34 @@ if command -v pveversion >/dev/null 2>&1 || [ -f /etc/pve/.version ] || dpkg -l 
     echo "✓ Detected Proxmox VE host ($PVE_VER)"
     echo "  Skipping packages already provided by Proxmox (QEMU, LXC)"
 fi
+
+# ─── Install manifest: snapshot package state BEFORE we install anything ───
+# Goal: produce a record at /var/log/wolfstack/install-<timestamp>.log of
+# every package that was added or upgraded by this run, so a user who needs
+# to roll back has a precise list of what changed. We snapshot here (before
+# any install commands run) and again right before the completion banner;
+# the diff is the manifest. This catches every package-manager call in the
+# script without having to wrap each one individually.
+WS_MANIFEST_DIR="/var/log/wolfstack"
+WS_MANIFEST_TS="$(date +%Y%m%d-%H%M%S)"
+WS_MANIFEST_FILE="$WS_MANIFEST_DIR/install-$WS_MANIFEST_TS.log"
+WS_PKG_BEFORE="$WS_MANIFEST_DIR/.pkg-before-$$"
+WS_PKG_AFTER="$WS_MANIFEST_DIR/.pkg-after-$$"
+mkdir -p "$WS_MANIFEST_DIR" 2>/dev/null || true
+chmod 750 "$WS_MANIFEST_DIR" 2>/dev/null || true
+
+ws_snapshot_packages() {
+    local out="$1"
+    : > "$out" 2>/dev/null || return 0
+    if command -v dpkg-query >/dev/null 2>&1; then
+        dpkg-query -W -f='${Package}\t${Version}\n' 2>/dev/null | sort > "$out"
+    elif command -v rpm >/dev/null 2>&1; then
+        rpm -qa --qf '%{NAME}\t%{VERSION}-%{RELEASE}\n' 2>/dev/null | sort > "$out"
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -Q 2>/dev/null | tr ' ' '\t' | sort > "$out"
+    fi
+}
+ws_snapshot_packages "$WS_PKG_BEFORE"
 
 # ─── Install system dependencies ────────────────────────────────────────────
 echo ""
@@ -458,9 +675,140 @@ else
     fi
 fi
 
+# ─── Source-build fallback for architectures Proxmox doesn't ship binaries for ─
+# Proxmox publishes proxmox-backup-client ONLY for amd64
+# (http://download.proxmox.com/debian/pbs/dists/{bookworm,trixie}/pbs-no-subscription/
+# only has binary-amd64/). Every other architecture — Raspberry Pi (aarch64),
+# Apple Silicon Linux (aarch64), ARM servers (aarch64), armv7l Pis — silently
+# fails the .deb extraction path above. This block builds the client crate from
+# source via cargo so PBS backup destinations work on ARM hosts.
+#
+# Skip with --skip-pbs-build if you don't need PBS and don't want to wait
+# 20-30 min on a Pi. Force a rebuild attempt with --build-pbs even on amd64.
+pbs_build_from_source() {
+    local target_arch="${HOST_ARCH:-$(uname -m)}"
+    echo ""
+    echo "  Building proxmox-backup-client from source for $target_arch..."
+    echo "  This takes ~20-30 minutes on a Raspberry Pi 4. Re-run setup.sh"
+    echo "  with --skip-pbs-build to skip on next upgrade if you don't need PBS."
+
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "  ✗ Cargo (Rust toolchain) not found — cannot build from source."
+        echo "    Install Rust first: https://rustup.rs/  then re-run setup.sh"
+        return 1
+    fi
+
+    # Build dependencies. The proxmox-backup-client crate links libssl, libacl,
+    # libfuse3 (for fuse-mount of pxar archives), and libsystemd. Names vary
+    # by distro — best-effort install, build will fail loudly if any are missing.
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get install -y --no-install-recommends \
+            git build-essential pkg-config clang \
+            libssl-dev libacl1-dev libfuse3-dev libsystemd-dev uuid-dev 2>/dev/null \
+            || echo "  ⚠ Some build deps may be missing — continuing anyway"
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y git gcc gcc-c++ make pkgconf-pkg-config clang \
+            openssl-devel libacl-devel fuse3-devel systemd-devel libuuid-devel 2>/dev/null \
+            || echo "  ⚠ Some build deps may be missing — continuing anyway"
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -S --needed --noconfirm git base-devel pkg-config clang \
+            openssl acl fuse3 systemd-libs util-linux 2>/dev/null \
+            || echo "  ⚠ Some build deps may be missing — continuing anyway"
+    elif command -v zypper >/dev/null 2>&1; then
+        zypper install -y git gcc gcc-c++ make pkg-config clang \
+            libopenssl-devel libacl-devel fuse3-devel systemd-devel libuuid-devel 2>/dev/null \
+            || echo "  ⚠ Some build deps may be missing — continuing anyway"
+    fi
+
+    local src="${CUSTOM_INSTALL_DIR:-/var/cache/wolfstack}/proxmox-backup-src"
+    rm -rf "$src"
+    mkdir -p "$(dirname "$src")"
+
+    if ! git clone --depth 1 https://git.proxmox.com/git/proxmox-backup.git "$src" 2>&1 | tail -3; then
+        echo "  ✗ Could not clone proxmox-backup source from git.proxmox.com"
+        rm -rf "$src"
+        return 1
+    fi
+
+    # Build only the client crate. The wider workspace pulls in PBS-server
+    # crates (proxmox-backup-server, daemons, web UI assets) that need
+    # extra build infrastructure we don't want to drag in for the client.
+    # Re-use the swap created earlier in the wolfstack source-build block
+    # if memory is tight (1GB Pi 3, 2GB Pi 4).
+    local cargo_jobs=""
+    local total_kb
+    total_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
+    if [ -n "$total_kb" ] && [ "$total_kb" -lt 4000000 ]; then
+        cargo_jobs="-j 1"
+        echo "  Low memory detected — limiting build to one job"
+    fi
+
+    if ! ( cd "$src" && cargo build --release $cargo_jobs --bin proxmox-backup-client ) 2>&1 | tail -15; then
+        echo "  ✗ cargo build failed — see output above"
+        echo "    The proxmox-backup workspace can be sensitive to system library"
+        echo "    versions. If openssl-sys, libfuse-sys, or proxmox-* crates"
+        echo "    failed, install the matching -devel/-dev packages and re-run."
+        rm -rf "$src"
+        return 1
+    fi
+
+    if [ -x "$src/target/release/proxmox-backup-client" ]; then
+        install -m 0755 "$src/target/release/proxmox-backup-client" /usr/local/bin/proxmox-backup-client
+        echo "  ✓ proxmox-backup-client built and installed to /usr/local/bin/"
+        rm -rf "$src"
+        return 0
+    fi
+    rm -rf "$src"
+    return 1
+}
+
+if [ "$pbs_install_success" != "true" ] && [ "$SKIP_PBS_BUILD" != "true" ]; then
+    # Tell the user WHY the install failed (most likely: arch mismatch).
+    case "$HOST_ARCH" in
+        x86_64)
+            echo "  ⚠ proxmox-backup-client install failed on x86_64 — unusual."
+            echo "    Network or repo issue likely. Skipping source build (the apt"
+            echo "    path should have worked). Re-run with --build-pbs to force"
+            echo "    a from-source attempt anyway."
+            ;;
+        aarch64|arm64|armv7l|armv6l)
+            echo ""
+            echo "  ℹ Proxmox doesn't publish proxmox-backup-client binaries for $HOST_ARCH."
+            echo "    The Debian PBS repo at download.proxmox.com only has binary-amd64/."
+            echo "    Falling back to source build so PBS backup destinations work here."
+            pbs_build_from_source && pbs_install_success=true
+            ;;
+        *)
+            echo "  ℹ No upstream proxmox-backup-client binary for $HOST_ARCH."
+            echo "    Attempting source build via cargo..."
+            pbs_build_from_source && pbs_install_success=true
+            ;;
+    esac
+fi
+
+# Allow `--build-pbs` to force a source build on amd64 too (useful for users
+# who want to track upstream master rather than the published bookworm/trixie
+# .deb releases).
+if [ "$pbs_install_success" = "true" ] && [ "$FORCE_PBS_BUILD" = "true" ]; then
+    echo "  --build-pbs requested — replacing installed binary with source build"
+    pbs_build_from_source || true
+fi
+if [ "$pbs_install_success" != "true" ] && [ "$FORCE_PBS_BUILD" = "true" ]; then
+    pbs_build_from_source && pbs_install_success=true
+fi
+
 if [ "$pbs_install_success" != "true" ]; then
-    echo "⚠ Could not install proxmox-backup-client. PBS integration will be unavailable."
-    echo "  You can install manually later. See: https://pbs.proxmox.com/docs/backup-client.html"
+    echo ""
+    echo "  ⚠ proxmox-backup-client is NOT installed on this host."
+    echo "    Impact: PBS backup destinations in WolfStack will not work."
+    echo "    Workarounds — these backup destinations all work without PBS client:"
+    echo "      • Local filesystem"
+    echo "      • S3 / S3-compatible (Backblaze B2, MinIO, etc.)"
+    echo "      • NFS mount"
+    echo "      • SMB / CIFS share"
+    echo "      • SSHFS to a remote WolfStack node"
+    echo "      • WolfDisk replication"
+    echo "    Manual install (if you really need PBS): https://pbs.proxmox.com/docs/backup-client.html"
 fi
 
 # Fix libfuse3 soname: proxmox-backup-client links against libfuse3.so.3
@@ -1075,6 +1423,32 @@ else
     # Fall back to building from source
     echo "Building WolfStack from source (this may take a few minutes)..."
 
+    # Source build needs serious disk space — Cargo's target/ regularly hits
+    # 2-4 GB for a release build, plus the rust toolchain in $CARGO_HOME.
+    # Bail loudly here rather than letting the user discover an out-of-space
+    # error 15 minutes into a `cargo build`. Skip when the user pointed
+    # CARGO_TARGET_DIR at a custom mount (they've already planned space).
+    BUILD_DIR="${CARGO_TARGET_DIR:-${CUSTOM_INSTALL_DIR:-$INSTALL_DIR}}"
+    BUILD_FREE_KB=$(df -Pk "$BUILD_DIR" 2>/dev/null | awk 'NR==2 {print $4}')
+    if [ -n "$BUILD_FREE_KB" ] && [ "$BUILD_FREE_KB" -lt 3145728 ]; then
+        FREE_GB=$(( BUILD_FREE_KB / 1024 / 1024 ))
+        echo "  ⚠ Only ${FREE_GB} GB free at $BUILD_DIR. Source build needs ~3 GB."
+        echo "    Free up space, or pass --install-dir /path/to/larger/disk to redirect"
+        echo "    Cargo's target directory and toolchain to an external mount."
+        if [ "$ASSUME_YES" != true ]; then
+            if [ -t 0 ] || [ -r /dev/tty ]; then
+                printf "  Continue anyway and risk an out-of-space failure mid-build? [y/N] "
+                WS_REPLY=""
+                if [ -t 0 ]; then read -r WS_REPLY
+                else read -r WS_REPLY < /dev/tty 2>/dev/null || WS_REPLY=""; fi
+                case "$WS_REPLY" in y|Y|yes|YES) ;; *) echo "  Aborted."; exit 1 ;; esac
+            else
+                echo "  Aborting — re-run with --yes to override."
+                exit 1
+            fi
+        fi
+    fi
+
     # Force full rebuild to ensure the new version takes effect
     echo "  Cleaning previous build..."
     CLEAN_TARGET="${CARGO_TARGET_DIR:-$INSTALL_DIR/target}"
@@ -1137,6 +1511,63 @@ else
 fi
 
 echo "✓ wolfstack installed to /usr/local/bin/wolfstack"
+
+# ─── Drop a local copy of uninstall.sh ──────────────────────────────────────
+# Adam Cogswell's feedback: when DNS or networking gets broken (e.g. dnsmasq
+# vs Technitium collision) the user can't curl uninstall.sh to recover.
+# Stash a copy at /usr/local/bin/wolfstack-uninstall so it's reachable
+# offline. We fetch from the same branch this setup.sh came from. If the
+# fetch fails we still write a minimal stub so the user has *something*.
+WS_UNINSTALL_DEST="/usr/local/bin/wolfstack-uninstall"
+WS_UNINSTALL_URL="https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfStack/${BRANCH}/uninstall.sh"
+WS_UNINSTALL_FETCHED=false
+if command -v curl >/dev/null 2>&1; then
+    if curl -fsSL --connect-timeout 10 --max-time 60 -o "${WS_UNINSTALL_DEST}.new" "$WS_UNINSTALL_URL" 2>/dev/null; then
+        if head -1 "${WS_UNINSTALL_DEST}.new" 2>/dev/null | grep -q '^#!'; then
+            mv "${WS_UNINSTALL_DEST}.new" "$WS_UNINSTALL_DEST"
+            chmod 0755 "$WS_UNINSTALL_DEST"
+            WS_UNINSTALL_FETCHED=true
+            echo "✓ Uninstall script saved to $WS_UNINSTALL_DEST"
+        else
+            rm -f "${WS_UNINSTALL_DEST}.new"
+        fi
+    fi
+fi
+if [ "$WS_UNINSTALL_FETCHED" != true ]; then
+    # Fallback stub — covers the 90% case (stop the service + remove the
+    # binary + the systemd unit). Anything beyond this needs the full
+    # uninstall.sh from the repo, but at least the user gets back to a
+    # bootable state without internet.
+    cat > "$WS_UNINSTALL_DEST" <<'WSUNINSTALL_STUB'
+#!/bin/bash
+# WolfStack offline-uninstall stub. The full uninstaller could not be
+# fetched at install time. This stub does the minimum needed to recover:
+# stop the service, remove the binary, remove the systemd unit. Run
+# without arguments. Add --purge to also wipe /etc/wolfstack and the
+# install manifest log directory.
+set -e
+PURGE=false
+[ "${1:-}" = "--purge" ] && PURGE=true
+if [ "$EUID" -ne 0 ]; then
+    echo "wolfstack-uninstall must be run as root (use sudo)." >&2
+    exit 1
+fi
+echo "Stopping wolfstack…"
+systemctl stop wolfstack 2>/dev/null || true
+systemctl disable wolfstack 2>/dev/null || true
+rm -f /etc/systemd/system/wolfstack.service
+systemctl daemon-reload 2>/dev/null || true
+rm -f /usr/local/bin/wolfstack
+if [ "$PURGE" = true ]; then
+    rm -rf /etc/wolfstack /var/log/wolfstack
+    echo "Purged /etc/wolfstack and /var/log/wolfstack."
+fi
+echo "Stub uninstall complete. For a full uninstall (WolfNet/WolfProxy/etc.)"
+echo "fetch the full script: curl -sSL https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfStack/master/uninstall.sh | sudo bash"
+WSUNINSTALL_STUB
+    chmod 0755 "$WS_UNINSTALL_DEST"
+    echo "⚠ Could not fetch full uninstall.sh — wrote offline stub to $WS_UNINSTALL_DEST"
+fi
 
 # AI knowledge base is now compiled into the binary — no separate install needed
 echo "✓ AI knowledge base embedded in binary"
@@ -1367,6 +1798,13 @@ if [ ! -f "/etc/systemd/system/wolfstack.service" ]; then
     echo "  ──────────────────────────────────────────────────"
     echo ""
 
+    # In agent mode, the binary is run with --agent which disables the
+    # management SPA but keeps the cluster API. The flag is part of the
+    # ExecStart line so a manual edit + daemon-reload is enough to flip
+    # an agent into a full server later (or vice versa).
+    AGENT_FLAG=""
+    [ "$AGENT_MODE" = true ] && AGENT_FLAG=" --agent"
+
     cat > /etc/systemd/system/wolfstack.service <<EOF
 [Unit]
 Description=WolfStack - Server Management Platform
@@ -1375,7 +1813,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/wolfstack --port $WS_PORT --bind $WS_BIND
+ExecStart=/usr/local/bin/wolfstack --port $WS_PORT --bind $WS_BIND${AGENT_FLAG}
 WorkingDirectory=/opt/wolfstack
 Restart=on-failure
 RestartSec=5
@@ -1417,7 +1855,46 @@ EOF
 else
     echo ""
     echo "✓ Service already installed - reloading systemd"
+    # Server↔agent flip handling. We only modify the ExecStart= line on a
+    # rerun and only when the user explicitly asked for the OTHER mode —
+    # so a plain `setup.sh` with no flag never alters an existing unit's
+    # mode. The original unit is backed up to .pre-agent-flip so the user
+    # can recover any custom edits we may have stomped.
+    UNIT_FILE="/etc/systemd/system/wolfstack.service"
+    EXISTING_AGENT=false
+    if grep -qE '^ExecStart=.* --agent( |$)' "$UNIT_FILE" 2>/dev/null; then
+        EXISTING_AGENT=true
+    fi
+    if [ "$AGENT_MODE" = true ] && [ "$EXISTING_AGENT" = false ]; then
+        echo "  → Flipping unit from SERVER to AGENT mode (--agent appended to ExecStart=)"
+        cp "$UNIT_FILE" "${UNIT_FILE}.pre-agent-flip"
+        # Append " --agent" to any ExecStart line that targets our binary
+        # and doesn't already have the flag. Anchor to /usr/local/bin/wolfstack
+        # so we don't touch unrelated ExecStartPre/Post lines.
+        sed -i -E 's|^(ExecStart=/usr/local/bin/wolfstack[^\n]*?)(\s*)$|\1 --agent\2|' "$UNIT_FILE"
+        echo "    Backup saved at ${UNIT_FILE}.pre-agent-flip"
+    elif [ "$AGENT_MODE" = false ] && [ "$EXISTING_AGENT" = true ]; then
+        # User reran without --agent; assume they want server mode back.
+        # If they want to keep agent mode, they should not rerun without
+        # the flag — make this clear AFTER the change so the rerun is
+        # idempotent (rerun with --agent → still agent; rerun without
+        # → server).
+        echo "  → Flipping unit from AGENT to SERVER mode (removing --agent from ExecStart=)"
+        cp "$UNIT_FILE" "${UNIT_FILE}.pre-agent-flip"
+        sed -i -E 's|^(ExecStart=/usr/local/bin/wolfstack[^\n]*?)\s+--agent(\s.*)?$|\1\2|' "$UNIT_FILE"
+        echo "    Backup saved at ${UNIT_FILE}.pre-agent-flip"
+        echo "    Pass --agent on the next rerun to flip back."
+    fi
     systemctl daemon-reload
+    # Restart only if we actually changed the unit, otherwise leave
+    # whatever the user has running alone.
+    if [ -f "${UNIT_FILE}.pre-agent-flip" ]; then
+        # Only restart if the flip was JUST done (file is fresh).
+        if [ "$(find "${UNIT_FILE}.pre-agent-flip" -mmin -1 2>/dev/null)" ]; then
+            echo "  → Restarting wolfstack to apply mode change..."
+            systemctl restart wolfstack 2>/dev/null || true
+        fi
+    fi
 fi
 
 # ─── Firewall ───────────────────────────────────────────────────────────────
@@ -1513,17 +1990,111 @@ get_primary_ip() {
     echo "localhost"
 }
 
+# ─── Install manifest: snapshot package state AFTER and write the diff ─────
+ws_snapshot_packages "$WS_PKG_AFTER"
+{
+    echo "# WolfStack install manifest"
+    echo "# Generated: $(date -Iseconds 2>/dev/null || date)"
+    echo "# Host:      $(hostname 2>/dev/null || echo unknown)"
+    echo "# Distro:    ${DISTRO:-unknown}"
+    echo "# Pkg mgr:   ${PKG_MANAGER:-unknown}"
+    echo "# Proxmox:   ${IS_PROXMOX:-false}"
+    echo ""
+    echo "# This file lists every package whose installed version changed during"
+    echo "# the WolfStack install. Lines starting '+' were added or upgraded."
+    echo "# Lines starting '-' were removed (should be empty in normal runs)."
+    echo "# To uninstall, run /usr/local/bin/wolfstack-uninstall (or uninstall.sh"
+    echo "# from the source tree) — it reads the most recent manifest."
+    echo ""
+    echo "## Packages added or upgraded"
+    if [ -s "$WS_PKG_BEFORE" ] && [ -s "$WS_PKG_AFTER" ]; then
+        # comm -13 = lines only in AFTER → packages added or version-bumped
+        comm -13 "$WS_PKG_BEFORE" "$WS_PKG_AFTER" | sed 's/^/+ /'
+    else
+        echo "  (no package snapshot available — unsupported package manager)"
+    fi
+    echo ""
+    echo "## Packages removed"
+    if [ -s "$WS_PKG_BEFORE" ] && [ -s "$WS_PKG_AFTER" ]; then
+        comm -23 "$WS_PKG_BEFORE" "$WS_PKG_AFTER" | sed 's/^/- /'
+    fi
+    echo ""
+    echo "## Services touched by setup.sh"
+    echo "  systemd unit: wolfstack.service (enabled + started)"
+    if [ -n "$DNSMASQ_PRE_STATE" ]; then
+        echo "  dnsmasq.service: prior state = $DNSMASQ_PRE_STATE"
+    fi
+    echo ""
+    echo "## Files written"
+    echo "  /etc/wolfstack/                 — config, secrets, license"
+    echo "  /usr/local/bin/wolfstack        — main binary"
+    echo "  /etc/systemd/system/wolfstack.service — systemd unit"
+    echo "  /etc/wolfstack/join-token       — cluster join token (mode 0600)"
+    echo "  $WS_MANIFEST_FILE  — this manifest"
+} > "$WS_MANIFEST_FILE" 2>/dev/null || true
+chmod 640 "$WS_MANIFEST_FILE" 2>/dev/null || true
+rm -f "$WS_PKG_BEFORE" "$WS_PKG_AFTER" 2>/dev/null || true
+
+# ─── Pre-generate join token so we can show it in the banner ────────────────
+# wolfstack normally generates this on first run via load_join_token() in
+# src/api/mod.rs. We pre-create it here using the same format (64 hex chars
+# from /dev/urandom) so the banner can show it immediately and the user
+# can paste it into another node's UI before this service finishes booting.
+JOIN_TOKEN_FILE="/etc/wolfstack/join-token"
+if [ ! -s "$JOIN_TOKEN_FILE" ]; then
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex 32 > "$JOIN_TOKEN_FILE" 2>/dev/null || true
+    elif [ -r /dev/urandom ]; then
+        # POSIX-portable fallback: od + tr produces 64 lowercase hex chars
+        od -An -vtx1 -N32 /dev/urandom 2>/dev/null | tr -d ' \n' > "$JOIN_TOKEN_FILE" || true
+        echo >> "$JOIN_TOKEN_FILE"
+    fi
+    chmod 600 "$JOIN_TOKEN_FILE" 2>/dev/null || true
+fi
+JOIN_TOKEN="$(tr -d '\n\r' < "$JOIN_TOKEN_FILE" 2>/dev/null || echo '')"
+
 echo "  🐺 Installation Complete!"
 echo "  ─────────────────────────────────────"
-echo "  Dashboard:  http://$(get_primary_ip):${WS_PORT}"
-echo "  Login:      Use your Linux system username and password"
+if [ "$AGENT_MODE" = true ]; then
+    echo "  Mode:       Agent-only (no management UI on this node)"
+    echo "  This node:  $(get_primary_ip):${WS_PORT}  (cluster API)"
+    echo "  Manage:     Open your master server's UI and add this node"
+    echo "              via Cluster → Add Node using the join token below."
+    echo ""
+    echo "  ⚠ Cluster secret note:"
+    echo "    If you rotated the cluster secret on the master server"
+    echo "    (Settings → Security), copy /etc/wolfstack/custom-cluster-secret"
+    echo "    from the master to THIS node before the first connection — otherwise"
+    echo "    inter-node calls will fail X-WolfStack-Secret authentication."
+else
+    echo "  Dashboard:  http://$(get_primary_ip):${WS_PORT}"
+    echo "  Login:      Use your Linux system username and password"
+fi
 echo ""
 echo "  Manage:"
 echo "  Status:     sudo systemctl status wolfstack"
 echo "  Logs:       sudo journalctl -u wolfstack -f"
 echo "  Restart:    sudo systemctl restart wolfstack"
 echo "  Config:     /etc/wolfstack/config.toml"
+echo "  Uninstall:  sudo wolfstack-uninstall              (preserves config)"
+echo "              sudo wolfstack-uninstall --purge      (full wipe of WolfStack)"
+echo "              sudo wolfstack-uninstall --all --purge (also remove WolfNet/Proxy/Serve/Disk/Scale)"
+if [ -s "$WS_MANIFEST_FILE" ]; then
+    echo "  Manifest:   $WS_MANIFEST_FILE"
+    echo "              (records every package added/upgraded — kept for rollback)"
+fi
 echo ""
+if [ -n "$JOIN_TOKEN" ]; then
+    echo "  ─── Add this node to a cluster ──────"
+    echo "  This node's join token (paste into the master server's"
+    echo "  \"Add Node\" form to link this server to an existing cluster):"
+    echo ""
+    echo "    $JOIN_TOKEN"
+    echo ""
+    echo "  Token file:  $JOIN_TOKEN_FILE  (mode 0600, root only)"
+    echo "  Retrieve later:  sudo cat $JOIN_TOKEN_FILE"
+    echo ""
+fi
 echo "**** UPGRADE COMPLETE ****"
 echo ""
 echo "Please Refresh your browser if upgrading..."

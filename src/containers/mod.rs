@@ -2274,6 +2274,12 @@ pub struct ContainerInfo {
     pub mac_address: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub network_name: String,
+    /// Cumulative restart count reported by the runtime. Docker's
+    /// `State.RestartCount` from inspect; populated for Docker
+    /// containers. Always `None` for LXC (whose container-internal
+    /// init handles its own restart accounting).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2488,82 +2494,49 @@ fn docker_list(all: bool) -> Vec<ContainerInfo> {
         cmd.arg("-a");
     }
 
-    cmd.output()
-        .ok()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(|line| {
-                    let parts: Vec<&str> = line.split('\t').collect();
-                    let name = parts.get(1).unwrap_or(&"").to_string();
-                    let state = parts.get(4).unwrap_or(&"").to_string();
+    let ps_out = match cmd.output() {
+        Ok(o) => o,
+        Err(_) => return vec![],
+    };
+    let ps_text = String::from_utf8_lossy(&ps_out.stdout);
+    let lines: Vec<String> = ps_text.lines()
+        .filter(|l| !l.is_empty())
+        .map(|s| s.to_string())
+        .collect();
 
-                    // Combined inspect for network info + rootfs. We
-                    // keep restart-policy and autostart OUT of this
-                    // combined call because the template above has
-                    // proven fragile (range over empty networks, missing
-                    // GraphDriver.Data fields on non-overlay2 drivers
-                    // like zfs/btrfs/devicemapper, or newer Docker
-                    // versions subtly changing output) and when it
-                    // breaks, every container silently gets autostart=
-                    // false on the UI even though its actual policy is
-                    // unless-stopped. Dedicated inspect for RestartPolicy
-                    // lives below and is known-good for every Docker
-                    // version + storage driver combo.
-                    //
-                    // Inspect targets the container ID (parts[0]) not
-                    // the name — names can have aliases/prefixes that
-                    // confuse lookups; IDs never do.
-                    let cid = parts.first().copied().unwrap_or("");
-                    let inspect_target = if !cid.is_empty() { cid } else { name.as_str() };
-                    let inspect_fmt = "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}|{{range .NetworkSettings.Networks}}{{.Gateway}} {{end}}|{{range .NetworkSettings.Networks}}{{.MacAddress}} {{end}}|{{.GraphDriver.Data.MergedDir}}";
-                    let inspect_out = Command::new("docker")
-                        .args(["inspect", "-f", inspect_fmt, inspect_target])
-                        .output()
-                        .ok()
-                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                        .unwrap_or_default();
+    // Collect every container ID from the ps output, then run ONE
+    // `docker inspect <id1> <id2> ...` call and index the result by ID.
+    // This replaces the previous per-container-inspect loop (2 inspect
+    // calls × N containers = 2N subprocesses) with exactly 2 docker
+    // invocations total. Adam Cogswell's Proxmox box wasn't even
+    // running a Docker fleet, but the same N+1 pattern affected any
+    // user with more than a handful of containers — ~100ms per inspect
+    // × 30 containers = 3s before this fix.
+    let ids: Vec<String> = lines.iter()
+        .filter_map(|line| line.split('\t').next().map(|s| s.to_string()))
+        .filter(|id| !id.is_empty())
+        .collect();
+    let inspect_map: std::collections::HashMap<String, DockerInspectFields> =
+        docker_batched_inspect(&ids);
 
-                    let inspect_parts: Vec<&str> = inspect_out.splitn(4, '|').collect();
-                    let raw_net_ips = inspect_parts.first().unwrap_or(&"").trim();
-                    let raw_gateways = inspect_parts.get(1).unwrap_or(&"").trim();
-                    let raw_macs = inspect_parts.get(2).unwrap_or(&"").trim();
-                    let rootfs_raw = inspect_parts.get(3).unwrap_or(&"").trim().to_string();
+    lines.iter()
+        .map(|line| {
+            let parts: Vec<&str> = line.split('\t').collect();
+            let cid = parts.first().copied().unwrap_or("").to_string();
+            let name = parts.get(1).unwrap_or(&"").to_string();
+            let state = parts.get(4).unwrap_or(&"").to_string();
 
-                    // Dedicated inspect for the restart policy. If this
-                    // fails (container gone, daemon blip) we fall back
-                    // to "no" — but we LOG a warning so the operator
-                    // can diagnose a systemic parse failure instead of
-                    // quietly seeing every autostart checkbox unticked.
-                    let restart_policy = {
-                        let out = Command::new("docker")
-                            .args(["inspect", "-f", "{{.HostConfig.RestartPolicy.Name}}", inspect_target])
-                            .output();
-                        match out {
-                            Ok(o) if o.status.success() => {
-                                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                                // `<no value>` only appears if the
-                                // template path itself was wrong —
-                                // shouldn't happen for the canonical
-                                // HostConfig.RestartPolicy.Name path,
-                                // but guard anyway.
-                                if s == "<no value>" { String::new() } else { s }
-                            }
-                            Ok(o) => {
-                                warn!(
-                                    "docker inspect for restart policy of '{}' exited {}: {}",
-                                    inspect_target, o.status.code().unwrap_or(-1),
-                                    String::from_utf8_lossy(&o.stderr).trim()
-                                );
-                                String::new()
-                            }
-                            Err(e) => {
-                                warn!("docker inspect (restart policy) failed for '{}': {}", inspect_target, e);
-                                String::new()
-                            }
-                        }
-                    };
+            // Look up batched inspect data. Containers that race with
+            // a `docker rm` between `docker ps` and the inspect call
+            // simply have no entry — we fall through to defaults
+            // identical to what the old per-container fallback would
+            // have produced.
+            let fields = inspect_map.get(&cid).cloned().unwrap_or_default();
+            let raw_net_ips  = fields.network_ips.as_str();
+            let raw_gateways = fields.network_gateways.as_str();
+            let raw_macs     = fields.network_macs.as_str();
+            let rootfs_raw   = fields.merged_dir.clone();
+            let restart_policy = fields.restart_policy.clone();
 
                     // Parse WolfNet IP — override file takes priority, then Docker label
                     let wolfnet_ip = docker_effective_wolfnet_ip(&name);
@@ -2641,14 +2614,113 @@ fn docker_list(all: bool) -> Vec<ContainerInfo> {
                         fs_type: ft,
                         version: None,
                         services,
-                        gateway: container_gateway,
-                        mac_address: container_mac,
-                        network_name: net_name,
-                    }
-                })
-                .collect()
+                gateway: container_gateway,
+                mac_address: container_mac,
+                network_name: net_name,
+                restart_count: Some(fields.restart_count),
+            }
         })
-        .unwrap_or_default()
+        .collect()
+}
+
+/// Fields we extract from `docker inspect` for the list view. Defaults
+/// match what the old per-container template-format calls produced when
+/// they failed (empty network info, no rootfs, no restart policy → maps
+/// to "no autostart" in the UI).
+#[derive(Default, Clone)]
+struct DockerInspectFields {
+    network_ips: String,       // space-separated, mirrors old template output
+    network_gateways: String,
+    network_macs: String,
+    merged_dir: String,
+    restart_policy: String,
+    /// Cumulative number of times Docker has restarted this
+    /// container since creation (`State.RestartCount` from inspect).
+    /// The predictive restart-loop analyzer reads the delta of this
+    /// across ticks to detect crash-loops.
+    restart_count: u64,
+}
+
+/// Run ONE `docker inspect <id1> <id2> ...` and parse the resulting JSON
+/// array into a HashMap keyed by container ID. Replaces what used to be
+/// 2 inspect subprocesses per container — for a 30-container fleet
+/// that's 60 forks → 1 fork.
+///
+/// Falls back to an empty map when `docker inspect` fails outright (the
+/// daemon's down). Per-container fallback isn't necessary because the
+/// caller treats a missing entry as default-fields, which is the same
+/// thing the old code did when an individual inspect failed.
+fn docker_batched_inspect(ids: &[String])
+    -> std::collections::HashMap<String, DockerInspectFields>
+{
+    let mut map = std::collections::HashMap::new();
+    if ids.is_empty() { return map; }
+
+    // Pass IDs as positional args. Avoid building a single space-joined
+    // string — IDs never contain spaces but argv passing is the right
+    // shape for the tool anyway.
+    let mut cmd = Command::new("docker");
+    cmd.arg("inspect");
+    for id in ids { cmd.arg(id); }
+
+    let out = match cmd.output() {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            warn!(
+                "docker inspect (batched, {} ids) exited {}: {}",
+                ids.len(), o.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return map;
+        }
+        Err(e) => {
+            warn!("docker inspect (batched, {} ids) spawn failed: {}", ids.len(), e);
+            return map;
+        }
+    };
+
+    let arr: Vec<serde_json::Value> = match serde_json::from_slice(&out.stdout) {
+        Ok(a) => a,
+        Err(e) => {
+            warn!("docker inspect output JSON parse failed: {}", e);
+            return map;
+        }
+    };
+
+    for entry in arr {
+        let id = entry.get("Id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if id.is_empty() { continue; }
+        let mut fields = DockerInspectFields::default();
+
+        // Network: walk every entry under .NetworkSettings.Networks
+        // and concatenate IP/Gateway/MAC values space-separated, the
+        // same shape the old `{{range .NetworkSettings.Networks}}…
+        // {{end}}` Go template produced.
+        if let Some(networks) = entry.pointer("/NetworkSettings/Networks").and_then(|v| v.as_object()) {
+            let mut ips = Vec::new();
+            let mut gws = Vec::new();
+            let mut macs = Vec::new();
+            for (_, n) in networks {
+                if let Some(s) = n.get("IPAddress").and_then(|v| v.as_str()) { if !s.is_empty() { ips.push(s.to_string()); } }
+                if let Some(s) = n.get("Gateway").and_then(|v| v.as_str()) { if !s.is_empty() { gws.push(s.to_string()); } }
+                if let Some(s) = n.get("MacAddress").and_then(|v| v.as_str()) { if !s.is_empty() { macs.push(s.to_string()); } }
+            }
+            fields.network_ips = ips.join(" ");
+            fields.network_gateways = gws.join(" ");
+            fields.network_macs = macs.join(" ");
+        }
+        if let Some(s) = entry.pointer("/GraphDriver/Data/MergedDir").and_then(|v| v.as_str()) {
+            fields.merged_dir = s.to_string();
+        }
+        if let Some(s) = entry.pointer("/HostConfig/RestartPolicy/Name").and_then(|v| v.as_str()) {
+            fields.restart_policy = s.to_string();
+        }
+        if let Some(n) = entry.pointer("/State/RestartCount").and_then(|v| v.as_u64()) {
+            fields.restart_count = n;
+        }
+        map.insert(id, fields);
+    }
+    map
 }
 
 /// Get Docker container stats (one-shot)
@@ -3569,6 +3641,7 @@ pub fn lxc_list_all() -> Vec<ContainerInfo> {
                 gateway: lxc_gateway,
                 mac_address: lxc_mac,
                 network_name: lxc_link,
+                restart_count: None,  // LXC: see ContainerInfo::restart_count doc
             });
         }
     }
@@ -3576,6 +3649,78 @@ pub fn lxc_list_all() -> Vec<ContainerInfo> {
 }
 
 /// List LXC containers using Proxmox's pct command (filters out stale containers)
+/// Run ONE `df -PT --block-size=1` for every running LXC container's
+/// host-side rootfs path and return a map keyed by vmid. Avoids the
+/// per-CT `pct exec <vmid> df` namespace-entry tax — same numbers
+/// because the container's rootfs is mounted on the *host* at
+/// /var/lib/lxc/<vmid>/rootfs before any `pct exec` ever runs.
+///
+/// Falls back to an empty map when df fails (PATH missing, no running
+/// CTs, etc). Unparseable lines are skipped — the caller treats
+/// missing entries as "no disk usage data" rather than failing.
+///
+/// `-P` enforces POSIX (no line wrapping for long device names),
+/// `-T` adds the FS-type column, `--block-size=1` returns raw bytes.
+fn host_df_for_lxc(vmids: &[String])
+    -> std::collections::HashMap<String, (Option<u64>, Option<u64>, Option<String>)>
+{
+    let mut map = std::collections::HashMap::new();
+    if vmids.is_empty() { return map; }
+
+    // Build path → vmid lookup so we can match df output rows back to
+    // VMIDs. df prints the mount point in the last column; if a CT's
+    // rootfs is mounted directly on /var/lib/lxc/<vmid>/rootfs that
+    // string is what df shows. Some PVE versions mount via
+    // /var/lib/lxc/<vmid>/rootfs/ + bind, so we also accept the parent.
+    let paths: Vec<(String, String)> = vmids.iter()
+        .map(|v| (v.clone(), format!("/var/lib/lxc/{}/rootfs", v)))
+        .filter(|(_, p)| std::path::Path::new(p).exists())
+        .collect();
+    if paths.is_empty() { return map; }
+
+    let mut cmd = Command::new("df");
+    cmd.args(["-PT", "--block-size=1"]);
+    for (_, path) in &paths { cmd.arg(path); }
+
+    let out = match cmd.output() {
+        Ok(o) if o.status.success() || !o.stdout.is_empty() => o,
+        // df returns nonzero when ANY path fails (e.g. unmounted) but
+        // still writes valid rows for the others to stdout. Honour that
+        // partial-success behaviour.
+        Ok(o) => {
+            warn!(
+                "host_df_for_lxc: df exited {} with no stdout; falling back to empty map. stderr: {}",
+                o.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return map;
+        }
+        Err(e) => {
+            warn!("host_df_for_lxc: df spawn failed: {}", e);
+            return map;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // df -PT header: Filesystem Type 1B-blocks Used Available Capacity Mounted on
+    for line in stdout.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 7 { continue; }
+        let fs    = cols[1].to_string();
+        let total = cols[2].parse::<u64>().ok();
+        let used  = cols[3].parse::<u64>().ok();
+        // Mount column is the LAST column; -P prevents wrapping so the
+        // last token is reliably the mount point.
+        let mount = cols[cols.len() - 1];
+        // Match the path back to its vmid. We compare the FULL mount
+        // string (df doesn't trail-slash, neither does our format!).
+        if let Some((vmid, _)) = paths.iter().find(|(_, p)| p == mount) {
+            map.insert(vmid.clone(), (used, total, Some(fs)));
+        }
+    }
+    map
+}
+
 fn pct_list_all() -> Vec<ContainerInfo> {
     let output = match Command::new("pct").arg("list").output() {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
@@ -3609,18 +3754,69 @@ fn pct_list_all() -> Vec<ContainerInfo> {
         })
         .collect();
 
-    // Fetch all pct configs in parallel (one `pct config` per container)
-    let configs: Vec<String> = std::thread::scope(|s| {
-        let handles: Vec<_> = entries.iter().map(|(vmid, _, _)| {
-            let vmid = vmid.clone();
-            s.spawn(move || {
-                Command::new("pct").args(["config", &vmid]).output().ok()
-                    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                    .unwrap_or_default()
-            })
-        }).collect();
-        handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
-    });
+    // Fetch all pct configs by reading /etc/pve/lxc/<vmid>.conf directly.
+    // Same content `pct config <vmid>` returns — pmxcfs FUSE mount makes
+    // this the source of truth — but with zero subprocess overhead. The
+    // previous parallel-`pct config` approach paid ~300ms per CT (Perl
+    // wrapper around the Proxmox API); on a 30-CT box that's ~9s of
+    // forks even when fanned out. The filesystem path is microseconds
+    // per file. Falls back to `pct config` per CT when /etc/pve/lxc
+    // isn't readable (rare — same FUSE mount root needs to be available
+    // for `pct config` to work too).
+    //
+    // Adam Cogswell context (2026-04-29): symptom was "Virtual machines
+    // page spins forever" on his PVE box; same N+1 pattern exists for
+    // LXC and was the next thing to fix.
+    let pve_lxc_dir = "/etc/pve/lxc";
+    let lxc_dir_readable = std::fs::read_dir(pve_lxc_dir).is_ok();
+    let configs: Vec<String> = if lxc_dir_readable {
+        entries.iter().map(|(vmid, _, _)| {
+            let path = format!("{}/{}.conf", pve_lxc_dir, vmid);
+            // Strip [snapshot_*] sections so per-snapshot values don't
+            // bleed into the live view, mirroring pct config's default
+            // (which only shows the live state without --snapshot).
+            std::fs::read_to_string(&path)
+                .map(|t| t.lines()
+                    .take_while(|l| !l.trim_start().starts_with('['))
+                    .collect::<Vec<_>>().join("\n"))
+                .unwrap_or_default()
+        }).collect()
+    } else {
+        // Fallback to the old subprocess path. Kept parallel because
+        // when we DO need it, /etc/pve unreadable usually means the
+        // pmxcfs is in a degraded state and every Perl fork is going
+        // to be slow — at least let them race.
+        std::thread::scope(|s| {
+            let handles: Vec<_> = entries.iter().map(|(vmid, _, _)| {
+                let vmid = vmid.clone();
+                s.spawn(move || {
+                    Command::new("pct").args(["config", &vmid]).output().ok()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                        .unwrap_or_default()
+                })
+            }).collect();
+            handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+        })
+    };
+
+    // Batched host-side `df` for every running CT in ONE invocation.
+    // Each running LXC container's rootfs is mounted on the *host* at
+    // /var/lib/lxc/<vmid>/rootfs (PVE convention) BEFORE pct-exec
+    // crosses the namespace boundary — so calling df from the host on
+    // those paths returns identical numbers without entering any
+    // container's namespace.
+    //
+    // This replaces what used to be `timeout 5 pct exec <vmid> df`
+    // per running CT: ~500ms each (namespace entry + Perl-shell
+    // wrapper). On a 30-CT box that was ~15s wall-clock under the
+    // parallel scope below; now it's one ~50ms df call. Adam Cogswell
+    // 2026-04-29 follow-up: "lxc containers are a bit slow".
+    let running_vmids: Vec<String> = entries.iter()
+        .filter(|(_, state, _)| state == "running")
+        .map(|(vmid, _, _)| vmid.clone())
+        .collect();
+    let host_df_map: std::collections::HashMap<String, (Option<u64>, Option<u64>, Option<String>)> =
+        host_df_for_lxc(&running_vmids);
 
     // Now process each container in parallel for remaining details
     std::thread::scope(|s| {
@@ -3629,6 +3825,7 @@ fn pct_list_all() -> Vec<ContainerInfo> {
             let state = state.clone();
             let pct_name = pct_name.clone();
             let cfg_text = cfg_text.clone();
+            let df_for_this = host_df_map.get(&vmid).cloned();
             s.spawn(move || {
                 let status = if state == "running" {
                     let pid = Command::new("timeout").args(["5", "lxc-info", "-n", &vmid, "-pH"])
@@ -3716,22 +3913,12 @@ fn pct_list_all() -> Vec<ContainerInfo> {
                 } else { None };
 
                 let (du, dt, ft) = if state == "running" {
-                    // Use timeout to prevent hanging on unresponsive containers
-                    match Command::new("timeout").args(["5", "pct", "exec", &vmid, "--", "df", "-T", "--block-size=1", "/"]).output() {
-                        Ok(out) if out.status.success() => {
-                            let text = String::from_utf8_lossy(&out.stdout);
-                            if let Some(line) = text.lines().nth(1) {
-                                let p: Vec<&str> = line.split_whitespace().collect();
-                                let fs = p.get(1).map(|s| s.to_string());
-                                let total = p.get(2).and_then(|s| s.parse::<u64>().ok());
-                                let used  = p.get(3).and_then(|s| s.parse::<u64>().ok());
-                                (used, total, fs)
-                            } else {
-                                (None, None, None)
-                            }
-                        }
-                        _ => (None, None, None),
-                    }
+                    // Pre-fetched in a single host-side `df` call — no
+                    // subprocess spawn here, no namespace entry. Falls
+                    // back to (None, None, None) when the rootfs path
+                    // wasn't readable (rare — rootfs missing on a
+                    // running CT means PVE is in a broken state).
+                    df_for_this.unwrap_or((None, None, None))
                 } else {
                     let alloc_bytes = parse_pct_rootfs_size(&rootfs_storage);
                     (Some(0), alloc_bytes, None)
@@ -3767,6 +3954,7 @@ fn pct_list_all() -> Vec<ContainerInfo> {
                     gateway: pve_gateway,
                     mac_address: pve_mac,
                     network_name: pve_bridge,
+                    restart_count: None,  // PVE-LXC: see ContainerInfo::restart_count doc
                 }
             })
         }).collect();

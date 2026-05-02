@@ -58,6 +58,8 @@ pub struct PlatformManifest {
     pub max_nodes: u32,
     pub expires: String,
     pub features: Vec<String>,
+    #[serde(default)]
+    pub tier: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,19 +113,71 @@ pub fn probe_runtime() -> bool {
 }
 
 pub fn runtime_status() -> serde_json::Value {
+    // The dashboard badge needs the customer name and tier; it does NOT
+    // need the email. Omitting the email keeps it out of any
+    // authenticated session that isn't explicitly admin.
     match load_dm() {
-        Some(dm) => serde_json::json!({
-            "valid": true,
-            "customer": dm.customer,
-            "email": dm.email,
-            "max_nodes": dm.max_nodes,
-            "expires": dm.expires,
-            "features": dm.features,
-        }),
+        Some(dm) => {
+            let tier = resolve_tier(&dm);
+            let cap = effective_cap(tier, dm.max_nodes);
+            serde_json::json!({
+                "valid": true,
+                "tier": tier,
+                "customer": dm.customer,
+                "max_nodes": cap,
+                "expires": dm.expires,
+                "features": dm.features,
+            })
+        }
         None => serde_json::json!({
             "valid": false,
+            "tier": "community",
+            "max_nodes": 0,
+            "features": [],
             "message": rt_msg(4),
         }),
+    }
+}
+
+/// Normalise the host cap reported to UIs and gates. Enterprise is
+/// always unlimited, regardless of what a legacy per-installation
+/// licence stored in max_nodes.
+pub fn effective_cap(tier: &str, raw_max: u32) -> u32 {
+    match tier {
+        "homelab" | "pro" => raw_max,
+        _ => 0,
+    }
+}
+
+/// Public read-only view of the active licence — None when unlicensed
+/// (Community tier). Used by `/api/nodes` to enforce host caps.
+pub fn license_manifest() -> Option<PlatformManifest> {
+    load_dm()
+}
+
+/// Resolve the licence tier name. Newer licences include `tier` in the
+/// signed payload; older licences are inferred from the `features` list
+/// (the webhook always sets the first feature to the tier slug).
+pub fn resolve_tier(dm: &PlatformManifest) -> &'static str {
+    if !dm.tier.is_empty() {
+        return match dm.tier.as_str() {
+            "homelab" => "homelab",
+            "pro" => "pro",
+            "enterprise" => "enterprise",
+            _ => "enterprise",
+        };
+    }
+    if dm.features.iter().any(|f| f == "homelab") { "homelab" }
+    else if dm.features.iter().any(|f| f == "pro") { "pro" }
+    else { "enterprise" }
+}
+
+/// True when the licence grants access to a named feature
+/// (e.g. "sso", "api_keys", "plugins", "wolfcustom", "wolfhost").
+pub fn has_feature(name: &str) -> bool {
+    match load_dm() {
+        Some(dm) => dm.features.iter().any(|f| f == name),
+        None => false,
     }
 }
 
@@ -207,12 +261,13 @@ pub async fn report_license_heartbeat(cluster: &crate::agent::ClusterState) {
 }
 
 /// Shared HTTP client for the daily license heartbeat. One pool for
-/// the lifetime of the process.
+/// the lifetime of the process. wolfstack.org has a valid public cert,
+/// so cert verification stays on — the heartbeat carries the licence
+/// record and isn't something we want intercepted.
 static HEARTBEAT_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
         crate::api::ipv4_only_client_builder()
             .timeout(std::time::Duration::from_secs(15))
-            .danger_accept_invalid_certs(true)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     });

@@ -810,6 +810,7 @@ async fn tool_describe_cluster(
     let filter = args.get("cluster_name").and_then(|v| v.as_str());
     let nodes = state.cluster.get_all_nodes();
     let mut picked: Vec<_> = nodes.iter()
+        .filter(|n| n.node_type != "proxmox")
         .filter(|n| match filter {
             Some(c) => n.cluster_name.as_deref() == Some(c),
             None => true,

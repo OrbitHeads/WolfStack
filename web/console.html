@@ -193,6 +193,32 @@
                             term.writeln('\x1b[31m⚠ Failed to load AI action: ' + e.message + '\x1b[0m\r\n');
                         });
                 }
+
+                // Same pattern for predictive Inbox "Run" button:
+                // ?proposal_id=<id>&cmd_idx=<n> fetches the proposal's
+                // remediation command from the server (auth-gated;
+                // command comes from the proposal store on disk, not
+                // from URL params, so there's no injection surface)
+                // and writes it to the PTY's stdin.
+                const proposalId = params.get('proposal_id');
+                const cmdIdx = params.get('cmd_idx');
+                if (proposalId && cmdIdx && /^[A-Za-z0-9\-]+$/.test(proposalId) && /^\d+$/.test(cmdIdx)) {
+                    fetch('/api/proposals/' + encodeURIComponent(proposalId) + '/command/' + encodeURIComponent(cmdIdx))
+                        .then(r => {
+                            if (!r.ok) throw new Error('Proposal command not found');
+                            return r.json();
+                        })
+                        .then(data => {
+                            if (data.command) {
+                                term.writeln('\x1b[35m🔮 Predictive Inbox: ' + (data.title || 'remediation') + '\x1b[0m');
+                                term.writeln('\x1b[36m$ ' + data.command + '\x1b[0m\r\n');
+                                setTimeout(() => { ws.send(data.command + '\n'); }, 800);
+                            }
+                        })
+                        .catch(e => {
+                            term.writeln('\x1b[31m⚠ Failed to load predictive command: ' + e.message + '\x1b[0m\r\n');
+                        });
+                }
             };
 
             ws.onmessage = (event) => {

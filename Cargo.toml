@@ -1,6 +1,6 @@
 [package]
 name = "wolfstack"
-version = "22.1.0"
+version = "22.8.0"
 edition = "2024"
 authors = ["Wolf Software Systems Ltd"]
 description = "Server management platform for the Wolf software suite"
@@ -47,7 +47,7 @@ sysinfo = "0.32"
 clap = { version = "4", features = ["derive"] }
 
 # Utilities
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 chrono = { version = "0.4", features = ["serde"] }
 hostname = "0.4"
 libc = "0.2"
@@ -63,6 +63,7 @@ rand = "0.8"
 subtle = "2"
 sha-crypt = "0.5"
 yescrypt = { version = "0.1.0-rc.5", features = ["password-hash"] }
+webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation", "conditional-ui", "resident-key-support"] }
 lettre = { version = "0.11", features = ["tokio1-rustls-tls", "smtp-transport", "builder"], default-features = false }
 
 # S3 client (pure Rust — works on IBM Power/ppc64le, no C/C++ deps)

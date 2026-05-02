@@ -1169,3 +1169,163 @@ net0: virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0
         assert!(find_conflicts(&target, &[stopped]).is_empty());
     }
 }
+
+// ─── Network-safety preflight ──────────────────────────────────────
+//
+// Reported on Discord (PapaSchlumpf 2026-05-02): an HA-OS VM with PCI
+// passthrough of a NIC nuked DHCP for the entire network the moment
+// it started. The cause is structural — VFIO passthrough removes the
+// device from the host kernel, so any service binding to it (the
+// host's default-route, dnsmasq for WolfNet clients) loses its leg
+// instantly. Reboot is required because re-attaching from VFIO
+// without one tends to leave the device in an unrecoverable state.
+//
+// `check_passthrough_steals_host_net` returns the offending interface
+// name when the VM's passthrough list would claim the host's
+// default-route interface, so the start path can refuse with a
+// clear error before the operator nukes their own connectivity.
+
+/// Returns `Some(iface_name)` if any of `vm`'s passthrough config
+/// would steal the host's default-route interface. `None` when the
+/// VM is safe to start (or when we couldn't determine the host's
+/// default route — fail open rather than block legitimate starts).
+pub fn check_passthrough_steals_host_net(vm: &VmConfig) -> Option<String> {
+    let host_default_iface = host_default_route_interface()?;
+
+    // Per-NIC `passthrough_interface` (MACVTAP-style direct bind
+    // to a host interface). Lives on each `extra_nics[i]`.
+    for nic in &vm.extra_nics {
+        if let Some(iface) = &nic.passthrough_interface {
+            if iface == &host_default_iface {
+                return Some(host_default_iface);
+            }
+        }
+    }
+
+    // PCI passthrough: walk each BDF, ask sysfs which net interface
+    // (if any) is backed by that device, and compare.
+    for dev in &vm.pci_devices {
+        if let Some(net_iface) = pci_bdf_to_net_iface(&dev.bdf) {
+            if net_iface == host_default_iface {
+                return Some(host_default_iface);
+            }
+        }
+    }
+
+    None
+}
+
+/// Read the host's IPv4 default-route interface from `/proc/net/route`.
+/// Avoids shelling out to `ip` for the hot path. Returns `None` if
+/// no default route exists (host might be a network-isolated lab box
+/// where killing connectivity isn't fatal).
+fn host_default_route_interface() -> Option<String> {
+    let text = std::fs::read_to_string("/proc/net/route").ok()?;
+    for line in text.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 2 { continue; }
+        // Default route = destination 00000000. Field order on
+        // every Linux kernel: Iface Destination Gateway Flags ...
+        if cols[1] == "00000000" {
+            return Some(cols[0].to_string());
+        }
+    }
+    None
+}
+
+/// Map a PCI BDF (e.g. "0000:01:00.0" or "01:00.0") to the kernel
+/// network-interface name it backs, by reading
+/// `/sys/bus/pci/devices/{normalised-bdf}/net/`. Returns `None`
+/// when:
+///   • the BDF doesn't resolve in sysfs (device not present);
+///   • the device isn't a network class (the `net/` directory
+///     doesn't exist — e.g. a GPU passthrough);
+///   • the device IS a NIC but is already bound to vfio-pci (in
+///     which case the host doesn't currently use it, so it can't
+///     be the default-route interface either — safe).
+fn pci_bdf_to_net_iface(bdf: &str) -> Option<String> {
+    // Normalise short-form BDFs (`01:00.0`) to the full form sysfs
+    // uses (`0000:01:00.0`). Full-form input passes through.
+    let normalised = if bdf.matches(':').count() == 1 {
+        format!("0000:{}", bdf)
+    } else {
+        bdf.to_string()
+    };
+    let net_dir = format!("/sys/bus/pci/devices/{}/net", normalised);
+    let entries = std::fs::read_dir(&net_dir).ok()?;
+    for entry in entries.flatten() {
+        if let Some(name) = entry.file_name().to_str() {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod network_preflight_tests {
+    use super::*;
+    use super::super::manager::{NicConfig, VmConfig};
+
+    fn empty_vm() -> VmConfig {
+        VmConfig::new("test".to_string(), 1, 1024, 10)
+    }
+
+    fn nic_with_passthrough(iface: &str) -> NicConfig {
+        NicConfig {
+            model: "virtio".into(),
+            mac: None,
+            bridge: None,
+            passthrough_interface: Some(iface.to_string()),
+        }
+    }
+
+    #[test]
+    fn vm_with_no_passthrough_is_safe() {
+        let vm = empty_vm();
+        // A VM with no passthrough at all can never steal the host
+        // NIC, regardless of the host's actual route table.
+        assert!(check_passthrough_steals_host_net(&vm).is_none());
+    }
+
+    #[test]
+    fn passthrough_iface_matching_default_route_blocks() {
+        // We don't have a way to inject a fake default route, so
+        // pick whatever the host's actual default-route iface is
+        // (if any) and assert that a VM claiming that exact iface
+        // is flagged. Skips on hosts with no default route — those
+        // exist in CI environments without network.
+        let Some(host_iface) = host_default_route_interface() else { return; };
+        let mut vm = empty_vm();
+        vm.extra_nics.push(nic_with_passthrough(&host_iface));
+        assert_eq!(
+            check_passthrough_steals_host_net(&vm).as_deref(),
+            Some(host_iface.as_str()),
+            "passthrough_interface == default-route iface must be blocked",
+        );
+    }
+
+    #[test]
+    fn passthrough_iface_not_matching_default_route_allows() {
+        let mut vm = empty_vm();
+        // A bogus interface name that can't possibly be the host's
+        // default route. Counter-test pinning the safe path so a
+        // future false-positive bug is caught.
+        vm.extra_nics.push(nic_with_passthrough("does-not-exist-9999"));
+        assert!(check_passthrough_steals_host_net(&vm).is_none());
+    }
+
+    #[test]
+    fn pci_bdf_to_net_iface_handles_short_form() {
+        // We can't assert the actual return without a known PCI
+        // device, but we can confirm the BDF normalisation doesn't
+        // panic and returns None for a clearly-fake address.
+        assert_eq!(pci_bdf_to_net_iface("ff:ff.7"), None);
+        assert_eq!(pci_bdf_to_net_iface("0000:ff:ff.7"), None);
+    }
+
+    #[test]
+    fn host_default_route_interface_returns_string_or_none() {
+        // Smoke test — must not panic. Result depends on the host.
+        let _ = host_default_route_interface();
+    }
+}
