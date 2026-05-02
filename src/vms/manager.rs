@@ -10,7 +10,10 @@ use tracing::{error, warn, info};
 use rand::Rng;
 use crate::containers;
 use crate::networking;
-use super::passthrough::{parse_libvirt_hostdevs, parse_proxmox_passthrough, find_conflicts};
+use super::passthrough::{
+    parse_libvirt_hostdevs, parse_proxmox_passthrough,
+    find_conflicts, check_passthrough_steals_host_net,
+};
 
 /// A storage volume that can be attached to a VM
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1400,6 +1403,40 @@ impl VmManager {
                 return Err(format!(
                     "Cannot start VM '{}': passthrough device conflict — {}",
                     name, conflicts.join("; ")
+                ));
+            }
+
+            // Network-safety preflight: passing a NIC through to a
+            // guest takes it OUT of the host kernel namespace. If
+            // that NIC is the host's path to the network (default-
+            // route interface), the host loses connectivity the
+            // moment the VM starts — including dnsmasq for every
+            // client on the WolfNet/LAN bridge. Reboot is required
+            // because the device disappears in a way `ip link` can't
+            // undo without re-binding from VFIO.
+            //
+            // Reported on Discord (PapaSchlumpf 2026-05-02): HomeAssistant
+            // VM with passthrough NIC nuked DHCP for the whole
+            // network on start; reboot fixed, WolfStack restart did
+            // not. The kernel-state nature is the tell.
+            if let Some(blocking_iface) = check_passthrough_steals_host_net(target) {
+                return Err(format!(
+                    "Cannot start VM '{}': its passthrough configuration would \
+                     claim the host's primary network interface '{}'. Starting \
+                     would disconnect the host from the network and break DHCP \
+                     for every client on the WolfNet bridge — recovery would \
+                     require a host reboot.\n\n\
+                     Fixes:\n\
+                     (a) Remove the PCI passthrough for that NIC and attach \
+                     a virtio bridge NIC instead — the guest gets the same \
+                     reachability without taking the host's uplink.\n\
+                     (b) Move the host's primary connectivity to a different \
+                     physical NIC (so the passed-through one is no longer the \
+                     default route).\n\
+                     (c) If you genuinely need to take that NIC and have an \
+                     out-of-band recovery path, edit the VM's PCI passthrough \
+                     list to confirm.",
+                    name, blocking_iface,
                 ));
             }
         }

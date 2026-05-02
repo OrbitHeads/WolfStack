@@ -538,7 +538,17 @@ impl AiAgent {
             h.iter().rev().take(10).cloned().collect::<Vec<_>>().into_iter().rev().collect()
         };
 
-        let system_prompt = build_system_prompt(&self.knowledge_base, system_context);
+        // Local providers get a compact system prompt that omits the
+        // ~200 KB embedded knowledge base — small models (2-8 B)
+        // routinely have 4-8 K context windows that the full prompt
+        // can't fit. Cloud providers (Claude / Gemini / OpenAI /
+        // OpenRouter) keep the full KB; their context windows are
+        // 100K+ tokens and the KB is genuinely useful for grounding.
+        let system_prompt = if config.provider == "local" {
+            build_compact_system_prompt(system_context)
+        } else {
+            build_system_prompt(&self.knowledge_base, system_context)
+        };
 
         let mut current_msg = user_message.to_string();
         let mut final_response = String::new();
@@ -1970,6 +1980,31 @@ fn build_system_prompt(knowledge: &str, server_context: &str) -> String {
     )
 }
 
+/// Compact system prompt for local / small-context providers. Strips
+/// the embedded knowledge base (~200 KB hand-written + generated) so
+/// the request fits inside the 4-8 K context windows typical of
+/// 2-8 B local models. The model still gets the capability
+/// instructions and tool-use rules — just not the full Wolf product
+/// docs, which it usually doesn't need to answer cluster-state
+/// questions anyway.
+///
+/// Reported on Discord (Gary KO4BSR 2026-05-01): FunctionGemma's
+/// test-connection returned `finish_reason=tool_calls` with empty
+/// tool_calls and a 143 KB request body — the KB alone overflowed
+/// the model's context window and the response collapsed.
+fn build_compact_system_prompt(server_context: &str) -> String {
+    let full = build_system_prompt("", server_context);
+    // The full builder still includes the "Below is comprehensive
+    // documentation…" header even when knowledge is empty. Strip
+    // that trailing line so the model isn't told to consult docs
+    // that aren't there.
+    if let Some(idx) = full.rfind("Below is comprehensive documentation") {
+        full[..idx].trim_end().to_string()
+    } else {
+        full
+    }
+}
+
 // ─── Simple / stateless chat helper ───
 
 /// Single-shot prompt-to-response against the configured AI provider.
@@ -2443,20 +2478,57 @@ async fn call_local_inner(
     }
 
     if combined.is_empty() {
+        // Special case: model signalled `finish_reason=tool_calls`
+        // (intent to call a tool) but neither the structured
+        // `tool_calls` array nor the content fallback yielded
+        // anything dispatchable. Surface what the model actually
+        // emitted so the user can see WHY the call didn't translate
+        // — e.g., FunctionGemma calling a function name we don't
+        // expose, or a malformed tool_calls payload.
+        if finish_reason == "tool_calls" {
+            let tool_calls_preview = serde_json::to_string(&msg["tool_calls"])
+                .unwrap_or_else(|_| "<unserialisable>".into());
+            let names_seen: Vec<&str> = msg["tool_calls"].as_array()
+                .map(|a| a.iter()
+                    .filter_map(|t| t["function"]["name"].as_str())
+                    .collect())
+                .unwrap_or_default();
+            tracing::warn!(
+                target: "wolfstack::ai",
+                "call_local: model={} signalled tool_calls but nothing dispatched. \
+                 Names seen: {:?}. Allowed: {:?}. Raw tool_calls: {}",
+                model, names_seen, MAIN_AI_TOOLS,
+                tool_calls_preview.chars().take(800).collect::<String>(),
+            );
+            let names_str = if names_seen.is_empty() {
+                "(none — empty tool_calls array)".to_string()
+            } else {
+                format!("[{}]", names_seen.join(", "))
+            };
+            return Err(format!(
+                "Local AI ({}) wanted to call tools but emitted names this \
+                 build doesn't expose. Got: {}. Allowed: [{}]. \
+                 The model is most likely matching its training-time tool \
+                 catalogue rather than WolfStack's. Try a model fine-tuned \
+                 on OpenAI-style function-calling (qwen2.5:3b, llama3.1, \
+                 mistral-functioncalling) — those align to the schema \
+                 WolfStack advertises.",
+                model, names_str, MAIN_AI_TOOLS.join(", "),
+            ));
+        }
         tracing::warn!(
             target: "wolfstack::ai",
             "call_local: empty response (model={} finish_reason={} body_size={}). \
-             Common causes: model context exceeded by system prompt + tools + \
-             history; model doesn't follow instructions; server filtered the \
-             output. Body preview: {}",
+             Common causes: context exceeded; model doesn't follow instructions; \
+             server filtered the output. Body preview: {}",
             model, finish_reason, text.len(),
             text.chars().take(300).collect::<String>(),
         );
         return Err(format!(
-            "Local AI returned empty response (finish_reason={}). The request \
-             body was {} bytes — if the model has a small context window (4-8K \
-             on many small models) it may have run out of tokens. Try a model \
-             with a larger context, or simpler prompts.",
+            "Local AI returned empty response (finish_reason={}). Request body \
+             was {} bytes — if the model has a small context window (4-8 K on \
+             many small models) it may have run out of tokens. Try a smaller \
+             model prompt or a longer-context model.",
             finish_reason, body_size,
         ));
     }
@@ -2714,6 +2786,41 @@ mod content_tool_call_tests {
         let c = r#"{"name": "exec_local", "arguments": "{\"command\": \"ls\"}"}"#;
         let calls = extract_tool_calls_from_content(c, MAIN_AI_TOOLS).expect("parse");
         assert_eq!(calls[0].1["command"], "ls");
+    }
+
+    /// Compact prompt for local providers must NOT carry the
+    /// embedded knowledge base. Reported by Gary KO4BSR 2026-05-01:
+    /// 143 KB request body overflowed FunctionGemma's context.
+    /// Pin a generous upper bound (10 KB) so future additions to
+    /// the prompt-shape can't silently re-inflate it past the
+    /// 4 K-token budget of small local models.
+    #[test]
+    fn compact_system_prompt_omits_knowledge_base() {
+        let compact = build_compact_system_prompt("# Server\n(test context)");
+        assert!(
+            compact.len() < 10_000,
+            "compact prompt is {} bytes — must stay well below the 4-8 K-token \
+             window of small local models. The KB inclusion was the bug.",
+            compact.len(),
+        );
+        // Nothing in the compact prompt should mention "knowledge
+        // base" or echo the trailing "Below is comprehensive
+        // documentation" header — that text is what introduces the
+        // KB block, and an empty introduction is misleading.
+        assert!(
+            !compact.contains("Below is comprehensive documentation"),
+            "compact prompt must not include the KB-introduction header",
+        );
+    }
+
+    #[test]
+    fn full_system_prompt_does_include_knowledge_base() {
+        // Counter-test so a future refactor that "compactifies" the
+        // full prompt builder (and breaks cloud-AI grounding) trips
+        // a test instead of silently shipping.
+        let full = build_system_prompt("# KB content goes here", "# Server\n(test)");
+        assert!(full.contains("# KB content goes here"));
+        assert!(full.contains("Below is comprehensive documentation"));
     }
 
     #[test]
