@@ -28818,21 +28818,59 @@ async function loadSponsorHeaderBadge() {
     var badgeEl = document.getElementById('sponsor-header-badge');
     if (!badgeEl) return;
 
-    // Check enterprise license first — takes priority over sponsor tier
+    // Check WolfStack licence first — takes priority over sponsor tier
     try {
         var licResp = await fetch(apiUrl('/api/platform/status'));
         if (licResp.ok) {
             var lic = await licResp.json();
             if (lic.valid) {
-                badgeEl.style.background = 'linear-gradient(135deg, #dc2626, #ef4444)';
-                badgeEl.textContent = 'Enterprise';
-                if (textEl) textEl.textContent = lic.customer || 'Enterprise License';
+                var tierLabels = { homelab: 'Homelab', pro: 'Pro', enterprise: 'Enterprise' };
+                var tierGradients = {
+                    homelab: 'linear-gradient(135deg, #2563eb, #3b82f6)',
+                    pro: 'linear-gradient(135deg, #7c3aed, #a855f7)',
+                    enterprise: 'linear-gradient(135deg, #dc2626, #ef4444)'
+                };
+                var tierBg = {
+                    homelab: 'linear-gradient(135deg, rgba(37,99,235,0.12), rgba(59,130,246,0.08))',
+                    pro: 'linear-gradient(135deg, rgba(124,58,237,0.12), rgba(168,85,247,0.08))',
+                    enterprise: 'linear-gradient(135deg, rgba(220,38,38,0.12), rgba(239,68,68,0.08))'
+                };
+                var tierBorder = {
+                    homelab: 'rgba(37,99,235,0.25)',
+                    pro: 'rgba(124,58,237,0.25)',
+                    enterprise: 'rgba(220,38,38,0.25)'
+                };
+                var tier = lic.tier || 'enterprise';
+                var label = tierLabels[tier] || 'Licensed';
+                // When over the host cap we paint the badge amber to flag
+                // it without breaking the operator's flow — usage is never
+                // hard-blocked, this is just a visible "you owe us a chat"
+                // signal.
+                var amberGrad = 'linear-gradient(135deg, #d97706, #f59e0b)';
+                var amberBg   = 'linear-gradient(135deg, rgba(217,119,6,0.14), rgba(245,158,11,0.10))';
+                var amberBorder = 'rgba(217,119,6,0.35)';
+                var overCap = !!lic.over_cap;
+                badgeEl.style.background = overCap ? amberGrad : (tierGradients[tier] || tierGradients.enterprise);
+                badgeEl.textContent = overCap ? (label + ' · over cap') : label;
+                var detail = lic.customer || 'Licensed';
+                if (typeof lic.current_nodes === 'number') {
+                    if (lic.max_nodes && lic.max_nodes > 0) {
+                        detail += ' — ' + lic.current_nodes + '/' + lic.max_nodes + ' hosts';
+                    } else {
+                        detail += ' — ' + lic.current_nodes + ' host' + (lic.current_nodes === 1 ? '' : 's');
+                    }
+                }
+                if (textEl) textEl.textContent = detail;
                 if (linkEl) {
-                    linkEl.style.background = 'linear-gradient(135deg, rgba(220,38,38,0.12), rgba(239,68,68,0.08))';
-                    linkEl.style.borderColor = 'rgba(220,38,38,0.25)';
-                    linkEl.removeAttribute('href');
-                    linkEl.removeAttribute('target');
-                    linkEl.style.cursor = 'default';
+                    linkEl.style.background  = overCap ? amberBg     : (tierBg[tier]     || tierBg.enterprise);
+                    linkEl.style.borderColor = overCap ? amberBorder : (tierBorder[tier] || tierBorder.enterprise);
+                    linkEl.style.cursor = 'pointer';
+                    linkEl.setAttribute('href', 'https://wolfstack.org/enterprise-portal.php');
+                    linkEl.setAttribute('target', '_blank');
+                    linkEl.setAttribute('rel', 'noopener');
+                    linkEl.title = overCap
+                        ? 'Cluster exceeds the ' + tier + ' tier — click to upgrade'
+                        : 'Click to manage your WolfStack subscription';
                 }
                 return; // Skip sponsor check
             }

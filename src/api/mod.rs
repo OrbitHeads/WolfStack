@@ -2260,6 +2260,39 @@ pub async fn add_node(req: HttpRequest, state: web::Data<AppState>, body: web::J
         }));
     }
 
+    // Licence host-cap policy: SOFT cap, never hard block.
+    //
+    // Going over your tier's host count gets you a warning attached to
+    // the response (and a banner in the dashboard) but the join still
+    // succeeds. Reconciliation happens server-side via the daily licence
+    // heartbeat. We never block someone from using WolfStack because
+    // they outgrew their tier — that's a sales conversation, not an
+    // outage.
+    let cap_warning: Option<serde_json::Value> = if let Some(dm) = crate::compat::license_manifest() {
+        let tier = crate::compat::resolve_tier(&dm);
+        let cap = crate::compat::effective_cap(tier, dm.max_nodes);
+        if cap > 0 {
+            let current = state.cluster.get_all_nodes().len() as u32;
+            if current + 1 > cap {
+                let upgrade = match tier {
+                    "homelab" => "Upgrade to Pro (£49/mo, 25 hosts) at https://wolfstack.org/enterprise.php",
+                    "pro"     => "Upgrade to Enterprise (unlimited hosts) at https://wolfstack.org/enterprise.php",
+                    _         => "Contact sales@wolf.uk.com to raise the cap",
+                };
+                Some(serde_json::json!({
+                    "message": format!(
+                        "Host added — but your cluster now exceeds the {} tier ({} of {} hosts). {}",
+                        tier, current + 1, cap, upgrade
+                    ),
+                    "tier": tier,
+                    "max_nodes": cap,
+                    "current_nodes": current + 1,
+                    "feature": "host_cap",
+                }))
+            } else { None }
+        } else { None }
+    } else { None };
+
     let node_type = body.node_type.as_deref().unwrap_or("wolfstack");
 
     if node_type == "proxmox" {
@@ -2416,13 +2449,19 @@ pub async fn add_node(req: HttpRequest, state: web::Data<AppState>, body: web::J
         });
     }
 
-    HttpResponse::Ok().json(serde_json::json!({
+    let mut response = serde_json::json!({
         "id": id,
         "address": body.address,
         "port": port,
         "node_type": "wolfstack",
         "cluster_name": cluster_name,
-    }))
+    });
+    if let Some(warning) = cap_warning {
+        if let Some(obj) = response.as_object_mut() {
+            obj.insert("warning".to_string(), warning);
+        }
+    }
+    HttpResponse::Ok().json(response)
 }
 
 /// DELETE /api/nodes/{id} — remove a server
@@ -20898,12 +20937,12 @@ pub async fn plugins_reload(req: HttpRequest, state: web::Data<AppState>) -> Htt
 
 const PLUGIN_INDEX_URL: &str = "https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfStack/master/pkg/index.json";
 
-/// GET /api/plugins/store — fetch available plugins from the plugin store (Enterprise only)
+/// GET /api/plugins/store — fetch available plugins from the plugin store (Pro+ only)
 pub async fn plugins_store(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    if !crate::compat::platform_ready() {
+    if !crate::compat::has_feature("plugins") {
         return HttpResponse::Forbidden().json(serde_json::json!({
-            "error": "Plugin store requires an Enterprise license",
+            "error": "Plugins require a Pro or Enterprise licence — upgrade at https://wolfstack.org/enterprise.php",
             "feature": "plugins"
         }));
     }
@@ -20961,12 +21000,12 @@ pub struct PluginInstallRequest {
     pub url: String,
 }
 
-/// POST /api/plugins/install — install a plugin from URL (Enterprise only)
+/// POST /api/plugins/install — install a plugin from URL (Pro+ only)
 pub async fn plugins_install(req: HttpRequest, state: web::Data<AppState>, body: web::Json<PluginInstallRequest>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    if !crate::compat::platform_ready() {
+    if !crate::compat::has_feature("plugins") {
         return HttpResponse::Forbidden().json(serde_json::json!({
-            "error": "Plugins require an Enterprise license",
+            "error": "Plugins require a Pro or Enterprise licence — upgrade at https://wolfstack.org/enterprise.php",
             "feature": "plugins"
         }));
     }
@@ -21002,11 +21041,11 @@ pub async fn plugins_toggle(req: HttpRequest, state: web::Data<AppState>, path: 
     }
 }
 
-/// GET /api/plugins/{id}/file/{path} — serve plugin web assets (JS/CSS) (Enterprise only)
+/// GET /api/plugins/{id}/file/{path} — serve plugin web assets (JS/CSS) (Pro+ only)
 pub async fn plugins_file(_req: HttpRequest, path: web::Path<(String, String)>) -> HttpResponse {
     // No auth required for static assets (they're loaded by the browser)
-    // But plugins are an Enterprise feature — don't serve assets without a license
-    if !crate::compat::platform_ready() {
+    // But plugins are gated to Pro+ — don't serve assets without that feature
+    if !crate::compat::has_feature("plugins") {
         return HttpResponse::Forbidden().finish();
     }
     let (plugin_id, file_path) = path.into_inner();
@@ -21129,10 +21168,21 @@ pub async fn plugin_data_file(req: HttpRequest, state: web::Data<AppState>, path
 
 // ─── Access Token Management ───
 
-/// GET /api/platform/status
+/// GET /api/platform/status — licence status + current host count.
+/// Used by the dashboard tier badge and the Settings → License view.
 pub async fn platform_status(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    HttpResponse::Ok().json(crate::compat::runtime_status())
+
+    let mut status = crate::compat::runtime_status();
+    let current_nodes = state.cluster.get_all_nodes().len() as u32;
+    if let Some(obj) = status.as_object_mut() {
+        obj.insert("current_nodes".to_string(), serde_json::json!(current_nodes));
+        // over_cap is informational — usage is never hard-blocked.
+        let cap = obj.get("max_nodes").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let over = cap > 0 && current_nodes > cap;
+        obj.insert("over_cap".to_string(), serde_json::json!(over));
+    }
+    HttpResponse::Ok().json(status)
 }
 
 #[derive(Deserialize)]
